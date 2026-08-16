@@ -386,6 +386,71 @@ const CSIDL_COMMON_DOCUMENTS: i32 = 0x002e;
 const CSIDL_COMMON_ADMINTOOLS: i32 = 0x002f;
 const CSIDL_ADMINTOOLS: i32 = 0x0030;
 
+// ── CRT errno values (MSVC errno.h numbering) ────────────────────────────────
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const ESRCH: i32 = 3;
+const EINTR: i32 = 4;
+const EIO: i32 = 5;
+const ENXIO: i32 = 6;
+const E2BIG: i32 = 7;
+const ENOEXEC: i32 = 8;
+const EBADF: i32 = 9;
+const ECHILD: i32 = 10;
+const EAGAIN: i32 = 11;
+const ENOMEM: i32 = 12;
+const EACCES: i32 = 13;
+const EFAULT: i32 = 14;
+const EBUSY: i32 = 16;
+const EEXIST: i32 = 17;
+const EXDEV: i32 = 18;
+const ENODEV: i32 = 19;
+const ENOTDIR: i32 = 20;
+const EISDIR: i32 = 21;
+const EINVAL: i32 = 22;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOTTY: i32 = 25;
+const EFBIG: i32 = 27;
+const ENOSPC: i32 = 28;
+const ESPIPE: i32 = 29;
+const EROFS: i32 = 30;
+const EMLINK: i32 = 31;
+const EPIPE: i32 = 32;
+const EDOM: i32 = 33;
+const ERANGE: i32 = 34;
+const EDEADLK: i32 = 36;
+const ENAMETOOLONG: i32 = 38;
+const ENOLCK: i32 = 39;
+const ENOSYS: i32 = 40;
+const ENOTEMPTY: i32 = 41;
+/// `_TRUNCATE` sentinel for the `*_s` string functions (x86 `size_t` is 32-bit).
+const CRTT_TRUNCATE: u64 = 0xFFFF_FFFF;
+/// `_TRUNCATE` as a full-width `size_t` (x64 guests).
+const CRTT_TRUNCATE_64: u64 = u64::MAX;
+// ── CRT stat mode bits (_stat structs) ───────────────────────────────────────
+const S_IFMT: u32 = 0xF000;
+const S_IFDIR: u32 = 0x4000;
+const S_IFCHR: u32 = 0x2000;
+const S_IFREG: u32 = 0x8000;
+const S_IREAD: u32 = 0x0100;
+const S_IWRITE: u32 = 0x0080;
+const S_IEXEC: u32 = 0x0040;
+// ── CRT stdio constants ──────────────────────────────────────────────────────
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
+const EOF: i32 = -1;
+/// Access-mode bits used by `_access`/`_waccess`.
+const ACCESS_EXISTS: i32 = 0;
+const ACCESS_WRITE: i32 = 2;
+const ACCESS_READ: i32 = 4;
+const ACCESS_READ_WRITE: i32 = 6;
+/// Maximum element size accepted by the CRT qsort shim (bytes).
+const CRT_QSORT_MAX_ELEMENT_SIZE: usize = 4096;
+/// Maximum element count accepted by the CRT qsort shim.
+const CRT_QSORT_MAX_COUNT: usize = 1 << 20;
+
 type U64Map<V> = HashMap<u64, V, U64IdentityBuildHasher>;
 
 #[derive(Clone, Copy, Default)]
@@ -3014,6 +3079,150 @@ pub enum HostThunk {
     // ── CRT locale support ──────────────────────────────────────────────────
     /// setlocale — gets or sets the C locale (needed by Steam's CRT init).
     Setlocale,
+    // ── Patch 6b: CRT / UCRT / MSVCRT host-thunk surface ─────────────────────
+    /// `_errno` — returns a guest pointer to the per-thread errno int.
+    CrtErrno,
+    /// `_doserrno` — returns a guest pointer to the per-thread doserrno int.
+    CrtDoserrno,
+    /// `_get_errno` — copies the current errno to an out-param; returns 0.
+    GetErrno,
+    /// `_set_errno` — sets errno from an argument; returns the previous value.
+    SetErrno,
+    /// `__stdio_common_vsnprintf_s` — secure bounded narrow sprintf (6 args).
+    StdioCommonVsnprintfS,
+    /// `__stdio_common_vsprintf_s` — secure narrow sprintf (6 args).
+    StdioCommonVsprintfS,
+    /// `__stdio_common_vsnprintf` — legacy bounded narrow sprintf (6 args).
+    StdioCommonVsnprintf,
+    Memcpy,
+    Memmove,
+    Memset,
+    Memcmp,
+    Memchr,
+    Strcpy,
+    Strncpy,
+    Strcat,
+    Strncat,
+    Strcmp,
+    Strchr,
+    Strstr,
+    Stricmp,
+    Strnicmp,
+    Strerror,
+    /// `_strerror` — "prefix: message" form of strerror.
+    StrerrorPrefix,
+    Wcslen,
+    Wcscpy,
+    Wcscat,
+    Wcscmp,
+    Wcsncpy,
+    Wcsrchr,
+    Wcschr,
+    Wcsstr,
+    Wcsnlen,
+    Wcsicmp,
+    Wcsnicmp,
+    StrcpyS,
+    StrncpyS,
+    StrcatS,
+    StrncatS,
+    MemcpyS,
+    MemmoveS,
+    WcscpyS,
+    WcsncpyS,
+    Isalpha,
+    Isdigit,
+    Isalnum,
+    Isxdigit,
+    Isspace,
+    Isupper,
+    Islower,
+    Ispunct,
+    Isprint,
+    Isgraph,
+    Iscntrl,
+    Tolower,
+    Toupper,
+    Atoi,
+    Atol,
+    Atof,
+    Strtol,
+    Strtoul,
+    Strtoi64,
+    Strtoi64S,
+    Strtoui64,
+    Strtoui64S,
+    Abs,
+    Labs,
+    Div,
+    Ldiv,
+    Qsort,
+    Bsearch,
+    Getcwd,
+    Wgetcwd,
+    Chdir,
+    Wchdir,
+    Access,
+    Waccess,
+    Chmod,
+    Wchmod,
+    Stat,
+    Wstat,
+    Stat64,
+    Wstat64,
+    Fstat,
+    Fstat64,
+    Getenv,
+    Wgetenv,
+    DupenvS,
+    WdupenvS,
+    Putenv,
+    Wputenv,
+    Splitpath,
+    Wsplitpath,
+    SplitpathS,
+    WsplitpathS,
+    Makepath,
+    Wmakepath,
+    MakepathS,
+    WmakepathS,
+    Rand,
+    Srand,
+    Clock,
+    Time,
+    Time64,
+    Beginthreadex,
+    Endthreadex,
+    Beginthread,
+    Endthread,
+    Fopen,
+    Wfopen,
+    FopenS,
+    WfopenS,
+    Fsopen,
+    Freopen,
+    Fdopen,
+    Fclose,
+    Fflush,
+    Fread,
+    Fgets,
+    Fputs,
+    Fgetc,
+    Fputc,
+    Fseek,
+    Ftell,
+    FreadS,
+    FwriteS,
+    Fcloseall,
+    Flushall,
+    Lock,
+    Unlock,
+    Fileno,
+    Filelength,
+    Filelengthi64,
+    Chsize,
+    Isatty,
+    Commit,
     // ── WinINet network status ──────────────────────────────────────────────
     /// InternetGetConnectedState — returns whether the system has network connectivity.
     InternetGetConnectedState,
@@ -3031,6 +3240,22 @@ struct CrtGlobals {
     commode_ptr: u64,
     fmode_ptr: u64,
     iob_streams: [u64; 3],
+}
+
+/// Host-side state behind a guest `FILE*` (the FILE block is a zeroed 0x80-byte
+/// guest allocation that mirrors the UCRT `_iobuf` footprint; the fd lives at
+/// offset 0x10 so guests reading `_file` directly observe it).
+#[derive(Debug, Clone)]
+struct CrtFileState {
+    /// Win32 handle backing the stream (for files opened via the CRT).
+    handle: u32,
+    /// Normalised guest path ("" for `_fdopen`-created streams).
+    path: String,
+    readable: bool,
+    writable: bool,
+    /// `a`/`a+` mode: writes are always positioned at EOF.
+    append: bool,
+    update: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3597,6 +3822,33 @@ struct PeHostRuntime {
     error_mode: u32,
     last_error: u32,
     invalid_parameter_handler: u64,
+    // ── Patch 6b: CRT errno / doserrno model ────────────────────────────────
+    /// TLS vector slot holding the per-thread errno int pointer. 0 = not yet
+    /// allocated (slot 0 is permanently occupied by the static TLS block, so
+    /// 0 is a safe "unallocated" sentinel).
+    crt_errno_slot: u32,
+    /// TLS vector slot holding the per-thread doserrno int pointer (0 = none).
+    crt_doserrno_slot: u32,
+    /// Host-side mirror of the current thread's errno (used by `_get_errno`
+    /// and as the x64 fallback when no guest TLS vector exists).
+    crt_errno_value: i32,
+    /// Host-side mirror of the current thread's doserrno.
+    crt_doserrno_value: i32,
+    /// Stable guest int storage for errno on x64 (no TLS vector) — lazily
+    /// allocated on first use.
+    crt_errno_storage: u64,
+    /// Stable guest int storage for doserrno on x64 — lazily allocated.
+    crt_doserrno_storage: u64,
+    /// Guest pointer to the static buffer used by strerror/_strerror.
+    crt_strerror_buf: u64,
+    /// MSVC LCG PRNG state for rand/srand.
+    crt_rand_state: u32,
+    /// Host instant for `clock()` (elapsed milliseconds since runtime start).
+    crt_start_instant: std::time::Instant,
+    /// Guest `FILE*` block address → host stream state.
+    crt_files: BTreeMap<u64, CrtFileState>,
+    /// Monotonic index used to allocate guest FILE blocks.
+    crt_next_file_index: u64,
     unhandled_exception_filter: u64,
     main_module_security_cookie_address: Option<u64>,
     process_pointer_cookie: u64,
@@ -8215,6 +8467,17 @@ impl PeHostRuntime {
             error_mode: 0,
             last_error: 0,
             invalid_parameter_handler: 0,
+            crt_errno_slot: 0,
+            crt_doserrno_slot: 0,
+            crt_errno_value: 0,
+            crt_doserrno_value: 0,
+            crt_errno_storage: 0,
+            crt_doserrno_storage: 0,
+            crt_strerror_buf: 0,
+            crt_rand_state: 1,
+            crt_start_instant: std::time::Instant::now(),
+            crt_files: BTreeMap::new(),
+            crt_next_file_index: 1,
             unhandled_exception_filter: 0,
             main_module_security_cookie_address: None,
             process_pointer_cookie: 0,
@@ -29908,8 +30171,15 @@ impl PeHostRuntime {
                 let count = guest_call_arg(state, memory, 0)?;
                 let size = guest_call_arg(state, memory, 1)?;
                 let total = count.saturating_mul(size).max(1);
-                let address = self.alloc_heap(memory, total as usize, true)?;
-                state.set(Register::Rax, address);
+                match self.alloc_heap(memory, total as usize, true) {
+                    Ok(address) => {
+                        state.set(Register::Rax, address);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, ENOMEM);
+                        state.set(Register::Rax, 0);
+                    }
+                }
                 self.last_error = 0;
                 self.push_trace(
                     "memory",
@@ -29919,7 +30189,7 @@ impl PeHostRuntime {
                         ("size".to_string(), json!(size)),
                         ("total".to_string(), json!(total)),
                     ]),
-                    json!(address),
+                    json!(state.get(Register::Rax)),
                 );
             }
             HostThunk::Free => {
@@ -29936,37 +30206,67 @@ impl PeHostRuntime {
             }
             HostThunk::Malloc => {
                 let size = guest_call_arg(state, memory, 0)?.max(1);
-                let address = self.alloc_heap(memory, size as usize, true)?;
-                state.set(Register::Rax, address);
+                match self.alloc_heap(memory, size as usize, true) {
+                    Ok(address) => {
+                        state.set(Register::Rax, address);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, ENOMEM);
+                        state.set(Register::Rax, 0);
+                    }
+                }
                 self.last_error = 0;
                 self.push_trace(
                     "memory",
                     "malloc",
                     BTreeMap::from([("size".to_string(), json!(size))]),
-                    json!(address),
+                    json!(state.get(Register::Rax)),
                 );
             }
             HostThunk::Realloc => {
                 let ptr = guest_call_arg(state, memory, 0)?;
-                let new_size = guest_call_arg(state, memory, 1)?.max(1);
-                if ptr == 0 {
+                let new_size = guest_call_arg(state, memory, 1)?;
+                if new_size == 0 {
+                    // realloc(p, 0) frees the block and returns NULL (C99).
+                    if ptr != 0 {
+                        self.heap_allocations.remove(&ptr);
+                    }
+                    state.set(Register::Rax, 0);
+                } else if ptr == 0 {
                     // NULL pointer — equivalent to malloc(new_size)
-                    let address = self.alloc_heap(memory, new_size as usize, true)?;
-                    state.set(Register::Rax, address);
-                } else if let Some(&old_size) = self.heap_allocations.get(&ptr) {
-                    // Existing heap allocation — allocate new block, copy old contents, free old
-                    let copy_size = old_size.min(new_size as usize);
-                    let new_addr = self.alloc_heap(memory, new_size as usize, true)?;
-                    if new_addr != 0 && copy_size > 0
-                        && let Ok(old_bytes) = memory.read_bytes(ptr, copy_size) {
-                            memory.map_bytes(new_addr, &old_bytes);
+                    match self.alloc_heap(memory, new_size as usize, true) {
+                        Ok(address) => {
+                            state.set(Register::Rax, address);
                         }
-                    self.heap_allocations.remove(&ptr);
-                    state.set(Register::Rax, new_addr);
+                        Err(_) => {
+                            self.set_crt_errno(memory, ENOMEM);
+                            state.set(Register::Rax, 0);
+                        }
+                    }
+                } else if let Some(&old_size) = self.heap_allocations.get(&ptr) {
+                    // Existing heap allocation — allocate new block, copy old
+                    // contents, free old.
+                    let copy_size = old_size.min(new_size as usize);
+                    match self.alloc_heap(memory, new_size as usize, true) {
+                        Ok(new_addr) => {
+                            if new_addr != 0 && copy_size > 0
+                                && let Ok(old_bytes) = memory.read_bytes(ptr, copy_size) {
+                                    memory.map_bytes(new_addr, &old_bytes);
+                                }
+                            self.heap_allocations.remove(&ptr);
+                            state.set(Register::Rax, new_addr);
+                        }
+                        Err(_) => {
+                            self.set_crt_errno(memory, ENOMEM);
+                            state.set(Register::Rax, 0);
+                        }
+                    }
                 } else {
-                    // Pointer not in heap_allocations — allocate fresh (best-effort)
-                    let address = self.alloc_heap(memory, new_size as usize, true)?;
-                    state.set(Register::Rax, address);
+                    // Pointer not tracked by this runtime's heap: per C the
+                    // behavior is undefined; the remediation requires
+                    // NULL + errno EINVAL.
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, 0);
                 }
                 self.last_error = 0;
                 self.push_trace(
@@ -30133,7 +30433,445 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::StdioCommonVfprintf => {
+                // int __stdio_common_vfprintf(u64 options, FILE* stream,
+                //                             const wchar_t* format, _locale_t locale,
+                //                             va_list argptr) — x86 cdecl varargs.
+                let stream = guest_call_arg(state, memory, 1)?;
+                let format_ptr = guest_call_arg(state, memory, 2)?;
+                let argptr = guest_call_arg(state, memory, 4)?;
+                let bytes = self.crt_vfprintf_render(memory, format_ptr, argptr)?;
+                let written = self.crt_vfprintf_deliver(memory, stream, &bytes)?;
+                state.set(Register::Rax, written);
+                self.last_error = 0;
+                self.push_trace(
+                    "stdio",
+                    "__stdio_common_vfprintf",
+                    BTreeMap::from([
+                        ("format_ptr".to_string(), json!(format!("{format_ptr:#x}"))),
+                        ("stream".to_string(), json!(format!("{stream:#x}"))),
+                        ("argptr".to_string(), json!(format!("{argptr:#x}"))),
+                    ]),
+                    json!(written),
+                );
+            }
+            HostThunk::StdioCommonVsnprintfS
+            | HostThunk::StdioCommonVsprintfS
+            | HostThunk::StdioCommonVsnprintf => {
+                // 6-arg UCRT entries:
+                //   __stdio_common_vsnprintf_s(u64 options, char* buffer,
+                //       size_t bufferCount, const wchar_t* format,
+                //       _locale_t locale, va_list argptr)
+                let secure = !matches!(thunk, HostThunk::StdioCommonVsnprintf);
+                let buffer = guest_call_arg(state, memory, 1)?;
+                let buffer_count = guest_call_arg(state, memory, 2)? as usize;
+                let format_ptr = guest_call_arg(state, memory, 3)?;
+                let argptr = guest_call_arg(state, memory, 5)?;
+                let bytes = self.crt_vfprintf_render(memory, format_ptr, argptr)?;
+                let required = bytes.len();
+                // Query idiom: NULL buffer with a zero count returns the
+                // required size (both _s and legacy entry points).
+                if buffer == 0 && buffer_count == 0 {
+                    state.set(Register::Rax, required as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                if secure {
+                    // _s contract: on truncation invoke the invalid-parameter
+                    // handler, set errno ERANGE, NUL-terminate what fits, and
+                    // return the REQUIRED count (the UCRT common-string
+                    // behavior documented in patch 6b; _vsnprintf_s returns
+                    // the required size so callers can retry).
+                    if required >= buffer_count {
+                        if buffer != 0 && buffer_count > 0 {
+                            let copy = buffer_count.saturating_sub(1).min(required);
+                            memory.map_bytes(buffer, &bytes[..copy]);
+                            memory.map_bytes(buffer + copy as u64, &[0_u8]);
+                        }
+                        self.set_crt_errno(memory, ERANGE);
+                        if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {
+                            state.set(Register::Rax, required as u64);
+                            return Ok(Some(134));
+                        }
+                        state.set(Register::Rax, required as u64);
+                    } else if buffer != 0 {
+                        memory.map_bytes(buffer, &bytes);
+                        memory.map_bytes(buffer + required as u64, &[0_u8]);
+                        state.set(Register::Rax, required as u64);
+                    } else {
+                        state.set(Register::Rax, required as u64);
+                    }
+                } else {
+                    // Legacy _vsnprintf contract: overflow returns -1 and the
+                    // buffer is left unterminated and untouched.
+                    if required >= buffer_count {
+                        state.set(Register::Rax, (-1_i64) as u64);
+                    } else if buffer != 0 {
+                        memory.map_bytes(buffer, &bytes);
+                        memory.map_bytes(buffer + required as u64, &[0_u8]);
+                        state.set(Register::Rax, required as u64);
+                    } else {
+                        state.set(Register::Rax, required as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: errno / doserrno ────────────────────────────────────
+            HostThunk::CrtErrno => {
+                let errno_ptr = self.crt_errno_ptr(memory)?;
+                state.set(Register::Rax, errno_ptr);
+                self.last_error = 0;
+            }
+            HostThunk::CrtDoserrno => {
+                let doserrno_ptr = self.crt_doserrno_ptr(memory)?;
+                state.set(Register::Rax, doserrno_ptr);
+                self.last_error = 0;
+            }
+            HostThunk::GetErrno => {
+                let out_ptr = guest_call_arg(state, memory, 0)?;
+                let value = self.crt_errno_get(memory);
+                if out_ptr != 0 {
+                    write_u32(memory, out_ptr, value as u32);
+                }
                 state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::SetErrno => {
+                let value = guest_call_arg(state, memory, 0)? as i32;
+                let previous = self.crt_errno_get(memory);
+                self.set_crt_errno(memory, value);
+                state.set(Register::Rax, previous as u64);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: memory ──────────────────────────────────────────────
+            HostThunk::Memcpy | HostThunk::Memmove => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let bytes = memory.read_bytes(source, count)?;
+                if matches!(thunk, HostThunk::Memcpy) {
+                    memory.map_bytes(destination, &bytes);
+                } else {
+                    // memmove: byte-by-byte so overlapping ranges are safe.
+                    for (offset, byte) in bytes.iter().enumerate() {
+                        memory.write_u8(destination + offset as u64, *byte);
+                    }
+                }
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Memset => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u8;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                for offset in 0..count {
+                    memory.write_u8(destination + offset as u64, value);
+                }
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Memcmp => {
+                let left = guest_call_arg(state, memory, 0)?;
+                let right = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let left_bytes = memory.read_bytes(left, count)?;
+                let right_bytes = memory.read_bytes(right, count)?;
+                let mut result = 0_i32;
+                for (a, b) in left_bytes.iter().zip(right_bytes.iter()) {
+                    if a != b {
+                        result = i32::from(*a as i8) - i32::from(*b as i8);
+                        break;
+                    }
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Memchr => {
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u8;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let bytes = memory.read_bytes(buffer, count)?;
+                let found = bytes.iter().position(|byte| *byte == value);
+                state.set(Register::Rax, found.map(|index| buffer + index as u64).unwrap_or(0));
+                self.last_error = 0;
+            }
+            HostThunk::Strcpy => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let bytes = read_c_string_limit(memory, source, usize::MAX)?;
+                memory.map_bytes(destination, &bytes);
+                memory.write_u8(destination + bytes.len() as u64, 0);
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Strncpy => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let bytes = read_c_string_limit(memory, source, count)?;
+                memory.map_bytes(destination, &bytes);
+                for offset in bytes.len()..count {
+                    memory.write_u8(destination + offset as u64, 0);
+                }
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Strcat => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let dest_len = read_c_string_limit(memory, destination, usize::MAX)?.len();
+                let bytes = read_c_string_limit(memory, source, usize::MAX)?;
+                let end = destination + dest_len as u64;
+                memory.map_bytes(end, &bytes);
+                memory.write_u8(end + bytes.len() as u64, 0);
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Strncat => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let dest_len = read_c_string_limit(memory, destination, usize::MAX)?.len();
+                let bytes = read_c_string_limit(memory, source, count)?;
+                let end = destination + dest_len as u64;
+                memory.map_bytes(end, &bytes);
+                memory.write_u8(end + bytes.len() as u64, 0);
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Strcmp => {
+                let left = read_c_string_limit(memory, guest_call_arg(state, memory, 0)?, usize::MAX)?;
+                let right = read_c_string_limit(memory, guest_call_arg(state, memory, 1)?, usize::MAX)?;
+                let mut result = 0_i32;
+                for (a, b) in left.iter().zip(right.iter()) {
+                    if a != b {
+                        result = i32::from(*a as i8) - i32::from(*b as i8);
+                        break;
+                    }
+                }
+                if result == 0 {
+                    result = (left.len() as i32) - (right.len() as i32);
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Stricmp | HostThunk::Strnicmp => {
+                let bounded = matches!(thunk, HostThunk::Strnicmp);
+                let left_ptr = guest_call_arg(state, memory, 0)?;
+                let right_ptr = guest_call_arg(state, memory, 1)?;
+                let count = if bounded {
+                    guest_call_arg(state, memory, 2)? as usize
+                } else {
+                    usize::MAX
+                };
+                let left = read_c_string_limit(memory, left_ptr, count)?;
+                let right = read_c_string_limit(memory, right_ptr, count)?;
+                let mut result = 0_i32;
+                for (a, b) in left.iter().zip(right.iter()) {
+                    let a = a.to_ascii_lowercase();
+                    let b = b.to_ascii_lowercase();
+                    if a != b {
+                        result = i32::from(a as i8) - i32::from(b as i8);
+                        break;
+                    }
+                }
+                if result == 0 && !bounded {
+                    result = (left.len() as i32) - (right.len() as i32);
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Strchr => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u8;
+                let bytes = read_c_string_limit(memory, string_ptr, usize::MAX)?;
+                let found = bytes.iter().position(|byte| *byte == value);
+                state.set(
+                    Register::Rax,
+                    found.map(|index| string_ptr + index as u64).unwrap_or(0),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::Strstr => {
+                let haystack = guest_call_arg(state, memory, 0)?;
+                let needle = guest_call_arg(state, memory, 1)?;
+                let hay = read_c_string_limit(memory, haystack, usize::MAX)?;
+                let needle_bytes = read_c_string_limit(memory, needle, usize::MAX)?;
+                let found = if needle_bytes.is_empty() {
+                    Some(0)
+                } else {
+                    hay.windows(needle_bytes.len())
+                        .position(|window| window == needle_bytes)
+                };
+                state.set(
+                    Register::Rax,
+                    found.map(|index| haystack + index as u64).unwrap_or(0),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::Strerror | HostThunk::StrerrorPrefix => {
+                if self.crt_strerror_buf == 0 {
+                    self.crt_strerror_buf = self.alloc_c_string(memory, "Unknown error")?;
+                }
+                let message = if matches!(thunk, HostThunk::StrerrorPrefix) {
+                    let prefix = guest_call_arg(state, memory, 0)?;
+                    let prefix_text = read_c_string(memory, prefix)?;
+                    let errno_value = self.crt_errno_get(memory);
+                    format!("{}: {}", prefix_text, crt_errno_message(errno_value))
+                } else {
+                    let errnum = guest_call_arg(state, memory, 0)? as i32;
+                    crt_errno_message(errnum).to_string()
+                };
+                let bytes = self.alloc_c_string(memory, &message)?;
+                self.crt_strerror_buf = bytes;
+                state.set(Register::Rax, bytes);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: wide strings ────────────────────────────────────────
+            HostThunk::Wcslen => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let wide = read_utf16_string(memory, string_ptr)?;
+                state.set(Register::Rax, wide.encode_utf16().count() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Wcsnlen => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let max = guest_call_arg(state, memory, 1)? as usize;
+                let wide = read_utf16_string(memory, string_ptr)?;
+                let len = wide.encode_utf16().count().min(max);
+                state.set(Register::Rax, len as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Wcscpy => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let wide = read_utf16_string(memory, source)?;
+                let bytes = wide
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>();
+                memory.map_bytes(destination, &bytes);
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Wcscat => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let dest_units = read_utf16_string(memory, destination)?
+                    .encode_utf16()
+                    .count();
+                let wide = read_utf16_string(memory, source)?;
+                let bytes = wide
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>();
+                memory.map_bytes(destination + dest_units as u64 * 2, &bytes);
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Wcscmp => {
+                let left = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                let right = read_utf16_string(memory, guest_call_arg(state, memory, 1)?)?;
+                let left_units = left.encode_utf16().collect::<Vec<_>>();
+                let right_units = right.encode_utf16().collect::<Vec<_>>();
+                let mut result = 0_i32;
+                for (a, b) in left_units.iter().zip(right_units.iter()) {
+                    if a != b {
+                        result = i32::from(*a) - i32::from(*b);
+                        break;
+                    }
+                }
+                if result == 0 {
+                    result = (left_units.len() as i32) - (right_units.len() as i32);
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Wcsicmp | HostThunk::Wcsnicmp => {
+                let bounded = matches!(thunk, HostThunk::Wcsnicmp);
+                let left = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                let right = read_utf16_string(memory, guest_call_arg(state, memory, 1)?)?;
+                let max = if bounded {
+                    guest_call_arg(state, memory, 2)? as usize
+                } else {
+                    usize::MAX
+                };
+                let left_units = left.encode_utf16().take(max).collect::<Vec<_>>();
+                let right_units = right.encode_utf16().take(max).collect::<Vec<_>>();
+                let mut result = 0_i32;
+                for (a, b) in left_units.iter().zip(right_units.iter()) {
+                    let a = char::from_u32(u32::from(*a)).unwrap_or('\u{FFFD}');
+                    let b = char::from_u32(u32::from(*b)).unwrap_or('\u{FFFD}');
+                    let a = a.to_ascii_lowercase() as u32;
+                    let b = b.to_ascii_lowercase() as u32;
+                    if a != b {
+                        result = a as i32 - b as i32;
+                        break;
+                    }
+                }
+                if result == 0 && !bounded {
+                    result = (left_units.len() as i32) - (right_units.len() as i32);
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Wcsncpy => {
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let wide = read_utf16_string(memory, source)?;
+                let units = wide.encode_utf16().collect::<Vec<_>>();
+                for (index, unit) in units.iter().take(count).enumerate() {
+                    memory.map_bytes(destination + index as u64 * 2, &unit.to_le_bytes());
+                }
+                for index in units.len()..count {
+                    memory.map_bytes(destination + index as u64 * 2, &0_u16.to_le_bytes());
+                }
+                state.set(Register::Rax, destination);
+                self.last_error = 0;
+            }
+            HostThunk::Wcsrchr => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u16;
+                let wide = read_utf16_string(memory, string_ptr)?;
+                let units = wide.encode_utf16().collect::<Vec<_>>();
+                let found = units.iter().rposition(|unit| *unit == value);
+                state.set(
+                    Register::Rax,
+                    found.map(|index| string_ptr + index as u64 * 2).unwrap_or(0),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::Wcschr => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u16;
+                let wide = read_utf16_string(memory, string_ptr)?;
+                let units = wide.encode_utf16().collect::<Vec<_>>();
+                let found = units.iter().position(|unit| *unit == value);
+                state.set(
+                    Register::Rax,
+                    found.map(|index| string_ptr + index as u64 * 2).unwrap_or(0),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::Wcsstr => {
+                let haystack = guest_call_arg(state, memory, 0)?;
+                let needle = guest_call_arg(state, memory, 1)?;
+                let hay = read_utf16_string(memory, haystack)?;
+                let needle_units = read_utf16_string(memory, needle)?.encode_utf16().collect::<Vec<_>>();
+                let hay_units = hay.encode_utf16().collect::<Vec<_>>();
+                let found = if needle_units.is_empty() {
+                    Some(0)
+                } else {
+                    hay_units
+                        .windows(needle_units.len())
+                        .position(|window| window == needle_units)
+                };
+                state.set(
+                    Register::Rax,
+                    found.map(|index| haystack + index as u64 * 2).unwrap_or(0),
+                );
                 self.last_error = 0;
             }
             HostThunk::Fwrite => {
@@ -30146,15 +30884,21 @@ impl PeHostRuntime {
                 for offset in 0..total {
                     bytes.push(memory.read_u8(ptr + offset as u64)?);
                 }
-                let text = String::from_utf8_lossy(&bytes);
-                if stream == self.globals.iob_streams[2] {
-                    self.stderr.push_str(&text);
+                if self.crt_iob_index(stream).is_some() {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if stream == self.globals.iob_streams[2] {
+                        self.stderr.push_str(&text);
+                    } else {
+                        self.stdout.push_str(&text);
+                    }
+                    state.set(Register::Rax, count);
                 } else {
-                    self.stdout.push_str(&text);
+                    let items = self.crt_fwrite_impl(memory, ptr, size, count, stream)?;
+                    state.set(Register::Rax, items);
                 }
-                state.set(Register::Rax, count);
                 self.last_error = 0;
             }
+
             HostThunk::Strlen => {
                 let string_ptr = guest_call_arg(state, memory, 0)?;
                 state.set(Register::Rax, read_c_string(memory, string_ptr)?.len() as u64);
@@ -30178,6 +30922,1517 @@ impl PeHostRuntime {
             }
             HostThunk::SetUserMathErr => {
                 state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: secure string variants (raise_invalid_parameter) ──
+            HostThunk::StrcpyS => {
+                // errno_t strcpy_s(char* dst, size_t size, const char* src)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let bytes = read_c_string_limit(memory, source, size)?;
+                    if bytes.len() >= size {
+                        memory.write_u8(destination, 0);
+                        if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                            return Ok(Some(code));
+                        }
+                        state.set(Register::Rax, ERANGE as u64);
+                    } else {
+                        memory.map_bytes(destination, &bytes);
+                        memory.write_u8(destination + bytes.len() as u64, 0);
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::StrncpyS => {
+                // errno_t strncpy_s(char* dst, size_t size, const char* src, size_t count)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                let count = guest_call_arg(state, memory, 3)?;
+                let truncate = count == CRTT_TRUNCATE || count == CRTT_TRUNCATE_64;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else if truncate {
+                    // Copy as much as fits; NUL-terminate; no error.
+                    let bytes = read_c_string_limit(memory, source, size.saturating_sub(1))?;
+                    let copy = bytes.len().min(size.saturating_sub(1));
+                    memory.map_bytes(destination, &bytes[..copy]);
+                    memory.write_u8(destination + copy as u64, 0);
+                    state.set(Register::Rax, 0);
+                } else {
+                    let count = count as usize;
+                    let bytes = read_c_string_limit(memory, source, count)?;
+                    if bytes.len() >= size {
+                        memory.write_u8(destination, 0);
+                        if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                            return Ok(Some(code));
+                        }
+                        state.set(Register::Rax, ERANGE as u64);
+                    } else {
+                        memory.map_bytes(destination, &bytes);
+                        memory.write_u8(destination + bytes.len() as u64, 0);
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::StrcatS => {
+                // errno_t strcat_s(char* dst, size_t size, const char* src)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let dest_len = read_c_string_limit(memory, destination, size)?.len();
+                    let src_len = read_c_string_limit(memory, source, size)?.len();
+                    if dest_len + src_len >= size {
+                        memory.write_u8(destination, 0);
+                        if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                            return Ok(Some(code));
+                        }
+                        state.set(Register::Rax, ERANGE as u64);
+                    } else {
+                        let bytes = read_c_string_limit(memory, source, usize::MAX)?;
+                        let end = destination + dest_len as u64;
+                        memory.map_bytes(end, &bytes);
+                        memory.write_u8(end + bytes.len() as u64, 0);
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::StrncatS => {
+                // errno_t strncat_s(char* dst, size_t size, const char* src, size_t count)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                let count = guest_call_arg(state, memory, 3)?;
+                let truncate = count == CRTT_TRUNCATE || count == CRTT_TRUNCATE_64;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let dest_len = read_c_string_limit(memory, destination, size)?.len();
+                    let remaining = size.saturating_sub(dest_len).saturating_sub(1);
+                    if truncate {
+                        let bytes = read_c_string_limit(memory, source, remaining)?;
+                        let end = destination + dest_len as u64;
+                        memory.map_bytes(end, &bytes);
+                        memory.write_u8(end + bytes.len() as u64, 0);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        let count = count as usize;
+                        let bytes = read_c_string_limit(memory, source, count)?;
+                        if bytes.len() > remaining {
+                            memory.write_u8(destination, 0);
+                            if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                                return Ok(Some(code));
+                            }
+                            state.set(Register::Rax, ERANGE as u64);
+                        } else {
+                            let end = destination + dest_len as u64;
+                            memory.map_bytes(end, &bytes);
+                            memory.write_u8(end + bytes.len() as u64, 0);
+                            state.set(Register::Rax, 0);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::MemcpyS | HostThunk::MemmoveS => {
+                // errno_t memcpy_s(void* dst, size_t dstSize, const void* src, size_t count)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let destination_size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                let count = guest_call_arg(state, memory, 3)? as usize;
+                let invalid = destination == 0
+                    || source == 0
+                    || destination_size == 0
+                    || count > destination_size;
+                if invalid {
+                    if destination != 0 && destination_size > 0 {
+                        memory.map_bytes(destination, &vec![0_u8; destination_size]);
+                    }
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let bytes = memory.read_bytes(source, count)?;
+                    memory.map_bytes(destination, &bytes);
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WcscpyS => {
+                // errno_t wcscpy_s(wchar_t* dst, size_t sizeInWords, const wchar_t* src)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let units = read_utf16_string(memory, source)?.encode_utf16().collect::<Vec<_>>();
+                    if units.len() >= size {
+                        memory.map_bytes(destination, &0_u16.to_le_bytes());
+                        if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                            return Ok(Some(code));
+                        }
+                        state.set(Register::Rax, ERANGE as u64);
+                    } else {
+                        let bytes = units
+                            .iter()
+                            .chain(std::iter::once(&0_u16))
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        memory.map_bytes(destination, &bytes);
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WcsncpyS => {
+                // errno_t wcsncpy_s(wchar_t* dst, size_t sizeInWords,
+                //                   const wchar_t* src, size_t count)
+                let destination = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let source = guest_call_arg(state, memory, 2)?;
+                let count = guest_call_arg(state, memory, 3)?;
+                let truncate = count == CRTT_TRUNCATE || count == CRTT_TRUNCATE_64;
+                if destination == 0 || size == 0 || source == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else if truncate {
+                    let units = read_utf16_string(memory, source)?.encode_utf16().collect::<Vec<_>>();
+                    let copy = units.len().min(size.saturating_sub(1));
+                    let mut bytes = units[..copy]
+                        .iter()
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    bytes.extend_from_slice(&0_u16.to_le_bytes());
+                    memory.map_bytes(destination, &bytes);
+                    state.set(Register::Rax, 0);
+                } else {
+                    let count = count as usize;
+                    let units = read_utf16_string(memory, source)?.encode_utf16().collect::<Vec<_>>();
+                    if units.len().min(count) >= size {
+                        memory.map_bytes(destination, &0_u16.to_le_bytes());
+                        if let Some(code) = self.crt_invalid_parameter(state, memory, ERANGE)? {
+                            return Ok(Some(code));
+                        }
+                        state.set(Register::Rax, ERANGE as u64);
+                    } else {
+                        let copy = units.len().min(count);
+                        let mut bytes = units[..copy]
+                            .iter()
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        bytes.extend_from_slice(&0_u16.to_le_bytes());
+                        memory.map_bytes(destination, &bytes);
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: character classes (locale "C", ASCII) ──────────────
+            HostThunk::Isalpha
+            | HostThunk::Isdigit
+            | HostThunk::Isalnum
+            | HostThunk::Isxdigit
+            | HostThunk::Isspace
+            | HostThunk::Isupper
+            | HostThunk::Islower
+            | HostThunk::Ispunct
+            | HostThunk::Isprint
+            | HostThunk::Isgraph
+            | HostThunk::Iscntrl => {
+                let value = guest_call_arg(state, memory, 0)? as i32;
+                let byte = value as u8;
+                let is = match thunk {
+                    HostThunk::Isalpha => byte.is_ascii_alphabetic(),
+                    HostThunk::Isdigit => byte.is_ascii_digit(),
+                    HostThunk::Isalnum => byte.is_ascii_alphanumeric(),
+                    HostThunk::Isxdigit => byte.is_ascii_hexdigit(),
+                    HostThunk::Isspace => matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'),
+                    HostThunk::Isupper => byte.is_ascii_uppercase(),
+                    HostThunk::Islower => byte.is_ascii_lowercase(),
+                    HostThunk::Ispunct => {
+                        (0x21..=0x2F).contains(&value)
+                            || (0x3A..=0x40).contains(&value)
+                            || (0x5B..=0x60).contains(&value)
+                            || (0x7B..=0x7E).contains(&value)
+                    }
+                    HostThunk::Isprint => (0x20..=0x7E).contains(&value),
+                    HostThunk::Isgraph => (0x21..=0x7E).contains(&value),
+                    HostThunk::Iscntrl => (0x00..0x20).contains(&value) || value == 0x7F,
+                    _ => false,
+                } && (0..=0x7F).contains(&value);
+                state.set(Register::Rax, u64::from(is));
+                self.last_error = 0;
+            }
+            HostThunk::Tolower | HostThunk::Toupper => {
+                let value = guest_call_arg(state, memory, 0)? as i32;
+                let mapped = if matches!(thunk, HostThunk::Tolower) {
+                    if (value as u8).is_ascii_uppercase() {
+                        value + 0x20
+                    } else {
+                        value
+                    }
+                } else if (value as u8).is_ascii_lowercase() {
+                    value - 0x20
+                } else {
+                    value
+                };
+                state.set(Register::Rax, mapped as u64);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: conversions ────────────────────────────────────────
+            HostThunk::Atoi | HostThunk::Atol => {
+                let ptr = guest_call_arg(state, memory, 0)?;
+                let bytes = read_c_string(memory, ptr)?;
+                let value = crt_parse_strtol(&bytes, 10, None);
+                state.set(Register::Rax, value as i32 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Atof => {
+                let ptr = guest_call_arg(state, memory, 0)?;
+                let bytes = read_c_string(memory, ptr)?;
+                let value = crt_parse_strtod(&bytes);
+                // x86 cdecl returns doubles in ST(0) (the emulated x87 stack).
+                state.x87.stack.push(value);
+                state.set(Register::Rax, value.to_bits());
+                self.last_error = 0;
+            }
+            HostThunk::Strtol | HostThunk::Strtoul => {
+                let ptr = guest_call_arg(state, memory, 0)?;
+                let end_ptr = guest_call_arg(state, memory, 1)?;
+                let base = guest_call_arg(state, memory, 2)? as i32;
+                let signed = matches!(thunk, HostThunk::Strtol);
+                let bytes = read_c_string(memory, ptr)?;
+                let (value, consumed, overflow) = crt_parse_strtol_full(&bytes, base);
+                if end_ptr != 0 {
+                    write_guest_pointer(memory, end_ptr, ptr + consumed as u64, self.guest_arch)?;
+                }
+                if overflow {
+                    self.set_crt_errno(memory, ERANGE);
+                }
+                let value = if signed {
+                    if overflow {
+                        if bytes[..consumed].trim_start().starts_with('-') {
+                            i32::MIN as i64
+                        } else {
+                            i32::MAX as i64
+                        }
+                    } else {
+                        value
+                    }
+                } else if overflow {
+                    if bytes[..consumed].trim_start().starts_with('-') {
+                        0
+                    } else {
+                        u32::MAX as i64
+                    }
+                } else {
+                    value
+                };
+                state.set(Register::Rax, value as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Strtoi64 | HostThunk::Strtoi64S | HostThunk::Strtoui64 | HostThunk::Strtoui64S => {
+                // __int64 _strtoi64(str, endptr, base) — 64-bit result (EAX:EDX
+                // on x86); errno_t _strtoi64_s(str, endptr, base, __int64* value).
+                let secure = matches!(thunk, HostThunk::Strtoi64S | HostThunk::Strtoui64S);
+                let ptr = guest_call_arg(state, memory, 0)?;
+                let end_ptr = guest_call_arg(state, memory, 1)?;
+                let base = guest_call_arg(state, memory, 2)? as i32;
+                let value_ptr = if secure { guest_call_arg(state, memory, 3)? } else { 0 };
+                let signed = matches!(thunk, HostThunk::Strtoi64 | HostThunk::Strtoi64S);
+                let bytes = read_c_string(memory, ptr)?;
+                let (value, consumed, overflow) = crt_parse_strtoll_full(&bytes, base);
+                if end_ptr != 0 {
+                    write_guest_pointer(memory, end_ptr, ptr + consumed as u64, self.guest_arch)?;
+                }
+                if overflow {
+                    self.set_crt_errno(memory, ERANGE);
+                }
+                let negative = bytes[..consumed].trim_start().starts_with('-');
+                let value = if signed {
+                    if overflow {
+                        if negative {
+                            i64::MIN
+                        } else {
+                            i64::MAX
+                        }
+                    } else {
+                        value
+                    }
+                } else if overflow {
+                    if negative {
+                        0
+                    } else {
+                        u64::MAX as i64
+                    }
+                } else {
+                    value
+                };
+                if secure {
+                    // _s variant: write the clamped 64-bit value through the
+                    // out-param and return errno_t (0 on success, ERANGE on
+                    // overflow).
+                    if value_ptr != 0 {
+                        write_u64(memory, value_ptr, value as u64);
+                    }
+                    state.set(Register::Rax, if overflow { ERANGE as u64 } else { 0 });
+                } else {
+                    // Plain variant: 64-bit value returned in EAX:EDX (x86).
+                    state.set(Register::Rax, value as u32 as u64);
+                    if self.guest_arch == GuestArch::X86 {
+                        state.set(Register::Rdx, ((value as u64) >> 32) as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Abs | HostThunk::Labs => {
+                let value = guest_call_arg(state, memory, 0)? as i32;
+                state.set(Register::Rax, value.unsigned_abs() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Div | HostThunk::Ldiv => {
+                // div_t { int quot; int rem; } — x86 returns quot in EAX and
+                // rem in EDX; x64 packs both into RAX.
+                let numerator = guest_call_arg(state, memory, 0)? as i32;
+                let denominator = guest_call_arg(state, memory, 1)? as i32;
+                if denominator == 0 {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, 0);
+                    state.set(Register::Rdx, 0);
+                } else {
+                    let quot = numerator.wrapping_div(denominator);
+                    let rem = numerator.wrapping_rem(denominator);
+                    state.set(Register::Rax, quot as u32 as u64);
+                    if self.guest_arch == GuestArch::X86 {
+                        state.set(Register::Rdx, rem as u32 as u64);
+                    } else {
+                        state.set(
+                            Register::Rax,
+                            (quot as u32 as u64) | ((rem as u32 as u64) << 32),
+                        );
+                    }
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: qsort / bsearch ────────────────────────────────────
+            HostThunk::Qsort => {
+                let base = guest_call_arg(state, memory, 0)?;
+                let count = guest_call_arg(state, memory, 1)? as usize;
+                let size = guest_call_arg(state, memory, 2)? as usize;
+                let compare = guest_call_arg(state, memory, 3)?;
+                if size > CRT_QSORT_MAX_ELEMENT_SIZE || count > CRT_QSORT_MAX_COUNT {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    self.crt_qsort_impl(state, memory, base, count, size, compare)?;
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::Bsearch => {
+                // void* bsearch(const void* key, const void* base, size_t num,
+                //               size_t size, int (__cdecl *compare)(...))
+                let key = guest_call_arg(state, memory, 0)?;
+                let base = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let size = guest_call_arg(state, memory, 3)? as usize;
+                let compare = guest_call_arg(state, memory, 4)?;
+                let mut low = 0_usize;
+                let mut high = count;
+                let mut found = 0_u64;
+                if size > CRT_QSORT_MAX_ELEMENT_SIZE {
+                    self.set_crt_errno(memory, EINVAL);
+                } else {
+                    while low < high {
+                        let mid = low + (high - low) / 2;
+                        let mid_ptr = base.wrapping_add((mid as u64).wrapping_mul(size as u64));
+                        let result = self.execute_guest_callback(
+                            state,
+                            memory,
+                            compare,
+                            &[key, mid_ptr],
+                            "bsearch_compare",
+                        )? as i32;
+                        if result == 0 {
+                            found = mid_ptr;
+                            break;
+                        } else if result < 0 {
+                            high = mid;
+                        } else {
+                            low = mid + 1;
+                        }
+                    }
+                }
+                state.set(Register::Rax, found);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: directory / access / chmod ─────────────────────────
+            HostThunk::Getcwd | HostThunk::Wgetcwd => {
+                let wide = matches!(thunk, HostThunk::Wgetcwd);
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let cwd = self.current_directory.clone();
+                if buffer == 0 {
+                    // NULL buffer → malloc'd result.
+                    let allocated = if wide {
+                        self.alloc_utf16_string(memory, &cwd)?
+                    } else {
+                        self.alloc_c_string(memory, &cwd)?
+                    };
+                    state.set(Register::Rax, allocated);
+                } else {
+                    let required = if wide {
+                        cwd.encode_utf16().count() + 1
+                    } else {
+                        cwd.len() + 1
+                    };
+                    if size < required {
+                        self.set_crt_errno(memory, ERANGE);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        if wide {
+                            let bytes = cwd
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(buffer, &bytes);
+                        } else {
+                            memory.map_bytes(buffer, cwd.as_bytes());
+                            memory.write_u8(buffer + cwd.len() as u64, 0);
+                        }
+                        state.set(Register::Rax, buffer);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Chdir | HostThunk::Wchdir => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let path = if matches!(thunk, HostThunk::Wchdir) {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let resolved = resolve_guest_path(&self.current_directory, &path);
+                match self.win32.get_file_attributes_w(&resolved) {
+                    Ok(attributes) if attributes.iter().any(|a| a == "directory") => {
+                        self.current_directory = resolved;
+                        state.set(Register::Rax, 0);
+                    }
+                    _ => {
+                        self.set_crt_errno(memory, ENOENT);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Access | HostThunk::Waccess => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let mode = guest_call_arg(state, memory, 1)? as i32;
+                let path = if matches!(thunk, HostThunk::Waccess) {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let resolved = resolve_guest_path(&self.current_directory, &path);
+                if !matches!(mode, ACCESS_EXISTS | ACCESS_WRITE | ACCESS_READ | ACCESS_READ_WRITE) {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, -1_i64 as u64);
+                } else {
+                    match self.win32.get_file_attributes_w(&resolved) {
+                        Ok(attributes) => {
+                            let read_only = attributes.iter().any(|a| a == "readonly");
+                            let writable = !read_only;
+                            let exists_ok = mode == ACCESS_EXISTS || mode == ACCESS_READ;
+                            if exists_ok || (writable && (mode & ACCESS_WRITE != 0)) {
+                                state.set(Register::Rax, 0);
+                            } else {
+                                self.set_crt_errno(memory, EACCES);
+                                state.set(Register::Rax, -1_i64 as u64);
+                            }
+                        }
+                        Err(_) => {
+                            self.set_crt_errno(memory, ENOENT);
+                            state.set(Register::Rax, -1_i64 as u64);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Chmod | HostThunk::Wchmod => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let mode = guest_call_arg(state, memory, 1)? as u32;
+                let path = if matches!(thunk, HostThunk::Wchmod) {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let resolved = resolve_guest_path(&self.current_directory, &path);
+                if mode & !(S_IREAD | S_IWRITE) != 0 {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, -1_i64 as u64);
+                } else {
+                    let current = self
+                        .win32
+                        .get_file_attributes_w(&resolved)
+                        .unwrap_or_default();
+                    let mut attributes = current;
+                    attributes.retain(|attribute| attribute != "readonly");
+                    if mode & S_IWRITE == 0 {
+                        attributes.push("readonly".to_string());
+                    }
+                    let attribute_refs = attributes.iter().map(String::as_str).collect::<Vec<_>>();
+                    match self.win32.set_file_attributes_w(&resolved, &attribute_refs) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 0);
+                        }
+                        Err(_) => {
+                            self.set_crt_errno(memory, ENOENT);
+                            state.set(Register::Rax, -1_i64 as u64);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: stat family ────────────────────────────────────────
+            HostThunk::Stat | HostThunk::Wstat | HostThunk::Stat64 | HostThunk::Wstat64 => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let stat_ptr = guest_call_arg(state, memory, 1)?;
+                let wide = matches!(thunk, HostThunk::Wstat | HostThunk::Wstat64);
+                let wide64 = matches!(thunk, HostThunk::Stat64 | HostThunk::Wstat64);
+                let path = if wide {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let resolved = resolve_guest_path(&self.current_directory, &path);
+                match crt_stat_info(self, &resolved) {
+                    Ok(info) => {
+                        if stat_ptr != 0 {
+                            crt_write_stat(memory, stat_ptr, &info, wide64);
+                        }
+                        state.set(Register::Rax, 0);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, ENOENT);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fstat | HostThunk::Fstat64 => {
+                let fd = guest_call_arg(state, memory, 0)? as i32;
+                let stat_ptr = guest_call_arg(state, memory, 1)?;
+                let wide64 = matches!(thunk, HostThunk::Fstat64);
+                let mut found = None;
+                for state in self.crt_files.values() {
+                    if state.handle as i32 == fd {
+                        found = Some(state.clone());
+                        break;
+                    }
+                }
+                let Some(file_state) = found else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if file_state.path.is_empty() {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                match crt_stat_info(self, &file_state.path) {
+                    Ok(info) => {
+                        if stat_ptr != 0 {
+                            crt_write_stat(memory, stat_ptr, &info, wide64);
+                        }
+                        state.set(Register::Rax, 0);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, ENOENT);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: environment ────────────────────────────────────────
+            HostThunk::Getenv | HostThunk::Wgetenv => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let wide = matches!(thunk, HostThunk::Wgetenv);
+                let name = if wide {
+                    read_utf16_string(memory, name_ptr)?
+                } else {
+                    read_c_string(memory, name_ptr)?
+                };
+                let value = self
+                    .process_environment
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                    .map(|(_, value)| value.clone());
+                let result = match value {
+                    Some(value) => {
+                        if wide {
+                            self.alloc_utf16_string(memory, &value)?
+                        } else {
+                            self.alloc_c_string(memory, &value)?
+                        }
+                    }
+                    None => 0,
+                };
+                state.set(Register::Rax, result);
+                self.last_error = 0;
+            }
+            HostThunk::DupenvS | HostThunk::WdupenvS => {
+                // errno_t _dupenv_s(char** pBuffer, size_t* pSize, const char* name)
+                let buffer_ptr = guest_call_arg(state, memory, 0)?;
+                let size_ptr = guest_call_arg(state, memory, 1)?;
+                let name_ptr = guest_call_arg(state, memory, 2)?;
+                let wide = matches!(thunk, HostThunk::WdupenvS);
+                if buffer_ptr == 0 || size_ptr == 0 || name_ptr == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let name = if wide {
+                        read_utf16_string(memory, name_ptr)?
+                    } else {
+                        read_c_string(memory, name_ptr)?
+                    };
+                    let value = self
+                        .process_environment
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                        .map(|(_, value)| value.clone());
+                    match value {
+                        Some(value) => {
+                            let allocation = if wide {
+                                self.alloc_utf16_string(memory, &value)?
+                            } else {
+                                self.alloc_c_string(memory, &value)?
+                            };
+                            write_guest_pointer(memory, buffer_ptr, allocation, self.guest_arch)?;
+                            let length = if wide {
+                                (value.encode_utf16().count() + 1) as u64
+                            } else {
+                                (value.len() + 1) as u64
+                            };
+                            write_guest_pointer(memory, size_ptr, length, self.guest_arch)?;
+                            state.set(Register::Rax, 0);
+                        }
+                        None => {
+                            write_guest_pointer(memory, buffer_ptr, 0, self.guest_arch)?;
+                            write_guest_pointer(memory, size_ptr, 0, self.guest_arch)?;
+                            state.set(Register::Rax, 0);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Putenv | HostThunk::Wputenv => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let wide = matches!(thunk, HostThunk::Wputenv);
+                let string = if wide {
+                    read_utf16_string(memory, string_ptr)?
+                } else {
+                    read_c_string(memory, string_ptr)?
+                };
+                if let Some((name, value)) = string.split_once('=') {
+                    self.process_environment
+                        .insert(name.to_string(), value.to_string());
+                } else {
+                    self.process_environment
+                        .retain(|key, _| !key.eq_ignore_ascii_case(&string));
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: splitpath / makepath ───────────────────────────────
+            HostThunk::Splitpath | HostThunk::Wsplitpath => {
+                let wide = matches!(thunk, HostThunk::Wsplitpath);
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let drive_ptr = guest_call_arg(state, memory, 1)?;
+                let dir_ptr = guest_call_arg(state, memory, 2)?;
+                let name_ptr = guest_call_arg(state, memory, 3)?;
+                let ext_ptr = guest_call_arg(state, memory, 4)?;
+                let path = if wide {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let (drive, dir, name, ext) = crt_split_path(&path);
+                if wide {
+                    write_guest_wide_str(memory, drive_ptr, &drive);
+                    write_guest_wide_str(memory, dir_ptr, &dir);
+                    write_guest_wide_str(memory, name_ptr, &name);
+                    write_guest_wide_str(memory, ext_ptr, &ext);
+                } else {
+                    write_guest_c_str(memory, drive_ptr, &drive);
+                    write_guest_c_str(memory, dir_ptr, &dir);
+                    write_guest_c_str(memory, name_ptr, &name);
+                    write_guest_c_str(memory, ext_ptr, &ext);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::SplitpathS | HostThunk::WsplitpathS => {
+                // errno_t _splitpath_s(path, drive, driveSize, dir, dirSize,
+                //                      name, nameSize, ext, extSize)
+                let wide = matches!(thunk, HostThunk::WsplitpathS);
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let drive_ptr = guest_call_arg(state, memory, 1)?;
+                let drive_size = guest_call_arg(state, memory, 2)? as usize;
+                let dir_ptr = guest_call_arg(state, memory, 3)?;
+                let dir_size = guest_call_arg(state, memory, 4)? as usize;
+                let name_ptr = guest_call_arg(state, memory, 5)?;
+                let name_size = guest_call_arg(state, memory, 6)? as usize;
+                let ext_ptr = guest_call_arg(state, memory, 7)?;
+                let ext_size = guest_call_arg(state, memory, 8)? as usize;
+                let path = if wide {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let (drive, dir, name, ext) = crt_split_path(&path);
+                let mut status = 0_u64;
+                let write_part = |memory: &mut MemoryImage,
+                                      buffer: u64,
+                                      capacity: usize,
+                                      value: &str,
+                                      status: &mut u64| {
+                    if buffer == 0 || capacity == 0 {
+                        *status = ERANGE as u64;
+                        return;
+                    }
+                    let required = if wide {
+                        value.encode_utf16().count() + 1
+                    } else {
+                        value.len() + 1
+                    };
+                    if required > capacity {
+                        *status = ERANGE as u64;
+                        return;
+                    }
+                    if wide {
+                        write_guest_wide_str(memory, buffer, value);
+                    } else {
+                        write_guest_c_str(memory, buffer, value);
+                    }
+                };
+                write_part(memory, drive_ptr, drive_size, &drive, &mut status);
+                write_part(memory, dir_ptr, dir_size, &dir, &mut status);
+                write_part(memory, name_ptr, name_size, &name, &mut status);
+                write_part(memory, ext_ptr, ext_size, &ext, &mut status);
+                if status != 0
+                    && let Some(code) = self.crt_invalid_parameter(state, memory, status as i32)?
+                {
+                    return Ok(Some(code));
+                }
+                state.set(Register::Rax, status);
+                self.last_error = 0;
+            }
+            HostThunk::Makepath | HostThunk::Wmakepath => {
+                let wide = matches!(thunk, HostThunk::Wmakepath);
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let drive_ptr = guest_call_arg(state, memory, 1)?;
+                let dir_ptr = guest_call_arg(state, memory, 2)?;
+                let name_ptr = guest_call_arg(state, memory, 3)?;
+                let ext_ptr = guest_call_arg(state, memory, 4)?;
+                let read_part = |memory: &MemoryImage, ptr: u64| -> String {
+                    if ptr == 0 {
+                        return String::new();
+                    }
+                    if wide {
+                        read_utf16_string(memory, ptr).unwrap_or_default()
+                    } else {
+                        read_c_string(memory, ptr).unwrap_or_default()
+                    }
+                };
+                let drive = read_part(memory, drive_ptr);
+                let dir = read_part(memory, dir_ptr);
+                let name = read_part(memory, name_ptr);
+                let ext = read_part(memory, ext_ptr);
+                let assembled = crt_make_path(&drive, &dir, &name, &ext);
+                if wide {
+                    write_guest_wide_str(memory, path_ptr, &assembled);
+                } else {
+                    write_guest_c_str(memory, path_ptr, &assembled);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MakepathS | HostThunk::WmakepathS => {
+                // errno_t _makepath_s(char* path, size_t size, drive, dir, name, ext)
+                let wide = matches!(thunk, HostThunk::WmakepathS);
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let drive_ptr = guest_call_arg(state, memory, 2)?;
+                let dir_ptr = guest_call_arg(state, memory, 3)?;
+                let name_ptr = guest_call_arg(state, memory, 4)?;
+                let ext_ptr = guest_call_arg(state, memory, 5)?;
+                let read_part = |memory: &MemoryImage, ptr: u64| -> String {
+                    if ptr == 0 {
+                        return String::new();
+                    }
+                    if wide {
+                        read_utf16_string(memory, ptr).unwrap_or_default()
+                    } else {
+                        read_c_string(memory, ptr).unwrap_or_default()
+                    }
+                };
+                let drive = read_part(memory, drive_ptr);
+                let dir = read_part(memory, dir_ptr);
+                let name = read_part(memory, name_ptr);
+                let ext = read_part(memory, ext_ptr);
+                let assembled = crt_make_path(&drive, &dir, &name, &ext);
+                let required = if wide {
+                    assembled.encode_utf16().count() + 1
+                } else {
+                    assembled.len() + 1
+                };
+                if path_ptr == 0 || size < required {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    if wide {
+                        write_guest_wide_str(memory, path_ptr, &assembled);
+                    } else {
+                        write_guest_c_str(memory, path_ptr, &assembled);
+                    }
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            // ── Patch 6b: rand / time / clock ────────────────────────────────
+            HostThunk::Rand => {
+                self.crt_rand_state = self
+                    .crt_rand_state
+                    .wrapping_mul(214_013)
+                    .wrapping_add(2_531_011);
+                state.set(Register::Rax, u64::from((self.crt_rand_state >> 16) & 0x7FFF));
+                self.last_error = 0;
+            }
+            HostThunk::Srand => {
+                self.crt_rand_state = guest_call_arg(state, memory, 0)? as u32;
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::Clock => {
+                let elapsed = self.crt_start_instant.elapsed().as_millis() as i64;
+                state.set(Register::Rax, (elapsed as i32) as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Time | HostThunk::Time64 => {
+                let timer_ptr = guest_call_arg(state, memory, 0)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or(-1);
+                if timer_ptr != 0 {
+                    if matches!(thunk, HostThunk::Time64) {
+                        write_u64(memory, timer_ptr, now as u64);
+                    } else {
+                        write_u32(memory, timer_ptr, now as u32);
+                    }
+                }
+                state.set(Register::Rax, now as u64);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: CRT threads ────────────────────────────────────────
+            HostThunk::Beginthreadex => {
+                // uintptr_t _beginthreadex(void* security, unsigned stackSize,
+                //     unsigned (__stdcall *start)(void*), void* arg,
+                //     unsigned initflag, unsigned* thrdaddr)
+                let security_attributes_ptr = guest_call_arg(state, memory, 0)?;
+                let stack_size = guest_call_arg(state, memory, 1)?;
+                let start_address = guest_call_arg(state, memory, 2)?;
+                let parameter = guest_call_arg(state, memory, 3)?;
+                let creation_flags = guest_call_arg_u32(state, memory, 4)?;
+                let thread_id_ptr = guest_call_arg(state, memory, 5)?;
+                let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
+                let inheritable = if security_attributes_ptr == 0 {
+                    false
+                } else {
+                    read_u32(memory, security_attributes_ptr + inherit_offset)? != 0
+                };
+                let can_queue_guest_thread = self.guest_arch == GuestArch::X86
+                    && creation_flags & CREATE_SUSPENDED == 0
+                    && start_address != 0;
+                let thread_handle = self.win32.create_thread(
+                    crate::win32::ThreadPlan {
+                        exit_code: None,
+                        priority: 0,
+                        signaled: false,
+                    },
+                    inheritable,
+                );
+                let thread_id = self.win32.thread_id_for_handle(thread_handle)?;
+                if thread_id_ptr != 0 {
+                    write_u32(memory, thread_id_ptr, thread_id);
+                }
+                if can_queue_guest_thread {
+                    let pending_thread = self.prepare_guest_thread_entry(
+                        memory,
+                        thread_handle,
+                        stack_size,
+                        start_address,
+                        parameter,
+                    )?;
+                    self.pending_guest_threads.push_back(pending_thread);
+                }
+                state.set(Register::Rax, u64::from(thread_handle));
+                self.last_error = 0;
+            }
+            HostThunk::Endthreadex => {
+                let code = guest_call_arg(state, memory, 0)? as u32;
+                let handle = self.win32.current_thread_handle();
+                let _ = self.win32.exit_thread(handle, code);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::Beginthread => {
+                // uintptr_t _beginthread(void (__cdecl *start)(void*), unsigned stackSize,
+                //                         void* arg)
+                let start_address = guest_call_arg(state, memory, 0)?;
+                let stack_size = guest_call_arg(state, memory, 1)?;
+                let parameter = guest_call_arg(state, memory, 2)?;
+                let thread_handle = self.win32.create_thread(
+                    crate::win32::ThreadPlan {
+                        exit_code: None,
+                        priority: 0,
+                        signaled: false,
+                    },
+                    false,
+                );
+                if self.guest_arch == GuestArch::X86 && start_address != 0 {
+                    let pending_thread = self.prepare_guest_thread_entry(
+                        memory,
+                        thread_handle,
+                        stack_size,
+                        start_address,
+                        parameter,
+                    )?;
+                    self.pending_guest_threads.push_back(pending_thread);
+                }
+                state.set(Register::Rax, u64::from(thread_handle));
+                self.last_error = 0;
+            }
+            HostThunk::Endthread => {
+                let handle = self.win32.current_thread_handle();
+                let _ = self.win32.exit_thread(handle, 0);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: FILE* model ────────────────────────────────────────
+            HostThunk::Fopen | HostThunk::Wfopen | HostThunk::Fsopen => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let mode_ptr = guest_call_arg(state, memory, 1)?;
+                let wide = matches!(thunk, HostThunk::Wfopen);
+                let path = if wide {
+                    read_utf16_string(memory, path_ptr)?
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let mode = read_c_string(memory, mode_ptr)?;
+                match self.crt_fopen_impl(memory, &path, &mode)? {
+                    Some(file_ptr) => {
+                        state.set(Register::Rax, file_ptr);
+                    }
+                    None => {
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::FopenS | HostThunk::WfopenS => {
+                // errno_t fopen_s(FILE** pFile, const char* path, const char* mode)
+                let file_ptr_ptr = guest_call_arg(state, memory, 0)?;
+                let path_ptr = guest_call_arg(state, memory, 1)?;
+                let mode_ptr = guest_call_arg(state, memory, 2)?;
+                let wide = matches!(thunk, HostThunk::WfopenS);
+                if file_ptr_ptr == 0 || path_ptr == 0 || mode_ptr == 0 {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    if file_ptr_ptr != 0 {
+                        write_guest_pointer(memory, file_ptr_ptr, 0, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                } else {
+                    let path = if wide {
+                        read_utf16_string(memory, path_ptr)?
+                    } else {
+                        read_c_string(memory, path_ptr)?
+                    };
+                    let mode = read_c_string(memory, mode_ptr)?;
+                    match self.crt_fopen_impl(memory, &path, &mode)? {
+                        Some(file_ptr) => {
+                            write_guest_pointer(memory, file_ptr_ptr, file_ptr, self.guest_arch)?;
+                            state.set(Register::Rax, 0);
+                        }
+                        None => {
+                            write_guest_pointer(memory, file_ptr_ptr, 0, self.guest_arch)?;
+                            state.set(Register::Rax, self.crt_errno_get(memory) as u64);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Freopen => {
+                // FILE* freopen(const char* path, const char* mode, FILE* stream)
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let mode_ptr = guest_call_arg(state, memory, 1)?;
+                let stream = guest_call_arg(state, memory, 2)?;
+                if path_ptr == 0 {
+                    // freopen(NULL, ...) flushes and returns the stream.
+                    state.set(Register::Rax, stream);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let path = read_c_string(memory, path_ptr)?;
+                let mode = read_c_string(memory, mode_ptr)?;
+                let _ = self.crt_close_stream(stream);
+                match self.crt_fopen_impl(memory, &path, &mode)? {
+                    Some(file_ptr) => {
+                        state.set(Register::Rax, file_ptr);
+                    }
+                    None => {
+                        state.set(Register::Rax, 0);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fdopen => {
+                // FILE* _fdopen(int fd, const char* mode)
+                let fd = guest_call_arg(state, memory, 0)? as i32;
+                let mode_ptr = guest_call_arg(state, memory, 1)?;
+                let mode = read_c_string(memory, mode_ptr)?;
+                let Some((readable, writable, append, update, _)) =
+                    Self::crt_parse_fopen_mode(&mode)
+                else {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if fd < 0 {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let file_state = CrtFileState {
+                    handle: fd as u32,
+                    path: String::new(),
+                    readable,
+                    writable,
+                    append,
+                    update,
+                };
+                let file_ptr = self.crt_alloc_file(memory, &file_state)?;
+                state.set(Register::Rax, file_ptr);
+                self.last_error = 0;
+            }
+            HostThunk::Fclose => {
+                let stream = guest_call_arg(state, memory, 0)?;
+                if self.crt_iob_index(stream).is_some() || self.crt_close_stream(stream)? {
+                    state.set(Register::Rax, 0);
+                } else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, EOF as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fflush => {
+                let stream = guest_call_arg(state, memory, 0)?;
+                if stream == 0 || self.crt_iob_index(stream).is_some() {
+                    state.set(Register::Rax, 0);
+                } else if let Some(file_state) = self.crt_stream_state(stream) {
+                    match self.win32.flush_file_buffers(file_state.handle) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 0);
+                        }
+                        Err(_) => {
+                            self.set_crt_errno(memory, EIO);
+                            state.set(Register::Rax, EOF as u64);
+                        }
+                    }
+                } else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, EOF as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fread | HostThunk::FreadS => {
+                // size_t fread(void* buffer, size_t size, size_t count, FILE* stream)
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)?;
+                let stream = guest_call_arg(state, memory, 3)?;
+                let items = self.crt_fread_impl(memory, buffer, size, count, stream)?;
+                state.set(Register::Rax, items);
+                self.last_error = 0;
+            }
+            HostThunk::FwriteS => {
+                // fwrite_s mirrors fwrite with overflow-checked size*count.
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)?;
+                let count = guest_call_arg(state, memory, 2)?;
+                let stream = guest_call_arg(state, memory, 3)?;
+                if size.checked_mul(count).is_none() {
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    let items = self.crt_fwrite_impl(memory, buffer, size, count, stream)?;
+                    state.set(Register::Rax, items);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fgets => {
+                // char* fgets(char* buffer, int maxCount, FILE* stream)
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let max_count = guest_call_arg(state, memory, 1)? as usize;
+                let stream = guest_call_arg(state, memory, 2)?;
+                if buffer == 0 || max_count == 0 {
+                    self.set_crt_errno(memory, EINVAL);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                if max_count == 1 {
+                    memory.write_u8(buffer, 0);
+                    state.set(Register::Rax, buffer);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                if let Some(index) = self.crt_iob_index(stream) {
+                    let _ = index;
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(file_state) = self.crt_stream_state(stream) else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if !file_state.readable {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // Read byte-by-byte so the stream position stops exactly at
+                // the newline (or the count limit / EOF), matching fgets.
+                let limit = max_count.saturating_sub(1);
+                let mut collected = Vec::new();
+                while collected.len() < limit {
+                    match self.win32.read_file(file_state.handle, 1) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            collected.push(bytes[0]);
+                            if bytes[0] == b'\n' {
+                                break;
+                            }
+                        }
+                        _ => break, // EOF or read error
+                    }
+                }
+                if collected.is_empty() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                memory.map_bytes(buffer, &collected);
+                memory.write_u8(buffer + collected.len() as u64, 0);
+                state.set(Register::Rax, buffer);
+                self.last_error = 0;
+            }
+            HostThunk::Fputs => {
+                // int fputs(const char* str, FILE* stream)
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let stream = guest_call_arg(state, memory, 1)?;
+                let bytes = read_c_string_limit(memory, string_ptr, usize::MAX)?;
+                let items = self.crt_fwrite_impl(memory, string_ptr, 1, bytes.len() as u64, stream)?;
+                state.set(Register::Rax, if items == bytes.len() as u64 { 0 } else { EOF as u64 });
+                self.last_error = 0;
+            }
+            HostThunk::Fgetc => {
+                // int fgetc(FILE* stream) — 0xFF..0x7F returned as-is, EOF (-1)
+                // on end-of-file.
+                let stream = guest_call_arg(state, memory, 0)?;
+                if self.crt_iob_index(stream).is_some() {
+                    state.set(Register::Rax, EOF as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(file_state) = self.crt_stream_state(stream) else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, EOF as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                match self.win32.read_file(file_state.handle, 1) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        state.set(Register::Rax, u64::from(bytes[0]));
+                    }
+                    _ => {
+                        state.set(Register::Rax, EOF as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fputc => {
+                // int fputc(int ch, FILE* stream)
+                let ch = guest_call_arg(state, memory, 0)? as u8;
+                let stream = guest_call_arg(state, memory, 1)?;
+                let ch_address = self.alloc_u32(memory, 0)?;
+                memory.write_u8(ch_address, ch);
+                let items = self.crt_fwrite_impl(memory, ch_address, 1, 1, stream)?;
+                state.set(Register::Rax, if items == 1 { u64::from(ch) } else { EOF as u64 });
+                self.last_error = 0;
+            }
+            HostThunk::Fseek => {
+                // int fseek(FILE* stream, long offset, int origin)
+                let stream = guest_call_arg(state, memory, 0)?;
+                let offset = guest_call_arg(state, memory, 1)? as i64;
+                let origin = guest_call_arg(state, memory, 2)? as i32;
+                if self.crt_iob_index(stream).is_some() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(file_state) = self.crt_stream_state(stream) else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let origin = match origin {
+                    SEEK_SET => crate::win32::SeekOrigin::Begin,
+                    SEEK_CUR => crate::win32::SeekOrigin::Current,
+                    SEEK_END => crate::win32::SeekOrigin::End,
+                    _ => {
+                        self.set_crt_errno(memory, EINVAL);
+                        state.set(Register::Rax, -1_i64 as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                match self.win32.set_file_pointer_ex(file_state.handle, offset, origin) {
+                    Ok(_) => {
+                        state.set(Register::Rax, 0);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, EINVAL);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Ftell => {
+                let stream = guest_call_arg(state, memory, 0)?;
+                if self.crt_iob_index(stream).is_some() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(file_state) = self.crt_stream_state(stream) else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                match self.win32.set_file_pointer_ex(file_state.handle, 0, crate::win32::SeekOrigin::Current) {
+                    Ok(position) => {
+                        state.set(Register::Rax, position);
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, EIO);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Fcloseall => {
+                let streams = self.crt_files.keys().copied().collect::<Vec<_>>();
+                let mut closed = 0_u64;
+                for stream in streams {
+                    if self.crt_close_stream(stream)? {
+                        closed += 1;
+                    }
+                }
+                state.set(Register::Rax, closed);
+                self.last_error = 0;
+            }
+            HostThunk::Flushall => {
+                let streams = self.crt_files.keys().copied().collect::<Vec<_>>();
+                let mut flushed = 0_u64;
+                for stream in streams {
+                    if let Some(file_state) = self.crt_stream_state(stream)
+                        && self.win32.flush_file_buffers(file_state.handle).is_ok()
+                    {
+                        flushed += 1;
+                    }
+                }
+                state.set(Register::Rax, flushed);
+                self.last_error = 0;
+            }
+            // ── Patch 6b: fd helpers ─────────────────────────────────────────
+            HostThunk::Lock | HostThunk::Unlock => {
+                // _lock/_unlock are no-ops in this model (no internal locking).
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::Fileno => {
+                // int _fileno(FILE* stream)
+                let stream = guest_call_arg(state, memory, 0)?;
+                let fd = if let Some(index) = self.crt_iob_index(stream) {
+                    index as i32
+                } else {
+                    match self.crt_stream_handle(stream) {
+                        Some(handle) => handle as i32,
+                        None => {
+                            self.set_crt_errno(memory, EBADF);
+                            state.set(Register::Rax, -1_i64 as u64);
+                            self.last_error = 0;
+                            return Ok(None);
+                        }
+                    }
+                };
+                state.set(Register::Rax, fd as u64);
+                self.last_error = 0;
+            }
+            HostThunk::Filelength | HostThunk::Filelengthi64 => {
+                // long _filelength(int fd) / __int64 _filelengthi64(int fd)
+                let fd = guest_call_arg(state, memory, 0)? as i32;
+                let mut found = None;
+                for file_state in self.crt_files.values() {
+                    if file_state.handle as i32 == fd {
+                        found = Some(file_state.clone());
+                        break;
+                    }
+                }
+                let Some(file_state) = found else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                match self.win32.get_file_size_ex(file_state.handle) {
+                    Ok(size) => {
+                        if matches!(thunk, HostThunk::Filelength) {
+                            state.set(Register::Rax, (size as u32) as u64);
+                        } else {
+                            state.set(Register::Rax, size);
+                        }
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, EBADF);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Chsize => {
+                // int _chsize(int fd, long size)
+                let fd = guest_call_arg(state, memory, 0)? as i32;
+                let size = guest_call_arg(state, memory, 1)? as u64;
+                let mut found = None;
+                for file_state in self.crt_files.values() {
+                    if file_state.handle as i32 == fd {
+                        found = Some(file_state.clone());
+                        break;
+                    }
+                }
+                let Some(file_state) = found else {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if file_state.path.is_empty() {
+                    self.set_crt_errno(memory, EBADF);
+                    state.set(Register::Rax, -1_i64 as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                match self.win32.guest_path_to_host_path(&file_state.path) {
+                    Ok(host_path) => {
+                        let result = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&host_path)
+                            .and_then(|file| file.set_len(size));
+                        match result {
+                            Ok(()) => {
+                                state.set(Register::Rax, 0);
+                            }
+                            Err(_) => {
+                                self.set_crt_errno(memory, EACCES);
+                                state.set(Register::Rax, -1_i64 as u64);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.set_crt_errno(memory, EACCES);
+                        state.set(Register::Rax, -1_i64 as u64);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Isatty => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::Commit => {
+                // int _commit(int fd)
+                let fd = guest_call_arg(state, memory, 0)? as i32;
+                let mut flushed = false;
+                for file_state in self.crt_files.values() {
+                    if file_state.handle as i32 == fd
+                        && self.win32.flush_file_buffers(file_state.handle).is_ok()
+                    {
+                        flushed = true;
+                        break;
+                    }
+                }
+                state.set(Register::Rax, if flushed { 0 } else { -1_i64 as u64 });
                 self.last_error = 0;
             }
             // -- usp10.dll Uniscribe (P0.3) --------------------------------------------
@@ -47787,6 +50042,14 @@ impl PeHostRuntime {
             memory.map_bytes(static_tls_block, &static_tls_bytes);
             thread_tls_slots.insert(0, static_tls_block);
         }
+        // Patch 6b: each guest thread gets its own zeroed errno/doserrno int
+        // in the reserved CRT TLS slots (per-thread errno semantics).
+        for slot in [self.crt_errno_slot, self.crt_doserrno_slot] {
+            if slot != 0 {
+                let storage = self.alloc_zeroed(memory, 4, 4)?;
+                thread_tls_slots.insert(slot, storage);
+            }
+        }
         let thread_fls_slots = current_fls_slots
             .keys()
             .copied()
@@ -48908,6 +51171,950 @@ impl PeHostRuntime {
                 .tls_vector_ptr
                 .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
             write_guest_pointer(memory, slot_address, value, self.guest_arch)?;
+        }
+        Ok(())
+    }
+
+    // ── Patch 6b: CRT errno / doserrno model ──────────────────────────────────
+    // The errno int lives in guest memory at a stable per-thread address.  For
+    // x86 guests the address is stored in a dedicated TLS vector slot (found
+    // with the same first-free search as `TlsAlloc`, so it never collides with
+    // guest-allocated slots), which `prepare_guest_thread_entry` re-creates
+    // per thread.  For x64 guests (no TLS vector) a single stable allocation is
+    // used.  `_errno`/`_doserrno` return this address; the guest reads and
+    // writes the int through it directly.
+    fn allocate_crt_tls_storage(&mut self, memory: &mut MemoryImage, seed: u32) -> AppResult<u32> {
+        let storage = self.alloc_u32(memory, seed)?;
+        let slot = (1_u32..4096)
+            .find(|candidate| !self.tls_slots.contains_key(candidate))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    "CRT TLS slot space exhausted (4096 slots)",
+                )
+            })?;
+        self.tls_slots.insert(slot, storage);
+        self.sync_guest_tls_slot(memory, slot, storage)?;
+        Ok(slot)
+    }
+
+    fn crt_tls_storage(&self, memory: &MemoryImage, slot: u32) -> AppResult<u64> {
+        if self.tls_vector_ptr != 0 && slot != 0 {
+            let slot_address = self
+                .tls_vector_ptr
+                .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
+            return read_guest_pointer(memory, slot_address, self.guest_arch);
+        }
+        Ok(0)
+    }
+
+    /// Guest pointer to the current thread's errno int (allocating it on first
+    /// use).  Fresh storage is seeded with the host-side mirror so values set
+    /// via `set_crt_errno` before the slot was allocated are not lost.
+    fn crt_errno_ptr(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        if self.crt_errno_slot == 0 {
+            if self.tls_vector_ptr == 0 {
+                if self.crt_errno_storage == 0 {
+                    self.crt_errno_storage =
+                        self.alloc_u32(memory, self.crt_errno_value as u32)?;
+                }
+                return Ok(self.crt_errno_storage);
+            }
+            self.crt_errno_slot = self.allocate_crt_tls_storage(memory, self.crt_errno_value as u32)?;
+        }
+        let ptr = self.crt_tls_storage(memory, self.crt_errno_slot)?;
+        if ptr != 0 {
+            return Ok(ptr);
+        }
+        let storage = self.alloc_u32(memory, self.crt_errno_value as u32)?;
+        self.tls_slots.insert(self.crt_errno_slot, storage);
+        self.sync_guest_tls_slot(memory, self.crt_errno_slot, storage)?;
+        Ok(storage)
+    }
+
+    /// Guest pointer to the current thread's doserrno int (allocating it on
+    /// first use).  Fresh storage is seeded with the host-side mirror.
+    fn crt_doserrno_ptr(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        if self.crt_doserrno_slot == 0 {
+            if self.tls_vector_ptr == 0 {
+                if self.crt_doserrno_storage == 0 {
+                    self.crt_doserrno_storage =
+                        self.alloc_u32(memory, self.crt_doserrno_value as u32)?;
+                }
+                return Ok(self.crt_doserrno_storage);
+            }
+            self.crt_doserrno_slot =
+                self.allocate_crt_tls_storage(memory, self.crt_doserrno_value as u32)?;
+        }
+        let ptr = self.crt_tls_storage(memory, self.crt_doserrno_slot)?;
+        if ptr != 0 {
+            return Ok(ptr);
+        }
+        let storage = self.alloc_u32(memory, self.crt_doserrno_value as u32)?;
+        self.tls_slots.insert(self.crt_doserrno_slot, storage);
+        self.sync_guest_tls_slot(memory, self.crt_doserrno_slot, storage)?;
+        Ok(storage)
+    }
+
+    /// Host-side helper used by failing CRT thunks: records `value` as the
+    /// current thread's errno, both in the guest-visible int (if the TLS
+    /// storage is initialised) and in the host mirror.  CRT functions do NOT
+    /// set GetLastError.
+    fn write_crt_errno_value(&self, memory: &mut MemoryImage, ptr: u64, value: i32) {
+        if ptr != 0 {
+            memory.map_bytes(ptr, &value.to_le_bytes());
+        }
+    }
+
+    fn set_crt_errno(&mut self, memory: &mut MemoryImage, value: i32) {
+        self.crt_errno_value = value;
+        if self.tls_vector_ptr != 0 && self.crt_errno_slot != 0 {
+            let ptr = self
+                .crt_tls_storage(memory, self.crt_errno_slot)
+                .unwrap_or(0);
+            if ptr != 0 {
+                self.write_crt_errno_value(memory, ptr, value);
+                return;
+            }
+        }
+        self.write_crt_errno_value(memory, self.crt_errno_storage, value);
+    }
+
+    /// Host-side helper mirroring `set_crt_errno` for `_doserrno`.
+    fn set_crt_doserrno(&mut self, memory: &mut MemoryImage, value: i32) {
+        self.crt_doserrno_value = value;
+        if self.tls_vector_ptr != 0 && self.crt_doserrno_slot != 0 {
+            let ptr = self
+                .crt_tls_storage(memory, self.crt_doserrno_slot)
+                .unwrap_or(0);
+            if ptr != 0 {
+                self.write_crt_errno_value(memory, ptr, value);
+                return;
+            }
+        }
+        self.write_crt_errno_value(memory, self.crt_doserrno_storage, value);
+    }
+
+    /// Current errno value for the running thread (guest storage wins when
+    /// present — the guest may have written to the `_errno()` int directly).
+    fn crt_errno_get(&mut self, memory: &mut MemoryImage) -> i32 {
+        let mut value = self.crt_errno_value;
+        let ptr = if self.tls_vector_ptr != 0 && self.crt_errno_slot != 0 {
+            self.crt_tls_storage(memory, self.crt_errno_slot).ok()
+        } else if self.crt_errno_storage != 0 {
+            Some(self.crt_errno_storage)
+        } else {
+            None
+        };
+        if let Some(ptr) = ptr
+            && ptr != 0
+            && let Ok(bytes) = memory.read_bytes(ptr, 4)
+        {
+            value = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        self.crt_errno_value = value;
+        value
+    }
+
+    /// Invoke the guest's `_invalid_parameter_handler` (installed via
+    /// `_set_invalid_parameter_handler`) with the standard "noinfo" argument
+    /// list (expression, function, file, line, reserved), then — because the
+    /// Windows CRT terminates after a returning handler — report that the
+    /// guest should be aborted.  With no handler installed the guest is
+    /// aborted immediately (emulating the default Watson/abort behavior).
+    ///
+    /// Returns `true` when the caller must terminate the guest (abort).
+    fn raise_invalid_parameter(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        expression: u64,
+        file: u64,
+        line: u32,
+    ) -> AppResult<bool> {
+        if self.invalid_parameter_handler != 0 {
+            let handler = self.invalid_parameter_handler;
+            let _ = self.execute_guest_callback(
+                state,
+                memory,
+                handler,
+                &[expression, 0, file, u64::from(line), 0],
+                "invalid_parameter_handler",
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Convenience: raise the invalid-parameter handler and set errno; used by
+    /// the `*_s` family when the caller MUST be aborted on return.
+    fn crt_invalid_parameter(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        errno_value: i32,
+    ) -> AppResult<Option<i32>> {
+        self.set_crt_errno(memory, errno_value);
+        if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {
+            state.set(Register::Rax, errno_value as u64);
+            return Ok(Some(134)); // abort()
+        }
+        Ok(None)
+    }
+
+    // ── Patch 6b: CRT FILE* model ─────────────────────────────────────────────
+    /// Allocate a guest FILE block (zeroed 0x80 bytes, mirroring the
+    /// `__acrt_iob_func` blocks) and register host state for it.  The fd is
+    /// written at offset 0x10 (the `_iobuf::_file` field offset on x86) so
+    /// `_fileno` and guest code reading the struct directly agree.
+    fn crt_alloc_file(&mut self, memory: &mut MemoryImage, state: &CrtFileState) -> AppResult<u64> {
+        let file_ptr = self.alloc_zeroed(memory, 0x80, 16)?;
+        memory.map_bytes(file_ptr + 0x10, &state.handle.to_le_bytes());
+        self.crt_files.insert(file_ptr, state.clone());
+        Ok(file_ptr)
+    }
+
+    fn crt_stream_state(&self, stream: u64) -> Option<CrtFileState> {
+        self.crt_files.get(&stream).cloned()
+    }
+
+    /// True when `stream` is one of the standard iob streams (stdin/stdout/
+    /// stderr).  Returns the stream index (0/1/2) when it is.
+    fn crt_iob_index(&self, stream: u64) -> Option<usize> {
+        self.globals
+            .iob_streams
+            .iter()
+            .position(|iob| *iob == stream)
+    }
+
+    /// The win32 handle for a stream, or None for the iob streams / unknown
+    /// streams.
+    fn crt_stream_handle(&self, stream: u64) -> Option<u32> {
+        self.crt_stream_state(stream).map(|state| state.handle)
+    }
+
+    fn crt_close_stream(&mut self, stream: u64) -> AppResult<bool> {
+        if let Some(state) = self.crt_files.remove(&stream) {
+            let _ = self.win32.close_handle(state.handle);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    // ── Patch 6b: printf engine ───────────────────────────────────────────────
+    /// Parse a UCRT `__stdio_common_*` format specification starting at the
+    /// `%` in a wide format string and render one conversion.  `va` is the
+    /// x86-cdecl vararg cursor; `out` receives the rendered bytes.
+    fn crt_render_conversion(
+        &mut self,
+        memory: &MemoryImage,
+        format: &[u16],
+        index: &mut usize,
+        va: &mut CrtVaReader<'_>,
+        out: &mut Vec<u8>,
+        guest_arch: GuestArch,
+    ) -> AppResult<()> {
+        let mut flags_minus = false;
+        let mut flags_plus = false;
+        let mut flags_zero = false;
+        let mut flags_space = false;
+        let mut flags_hash = false;
+        *index += 1;
+        while *index < format.len() {
+            match format[*index] {
+                0x2D => flags_minus = true,
+                0x2B => flags_plus = true,
+                0x30 => flags_zero = true,
+                0x20 => flags_space = true,
+                0x23 => flags_hash = true,
+                _ => break,
+            }
+            *index += 1;
+        }
+        let mut width: i32 = -1;
+        while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
+            width = width.max(0).saturating_mul(10).saturating_add(i32::from(format[*index] - b'0' as u16));
+            *index += 1;
+        }
+        let mut precision: i32 = -1;
+        if *index < format.len() && format[*index] == 0x2E {
+            *index += 1;
+            precision = 0;
+            while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
+                precision = precision.saturating_mul(10).saturating_add(i32::from(format[*index] - b'0' as u16));
+                *index += 1;
+            }
+        }
+        let mut length = CrtLengthModifier::None;
+        if *index < format.len() {
+            match format[*index] {
+                0x68 => {
+                    *index += 1;
+                    if *index < format.len() && format[*index] == 0x68 {
+                        length = CrtLengthModifier::Hh;
+                        *index += 1;
+                    } else {
+                        length = CrtLengthModifier::H;
+                    }
+                }
+                0x6C => {
+                    *index += 1;
+                    if *index < format.len() && format[*index] == 0x6C {
+                        length = CrtLengthModifier::Ll;
+                        *index += 1;
+                    } else {
+                        length = CrtLengthModifier::L;
+                    }
+                }
+                0x49 => {
+                    // I64
+                    if *index + 2 < format.len()
+                        && format[*index + 1] == 0x36
+                        && format[*index + 2] == 0x34
+                    {
+                        length = CrtLengthModifier::Ll;
+                        *index += 3;
+                    } else {
+                        *index += 1;
+                    }
+                }
+                0x77 => {
+                    length = CrtLengthModifier::L;
+                    *index += 1;
+                }
+                _ => {}
+            }
+        }
+        let conversion = *format.get(*index).unwrap_or(&0);
+        *index += 1;
+
+        let pad = |rendered: &mut Vec<u8>,
+                   width: i32,
+                   flags_minus: bool,
+                   flags_zero: bool|
+         -> Vec<u8> {
+            let width = width.max(rendered.len() as i32) as usize;
+            if flags_minus {
+                let mut padded = rendered.clone();
+                padded.resize(width, b' ');
+                padded
+            } else {
+                let mut padded = vec![b' '; width];
+                let start = width - rendered.len();
+                if flags_zero {
+                    let first = rendered[0];
+                    for (i, slot) in padded.iter_mut().enumerate().take(start) {
+                        if i == 0 && matches!(first, b'-' | b'+' | b' ') {
+                            *slot = first;
+                        } else {
+                            *slot = b'0';
+                        }
+                    }
+                    padded[start..].copy_from_slice(rendered);
+                } else {
+                    padded[start..].copy_from_slice(rendered);
+                }
+                padded
+            }
+        };
+
+        let sign_prefix = |rendered: &mut Vec<u8>,
+                           negative: bool,
+                           flags_plus: bool,
+                           flags_space: bool| {
+            if negative {
+                rendered.insert(0, b'-');
+            } else if flags_plus {
+                rendered.insert(0, b'+');
+            } else if flags_space {
+                rendered.insert(0, b' ');
+            }
+        };
+
+        let hex_digit = |digit: u8, upper: bool| -> u8 {
+            if digit < 10 {
+                b'0' + digit
+            } else if upper {
+                b'A' + digit - 10
+            } else {
+                b'a' + digit - 10
+            }
+        };
+
+        match conversion {
+            0x64 | 0x69 => {
+                // %d %i — signed integer
+                let (value, negative) = match length {
+                    CrtLengthModifier::None | CrtLengthModifier::L => {
+                        let raw = va.read_u32()? as i32;
+                        (raw.unsigned_abs() as u64, raw < 0)
+                    }
+                    CrtLengthModifier::H => {
+                        let raw = (va.read_u32()? as u16 as i16) as i32;
+                        (raw.unsigned_abs() as u64, raw < 0)
+                    }
+                    CrtLengthModifier::Hh => {
+                        let raw = (va.read_u32()? as u8 as i8) as i32;
+                        (raw.unsigned_abs() as u64, raw < 0)
+                    }
+                    CrtLengthModifier::Ll => {
+                        let raw = va.read_u64()? as i64;
+                        (raw.unsigned_abs(), raw < 0)
+                    }
+                };
+                let mut digits = Vec::new();
+                let mut remaining = value;
+                if remaining == 0 {
+                    digits.push(b'0');
+                }
+                while remaining > 0 {
+                    digits.push(b'0' + (remaining % 10) as u8);
+                    remaining /= 10;
+                }
+                digits.reverse();
+                if precision >= 0 {
+                    while digits.len() < precision as usize {
+                        digits.insert(0, b'0');
+                    }
+                    if precision == 0 && value == 0 {
+                        digits.clear();
+                    }
+                }
+                let mut rendered = digits;
+                if !(rendered.is_empty() && precision == 0 && value == 0) {
+                    sign_prefix(&mut rendered, negative, flags_plus, flags_space);
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+            }
+            0x75 => {
+                let value = match length {
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
+                    CrtLengthModifier::Ll => va.read_u64()?,
+                };
+                let mut digits = Vec::new();
+                let mut remaining = value;
+                if remaining == 0 {
+                    digits.push(b'0');
+                }
+                while remaining > 0 {
+                    digits.push(b'0' + (remaining % 10) as u8);
+                    remaining /= 10;
+                }
+                digits.reverse();
+                if precision >= 0 {
+                    while digits.len() < precision as usize {
+                        digits.insert(0, b'0');
+                    }
+                    if precision == 0 && value == 0 {
+                        digits.clear();
+                    }
+                }
+                let mut rendered = digits;
+                if flags_space && !flags_plus && !rendered.is_empty() {
+                    rendered.insert(0, b' ');
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+            }
+            0x78 | 0x58 => {
+                let value = match length {
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
+                    CrtLengthModifier::Ll => va.read_u64()?,
+                };
+                let upper = conversion == 0x58;
+                let mut digits = Vec::new();
+                let mut remaining = value;
+                if remaining == 0 {
+                    digits.push(b'0');
+                }
+                while remaining > 0 {
+                    digits.push(hex_digit((remaining % 16) as u8, upper));
+                    remaining /= 16;
+                }
+                digits.reverse();
+                if precision >= 0 {
+                    while digits.len() < precision as usize {
+                        digits.insert(0, b'0');
+                    }
+                    if precision == 0 && value == 0 {
+                        digits.clear();
+                    }
+                }
+                let mut rendered = digits;
+                if flags_hash && value != 0 {
+                    rendered.insert(0, if upper { b'X' } else { b'x' });
+                    rendered.insert(0, b'0');
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+            }
+            0x6F => {
+                let value = match length {
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
+                    CrtLengthModifier::Ll => va.read_u64()?,
+                };
+                let mut digits = Vec::new();
+                let mut remaining = value;
+                if remaining == 0 {
+                    digits.push(b'0');
+                }
+                while remaining > 0 {
+                    digits.push(b'0' + (remaining % 8) as u8);
+                    remaining /= 8;
+                }
+                digits.reverse();
+                if precision >= 0 {
+                    while digits.len() < precision as usize {
+                        digits.insert(0, b'0');
+                    }
+                    if precision == 0 && value == 0 {
+                        digits.clear();
+                    }
+                }
+                let mut rendered = digits;
+                if flags_hash && value != 0 && !rendered.starts_with(b"0") {
+                    rendered.insert(0, b'0');
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+            }
+            0x63 => {
+                let ch = va.read_u32()? as u8;
+                out.extend(pad(&mut [ch].to_vec(), width, flags_minus, false));
+            }
+            0x73 => {
+                // %s — narrow (ANSI) guest string
+                let ptr = va.read_pointer()?;
+                let max = if precision >= 0 {
+                    precision as usize
+                } else {
+                    usize::MAX
+                };
+                let bytes = read_c_string_limit(memory, ptr, max)?;
+                let mut rendered = bytes;
+                if precision >= 0 {
+                    rendered.truncate(precision as usize);
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, false));
+            }
+            0x53 => {
+                // %S / %ls — wide guest string, narrowed to the ANSI page
+                let ptr = va.read_pointer()?;
+                let wide = read_utf16_string(memory, ptr)?;
+                let wide_units = wide.encode_utf16().collect::<Vec<_>>();
+                let mut bytes = self
+                    .win32
+                    .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
+                    .unwrap_or_else(|_| wide.as_bytes().to_vec());
+                if precision >= 0 {
+                    bytes.truncate(precision as usize);
+                }
+                out.extend(pad(&mut bytes, width, flags_minus, false));
+            }
+            0x70 => {
+                let ptr = va.read_pointer()?;
+                let digits = if guest_arch == GuestArch::X64 { 16 } else { 8 };
+                let mut rendered = format!("{:0width$X}", ptr, width = digits).into_bytes();
+                out.extend(pad(&mut rendered, width, flags_minus, true));
+            }
+            0x25 => {
+                out.push(b'%');
+            }
+            0x66 | 0x65 | 0x67 | 0x46 | 0x45 | 0x47 => {
+                let value = va.read_f64()?;
+                let precision_explicit = precision >= 0;
+                let precision = if precision < 0 { 6 } else { precision };
+                let uppercase = conversion == 0x46 || conversion == 0x45 || conversion == 0x47;
+                let negative = value.is_sign_negative() && value != 0.0;
+                let magnitude = value.abs();
+                let conversion_lower = char::from_u32(u32::from(conversion))
+                    .map(|ch| ch.to_ascii_lowercase() as u32)
+                    .unwrap_or(u32::from(conversion));
+                let mut rendered = match conversion_lower {
+                    0x66 => crt_format_fixed(magnitude, precision),
+                    0x65 => crt_format_exponential(magnitude, precision, uppercase),
+                    _ => crt_format_general(magnitude, precision, uppercase, flags_hash),
+                };
+                if flags_hash && !rendered.contains(&b'.') {
+                    rendered.push(b'.');
+                }
+                if negative {
+                    rendered.insert(0, b'-');
+                } else if flags_plus {
+                    rendered.insert(0, b'+');
+                } else if flags_space {
+                    rendered.insert(0, b' ');
+                }
+                out.extend(pad(&mut rendered, width, flags_minus, !precision_explicit && flags_zero));
+            }
+            _ => {
+                // Unknown conversion: UCRT renders the '%' and the offending
+                // character literally.
+                out.push(b'%');
+                if conversion != 0 {
+                    let mut bytes = [0_u8; 2];
+                    let mut encoded = [0_u8; 4];
+                    let s = char::from_u32(u32::from(conversion)).unwrap_or('\u{FFFD}');
+                    let n = s.encode_utf8(&mut encoded).len();
+                    bytes[..n].copy_from_slice(&encoded[..n]);
+                    out.extend_from_slice(&bytes[..n]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared printf engine: renders the wide format with the x86-cdecl
+    /// vararg list at `argptr` and returns the produced narrow bytes.
+    fn crt_vfprintf_render(
+        &mut self,
+        memory: &mut MemoryImage,
+        format_ptr: u64,
+        argptr: u64,
+    ) -> AppResult<Vec<u8>> {
+        if format_ptr == 0 {
+            self.set_crt_errno(memory, EINVAL);
+            return Ok(Vec::new());
+        }
+        let wide = read_utf16_string(memory, format_ptr)?;
+        let format_units = wide.encode_utf16().collect::<Vec<_>>();
+        let mut va = CrtVaReader::new(&*memory, argptr, self.guest_arch);
+        let mut out = Vec::new();
+        let mut index = 0_usize;
+        while index < format_units.len() {
+            if format_units[index] == 0x25 {
+                self.crt_render_conversion(&*memory, &format_units, &mut index, &mut va, &mut out, self.guest_arch)?;
+            } else {
+                let mut encoded = [0_u8; 4];
+                if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
+                    out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+                }
+                index += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deliver rendered printf output to a stream: iob streams go to the
+    /// runtime stdout/stderr buffers; CRT-opened FILE* streams go through the
+    /// win32 handle; a NULL stream is treated as stdout (best-effort).
+    fn crt_vfprintf_deliver(&mut self, memory: &mut MemoryImage, stream: u64, bytes: &[u8]) -> AppResult<u64> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if stream == 0 || self.crt_iob_index(stream).is_some() {
+            let text = String::from_utf8_lossy(bytes);
+            if self.crt_iob_index(stream) == Some(2) {
+                self.stderr.push_str(&text);
+            } else {
+                self.stdout.push_str(&text);
+            }
+            return Ok(bytes.len() as u64);
+        }
+        if let Some(state) = self.crt_stream_state(stream) {
+            if !state.writable {
+                self.set_crt_errno(memory, EBADF);
+                return Ok(0);
+            }
+            if state.append {
+                let _ = self.win32.set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
+            }
+            match self.win32.write_file(state.handle, bytes) {
+                Ok(_) => Ok(bytes.len() as u64),
+                Err(_) => {
+                    self.set_crt_errno(memory, EIO);
+                    Ok(0)
+                }
+            }
+        } else {
+            self.set_crt_errno(memory, EBADF);
+            Ok(0)
+        }
+    }
+
+    // ── Patch 6b: fopen-family implementation ─────────────────────────────────
+    /// Parse a CRT fopen mode string: base r/w/a, optional '+', optional
+    /// b/t (ignored), and the S/D/N/c flags (ignored).  Returns
+    /// (readable, writable, append, update, base) where `base` is the mode
+    /// character that drives the creation disposition.
+    fn crt_parse_fopen_mode(mode: &str) -> Option<(bool, bool, bool, bool, char)> {
+        let mode = mode.trim();
+        let mut chars = mode.chars();
+        let base = chars.next()?;
+        let (readable, writable) = match base {
+            'r' => (true, false),
+            'w' => (false, true),
+            'a' => (false, true),
+            _ => return None,
+        };
+        let append = base == 'a';
+        let mut update = false;
+        for ch in chars {
+            match ch {
+                '+' => update = true,
+                'b' | 't' | 'S' | 'D' | 'N' | 'c' | 'R' | 'T' => {}
+                _ => return None,
+            }
+        }
+        let (readable, writable) = if update {
+            (true, true)
+        } else {
+            (readable, writable)
+        };
+        Some((readable, writable, append, update, base))
+    }
+
+    /// Open a CRT stream: parse the mode, open the file via the win32
+    /// create-file path, allocate a guest FILE block, and register it.  On
+    /// failure returns Ok(None) with errno set.
+    fn crt_fopen_impl(
+        &mut self,
+        memory: &mut MemoryImage,
+        path: &str,
+        mode: &str,
+    ) -> AppResult<Option<u64>> {
+        let resolved = resolve_guest_path(&self.current_directory, path);
+        let Some((readable, writable, append, update, base)) = Self::crt_parse_fopen_mode(mode)
+        else {
+            self.set_crt_errno(memory, EINVAL);
+            return Ok(None);
+        };
+        // Append streams additionally grant read access so the model's
+        // seek-to-EOF (which needs FILE_READ_ATTRIBUTES for the size query)
+        // works with write-only "a" modes.
+        let access = crate::ge::FileAccess {
+            read: readable || append,
+            write: writable,
+            delete: false,
+        };
+        let share = crate::ge::ShareMode {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        // The BASE mode character drives the disposition: r → open existing,
+        // w → create always (truncate), a → open always (append).
+        let creation = match base {
+            'w' => crate::win32::CreationDisposition::CreateAlways,
+            'a' => crate::win32::CreationDisposition::OpenAlways,
+            _ => crate::win32::CreationDisposition::OpenExisting,
+        };
+        let handle = match self.win32.create_file_w(
+            &resolved,
+            access,
+            share,
+            creation,
+            false,
+            false,
+            false,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.set_crt_doserrno(memory, last_error_from_app_error(&error) as i32);
+                self.set_crt_errno(memory, match error.code {
+                    ReasonCode::RcFsNotFound => ENOENT,
+                    ReasonCode::RcFsAlreadyExists => EEXIST,
+                    ReasonCode::RcFsPathInvalid => ENOENT,
+                    ReasonCode::RcIo => EACCES,
+                    _ => EACCES,
+                });
+                return Ok(None);
+            }
+        };
+        if append {
+            let _ = self
+                .win32
+                .set_file_pointer_ex(handle, 0, crate::win32::SeekOrigin::End);
+        }
+        let file_state = CrtFileState {
+            handle,
+            path: resolved,
+            readable,
+            writable,
+            append,
+            update,
+        };
+        let file_ptr = self.crt_alloc_file(memory, &file_state)?;
+        Ok(Some(file_ptr))
+    }
+
+    /// fread core: read up to `size*count` bytes at the stream position.
+    /// Returns the number of complete items read.
+    fn crt_fread_impl(
+        &mut self,
+        memory: &mut MemoryImage,
+        buffer: u64,
+        size: u64,
+        count: u64,
+        stream: u64,
+    ) -> AppResult<u64> {
+        let total = match size.checked_mul(count) {
+            Some(total) if total <= 0x7FFF_FFFF => total as usize,
+            _ => {
+                self.set_crt_errno(memory, EINVAL);
+                return Ok(0);
+            }
+        };
+        if buffer == 0 || total == 0 {
+            return Ok(0);
+        }
+        if let Some(index) = self.crt_iob_index(stream) {
+            // stdin has no backing data in this model.
+            let _ = index;
+            return Ok(0);
+        }
+        let Some(state) = self.crt_stream_state(stream) else {
+            self.set_crt_errno(memory, EBADF);
+            return Ok(0);
+        };
+        if !state.readable {
+            self.set_crt_errno(memory, EBADF);
+            return Ok(0);
+        }
+        match self.win32.read_file(state.handle, total) {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    memory.map_bytes(buffer, &bytes);
+                }
+                let items = (bytes.len() as u64).checked_div(size).unwrap_or(0);
+                Ok(items)
+            }
+            Err(_) => {
+                self.set_crt_errno(memory, EIO);
+                Ok(0)
+            }
+        }
+    }
+
+    /// fwrite core: write `size*count` bytes at the stream position (append
+    /// streams seek to EOF first).  Returns the number of complete items.
+    fn crt_fwrite_impl(
+        &mut self,
+        memory: &mut MemoryImage,
+        buffer: u64,
+        size: u64,
+        count: u64,
+        stream: u64,
+    ) -> AppResult<u64> {
+        let total = match size.checked_mul(count) {
+            Some(total) if total <= 0x7FFF_FFFF => total as usize,
+            _ => {
+                self.set_crt_errno(memory, EINVAL);
+                return Ok(0);
+            }
+        };
+        if buffer == 0 || total == 0 {
+            return Ok(0);
+        }
+        let bytes = memory.read_bytes(buffer, total)?;
+        if let Some(index) = self.crt_iob_index(stream) {
+            let text = String::from_utf8_lossy(&bytes);
+            if index == 2 {
+                self.stderr.push_str(&text);
+            } else {
+                self.stdout.push_str(&text);
+            }
+            return Ok(count);
+        }
+        let Some(state) = self.crt_stream_state(stream) else {
+            self.set_crt_errno(memory, EBADF);
+            return Ok(0);
+        };
+        if !state.writable {
+            self.set_crt_errno(memory, EBADF);
+            return Ok(0);
+        }
+        if state.append {
+            let _ = self
+                .win32
+                .set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
+        }
+        match self.win32.write_file(state.handle, &bytes) {
+            Ok(written) => {
+                let items = u64::from(written).checked_div(size).unwrap_or(0);
+                Ok(items)
+            }
+            Err(_) => {
+                self.set_crt_errno(memory, EIO);
+                Ok(0)
+            }
+        }
+    }
+
+    /// qsort core: heap sort of `num` elements of `size` bytes at `base`,
+    /// comparing via the guest comparator (x86 cdecl, two pointer args).
+    fn crt_qsort_impl(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        base: u64,
+        num: usize,
+        size: usize,
+        compare: u64,
+    ) -> AppResult<()> {
+        if num < 2 || size == 0 {
+            return Ok(());
+        }
+        let compare_at = |runtime: &mut Self,
+                          memory: &mut MemoryImage,
+                          state: &mut CpuState,
+                          a: usize,
+                          b: usize|
+         -> AppResult<i32> {
+            let pa = base.wrapping_add((a as u64).wrapping_mul(size as u64));
+            let pb = base.wrapping_add((b as u64).wrapping_mul(size as u64));
+            let result = runtime.execute_guest_callback(
+                state,
+                memory,
+                compare,
+                &[pa, pb],
+                "qsort_compare",
+            )?;
+            Ok(result as i32)
+        };
+        let swap = |memory: &mut MemoryImage, a: usize, b: usize| -> AppResult<()> {
+            let pa = base.wrapping_add((a as u64).wrapping_mul(size as u64));
+            let pb = base.wrapping_add((b as u64).wrapping_mul(size as u64));
+            let bytes_a = memory.read_bytes(pa, size)?;
+            let bytes_b = memory.read_bytes(pb, size)?;
+            memory.map_bytes(pa, &bytes_b);
+            memory.map_bytes(pb, &bytes_a);
+            Ok(())
+        };
+        // Heap sort (in-place, O(n log n) comparisons).
+        let sift_down = |runtime: &mut Self,
+                             memory: &mut MemoryImage,
+                             state: &mut CpuState,
+                             root: usize,
+                             bottom: usize|
+         -> AppResult<()> {
+            let mut root = root;
+            loop {
+                let mut child = root * 2 + 1;
+                if child >= bottom {
+                    return Ok(());
+                }
+                if child + 1 < bottom
+                    && compare_at(runtime, memory, state, child, child + 1)? < 0
+                {
+                    child += 1;
+                }
+                if compare_at(runtime, memory, state, root, child)? < 0 {
+                    swap(memory, root, child)?;
+                    root = child;
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+        for start in (0..num / 2).rev() {
+            sift_down(self, memory, state, start, num)?;
+        }
+        for end in (1..num).rev() {
+            swap(memory, 0, end)?;
+            sift_down(self, memory, state, 0, end)?;
         }
         Ok(())
     }
@@ -59163,6 +62370,151 @@ impl PeHostRuntime {
 }
 
 impl HostThunk {
+    /// Patch 6b: shared name → thunk table for the CRT-family DLLs
+    /// (ucrtbase.dll / msvcrt.dll).  Only names not covered by the explicit
+    /// arms above belong here.
+    fn crt_thunk_from_name(name: &str) -> Option<Self> {
+        use HostThunk::*;
+        Some(match name {
+            "_errno" | "__errno" => CrtErrno,
+            "_doserrno" => CrtDoserrno,
+            "_get_errno" => GetErrno,
+            "_set_errno" => SetErrno,
+            "__stdio_common_vsnprintf_s" => StdioCommonVsnprintfS,
+            "__stdio_common_vsprintf_s" => StdioCommonVsprintfS,
+            "__stdio_common_vsnprintf" => StdioCommonVsnprintf,
+            "memcpy" => Memcpy,
+            "memmove" => Memmove,
+            "memset" => Memset,
+            "memcmp" => Memcmp,
+            "memchr" => Memchr,
+            "strcpy" => Strcpy,
+            "strncpy" => Strncpy,
+            "strcat" => Strcat,
+            "strncat" => Strncat,
+            "strcmp" => Strcmp,
+            "strchr" => Strchr,
+            "strstr" => Strstr,
+            "_stricmp" => Stricmp,
+            "_strnicmp" => Strnicmp,
+            "strerror" => Strerror,
+            "_strerror" => StrerrorPrefix,
+            "wcslen" => Wcslen,
+            "wcscpy" => Wcscpy,
+            "wcscat" => Wcscat,
+            "wcscmp" => Wcscmp,
+            "wcsncpy" => Wcsncpy,
+            "wcsrchr" => Wcsrchr,
+            "wcschr" => Wcschr,
+            "wcsstr" => Wcsstr,
+            "wcsnlen" => Wcsnlen,
+            "_wcsicmp" => Wcsicmp,
+            "_wcsnicmp" => Wcsnicmp,
+            "strcpy_s" => StrcpyS,
+            "strncpy_s" => StrncpyS,
+            "strcat_s" => StrcatS,
+            "strncat_s" => StrncatS,
+            "memcpy_s" => MemcpyS,
+            "memmove_s" => MemmoveS,
+            "wcscpy_s" => WcscpyS,
+            "wcsncpy_s" => WcsncpyS,
+            "isalpha" => Isalpha,
+            "isdigit" => Isdigit,
+            "isalnum" => Isalnum,
+            "isxdigit" => Isxdigit,
+            "isspace" => Isspace,
+            "isupper" => Isupper,
+            "islower" => Islower,
+            "ispunct" => Ispunct,
+            "isprint" => Isprint,
+            "isgraph" => Isgraph,
+            "iscntrl" => Iscntrl,
+            "tolower" => Tolower,
+            "toupper" => Toupper,
+            "atoi" => Atoi,
+            "atol" => Atol,
+            "atof" => Atof,
+            "strtol" => Strtol,
+            "strtoul" => Strtoul,
+            "_strtoi64" => Strtoi64,
+            "_strtoi64_s" => Strtoi64S,
+            "_strtoui64" => Strtoui64,
+            "_strtoui64_s" => Strtoui64S,
+            "abs" => Abs,
+            "labs" => Labs,
+            "div" => Div,
+            "ldiv" => Ldiv,
+            "qsort" => Qsort,
+            "bsearch" => Bsearch,
+            "_getcwd" => Getcwd,
+            "_wgetcwd" => Wgetcwd,
+            "_chdir" => Chdir,
+            "_wchdir" => Wchdir,
+            "_access" => Access,
+            "_waccess" => Waccess,
+            "_chmod" => Chmod,
+            "_wchmod" => Wchmod,
+            "_stat" => Stat,
+            "_wstat" => Wstat,
+            "_stat64" => Stat64,
+            "_wstat64" => Wstat64,
+            "fstat" | "_fstat" => Fstat,
+            "_fstat64" => Fstat64,
+            "getenv" => Getenv,
+            "_wgetenv" => Wgetenv,
+            "_dupenv_s" => DupenvS,
+            "_wdupenv_s" => WdupenvS,
+            "_putenv" => Putenv,
+            "_wputenv" => Wputenv,
+            "_splitpath" => Splitpath,
+            "_wsplitpath" => Wsplitpath,
+            "_splitpath_s" => SplitpathS,
+            "_wsplitpath_s" => WsplitpathS,
+            "_makepath" => Makepath,
+            "_wmakepath" => Wmakepath,
+            "_makepath_s" => MakepathS,
+            "_wmakepath_s" => WmakepathS,
+            "rand" => Rand,
+            "srand" => Srand,
+            "clock" => Clock,
+            "time" => Time,
+            "_time64" => Time64,
+            "_beginthreadex" => Beginthreadex,
+            "_endthreadex" => Endthreadex,
+            "_beginthread" => Beginthread,
+            "_endthread" => Endthread,
+            "fopen" => Fopen,
+            "_wfopen" => Wfopen,
+            "fopen_s" => FopenS,
+            "_wfopen_s" => WfopenS,
+            "_fsopen" => Fsopen,
+            "freopen" => Freopen,
+            "_fdopen" => Fdopen,
+            "fclose" => Fclose,
+            "fflush" => Fflush,
+            "fread" => Fread,
+            "fgets" => Fgets,
+            "fputs" => Fputs,
+            "fgetc" => Fgetc,
+            "fputc" => Fputc,
+            "fseek" => Fseek,
+            "ftell" => Ftell,
+            "fread_s" => FreadS,
+            "fwrite_s" => FwriteS,
+            "_fcloseall" => Fcloseall,
+            "_flushall" => Flushall,
+            "_lock" => Lock,
+            "_unlock" => Unlock,
+            "_fileno" => Fileno,
+            "_filelength" => Filelength,
+            "_filelengthi64" => Filelengthi64,
+            "_chsize" => Chsize,
+            "_isatty" => Isatty,
+            "_commit" => Commit,
+            _ => return None,
+        })
+    }
+
     fn from_import(import: &ResolvedImport) -> Self {
         let dll = import.resolved_module.to_ascii_lowercase();
         match (&dll[..], &import.symbol) {
@@ -61135,6 +64487,7 @@ impl HostThunk {
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "calloc" => Self::Calloc,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "free" => Self::Free,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "malloc" => Self::Malloc,
+            ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "realloc" => Self::Realloc,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. })
                 if name == "__C_specific_handler" =>
             {
@@ -61280,6 +64633,12 @@ impl HostThunk {
             }
             ("msvcrt.dll", ImportSymbol::ByName { name, .. }) if name == "__setusermatherr" => {
                 Self::SetUserMathErr
+            }
+            // -- Patch 6b: CRT / UCRT surface (shared name table) --
+            ("ucrtbase.dll" | "msvcrt.dll", ImportSymbol::ByName { name, .. })
+                if let Some(thunk) = Self::crt_thunk_from_name(name) =>
+            {
+                thunk
             }
             // -- usp10.dll (Uniscribe) — P0.3 --
             ("usp10.dll", ImportSymbol::ByName { name, .. }) if name == "ScriptStringAnalyse" => {
@@ -65084,20 +68443,32 @@ fn decode_current_instruction(
     memory: &MemoryImage,
     rip: u64,
 ) -> AppResult<DecodedInstruction> {
+    // Read up to 15 bytes (max x86 instruction length).  Unlike a blind
+    // `read_into_slice` (which leaves the window zeroed when any trailing
+    // byte is unmapped, causing misdecodes of garbage `add [eax], al`
+    // sleds), the readable prefix is determined byte-by-byte so guest
+    // callbacks sitting at the edge of a mapped region decode correctly.
     let mut bytes = [0_u8; 15];
-    // Read up to 15 bytes (max x86 instruction length). If memory doesn't
-    // have all 15, read what's available.
-    let _ = memory.read_into_slice(rip, &mut bytes);
+    let mut readable = 0_usize;
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        match memory.read_u8(rip + index as u64) {
+            Ok(byte) => {
+                *slot = byte;
+                readable = index + 1;
+            }
+            Err(_) => break,
+        }
+    }
     // Try from LONGEST to SHORTEST.  Most x86 instructions are 2-6 bytes,
     // so trying the longest window first means we typically succeed on the
     // FIRST call to decode_block (1 call instead of 15).
-    for len in (1..=bytes.len()).rev() {
+    for len in (1..=readable.max(1)).rev() {
         if let Ok(decoded) = engine.decode_block(&bytes[..len], rip)
             && decoded.len() == 1 && decoded[0].size == len {
                 return Ok(decoded.into_iter().next().expect("decoded instruction"));
             }
     }
-    let window = bytes
+    let window = bytes[..readable]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
@@ -66515,6 +69886,553 @@ fn write_guest_window_class(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrtLengthModifier {
+    None,
+    H,
+    Hh,
+    L,
+    Ll,
+}
+
+/// Cursor over an x86-cdecl vararg list (the UCRT `va_list` for x86 guests is
+/// a pointer into the caller's stack).  32-bit values advance 4 bytes; 64-bit
+/// values (ll/I64 integers and doubles) advance 8 bytes across two slots.
+struct CrtVaReader<'a> {
+    memory: &'a MemoryImage,
+    cursor: u64,
+    arch: GuestArch,
+}
+
+impl<'a> CrtVaReader<'a> {
+    fn new(memory: &'a MemoryImage, cursor: u64, arch: GuestArch) -> Self {
+        Self {
+            memory,
+            cursor,
+            arch,
+        }
+    }
+
+    fn read_u32(&mut self) -> AppResult<u32> {
+        let value = read_u32(self.memory, self.cursor)?;
+        self.cursor = self.cursor.wrapping_add(4);
+        Ok(value)
+    }
+
+    fn read_u64(&mut self) -> AppResult<u64> {
+        let value = match self.arch {
+            GuestArch::X86 => {
+                let low = read_u32(self.memory, self.cursor)? as u64;
+                let high = read_u32(self.memory, self.cursor.wrapping_add(4))? as u64;
+                low | (high << 32)
+            }
+            GuestArch::X64 => self.memory.read_u64(self.cursor)?,
+        };
+        self.cursor = self.cursor.wrapping_add(8);
+        Ok(value)
+    }
+
+    fn read_pointer(&mut self) -> AppResult<u64> {
+        match self.arch {
+            GuestArch::X86 => {
+                let value = read_u32(self.memory, self.cursor)? as u64;
+                self.cursor = self.cursor.wrapping_add(4);
+                Ok(value)
+            }
+            GuestArch::X64 => {
+                let value = self.memory.read_u64(self.cursor)?;
+                self.cursor = self.cursor.wrapping_add(8);
+                Ok(value)
+            }
+        }
+    }
+
+    fn read_f64(&mut self) -> AppResult<f64> {
+        let bits = self.read_u64()?;
+        Ok(f64::from_bits(bits))
+    }
+}
+
+/// MSVC strerror message table (mirrors UCRT's strerror.c strings).
+fn crt_errno_message(errnum: i32) -> &'static str {
+    match errnum {
+        0 => "No error",
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        3 => "No such process",
+        4 => "Interrupted function call",
+        5 => "Input/output error",
+        6 => "No such device or address",
+        7 => "Arg list too long",
+        8 => "Exec format error",
+        9 => "Bad file descriptor",
+        10 => "No child processes",
+        11 => "Resource temporarily unavailable",
+        12 => "Not enough space",
+        13 => "Permission denied",
+        14 => "Bad address",
+        15 => "Unknown error",
+        16 => "Resource device",
+        17 => "File exists",
+        18 => "Improper link",
+        19 => "No such device",
+        20 => "Not a directory",
+        21 => "Is a directory",
+        22 => "Invalid argument",
+        23 => "Too many open files in system",
+        24 => "Too many open files",
+        25 => "Inappropriate I/O control operation",
+        26 => "Text file busy",
+        27 => "File too large",
+        28 => "No space left on device",
+        29 => "Illegal seek",
+        30 => "Cannot create a file when that file already exists",
+        31 => "Directory not empty",
+        32 => "Broken pipe",
+        33 => "Math argument",
+        34 => "Result too large",
+        35 => "File already exists",
+        36 => "Too many links",
+        37 => "Unknown error",
+        38 => "Filename too long",
+        39 => "No locks available",
+        40 => "Function not implemented",
+        41 => "Directory not empty",
+        _ => "Unknown error",
+    }
+}
+
+/// Stat data collected for `_stat`/`_fstat` (FILETIME ticks, Unix-converted on
+/// write).
+#[derive(Debug, Clone, Copy)]
+struct CrtStatInfo {
+    is_directory: bool,
+    read_only: bool,
+    size: u64,
+    creation_time_ticks: u64,
+    last_access_time_ticks: u64,
+    last_write_time_ticks: u64,
+}
+
+/// Collect stat info for a resolved guest path (GE metadata + host size).
+fn crt_stat_info(
+    runtime: &mut PeHostRuntime,
+    path: &str,
+) -> AppResult<CrtStatInfo> {
+    let metadata = runtime.win32.ge().get_file_metadata(path)?;
+    let host_path = runtime.win32.guest_path_to_host_path(path)?;
+    let host_metadata = std::fs::metadata(&host_path).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to stat {}", host_path.display()),
+            &error,
+        )
+    })?;
+    Ok(CrtStatInfo {
+        is_directory: metadata.kind == crate::ge::FsEntryKind::Directory,
+        read_only: metadata.attributes.iter().any(|a| a == "readonly"),
+        size: if metadata.kind == crate::ge::FsEntryKind::Directory {
+            0
+        } else {
+            host_metadata.len()
+        },
+        creation_time_ticks: metadata.creation_time_ticks,
+        last_access_time_ticks: metadata.last_access_time_ticks,
+        last_write_time_ticks: metadata.last_write_time_ticks,
+    })
+}
+
+/// Convert FILETIME ticks (100 ns since 1601) to Unix seconds.
+fn crt_ticks_to_unix(ticks: u64) -> i64 {
+    if ticks == 0 {
+        return 0;
+    }
+    const WINDOWS_TO_UNIX_OFFSET: u64 = 11_644_473_600;
+    let seconds = ticks / 10_000_000;
+    (seconds.saturating_sub(WINDOWS_TO_UNIX_OFFSET)) as i64
+}
+
+/// Write a `struct _stat` (32-bit variant, offsets 0,4,8,10,12,14,16,20,24,28,32)
+/// or `struct _stat64` (64-bit time/size) into guest memory.
+fn crt_write_stat(memory: &mut MemoryImage, stat_ptr: u64, info: &CrtStatInfo, wide64: bool) {
+    let mode = if info.is_directory {
+        S_IFDIR
+    } else {
+        S_IFREG
+    } | if info.read_only { S_IREAD } else { S_IREAD | S_IWRITE };
+    let mtime = crt_ticks_to_unix(info.last_write_time_ticks);
+    let atime = crt_ticks_to_unix(info.last_access_time_ticks);
+    let ctime = crt_ticks_to_unix(info.creation_time_ticks);
+    if wide64 {
+        // _stat64: st_dev u32 @0, st_ino u32 @4, st_mode u16 @8,
+        // st_nlink u16 @10, st_uid u16 @12, st_gid u16 @14, st_rdev u32 @16,
+        // pad u32 @20, st_size i64 @24, st_atime i64 @32, st_mtime i64 @40,
+        // st_ctime i64 @48.
+        write_u32(memory, stat_ptr, 0);
+        write_u32(memory, stat_ptr + 4, 0);
+        write_u32(memory, stat_ptr + 8, mode);
+        write_u32(memory, stat_ptr + 12, 0);
+        write_u32(memory, stat_ptr + 16, 0);
+        write_u32(memory, stat_ptr + 20, 0);
+        write_u64(memory, stat_ptr + 24, info.size);
+        write_u64(memory, stat_ptr + 32, atime as u64);
+        write_u64(memory, stat_ptr + 40, mtime as u64);
+        write_u64(memory, stat_ptr + 48, ctime as u64);
+    } else {
+        // _stat: st_dev u32 @0, st_ino u32 @4, st_mode u16 @8, st_nlink u16
+        // @10, st_uid u16 @12, st_gid u16 @14, st_rdev u32 @16, st_size u32
+        // @20, st_atime u32 @24, st_mtime u32 @28, st_ctime u32 @32.
+        write_u32(memory, stat_ptr, 0);
+        write_u32(memory, stat_ptr + 4, 0);
+        write_u16(memory, stat_ptr + 8, mode as u16);
+        write_u16(memory, stat_ptr + 10, 1);
+        write_u16(memory, stat_ptr + 12, 0);
+        write_u16(memory, stat_ptr + 14, 0);
+        write_u32(memory, stat_ptr + 16, 0);
+        write_u32(memory, stat_ptr + 20, info.size.min(u32::MAX as u64) as u32);
+        write_u32(memory, stat_ptr + 24, atime as u32);
+        write_u32(memory, stat_ptr + 28, mtime as u32);
+        write_u32(memory, stat_ptr + 32, ctime as u32);
+    }
+}
+
+/// Write a NUL-terminated narrow string into guest memory (used by
+/// _splitpath-family thunks).
+fn write_guest_c_str(memory: &mut MemoryImage, buffer: u64, value: &str) {
+    if buffer == 0 {
+        return;
+    }
+    memory.map_bytes(buffer, value.as_bytes());
+    memory.write_u8(buffer + value.len() as u64, 0);
+}
+
+/// Write a NUL-terminated wide string into guest memory.
+fn write_guest_wide_str(memory: &mut MemoryImage, buffer: u64, value: &str) {
+    if buffer == 0 {
+        return;
+    }
+    let bytes = value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    memory.map_bytes(buffer, &bytes);
+}
+
+/// Windows `_splitpath` decomposition: drive ("C:"), directory (including
+/// separators), filename, extension (including the leading '.').
+fn crt_split_path(path: &str) -> (String, String, String, String) {
+    let (drive, rest) = match windows_drive_prefix(path) {
+        Some(prefix) => {
+            let rest = &path[prefix.len()..];
+            (prefix.to_string(), rest)
+        }
+        None => (String::new(), path),
+    };
+    // Locate the last separator after the drive.
+    let separator = rest
+        .rfind(['\\', '/'])
+        .map(|index| index + 1);
+    let (dir, name_ext) = match separator {
+        Some(index) => (rest[..index].to_string(), &rest[index..]),
+        None => (String::new(), rest),
+    };
+    if name_ext == "." || name_ext == ".." {
+        return (drive, dir, name_ext.to_string(), String::new());
+    }
+    let ext_start = name_ext.rfind('.');
+    match ext_start {
+        Some(index) => (
+            drive,
+            dir,
+            name_ext[..index].to_string(),
+            name_ext[index..].to_string(),
+        ),
+        None => (drive, dir, name_ext.to_string(), String::new()),
+    }
+}
+
+/// Windows `_makepath` assembly: drive (adding ':' if absent), dir (adding a
+/// trailing separator if non-empty and missing one), name, ext.
+fn crt_make_path(drive: &str, dir: &str, name: &str, ext: &str) -> String {
+    let mut out = String::new();
+    if !drive.is_empty() {
+        out.push_str(drive);
+        if !out.ends_with(':') {
+            out.push(':');
+        }
+    }
+    if !dir.is_empty() {
+        out.push_str(dir);
+        if !out.ends_with(['\\', '/']) {
+            out.push('\\');
+        }
+    }
+    out.push_str(name);
+    out.push_str(ext);
+    out
+}
+
+/// strtol core (32-bit `long` on Windows): parses with base 0/2..=36, returns
+/// (value, consumed_bytes, overflow).
+fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
+    let bytes = bytes.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+    let mut base = base;
+    let consumed = index;
+    let mut digits_start = index;
+    if base == 0 {
+        if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+            base = 16;
+            index += 2;
+            digits_start = index;
+        } else if index < bytes.len() && bytes[index] == b'0' {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    } else if base == 16 && index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+        index += 2;
+        digits_start = index;
+    }
+    let mut value: i64 = 0;
+    let mut overflow = false;
+    while index < bytes.len() {
+        let digit = match bytes[index] {
+            b'0'..=b'9' => bytes[index] - b'0',
+            b'a'..=b'z' => bytes[index] - b'a' + 10,
+            b'A'..=b'Z' => bytes[index] - b'A' + 10,
+            _ => break,
+        } as i64;
+        if digit >= i64::from(base.max(2)) {
+            break;
+        }
+        let next = value.saturating_mul(base as i64).saturating_add(digit);
+        if next < value || next > i32::MAX as i64 {
+            overflow = true;
+        }
+        value = next;
+        index += 1;
+    }
+    if index == digits_start {
+        return (0, consumed, false);
+    }
+    (if negative { -value } else { value }, index, overflow)
+}
+
+/// _strtoi64 core: same parsing with 64-bit range clamping.
+fn crt_parse_strtoll_full(bytes: &str, base: i32) -> (i64, usize, bool) {
+    let bytes = bytes.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+    let mut base = base;
+    let mut digits_start = index;
+    if base == 0 {
+        if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+            base = 16;
+            index += 2;
+            digits_start = index;
+        } else if index < bytes.len() && bytes[index] == b'0' {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    } else if base == 16 && index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+        index += 2;
+        digits_start = index;
+    }
+    let mut value: i64 = 0;
+    let mut overflow = false;
+    while index < bytes.len() {
+        let digit = match bytes[index] {
+            b'0'..=b'9' => bytes[index] - b'0',
+            b'a'..=b'z' => bytes[index] - b'a' + 10,
+            b'A'..=b'Z' => bytes[index] - b'A' + 10,
+            _ => break,
+        } as i64;
+        if digit >= i64::from(base.max(2)) {
+            break;
+        }
+        let (next, overflowing) = value.overflowing_mul(base as i64);
+        let (next, overflowing_add) = next.overflowing_add(digit);
+        if overflowing || overflowing_add {
+            overflow = true;
+            value = if negative { i64::MIN } else { i64::MAX };
+            // Consume the remaining digits so endptr lands after them.
+            index += 1;
+            while index < bytes.len() {
+                let digit = match bytes[index] {
+                    b'0'..=b'9' => bytes[index] - b'0',
+                    b'a'..=b'z' => bytes[index] - b'a' + 10,
+                    b'A'..=b'Z' => bytes[index] - b'A' + 10,
+                    _ => break,
+                } as i64;
+                if digit >= i64::from(base.max(2)) {
+                    break;
+                }
+                index += 1;
+            }
+            break;
+        }
+        value = next;
+        index += 1;
+    }
+    if index == digits_start {
+        return (0, 0, false);
+    }
+    (if negative { -value } else { value }, index, overflow)
+}
+
+/// Simple strtol: parse with a fixed base, clamp at i32 range (strtol on
+/// Windows is 32-bit), used by atoi/atol.
+fn crt_parse_strtol(bytes: &str, base: i32, _end: Option<&mut usize>) -> i64 {
+    let (value, _, overflow) = crt_parse_strtol_full(bytes, base);
+    if overflow {
+        if value < 0 {
+            i32::MIN as i64
+        } else {
+            i32::MAX as i64
+        }
+    } else {
+        value
+    }
+}
+
+/// Minimal strtod (C locale): optional whitespace, sign, digits, '.', exponent.
+fn crt_parse_strtod(bytes: &str) -> f64 {
+    let bytes = bytes.trim_start();
+    let mut index = 0_usize;
+    if index < bytes.len() && (bytes.as_bytes()[index] == b'+' || bytes.as_bytes()[index] == b'-') {
+        index += 1;
+    }
+    let start = index;
+    while index < bytes.len() && bytes.as_bytes()[index].is_ascii_digit() {
+        index += 1;
+    }
+    let mut has_dot = false;
+    if index < bytes.len() && bytes.as_bytes()[index] == b'.' {
+        has_dot = true;
+        index += 1;
+        while index < bytes.len() && bytes.as_bytes()[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    let mut exponent = String::new();
+    if index < bytes.len() && (bytes.as_bytes()[index] == b'e' || bytes.as_bytes()[index] == b'E') {
+        let mut exp_index = index + 1;
+        if exp_index < bytes.len() && (bytes.as_bytes()[exp_index] == b'+' || bytes.as_bytes()[exp_index] == b'-') {
+            exp_index += 1;
+        }
+        if exp_index < bytes.len() && bytes.as_bytes()[exp_index].is_ascii_digit() {
+            exponent = bytes[index + 1..].to_string();
+            index = exp_index;
+            while index < bytes.len() && bytes.as_bytes()[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    if index == start && !has_dot {
+        return 0.0;
+    }
+    let token = format!("{}{}", &bytes[..index], exponent);
+    token.parse::<f64>().unwrap_or(0.0)
+}
+
+fn crt_format_fixed(value: f64, precision: i32) -> Vec<u8> {
+    if !value.is_finite() {
+        return if value.is_nan() { b"nan".to_vec() } else { b"inf".to_vec() };
+    }
+    format!("{:.*}", precision.max(0) as usize, value).into_bytes()
+}
+
+fn crt_format_exponential(value: f64, precision: i32, uppercase: bool) -> Vec<u8> {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            b"nan".to_vec()
+        } else {
+            b"inf".to_vec()
+        };
+    }
+    if value == 0.0 {
+        let mut out = format!("0.{:0width$}", "", width = precision.max(0) as usize).into_bytes();
+        out.push(if uppercase { b'E' } else { b'e' });
+        out.extend_from_slice(b"+00");
+        return out;
+    }
+    // Normalise to d.ddd… × 10^exp
+    let mut exponent = value.log10().floor() as i32;
+    let mut mantissa = value / 10f64.powi(exponent);
+    // Rounding can push the mantissa past 10 (e.g. 9.9999… → 10.0).
+    if mantissa >= 10.0 {
+        mantissa /= 10.0;
+        exponent += 1;
+    }
+    let precision = precision.max(0) as usize;
+    let mut out = format!("{:.*}", precision, mantissa).into_bytes();
+    out.push(if uppercase { b'E' } else { b'e' });
+    if exponent < 0 {
+        out.push(b'-');
+        exponent = exponent.saturating_abs();
+    } else {
+        out.push(b'+');
+    }
+    out.extend_from_slice(format!("{exponent:02}").as_bytes());
+    out
+}
+
+fn crt_format_general(value: f64, precision: i32, uppercase: bool, _hash: bool) -> Vec<u8> {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            b"nan".to_vec()
+        } else {
+            b"inf".to_vec()
+        };
+    }
+    let precision = precision.max(1) as usize;
+    if value == 0.0 {
+        return vec![b'0'];
+    }
+    let exponent = value.abs().log10().floor() as i32;
+    if exponent < -4 || exponent >= precision as i32 {
+        // %e with precision-1, then strip trailing zeros from the mantissa.
+        let mut out = crt_format_exponential(value, (precision.saturating_sub(1)) as i32, uppercase);
+        if let Some(e_pos) = out.iter().position(|byte| *byte == b'e' || *byte == b'E') {
+            let mut mantissa = out[..e_pos].to_vec();
+            while mantissa.len() > 2 && mantissa.last() == Some(&b'0') {
+                mantissa.pop();
+            }
+            let mut rest = out[e_pos..].to_vec();
+            mantissa.append(&mut rest);
+            out = mantissa;
+        }
+        out
+    } else {
+        let mut out = crt_format_fixed(value, (precision as i32 - exponent - 1).max(0));
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
+        if out.last() == Some(&b'.') {
+            out.pop();
+        }
+        out
+    }
 }
 
 fn read_c_string(memory: &MemoryImage, address: u64) -> AppResult<String> {
@@ -70211,6 +74129,11 @@ mod tests {
 
     #[test]
     fn wait_for_single_object_pumps_pending_guest_thread() {
+        // The guest-callback decode path (the generated x86 decoder probes a
+        // ~185 KiB stack frame) plus the GE setup consumes nearly all of
+        // libtest's default 2 MiB thread stack; run on an 8 MiB stack so the
+        // test is not dependent on compiler codegen details.
+        with_big_stack(|| {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(
             temp_dir.path(),
@@ -70268,6 +74191,7 @@ mod tests {
                 .expect("thread exit code after wait"),
             Some(7)
         );
+        })
     }
 
     #[test]
@@ -75846,6 +79770,952 @@ mod tests {
         assert_eq!(live_frame.width, 2);
         assert_eq!(live_frame.height, 1);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Patch 6b: CRT / UCRT / MSVCRT host-thunk surface tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Build an x86 runtime with a guest TLS vector mirroring the loader's
+    /// setup (static block in slot 0) so the errno slot machinery is active.
+    fn setup_crt_test_runtime() -> (TempDir, PeHostRuntime, MemoryImage) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "crt-p6b", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let static_tls_block = runtime
+            .alloc_zeroed(&mut memory, 0x2000, 16)
+            .expect("static tls block");
+        runtime.tls_vector_ptr = runtime
+            .alloc_zeroed(&mut memory, 4096 * 4, 16)
+            .expect("tls vector");
+        runtime.tls_slots.insert(0, static_tls_block);
+        runtime
+            .sync_guest_tls_slot(&mut memory, 0, static_tls_block)
+            .expect("sync tls slot 0");
+        (temp_dir, runtime, memory)
+    }
+
+    fn write_x86_stub(memory: &mut MemoryImage, address: u64, bytes: &[u8]) {
+        memory.map_bytes(address, bytes);
+    }
+
+    /// Guest callback: `mov eax, <addr>; mov dword ptr [eax], <marker>; ret`.
+    fn marker_callback(address: u64, marker: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0xB8);
+        bytes.extend_from_slice(&(address as u32).to_le_bytes());
+        bytes.push(0xC7);
+        bytes.push(0x00);
+        bytes.extend_from_slice(&marker.to_le_bytes());
+        bytes.push(0xC3);
+        bytes
+    }
+
+    /// Guest qsort comparator: `int cmp(const void* a, const void* b)
+    /// { return *(int*)a - *(int*)b; }` (x86 cdecl).
+    fn qsort_compare_stub() -> Vec<u8> {
+        vec![
+            0x8B, 0x44, 0x24, 0x04, // mov eax, [esp+4]  (eax = a)
+            0x8B, 0x4C, 0x24, 0x08, // mov ecx, [esp+8]  (ecx = b)
+            0x8B, 0x10, // mov edx, [eax]  (edx = *a)
+            0x8B, 0x01, // mov eax, [ecx]  (eax = *b)
+            0x29, 0xC2, // sub edx, eax    (edx = *a - *b)
+            0x89, 0xD0, // mov eax, edx
+            0xC3, // ret
+        ]
+    }
+
+    /// Dispatch a thunk with a custom arg list and return dispatch_import's
+    /// Option<i32> result (needed to observe abort/exit propagation).
+    ///
+    /// The stack region is mapped generously (0x40_000..0x50_200) because
+    /// guest callbacks (invalid-parameter handlers, comparators) receive
+    /// their synthetic frames BELOW the current RSP.
+    fn dispatch_x86_thunk_result(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u32],
+    ) -> Option<i32> {
+        let stack = 0x50_000;
+        memory.map_bytes(0x40_000, &[0_u8; 0x12_200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch x86 thunk")
+    }
+
+    /// Run a closure on a thread with an 8 MiB stack.  Guest-callback
+    /// execution nests several decode frames, and the generated x86 decoder
+    /// has a large stack frame that overflows libtest's 2 MiB default
+    /// thread stack.
+    fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn big-stack thread")
+            .join()
+            .expect("big-stack thread panicked")
+    }
+
+    /// Dispatch a CRT thunk with the same big-stack setup as
+    /// `dispatch_x86_thunk_result` (guest callbacks push frames below RSP).
+    fn dispatch_x86_thunk_crt(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u32],
+    ) -> u64 {
+        let stack = 0x50_000;
+        memory.map_bytes(0x40_000, &[0_u8; 0x12_200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch x86 thunk");
+        state.get(Register::Rax)
+    }
+
+    #[test]
+    fn crt_errno_roundtrip_and_pointer_matches_tls_slot() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let set_errno = runtime.alloc_host_thunk(HostThunk::SetErrno);
+        let get_errno = runtime.alloc_host_thunk(HostThunk::GetErrno);
+        let errno_fn = runtime.alloc_host_thunk(HostThunk::CrtErrno);
+
+        let previous = dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[42]);
+        assert_eq!(previous, 0);
+        let out = 0x61_000;
+        memory.map_bytes(out, &[0_u8; 4]);
+        let status = dispatch_x86_thunk(&mut runtime, &mut memory, get_errno, &[out as u32]);
+        assert_eq!(status, 0);
+        assert_eq!(read_u32(&memory, out).expect("errno out"), 42);
+
+        let errno_ptr = dispatch_x86_thunk(&mut runtime, &mut memory, errno_fn, &[]);
+        assert_ne!(errno_ptr, 0);
+        assert_eq!(read_u32(&memory, errno_ptr).expect("errno int"), 42);
+        // The returned pointer must be the value stored in the guest TLS
+        // vector at the reserved errno slot (tls_vector_ptr + slot*ptr_size).
+        let slot = runtime.crt_errno_slot;
+        assert_ne!(slot, 0);
+        let slot_value = read_guest_pointer(
+            &memory,
+            runtime.tls_vector_ptr + u64::from(slot) * 4,
+            GuestArch::X86,
+        )
+        .expect("tls slot value");
+        assert_eq!(slot_value, errno_ptr);
+
+        // _set_errno returns the previous value.
+        let previous = dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[7]);
+        assert_eq!(previous, 42);
+        let status = dispatch_x86_thunk(&mut runtime, &mut memory, get_errno, &[out as u32]);
+        assert_eq!(status, 0);
+        assert_eq!(read_u32(&memory, out).expect("errno out"), 7);
+
+        // The guest can write the errno int directly through the pointer.
+        memory.map_bytes(errno_ptr, &99_i32.to_le_bytes());
+        assert_eq!(runtime.crt_errno_get(&mut memory), 99);
+    }
+
+    #[test]
+    fn crt_doserrno_uses_same_slot_convention() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let doserrno_fn = runtime.alloc_host_thunk(HostThunk::CrtDoserrno);
+        let doserrno_ptr = dispatch_x86_thunk(&mut runtime, &mut memory, doserrno_fn, &[]);
+        assert_ne!(doserrno_ptr, 0);
+        let slot = runtime.crt_doserrno_slot;
+        assert_ne!(slot, 0);
+        assert_ne!(slot, runtime.crt_errno_slot);
+        let slot_value = read_guest_pointer(
+            &memory,
+            runtime.tls_vector_ptr + u64::from(slot) * 4,
+            GuestArch::X86,
+        )
+        .expect("tls slot value");
+        assert_eq!(slot_value, doserrno_ptr);
+        runtime.set_crt_doserrno(&mut memory, 2);
+        assert_eq!(read_u32(&memory, doserrno_ptr).expect("doserrno int"), 2);
+    }
+
+    #[test]
+    fn crt_fopen_missing_file_sets_errno_enoent() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let path = runtime
+            .alloc_c_string(&mut memory, "C:\\no\\such\\file.txt")
+            .expect("path");
+        let mode = runtime.alloc_c_string(&mut memory, "r").expect("mode");
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path as u32, mode as u32],
+        );
+        assert_eq!(fp, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ENOENT);
+        // GetLastError is NOT set by CRT functions.
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn crt_vfprintf_produces_exact_output() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%s %d %x|%05d|%-4d|%+d|%#x|%c")
+            .expect("format");
+        let s = runtime.alloc_c_string(&mut memory, "hello").expect("str");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        write_u32(&mut memory, va_area, s as u32);
+        write_u32(&mut memory, va_area + 4, 255);
+        write_u32(&mut memory, va_area + 8, 0xBEEF);
+        write_u32(&mut memory, va_area + 12, 42);
+        write_u32(&mut memory, va_area + 16, 7);
+        write_u32(&mut memory, va_area + 20, 12);
+        write_u32(&mut memory, va_area + 24, 0xCAFE);
+        write_u32(&mut memory, va_area + 28, b'Z' as u32);
+        let stream = runtime.globals.iob_streams[1]; // stdout
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(written, "hello 255 beef|00042|7   |+12|0xcafe|Z".len() as u64);
+        assert_eq!(runtime.stdout, "hello 255 beef|00042|7   |+12|0xcafe|Z");
+        assert_eq!(runtime.stderr, "");
+    }
+
+    #[test]
+    fn crt_vfprintf_wide_string_and_float_conversions() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%S|%.2f|%e|%g")
+            .expect("format");
+        let wide = runtime
+            .alloc_utf16_string(&mut memory, "wide!")
+            .expect("wide");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        write_u32(&mut memory, va_area, wide as u32);
+        let double_bits = 3.25f64.to_bits();
+        write_u32(&mut memory, va_area + 4, double_bits as u32);
+        write_u32(&mut memory, va_area + 8, (double_bits >> 32) as u32);
+        write_u32(&mut memory, va_area + 12, double_bits as u32);
+        write_u32(&mut memory, va_area + 16, (double_bits >> 32) as u32);
+        write_u32(&mut memory, va_area + 20, double_bits as u32);
+        write_u32(&mut memory, va_area + 24, (double_bits >> 32) as u32);
+        let stream = runtime.globals.iob_streams[1];
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(runtime.stdout, "wide!|3.25|3.250000e+00|3.25");
+    }
+
+    #[test]
+    fn crt_vsnprintf_s_truncation_returns_required_and_terminates() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vsnprintf_s = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintfS);
+        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 16]);
+        write_u32(&mut memory, va_area, 12_345);
+        let buffer = 0x62_000;
+        memory.map_bytes(buffer, &[0xAA_u8; 16]);
+
+        // Truncation: required size returned, NUL-terminated prefix, ERANGE.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsnprintf_s,
+            &[0, buffer as u32, 3, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(ret, 5);
+        assert_eq!(
+            memory.read_bytes(buffer, 3).expect("buffer"),
+            [b'1', b'2', 0]
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+        // The truncation aborted the guest (no handler installed); clear
+        // errno for the success case below.
+        let set_errno = runtime.alloc_host_thunk(HostThunk::SetErrno);
+        dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
+
+        // Success: full string + NUL, no errno.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsnprintf_s,
+            &[0, buffer as u32, 16, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(ret, 5);
+        assert_eq!(
+            memory.read_bytes(buffer, 6).expect("buffer"),
+            [b'1', b'2', b'3', b'4', b'5', 0]
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), 0);
+    }
+
+    #[test]
+    fn crt_vsnprintf_legacy_returns_minus_one_on_overflow() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vsnprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintf);
+        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 16]);
+        write_u32(&mut memory, va_area, 999);
+        let buffer = 0x62_000;
+        memory.map_bytes(buffer, &[0xAA_u8; 16]);
+
+        // Legacy _vsnprintf: overflow → -1, buffer untouched and unterminated.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsnprintf,
+            &[0, buffer as u32, 2, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(ret, (-1_i32) as u32 as u64);
+        assert_eq!(memory.read_bytes(buffer, 4).expect("buffer"), [0xAA; 4]);
+
+        // Fits → written + NUL.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsnprintf,
+            &[0, buffer as u32, 8, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(ret, 3);
+        assert_eq!(
+            memory.read_bytes(buffer, 4).expect("buffer"),
+            [b'9', b'9', b'9', 0]
+        );
+
+        // Query idiom: NULL buffer + 0 count → required size.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsnprintf,
+            &[0, 0, 0, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(ret, 3);
+    }
+
+    #[test]
+    fn crt_invalid_parameter_invokes_guest_handler() {
+        with_big_stack(|| {
+            let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+            let marker_addr = 0x70_000;
+            write_x86_stub(
+                &mut memory,
+                0x70_100,
+                &marker_callback(marker_addr, 0xCAFE_5EED),
+            );
+            let set_handler = runtime.alloc_host_thunk(HostThunk::SetInvalidParameterHandler);
+            let previous =
+                dispatch_x86_thunk_crt(&mut runtime, &mut memory, set_handler, &[0x70_100]);
+            assert_eq!(previous, 0);
+
+            let strcpy_s = runtime.alloc_host_thunk(HostThunk::StrcpyS);
+            let dst = 0x62_000;
+            memory.map_bytes(dst, &[0_u8; 8]);
+            let src = runtime.alloc_c_string(&mut memory, "hello").expect("src");
+            // dst capacity 4 < 6 (strlen("hello") + 1) → ERANGE, handler
+            // invoked, destination reset to the empty string.
+            dispatch_x86_thunk_crt(
+                &mut runtime,
+                &mut memory,
+                strcpy_s,
+                &[dst as u32, 4, src as u32],
+            );
+            assert_eq!(
+                read_u32(&memory, marker_addr).expect("marker"),
+                0xCAFE_5EED
+            );
+            assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+            assert_eq!(memory.read_u8(dst).expect("dst[0]"), 0);
+        })
+    }
+
+    #[test]
+    fn crt_invalid_parameter_without_handler_aborts() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strcpy_s = runtime.alloc_host_thunk(HostThunk::StrcpyS);
+        let src = runtime.alloc_c_string(&mut memory, "hello").expect("src");
+        // NULL destination with no handler installed → abort (exit code 134).
+        let result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            strcpy_s,
+            &[0, 4, src as u32],
+        );
+        assert_eq!(result, Some(134));
+    }
+
+    #[test]
+    fn crt_strcpy_s_success_and_truncation() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        // Success path (no handler needed — no error).
+        let strcpy_s = runtime.alloc_host_thunk(HostThunk::StrcpyS);
+        let dst = 0x62_000;
+        memory.map_bytes(dst, &[0xAA_u8; 16]);
+        let src = runtime.alloc_c_string(&mut memory, "abc").expect("src");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strcpy_s,
+            &[dst as u32, 16, src as u32],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(memory.read_bytes(dst, 4).expect("dst"), [b'a', b'b', b'c', 0]);
+
+        // Truncation resets the destination and aborts (no handler).
+        let result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            strcpy_s,
+            &[dst as u32, 3, src as u32],
+        );
+        assert_eq!(result, Some(134));
+        assert_eq!(memory.read_u8(dst).expect("dst[0]"), 0);
+    }
+
+    #[test]
+    fn crt_strncpy_pads_and_cmp_family() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strncpy = runtime.alloc_host_thunk(HostThunk::Strncpy);
+        let strcmp = runtime.alloc_host_thunk(HostThunk::Strcmp);
+        let stricmp = runtime.alloc_host_thunk(HostThunk::Stricmp);
+        let strchr = runtime.alloc_host_thunk(HostThunk::Strchr);
+        let strstr = runtime.alloc_host_thunk(HostThunk::Strstr);
+
+        // strncpy pads with NULs when the source is shorter than count.
+        let dst = 0x62_000;
+        memory.map_bytes(dst, &[0xAA_u8; 16]);
+        let src = runtime.alloc_c_string(&mut memory, "ab").expect("src");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncpy,
+            &[dst as u32, src as u32, 8],
+        );
+        assert_eq!(ret, dst);
+        let bytes = memory.read_bytes(dst, 8).expect("dst");
+        assert_eq!(&bytes[..2], b"ab");
+        assert_eq!(&bytes[2..], &[0_u8; 6]);
+
+        // strncpy does NOT terminate when the source fills the count.
+        memory.map_bytes(dst, &[0xAA_u8; 16]);
+        let src_long = runtime.alloc_c_string(&mut memory, "abcdef").expect("src");
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncpy,
+            &[dst as u32, src_long as u32, 3],
+        );
+        assert_eq!(memory.read_bytes(dst, 4).expect("dst"), [b'a', b'b', b'c', 0xAA]);
+
+        // strcmp: exact match 0, differing bytes give the signed diff.
+        let a = runtime.alloc_c_string(&mut memory, "abc").expect("a");
+        let b = runtime.alloc_c_string(&mut memory, "abc").expect("b");
+        let c = runtime.alloc_c_string(&mut memory, "abd").expect("c");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, strcmp, &[a as u32, b as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, strcmp, &[a as u32, c as u32]),
+            (-1_i32) as u32 as u64
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, strcmp, &[c as u32, a as u32]),
+            1
+        );
+
+        // _stricmp is case-insensitive.
+        let upper = runtime.alloc_c_string(&mut memory, "AbC").expect("u");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, stricmp, &[upper as u32, b as u32]),
+            0
+        );
+
+        // strchr / strstr return pointers.
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strchr,
+            &[a as u32, b'c' as u32],
+        );
+        assert_eq!(found, a + 2);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                strchr,
+                &[a as u32, b'z' as u32],
+            ),
+            0
+        );
+        let haystack = runtime.alloc_c_string(&mut memory, "hello world").expect("h");
+        let needle = runtime.alloc_c_string(&mut memory, "world").expect("n");
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strstr,
+            &[haystack as u32, needle as u32],
+        );
+        assert_eq!(found, haystack + 6);
+    }
+
+    #[test]
+    fn crt_strtol_endptr_and_erange() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strtol = runtime.alloc_host_thunk(HostThunk::Strtol);
+
+        // base 0 with 0x prefix; endptr advances past the consumed digits.
+        let s = runtime.alloc_c_string(&mut memory, "  0x1F rest").expect("s");
+        let end = 0x61_000;
+        memory.map_bytes(end, &[0_u8; 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtol,
+            &[s as u32, end as u32, 0],
+        );
+        assert_eq!(ret, 31);
+        assert_eq!(read_u32(&memory, end).expect("end"), (s + 6) as u32);
+
+        // Overflow clamps to LONG_MAX and sets errno ERANGE.
+        let big = runtime.alloc_c_string(&mut memory, "99999999999").expect("big");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtol,
+            &[big as u32, 0, 10],
+        );
+        assert_eq!(ret, i32::MAX as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+
+        // No conversion: endptr stays at nptr, value 0.
+        let bad = runtime.alloc_c_string(&mut memory, "xyz").expect("bad");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtol,
+            &[bad as u32, end as u32, 10],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(read_u32(&memory, end).expect("end"), bad as u32);
+    }
+
+    #[test]
+    fn crt_qsort_sorts_with_guest_comparator() {
+        with_big_stack(|| {
+            let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+            write_x86_stub(&mut memory, 0x70_200, &qsort_compare_stub());
+            let qsort = runtime.alloc_host_thunk(HostThunk::Qsort);
+            let base = 0x64_000;
+            let initial = [5_i32, 2, 8, 1, 9, 3];
+            let mut bytes = Vec::new();
+            for value in initial {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            memory.map_bytes(base, &bytes);
+            dispatch_x86_thunk_crt(
+                &mut runtime,
+                &mut memory,
+                qsort,
+                &[base as u32, 6, 4, 0x70_200],
+            );
+            let sorted = memory.read_bytes(base, 24).expect("sorted");
+            let mut values = Vec::new();
+            for chunk in sorted.chunks_exact(4) {
+                values.push(i32::from_le_bytes(chunk.try_into().expect("chunk")));
+            }
+            assert_eq!(values, vec![1, 2, 3, 5, 8, 9]);
+        })
+    }
+
+    #[test]
+    fn crt_getcwd_full_and_erange() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime.current_directory = "C:\\games\\test".to_string();
+        let getcwd = runtime.alloc_host_thunk(HostThunk::Getcwd);
+
+        let buf = 0x62_000;
+        memory.map_bytes(buf, &[0_u8; 64]);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, getcwd, &[buf as u32, 64]);
+        assert_eq!(ret, buf);
+        assert_eq!(read_c_string(&memory, buf).expect("cwd"), "C:\\games\\test");
+
+        // Small buffer → NULL + ERANGE.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, getcwd, &[buf as u32, 4]);
+        assert_eq!(ret, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+
+        // NULL buffer → malloc'd result.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, getcwd, &[0, 0]);
+        assert_ne!(ret, 0);
+        assert_eq!(read_c_string(&memory, ret).expect("cwd"), "C:\\games\\test");
+    }
+
+    #[test]
+    fn crt_access_readonly_and_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let guest_path = "C:\\game\\ro.txt";
+        write_guest_pe_file(&runtime, guest_path, b"data");
+        let host_path = runtime
+            .win32
+            .guest_path_to_host_path(guest_path)
+            .expect("host path");
+        fs::set_permissions(&host_path, fs::Permissions::from_mode(0o444)).expect("readonly");
+        let access = runtime.alloc_host_thunk(HostThunk::Access);
+        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+
+        // mode 2 (W_OK) on a read-only file → -1 + EACCES.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, access, &[path_ptr as u32, 2]);
+        assert_eq!(ret, (-1_i32) as u32 as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), EACCES);
+
+        // mode 0 / 4 succeed on an existing file.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, access, &[path_ptr as u32, 0]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, access, &[path_ptr as u32, 4]),
+            0
+        );
+
+        // Missing file → -1 + ENOENT.
+        let missing = runtime
+            .alloc_c_string(&mut memory, "C:\\game\\missing.txt")
+            .expect("missing");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            access,
+            &[missing as u32, 0],
+        );
+        assert_eq!(ret, (-1_i32) as u32 as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ENOENT);
+    }
+
+    #[test]
+    fn crt_stat_fills_mode_and_size() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let guest_path = "C:\\game\\st.txt";
+        write_guest_pe_file(&runtime, guest_path, b"hello world");
+        let stat = runtime.alloc_host_thunk(HostThunk::Stat);
+        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+        let stat_buf = 0x62_000;
+        memory.map_bytes(stat_buf, &[0_u8; 64]);
+
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            stat,
+            &[path_ptr as u32, stat_buf as u32],
+        );
+        assert_eq!(ret, 0);
+        // st_mode @8 = S_IFREG | S_IREAD | S_IWRITE (u16 field)
+        assert_eq!(
+            read_u32(&memory, stat_buf + 8).expect("st_mode") & 0xFFFF,
+            0x8180
+        );
+        // st_size @20
+        assert_eq!(read_u32(&memory, stat_buf + 20).expect("st_size"), 11);
+
+        // Directory: st_mode = S_IFDIR | permissions.
+        let dir_ptr = runtime.alloc_c_string(&mut memory, "C:\\game").expect("dir");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            stat,
+            &[dir_ptr as u32, stat_buf as u32],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(
+            read_u32(&memory, stat_buf + 8).expect("st_mode") & 0xF000,
+            S_IFDIR
+        );
+
+        // Missing → -1 + ENOENT.
+        let missing = runtime
+            .alloc_c_string(&mut memory, "C:\\game\\nope.txt")
+            .expect("missing");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            stat,
+            &[missing as u32, stat_buf as u32],
+        );
+        assert_eq!(ret, (-1_i32) as u32 as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ENOENT);
+    }
+
+    #[test]
+    fn crt_dupenv_s_allocates_and_handles_missing() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .process_environment
+            .insert("MY_VAR".to_string(), "value123".to_string());
+        let dupenv_s = runtime.alloc_host_thunk(HostThunk::DupenvS);
+        let name = runtime.alloc_c_string(&mut memory, "MY_VAR").expect("name");
+        let buffer_ptr = 0x61_000;
+        let size_ptr = 0x61_008;
+        memory.map_bytes(buffer_ptr, &[0_u8; 8]);
+        memory.map_bytes(size_ptr, &[0_u8; 8]);
+
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            dupenv_s,
+            &[buffer_ptr as u32, size_ptr as u32, name as u32],
+        );
+        assert_eq!(ret, 0);
+        let allocated =
+            read_guest_pointer(&memory, buffer_ptr, GuestArch::X86).expect("buffer");
+        assert_ne!(allocated, 0);
+        assert_eq!(
+            read_guest_pointer(&memory, size_ptr, GuestArch::X86).expect("size"),
+            9
+        );
+        assert_eq!(read_c_string(&memory, allocated).expect("value"), "value123");
+
+        // Missing variable → NULL buffer, zero size, success.
+        let missing = runtime.alloc_c_string(&mut memory, "NO_SUCH_VAR").expect("missing");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            dupenv_s,
+            &[buffer_ptr as u32, size_ptr as u32, missing as u32],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(
+            read_guest_pointer(&memory, buffer_ptr, GuestArch::X86).expect("buffer"),
+            0
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, size_ptr, GuestArch::X86).expect("size"),
+            0
+        );
+    }
+
+    #[test]
+    fn crt_splitpath_s_parses_components() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let splitpath_s = runtime.alloc_host_thunk(HostThunk::SplitpathS);
+        let path = runtime
+            .alloc_c_string(&mut memory, "C:\\dir\\sub\\file.txt")
+            .expect("path");
+        let drive = 0x62_000;
+        let dir = 0x62_010;
+        let name = 0x62_050;
+        let ext = 0x62_090;
+        memory.map_bytes(drive, &[0_u8; 16]);
+        memory.map_bytes(dir, &[0_u8; 64]);
+        memory.map_bytes(name, &[0_u8; 64]);
+        memory.map_bytes(ext, &[0_u8; 32]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            splitpath_s,
+            &[
+                path as u32,
+                drive as u32,
+                16,
+                dir as u32,
+                64,
+                name as u32,
+                64,
+                ext as u32,
+                32,
+            ],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(read_c_string(&memory, drive).expect("drive"), "C:");
+        assert_eq!(read_c_string(&memory, dir).expect("dir"), "\\dir\\sub\\");
+        assert_eq!(read_c_string(&memory, name).expect("name"), "file");
+        assert_eq!(read_c_string(&memory, ext).expect("ext"), ".txt");
+    }
+
+    #[test]
+    fn crt_fopen_fwrite_fclose_fread_roundtrip() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let fwrite = runtime.alloc_host_thunk(HostThunk::Fwrite);
+        let fread = runtime.alloc_host_thunk(HostThunk::Fread);
+        let fclose = runtime.alloc_host_thunk(HostThunk::Fclose);
+        let ftell = runtime.alloc_host_thunk(HostThunk::Ftell);
+        let fseek = runtime.alloc_host_thunk(HostThunk::Fseek);
+
+        let guest_path = "C:\\game\\io.txt";
+        let host_path = runtime
+            .win32
+            .guest_path_to_host_path(guest_path)
+            .expect("host path");
+        runtime
+            .win32
+            .create_directory_w("C:\\game")
+            .expect("create guest dir");
+        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "w+").expect("mode");
+
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path_ptr as u32, mode_ptr as u32],
+        );
+        assert_ne!(fp, 0);
+
+        // fwrite 11 bytes.
+        let data = b"hello world";
+        let buf = 0x64_000;
+        memory.map_bytes(buf, data);
+        let written =
+            dispatch_x86_thunk(&mut runtime, &mut memory, fwrite, &[buf as u32, 1, 11, fp as u32]);
+        assert_eq!(written, 11);
+
+        // ftell reflects the write position.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, ftell, &[fp as u32]),
+            11
+        );
+
+        // fseek back to start, then fread roundtrip.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, fseek, &[fp as u32, 0, 0]),
+            0
+        );
+        let rbuf = 0x64_100;
+        memory.map_bytes(rbuf, &[0_u8; 16]);
+        let read =
+            dispatch_x86_thunk(&mut runtime, &mut memory, fread, &[rbuf as u32, 1, 11, fp as u32]);
+        assert_eq!(read, 11);
+        assert_eq!(memory.read_bytes(rbuf, 11).expect("readback"), data);
+
+        // fclose → 0; the host file persists.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, fclose, &[fp as u32]),
+            0
+        );
+        assert_eq!(fs::read(&host_path).expect("host file"), data);
+        assert_eq!(runtime.crt_files.len(), 0);
+
+        // Reopen for append: writes land at EOF.
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "a").expect("mode");
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path_ptr as u32, mode_ptr as u32],
+        );
+        assert_ne!(fp, 0);
+        let written =
+            dispatch_x86_thunk(&mut runtime, &mut memory, fwrite, &[buf as u32, 1, 1, fp as u32]);
+        assert_eq!(written, 1);
+        dispatch_x86_thunk(&mut runtime, &mut memory, fclose, &[fp as u32]);
+        let mut expected = data.to_vec();
+        expected.push(b'h');
+        assert_eq!(fs::read(&host_path).expect("host file"), expected);
+    }
+
+    #[test]
+    fn crt_beginthreadex_creates_pending_guest_thread() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        write_x86_stub(&mut memory, 0x70_300, &[0xC3]); // plain ret
+        let beginthreadex = runtime.alloc_host_thunk(HostThunk::Beginthreadex);
+        let tid = 0x61_000;
+        memory.map_bytes(tid, &[0_u8; 4]);
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            beginthreadex,
+            &[0, 0, 0x70_300, 0, 0, tid as u32],
+        );
+        assert_ne!(handle, 0);
+        assert_ne!(read_u32(&memory, tid).expect("tid"), 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+        assert_eq!(runtime.pending_guest_threads[0].start_address, 0x70_300);
+    }
+
+
+    #[test]
+    fn crt_strtoi64_variants() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        // Plain _strtoi64: 64-bit value; low half in EAX, high half in EDX.
+        let strtoi64 = runtime.alloc_host_thunk(HostThunk::Strtoi64);
+        let s = runtime
+            .alloc_c_string(&mut memory, "1234567890123456789")
+            .expect("s");
+        let end = 0x61_000;
+        memory.map_bytes(end, &[0_u8; 4]);
+        let low = dispatch_x86_thunk(&mut runtime, &mut memory, strtoi64, &[s as u32, end as u32, 10]);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, 0x50_000);
+        write_u32(&mut memory, 0x50_000, 0);
+        write_u32(&mut memory, 0x50_004, s as u32);
+        write_u32(&mut memory, 0x50_008, 0);
+        write_u32(&mut memory, 0x50_00C, 10);
+        runtime
+            .dispatch_import(strtoi64, &mut state, &mut memory)
+            .expect("strtoi64");
+        let high = state.get(Register::Rdx);
+        let parsed = low | (high << 32);
+        assert_eq!(parsed, 1_234_567_890_123_456_789_u64);
+
+        // _strtoi64_s: writes through the out-param, returns errno_t.
+        let strtoi64_s = runtime.alloc_host_thunk(HostThunk::Strtoi64S);
+        let out = 0x61_010;
+        memory.map_bytes(out, &[0_u8; 8]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoi64_s,
+            &[s as u32, end as u32, 10, out as u32],
+        );
+        assert_eq!(status, 0);
+        assert_eq!(
+            memory.read_u64(out).expect("value"),
+            1_234_567_890_123_456_789_u64
+        );
+
+        // Overflow: ERANGE status, clamped value written.
+        let big = runtime
+            .alloc_c_string(&mut memory, "99999999999999999999999999")
+            .expect("big");
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoi64_s,
+            &[big as u32, end as u32, 10, out as u32],
+        );
+        assert_eq!(status, ERANGE as u64);
+        assert_eq!(memory.read_u64(out).expect("value"), i64::MAX as u64);
+    }
+
+
+
+
 }
 
 fn read_d3d12_command_queue_desc(
