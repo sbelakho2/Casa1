@@ -254,17 +254,34 @@ const BASIC_BLOCK_MAX_BYTES: usize = 512;
 const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const FILE_READ_DATA: u32 = 0x0000_0001;
+const FILE_LIST_DIRECTORY: u32 = 0x0000_0001; // alias of FILE_READ_DATA
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
+const FILE_ADD_FILE: u32 = 0x0000_0002; // alias of FILE_WRITE_DATA
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
+const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004; // alias of FILE_APPEND_DATA
 const FILE_READ_EA: u32 = 0x0000_0008;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
 const FILE_EXECUTE: u32 = 0x0000_0020;
+const FILE_TRAVERSE: u32 = 0x0000_0020; // alias of FILE_EXECUTE
 const FILE_DELETE_CHILD: u32 = 0x0000_0040;
 const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+const READ_CONTROL: u32 = 0x0002_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const STANDARD_RIGHTS_REQUIRED: u32 = DELETE_ACCESS | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+const FILE_GENERIC_READ: u32 =
+    FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+const FILE_GENERIC_WRITE: u32 =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | READ_CONTROL
+        | SYNCHRONIZE;
+const FILE_GENERIC_EXECUTE: u32 = FILE_READ_ATTRIBUTES | FILE_EXECUTE | FILE_TRAVERSE | SYNCHRONIZE;
+const FILE_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1FF;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
@@ -292,6 +309,7 @@ const TRUNCATE_EXISTING: u32 = 5;
 /// comfortably covers `\\?\` extended-length paths.
 const MAX_CREATE_FILE_PATH_UTF16_UNITS: usize = 32_768;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0800_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
@@ -28396,8 +28414,10 @@ impl PeHostRuntime {
                 let creation_raw = guest_call_arg_u32(state, memory, 4)?;
                 let flags_and_attributes = guest_call_arg_u32(state, memory, 5)?;
                 let template_file = guest_call_arg(state, memory, 6)?;
-                let desired_access = file_access_from_win32(desired_access_raw);
+                let granted_access = expand_generic_access(desired_access_raw);
+                let desired_access = file_access_from_win32(granted_access);
                 let share_mode = share_mode_from_win32(share_mode_raw);
+                let delete_on_close = flags_and_attributes & FILE_FLAG_DELETE_ON_CLOSE != 0;
                 let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let inheritable = if security_attributes == 0 {
                     false
@@ -28514,7 +28534,7 @@ impl PeHostRuntime {
                                 // NTFS Alternate Data Stream path detected.
                                 // Open the base file and register the ADS handle mapping.
                                 match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                                    self.win32.create_file_w(
+                                    self.win32.create_file_w_extended(
                                         &base_guest_path,
                                         desired_access,
                                         share_mode,
@@ -28522,6 +28542,8 @@ impl PeHostRuntime {
                                         inheritable,
                                         flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
                                         flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                        granted_access,
+                                        delete_on_close,
                                     )
                                 }) {
                                     Ok(handle) => {
@@ -28617,7 +28639,7 @@ impl PeHostRuntime {
                             } else {
                                 // Normal (non-ADS) file creation
                                 match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                                    self.win32.create_file_w(
+                                    self.win32.create_file_w_extended(
                                         &path,
                                         desired_access,
                                         share_mode,
@@ -28625,6 +28647,8 @@ impl PeHostRuntime {
                                         inheritable,
                                         flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
                                         flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                        granted_access,
+                                        delete_on_close,
                                     )
                                 }) {
                                     Ok(handle) => {
@@ -37338,8 +37362,10 @@ impl PeHostRuntime {
                 let creation_raw = arg(4) as u32;
                 let flags_and_attributes = arg(5) as u32;
                 let template_file = arg(6);
-                let desired_access = file_access_from_win32(desired_access_raw);
+                let granted_access = expand_generic_access(desired_access_raw);
+                let desired_access = file_access_from_win32(granted_access);
                 let share_mode = share_mode_from_win32(share_mode_raw);
+                let delete_on_close = flags_and_attributes & FILE_FLAG_DELETE_ON_CLOSE != 0;
                 let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let inheritable = if security_attributes == 0 { false } else { read_u32(memory, security_attributes + inherit_offset).unwrap_or(0) != 0 };
                 if raw_path.starts_with("\\\\.\\pipe\\") || raw_path.starts_with("\\\\?\\pipe\\") {
@@ -37386,7 +37412,7 @@ impl PeHostRuntime {
                                 _ => false,
                             };
                             match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                                self.win32.create_file_w(
+                                self.win32.create_file_w_extended(
                                     &path,
                                     desired_access,
                                     share_mode,
@@ -37394,6 +37420,8 @@ impl PeHostRuntime {
                                     inheritable,
                                     flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
                                     flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                    granted_access,
+                                    delete_on_close,
                                 )
                             }) {
                                 Ok(handle) => {
@@ -66683,13 +66711,44 @@ fn build_windows_command_line(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+/// Expand the Win32 `GENERIC_*` access bits into their concrete
+/// `FILE_*`/standard-right equivalents, as `NtCreateFile` does when
+/// `CreateFile`-style desired-access values are passed in.  The expanded mask
+/// is what gets stored as the handle's granted access and what subsequent
+/// per-operation access checks are evaluated against; a bare `GENERIC_READ`
+/// must not implicitly grant `FILE_WRITE_*` bits, and vice versa.
+fn expand_generic_access(desired_access: u32) -> u32 {
+    const GENERIC_BITS: u32 = GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL;
+    let mut expanded = desired_access & !GENERIC_BITS;
+    if desired_access & GENERIC_READ != 0 {
+        expanded |= FILE_GENERIC_READ;
+    }
+    if desired_access & GENERIC_WRITE != 0 {
+        expanded |= FILE_GENERIC_WRITE;
+    }
+    if desired_access & GENERIC_EXECUTE != 0 {
+        expanded |= FILE_GENERIC_EXECUTE;
+    }
+    if desired_access & GENERIC_ALL != 0 {
+        expanded |= FILE_ALL_ACCESS;
+    }
+    expanded
+}
+
+/// Project a full Win32 file-rights mask onto the three-boolean
+/// `crate::ge::FileAccess` used by the GE filesystem layer.
+///
+/// This is a deliberate compatibility projection: the GE layer reasons about
+/// read/write/delete intent, while the full expanded rights mask is retained
+/// on the handle for per-operation enforcement (see `require_access` in
+/// win32.rs).  `FILE_EXECUTE` deliberately does NOT imply read-data: execute
+/// access alone must not allow reading the file's contents.
 fn file_access_from_win32(desired_access: u32) -> crate::ge::FileAccess {
     let read_bits = GENERIC_READ
         | GENERIC_ALL
         | FILE_READ_DATA
         | FILE_READ_EA
-        | FILE_READ_ATTRIBUTES
-        | FILE_EXECUTE;
+        | FILE_READ_ATTRIBUTES;
     let write_bits = GENERIC_WRITE
         | GENERIC_ALL
         | FILE_WRITE_DATA
@@ -68071,6 +68130,384 @@ mod tests {
                 .host_path_for_windows_path(r"C:\package\bogus-template.tmp")
                 .expect("host path")
                 .exists()
+        );
+    }
+
+    // ── File access-right mapping tests ─────────────────────────────────
+
+    #[test]
+    fn expand_generic_access_read_maps_to_file_generic_read() {
+        assert_eq!(expand_generic_access(GENERIC_READ), FILE_GENERIC_READ);
+    }
+
+    #[test]
+    fn expand_generic_access_write_maps_to_file_generic_write() {
+        assert_eq!(expand_generic_access(GENERIC_WRITE), FILE_GENERIC_WRITE);
+    }
+
+    #[test]
+    fn expand_generic_access_execute_maps_to_file_generic_execute() {
+        assert_eq!(expand_generic_access(GENERIC_EXECUTE), FILE_GENERIC_EXECUTE);
+    }
+
+    #[test]
+    fn expand_generic_access_all_maps_to_file_all_access() {
+        assert_eq!(expand_generic_access(GENERIC_ALL), FILE_ALL_ACCESS);
+    }
+
+    #[test]
+    fn expand_generic_access_passes_through_file_bits() {
+        assert_eq!(
+            expand_generic_access(FILE_WRITE_DATA | FILE_READ_ATTRIBUTES),
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES
+        );
+        assert_eq!(expand_generic_access(0), 0);
+    }
+
+    #[test]
+    fn expand_generic_access_combines_generic_and_file_bits() {
+        assert_eq!(
+            expand_generic_access(GENERIC_READ | FILE_WRITE_DATA),
+            FILE_GENERIC_READ | FILE_WRITE_DATA
+        );
+    }
+
+    #[test]
+    fn file_execute_does_not_imply_read() {
+        let access = file_access_from_win32(FILE_EXECUTE);
+        assert!(
+            !access.read,
+            "FILE_EXECUTE must not imply read-data access"
+        );
+        assert!(!access.write);
+        assert!(!access.delete);
+    }
+
+    #[test]
+    fn read_file_denied_on_write_only_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "read-denied", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\deny-read.tmp")
+            .expect("path");
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let buffer = 0x30_000_u32;
+        memory.map_bytes(buffer as u64, &[0_u8; 64]);
+        let read_file = runtime.alloc_host_thunk(HostThunk::ReadFile);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_file,
+            &[handle as u32, buffer, 16, 0, 0],
+        );
+        assert_eq!(result, 0, "ReadFile must fail on a write-only handle");
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+    }
+
+    #[test]
+    fn write_file_denied_on_read_only_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "write-denied", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\deny-write.tmp")
+            .expect("path");
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let buffer = 0x30_000_u32;
+        memory.map_bytes(buffer as u64, b"data");
+        let write_file = runtime.alloc_host_thunk(HostThunk::WriteFile);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            write_file,
+            &[handle as u32, buffer, 4, 0, 0],
+        );
+        assert_eq!(result, 0, "WriteFile must fail on a read-only handle");
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+    }
+
+    #[test]
+    fn set_file_pointer_denied_without_read_write() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "seek-denied", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\deny-seek.tmp")
+            .expect("path");
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_EXECUTE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let set_file_pointer = runtime.alloc_host_thunk(HostThunk::SetFilePointerEx);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_file_pointer,
+            &[handle as u32, 0, 0, 1, 0],
+        );
+        assert_eq!(
+            result, 0,
+            "SetFilePointerEx must fail on a handle granted neither read nor write"
+        );
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+    }
+
+    #[test]
+    fn create_always_share_conflict_does_not_truncate() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "ca-share-conflict",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\exclusive.tmp")
+            .expect("path");
+
+        // First open: exclusive (share=0), read+write.
+        let h1 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(h1, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        // Write distinguishable content through the first handle.
+        let buffer = 0x30_000_u32;
+        memory.map_bytes(buffer as u64, b"important-content");
+        let write_file = runtime.alloc_host_thunk(HostThunk::WriteFile);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            write_file,
+            &[h1 as u32, buffer, 17, 0, 0],
+        );
+        assert_eq!(written, 1);
+
+        // CREATE_ALWAYS on the same path with incompatible share (0) must
+        // fail with ERROR_SHARING_VIOLATION *before* any truncation.
+        let h2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_WRITE,
+                0,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
+        assert_eq!(h2, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_SHARING_VIOLATION);
+
+        // Close the exclusive handle, reopen, and verify the content
+        // survived the failed CREATE_ALWAYS.
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h1 as u32]);
+
+        let h3 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                OPEN_EXISTING,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(h3, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let read_buffer = 0x31_000_u32;
+        memory.map_bytes(read_buffer as u64, &[0_u8; 64]);
+        let read_file = runtime.alloc_host_thunk(HostThunk::ReadFile);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_file,
+            &[h3 as u32, read_buffer, 64, 0, 0],
+        );
+        assert_eq!(result, 1);
+        let bytes = memory
+            .read_bytes(read_buffer as u64, 17)
+            .expect("read guest buffer");
+        assert_eq!(
+            bytes,
+            b"important-content",
+            "CREATE_ALWAYS share conflict must not truncate the file"
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h3 as u32]);
+    }
+
+    #[test]
+    fn delete_on_close_removes_file() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "delete-on-close",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\delete-on-close.tmp")
+            .expect("path");
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                FILE_FLAG_DELETE_ON_CLOSE,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        let host_path = runtime
+            .win32
+            .ge()
+            .host_path_for_windows_path(r"C:\package\delete-on-close.tmp")
+            .expect("host path");
+        assert!(host_path.exists(), "file exists before close");
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+        assert_eq!(result, 1);
+        assert!(
+            !host_path.exists(),
+            "FILE_FLAG_DELETE_ON_CLOSE must remove the file on CloseHandle"
         );
     }
 

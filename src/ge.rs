@@ -1180,6 +1180,20 @@ impl GameEnvironment {
         })
     }
 
+    /// Whether `DeleteFile`-style deletion of `windows_path` is permitted by
+    /// the share-state matrix: `true` when no open handle exists for the
+    /// path, or every open handle was opened with `FILE_SHARE_DELETE`.
+    /// Mirrors the Windows rule that a file may be deleted while handles are
+    /// open only if those handles share delete access.
+    pub fn check_delete_sharing(&self, windows_path: &str) -> AppResult<bool> {
+        let resolved = self.resolve_existing_path(windows_path, None, 0)?;
+        self.with_shared_file_runtime(|runtime| {
+            Ok(runtime.open_handles.iter().all(|state| {
+                state.normalized_path != resolved.normalized_path || state.share_mode.delete
+            }))
+        })
+    }
+
     pub fn lock_file_range(
         &self,
         handle: &FileHandle,

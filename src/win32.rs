@@ -30,6 +30,68 @@ const MAX_COMMIT_PAGES: u64 = 0x10_0000;
 /// unbounded host-side block would starve the signaler and hang the guest.
 const BLOCKING_POLL_ITERATIONS: usize = 5000;
 
+// ── Win32 file access-right constants ────────────────────────────────────────
+// The raw `FILE_*` / standard-right bits as defined by winnt.h.  Handles
+// carry the EXPANDED desired-access mask (generic bits replaced by their
+// concrete equivalents) and every per-operation check evaluates against it.
+const FILE_READ_DATA: u32 = 0x0000_0001;
+const FILE_WRITE_DATA: u32 = 0x0000_0002;
+const FILE_APPEND_DATA: u32 = 0x0000_0004;
+const FILE_READ_EA: u32 = 0x0000_0008;
+const FILE_WRITE_EA: u32 = 0x0000_0010;
+const FILE_EXECUTE: u32 = 0x0000_0020;
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+const DELETE_ACCESS: u32 = 0x0001_0000;
+const READ_CONTROL: u32 = 0x0002_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const STANDARD_RIGHTS_REQUIRED: u32 = DELETE_ACCESS | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+const FILE_GENERIC_READ: u32 =
+    FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+const FILE_GENERIC_WRITE: u32 =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | READ_CONTROL
+        | SYNCHRONIZE;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+/// Reconstruct the raw `FILE_SHARE_*` flag value from the GE `ShareMode`
+/// triple.  The projection is exact (each bool maps to one bit), so handles
+/// can record the raw share mode for share-state bookkeeping.
+fn share_mode_to_raw(share_mode: ShareMode) -> u32 {
+    let mut raw = 0;
+    if share_mode.read {
+        raw |= FILE_SHARE_READ;
+    }
+    if share_mode.write {
+        raw |= FILE_SHARE_WRITE;
+    }
+    if share_mode.delete {
+        raw |= FILE_SHARE_DELETE;
+    }
+    raw
+}
+
+/// Compatibility projection: derive a plausible granted-access mask from the
+/// three-boolean GE `FileAccess`.  Used by the legacy 7-argument
+/// `create_file_w` API (which predates the expanded-mask plumbing); thunks
+/// pass the true expanded mask through `create_file_w_extended`.
+fn granted_access_from_file_access(access: FileAccess) -> u32 {
+    let mut mask = 0;
+    if access.read {
+        mask |= FILE_GENERIC_READ;
+    }
+    if access.write {
+        mask |= FILE_GENERIC_WRITE;
+    }
+    if access.delete {
+        mask |= DELETE_ACCESS;
+    }
+    mask
+}
+
 pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
 pub const WAIT_ABANDONED: u32 = 0x0000_0080;
 pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
@@ -483,6 +545,24 @@ struct FileObject {
     /// for directory handles or files that could not be opened; those fall
     /// back to whole-file I/O.
     host_file: Option<std::fs::File>,
+    /// The expanded Win32 desired-access mask (generic bits already replaced
+    /// by their concrete `FILE_*` equivalents) this handle was granted at
+    /// open time.  Per-operation access checks evaluate against this.
+    granted_access: u32,
+    /// The raw `FILE_SHARE_*` share-mode value supplied at open time.
+    share_mode: u32,
+    /// True when the file has been deleted (via DeleteFileW) while this
+    /// handle is still open (the handle survived because it was opened with
+    /// FILE_SHARE_DELETE).  The file is already gone from the filesystem;
+    /// there is nothing to clean up at close time.
+    delete_pending: bool,
+    /// True for directory handles, recorded at open time (never recomputed
+    /// via `is_dir()` afterwards, so a deleted directory does not turn into
+    /// a file handle).
+    is_directory: bool,
+    /// FILE_FLAG_DELETE_ON_CLOSE semantics: the file is removed when this
+    /// handle is closed.
+    delete_on_close: bool,
 }
 
 type FileHandleObject = Rc<RefCell<FileObject>>;
@@ -1705,6 +1785,46 @@ impl Win32Subsystem {
         overlapped: bool,
         backup_semantics: bool,
     ) -> AppResult<Handle> {
+        // Legacy API: derive a plausible granted-access mask from the
+        // three-boolean projection.  The thunks use `create_file_w_extended`
+        // to pass the true expanded rights mask.
+        let granted_access = granted_access_from_file_access(desired_access);
+        self.create_file_w_extended(
+            path,
+            desired_access,
+            share_mode,
+            creation,
+            inheritable,
+            overlapped,
+            backup_semantics,
+            granted_access,
+            false,
+        )
+    }
+
+    /// Extended file open carrying the EXPANDED Win32 desired-access mask
+    /// (generic bits replaced by their concrete `FILE_*` equivalents) and the
+    /// `FILE_FLAG_DELETE_ON_CLOSE` flag.  `granted_access` is recorded on the
+    /// handle descriptor and enforced by per-operation access checks;
+    /// `share_mode` participates in the GE share-state conflict matrix.
+    ///
+    /// Ordering guarantee: for an existing file, the share-conflict check runs
+    /// BEFORE any destructive disposition (CREATE_ALWAYS / TRUNCATE_EXISTING
+    /// truncate the file only after the sharing check passes), so a failed
+    /// open never destroys file contents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_file_w_extended(
+        &mut self,
+        path: &str,
+        desired_access: FileAccess,
+        share_mode: ShareMode,
+        creation: CreationDisposition,
+        inheritable: bool,
+        overlapped: bool,
+        backup_semantics: bool,
+        granted_access: u32,
+        delete_on_close: bool,
+    ) -> AppResult<Handle> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         let exists = host_path.exists();
         if exists && host_path.is_dir() {
@@ -1722,20 +1842,32 @@ impl Win32Subsystem {
                     ),
                 ));
             }
+            // Directory handles participate in the same GE share-state matrix
+            // as files: `ge.open_file` resolves directories too, so a second
+            // open without compatible share modes fails with a sharing
+            // violation.
+            let ge_handle = Some(self.ge.open_file(path, desired_access, share_mode)?);
             return Ok(self.insert_object(
                 ObjectType::File,
-                0x12019f,
+                granted_access,
                 inheritable,
                 KernelObject::File(Rc::new(RefCell::new(FileObject {
                     normalized_path,
                     host_path,
-                    ge_handle: None,
+                    ge_handle,
                     position: 0,
                     overlapped,
                     host_file: None,
+                    granted_access,
+                    share_mode: share_mode_to_raw(share_mode),
+                    delete_pending: false,
+                    is_directory: true,
+                    delete_on_close: false,
                 }))),
             ));
         }
+        // Fail-fast disposition checks that never touch the filesystem and
+        // short-circuit before any share interaction.
         match creation {
             CreationDisposition::CreateNew if exists => {
                 return Err(AppError::new(
@@ -1751,47 +1883,77 @@ impl Win32Subsystem {
                     format!("{} does not exist", normalized_path),
                 ));
             }
-            CreationDisposition::CreateAlways
-            | CreationDisposition::OpenAlways
-            | CreationDisposition::CreateNew
-                if !exists =>
-            {
-                self.ensure_parent_exists(&host_path)?;
-                fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to create {}", host_path.display()),
-                        &error,
-                    )
-                })?;
-                self.sync_entry(&normalized_path, &host_path, false)?;
-            }
-            CreationDisposition::CreateAlways if exists => {
-                fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to truncate {}", host_path.display()),
-                        &error,
-                    )
-                })?;
-                self.sync_entry(&normalized_path, &host_path, false)?;
-            }
-            CreationDisposition::TruncateExisting if exists => {
-                fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to truncate {}", host_path.display()),
-                        &error,
-                    )
-                })?;
-                self.sync_entry(&normalized_path, &host_path, false)?;
-            }
             _ => {}
         }
+        // Share-conflict check FIRST, before any destructive disposition:
+        // `ge.open_file` registers the handle in the share runtime and fails
+        // with a sharing violation when an existing handle's share modes do
+        // not permit this open.  Only after the check passes may
+        // CREATE_ALWAYS / TRUNCATE_EXISTING truncate or create.
         let ge_handle = if host_path.exists() {
             Some(self.ge.open_file(path, desired_access, share_mode)?)
         } else {
             None
+        };
+        let disposition_result = (|| -> AppResult<()> {
+            match creation {
+                CreationDisposition::CreateAlways
+                | CreationDisposition::OpenAlways
+                | CreationDisposition::CreateNew
+                    if !host_path.exists() =>
+                {
+                    self.ensure_parent_exists(&host_path)?;
+                    fs::write(&host_path, []).map_err(|error| {
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to create {}", host_path.display()),
+                            &error,
+                        )
+                    })?;
+                    self.sync_entry(&normalized_path, &host_path, false)?;
+                }
+                CreationDisposition::CreateAlways if host_path.exists() => {
+                    fs::write(&host_path, []).map_err(|error| {
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to truncate {}", host_path.display()),
+                            &error,
+                        )
+                    })?;
+                    self.sync_entry(&normalized_path, &host_path, false)?;
+                }
+                CreationDisposition::TruncateExisting if host_path.exists() => {
+                    fs::write(&host_path, []).map_err(|error| {
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to truncate {}", host_path.display()),
+                            &error,
+                        )
+                    })?;
+                    self.sync_entry(&normalized_path, &host_path, false)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        if let Err(error) = disposition_result {
+            // The share claim was registered above; release it so a failed
+            // open does not leak a share-state entry.
+            if let Some(ge_handle) = &ge_handle {
+                let _ = self.ge.close_file_handle(ge_handle);
+            }
+            return Err(error);
+        }
+        // An open that created a previously-missing file had nothing to
+        // share-check against, but the handle still claims share state in the
+        // runtime (otherwise later opens would not see it and deletion could
+        // bypass FILE_SHARE_DELETE).
+        let ge_handle = match ge_handle {
+            Some(handle) => Some(handle),
+            None if host_path.exists() => {
+                Some(self.ge.open_file(path, desired_access, share_mode)?)
+            }
+            None => None,
         };
         // Keep a real file descriptor for positional I/O so reads/writes do
         // not re-read and rewrite the whole file on every syscall.
@@ -1802,7 +1964,7 @@ impl Win32Subsystem {
             .ok();
         Ok(self.insert_object(
             ObjectType::File,
-            0x12019f,
+            granted_access,
             inheritable,
             KernelObject::File(Rc::new(RefCell::new(FileObject {
                 normalized_path,
@@ -1811,6 +1973,11 @@ impl Win32Subsystem {
                 position: 0,
                 overlapped,
                 host_file,
+                granted_access,
+                share_mode: share_mode_to_raw(share_mode),
+                delete_pending: false,
+                is_directory: false,
+                delete_on_close,
             }))),
         ))
     }
@@ -1837,6 +2004,21 @@ impl Win32Subsystem {
             };
             if let Some(ge_handle) = ge_handle {
                 self.ge.close_file_handle(&ge_handle)?;
+            }
+            let (delete_on_close, normalized_path, host_path) = {
+                let file = file.borrow();
+                (
+                    file.delete_on_close,
+                    file.normalized_path.clone(),
+                    file.host_path.clone(),
+                )
+            };
+            if delete_on_close {
+                // FILE_FLAG_DELETE_ON_CLOSE: remove the file now that this
+                // handle closes.  A sharing failure during the removal is
+                // ignored, matching Windows behavior.
+                let _ = fs::remove_file(&host_path);
+                self.ge.config.fs_state.entries.remove(&normalized_path);
             }
         }
         // Windows forgets named objects once the last handle closes, so a
@@ -1885,10 +2067,29 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    /// Enforce a per-operation granted-access check: the operation requires
+    /// `required` bits to be present in the handle's expanded access mask.
+    /// Fails with `RcHelperPermissionDenied` (which maps to Win32
+    /// ERROR_ACCESS_DENIED) when the bits are absent.
+    fn require_access(entry: &HandleEntry, required: u32) -> Result<(), AppError> {
+        if entry.descriptor.access_mask & required != 0 {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                ReasonCode::RcHelperPermissionDenied,
+                format!(
+                    "handle requires access {required:#x}, granted {:#x}",
+                    entry.descriptor.access_mask
+                ),
+            ))
+        }
+    }
+
     pub fn read_file(&mut self, handle: Handle, length: usize) -> AppResult<Vec<u8>> {
         let object_type = self.handle_entry(handle)?.descriptor.object_type;
         match object_type {
             ObjectType::File => {
+                Self::require_access(self.handle_entry(handle)?, FILE_READ_DATA)?;
                 let entry = self.handle_entry_mut(handle)?;
                 if let KernelObject::File(file) = &mut entry.object {
                     let mut file = file.borrow_mut();
@@ -1993,6 +2194,7 @@ impl Win32Subsystem {
         let object_type = self.handle_entry(handle)?.descriptor.object_type;
         match object_type {
             ObjectType::File => {
+                Self::require_access(self.handle_entry(handle)?, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
                 let (normalized_path, host_path) = {
                     let entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
@@ -2124,6 +2326,10 @@ impl Win32Subsystem {
 
     pub fn flush_file_buffers(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
+        // Windows FlushFileBuffers on a read-only handle succeeds as long as
+        // the file is readable; the operation only requires the ability to
+        // inspect the file (FILE_READ_ATTRIBUTES), not write access.
+        Self::require_access(entry, FILE_READ_ATTRIBUTES)?;
         match &entry.object {
             KernelObject::File(file) => {
                 let file = file.borrow();
@@ -2154,6 +2360,7 @@ impl Win32Subsystem {
 
     pub fn get_file_size_ex(&self, handle: Handle) -> AppResult<u64> {
         let entry = self.handle_entry(handle)?;
+        Self::require_access(entry, FILE_READ_ATTRIBUTES)?;
         match &entry.object {
             KernelObject::File(file) => {
                 let file = file.borrow();
@@ -2178,6 +2385,10 @@ impl Win32Subsystem {
         origin: SeekOrigin,
     ) -> AppResult<u64> {
         let size = self.get_file_size_ex(handle)? as i128;
+        // Seeking moves the file pointer, which both reads and writes build
+        // on; a handle granted neither FILE_READ_DATA nor FILE_WRITE_DATA
+        // must not be able to reposition it.
+        Self::require_access(self.handle_entry(handle)?, FILE_READ_DATA | FILE_WRITE_DATA)?;
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::File(file) => {
@@ -2362,6 +2573,17 @@ impl Win32Subsystem {
 
     pub fn delete_file_w(&mut self, path: &str) -> AppResult<()> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
+        // FILE_SHARE_DELETE enforcement: deletion is only allowed when no
+        // open handle holds the file without FILE_SHARE_DELETE (no handles
+        // at all is trivially allowed).
+        if !self.ge.check_delete_sharing(path)? {
+            return Err(AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                format!(
+                    "sharing violation: {normalized_path} is open without FILE_SHARE_DELETE"
+                ),
+            ));
+        }
         fs::remove_file(&host_path).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -2370,6 +2592,18 @@ impl Win32Subsystem {
             )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
+        // Handles that survived the delete (they were open with
+        // FILE_SHARE_DELETE) now reference a deleted file; record
+        // delete_pending so close-time cleanup (e.g. FILE_FLAG_DELETE_ON_CLOSE
+        // removal) does not double-delete.
+        for entry in self.handles.values_mut() {
+            if let KernelObject::File(file) = &mut entry.object {
+                let mut file = file.borrow_mut();
+                if file.normalized_path == normalized_path {
+                    file.delete_pending = true;
+                }
+            }
+        }
         self.save_config_now()
     }
 
@@ -4912,11 +5146,12 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, MemoryProtection,
-        SeekOrigin, ShareMode, WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms,
-        split_find_search_pattern, windows_pattern_matches,
+        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, KernelObject,
+        MemoryProtection, SeekOrigin, ShareMode, WaitStatus, Win32Subsystem, iconv_ffi,
+        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches,
     };
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
+    use crate::reason::ReasonCode;
     use std::fs;
 
     #[test]
@@ -5729,6 +5964,70 @@ mod tests {
             "write at huge position must not panic"
         );
         win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn delete_file_share_delete_violation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "df-sd", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let h1 = win32
+            .create_file_w(
+                "C:\\del-share.txt",
+                FileAccess::read_write(),
+                ShareMode::read_only(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("open file without FILE_SHARE_DELETE");
+        win32.write_file(h1, b"data").expect("write");
+
+        // An open handle without FILE_SHARE_DELETE blocks deletion.
+        let denied = win32
+            .delete_file_w("C:\\del-share.txt")
+            .expect_err("delete must be denied");
+        assert_eq!(
+            denied.code,
+            ReasonCode::RcFsSharingViolation,
+            "delete without FILE_SHARE_DELETE must report a sharing violation"
+        );
+
+        win32.close_handle(h1).expect("close");
+
+        // Reopening with FILE_SHARE_DELETE permits deletion; the surviving
+        // handle is marked delete_pending.
+        let h2 = win32
+            .create_file_w(
+                "C:\\del-share.txt",
+                FileAccess::read_only(),
+                ShareMode {
+                    read: true,
+                    write: false,
+                    delete: true,
+                },
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("reopen with FILE_SHARE_DELETE");
+        win32
+            .delete_file_w("C:\\del-share.txt")
+            .expect("delete allowed with FILE_SHARE_DELETE");
+        let entry = win32.handles.get(&h2).expect("surviving handle");
+        match &entry.object {
+            KernelObject::File(file) => {
+                assert!(
+                    file.borrow().delete_pending,
+                    "surviving handle must be marked delete_pending"
+                );
+            }
+            _ => panic!("expected a file handle"),
+        }
+        win32.close_handle(h2).expect("close");
     }
 
     #[test]
