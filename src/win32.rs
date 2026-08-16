@@ -4164,14 +4164,22 @@ impl Win32Subsystem {
         Ok(self.thread_state(thread_id)?.priority)
     }
 
-    pub fn open_thread(&mut self, thread_id: u32, inheritable: bool) -> Handle {
+    pub fn open_thread(
+        &mut self,
+        thread_id: u32,
+        desired_access: u32,
+        inheritable: bool,
+    ) -> Option<Handle> {
+        if !self.thread_exists(thread_id) {
+            return None;
+        }
         self.ensure_thread_state(thread_id);
-        self.insert_object(
+        Some(self.insert_object(
             ObjectType::Thread,
-            0x1F03FF,
+            desired_access,
             inheritable,
             KernelObject::Thread(ThreadObject { thread_id }),
-        )
+        ))
     }
 
     pub fn suspend_thread(&mut self, handle: Handle) -> AppResult<u32> {
@@ -4190,12 +4198,17 @@ impl Win32Subsystem {
         Ok(prev)
     }
 
-    pub fn terminate_thread(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
+    pub fn terminate_thread(&mut self, handle: Handle, exit_code: u32) -> AppResult<bool> {
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
+        if state.exit_code.is_some() {
+            // Windows: TerminateThread on an already-exited thread is a
+            // no-op that returns TRUE; the recorded exit code is preserved.
+            return Ok(false);
+        }
         state.exit_code = Some(exit_code);
         state.terminated = true;
-        Ok(())
+        Ok(true)
     }
 
     pub fn tls_alloc(&mut self) -> u32 {
@@ -4783,6 +4796,19 @@ impl Win32Subsystem {
                 format!("unknown thread {thread_id}"),
             )
         })
+    }
+
+    /// Whether a guest thread with this ID exists (the main thread or a
+    /// thread created by `create_thread`).  Used by `OpenThread` to reject
+    /// lookups of non-existent thread IDs with ERROR_INVALID_PARAMETER.
+    pub fn thread_exists(&self, thread_id: u32) -> bool {
+        thread_id == 1 || self.threads.contains_key(&thread_id)
+    }
+
+    /// The kernel-object type behind a handle, for wait/terminate dispatch
+    /// in pe_runtime.
+    pub fn handle_object_type(&self, handle: Handle) -> AppResult<ObjectType> {
+        Ok(self.handle_entry(handle)?.descriptor.object_type)
     }
 
     fn thread_state_mut(&mut self, thread_id: u32) -> AppResult<&mut ThreadState> {

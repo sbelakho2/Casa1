@@ -2059,6 +2059,9 @@ pub enum HostThunk {
     OpenThread,
     /// `SetThreadPriority` — sets the priority value for the specified thread.
     SetThreadPriority,
+    /// `ExitThread` — ends the calling thread (noreturn; the exit code is
+    /// recorded and the thread never resumes).
+    ExitThread,
     /// `TerminateThread` — terminates a thread.
     TerminateThread,
     /// `SuspendThread` — suspends the specified thread.
@@ -3757,6 +3760,18 @@ struct PeHostRuntime {
     active_pumped_guest_thread: Option<u32>,
     yield_pumped_guest_thread: bool,
     yield_pumped_guest_thread_wake_tick: Option<u64>,
+    /// Set by `ExitThread`/`_endthreadex`/`_endthread`/`TerminateThread` while
+    /// a pumped thread is active: the pump consumes it and ends the thread
+    /// immediately instead of resuming guest code.
+    pumped_thread_exit_requested: Option<u32>,
+    /// Whether the pump fires DLL_THREAD_DETACH for an explicit exit
+    /// (`ExitThread`/`_endthreadex` fire it; `TerminateThread` does not).
+    pumped_thread_exit_with_detach: bool,
+    /// Process-exit request recorded by `ExitProcess`/`TerminateProcess`(self)/
+    /// `exit`/`_exit`/`abort` before they return.  When a pumped thread
+    /// requests process exit, the pump abandons all pending threads and
+    /// propagates the code to the main loop (which breaks on `Some(code)`).
+    process_exit_requested: Option<u32>,
     tls_vector_ptr: u64,
     init_once_pending: BTreeSet<u64>,
     init_once_completed: BTreeMap<u64, u64>,
@@ -4174,6 +4189,22 @@ struct ProgressBarState {
     step: i32,
 }
 
+/// Lifecycle state of a cooperative guest thread.
+///
+/// Created threads enter `Runnable`; yielding through `Sleep`/alertable waits
+/// moves them to `Waiting`/`AlertableWaiting`; `ExitThread`/`_endthreadex`/
+/// `TerminateThread` move the active thread to `Exiting`; the pump completes
+/// the exit with `Exited`.  Queued threads terminated from another thread are
+/// marked `Exited` so they never run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestThreadState {
+    Runnable,
+    Waiting,
+    AlertableWaiting,
+    Exiting,
+    Exited,
+}
+
 struct PendingGuestThread {
     handle: u32,
     thread_id: u32,
@@ -4187,11 +4218,50 @@ struct PendingGuestThread {
     tls_slots: BTreeMap<u32, u64>,
     fls_slots: BTreeMap<u32, u64>,
     state: CpuState,
+    /// Guest-thread lifecycle state (see `GuestThreadState`).
+    state_machine: GuestThreadState,
+    /// Exit code recorded by an explicit exit API (`ExitThread`,
+    /// `_endthreadex`, `_endthread`, `TerminateThread`).  When the pump
+    /// reaches the thread-end path it uses
+    /// `exit_code_override.or(Some(RAX))`: an explicit exit is noreturn, so
+    /// the procedure's return value only matters when no explicit exit ran.
+    exit_code_override: Option<u32>,
 }
 
 enum GuestCallbackDisposition {
     Returned(u64),
     Yielded,
+}
+
+/// Outcome of a `pump_pending_guest_thread` cycle.
+struct PumpOutcome {
+    /// Whether a guest thread was pumped (ran for a slice).
+    did_work: bool,
+    /// Process-exit code requested from within a pumped thread; when set the
+    /// caller must propagate it as a thunk `Some(code)` result so the main
+    /// loop terminates the guest run.
+    process_exit: Option<i32>,
+}
+
+/// Per-thread result of a pump cycle, transferring the (possibly re-queued)
+/// thread record and any process-exit request back to the pump's tail.
+struct PumpedThreadOutcome {
+    requeue: Option<PendingGuestThread>,
+    process_exit: Option<i32>,
+}
+
+/// Outcome of a cooperative wait (`wait_for_single_object_pumping`): either
+/// the final wait status or a process-exit request that the caller must
+/// propagate as a thunk `Some(code)` result.
+enum PumpWaitOutcome {
+    Wait(crate::win32::WaitStatus),
+    /// Historical non-thread behavior: a signal that arrives during the
+    /// pump phase was returned with RAX untouched (the pre-fix thunk did
+    /// `return Ok(None)` without setting RAX).  Steam's shutdown handshake
+    /// depends on the caller seeing its pre-call RAX in this case, so the
+    /// thunk must leave the register alone.
+    Unreported,
+    ProcessExit(i32),
 }
 
 impl Default for ProgressBarState {
@@ -8425,6 +8495,9 @@ impl PeHostRuntime {
             active_pumped_guest_thread: None,
             yield_pumped_guest_thread: false,
             yield_pumped_guest_thread_wake_tick: None,
+            pumped_thread_exit_requested: None,
+            pumped_thread_exit_with_detach: true,
+            process_exit_requested: None,
             tls_vector_ptr: 0,
             init_once_pending: BTreeSet::new(),
             init_once_completed: BTreeMap::new(),
@@ -24591,7 +24664,13 @@ impl PeHostRuntime {
                         );
                         break;
                     }
-                    if self.pump_pending_guest_thread(memory)? {
+                    let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                    if let Some(code) = pump_outcome.process_exit {
+                        // A pumped thread requested process exit — propagate
+                        // the code so the main loop terminates the run.
+                        return Ok(Some(code));
+                    }
+                    if pump_outcome.did_work {
                         continue;
                     }
                     // Drain expired timer and wait callbacks from the
@@ -28392,26 +28471,17 @@ impl PeHostRuntime {
                     return Ok(None);
                 }
                 let timeout = guest_call_arg_u32(state, memory, 1)?;
-                let mut result = self.win32.wait_for_single_object(handle, timeout, false, None);
-                if timeout != 0 && matches!(result, Ok(crate::win32::WaitStatus::Timeout)) {
-                    while !self.pending_guest_threads.is_empty() {
-                        let pumped = self.pump_pending_guest_thread(memory)?;
-                        result = self.win32.wait_for_single_object(handle, 0, false, None);
-                        if !matches!(result, Ok(crate::win32::WaitStatus::Timeout)) || !pumped {
-                            return Ok(None);
-                        }
-                    }
-                    // `wait_for_single_object` is non-blocking for every
-                    // kernel object except a Process with an exit_sync
-                    // condvar (Event/Mutex/Semaphore/Thread/Timer return
-                    // `Timeout` immediately).  Without a real sleep here, a
-                    // guest that polls a non-signaled object in a loop
-                    // (Steam/CEF do this heavily) busy-spins at ~100% CPU.
-                    // Sleep 1 ms so the calling guest thread yields until the
-                    // object has a chance to become signaled.
-                }
-                match result {
-                    Ok(result) => {
+                let is_thread = matches!(
+                    self.win32.handle_object_type(handle),
+                    Ok(crate::win32::ObjectType::Thread)
+                );
+                let wait_result = if is_thread {
+                    self.wait_for_single_object_pumping(memory, handle, timeout)
+                } else {
+                    self.wait_for_single_object_non_thread(memory, handle, timeout)
+                };
+                match wait_result {
+                    Ok(PumpWaitOutcome::Wait(result)) => {
                         state.set(Register::Rax, u64::from(result.code()));
                         self.last_error = 0;
                         self.push_trace(
@@ -28423,6 +28493,16 @@ impl PeHostRuntime {
                             ]),
                             json!(result.code()),
                         );
+                    }
+                    Ok(PumpWaitOutcome::Unreported) => {
+                        // Historical behavior: leave RAX untouched so the
+                        // caller sees its pre-call value.
+                        self.last_error = 0;
+                    }
+                    Ok(PumpWaitOutcome::ProcessExit(code)) => {
+                        // A pumped thread requested process exit while we
+                        // were pumping — end the guest run.
+                        return Ok(Some(code));
                     }
                     Err(error) => {
                         state.set(Register::Rax, u64::from(u32::MAX));
@@ -28448,63 +28528,174 @@ impl PeHostRuntime {
                         handles.push(handle);
                     }
 
-                    if wait_all {
-                        result_code = 0;
-                        for &handle in &handles {
-                            match self.win32.wait_for_single_object(handle, timeout, false, None) {
-                                Ok(crate::win32::WaitStatus::Object0) => {}
-                                Ok(status) => {
-                                    let _ = status.code();
-                                    return Ok(None);
-                                }
-                                Err(_) => {
-                                    // WAIT_TIMEOUT indicates the handle is invalid
-                                    self.last_error = ERROR_INVALID_HANDLE;
-                                    return Ok(None);
-                                }
+                    if timeout == 0 {
+                        // Non-blocking single poll pass.
+                        match self
+                            .win32
+                            .wait_for_multiple_objects(&handles, wait_all, 0, false, None)
+                        {
+                            Ok((status, index))
+                                if !matches!(
+                                    status,
+                                    crate::win32::WaitStatus::Timeout
+                                ) =>
+                            {
+                                result_code = status.code().wrapping_add(index as u32);
+                                self.last_error = 0;
+                            }
+                            Ok(_) => {
+                                result_code = crate::win32::WAIT_TIMEOUT;
+                            }
+                            Err(_) => {
+                                result_code = u32::MAX; // WAIT_FAILED
+                                self.last_error = ERROR_INVALID_HANDLE;
                             }
                         }
                     } else {
-                        for (i, &handle) in handles.iter().enumerate() {
-                            match self.win32.wait_for_single_object(handle, 0, false, None) {
-                                Ok(crate::win32::WaitStatus::Object0) => {
-                                    let _ = i as u32;
-                                    return Ok(None);
+                        let any_thread = handles.iter().any(|&handle| {
+                            matches!(
+                                self.win32.handle_object_type(handle),
+                                Ok(crate::win32::ObjectType::Thread)
+                            )
+                        });
+                        if !any_thread {
+                            // Historical non-thread behavior (mirrors the
+                            // pre-fix thunk): a non-blocking poll pass, then a
+                            // blocking win32 wait on the first handle (finite
+                            // timeouts advance the guest clock; process
+                            // handles block on the exit_sync condvar), then
+                            // pump pending guest threads while the queue is
+                            // non-empty, then report.  Guests rely on this
+                            // interleaving for event handshakes, so do not
+                            // pump DURING the timeout window.
+                            match self
+                                .win32
+                                .wait_for_multiple_objects(&handles, wait_all, 0, false, None)
+                            {
+                                Ok((status, index))
+                                    if !matches!(
+                                        status,
+                                        crate::win32::WaitStatus::Timeout
+                                    ) =>
+                                {
+                                    result_code = status.code().wrapping_add(index as u32);
+                                    self.last_error = 0;
                                 }
-                                Ok(_) => {}
+                                Ok(_) => {
+                                    match self
+                                        .win32
+                                        .wait_for_single_object(handles[0], timeout, false, None)
+                                    {
+                                        Ok(status)
+                                            if !matches!(
+                                                status,
+                                                crate::win32::WaitStatus::Timeout
+                                            ) =>
+                                        {
+                                            result_code = status.code();
+                                            self.last_error = 0;
+                                        }
+                                        Ok(_) => {}
+                                        Err(_) => {
+                                            result_code = u32::MAX; // WAIT_FAILED
+                                            self.last_error = ERROR_INVALID_HANDLE;
+                                        }
+                                    }
+                                    if result_code == crate::win32::WAIT_TIMEOUT {
+                                        loop {
+                                            let pump_outcome =
+                                                self.pump_pending_guest_thread(memory)?;
+                                            if let Some(code) = pump_outcome.process_exit {
+                                                return Ok(Some(code));
+                                            }
+                                            let polled = self
+                                                .win32
+                                                .wait_for_multiple_objects(
+                                                    &handles,
+                                                    wait_all,
+                                                    0,
+                                                    false,
+                                                    None,
+                                                );
+                                            if let Ok((status, _index)) = polled
+                                                && !matches!(
+                                                    status,
+                                                    crate::win32::WaitStatus::Timeout
+                                                )
+                                            {
+                                                // Pump-phase signal —
+                                                // historically unreported
+                                                // (the old thunk returned
+                                                // without updating RAX);
+                                                // keep the timeout result.
+                                                break;
+                                            }
+                                            if !pump_outcome.did_work {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(_) => {
-                                    // WAIT_TIMEOUT indicates the handle is invalid
+                                    result_code = u32::MAX; // WAIT_FAILED
                                     self.last_error = ERROR_INVALID_HANDLE;
-                                    return Ok(None);
                                 }
                             }
-                        }
-                        // Nothing was signaled and `wait_for_single_object`
-                        // is non-blocking for non-Process kernel objects, so
-                        // a guest polling loop would busy-spin at ~100% CPU.
-                        // Sleep 1 ms when the caller actually wanted to block
-                        // (non-zero timeout), so the object has a chance to
-                        // become signaled before the next poll.
-                        
-                        if result_code == crate::win32::WAIT_TIMEOUT && timeout != 0 && !handles.is_empty() {
-                            match self.win32.wait_for_single_object(handles[0], timeout, false, None) {
-                                Ok(crate::win32::WaitStatus::Object0) => {
-                                    result_code = 0;
+                        } else {
+                            // Thread targets can be sleeping workers whose
+                            // wake_tick is in the future, so pump one thread
+                            // per cycle, host-sleep 1 ms and advance the guest
+                            // clock until they become runnable.  Never report
+                            // WAIT_TIMEOUT for INFINITE while a target thread
+                            // can still complete (the CThread::JoinThread
+                            // regression).
+                            let deadline = (timeout != u32::MAX).then(|| {
+                                self.win32.get_tick_count64().saturating_add(timeout as u64)
+                            });
+                            loop {
+                                match self.win32.wait_for_multiple_objects(
+                                    &handles,
+                                    wait_all,
+                                    0,
+                                    false,
+                                    None,
+                                ) {
+                                    Ok((status, index))
+                                        if !matches!(
+                                            status,
+                                            crate::win32::WaitStatus::Timeout
+                                        ) =>
+                                    {
+                                        // WAIT_OBJECT_0 + index (wait-any) or
+                                        // WAIT_OBJECT_0 (wait-all).
+                                        result_code =
+                                            status.code().wrapping_add(index as u32);
+                                        self.last_error = 0;
+                                        break;
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => {
+                                        result_code = u32::MAX; // WAIT_FAILED
+                                        self.last_error = ERROR_INVALID_HANDLE;
+                                        break;
+                                    }
                                 }
-                                Ok(status) => {
-                                    result_code = status.code();
+                                let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                                if let Some(code) = pump_outcome.process_exit {
+                                    return Ok(Some(code));
                                 }
-                                Err(_) => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                self.win32.record_sleep_observation(1, 1);
+                                if let Some(deadline) = deadline
+                                    && self.win32.get_tick_count64() >= deadline
+                                {
                                     result_code = crate::win32::WAIT_TIMEOUT;
-                                    self.last_error = ERROR_INVALID_HANDLE;
+                                    break;
                                 }
                             }
                         }
                     }
                     state.set(Register::Rax, u64::from(result_code));
-                    if result_code != crate::win32::WAIT_TIMEOUT && self.last_error == 0 {
-                        self.last_error = 0;
-                    }
                 }
                 self.push_trace(
                     "process",
@@ -28632,6 +28823,10 @@ impl PeHostRuntime {
                     json!(1),
                 );
                 if handle == current_process_handle || process.process_id == std::process::id() {
+                    // Terminating the current process: record the exit
+                    // request so a pumped caller propagates it instead of
+                    // consuming the code as the thread's own exit code.
+                    self.process_exit_requested = Some(exit_code);
                     return Ok(Some(exit_code as i32));
                 }
                 state.set(Register::Rax, 1);
@@ -30313,7 +30508,13 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::CrtExit => {
-                return Ok(Some(guest_call_arg(state, memory, 0)? as i32));
+                let code = guest_call_arg(state, memory, 0)? as i32;
+                // Record the process-exit request BEFORE returning so that a
+                // pumped thread that calls exit() ends the whole guest run
+                // (the pump checks this flag after the callback) instead of
+                // having the code consumed as the thread's exit code.
+                self.process_exit_requested = Some(code as u32);
+                return Ok(Some(code));
             }
             HostThunk::InitializeNarrowEnvironment => {
                 state.set(Register::Rax, 0);
@@ -30392,10 +30593,13 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::Abort => {
+                self.process_exit_requested = Some(134);
                 return Ok(Some(134));
             }
             HostThunk::Exit => {
-                return Ok(Some(guest_call_arg(state, memory, 0)? as i32));
+                let code = guest_call_arg(state, memory, 0)? as i32;
+                self.process_exit_requested = Some(code as u32);
+                return Ok(Some(code));
             }
             HostThunk::Signal => {
                 let signal = guest_call_arg(state, memory, 0)? as i32;
@@ -31919,10 +32123,13 @@ impl PeHostRuntime {
             }
             HostThunk::Endthreadex => {
                 let code = guest_call_arg(state, memory, 0)? as u32;
-                let handle = self.win32.current_thread_handle();
-                let _ = self.win32.exit_thread(handle, code);
+                // `_endthreadex` is noreturn: record the exit code and end
+                // the thread immediately.  The subsequent sentinel `ret` must
+                // never overwrite this code (the pump uses the override).
+                self.request_current_thread_exit(code, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
+                return Ok(Some(code as i32));
             }
             HostThunk::Beginthread => {
                 // uintptr_t _beginthread(void (__cdecl *start)(void*), unsigned stackSize,
@@ -31952,10 +32159,11 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::Endthread => {
-                let handle = self.win32.current_thread_handle();
-                let _ = self.win32.exit_thread(handle, 0);
+                // `_endthread` is noreturn; the thread ends with code 0.
+                self.request_current_thread_exit(0, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
+                return Ok(Some(0));
             }
             // ── Patch 6b: FILE* model ────────────────────────────────────────
             HostThunk::Fopen | HostThunk::Wfopen | HostThunk::Fsopen => {
@@ -35012,7 +35220,10 @@ impl PeHostRuntime {
                             }
                         // Pump pending guest threads for cooperative multitasking
                         if !self.pending_guest_threads.is_empty() {
-                            self.pump_pending_guest_thread(memory)?;
+                            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                            if let Some(code) = pump_outcome.process_exit {
+                                return Ok(Some(code));
+                            }
                         } else {
                             // Short sleep to avoid busy-waiting when no guest threads
                             // are pending; recheck after a brief pause.
@@ -35822,6 +36033,11 @@ impl PeHostRuntime {
             }
             HostThunk::ExitProcess => {
                 let code = guest_call_arg(state, memory, 0)? as i32;
+                // Record the process-exit request BEFORE returning so a
+                // pumped thread that calls ExitProcess ends the whole guest
+                // run instead of the code being consumed as the thread's
+                // own exit code.
+                self.process_exit_requested = Some(code as u32);
                 self.push_trace(
                     "process",
                     "ExitProcess",
@@ -39567,7 +39783,10 @@ impl PeHostRuntime {
                         let max_sleep = std::time::Duration::from_millis(milliseconds.min(100) as u64);
                         while sleep_start.elapsed() < max_sleep {
                             if !self.pending_guest_threads.is_empty() {
-                                self.pump_pending_guest_thread(memory)?;
+                                let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                                if let Some(code) = pump_outcome.process_exit {
+                                    return Ok(Some(code));
+                                }
                             } else {
                                 return Ok(None);
                             }
@@ -39887,9 +40106,20 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
             }
             HostThunk::OpenThread => {
-                // Stub — return a synthetic handle
-                let (handle, _created) = self.win32.create_event(false, false, false, None);
-                state.set(Register::Rax, handle as u64);
+                let desired_access = arg(0) as u32;
+                let inherit_handle = arg(1) != 0;
+                let thread_id = arg(2) as u32;
+                match self.win32.open_thread(thread_id, desired_access, inherit_handle) {
+                    Some(handle) => {
+                        state.set(Register::Rax, handle as u64);
+                        self.last_error = 0;
+                    }
+                    None => {
+                        // No thread with this ID exists.
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::SetThreadPriority => {
                 let handle = arg(0) as u32;
@@ -39900,14 +40130,52 @@ impl PeHostRuntime {
                 }
                 state.set(Register::Rax, 1); // TRUE
             }
+            HostThunk::ExitThread => {
+                let code = arg(0) as u32;
+                // `ExitThread` is noreturn: record the code and end the
+                // calling thread immediately.  From a pumped thread the pump
+                // consumes the request; from the main thread the process
+                // exits with the code (Windows: the last thread exiting
+                // terminates the process).
+                self.request_current_thread_exit(code, true);
+                self.last_error = 0;
+                return Ok(Some(code as i32));
+            }
             HostThunk::TerminateThread => {
                 let handle = arg(0) as u32;
+                let exit_code = arg(1) as u32;
                 if handle == 0 {
                     state.set(Register::Rax, 0); // FALSE
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
+                if !matches!(
+                    self.win32.handle_object_type(handle),
+                    Ok(crate::win32::ObjectType::Thread)
+                ) {
+                    state.set(Register::Rax, 0); // FALSE
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                let Ok(target_tid) = self.win32.thread_id_for_handle(handle) else {
+                    state.set(Register::Rax, 0); // FALSE
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                // A queued (not-yet-run) guest thread is terminated outright:
+                // remove it (marking it Exited) so it never runs, and record
+                // the exit code in the thread state below.
+                self.pending_guest_threads.retain(|thread| thread.thread_id != target_tid);
+                if target_tid == self.win32.current_thread_id() {
+                    // Terminating the current pumped thread: mark it Exiting
+                    // (no DLL_THREAD_DETACH per Windows) and end it.
+                    self.request_current_thread_exit(exit_code, false);
+                    self.last_error = 0;
+                    return Ok(Some(exit_code as i32));
+                }
+                let _ = self.win32.terminate_thread(handle, exit_code)?;
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::SuspendThread => {
                 let handle = arg(0) as u32;
@@ -40496,19 +40764,30 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                     self.last_error = 0;
                 } else {
-                    match self.win32.wait_for_single_object(handle, timeout, false, None) {
-                        Ok(result) => {
-                            state.set(Register::Rax, result as u64);
-                            // Mirrors the WaitForSingleObject thunk:
-                            // `wait_for_single_object` returns `Timeout`
-                            // immediately for non-Process kernel objects, so
-                            // a guest polling loop would busy-spin at ~100%
-                            // CPU.  Sleep 1 ms when the caller actually
-                            // wanted to block (non-zero timeout) but timed out.
-                            if timeout != 0
-                                && matches!(result, crate::win32::WaitStatus::Timeout)
-                            {
-                            }
+                    // With no APCs pending, an alertable wait is equivalent
+                    // to a non-alertable one.
+                    let is_thread = matches!(
+                        self.win32.handle_object_type(handle),
+                        Ok(crate::win32::ObjectType::Thread)
+                    );
+                    let wait_result = if is_thread {
+                        // Thread targets: pump pending guest threads and
+                        // never report WAIT_TIMEOUT for INFINITE while the
+                        // target thread can still complete.
+                        self.wait_for_single_object_pumping(memory, handle, timeout)
+                    } else {
+                        self.wait_for_single_object_non_thread(memory, handle, timeout)
+                    };
+                    match wait_result {
+                        Ok(PumpWaitOutcome::Wait(result)) => {
+                            state.set(Register::Rax, u64::from(result.code()));
+                            self.last_error = 0;
+                        }
+                        Ok(PumpWaitOutcome::Unreported) => {
+                            self.last_error = 0;
+                        }
+                        Ok(PumpWaitOutcome::ProcessExit(code)) => {
+                            return Ok(Some(code));
                         }
                         Err(error) => {
                             state.set(Register::Rax, 0xFFFFFFFF); // WAIT_FAILED
@@ -50000,6 +50279,22 @@ impl PeHostRuntime {
         }
     }
 
+    /// Record an explicit exit request for the calling guest thread.
+    ///
+    /// While a pumped thread is active, the request is handed to the pump,
+    /// which ends the thread immediately (`ExitThread`/`_endthreadex` fire
+    /// DLL_THREAD_DETACH, `TerminateThread` does not).  On a non-pumped
+    /// context (the main thread) the request becomes a process-exit request:
+    /// Windows ends the process when its last thread exits.
+    fn request_current_thread_exit(&mut self, code: u32, fire_detach: bool) {
+        if self.active_pumped_guest_thread.is_some() {
+            self.pumped_thread_exit_requested = Some(code);
+            self.pumped_thread_exit_with_detach = fire_detach;
+        } else {
+            self.process_exit_requested = Some(code);
+        }
+    }
+
     fn prepare_guest_thread_entry(
         &mut self,
         memory: &mut MemoryImage,
@@ -50109,30 +50404,46 @@ impl PeHostRuntime {
             tls_slots: thread_tls_slots,
             fls_slots: thread_fls_slots,
             state: thread_state,
+            state_machine: GuestThreadState::Runnable,
+            exit_code_override: None,
         })
     }
 
-    fn pump_pending_guest_thread(&mut self, memory: &mut MemoryImage) -> AppResult<bool> {
+    fn pump_pending_guest_thread(&mut self, memory: &mut MemoryImage) -> AppResult<PumpOutcome> {
         let now = self.win32.get_tick_count64();
-        let Some(ready_index) = self
-            .pending_guest_threads
-            .iter()
-            .position(|thread| thread.wake_tick <= now)
-        else {
-            return Ok(false);
+        let Some(ready_index) = self.pending_guest_threads.iter().position(|thread| {
+            thread.wake_tick <= now && thread.state_machine != GuestThreadState::Exited
+        }) else {
+            return Ok(PumpOutcome {
+                did_work: false,
+                process_exit: None,
+            });
         };
         let Some(mut pending_thread) = self.pending_guest_threads.remove(ready_index) else {
-            return Ok(false);
+            return Ok(PumpOutcome {
+                did_work: false,
+                process_exit: None,
+            });
         };
+
 
         let previous_thread_id = self.win32.set_current_thread_id(pending_thread.thread_id);
         let previous_teb_base = self.teb_base;
         let previous_tls_vector_ptr = self.tls_vector_ptr;
         let previous_tls_slots = self.tls_slots.clone();
         let previous_fls_slots = self.fls_slots.clone();
+        // Nested pumps (GetMessageW → pump → thunk → pump) must restore the
+        // outer pumped thread's identity, yield request and exit request;
+        // otherwise a nested pump clobbers the outer thread's state.
+        let previous_active_thread = self.active_pumped_guest_thread;
+        let previous_yield_request =
+            std::mem::replace(&mut self.yield_pumped_guest_thread, false);
+        let previous_yield_wake_tick = self.yield_pumped_guest_thread_wake_tick.take();
+        let previous_exit_request = self.pumped_thread_exit_requested.take();
+        let previous_exit_detach =
+            std::mem::replace(&mut self.pumped_thread_exit_with_detach, true);
         self.active_pumped_guest_thread = Some(pending_thread.handle);
-        self.yield_pumped_guest_thread = false;
-        self.yield_pumped_guest_thread_wake_tick = None;
+        pending_thread.state_machine = GuestThreadState::Runnable;
 
         // Use a regular block instead of an IIFE closure to save one stack frame
         // per recursion level in the GetMessageW → pump → execute_guest_callback_inner
@@ -50152,6 +50463,17 @@ impl PeHostRuntime {
             {
                 let mut tls_state = CpuState::new(GuestArch::X86);
                 tls_state.segment_bases.fs = self.teb_base;
+                // TLS callbacks run on the thread's own stack: a zeroed RSP
+                // would wrap the synthetic callback frame to an unmapped
+                // high address (the x86 CPU masks RSP to 32 bits while the
+                // frame is written at the raw u64).  Place the frame 0x100
+                // bytes below the thread's initial frame pointer instead.
+                if self.guest_arch == GuestArch::X86 {
+                    tls_state.set(
+                        Register::Rsp,
+                        pending_thread.initial_rsp.saturating_sub(0x100),
+                    );
+                }
                 self.fire_tls_callbacks_for_all_modules(&mut tls_state, memory, DLL_THREAD_ATTACH)?;
             }
 
@@ -50170,49 +50492,145 @@ impl PeHostRuntime {
                 true,
                 resume_rsp,
             )?;
-            match disposition {
-                GuestCallbackDisposition::Returned(exit_code) => {
+
+            // An explicit exit API (ExitThread/_endthreadex/_endthread/
+            // TerminateThread) recorded its request in the runtime fields
+            // before returning, so the pump can distinguish an explicit exit
+            // (noreturn; exit-code override wins) from a plain return.
+            let explicit_exit = self.pumped_thread_exit_requested.take();
+            let explicit_exit_detach =
+                std::mem::replace(&mut self.pumped_thread_exit_with_detach, true);
+            let process_exit_pending = self.process_exit_requested.is_some();
+
+            if process_exit_pending {
+                // A process-exit API (ExitProcess / exit / _exit / abort /
+                // TerminateProcess on the process) ran inside this pumped
+                // thread.  Windows does not fire DLL_THREAD_DETACH for
+                // threads during process exit; abandon every queued guest
+                // thread and propagate the code to the main loop (which
+                // breaks on a thunk's `Some(code)` result).
+                for thread in &mut self.pending_guest_threads {
+                    thread.state_machine = GuestThreadState::Exited;
+                }
+                self.pending_guest_threads.clear();
+                pending_thread.state_machine = GuestThreadState::Exited;
+                let code = match disposition {
+                    GuestCallbackDisposition::Returned(exit_code) => exit_code as i32,
+                    GuestCallbackDisposition::Yielded => {
+                        self.process_exit_requested.unwrap_or(0) as i32
+                    }
+                };
+                Ok((
+                    PumpedThreadOutcome {
+                        requeue: None,
+                        process_exit: Some(code),
+                    },
+                    self.tls_slots.clone(),
+                    self.fls_slots.clone(),
+                ))
+            } else if let Some(exit_code) = explicit_exit {
+                // Explicit thread exit: the exit thunk is noreturn, so the
+                // thread ends here.  ExitThread/_endthreadex fire
+                // DLL_THREAD_DETACH; TerminateThread does not.
+                pending_thread.state_machine = GuestThreadState::Exiting;
+                if explicit_exit_detach {
                     // Fire TLS thread-detach callbacks for all loaded modules.
                     // These run after the thread's start function exits, before
                     // the thread is torn down — matching Windows TLS callback ordering.
                     {
                         let mut tls_state = CpuState::new(GuestArch::X86);
                         tls_state.segment_bases.fs = self.teb_base;
+                        if self.guest_arch == GuestArch::X86 {
+                            tls_state.set(
+                                Register::Rsp,
+                                pending_thread.initial_rsp.saturating_sub(0x100),
+                            );
+                        }
                         self.fire_tls_callbacks_for_all_modules(
                             &mut tls_state,
                             memory,
                             DLL_THREAD_DETACH,
                         )?;
                     }
-                    self.win32
-                        .set_thread_exit_code_by_id(pending_thread.thread_id, exit_code as u32)?;
-                    Ok((None, self.tls_slots.clone(), self.fls_slots.clone()))
                 }
-                GuestCallbackDisposition::Yielded => {
-                    pending_thread.tls_slots = self.tls_slots.clone();
-                    pending_thread.fls_slots = self.fls_slots.clone();
-                    pending_thread.wake_tick = self
-                        .yield_pumped_guest_thread_wake_tick
-                        .take()
-                        .unwrap_or_else(|| self.win32.get_tick_count64());
-                    Ok((
-                        Some(pending_thread),
-                        self.tls_slots.clone(),
-                        self.fls_slots.clone(),
-                    ))
+                let final_code = pending_thread.exit_code_override.unwrap_or(exit_code);
+                self.win32
+                    .set_thread_exit_code_by_id(pending_thread.thread_id, final_code)?;
+                pending_thread.state_machine = GuestThreadState::Exited;
+                Ok((
+                    PumpedThreadOutcome {
+                        requeue: None,
+                        process_exit: None,
+                    },
+                    self.tls_slots.clone(),
+                    self.fls_slots.clone(),
+                ))
+            } else {
+                match disposition {
+                    GuestCallbackDisposition::Returned(exit_code) => {
+                        // Fire TLS thread-detach callbacks for all loaded modules.
+                        // These run after the thread's start function exits, before
+                        // the thread is torn down — matching Windows TLS callback ordering.
+                        {
+                            let mut tls_state = CpuState::new(GuestArch::X86);
+                            tls_state.segment_bases.fs = self.teb_base;
+                            if self.guest_arch == GuestArch::X86 {
+                                tls_state.set(
+                                    Register::Rsp,
+                                    pending_thread.initial_rsp.saturating_sub(0x100),
+                                );
+                            }
+                            self.fire_tls_callbacks_for_all_modules(
+                                &mut tls_state,
+                                memory,
+                                DLL_THREAD_DETACH,
+                            )?;
+                        }
+                        let final_code = pending_thread.exit_code_override.unwrap_or(exit_code as u32);
+                        self.win32
+                            .set_thread_exit_code_by_id(pending_thread.thread_id, final_code)?;
+                        pending_thread.state_machine = GuestThreadState::Exited;
+                        Ok((
+                            PumpedThreadOutcome {
+                                requeue: None,
+                                process_exit: None,
+                            },
+                            self.tls_slots.clone(),
+                            self.fls_slots.clone(),
+                        ))
+                    }
+                    GuestCallbackDisposition::Yielded => {
+                        pending_thread.tls_slots = self.tls_slots.clone();
+                        pending_thread.fls_slots = self.fls_slots.clone();
+                        pending_thread.wake_tick = self
+                            .yield_pumped_guest_thread_wake_tick
+                            .take()
+                            .unwrap_or_else(|| self.win32.get_tick_count64());
+                        pending_thread.state_machine = GuestThreadState::Waiting;
+                        Ok((
+                            PumpedThreadOutcome {
+                                requeue: Some(pending_thread),
+                                process_exit: None,
+                            },
+                            self.tls_slots.clone(),
+                            self.fls_slots.clone(),
+                        ))
+                    }
                 }
             }
         };
 
-        self.active_pumped_guest_thread = None;
-        self.yield_pumped_guest_thread = false;
-        self.yield_pumped_guest_thread_wake_tick = None;
+        self.active_pumped_guest_thread = previous_active_thread;
+        self.yield_pumped_guest_thread = previous_yield_request;
+        self.yield_pumped_guest_thread_wake_tick = previous_yield_wake_tick;
+        self.pumped_thread_exit_requested = previous_exit_request;
+        self.pumped_thread_exit_with_detach = previous_exit_detach;
         self.win32.set_current_thread_id(previous_thread_id);
         self.teb_base = previous_teb_base;
         self.tls_vector_ptr = previous_tls_vector_ptr;
 
         match result {
-            Ok((maybe_pending_thread, thread_tls_slots, thread_fls_slots)) => {
+            Ok((outcome, thread_tls_slots, thread_fls_slots)) => {
                 let mut restored_tls_slots = previous_tls_slots.clone();
                 restored_tls_slots.retain(|slot, _| thread_tls_slots.contains_key(slot));
                 for slot in thread_tls_slots.keys().copied() {
@@ -50237,10 +50655,13 @@ impl PeHostRuntime {
                     let value = self.tls_slots.get(&slot).copied().unwrap_or(0);
                     self.sync_guest_tls_slot(memory, slot, value)?;
                 }
-                if let Some(pending_thread) = maybe_pending_thread {
+                if let Some(pending_thread) = outcome.requeue {
                     self.pending_guest_threads.push_back(pending_thread);
                 }
-                Ok(true)
+                Ok(PumpOutcome {
+                    did_work: true,
+                    process_exit: outcome.process_exit,
+                })
             }
             Err(error) => {
                 self.tls_slots = previous_tls_slots;
@@ -50251,6 +50672,102 @@ impl PeHostRuntime {
                 Err(error)
             }
         }
+    }
+
+    /// Cooperative wait on a single handle: poll the signaled state, pump
+    /// pending guest threads (one per cycle, honoring wake_tick), and when
+    /// nothing could be pumped host-sleep 1 ms while advancing the guest
+    /// clock so sleeping workers become runnable.
+    ///
+    /// For a THREAD target the wait never reports WAIT_TIMEOUT for INFINITE
+    /// while the target thread is still queued (a sleeping worker's wake_tick
+    /// lies in the future, so the pump cannot run it yet) — it keeps polling
+    /// until the thread reaches `Exited` or a finite timeout expires.
+    /// Non-thread kernel objects keep the historical single-pass behavior for
+    /// INFINITE (pump while the queue is non-empty, then report the timeout)
+    /// so guests that busy-poll objects in a loop (Steam/CEF) stay responsive.
+    ///
+    /// Returns `PumpWaitOutcome::ProcessExit` when a pumped thread requested
+    /// process exit; the caller must propagate it as a thunk `Some(code)`.
+    fn wait_for_single_object_pumping(
+        &mut self,
+        memory: &mut MemoryImage,
+        handle: u32,
+        timeout_ms: u32,
+    ) -> AppResult<PumpWaitOutcome> {
+        if timeout_ms == 0 {
+            return Ok(PumpWaitOutcome::Wait(
+                self.win32.wait_for_single_object(handle, 0, false, None)?,
+            ));
+        }
+        let deadline = (timeout_ms != u32::MAX)
+            .then(|| self.win32.get_tick_count64().saturating_add(timeout_ms as u64));
+        loop {
+            // (a) Poll the target's signaled state (non-blocking).
+            let status = self.win32.wait_for_single_object(handle, 0, false, None)?;
+            if !matches!(status, crate::win32::WaitStatus::Timeout) {
+                return Ok(PumpWaitOutcome::Wait(status));
+            }
+            // (b) Pump pending guest threads (one at a time, honoring
+            // wake_tick).
+            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+            if let Some(code) = pump_outcome.process_exit {
+                return Ok(PumpWaitOutcome::ProcessExit(code));
+            }
+            // (c) Nothing could be pumped — the target thread may be a
+            // sleeping worker with its wake_tick in the future.  Host-sleep
+            // 1 ms and advance the guest clock (as the existing pump path
+            // does) so the worker's sleep expires.  The wait must NOT report
+            // WAIT_TIMEOUT for INFINITE while the target thread is still
+            // queued — this is the CThread::JoinThread regression.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.win32.record_sleep_observation(1, 1);
+            if let Some(deadline) = deadline
+                && self.win32.get_tick_count64() >= deadline
+            {
+                return Ok(PumpWaitOutcome::Wait(crate::win32::WaitStatus::Timeout));
+            }
+        }
+    }
+
+    /// Historical non-thread wait behavior, replicated from the pre-fix
+    /// `WaitForSingleObject` thunk: first the blocking win32 wait (finite
+    /// timeouts advance the guest clock; process handles block on the
+    /// `exit_sync` condvar), then pump pending guest threads, then report.
+    ///
+    /// Steam's shutdown handshake depends on this exact interleaving: a
+    /// signal that arrives during the pump phase is historically NOT
+    /// reported (the old thunk returned without updating RAX, so the caller
+    /// saw its pre-call RAX).  Pump-phase signals therefore surface as
+    /// `PumpWaitOutcome::Unreported` and the thunk leaves RAX untouched,
+    /// keeping the guest on its historical path.
+    fn wait_for_single_object_non_thread(
+        &mut self,
+        memory: &mut MemoryImage,
+        handle: u32,
+        timeout_ms: u32,
+    ) -> AppResult<PumpWaitOutcome> {
+        let result = self.win32.wait_for_single_object(handle, timeout_ms, false, None)?;
+        if !matches!(result, crate::win32::WaitStatus::Timeout) {
+            return Ok(PumpWaitOutcome::Wait(result));
+        }
+        loop {
+            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+            if let Some(code) = pump_outcome.process_exit {
+                return Ok(PumpWaitOutcome::ProcessExit(code));
+            }
+            let polled = self.win32.wait_for_single_object(handle, 0, false, None)?;
+            if !matches!(polled, crate::win32::WaitStatus::Timeout) {
+                // Pump-phase signal — historically unreported: the caller
+                // sees its pre-call RAX (the pre-fix thunk returned
+                // `Ok(None)` without setting RAX).
+                return Ok(PumpWaitOutcome::Unreported);
+            }
+            if !pump_outcome.did_work {
+                break;
+            }
+        }
+        Ok(PumpWaitOutcome::Wait(result))
     }
 
     /// Drain the shared timer work sink and execute each expired timer
@@ -65156,6 +65673,14 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TerminateThread" => {
                 Self::TerminateThread
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ExitThread" => {
+                Self::ExitThread
+            }
+            ("api-ms-win-core-processthreads-l1-1-0.dll", ImportSymbol::ByName { name, .. })
+                if name == "ExitThread" =>
+            {
+                Self::ExitThread
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SuspendThread" => {
                 Self::SuspendThread
             }
@@ -67519,7 +68044,8 @@ impl HostThunk {
             | Self::ILFree
             | Self::SHSimpleIDListFromPath
             | Self::Freeaddrinfo
-            | Self::DragFinish => 4,
+            | Self::DragFinish
+            | Self::ExitThread => 4,
             Self::SetEnvironmentVariableW
             | Self::GetCPInfo
             | Self::SystemFunction036
@@ -73846,6 +74372,7 @@ mod tests {
             runtime
                 .pump_pending_guest_thread(&mut memory)
                 .expect("pump pending thread")
+                .did_work
         );
         assert_eq!(
             read_u32(&memory, thread_id_from_proc_ptr).expect("thread id from proc after pump"),
@@ -73924,6 +74451,7 @@ mod tests {
             runtime
                 .pump_pending_guest_thread(&mut memory)
                 .expect("pump pending thread after close")
+                .did_work
         );
         assert_eq!(
             read_u32(&memory, thread_id_from_proc_ptr).expect("thread id from proc after pump"),
@@ -74297,6 +74825,7 @@ mod tests {
             runtime
                 .pump_pending_guest_thread(&mut memory)
                 .expect("first pump")
+                .did_work
         );
         assert_eq!(
             read_u32(&memory, flag_ptr).expect("flag after first pump"),
@@ -74316,6 +74845,7 @@ mod tests {
             runtime
                 .pump_pending_guest_thread(&mut memory)
                 .expect("second pump")
+                .did_work
         );
         assert_eq!(
             read_u32(&memory, flag_ptr).expect("flag after second pump"),
@@ -74407,6 +74937,553 @@ mod tests {
             "unexpected derailment: {message}"
         );
         assert!(message.contains("rbp=0x7"), "EBP frame missing: {message}");
+    }
+
+    #[test]
+    fn exit_thread_ends_pumped_thread_with_code() {
+        // A pumped thread that calls ExitThread(9) must end immediately with
+        // exit code 9, fire DLL_THREAD_DETACH, and never be re-queued.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "exit-thread", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        // TLS callback that records the reason code at a guest address so the
+        // test can observe DLL_THREAD_ATTACH (2) / DLL_THREAD_DETACH (3).
+        let callback_address = 0x1001_0000_u64;
+        let detach_flag = 0x41_300_u32;
+        let mut callback_bytes = Vec::new();
+        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]  (reason)
+        callback_bytes.extend(&[0xA3]); // mov [flag], eax
+        callback_bytes.extend(&detach_flag.to_le_bytes());
+        callback_bytes.push(0xC3); // ret
+        memory.map_bytes(callback_address, &callback_bytes);
+        runtime.dll_info_table.insert(
+            0x1000_0000,
+            DllInfo {
+                handle: 0x1000_0000,
+                image_size: 0x10000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "test.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: vec![callback_address - 0x1000_0000],
+            },
+        );
+        memory.map_bytes(detach_flag as u64, &[0; 4]);
+
+        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let import_slot = 0x41_000_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        // push 9; call [ExitThread]; mov eax,0; ret 4 — the mov/ret must
+        // never execute.
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..17].copy_from_slice(&[
+            0x6A, 0x09, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC2,
+            0x04, 0x00, 0x90,
+        ]);
+        write_u32(&mut memory, import_slot, exit_thread as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump exit-thread")
+                .did_work
+        );
+        // The thread ended: not re-queued, exit code 9, DLL_THREAD_DETACH fired.
+        assert!(runtime.pending_guest_threads.is_empty());
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after pump"),
+            Some(9)
+        );
+        assert_eq!(
+            read_u32(&memory, detach_flag as u64).expect("tls detach flag"),
+            DLL_THREAD_DETACH
+        );
+        assert_eq!(runtime.win32.current_thread_id(), 1);
+        })
+    }
+
+    #[test]
+    fn endthreadex_code_is_not_overwritten_by_return() {
+        // `_endthreadex(5)` followed by a return with RAX=7: the explicit
+        // exit-code override (5) must win.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "endthreadex-override",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let endthreadex = runtime.alloc_host_thunk(HostThunk::Endthreadex);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let import_slot = 0x41_000_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        // push 5; call [_endthreadex]; mov eax,7; ret 4 — the mov/ret must
+        // never execute.
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..17].copy_from_slice(&[
+            0x68, 0x05, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00,
+            0x00, 0x00, 0xC2,
+        ]);
+        entrypoint_bytes[17..20].copy_from_slice(&[0x04, 0x00, 0x90]);
+        write_u32(&mut memory, import_slot, endthreadex as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump endthreadex thread")
+                .did_work
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after pump"),
+            Some(5)
+        );
+        })
+    }
+
+    #[test]
+    fn terminate_thread_forces_exit_with_code() {
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "terminate-thread",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        // TLS callback recording the reason code, to verify TerminateThread
+        // does NOT fire DLL_THREAD_DETACH.
+        let callback_address = 0x1001_0000_u64;
+        let detach_flag = 0x41_300_u32;
+        let mut callback_bytes = Vec::new();
+        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+        callback_bytes.extend(&[0xA3]); // mov [flag], eax
+        callback_bytes.extend(&detach_flag.to_le_bytes());
+        callback_bytes.push(0xC3); // ret
+        memory.map_bytes(callback_address, &callback_bytes);
+        runtime.dll_info_table.insert(
+            0x1000_0000,
+            DllInfo {
+                handle: 0x1000_0000,
+                image_size: 0x10000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "test.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: vec![callback_address - 0x1000_0000],
+            },
+        );
+        memory.map_bytes(detach_flag as u64, &[0; 4]);
+
+        let get_current_thread = runtime.alloc_host_thunk(HostThunk::GetCurrentThread);
+        let terminate_thread = runtime.alloc_host_thunk(HostThunk::TerminateThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let get_ct_slot = 0x41_000_u64;
+        let terminate_slot = 0x41_010_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        // call [GetCurrentThread]; push eax; push 4; call [TerminateThread];
+        // mov eax,9; ret 4 — the mov/ret must never execute.
+        let mut entrypoint_bytes = vec![0x90; 0x30];
+        entrypoint_bytes[..25].copy_from_slice(&[
+            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0x50, 0x6A, 0x04, 0xFF, 0x15, 0x10, 0x10, 0x04,
+            0x00, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00, 0x90, 0x90,
+        ]);
+        write_u32(&mut memory, get_ct_slot, get_current_thread as u32);
+        write_u32(&mut memory, terminate_slot, terminate_thread as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+
+        // Terminate the CURRENT pumped thread: it must end with the code,
+        // without DLL_THREAD_DETACH.
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump terminate-self thread")
+                .did_work
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after terminate-self"),
+            Some(4)
+        );
+        assert_eq!(
+            read_u32(&memory, detach_flag as u64).expect("tls flag after terminate-self"),
+            DLL_THREAD_ATTACH
+        );
+
+        // Terminate a queued (never-run) thread: it must never run, and the
+        // exit code is recorded.
+        let terminate_target = 0x41_200_u64;
+        let target_id_ptr = 0x41_214_u64;
+        let mut target_bytes = vec![0x90; 0x10];
+        target_bytes[..8].copy_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        memory.map_bytes(terminate_target, &target_bytes);
+        let target_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, terminate_target as u32, 0, 0, target_id_ptr as u32],
+        );
+        assert_ne!(target_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            terminate_thread,
+            &[target_handle as u32, 3],
+        );
+        assert_eq!(result, 1); // TRUE
+        assert_eq!(runtime.last_error, 0);
+        assert!(runtime.pending_guest_threads.is_empty(), "terminated thread removed");
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(target_handle as u32)
+                .expect("exit code after terminate"),
+            Some(3)
+        );
+        // Nothing left to pump.
+        assert!(
+            !runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump after terminate")
+                .did_work
+        );
+        })
+    }
+
+    #[test]
+    fn infinite_join_of_sleeping_thread_succeeds() {
+        // The Steam shutdown regression: a worker thread that Sleeps(50) then
+        // exits with 7 must be joinable with WaitForSingleObject(INFINITE) —
+        // no spurious WAIT_TIMEOUT.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "infinite-join-sleeping",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+        let import_slot = 0x41_000_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        // push 50; call [Sleep]; mov eax,7; ret 4
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..16].copy_from_slice(&[
+            0x6A, 0x32, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2,
+            0x04, 0x00,
+        ]);
+        write_u32(&mut memory, import_slot, sleep as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code before wait"),
+            None
+        );
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_for_single_object,
+            &[thread_handle as u32, u32::MAX],
+        );
+        assert_eq!(
+            result,
+            crate::win32::WAIT_OBJECT_0 as u64,
+            "INFINITE join of a sleeping worker must succeed, not return WAIT_TIMEOUT"
+        );
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after wait"),
+            Some(7)
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn wait_for_multiple_objects_thread_and_event_wait_any() {
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "wait-multiple-wait-any",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let wait_for_multiple = runtime.alloc_host_thunk(HostThunk::WaitForMultipleObjects);
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+
+        let (event_handle, _created) = runtime.win32.create_event(true, true, false, None);
+        runtime
+            .win32
+            .set_event(event_handle)
+            .expect("set event");
+
+        // wait-any over [thread, event]: the signaled event is at index 1, so
+        // the result must be WAIT_OBJECT_0 + 1 (and RAX must be set).
+        let handles_ptr = 0x41_400_u64;
+        write_u32(&mut memory, handles_ptr, thread_handle as u32);
+        write_u32(&mut memory, handles_ptr + 4, event_handle);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_for_multiple,
+            &[2, handles_ptr as u32, 0, u32::MAX],
+        );
+        assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64 + 1);
+        assert_eq!(runtime.last_error, 0);
+        })
+    }
+
+    #[test]
+    fn process_exit_from_pumped_thread_ends_run() {
+        // A pumped thread calls ExitProcess(-2): the run must terminate with
+        // exit code -2 and the remaining pending threads are abandoned.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "process-exit-pumped",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+        // NOTE: dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the
+        // guest mappings must live above that range.
+        let import_slot = 0x60_000_u64;
+        let exit_entry = 0x61_000_u64;
+        let sleeper_entry = 0x62_000_u64;
+        let thread_id_ptr = 0x61_100_u64;
+        let sleeper_id_ptr = 0x62_100_u64;
+        // push 0xFFFFFFFE; call [ExitProcess]; ret 4
+        let mut exit_bytes = vec![0x90; 0x20];
+        exit_bytes[..13].copy_from_slice(&[
+            0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC2, 0x04,
+        ]);
+        exit_bytes[13..16].copy_from_slice(&[0x00, 0x90, 0x90]);
+        let mut sleeper_bytes = vec![0x90; 0x10];
+        sleeper_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        write_u32(&mut memory, import_slot, exit_process as u32);
+        memory.map_bytes(exit_entry, &exit_bytes);
+        memory.map_bytes(sleeper_entry, &sleeper_bytes);
+
+        // Two threads: one calls ExitProcess, the other would return 7 if it
+        // ever ran.  The ExitProcess thread runs first (FIFO pump order).
+        let exit_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, exit_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(exit_handle, 0);
+        let sleeper_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, sleeper_entry as u32, 0, 0, sleeper_id_ptr as u32],
+        );
+        assert_ne!(sleeper_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 2);
+
+        // GetMessageW pumps pending threads; the ExitProcess thread must end
+        // the guest run with exit code -2 (0xFFFFFFFE) and abandon the
+        // remaining pending thread.
+        let result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            get_message,
+            &[0, 0, 0, 0],
+        );
+        assert_eq!(result, Some(-2));
+        assert!(
+            runtime.pending_guest_threads.is_empty(),
+            "pending threads abandoned on process exit"
+        );
+        })
+    }
+
+    #[test]
+    fn open_thread_returns_thread_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "open-thread",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
+        let get_exit_code_thread = runtime.alloc_host_thunk(HostThunk::GetExitCodeThread);
+        let exit_code_ptr = 0x41_000_u32;
+        memory.map_bytes(exit_code_ptr as u64, &[0; 4]);
+
+        // OpenThread on the main thread (tid 1) yields a real thread handle
+        // that GetExitCodeThread can query.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_thread,
+            &[0x1F_03FF, 0, 1],
+        );
+        assert_ne!(handle, 0);
+        assert_eq!(runtime.last_error, 0);
+        assert!(matches!(
+            runtime.win32.handle_object_type(handle as u32),
+            Ok(crate::win32::ObjectType::Thread)
+        ));
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_exit_code_thread,
+            &[handle as u32, exit_code_ptr],
+        );
+        assert_eq!(result, 1);
+        assert_eq!(
+            read_u32(&memory, exit_code_ptr as u64).expect("main thread exit code"),
+            STILL_ACTIVE
+        );
+
+        // A non-existent thread ID fails with ERROR_INVALID_PARAMETER.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_thread,
+            &[0x1F_03FF, 0, 0xDEAD_BEEF],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
     }
 
     #[test]
@@ -75830,6 +76907,7 @@ mod tests {
             runtime
                 .pump_pending_guest_thread(&mut memory)
                 .expect("pump created thread")
+                .did_work
         );
         assert_eq!(
             runtime
