@@ -59,7 +59,10 @@ pub struct GfxFrame {
     pub scene_id: String,
     pub frame_index: u32,
     pub hash: String,
-    pub ssim: f64,
+    /// Structural similarity of this frame against a reference.  `None`
+    /// means no SSIM was measured — a fabricated placeholder metric is
+    /// never recorded.
+    pub ssim: Option<f64>,
     pub metadata: BTreeMap<String, String>,
 }
 

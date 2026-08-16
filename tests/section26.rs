@@ -860,7 +860,7 @@ fn t26_14_canonical_frame_allocation() {
         scene_id: "t26_14_test_scene".to_string(),
         frame_index: 0,
         hash: String::new(),
-        ssim: 0.0,
+        ssim: None,
         metadata: BTreeMap::new(),
     };
 
@@ -873,7 +873,7 @@ fn t26_14_canonical_frame_allocation() {
     // Set frame dimensions / metadata (simulating allocation).
     frame.frame_index = 42;
     frame.hash = "abc123def456".to_string();
-    frame.ssim = 0.95;
+    frame.ssim = Some(0.95);
     frame
         .metadata
         .insert("width".to_string(), "1920".to_string());
@@ -887,7 +887,7 @@ fn t26_14_canonical_frame_allocation() {
     // Verify the updated state.
     assert_eq!(frame.frame_index, 42);
     assert_eq!(frame.hash, "abc123def456");
-    assert!((frame.ssim - 0.95).abs() < 1e-6);
+    assert!((frame.ssim.unwrap() - 0.95).abs() < 1e-6);
     assert_eq!(frame.metadata.len(), 3);
     assert_eq!(frame.metadata.get("width").unwrap(), "1920");
     assert_eq!(frame.metadata.get("height").unwrap(), "1080");
@@ -905,12 +905,12 @@ fn t26_14_canonical_frame_allocation() {
     // Verify the frame lifecycle by resetting and re-checking.
     frame.frame_index = 0;
     frame.hash.clear();
-    frame.ssim = 0.0;
+    frame.ssim = None;
     frame.metadata.clear();
 
     assert_eq!(frame.frame_index, 0);
     assert!(frame.hash.is_empty());
-    assert!((frame.ssim - 0.0).abs() < 1e-6);
+    assert!(frame.ssim.is_none());
     assert!(frame.metadata.is_empty());
 
     // GfxFrame can be serialized (derives Serialize).

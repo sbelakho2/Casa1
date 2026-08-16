@@ -181,7 +181,9 @@ impl VulkanLoader {
                 )
                 .as_bytes(),
             ),
-            ssim: 1.0,
+            // No actual frame is rasterized here, so no SSIM can be
+            // measured; recording a constant would fabricate a metric.
+            ssim: None,
             validation_errors: Vec::new(),
         })
     }
@@ -224,7 +226,9 @@ impl OpenGlDriver {
                 )
                 .as_bytes(),
             ),
-            ssim: 1.0,
+            // No actual frame is rasterized here, so no SSIM can be
+            // measured; recording a constant would fabricate a metric.
+            ssim: None,
             validation_errors: Vec::new(),
         })
     }

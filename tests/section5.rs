@@ -123,7 +123,7 @@ fn t5_1_file_api_differential_suite_vs_independent_reference() {
         .expect("copy file");
     assert_eq!(copy_bytes, 13);
     win32
-        .move_file_ex_w("C:\\Games\\copy.txt", "C:\\Games\\moved.txt", true)
+        .move_file_ex_w("C:\\Games\\copy.txt", "C:\\Games\\moved.txt", true, false)
         .expect("move file");
     let temp_path = win32.get_temp_path_w().expect("temp path");
     assert!(

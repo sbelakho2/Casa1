@@ -599,6 +599,7 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
         })
         .expect("create soak swapchain");
     let mut frame_times = Vec::new();
+    let mut frame_times_ns = Vec::new();
     for iteration in 0..512 {
         let resource = backend
             .create_resource(ResourceDesc {
@@ -614,28 +615,36 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
         backend
             .destroy_resource(resource)
             .expect("destroy transient resource");
-        frame_times.push(
-            backend
-                .present(swapchain, 1, false)
-                .expect("present soak frame")
-                .frame_time_us,
-        );
+        let result = backend
+            .present(swapchain, 1, false)
+            .expect("present soak frame");
+        frame_times.push(result.frame_time_us);
+        frame_times_ns.push(result.frame_time_ns);
     }
     assert_eq!(backend.live_resource_count(), 2);
-    // frame_time_us is now MEASURED wall-clock time since the previous
-    // present on the same swapchain (src/gfx.rs present()): the first
-    // present has no predecessor (0 µs) and every later present reports
+    // frame_time_us/frame_time_ns are MEASURED wall-clock times since the
+    // previous present on the same swapchain (src/gfx.rs present()): the
+    // first present has no predecessor (0) and every later present reports
     // its real elapsed time, which in this tight loop is far below one
     // vsync interval.
     assert_eq!(
         frame_times[0], 0,
         "the first present has no previous timestamp to measure against"
     );
-    for frame_time_us in frame_times.iter().skip(1) {
+    assert_eq!(
+        frame_times_ns[0], 0,
+        "the first present must also report zero nanoseconds"
+    );
+    for frame_time_ns in frame_times_ns.iter().skip(1) {
+        // Nanosecond resolution: sub-microsecond intervals are common in
+        // this tight loop and would truncate to 0 in the microsecond field,
+        // so assert on the nanosecond value to avoid the sub-µs flake.
         assert!(
-            *frame_time_us > 0,
-            "every later present must report a measured frame time"
+            *frame_time_ns > 0,
+            "every later present must report a measured frame time in nanoseconds"
         );
+    }
+    for frame_time_us in frame_times.iter().skip(1) {
         assert!(
             *frame_time_us < 16_666 * 16,
             "measured frame times must stay bounded, got {frame_time_us}"

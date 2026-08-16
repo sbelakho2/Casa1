@@ -808,6 +808,23 @@ pub struct D3d9Frame {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Pixel provenance: true when the pixels were invented by the host
+    /// (fixed-function placeholder rasterizer, or the blank present
+    /// fallback).  Synthesized frames are never published to the live
+    /// channel and never count as real guest presents.
+    pub synthesized: bool,
+}
+
+/// A D3D9 render-target snapshot with pixel provenance.  `synthesized` is
+/// true when the host invented the pixels (the fixed-function placeholder
+/// rasterizer or the blank fallback); such content must never be published
+/// as a real guest frame or counted as a real present.
+#[derive(Debug, Clone)]
+pub struct D3d9RenderTarget {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub synthesized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1001,7 +1018,7 @@ pub struct Direct3D9Shim {
     pub index_buffers: BTreeMap<D3d9IndexBufferId, IndexBuffer9>,
     pub textures: BTreeMap<D3d9TextureId, D3d9Texture>,
     pub devices: BTreeMap<D3d9DeviceId, Direct3D9Device>,
-    pub render_target: Option<(u32, u32, Vec<u8>)>,
+    pub render_target: Option<D3d9RenderTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -4069,17 +4086,20 @@ impl Direct3D9Shim {
             device.swapchain_width.min(16384),
             device.swapchain_height.min(16384),
         );
-        let pixels = self
-            .render_target
-            .clone()
-            .unwrap_or_else(|| (w, h, vec![0u8; (w as usize) * (h as usize) * 4]));
+        let (width, height, pixels, synthesized) = match self.render_target.clone() {
+            Some(rt) => (rt.width, rt.height, rt.pixels, rt.synthesized),
+            // Blank fallback: the host fabricated these pixels, so they are
+            // explicitly marked synthesized and never count as a real frame.
+            None => (w, h, vec![0u8; (w as usize) * (h as usize) * 4], true),
+        };
         let sig = format!("d3d9:present:device={}", device_id);
         Ok(D3d9Frame {
             hash: util::sha256_bytes(sig.as_bytes()),
             signature: sig,
-            pixels: pixels.2,
-            width: pixels.0,
-            height: pixels.1,
+            pixels,
+            width,
+            height,
+            synthesized,
         })
     }
 }
@@ -4164,6 +4184,9 @@ impl Direct3D9Device {
             pixels,
             width: w,
             height: h,
+            // The fixed-function rasterizer invents these pixels from device
+            // state; they are host-synthesized, never real guest content.
+            synthesized: true,
         })
     }
 

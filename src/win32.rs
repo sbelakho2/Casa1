@@ -1947,6 +1947,44 @@ impl Win32Subsystem {
         // with a sharing violation when an existing handle's share modes do
         // not permit this open.  Only after the check passes may
         // CREATE_ALWAYS / TRUNCATE_EXISTING truncate or create.
+        //
+        // Windows refuses to truncate a file carrying the readonly attribute
+        // (it is never cleared by the open) and TRUNCATE_EXISTING requires
+        // write access — both surface as ERROR_ACCESS_DENIED.
+        if host_path.exists()
+            && matches!(
+                creation,
+                CreationDisposition::CreateAlways | CreationDisposition::TruncateExisting
+            )
+        {
+            let metadata = self.ge.get_file_metadata(&normalized_path).map_err(|error| {
+                if matches!(error.code, ReasonCode::RcFsNotFound) {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!("failed to stat {}", normalized_path),
+                    )
+                } else {
+                    error
+                }
+            })?;
+            if metadata.attributes.iter().any(|attribute| attribute == "readonly") {
+                return Err(AppError::new(
+                    ReasonCode::RcHelperPermissionDenied,
+                    format!("{} is read-only", normalized_path),
+                ));
+            }
+            if matches!(creation, CreationDisposition::TruncateExisting)
+                && granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0
+            {
+                return Err(AppError::new(
+                    ReasonCode::RcHelperPermissionDenied,
+                    format!(
+                        "TRUNCATE_EXISTING requires write access to {}",
+                        normalized_path
+                    ),
+                ));
+            }
+        }
         let ge_handle = if host_path.exists() {
             Some(self.ge.open_file(path, desired_access, share_mode)?)
         } else {
@@ -2141,6 +2179,15 @@ impl Win32Subsystem {
                 ),
             ))
         }
+    }
+
+    /// Public per-operation granted-access check for a handle, used by the
+    /// runtime's ADS ReadFile/WriteFile paths (which operate on the base
+    /// file handle) so those operations cannot bypass the handle's recorded
+    /// access mask.
+    pub fn require_file_access(&self, handle: Handle, required: u32) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        Self::require_access(entry, required)
     }
 
     pub fn read_file(&mut self, handle: Handle, length: usize) -> AppResult<Vec<u8>> {
@@ -2384,10 +2431,10 @@ impl Win32Subsystem {
 
     pub fn flush_file_buffers(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
-        // Windows FlushFileBuffers on a read-only handle succeeds as long as
-        // the file is readable; the operation only requires the ability to
-        // inspect the file (FILE_READ_ATTRIBUTES), not write access.
-        Self::require_access(entry, FILE_READ_ATTRIBUTES)?;
+        // Windows FlushFileBuffers requires GENERIC_WRITE access to the file
+        // (the expanded mask grants FILE_WRITE_DATA|FILE_APPEND_DATA); a
+        // read-only handle must fail with ERROR_ACCESS_DENIED.
+        Self::require_access(entry, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
         match &entry.object {
             KernelObject::File(file) => {
                 let file = file.borrow();
@@ -2507,13 +2554,40 @@ impl Win32Subsystem {
                 &error,
             )
         })?;
+        // Windows never reports a zero FILETIME for a real file, but a
+        // persisted fs_state record may carry zero ticks (e.g. the access
+        // time was not tracked when the record was provisioned).  Fall back
+        // to host-derived times per field so GetFileInformationByHandleEx
+        // (the boot-sequence bootstrap_log metadata reader) never surfaces a
+        // zero timestamp.
+        let host_ticks = |time: std::io::Result<SystemTime>| {
+            time.ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| {
+                    WINDOWS_EPOCH_OFFSET_100NS
+                        .saturating_add(duration.as_nanos().div_euclid(100) as u64)
+                })
+                .unwrap_or(0)
+        };
         Ok(FileInformation {
             normalized_path,
             size: host.len(),
             attributes: metadata.attributes,
-            creation_time_ticks: metadata.creation_time_ticks,
-            last_access_time_ticks: metadata.last_access_time_ticks,
-            last_write_time_ticks: metadata.last_write_time_ticks,
+            creation_time_ticks: if metadata.creation_time_ticks != 0 {
+                metadata.creation_time_ticks
+            } else {
+                host_ticks(host.created())
+            },
+            last_access_time_ticks: if metadata.last_access_time_ticks != 0 {
+                metadata.last_access_time_ticks
+            } else {
+                host_ticks(host.accessed())
+            },
+            last_write_time_ticks: if metadata.last_write_time_ticks != 0 {
+                metadata.last_write_time_ticks
+            } else {
+                host_ticks(host.modified())
+            },
             is_directory: metadata.kind == FsEntryKind::Directory,
         })
     }
@@ -2631,6 +2705,16 @@ impl Win32Subsystem {
 
     pub fn delete_file_w(&mut self, path: &str) -> AppResult<()> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
+        // Windows refuses to delete a file carrying the readonly attribute:
+        // DeleteFileW on a read-only file fails with ERROR_ACCESS_DENIED.
+        if let Ok(metadata) = self.ge.get_file_metadata(&normalized_path)
+            && metadata.attributes.iter().any(|attribute| attribute == "readonly")
+        {
+            return Err(AppError::new(
+                ReasonCode::RcHelperPermissionDenied,
+                format!("{} is read-only", normalized_path),
+            ));
+        }
         // FILE_SHARE_DELETE enforcement: deletion is only allowed when no
         // open handle holds the file without FILE_SHARE_DELETE (no handles
         // at all is trivially allowed).
@@ -2670,6 +2754,7 @@ impl Win32Subsystem {
         from: &str,
         to: &str,
         replace_existing: bool,
+        copy_allowed: bool,
     ) -> AppResult<()> {
         let (from_norm, from_host) = self.resolve_host_path(from)?;
         let (to_norm, to_host) = self.resolve_host_path(to)?;
@@ -2688,24 +2773,55 @@ impl Win32Subsystem {
                 format!("parent directory of {} does not exist", to_norm),
             ));
         }
-        if replace_existing && to_host.exists() {
-            if to_host.is_dir() {
-                fs::remove_dir_all(&to_host).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to remove {}", to_host.display()),
-                        &error,
-                    )
-                })?;
-            } else {
-                fs::remove_file(&to_host).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to remove {}", to_host.display()),
-                        &error,
-                    )
-                })?;
+        // Share matrix: the move deletes the source, so every open handle on
+        // it must share delete; with MOVEFILE_COPY_ALLOWED the source is read
+        // (copy + delete fallback), so every open handle must share read too.
+        if !self.ge.check_delete_sharing(from)? {
+            return Err(AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                format!("sharing violation: {from_norm} is open without FILE_SHARE_DELETE"),
+            ));
+        }
+        if copy_allowed && !self.ge.check_read_sharing(from)? {
+            return Err(AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                format!("sharing violation: {from_norm} is open without FILE_SHARE_READ"),
+            ));
+        }
+        if to_host.exists() {
+            if !replace_existing {
+                // Without MOVEFILE_REPLACE_EXISTING an existing destination
+                // is ERROR_ALREADY_EXISTS — POSIX rename must never silently
+                // clobber it.
+                return Err(AppError::new(
+                    ReasonCode::RcFsAlreadyExists,
+                    format!("{} already exists", to_norm),
+                ));
             }
+            // Windows cannot replace a directory with a file: the replace
+            // path removes the destination FILE only and never touches a
+            // directory tree.
+            if to_host.is_dir() {
+                return Err(AppError::new(
+                    ReasonCode::RcHelperPermissionDenied,
+                    format!("{} is a directory and cannot be replaced", to_norm),
+                ));
+            }
+            // Replacing the destination deletes it, so every open handle on
+            // it must share delete.
+            if !self.ge.check_delete_sharing(to)? {
+                return Err(AppError::new(
+                    ReasonCode::RcFsSharingViolation,
+                    format!("sharing violation: {to_norm} is open without FILE_SHARE_DELETE"),
+                ));
+            }
+            fs::remove_file(&to_host).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to remove {}", to_host.display()),
+                    &error,
+                )
+            })?;
         }
         fs::rename(&from_host, &to_host).map_err(|error| {
             AppError::from_io(
@@ -2742,6 +2858,14 @@ impl Win32Subsystem {
             return Err(AppError::new(
                 ReasonCode::RcFsPathInvalid,
                 format!("parent directory of {} does not exist", to_norm),
+            ));
+        }
+        // Share matrix: copying reads the source, so every open handle on it
+        // must share read.
+        if !self.ge.check_read_sharing(from)? {
+            return Err(AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                format!("sharing violation: {from_norm} is open without FILE_SHARE_READ"),
             ));
         }
         let copied = fs::copy(&from_host, &to_host).map_err(|error| {
@@ -4639,12 +4763,17 @@ impl Win32Subsystem {
     /// resolves through the GE — i.e. exists from the guest's point of
     /// view.  This discriminates ERROR_PATH_NOT_FOUND (missing parent)
     /// from ERROR_FILE_NOT_FOUND (missing file inside a present parent).
+    /// A parent that exists as a FILE is NOT a directory and yields
+    /// ERROR_PATH_NOT_FOUND, matching Windows.
     /// Read-only: resolution must never create anything.
     fn parent_directory_exists(&self, normalized_path: &str) -> bool {
         let Some(parent) = normalized_path.rsplit_once('\\').map(|(p, _)| p) else {
             return false;
         };
-        self.ge.resolve_existing_path(parent, None, 0).is_ok()
+        match self.ge.resolve_existing_path(parent, None, 0) {
+            Ok(resolved) => resolved.host_path.is_dir(),
+            Err(_) => false,
+        }
     }
 
     /// Host-internal helper used ONLY by `stage_host_file_w` (staging a
@@ -6037,7 +6166,7 @@ mod tests {
             .expect("seed source file");
         win32.close_handle(h).expect("close");
 
-        let result = win32.move_file_ex_w("C:\\src.txt", "C:\\no_dest_parent\\dst.txt", false);
+        let result = win32.move_file_ex_w("C:\\src.txt", "C:\\no_dest_parent\\dst.txt", false, false);
         assert_eq!(
             result.expect_err("missing destination parent must fail").code,
             ReasonCode::RcFsPathInvalid,
@@ -6059,11 +6188,478 @@ mod tests {
         );
 
         // A missing SOURCE is ERROR_FILE_NOT_FOUND.
-        let result = win32.move_file_ex_w("C:\\no_such_src.txt", "C:\\dst.txt", false);
+        let result = win32.move_file_ex_w("C:\\no_such_src.txt", "C:\\dst.txt", false, false);
         assert_eq!(
             result.expect_err("missing source must fail").code,
             ReasonCode::RcFsNotFound,
             "MoveFileEx with a missing source must be ERROR_FILE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn move_file_ex_reject_directory_destination_with_replace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mvdir01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32
+            .create_file_w(
+                "C:\\mv-src.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("seed source file");
+        win32.close_handle(h).expect("close");
+
+        win32
+            .create_directory_w("C:\\mv-dst")
+            .expect("create destination directory");
+        let child = win32
+            .create_file_w(
+                "C:\\mv-dst\\child.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("seed directory child");
+        win32.close_handle(child).expect("close child");
+
+        // Windows cannot replace a directory with a file: the replace path
+        // must fail with ERROR_ACCESS_DENIED and must NEVER remove the tree.
+        let result = win32.move_file_ex_w("C:\\mv-src.txt", "C:\\mv-dst", true, false);
+        assert_eq!(
+            result.expect_err("directory destination must fail").code,
+            ReasonCode::RcHelperPermissionDenied,
+            "replacing a directory with a file must be ERROR_ACCESS_DENIED"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\mv-dst\\child.txt")
+                .expect("resolve child")
+                .exists(),
+            "directory tree must survive the failed replace"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\mv-src.txt")
+                .expect("resolve source")
+                .exists(),
+            "source must survive the failed replace"
+        );
+
+        // A FILE destination with REPLACE_EXISTING replaces correctly.
+        let h = win32
+            .create_file_w(
+                "C:\\mv-dst\\old.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("seed file destination");
+        win32.close_handle(h).expect("close");
+        win32
+            .move_file_ex_w("C:\\mv-src.txt", "C:\\mv-dst\\old.txt", true, false)
+            .expect("replace file destination");
+        assert!(
+            !win32
+                .guest_path_to_host_path("C:\\mv-src.txt")
+                .expect("resolve source")
+                .exists(),
+            "source must be gone after a successful replace"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\mv-dst\\old.txt")
+                .expect("resolve destination")
+                .exists(),
+            "destination must contain the moved file"
+        );
+    }
+
+    #[test]
+    fn move_file_ex_respects_delete_sharing_on_source() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mvsh01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32
+            .create_file_w(
+                "C:\\mv-share.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("open source without FILE_SHARE_DELETE");
+
+        // An open source handle without FILE_SHARE_DELETE blocks the move.
+        let result = win32.move_file_ex_w("C:\\mv-share.txt", "C:\\mv-share-dst.txt", false, false);
+        assert_eq!(
+            result.expect_err("move must be denied").code,
+            ReasonCode::RcFsSharingViolation,
+            "moving a source held open without FILE_SHARE_DELETE must be a sharing violation"
+        );
+
+        win32.close_handle(h).expect("close source");
+
+        // With no handles left the move succeeds.
+        win32
+            .move_file_ex_w("C:\\mv-share.txt", "C:\\mv-share-dst.txt", false, false)
+            .expect("move after closing the source");
+    }
+
+    #[test]
+    fn move_file_ex_requires_replace_existing_for_existing_destination() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mvre01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        for path in ["C:\\mvre-src.txt", "C:\\mvre-dst.txt"] {
+            let h = win32
+                .create_file_w(
+                    path,
+                    FileAccess::read_write(),
+                    ShareMode::none(),
+                    CreationDisposition::CreateAlways,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("seed file");
+            win32.close_handle(h).expect("close");
+        }
+
+        // Without MOVEFILE_REPLACE_EXISTING an existing destination is
+        // ERROR_ALREADY_EXISTS — rename must not silently clobber it.
+        let result = win32.move_file_ex_w("C:\\mvre-src.txt", "C:\\mvre-dst.txt", false, false);
+        assert_eq!(
+            result.expect_err("existing destination must fail").code,
+            ReasonCode::RcFsAlreadyExists,
+            "move onto an existing destination without replace must be ERROR_ALREADY_EXISTS"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\mvre-src.txt")
+                .expect("resolve source")
+                .exists(),
+            "source must survive a failed non-replacing move"
+        );
+
+        // With MOVEFILE_REPLACE_EXISTING the move succeeds.
+        win32
+            .move_file_ex_w("C:\\mvre-src.txt", "C:\\mvre-dst.txt", true, false)
+            .expect("move with replace");
+        assert!(
+            !win32
+                .guest_path_to_host_path("C:\\mvre-src.txt")
+                .expect("resolve source")
+                .exists(),
+            "source must be gone after the replacing move"
+        );
+    }
+
+    #[test]
+    fn truncate_existing_on_readonly_file_fails_access_denied() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "rotr01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\ro-truncate.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"keep-me").expect("write content");
+        win32.close_handle(h).expect("close");
+
+        // GE metadata path: the readonly attribute is stored on the record.
+        win32
+            .set_file_attributes_w(path, &["readonly"])
+            .expect("set readonly attribute");
+
+        for disposition in [
+            CreationDisposition::TruncateExisting,
+            CreationDisposition::CreateAlways,
+        ] {
+            let result = win32.create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                disposition,
+                false,
+                false,
+                false,
+            );
+            assert_eq!(
+                result.expect_err("read-only file must fail").code,
+                ReasonCode::RcHelperPermissionDenied,
+                "{disposition:?} on a read-only file must be ERROR_ACCESS_DENIED"
+            );
+        }
+
+        let contents = fs::read(
+            win32
+                .guest_path_to_host_path(path)
+                .expect("resolve host path"),
+        )
+        .expect("read file");
+        assert_eq!(contents, b"keep-me", "read-only file must not be truncated");
+    }
+
+    #[test]
+    fn truncate_existing_requires_write_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "rotr02", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\tr-write-req.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"content").expect("write content");
+        win32.close_handle(h).expect("close");
+
+        // GENERIC_READ-only (expanded FILE_GENERIC_READ carries no
+        // FILE_WRITE_DATA) TRUNCATE_EXISTING → ERROR_ACCESS_DENIED.
+        let result = win32.create_file_w(
+            path,
+            FileAccess::read_only(),
+            ShareMode::none(),
+            CreationDisposition::TruncateExisting,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            result.expect_err("read-only access must fail").code,
+            ReasonCode::RcHelperPermissionDenied,
+            "TRUNCATE_EXISTING without write access must be ERROR_ACCESS_DENIED"
+        );
+
+        // A FILE_WRITE_DATA-granting handle succeeds.
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess {
+                    read: false,
+                    write: true,
+                    delete: false,
+                },
+                ShareMode::none(),
+                CreationDisposition::TruncateExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("truncate with write access");
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn delete_file_w_on_readonly_file_fails_access_denied() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "rodf01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\ro-delete.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.close_handle(h).expect("close");
+        win32
+            .set_file_attributes_w(path, &["readonly"])
+            .expect("set readonly attribute");
+
+        let result = win32.delete_file_w(path);
+        assert_eq!(
+            result.expect_err("read-only file must fail").code,
+            ReasonCode::RcHelperPermissionDenied,
+            "DeleteFileW on a read-only file must be ERROR_ACCESS_DENIED"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path(path)
+                .expect("resolve host path")
+                .exists(),
+            "read-only file must survive DeleteFileW"
+        );
+
+        // Clearing the attribute allows deletion.
+        win32
+            .set_file_attributes_w(path, &[])
+            .expect("clear readonly attribute");
+        win32.delete_file_w(path).expect("delete after clearing readonly");
+    }
+
+    #[test]
+    fn flush_file_buffers_requires_write_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "flush01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\flush-req.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"data").expect("write");
+        win32.close_handle(h).expect("close");
+
+        // A GENERIC_READ-only handle must not be able to flush.
+        let read_only = win32
+            .create_file_w(
+                path,
+                FileAccess::read_only(),
+                ShareMode::none(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("open read-only");
+        let result = win32.flush_file_buffers(read_only);
+        assert_eq!(
+            result.expect_err("read-only flush must fail").code,
+            ReasonCode::RcHelperPermissionDenied,
+            "FlushFileBuffers on a read-only handle must be ERROR_ACCESS_DENIED"
+        );
+        win32.close_handle(read_only).expect("close");
+
+        // A FILE_WRITE_DATA-granting handle succeeds.
+        let write_only = win32
+            .create_file_w(
+                path,
+                FileAccess {
+                    read: false,
+                    write: true,
+                    delete: false,
+                },
+                ShareMode::none(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("open write-only");
+        win32
+            .flush_file_buffers(write_only)
+            .expect("flush with write access");
+        win32.close_handle(write_only).expect("close");
+    }
+
+    #[test]
+    fn open_existing_with_parent_file_returns_path_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "pif01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32
+            .create_file_w(
+                "C:\\parent-file.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("seed parent-as-file");
+        win32.close_handle(h).expect("close");
+
+        // A parent that exists as a FILE is not a directory: Windows reports
+        // ERROR_PATH_NOT_FOUND (3), not ERROR_FILE_NOT_FOUND (2).
+        for disposition in [
+            CreationDisposition::OpenExisting,
+            CreationDisposition::CreateNew,
+        ] {
+            let result = win32.create_file_w(
+                "C:\\parent-file.txt\\child.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                disposition,
+                false,
+                false,
+                false,
+            );
+            assert_eq!(
+                result.expect_err("parent-is-a-file must fail").code,
+                ReasonCode::RcFsPathInvalid,
+                "{disposition:?} with a file parent must be ERROR_PATH_NOT_FOUND"
+            );
+        }
+    }
+
+    #[test]
+    fn create_directory_missing_parent_returns_path_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cdmp01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Windows CreateDirectoryW on a missing parent is
+        // ERROR_PATH_NOT_FOUND (3), never ERROR_FILE_NOT_FOUND (2).
+        let result = win32.create_directory_w("C:\\no_such_parent_dir\\child");
+        assert_eq!(
+            result.expect_err("missing parent must fail").code,
+            ReasonCode::RcFsPathInvalid,
+            "CreateDirectoryW with a missing parent must be ERROR_PATH_NOT_FOUND"
+        );
+        assert!(
+            !win32
+                .guest_path_to_host_path("C:\\no_such_parent_dir")
+                .expect("resolve host path")
+                .exists(),
+            "missing parent must not be created"
         );
     }
 

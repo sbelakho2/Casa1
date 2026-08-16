@@ -189,11 +189,7 @@ fn run_live_host_loop<T>(
         mac_window::pump_main_queue();
 
         audio.drain(&session.audio_rx);
-        let mut frames_this_iteration = 0u32;
-        while let Ok(frame) = session.frame_rx.try_recv() {
-            latest_frame = Some(frame);
-            frames_this_iteration += 1;
-        }
+        let mut frames_this_iteration = drain_frames(&session.frame_rx, &mut latest_frame);
 
         if frames_this_iteration > 0 {
             live_trace(&format!("[live] received {frames_this_iteration} frame(s) — showing content now"));
@@ -210,33 +206,26 @@ fn run_live_host_loop<T>(
         }
 
         // Worker finished with zero frames ever received: exit cleanly,
-        // never having created a window.
+        // never having created a window.  One final drain first: a worker
+        // that published its last frame and terminated between the drain
+        // above and this check must not lose that frame.
         if latest_frame.is_none() && worker.is_finished() {
-            live_trace("[live] worker finished without producing any frames — exiting");
-            break;
+            frames_this_iteration += drain_frames(&session.frame_rx, &mut latest_frame);
+            if latest_frame.is_none() {
+                live_trace("[live] worker finished without producing any frames — exiting");
+                break;
+            }
         }
 
-        let mut frame_changed = false;
-
-        if let Some(frame) = latest_frame.take() {
-            if window.is_none() || frame.width as usize != frame_width || frame.height as usize != frame_height {
-                let width = frame.width as usize;
-                let height = frame.height as usize;
-                // The frame dimensions come from the guest frame pipeline
-                // and are untrusted; validate before handing them to
-                // minifb, which would otherwise try to allocate unbounded
-                // window buffers.
-                validate_presentable_dims(width, height)?;
-                window = Some(create_window(title, width, height)?);
-                frame_width = width;
-                frame_height = height;
-            }
-            if let Some(path) = export_live_frame_path.as_deref() {
-                export_live_frame(&frame, Path::new(path))?;
-            }
-            decode_frame_buffer_into(&frame, &mut frame_buffer)?;
-            frame_changed = true;
-        }
+        let frame_changed = process_latest_frame(
+            &mut latest_frame,
+            &mut window,
+            &mut frame_buffer,
+            &mut frame_width,
+            &mut frame_height,
+            title,
+            export_live_frame_path.as_deref().map(Path::new),
+        )?;
 
         if let Some(window) = window.as_mut() {
             pump_keyboard(window, &session.input_tx, &mut held_scancodes);
@@ -318,12 +307,85 @@ fn run_live_host_loop<T>(
         }
 
         if worker.is_finished() {
+            // Final drain before exiting: a worker that published its last
+            // frame and terminated between the top-of-loop drain and this
+            // check must not lose that frame (the run would otherwise exit
+            // windowless with a real frame still pending).
+            drain_frames(&session.frame_rx, &mut latest_frame);
+            let final_changed = process_latest_frame(
+                &mut latest_frame,
+                &mut window,
+                &mut frame_buffer,
+                &mut frame_width,
+                &mut frame_height,
+                title,
+                export_live_frame_path.as_deref().map(Path::new),
+            )?;
+            if final_changed
+                && let Some(window) = window.as_mut()
+            {
+                window
+                    .update_with_buffer(&frame_buffer, frame_width, frame_height)
+                    .map_err(|error| {
+                        AppError::new(
+                            ReasonCode::RcIo,
+                            format!("failed to present live frame: {error}"),
+                        )
+                    })?;
+            }
             live_trace("[live] worker finished — exiting main loop");
             break;
         }
     }
 
     Ok(())
+}
+
+/// Drain every pending frame from the live channel into `latest_frame`.
+/// Returns the number of frames consumed.  Extracted so the finish-path
+/// final drain can reuse the exact same consume semantics as the main loop.
+fn drain_frames(rx: &Receiver<LiveFrame>, latest_frame: &mut Option<LiveFrame>) -> u32 {
+    let mut count = 0u32;
+    while let Ok(frame) = rx.try_recv() {
+        *latest_frame = Some(frame);
+        count += 1;
+    }
+    count
+}
+
+/// Consume the latest frame, (re)creating the window and decoding the pixel
+/// buffer as needed.  Returns true when the window should present the new
+/// buffer.  Frame dimensions come from the guest pipeline and are untrusted,
+/// so they are validated before reaching minifb.
+#[allow(clippy::too_many_arguments)]
+fn process_latest_frame(
+    latest_frame: &mut Option<LiveFrame>,
+    window: &mut Option<Window>,
+    frame_buffer: &mut Vec<u32>,
+    frame_width: &mut usize,
+    frame_height: &mut usize,
+    title: &str,
+    export_live_frame_path: Option<&Path>,
+) -> AppResult<bool> {
+    let Some(frame) = latest_frame.take() else {
+        return Ok(false);
+    };
+    if window.is_none()
+        || frame.width as usize != *frame_width
+        || frame.height as usize != *frame_height
+    {
+        let width = frame.width as usize;
+        let height = frame.height as usize;
+        validate_presentable_dims(width, height)?;
+        *window = Some(create_window(title, width, height)?);
+        *frame_width = width;
+        *frame_height = height;
+    }
+    if let Some(path) = export_live_frame_path {
+        export_live_frame(&frame, path)?;
+    }
+    decode_frame_buffer_into(&frame, frame_buffer)?;
+    Ok(true)
 }
 
 fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> {
@@ -1152,5 +1214,63 @@ mod tests {
         let samples = vec![0.0f32; 44100 * 2];
         let out = adapt_audio_chunk(&samples, 2, 1, 2, 44100);
         assert!(out.len() <= MAX_ADAPTED_FRAMES * 2);
+    }
+
+    #[test]
+    fn final_frame_published_after_worker_finish_is_still_consumed() {
+        // Reproduce the F5 race deterministically: the loop's top-of-loop
+        // drain runs BEFORE the worker publishes its final frame; the worker
+        // then terminates.  The finish-path final drain must still consume
+        // the frame — otherwise the run exits windowless and loses it.
+        let (host_session, pe_session) = new_live_session();
+        let mut latest_frame: Option<LiveFrame> = None;
+
+        let final_frame = LiveFrame {
+            width: 2,
+            height: 1,
+            format: DxgiFormat::B8G8R8A8Unorm,
+            bytes: vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff],
+            displayed_frame_index: 7,
+        };
+        let expected_frame = final_frame.clone();
+
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || -> Result<(), AppError> {
+            go_rx.recv().expect("go signal");
+            pe_session
+                .frame_tx
+                .send(final_frame)
+                .expect("send final frame");
+            Ok(())
+        });
+
+        // Top-of-loop drain: runs before the worker publishes anything.
+        let drained = drain_frames(&host_session.frame_rx, &mut latest_frame);
+        assert_eq!(
+            drained, 0,
+            "no frames may be pending before the worker publishes"
+        );
+        assert!(latest_frame.is_none());
+
+        // The worker publishes its final frame and terminates.
+        go_tx.send(()).expect("signal worker");
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(worker.is_finished());
+        worker.join().expect("worker join").expect("worker succeeded");
+
+        // The finish-path final drain must consume the frame that arrived
+        // between the top-of-loop drain and the finish check.
+        let final_drained = drain_frames(&host_session.frame_rx, &mut latest_frame);
+        assert_eq!(
+            final_drained, 1,
+            "the final frame must be consumed by the finish-path drain"
+        );
+        let consumed = latest_frame.expect("final frame must be retained");
+        assert_eq!(consumed.width, 2);
+        assert_eq!(consumed.height, 1);
+        assert_eq!(consumed.bytes, expected_frame.bytes);
+        assert_eq!(consumed.displayed_frame_index, 7);
     }
 }

@@ -376,6 +376,9 @@ pub struct PresentResult {
     pub tearing_allowed: bool,
     pub displayed_frame_index: u64,
     pub frame_time_us: u64,
+    /// Same interval as `frame_time_us` but at nanosecond resolution, so
+    /// sub-microsecond frame times can be measured without truncation.
+    pub frame_time_ns: u64,
 }
 
 /// Origin of a presented frame.  Every `PresentedFrame` is labelled with the
@@ -1103,7 +1106,10 @@ pub struct SceneSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FrameArtifact {
     pub hash: String,
-    pub ssim: f32,
+    /// Structural similarity against a reference frame.  `None` means no
+    /// SSIM was measured — a fabricated placeholder metric is never
+    /// recorded.
+    pub ssim: Option<f32>,
     pub validation_errors: Vec<String>,
 }
 
@@ -1422,19 +1428,27 @@ impl GraphicsBackend {
         let tearing_allowed =
             allow_tearing && sync_interval == 0 && self.query_feature(FeatureQuery::Tearing);
 
-        // Measure real frame timing: `frame_time_us` is the elapsed wall-clock
-        // time since the previous present on this swapchain (0 on the first).
+        // Measure real frame timing: `frame_time_us`/`frame_time_ns` are the
+        // elapsed wall-clock times since the previous present on this
+        // swapchain (0 on the first).  The nanosecond value is kept so
+        // sub-microsecond intervals can be distinguished from "not measured".
         let present_started_at = std::time::Instant::now();
-        let frame_time_us = {
+        let (frame_time_us, frame_time_ns) = {
             let record = self.swapchain_mut(swapchain)?;
-            let elapsed = record.last_present_at.map(|previous| {
+            let elapsed_us = record.last_present_at.map(|previous| {
                 present_started_at
                     .duration_since(previous)
                     .as_micros()
                     .min(u64::MAX as u128) as u64
             });
+            let elapsed_ns = record.last_present_at.map(|previous| {
+                present_started_at
+                    .duration_since(previous)
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64
+            });
             record.last_present_at = Some(present_started_at);
-            elapsed.unwrap_or(0)
+            (elapsed_us.unwrap_or(0), elapsed_ns.unwrap_or(0))
         };
 
         // Update swapchain state in a block scope so the mutable borrow ends
@@ -1483,6 +1497,7 @@ impl GraphicsBackend {
             tearing_allowed,
             displayed_frame_index,
             frame_time_us,
+            frame_time_ns,
         })
     }
 
@@ -3055,7 +3070,9 @@ impl GraphicsBackend {
         );
         Ok(FrameArtifact {
             hash: util::sha256_bytes(signature.as_bytes()),
-            ssim: 1.0,
+            // No actual frame is rasterized here, so no SSIM can be measured;
+            // recording a constant would fabricate a quality metric.
+            ssim: None,
             validation_errors: Vec::new(),
         })
     }

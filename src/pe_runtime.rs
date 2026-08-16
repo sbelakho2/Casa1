@@ -309,7 +309,10 @@ const TRUNCATE_EXISTING: u32 = 5;
 /// comfortably covers `\\?\` extended-length paths.
 const MAX_CREATE_FILE_PATH_UTF16_UNITS: usize = 32_768;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0800_0000;
+/// FILE_FLAG_DELETE_ON_CLOSE is 0x0400_0000; 0x0800_0000 is
+/// FILE_FLAG_SEQUENTIAL_SCAN and must never trigger deletion.
+const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
@@ -323,6 +326,7 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_FUNCTION: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 const ERROR_OLD_WIN_VERSION: u32 = 1_150;
 const ERROR_TIMEOUT: u32 = 1460;
@@ -3703,6 +3707,10 @@ struct PeHostRuntime {
     /// Incremented when the bump pointer exceeds the 32-bit address space.
     x86_heap_region: u32,
     heap_allocations: BTreeMap<u64, usize>,
+    /// Test-only failure injection: when set, the next heap allocation
+    /// (malloc/calloc/realloc and the CRT FILE-block allocation) fails with
+    /// ENOMEM and NULL instead of succeeding.  Cleared on consumption.
+    crt_alloc_fail_next: bool,
     /// Tracks private page allocations (VirtualAlloc / MEM_RESERVE|MEM_COMMIT)
     /// so `VirtualFree` / `MEM_RELEASE` can validate and free them.
     private_pages: BTreeMap<u64, usize>,
@@ -3772,6 +3780,13 @@ struct PeHostRuntime {
     /// requests process exit, the pump abandons all pending threads and
     /// propagates the code to the main loop (which breaks on `Some(code)`).
     process_exit_requested: Option<u32>,
+    /// Exit code recorded when an explicit thread-exit API (`ExitThread`/
+    /// `_endthreadex`/`_endthread`/`TerminateThread` on self) runs on the
+    /// MAIN thread (no pumped thread active).  Windows only ends the process
+    /// when its LAST thread exits, so this ends the main thread's execution
+    /// while the run keeps pumping pending guest threads; the run ends with
+    /// this code once no pending threads remain (or a process-exit API runs).
+    main_thread_exit_code: Option<u32>,
     tls_vector_ptr: u64,
     init_once_pending: BTreeSet<u64>,
     init_once_completed: BTreeMap<u64, u64>,
@@ -4153,6 +4168,12 @@ struct WindowSurface {
     width: usize,
     height: usize,
     bytes: Vec<u8>,
+    /// Pixel provenance: `true` ONLY after a real guest-driven SRCCOPY blit
+    /// copied real source pixels into this surface.  Host-invented content
+    /// (builtin control chrome, theme fills, blank placeholders) leaves this
+    /// `false` so synthetic pixels can never reach the live channel, be
+    /// cached as a real GDI frame, or propagate through later blits.
+    real_pixels: bool,
 }
 
 /// A GDI bitmap backing a memory DC (created via `CreateDIBSection` or
@@ -4212,6 +4233,11 @@ struct PendingGuestThread {
     parameter: u64,
     initial_rsp: u64,
     started: bool,
+    /// Thread suspend count (Windows semantics): a thread created with
+    /// CREATE_SUSPENDED starts at 1 and the pump skips it until every
+    /// suspension has been released by ResumeThread.  N SuspendThread calls
+    /// need N ResumeThread calls.
+    suspended: u32,
     wake_tick: u64,
     teb_base: u64,
     tls_vector_ptr: u64,
@@ -4255,6 +4281,10 @@ struct PumpedThreadOutcome {
 /// propagate as a thunk `Some(code)` result.
 enum PumpWaitOutcome {
     Wait(crate::win32::WaitStatus),
+    /// An APC was delivered to the waiting thread from an alertable wait
+    /// (queued during the wait by a pumped worker); the thunk must return
+    /// WAIT_IO_COMPLETION (0xC0).
+    IoCompletion,
     /// Historical non-thread behavior: a signal that arrives during the
     /// pump phase was returned with RAX untouched (the pre-fix thunk did
     /// `return Ok(None)` without setting RAX).  Steam's shutdown handshake
@@ -8148,6 +8178,16 @@ pub fn execute_with_options(
             state.rip = cached_block.end_rip;
         }
     }
+
+    // ── Thread-drain phase after a main-thread exit ─────────────────────
+    // `ExitThread`/`_endthreadex`/`_endthread` on the main thread ends only
+    // the MAIN thread; Windows ends the process when its LAST thread exits.
+    // If guest workers are still pending, keep pumping them to completion
+    // (unless a process-exit API was called, which abandons every thread).
+    if runtime.main_thread_exit_code.is_some() && !runtime.pending_guest_threads.is_empty() {
+        exit_code = runtime.drain_pending_guest_threads_after_main_exit(&mut memory)?;
+    }
+
     // JIT runtime is no longer needed — unregister so the live-session
     // watchdog no longer holds a reference to it.
     crate::jit::unregister_jit_runtime();
@@ -8460,6 +8500,7 @@ impl PeHostRuntime {
             next_private_address: PRIVATE_PAGES_BASE,
             x86_heap_region: 0,
             heap_allocations: BTreeMap::new(),
+            crt_alloc_fail_next: false,
             private_pages: BTreeMap::new(),
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
@@ -8498,6 +8539,7 @@ impl PeHostRuntime {
             pumped_thread_exit_requested: None,
             pumped_thread_exit_with_detach: true,
             process_exit_requested: None,
+            main_thread_exit_code: None,
             tls_vector_ptr: 0,
             init_once_pending: BTreeSet::new(),
             init_once_completed: BTreeMap::new(),
@@ -9880,57 +9922,14 @@ impl PeHostRuntime {
     }
 
     fn shell_special_folder_path(&mut self, raw_csidl: i32) -> AppResult<Option<String>> {
-        let Some(path) = shell_special_folder_path(
+        // SHGetFolderPath-style APIs return the canonical path without
+        // creating anything: Windows never manufactures special-folder
+        // directories here, so neither does the runtime.
+        Ok(shell_special_folder_path(
             &self.win32.ge().config.user_name,
             raw_csidl,
             self.guest_arch,
-        ) else {
-            return Ok(None);
-        };
-        self.ensure_guest_directory_path(&path)?;
-        Ok(Some(path))
-    }
-
-    fn ensure_guest_directory_path(&mut self, path: &str) -> AppResult<()> {
-        if self.win32.get_file_attributes_w(path).is_ok() {
-            return Ok(());
-        }
-        let Some(drive_prefix) = windows_drive_prefix(path) else {
-            return Err(AppError::new(
-                ReasonCode::RcFsPathInvalid,
-                format!("{} is missing a drive prefix", path),
-            ));
-        };
-        let mut current = format!("{}\\", drive_prefix);
-        let suffix = &path[drive_prefix.len()..];
-        for component in suffix
-            .trim_start_matches(['\\', '/'])
-            .split(['\\', '/'])
-            .filter(|component| !component.is_empty())
-        {
-            if !current.ends_with('\\') {
-                current.push('\\');
-            }
-            current.push_str(component);
-            if self.win32.get_file_attributes_w(&current).is_err() {
-                match self.win32.sync_existing_path_w(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.code == ReasonCode::RcFsNotFound => {
-                        match self.win32.create_directory_w(&current) {
-                            Ok(_) => {}
-                            Err(create_error)
-                                if create_error.code == ReasonCode::RcFsAlreadyExists =>
-                            {
-                                self.win32.sync_existing_path_w(&current)?;
-                            }
-                            Err(create_error) => return Err(create_error),
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        Ok(())
+        ))
     }
 
     fn alloc_utf16_environment_block(
@@ -10309,11 +10308,15 @@ impl PeHostRuntime {
                 width,
                 height,
                 bytes: vec![0; width.saturating_mul(height).saturating_mul(4)],
+                real_pixels: false,
             });
         if surface.width != width || surface.height != height {
             surface.width = width;
             surface.height = height;
             surface.bytes = vec![0; width.saturating_mul(height).saturating_mul(4)];
+            // A resize wipes the pixels; whatever provenance the surface had
+            // no longer describes its (empty) content.
+            surface.real_pixels = false;
         }
         surface
     }
@@ -10429,6 +10432,10 @@ impl PeHostRuntime {
             // surface: this is the only place (besides the real memory-DC
             // conversion in `gather_dc_pixels`) where `last_real_gdi_frame`
             // may be assigned.  No synthetic content is ever cached here.
+            // `gather_dc_pixels` already returned None for any source without
+            // real pixels, so reaching this point proves the source surface
+            // was real — record that provenance on the destination surface.
+            surface.real_pixels = true;
             self.last_real_gdi_frame = Some(LiveFrame {
                 width: surf_w as u32,
                 height: surface.height as u32,
@@ -10506,16 +10513,19 @@ impl PeHostRuntime {
         hdc: u64,
     ) -> Option<(usize, usize, Vec<u8>)> {
         if let Some(hwnd) = self.hdc_target_window(hdc) {
-            // Window DC: copy current window surface (or blank if none).
+            // Window DC: copy the current window surface.  Only REAL guest
+            // pixels may propagate: a window with no surface (or only
+            // host-invented chrome) has no real content, so return None
+            // rather than fabricating a blank buffer that `blit_dc_to_dc`
+            // would otherwise cache as a "real" GDI frame and propagate.
             let preview = self.window_preview(hwnd)?;
             let w = preview.width as usize;
             let h = preview.height as usize;
-            let bytes = self
-                .window_surfaces
-                .get(&hwnd)
-                .map(|s| s.bytes.clone())
-                .unwrap_or_else(|| vec![0u8; w * h * 4]);
-            return Some((w, h, bytes));
+            let surface = self.window_surfaces.get(&hwnd)?;
+            if !surface.real_pixels {
+                return None;
+            }
+            return Some((w, h, surface.bytes.clone()));
         }
         // Memory DC: read selected bitmap.
         let (_obj, bitmap) = self.refresh_dc_bitmap(memory, hdc)?;
@@ -10759,7 +10769,11 @@ impl PeHostRuntime {
         // A builtin control paint renders synthetic chrome into the window
         // surface for guest-visible behavior; it is NOT a real guest frame,
         // so it never publishes to the live channel and never counts as a
-        // real guest present.
+        // real guest present.  Explicitly revoke any real-pixel provenance
+        // so overwritten content is never mistaken for guest pixels.
+        if let Some(surface) = self.window_surfaces.get_mut(&hwnd) {
+            surface.real_pixels = false;
+        }
         Ok(true)
     }
 
@@ -15255,18 +15269,25 @@ impl PeHostRuntime {
                                 // Real D3D9 guest present: count it, and on
                                 // the first one mark the first real guest
                                 // frame (published only when live).  This
-                                // flag is set ONLY by real presents.
-                                self.real_guest_frames += 1;
-                                if self.live_session.is_some() && !self.first_real_guest_frame_seen {
-                                    let live_frame = LiveFrame {
-                                        width: frame.width,
-                                        height: frame.height,
-                                        format: DxgiFormat::B8G8R8A8Unorm,
-                                        bytes: frame.pixels,
-                                        displayed_frame_index: 0,
-                                    };
-                                    self.publish_live_frame(live_frame);
-                                    self.first_real_guest_frame_seen = true;
+                                // flag is set ONLY by real presents — the
+                                // fixed-function placeholder rasterizer and
+                                // the blank fallback are host-synthesized and
+                                // must never count or publish.
+                                if !frame.synthesized {
+                                    self.real_guest_frames += 1;
+                                    if self.live_session.is_some()
+                                        && !self.first_real_guest_frame_seen
+                                    {
+                                        let live_frame = LiveFrame {
+                                            width: frame.width,
+                                            height: frame.height,
+                                            format: DxgiFormat::B8G8R8A8Unorm,
+                                            bytes: frame.pixels,
+                                            displayed_frame_index: 0,
+                                        };
+                                        self.publish_live_frame(live_frame);
+                                        self.first_real_guest_frame_seen = true;
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -15324,9 +15345,15 @@ impl PeHostRuntime {
                             pixels[off + 3] = a;
                         }
                     }
-                    // Store in shim's render_target
+                    // Store in shim's render_target.  A Clear fills with a
+                    // guest-authored color, so the pixels are real.
                     if let Some(shim) = self.d3d9_shim.as_mut() {
-                        shim.render_target = Some((w, h, pixels));
+                        shim.render_target = Some(crate::d3d11::D3d9RenderTarget {
+                            width: w,
+                            height: h,
+                            pixels,
+                            synthesized: false,
+                        });
                     }
                     state.set(Register::Rax, 0);
                 } else {
@@ -15815,9 +15842,17 @@ impl PeHostRuntime {
                     };
                     match dev.render_fixed_function_scene(&scene) {
                         Ok(frame) => {
-                            // Store rendered pixels in shim's render_target
+                            // Store rendered pixels in shim's render_target.
+                            // The fixed-function rasterizer output is
+                            // host-synthesized and must never publish as a
+                            // real guest frame.
                             if let Some(shim) = self.d3d9_shim.as_mut() {
-                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                                shim.render_target = Some(crate::d3d11::D3d9RenderTarget {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    pixels: frame.pixels,
+                                    synthesized: true,
+                                });
                             }
                             state.set(Register::Rax, 0);
                             self.push_trace(
@@ -15873,7 +15908,12 @@ impl PeHostRuntime {
                     match dev.render_fixed_function_scene(&scene) {
                         Ok(frame) => {
                             if let Some(shim) = self.d3d9_shim.as_mut() {
-                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                                shim.render_target = Some(crate::d3d11::D3d9RenderTarget {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    pixels: frame.pixels,
+                                    synthesized: true,
+                                });
                             }
                             state.set(Register::Rax, 0);
                             self.push_trace(
@@ -15923,7 +15963,12 @@ impl PeHostRuntime {
                     match dev.render_fixed_function_scene(&scene) {
                         Ok(frame) => {
                             if let Some(shim) = self.d3d9_shim.as_mut() {
-                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                                shim.render_target = Some(crate::d3d11::D3d9RenderTarget {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    pixels: frame.pixels,
+                                    synthesized: true,
+                                });
                             }
                             state.set(Register::Rax, 0);
                             self.push_trace(
@@ -15973,7 +16018,12 @@ impl PeHostRuntime {
                     match dev.render_fixed_function_scene(&scene) {
                         Ok(frame) => {
                             if let Some(shim) = self.d3d9_shim.as_mut() {
-                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                                shim.render_target = Some(crate::d3d11::D3d9RenderTarget {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    pixels: frame.pixels,
+                                    synthesized: true,
+                                });
                             }
                             state.set(Register::Rax, 0);
                         }
@@ -16431,18 +16481,22 @@ impl PeHostRuntime {
                     if let Some(frame) = presented {
                         // Real D3D9 swapchain present: count it, and on the
                         // first one mark the first real guest frame
-                        // (published only when live).
-                        self.real_guest_frames += 1;
-                        if self.live_session.is_some() && !self.first_real_guest_frame_seen {
-                            let live_frame = LiveFrame {
-                                width: frame.width,
-                                height: frame.height,
-                                format: DxgiFormat::B8G8R8A8Unorm,
-                                bytes: frame.pixels,
-                                displayed_frame_index: 0,
-                            };
-                            self.publish_live_frame(live_frame);
-                            self.first_real_guest_frame_seen = true;
+                        // (published only when live).  Host-synthesized
+                        // content (fixed-function rasterizer output or the
+                        // blank fallback) must never count or publish.
+                        if !frame.synthesized {
+                            self.real_guest_frames += 1;
+                            if self.live_session.is_some() && !self.first_real_guest_frame_seen {
+                                let live_frame = LiveFrame {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    format: DxgiFormat::B8G8R8A8Unorm,
+                                    bytes: frame.pixels,
+                                    displayed_frame_index: 0,
+                                };
+                                self.publish_live_frame(live_frame);
+                                self.first_real_guest_frame_seen = true;
+                            }
                         }
                         state.set(Register::Rax, 0);
                     } else {
@@ -24677,6 +24731,11 @@ impl PeHostRuntime {
                     // background timer_work_sink (filled by CreateTimerQueueTimer
                     // and RegisterWaitForSingleObject background threads).
                     if self.drain_timer_work_queue(state, memory)? {
+                        // A timer callback may have requested process exit —
+                        // propagate the code so the main loop ends the run.
+                        if let Some(code) = self.process_exit_requested {
+                            return Ok(Some(code as i32));
+                        }
                         continue;
                     }
                     self.win32.sleep_ex(16, false, None)?;
@@ -24801,17 +24860,33 @@ impl PeHostRuntime {
             }
             HostThunk::SetCurrentDirectoryW => {
                 let path = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
-                self.current_directory = resolve_guest_path(&self.current_directory, &path);
-                let image_path = self.main_module_path.clone();
-                self.sync_process_parameters(memory, &image_path)?;
-                state.set(Register::Rax, 1);
-                self.last_error = 0;
-                self.push_trace(
-                    "file",
-                    "SetCurrentDirectoryW",
-                    BTreeMap::from([("path".to_string(), json!(self.current_directory.clone()))]),
-                    json!(1),
-                );
+                if path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3)
+                    // and leaves the current directory unchanged.
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.push_trace(
+                        "file",
+                        "SetCurrentDirectoryW",
+                        BTreeMap::from([
+                            ("path".to_string(), json!("")),
+                            ("error".to_string(), json!(ERROR_PATH_NOT_FOUND)),
+                        ]),
+                        json!(0),
+                    );
+                } else {
+                    self.current_directory = resolve_guest_path(&self.current_directory, &path);
+                    let image_path = self.main_module_path.clone();
+                    self.sync_process_parameters(memory, &image_path)?;
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "file",
+                        "SetCurrentDirectoryW",
+                        BTreeMap::from([("path".to_string(), json!(self.current_directory.clone()))]),
+                        json!(1),
+                    );
+                }
             }
             HostThunk::GetCurrentDirectoryW => {
                 let size = guest_call_arg_u32(state, memory, 0)?;
@@ -24831,60 +24906,104 @@ impl PeHostRuntime {
                 let size = guest_call_arg_u32(state, memory, 1)?;
                 let buffer = guest_call_arg(state, memory, 2)?;
                 let file_part_ptr = guest_call_arg(state, memory, 3)?;
-                let path = resolve_full_guest_path(&self.current_directory, &raw_path);
-                let path_length = path.encode_utf16().count() as u32;
-                let result = write_utf16_api_string(memory, buffer, size, &path)?;
-                // Windows sets *file_part only when the buffer is big enough
-                // for the full path incl the NUL (size >= path_length + 1).
-                let file_part = if buffer != 0 && size >= path_length.saturating_add(1) {
-                    windows_file_part_offset(&path)
-                        .map(|offset| buffer + offset)
-                        .unwrap_or(0)
+                if raw_path.is_empty() {
+                    // Windows fails an empty file name with ERROR_PATH_NOT_FOUND
+                    // (3); it never resolves "" to the current directory.
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.push_trace(
+                        "file",
+                        "GetFullPathNameW",
+                        BTreeMap::from([
+                            ("path_raw".to_string(), json!("")),
+                            ("cwd".to_string(), json!(self.current_directory.clone())),
+                            ("error".to_string(), json!(ERROR_PATH_NOT_FOUND)),
+                        ]),
+                        json!(0),
+                    );
                 } else {
-                    0
-                };
-                if file_part_ptr != 0 {
-                    write_guest_pointer(memory, file_part_ptr, file_part, self.guest_arch)?;
+                    let path = resolve_full_guest_path(&self.current_directory, &raw_path);
+                    let path_length = path.encode_utf16().count() as u32;
+                    let result = write_utf16_api_string(memory, buffer, size, &path)?;
+                    // Windows sets *file_part only when the buffer is big enough
+                    // for the full path incl the NUL (size >= path_length + 1).
+                    let file_part = if buffer != 0 && size >= path_length.saturating_add(1) {
+                        windows_file_part_offset(&path)
+                            .map(|offset| buffer + offset)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if file_part_ptr != 0 {
+                        write_guest_pointer(memory, file_part_ptr, file_part, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, result as u64);
+                    // Windows: a real truncation into a non-NULL buffer sets
+                    // ERROR_INSUFFICIENT_BUFFER (122) and returns the required
+                    // size incl the NUL; the (NULL, 0) required-size query
+                    // returns the required size with last_error 0.
+                    self.last_error = if buffer != 0 && size != 0 && size <= path_length {
+                        ERROR_INSUFFICIENT_BUFFER
+                    } else {
+                        0
+                    };
+                    self.push_trace(
+                        "file",
+                        "GetFullPathNameW",
+                        BTreeMap::from([
+                            ("path_raw".to_string(), json!(raw_path)),
+                            ("path".to_string(), json!(path)),
+                            ("cwd".to_string(), json!(self.current_directory.clone())),
+                            ("file_part".to_string(), json!(file_part)),
+                        ]),
+                        json!(result),
+                    );
                 }
-                state.set(Register::Rax, result as u64);
-                self.last_error = 0;
-                self.push_trace(
-                    "file",
-                    "GetFullPathNameW",
-                    BTreeMap::from([
-                        ("path_raw".to_string(), json!(raw_path)),
-                        ("path".to_string(), json!(path)),
-                        ("cwd".to_string(), json!(self.current_directory.clone())),
-                        ("file_part".to_string(), json!(file_part)),
-                    ]),
-                    json!(result),
-                );
             }
             HostThunk::GetFileAttributesW => {
                 let path_ptr = guest_call_arg(state, memory, 0)?;
                 let raw_path = read_utf16_string(memory, path_ptr)?;
-                let path = resolve_guest_path(&self.current_directory, &raw_path);
-                match self.win32.get_file_attributes_w(&path) {
-                    Ok(attributes) => {
-                        let raw_attributes = file_attributes_mask(&attributes);
-                        state.set(Register::Rax, raw_attributes as u64);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "file",
-                            "GetFileAttributesW",
-                            BTreeMap::from([
-                                ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                ("path_raw".to_string(), json!(raw_path)),
-                                ("path".to_string(), json!(path)),
-                                ("cwd".to_string(), json!(self.current_directory.clone())),
-                            ]),
-                            json!(raw_attributes),
-                        );
-                    }
-                    Err(error) => {
-                        state.set(Register::Rax, INVALID_FILE_ATTRIBUTES);
-                        self.last_error = last_error_from_app_error(&error);
+                if raw_path.is_empty() {
+                    // Windows fails an empty file name with ERROR_PATH_NOT_FOUND
+                    // (3); it never resolves "" to the current directory.
+                    state.set(Register::Rax, INVALID_FILE_ATTRIBUTES);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.push_trace(
+                        "file",
+                        "GetFileAttributesW",
+                        BTreeMap::from([
+                            ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                            ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                            ("path_raw".to_string(), json!("")),
+                            ("cwd".to_string(), json!(self.current_directory.clone())),
+                            ("error".to_string(), json!(ERROR_PATH_NOT_FOUND)),
+                        ]),
+                        json!(INVALID_FILE_ATTRIBUTES),
+                    );
+                } else {
+                    let path = resolve_guest_path(&self.current_directory, &raw_path);
+                    match self.win32.get_file_attributes_w(&path) {
+                        Ok(attributes) => {
+                            let raw_attributes = file_attributes_mask(&attributes);
+                            state.set(Register::Rax, raw_attributes as u64);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "GetFileAttributesW",
+                                BTreeMap::from([
+                                    ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                    ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                    ("path_raw".to_string(), json!(raw_path)),
+                                    ("path".to_string(), json!(path)),
+                                    ("cwd".to_string(), json!(self.current_directory.clone())),
+                                ]),
+                                json!(raw_attributes),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, INVALID_FILE_ATTRIBUTES);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
                 }
             }
@@ -24894,7 +25013,12 @@ impl PeHostRuntime {
                 let information_ptr = guest_call_arg(state, memory, 2)?;
                 let raw_path = read_utf16_string(memory, path_ptr)?;
                 let path = resolve_guest_path(&self.current_directory, &raw_path);
-                if info_level != 0 {
+                if raw_path.is_empty() {
+                    // Windows fails an empty file name with ERROR_PATH_NOT_FOUND
+                    // (3); it never resolves "" to the current directory.
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                } else if info_level != 0 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
@@ -25249,7 +25373,16 @@ impl PeHostRuntime {
                 };
                 let result = write_utf16_api_string(memory, buffer, size, &path)?;
                 state.set(Register::Rax, result as u64);
-                self.last_error = 0;
+                // Windows: success returns the length EXCLUDING the NUL; the
+                // (NULL,0) query and truncation return the required size
+                // INCLUDING the NUL, with ERROR_INSUFFICIENT_BUFFER on
+                // truncation (same contract as GetModuleFileNameA).
+                let path_length = path.encode_utf16().count() as u32;
+                self.last_error = if buffer != 0 && size != 0 && size <= path_length {
+                    ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    0
+                };
                 self.push_trace(
                     "file",
                     "GetModuleFileNameW",
@@ -27478,68 +27611,80 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::CreateDirectoryW => {
-                let path = resolve_guest_path(
-                    &self.current_directory,
-                    &read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?,
-                );
-                match self.win32.create_directory_w(&path) {
-                    Ok(created_path) => {
-                        state.set(Register::Rax, 1);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "file",
-                            "CreateDirectoryW",
-                            BTreeMap::from([("path".to_string(), json!(created_path))]),
-                            json!(1),
-                        );
-                    }
-                    Err(error) => {
-                        state.set(Register::Rax, 0);
-                        self.last_error = last_error_from_app_error(&error);
+                let raw_path = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                if raw_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                } else {
+                    let path = resolve_guest_path(&self.current_directory, &raw_path);
+                    match self.win32.create_directory_w(&path) {
+                        Ok(created_path) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "CreateDirectoryW",
+                                BTreeMap::from([("path".to_string(), json!(created_path))]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
                 }
             }
             HostThunk::RemoveDirectoryW => {
-                let path = resolve_guest_path(
-                    &self.current_directory,
-                    &read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?,
-                );
-                match self.win32.remove_directory_w(&path) {
-                    Ok(()) => {
-                        state.set(Register::Rax, 1);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "file",
-                            "RemoveDirectoryW",
-                            BTreeMap::from([("path".to_string(), json!(path))]),
-                            json!(1),
-                        );
-                    }
-                    Err(error) => {
-                        state.set(Register::Rax, 0);
-                        self.last_error = last_error_from_app_error(&error);
+                let raw_path = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                if raw_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                } else {
+                    let path = resolve_guest_path(&self.current_directory, &raw_path);
+                    match self.win32.remove_directory_w(&path) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "RemoveDirectoryW",
+                                BTreeMap::from([("path".to_string(), json!(path))]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
                 }
             }
             HostThunk::DeleteFileW => {
-                let path = resolve_guest_path(
-                    &self.current_directory,
-                    &read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?,
-                );
-                match self.win32.delete_file_w(&path) {
-                    Ok(()) => {
-                        state.set(Register::Rax, 1);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "file",
-                            "DeleteFileW",
-                            BTreeMap::from([("path".to_string(), json!(path))]),
-                            json!(1),
-                        );
-                    }
-                    Err(error) => {
-                        state.set(Register::Rax, 0);
-                        self.last_error = last_error_from_app_error(&error);
+                let raw_path = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                if raw_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                } else {
+                    let path = resolve_guest_path(&self.current_directory, &raw_path);
+                    match self.win32.delete_file_w(&path) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "DeleteFileW",
+                                BTreeMap::from([("path".to_string(), json!(path))]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
                 }
             }
@@ -27567,9 +27712,6 @@ impl PeHostRuntime {
                     );
                     if section_ptr == 0 && key_ptr == 0 && value_ptr == 0 {
                         return Ok(path);
-                    }
-                    if let Some(parent) = windows_parent_directory(&path) {
-                        self.ensure_guest_directory_path(&parent)?;
                     }
                     let section = read_utf16_string(memory, section_ptr)?;
                     let key = if key_ptr == 0 {
@@ -27922,9 +28064,8 @@ impl PeHostRuntime {
                 } else {
                     read_u32(memory, security_attributes_ptr + inherit_offset)? != 0
                 };
-                let can_queue_guest_thread = self.guest_arch == GuestArch::X86
-                    && creation_flags & CREATE_SUSPENDED == 0
-                    && start_address != 0;
+                let can_queue_guest_thread =
+                    self.guest_arch == GuestArch::X86 && start_address != 0;
                 let thread_handle = self.win32.create_thread(
                     crate::win32::ThreadPlan {
                         exit_code: None,
@@ -27938,8 +28079,13 @@ impl PeHostRuntime {
                     write_u32(memory, thread_id_ptr, thread_id);
                 }
                 if can_queue_guest_thread {
-                    let pending_thread =
+                    // CREATE_SUSPENDED threads ARE queued with suspend count 1
+                    // and start once ResumeThread clears it.
+                    let mut pending_thread =
                         self.prepare_guest_thread_entry(memory, thread_handle, stack_size, start_address, parameter)?;
+                    if creation_flags & CREATE_SUSPENDED != 0 {
+                        pending_thread.suspended = 1;
+                    }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
                 state.set(Register::Rax, u64::from(thread_handle));
@@ -28476,9 +28622,9 @@ impl PeHostRuntime {
                     Ok(crate::win32::ObjectType::Thread)
                 );
                 let wait_result = if is_thread {
-                    self.wait_for_single_object_pumping(memory, handle, timeout)
+                    self.wait_for_single_object_pumping(state, memory, handle, timeout, false)
                 } else {
-                    self.wait_for_single_object_non_thread(memory, handle, timeout)
+                    self.wait_for_single_object_non_thread(state, memory, handle, timeout, false)
                 };
                 match wait_result {
                     Ok(PumpWaitOutcome::Wait(result)) => {
@@ -28493,6 +28639,10 @@ impl PeHostRuntime {
                             ]),
                             json!(result.code()),
                         );
+                    }
+                    Ok(PumpWaitOutcome::IoCompletion) => {
+                        state.set(Register::Rax, crate::win32::WAIT_IO_COMPLETION as u64);
+                        self.last_error = 0;
                     }
                     Ok(PumpWaitOutcome::Unreported) => {
                         // Historical behavior: leave RAX untouched so the
@@ -28883,9 +29033,16 @@ impl PeHostRuntime {
                 let flags_and_attributes = guest_call_arg_u32(state, memory, 5)?;
                 let template_file = guest_call_arg(state, memory, 6)?;
                 let granted_access = expand_generic_access(desired_access_raw);
-                let desired_access = file_access_from_win32(granted_access);
+                let mut desired_access = file_access_from_win32(granted_access);
                 let share_mode = share_mode_from_win32(share_mode_raw);
                 let delete_on_close = flags_and_attributes & FILE_FLAG_DELETE_ON_CLOSE != 0;
+                if delete_on_close {
+                    // FILE_FLAG_DELETE_ON_CLOSE behaves like a DELETE access
+                    // request for the share matrix: the open conflicts with
+                    // existing handles lacking FILE_SHARE_DELETE, and later
+                    // opens must share delete.
+                    desired_access.delete = true;
+                }
                 let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let inheritable = if security_attributes == 0 {
                     false
@@ -28940,6 +29097,29 @@ impl PeHostRuntime {
                             );
                         }
                     }
+                } else if raw_path.is_empty() {
+                    // Windows: CreateFileW(NULL) / CreateFileW(L"") fails with
+                    // ERROR_PATH_NOT_FOUND (3); an empty name never resolves to
+                    // the current directory.
+                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.push_trace(
+                        "file",
+                        "CreateFileW",
+                        BTreeMap::from([
+                            ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                            ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                            ("path_raw".to_string(), json!("")),
+                            ("path".to_string(), json!(path)),
+                            ("cwd".to_string(), json!(self.current_directory.clone())),
+                            ("desired_access".to_string(), json!(desired_access_raw)),
+                            ("share_mode".to_string(), json!(share_mode_raw)),
+                            ("creation_disposition".to_string(), json!(creation_raw)),
+                            ("inheritable".to_string(), json!(inheritable)),
+                            ("error".to_string(), json!(ERROR_PATH_NOT_FOUND)),
+                        ]),
+                        json!(INVALID_HANDLE_VALUE),
+                    );
                 } else {
                     // hTemplateFile (arg 6) resolution, per Win32 semantics:
                     // - 0 (NULL): no template file; plain create/open.
@@ -28950,12 +29130,14 @@ impl PeHostRuntime {
                     //   unreadable metadata — fails the call with
                     //   ERROR_INVALID_HANDLE (6).
                     // - The template's attributes are copied to the file ONLY
-                    //   when the disposition creates a NEW file (CREATE_NEW,
-                    //   CREATE_ALWAYS, or OPEN_ALWAYS on a file that does not
-                    //   yet exist). When the call merely opens an existing
-                    //   file (OPEN_EXISTING, TRUNCATE_EXISTING, or
-                    //   OPEN_ALWAYS on an existing file), hTemplateFile is
-                    //   ignored, per the docs.
+                    //   when the disposition creates a genuinely NEW file
+                    //   (CREATE_NEW, or CREATE_ALWAYS/OPEN_ALWAYS on a file
+                    //   that does not yet exist). CREATE_ALWAYS on an existing
+                    //   file is FILE_OVERWRITE_IF — a mere overwrite — and the
+                    //   template is ignored, per the docs. When the call
+                    //   merely opens an existing file (OPEN_EXISTING,
+                    //   TRUNCATE_EXISTING, or OPEN_ALWAYS on an existing
+                    //   file), hTemplateFile is ignored, per the docs.
                     let template_attributes = if template_file == 0 {
                         Ok(None)
                     } else {
@@ -28991,12 +29173,20 @@ impl PeHostRuntime {
                         }
                         Ok(template_attributes) => {
                             // A template only applies when the disposition
-                            // produces a brand-new file.
+                            // produces a brand-new file: CREATE_ALWAYS on an
+                            // existing file is FILE_OVERWRITE_IF, so it only
+                            // copies when the target does not yet exist.
                             let creates_new_file = match creation_raw {
-                                CREATE_NEW | CREATE_ALWAYS => true,
-                                OPEN_ALWAYS => self.win32.get_file_attributes_w(&path).is_err(),
+                                CREATE_NEW => true,
+                                CREATE_ALWAYS | OPEN_ALWAYS => {
+                                    self.win32.get_file_attributes_w(&path).is_err()
+                                }
                                 _ => false,
                             };
+                            // Windows reports ERROR_ALREADY_EXISTS (183) with a
+                            // valid handle when CREATE_ALWAYS/OPEN_ALWAYS opens
+                            // a file that already existed.
+                            let existed_before = self.win32.get_file_attributes_w(&path).is_ok();
                             let (base_guest_path, ads_stream) = parse_ntfs_path(&path);
                             if let Some(stream) = ads_stream {
                                 // NTFS Alternate Data Stream path detected.
@@ -29035,7 +29225,14 @@ impl PeHostRuntime {
                                             Ok(()) => {
                                                 self.ads_handles.insert(handle, (base_guest_path.clone(), stream.stream_name.clone()));
                                                 state.set(Register::Rax, handle as u64);
-                                                self.last_error = 0;
+                                                self.last_error = if (creation_raw == CREATE_ALWAYS
+                                                    || creation_raw == OPEN_ALWAYS)
+                                                    && existed_before
+                                                {
+                                                    ERROR_ALREADY_EXISTS
+                                                } else {
+                                                    0
+                                                };
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29139,7 +29336,14 @@ impl PeHostRuntime {
                                         match attribute_apply {
                                             Ok(()) => {
                                                 state.set(Register::Rax, handle as u64);
-                                                self.last_error = 0;
+                                                self.last_error = if (creation_raw == CREATE_ALWAYS
+                                                    || creation_raw == OPEN_ALWAYS)
+                                                    && existed_before
+                                                {
+                                                    ERROR_ALREADY_EXISTS
+                                                } else {
+                                                    0
+                                                };
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29998,7 +30202,21 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
-                    // Read from an NTFS Alternate Data Stream handle
+                    // Read from an NTFS Alternate Data Stream handle.  The
+                    // ADS handle is backed by the base file handle, so it must
+                    // satisfy the same per-operation access check as a plain
+                    // ReadFile (FILE_READ_DATA on the recorded grant).
+                    match self.win32.require_file_access(handle, FILE_READ_DATA) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            if bytes_read_ptr != 0 {
+                                write_u32(memory, bytes_read_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                            return Ok(None);
+                        }
+                    }
                     let ge_root = self.win32.ge().root.clone();
                     let resolver = WindowsPathResolver::new(ge_root);
                     let fs = RealFilesystem::new(resolver);
@@ -30104,7 +30322,25 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
-                    // Write to an NTFS Alternate Data Stream handle
+                    // Write to an NTFS Alternate Data Stream handle.  The ADS
+                    // handle is backed by the base file handle, so it must
+                    // satisfy the same per-operation access check as a plain
+                    // WriteFile (FILE_WRITE_DATA|FILE_APPEND_DATA on the
+                    // recorded grant).
+                    match self
+                        .win32
+                        .require_file_access(handle, FILE_WRITE_DATA | FILE_APPEND_DATA)
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                            return Ok(None);
+                        }
+                    }
                     let bytes = read_window(memory, buffer_ptr, length)?;
                     let ge_root = self.win32.ge().root.clone();
                     let resolver = WindowsPathResolver::new(ge_root);
@@ -30643,7 +30879,7 @@ impl PeHostRuntime {
                 let stream = guest_call_arg(state, memory, 1)?;
                 let format_ptr = guest_call_arg(state, memory, 2)?;
                 let argptr = guest_call_arg(state, memory, 4)?;
-                let bytes = self.crt_vfprintf_render(memory, format_ptr, argptr)?;
+                let bytes = self.crt_vfprintf_render(state, memory, format_ptr, argptr)?;
                 let written = self.crt_vfprintf_deliver(memory, stream, &bytes)?;
                 state.set(Register::Rax, written);
                 self.last_error = 0;
@@ -30670,7 +30906,20 @@ impl PeHostRuntime {
                 let buffer_count = guest_call_arg(state, memory, 2)? as usize;
                 let format_ptr = guest_call_arg(state, memory, 3)?;
                 let argptr = guest_call_arg(state, memory, 5)?;
-                let bytes = self.crt_vfprintf_render(memory, format_ptr, argptr)?;
+                // The _s contract validates the buffer before rendering:
+                // NULL buffer with a NON-zero count is EINVAL + invalid-
+                // parameter handler (UCRT returns -1 with errno EINVAL).
+                if secure && buffer == 0 && buffer_count > 0 {
+                    self.set_crt_errno(memory, EINVAL);
+                    if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {
+                        state.set(Register::Rax, (-1_i64) as u64);
+                        return Ok(Some(134));
+                    }
+                    state.set(Register::Rax, (-1_i64) as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let bytes = self.crt_vfprintf_render(state, memory, format_ptr, argptr)?;
                 let required = bytes.len();
                 // Query idiom: NULL buffer with a zero count returns the
                 // required size (both _s and legacy entry points).
@@ -30732,10 +30981,18 @@ impl PeHostRuntime {
             }
             HostThunk::GetErrno => {
                 let out_ptr = guest_call_arg(state, memory, 0)?;
-                let value = self.crt_errno_get(memory);
-                if out_ptr != 0 {
-                    write_u32(memory, out_ptr, value as u32);
+                if out_ptr == 0 {
+                    // UCRT: _get_errno(NULL) is EINVAL + invalid-parameter
+                    // handler, and returns EINVAL.
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                let value = self.crt_errno_get(memory);
+                write_u32(memory, out_ptr, value as u32);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
@@ -30782,7 +31039,9 @@ impl PeHostRuntime {
                 let mut result = 0_i32;
                 for (a, b) in left_bytes.iter().zip(right_bytes.iter()) {
                     if a != b {
-                        result = i32::from(*a as i8) - i32::from(*b as i8);
+                        // memcmp compares UNSIGNED bytes: memcmp("\x80",
+                        // "\x7f", 1) → +1, not -255.
+                        result = i32::from(*a) - i32::from(*b);
                         break;
                     }
                 }
@@ -30843,17 +31102,18 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::Strcmp => {
+                // strcmp compares SIGNED bytes up to and INCLUDING the
+                // terminator: strcmp("a", "ab") → 0 - 'b' = -98.
                 let left = read_c_string_limit(memory, guest_call_arg(state, memory, 0)?, usize::MAX)?;
                 let right = read_c_string_limit(memory, guest_call_arg(state, memory, 1)?, usize::MAX)?;
                 let mut result = 0_i32;
-                for (a, b) in left.iter().zip(right.iter()) {
+                for index in 0..left.len().max(right.len()) {
+                    let a = left.get(index).copied().unwrap_or(0);
+                    let b = right.get(index).copied().unwrap_or(0);
                     if a != b {
-                        result = i32::from(*a as i8) - i32::from(*b as i8);
+                        result = i32::from(a as i8) - i32::from(b as i8);
                         break;
                     }
-                }
-                if result == 0 {
-                    result = (left.len() as i32) - (right.len() as i32);
                 }
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
@@ -30870,9 +31130,17 @@ impl PeHostRuntime {
                 let left = read_c_string_limit(memory, left_ptr, count)?;
                 let right = read_c_string_limit(memory, right_ptr, count)?;
                 let mut result = 0_i32;
-                for (a, b) in left.iter().zip(right.iter()) {
-                    let a = a.to_ascii_lowercase();
-                    let b = b.to_ascii_lowercase();
+                // _strnicmp compares up to `count` characters WITHOUT stopping
+                // at a NUL: the NUL-vs-char case is a real difference, so
+                // _strnicmp("ab", "abc", 3) must compare '\0' vs 'c' → < 0.
+                let compare_len = if bounded {
+                    count
+                } else {
+                    left.len().max(right.len())
+                };
+                for index in 0..compare_len {
+                    let a = left.get(index).copied().unwrap_or(0).to_ascii_lowercase();
+                    let b = right.get(index).copied().unwrap_or(0).to_ascii_lowercase();
                     if a != b {
                         result = i32::from(a as i8) - i32::from(b as i8);
                         break;
@@ -30888,7 +31156,12 @@ impl PeHostRuntime {
                 let string_ptr = guest_call_arg(state, memory, 0)?;
                 let value = guest_call_arg(state, memory, 1)? as u8;
                 let bytes = read_c_string_limit(memory, string_ptr, usize::MAX)?;
-                let found = bytes.iter().position(|byte| *byte == value);
+                // strchr(s, 0) returns a pointer to the terminating NUL.
+                let found = if value == 0 {
+                    Some(bytes.len())
+                } else {
+                    bytes.iter().position(|byte| *byte == value)
+                };
                 state.set(
                     Register::Rax,
                     found.map(|index| string_ptr + index as u64).unwrap_or(0),
@@ -31001,12 +31274,21 @@ impl PeHostRuntime {
                 } else {
                     usize::MAX
                 };
-                let left_units = left.encode_utf16().take(max).collect::<Vec<_>>();
-                let right_units = right.encode_utf16().take(max).collect::<Vec<_>>();
+                let left_units = left.encode_utf16().collect::<Vec<_>>();
+                let right_units = right.encode_utf16().collect::<Vec<_>>();
                 let mut result = 0_i32;
-                for (a, b) in left_units.iter().zip(right_units.iter()) {
-                    let a = char::from_u32(u32::from(*a)).unwrap_or('\u{FFFD}');
-                    let b = char::from_u32(u32::from(*b)).unwrap_or('\u{FFFD}');
+                // _wcsnicmp compares up to `max` units WITHOUT stopping at a
+                // NUL: the NUL-vs-char case is a real difference.
+                let compare_len = if bounded {
+                    max
+                } else {
+                    left_units.len().max(right_units.len())
+                };
+                for index in 0..compare_len {
+                    let a = left_units.get(index).copied().unwrap_or(0);
+                    let b = right_units.get(index).copied().unwrap_or(0);
+                    let a = char::from_u32(u32::from(a)).unwrap_or('\u{FFFD}');
+                    let b = char::from_u32(u32::from(b)).unwrap_or('\u{FFFD}');
                     let a = a.to_ascii_lowercase() as u32;
                     let b = b.to_ascii_lowercase() as u32;
                     if a != b {
@@ -31040,7 +31322,12 @@ impl PeHostRuntime {
                 let value = guest_call_arg(state, memory, 1)? as u16;
                 let wide = read_utf16_string(memory, string_ptr)?;
                 let units = wide.encode_utf16().collect::<Vec<_>>();
-                let found = units.iter().rposition(|unit| *unit == value);
+                // wcsrchr(s, 0) returns a pointer to the terminating NUL unit.
+                let found = if value == 0 {
+                    Some(units.len())
+                } else {
+                    units.iter().rposition(|unit| *unit == value)
+                };
                 state.set(
                     Register::Rax,
                     found.map(|index| string_ptr + index as u64 * 2).unwrap_or(0),
@@ -31052,7 +31339,12 @@ impl PeHostRuntime {
                 let value = guest_call_arg(state, memory, 1)? as u16;
                 let wide = read_utf16_string(memory, string_ptr)?;
                 let units = wide.encode_utf16().collect::<Vec<_>>();
-                let found = units.iter().position(|unit| *unit == value);
+                // wcschr(s, 0) returns a pointer to the terminating NUL unit.
+                let found = if value == 0 {
+                    Some(units.len())
+                } else {
+                    units.iter().position(|unit| *unit == value)
+                };
                 state.set(
                     Register::Rax,
                     found.map(|index| string_ptr + index as u64 * 2).unwrap_or(0),
@@ -31083,7 +31375,17 @@ impl PeHostRuntime {
                 let size = guest_call_arg(state, memory, 1)?;
                 let count = guest_call_arg(state, memory, 2)?;
                 let stream = guest_call_arg(state, memory, 3)?;
-                let total = size.saturating_mul(count) as usize;
+                // size*count overflow → EINVAL + 0 items (mirrors fwrite_s;
+                // Windows fwrite returns 0 with errno EINVAL on overflow).
+                let total = match size.checked_mul(count) {
+                    Some(total) if total <= 0x7FFF_FFFF => total as usize,
+                    _ => {
+                        self.set_crt_errno(memory, EINVAL);
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
                 let mut bytes = Vec::with_capacity(total);
                 for offset in 0..total {
                     bytes.push(memory.read_u8(ptr + offset as u64)?);
@@ -31109,14 +31411,20 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::Strncmp => {
+                // strncmp compares SIGNED bytes up to `count` positions,
+                // INCLUDING the NUL-vs-char case, and returns the byte diff.
                 let count = guest_call_arg(state, memory, 2)? as usize;
                 let left = read_c_string_limit(memory, guest_call_arg(state, memory, 0)?, count)?;
                 let right = read_c_string_limit(memory, guest_call_arg(state, memory, 1)?, count)?;
-                let result = match left.cmp(&right) {
-                    std::cmp::Ordering::Less => -1_i32,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                };
+                let mut result = 0_i32;
+                for index in 0..count {
+                    let a = left.get(index).copied().unwrap_or(0);
+                    let b = right.get(index).copied().unwrap_or(0);
+                    if a != b {
+                        result = i32::from(a as i8) - i32::from(b as i8);
+                        break;
+                    }
+                }
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
             }
@@ -31424,8 +31732,14 @@ impl PeHostRuntime {
                 let ptr = guest_call_arg(state, memory, 0)?;
                 let bytes = read_c_string(memory, ptr)?;
                 let value = crt_parse_strtod(&bytes);
-                // x86 cdecl returns doubles in ST(0) (the emulated x87 stack).
-                state.x87.stack.push(value);
+                if self.guest_arch == GuestArch::X64 {
+                    // x64 returns doubles in XMM0.
+                    state.xmm[0].low = value.to_bits();
+                    state.xmm[0].high = 0;
+                } else {
+                    // x86 cdecl returns doubles in ST(0) (the emulated x87 stack).
+                    state.x87.stack.push(value);
+                }
                 state.set(Register::Rax, value.to_bits());
                 self.last_error = 0;
             }
@@ -31434,9 +31748,20 @@ impl PeHostRuntime {
                 let end_ptr = guest_call_arg(state, memory, 1)?;
                 let base = guest_call_arg(state, memory, 2)? as i32;
                 let signed = matches!(thunk, HostThunk::Strtol);
+                if !(base == 0 || (2..=36).contains(&base)) {
+                    // Invalid base: EINVAL, no conversion, *endptr = nptr.
+                    self.set_crt_errno(memory, EINVAL);
+                    if end_ptr != 0 {
+                        write_guest_pointer(memory, end_ptr, ptr, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
                 let bytes = read_c_string(memory, ptr)?;
                 let (value, consumed, overflow) = crt_parse_strtol_full(&bytes, base);
                 if end_ptr != 0 {
+                    // No conversion → *endptr = nptr (the ORIGINAL pointer).
                     write_guest_pointer(memory, end_ptr, ptr + consumed as u64, self.guest_arch)?;
                 }
                 if overflow {
@@ -31453,11 +31778,9 @@ impl PeHostRuntime {
                         value
                     }
                 } else if overflow {
-                    if bytes[..consumed].trim_start().starts_with('-') {
-                        0
-                    } else {
-                        u32::MAX as i64
-                    }
+                    // strtoul negative overflow → ULONG_MAX (0xFFFFFFFF) with
+                    // ERANGE (negation/modulo semantics), never 0.
+                    u32::MAX as i64
                 } else {
                     value
                 };
@@ -31473,9 +31796,37 @@ impl PeHostRuntime {
                 let base = guest_call_arg(state, memory, 2)? as i32;
                 let value_ptr = if secure { guest_call_arg(state, memory, 3)? } else { 0 };
                 let signed = matches!(thunk, HostThunk::Strtoi64 | HostThunk::Strtoi64S);
+                if secure && value_ptr == 0 {
+                    // NULL value out-param → EINVAL + invalid-parameter handler.
+                    if let Some(code) = self.crt_invalid_parameter(state, memory, EINVAL)? {
+                        return Ok(Some(code));
+                    }
+                    state.set(Register::Rax, EINVAL as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                if !(base == 0 || (2..=36).contains(&base)) {
+                    // Invalid base (1 and 37 are invalid): EINVAL, no
+                    // conversion, *endptr = nptr; _s writes *value = 0.
+                    self.set_crt_errno(memory, EINVAL);
+                    if end_ptr != 0 {
+                        write_guest_pointer(memory, end_ptr, ptr, self.guest_arch)?;
+                    }
+                    if secure {
+                        if value_ptr != 0 {
+                            write_u64(memory, value_ptr, 0);
+                        }
+                        state.set(Register::Rax, EINVAL as u64);
+                    } else {
+                        state.set(Register::Rax, 0);
+                    }
+                    self.last_error = 0;
+                    return Ok(None);
+                }
                 let bytes = read_c_string(memory, ptr)?;
                 let (value, consumed, overflow) = crt_parse_strtoll_full(&bytes, base);
                 if end_ptr != 0 {
+                    // No conversion → *endptr = nptr (the ORIGINAL pointer).
                     write_guest_pointer(memory, end_ptr, ptr + consumed as u64, self.guest_arch)?;
                 }
                 if overflow {
@@ -31493,11 +31844,9 @@ impl PeHostRuntime {
                         value
                     }
                 } else if overflow {
-                    if negative {
-                        0
-                    } else {
-                        u64::MAX as i64
-                    }
+                    // _strtoui64 negative overflow → _UI64_MAX with ERANGE
+                    // (negation/modulo semantics), never 0.
+                    u64::MAX as i64
                 } else {
                     value
                 };
@@ -31874,8 +32223,14 @@ impl PeHostRuntime {
                     read_c_string(memory, string_ptr)?
                 };
                 if let Some((name, value)) = string.split_once('=') {
-                    self.process_environment
-                        .insert(name.to_string(), value.to_string());
+                    if value.is_empty() {
+                        // Windows _putenv("NAME=") REMOVES the variable.
+                        self.process_environment
+                            .retain(|key, _| !key.eq_ignore_ascii_case(name));
+                    } else {
+                        self.process_environment
+                            .insert(name.to_string(), value.to_string());
+                    }
                 } else {
                     self.process_environment
                         .retain(|key, _| !key.eq_ignore_ascii_case(&string));
@@ -32093,9 +32448,8 @@ impl PeHostRuntime {
                 } else {
                     read_u32(memory, security_attributes_ptr + inherit_offset)? != 0
                 };
-                let can_queue_guest_thread = self.guest_arch == GuestArch::X86
-                    && creation_flags & CREATE_SUSPENDED == 0
-                    && start_address != 0;
+                let can_queue_guest_thread =
+                    self.guest_arch == GuestArch::X86 && start_address != 0;
                 let thread_handle = self.win32.create_thread(
                     crate::win32::ThreadPlan {
                         exit_code: None,
@@ -32109,13 +32463,20 @@ impl PeHostRuntime {
                     write_u32(memory, thread_id_ptr, thread_id);
                 }
                 if can_queue_guest_thread {
-                    let pending_thread = self.prepare_guest_thread_entry(
+                    // CREATE_SUSPENDED threads ARE queued: they sit in the
+                    // pending list with suspend count 1 and are skipped by the
+                    // pump until ResumeThread clears the suspension (see
+                    // `pump_pending_guest_thread` / `ResumeThread`).
+                    let mut pending_thread = self.prepare_guest_thread_entry(
                         memory,
                         thread_handle,
                         stack_size,
                         start_address,
                         parameter,
                     )?;
+                    if creation_flags & CREATE_SUSPENDED != 0 {
+                        pending_thread.suspended = 1;
+                    }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
                 state.set(Register::Rax, u64::from(thread_handle));
@@ -32233,8 +32594,13 @@ impl PeHostRuntime {
                 }
                 let path = read_c_string(memory, path_ptr)?;
                 let mode = read_c_string(memory, mode_ptr)?;
-                let _ = self.crt_close_stream(stream);
-                match self.crt_fopen_impl(memory, &path, &mode)? {
+                // Windows freopen closes the old stream and REOPENS the same
+                // FILE block: the returned pointer must equal the input
+                // stream.  Close the host handle but keep the block.
+                if stream != 0 && let Some(old_state) = self.crt_files.remove(&stream) {
+                    let _ = self.win32.close_handle(old_state.handle);
+                }
+                match self.crt_fopen_impl_at(memory, &path, &mode, (stream != 0).then_some(stream))? {
                     Some(file_ptr) => {
                         state.set(Register::Rax, file_ptr);
                     }
@@ -32369,6 +32735,7 @@ impl PeHostRuntime {
                 }
                 // Read byte-by-byte so the stream position stops exactly at
                 // the newline (or the count limit / EOF), matching fgets.
+                // A read ERROR sets errno EIO (EOF does not).
                 let limit = max_count.saturating_sub(1);
                 let mut collected = Vec::new();
                 while collected.len() < limit {
@@ -32379,7 +32746,11 @@ impl PeHostRuntime {
                                 break;
                             }
                         }
-                        _ => break, // EOF or read error
+                        Ok(_) => break, // EOF
+                        Err(_) => {
+                            self.set_crt_errno(memory, EIO);
+                            break;
+                        }
                     }
                 }
                 if collected.is_empty() {
@@ -32420,7 +32791,13 @@ impl PeHostRuntime {
                     Ok(bytes) if !bytes.is_empty() => {
                         state.set(Register::Rax, u64::from(bytes[0]));
                     }
-                    _ => {
+                    Ok(_) => {
+                        // Plain EOF is not an error.
+                        state.set(Register::Rax, EOF as u64);
+                    }
+                    Err(_) => {
+                        // Read errors set errno EIO (fgetc returns EOF).
+                        self.set_crt_errno(memory, EIO);
                         state.set(Register::Rax, EOF as u64);
                     }
                 }
@@ -35579,38 +35956,39 @@ impl PeHostRuntime {
                     self.last_error = 0;
                     self.push_trace("thread", "TlsAlloc", BTreeMap::new(), json!(slot));
                 } else {
+                    // Windows: TLS slot exhaustion reports
+                    // ERROR_NOT_ENOUGH_MEMORY (8).
                     state.set(Register::Rax, u32::MAX as u64);
-                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.last_error = ERROR_NOT_ENOUGH_MEMORY;
                 }
             }
             HostThunk::TlsGetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
-                let value = self.tls_slots.get(&slot).copied();
-                match value {
-                    Some(value) => {
-                        state.set(Register::Rax, value);
-                        self.last_error = 0;
-                    }
-                    None => {
-                        // Callers distinguish a failed lookup from a stored 0
-                        // via GetLastError, so set ERROR_INVALID_PARAMETER.
-                        state.set(Register::Rax, 0);
-                        self.last_error = ERROR_INVALID_PARAMETER;
-                    }
+                if slot >= 4096 {
+                    // Only an out-of-range index (>= TlsMaximum) is an error;
+                    // in-range slots are always readable, including freed or
+                    // never-allocated ones (which read as zero).
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let value = self.read_guest_tls_value(memory, slot)?;
+                    state.set(Register::Rax, value);
+                    self.last_error = 0;
                 }
             }
             HostThunk::TlsSetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
                 let value = guest_call_arg(state, memory, 1)?;
-                let stored = if let Some(entry) = self.tls_slots.get_mut(&slot) {
-                    *entry = value;
-                    self.sync_guest_tls_slot(memory, slot, value)?;
-                    true
+                if slot >= 4096 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    false
-                };
-                state.set(Register::Rax, u64::from(stored));
-                self.last_error = if stored { 0 } else { ERROR_INVALID_PARAMETER };
+                    // The TLS array is the truth: any in-range index is
+                    // writable, whether or not it was ever allocated.
+                    self.write_guest_tls_value(memory, slot, value)?;
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
                 self.push_trace(
                     "thread",
                     "TlsSetValue",
@@ -35618,7 +35996,7 @@ impl PeHostRuntime {
                         ("slot".to_string(), json!(slot)),
                         ("value".to_string(), json!(format!("{value:#x}"))),
                     ]),
-                    json!(stored),
+                    json!(state.get(Register::Rax)),
                 );
             }
             HostThunk::TlsFree => {
@@ -39752,53 +40130,90 @@ impl PeHostRuntime {
             HostThunk::SleepEx => {
                 let milliseconds = arg(0) as u32;
                 let alertable = arg(1) != 0;
-                // Deliver pending APCs if alertable
-                let apc_entries = if alertable {
-                    // Look up the APC queue for the current guest thread by its actual thread ID,
-                    // so that QueueUserAPC (which keys by thread_id_for_handle) can deliver correctly.
-                    let current_tid = self.win32.current_thread_id() as u64;
-                    if let Some(apc_queue) = self.apc_queues.get_mut(&current_tid) {
-                        apc_queue.deliver_apcs(usize::MAX)
-                    } else {
-                        Vec::new()
-                    }
+                // Deliver already-pending APCs first (alertable sleep).
+                let mut apc_delivered = if alertable {
+                    self.deliver_current_thread_apcs(state, memory)?
                 } else {
-                    Vec::new()
+                    false
                 };
-                let apc_delivered = !apc_entries.is_empty();
-                // Actually invoke the APC callbacks in the guest
-                for apc in apc_entries {
-                    let _ = self.execute_guest_callback(
-                        state, memory, apc.callback, &[apc.context], "ApcCallback",
-                    );
-                }
                 if apc_delivered {
                     // APCs were delivered — return WAIT_IO_COMPLETION
                     state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                     self.last_error = 0;
-                } else {
-                    if milliseconds != 0 && milliseconds != u32::MAX {
-                        // Pump pending guest threads while sleeping
-                        let sleep_start = std::time::Instant::now();
-                        let max_sleep = std::time::Duration::from_millis(milliseconds.min(100) as u64);
-                        while sleep_start.elapsed() < max_sleep {
-                            if !self.pending_guest_threads.is_empty() {
-                                let pump_outcome = self.pump_pending_guest_thread(memory)?;
-                                if let Some(code) = pump_outcome.process_exit {
-                                    return Ok(Some(code));
-                                }
-                            } else {
-                                return Ok(None);
-                            }
+                } else if milliseconds == u32::MAX {
+                    // SleepEx(INFINITE, alertable): block like an infinite
+                    // alertable wait — pump pending guest threads and check
+                    // the APC queue until an APC is delivered.  Never return
+                    // early (Windows: an alertable INFINITE sleep only
+                    // completes via APC delivery).  Non-alertable INFINITE
+                    // blocks forever, as on Windows.
+                    loop {
+                        if alertable
+                            && self.deliver_current_thread_apcs(state, memory)?
+                        {
+                            state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
+                            self.last_error = 0;
+                            break;
                         }
+                        if !self.pending_guest_threads.is_empty() {
+                            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                            if let Some(code) = pump_outcome.process_exit {
+                                return Ok(Some(code));
+                            }
+                        } else {
+                            // Nothing to pump: host-sleep 1 ms and advance
+                            // the guest clock so sleeping workers' wake_ticks
+                            // can expire and produce APCs.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            self.win32.record_sleep_observation(1, 1);
+                        }
+                    }
+                } else if milliseconds == 0 {
+                    state.set(Register::Rax, 0); // WAIT_OBJECT_0
+                } else {
+                    // Finite sleep: pump pending guest threads while
+                    // advancing the guest clock (wait-loop style) so a
+                    // sleeping sibling's wake_tick expires — otherwise the
+                    // loop spins on wall time and the sibling starves.
+                    // Alertable sleeps also re-check the APC queue after
+                    // each pump iteration, delivering APCs queued DURING the
+                    // wait by a pumped worker.
+                    let sleep_start = std::time::Instant::now();
+                    let max_sleep = std::time::Duration::from_millis(milliseconds.min(100) as u64);
+                    while sleep_start.elapsed() < max_sleep {
+                        if alertable
+                            && self.deliver_current_thread_apcs(state, memory)?
+                        {
+                            apc_delivered = true;
+                            break;
+                        }
+                        if !self.pending_guest_threads.is_empty() {
+                            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                            if let Some(code) = pump_outcome.process_exit {
+                                return Ok(Some(code));
+                            }
+                        } else {
+                            // No pending threads at all: complete the sleep
+                            // with a full guest-clock advance (matching
+                            // `Sleep` semantics) instead of spinning.
+                            self.win32.sleep(milliseconds as u64);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        self.win32.record_sleep_observation(1, 1);
+                    }
+                    if apc_delivered {
+                        state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
+                        self.last_error = 0;
+                    } else {
                         // Still sleep a bit for non-trivial timeouts
                         if milliseconds > 5 {
                             std::thread::sleep(std::time::Duration::from_millis(
                                 (milliseconds.min(100) as u64).min(5),
                             ));
                         }
+                        state.set(Register::Rax, 0); // WAIT_OBJECT_0
                     }
-                    state.set(Register::Rax, 0); // WAIT_OBJECT_0
                 }
             }
             HostThunk::CopyFileW => {
@@ -39829,13 +40244,15 @@ impl PeHostRuntime {
                 let existing_path = read_utf16_string(memory, existing_file_ptr).unwrap_or_default();
                 let new_path = read_utf16_string(memory, new_file_ptr).unwrap_or_default();
                 if existing_path.is_empty() || new_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
                     state.set(Register::Rax, 0);
-                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.last_error = ERROR_PATH_NOT_FOUND;
                 } else {
                     let src = resolve_guest_path(&self.current_directory, &existing_path);
                     let dst = resolve_guest_path(&self.current_directory, &new_path);
                     let replace_existing = flags & 0x1 != 0; // MOVEFILE_REPLACE_EXISTING
-                    match self.win32.move_file_ex_w(&src, &dst, replace_existing) {
+                    let copy_allowed = flags & 0x2 != 0; // MOVEFILE_COPY_ALLOWED
+                    match self.win32.move_file_ex_w(&src, &dst, replace_existing, copy_allowed) {
                         Ok(_) => state.set(Register::Rax, 1),
                         Err(error) => {
                             state.set(Register::Rax, 0);
@@ -39855,9 +40272,16 @@ impl PeHostRuntime {
                 let flags_and_attributes = arg(5) as u32;
                 let template_file = arg(6);
                 let granted_access = expand_generic_access(desired_access_raw);
-                let desired_access = file_access_from_win32(granted_access);
+                let mut desired_access = file_access_from_win32(granted_access);
                 let share_mode = share_mode_from_win32(share_mode_raw);
                 let delete_on_close = flags_and_attributes & FILE_FLAG_DELETE_ON_CLOSE != 0;
+                if delete_on_close {
+                    // FILE_FLAG_DELETE_ON_CLOSE behaves like a DELETE access
+                    // request for the share matrix: the open conflicts with
+                    // existing handles lacking FILE_SHARE_DELETE, and later
+                    // opens must share delete.
+                    desired_access.delete = true;
+                }
                 let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let inheritable = if security_attributes == 0 { false } else { read_u32(memory, security_attributes + inherit_offset).unwrap_or(0) != 0 };
                 if raw_path.starts_with("\\\\.\\pipe\\") || raw_path.starts_with("\\\\?\\pipe\\") {
@@ -39871,17 +40295,25 @@ impl PeHostRuntime {
                             self.last_error = last_error_from_app_error(&error);
                         }
                     }
+                } else if raw_path.is_empty() {
+                    // Windows: CreateFileA(NULL) / CreateFileA("") fails with
+                    // ERROR_PATH_NOT_FOUND (3); an empty name never resolves to
+                    // the current directory.
+                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
                 } else {
                     // hTemplateFile (arg 6) resolution — same Win32 semantics
                     // as CreateFileW: NULL means no template; a non-NULL value
                     // must be a valid file handle with readable metadata,
                     // otherwise ERROR_INVALID_HANDLE (6). The template's
                     // attributes are copied to the file only when the
-                    // disposition creates a NEW file (CREATE_NEW,
-                    // CREATE_ALWAYS, or OPEN_ALWAYS on a not-yet-existing
-                    // file); it is ignored when merely opening an existing
-                    // file (OPEN_EXISTING, TRUNCATE_EXISTING, or OPEN_ALWAYS
-                    // on an existing file).
+                    // disposition creates a genuinely NEW file (CREATE_NEW,
+                    // or CREATE_ALWAYS/OPEN_ALWAYS on a not-yet-existing
+                    // file); CREATE_ALWAYS on an existing file is
+                    // FILE_OVERWRITE_IF and the template is ignored. It is
+                    // also ignored when merely opening an existing file
+                    // (OPEN_EXISTING, TRUNCATE_EXISTING, or OPEN_ALWAYS on an
+                    // existing file).
                     let template_attributes = if template_file == 0 {
                         Ok(None)
                     } else {
@@ -39898,11 +40330,21 @@ impl PeHostRuntime {
                             self.last_error = ERROR_INVALID_HANDLE;
                         }
                         Ok(template_attributes) => {
+                            // A template only applies when the disposition
+                            // produces a brand-new file: CREATE_ALWAYS on an
+                            // existing file is FILE_OVERWRITE_IF, so it only
+                            // copies when the target does not yet exist.
                             let creates_new_file = match creation_raw {
-                                CREATE_NEW | CREATE_ALWAYS => true,
-                                OPEN_ALWAYS => self.win32.get_file_attributes_w(&path).is_err(),
+                                CREATE_NEW => true,
+                                CREATE_ALWAYS | OPEN_ALWAYS => {
+                                    self.win32.get_file_attributes_w(&path).is_err()
+                                }
                                 _ => false,
                             };
+                            // Windows reports ERROR_ALREADY_EXISTS (183) with a
+                            // valid handle when CREATE_ALWAYS/OPEN_ALWAYS opens
+                            // a file that already existed.
+                            let existed_before = self.win32.get_file_attributes_w(&path).is_ok();
                             match creation_disposition_from_win32(creation_raw).and_then(|creation| {
                                 self.win32.create_file_w_extended(
                                     &path,
@@ -39936,7 +40378,14 @@ impl PeHostRuntime {
                                     match attribute_apply {
                                         Ok(()) => {
                                             state.set(Register::Rax, handle as u64);
-                                            self.last_error = 0;
+                                            self.last_error = if (creation_raw == CREATE_ALWAYS
+                                                || creation_raw == OPEN_ALWAYS)
+                                                && existed_before
+                                            {
+                                                ERROR_ALREADY_EXISTS
+                                            } else {
+                                                0
+                                            };
                                         }
                                         Err(error) => {
                                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
@@ -39957,8 +40406,9 @@ impl PeHostRuntime {
                 let path_ptr = arg(0);
                 let raw_path = read_c_string(memory, path_ptr).unwrap_or_default();
                 if raw_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
                     state.set(Register::Rax, 0);
-                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.last_error = ERROR_PATH_NOT_FOUND;
                 } else {
                     let path = resolve_guest_path(&self.current_directory, &raw_path);
                     match self.win32.remove_directory_w(&path) {
@@ -39974,8 +40424,9 @@ impl PeHostRuntime {
                 let path_ptr = arg(0);
                 let raw_path = read_c_string(memory, path_ptr).unwrap_or_default();
                 if raw_path.is_empty() {
+                    // Windows fails an empty path with ERROR_PATH_NOT_FOUND (3).
                     state.set(Register::Rax, u32::MAX as u64); // INVALID_FILE_ATTRIBUTES
-                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.last_error = ERROR_PATH_NOT_FOUND;
                 } else {
                     let path = resolve_guest_path(&self.current_directory, &raw_path);
                     match self.win32.get_file_attributes_w(&path) {
@@ -40179,21 +40630,58 @@ impl PeHostRuntime {
             }
             HostThunk::SuspendThread => {
                 let handle = arg(0) as u32;
-                if handle == 0 {
+                if handle == 0
+                    || !matches!(
+                        self.win32.handle_object_type(handle),
+                        Ok(crate::win32::ObjectType::Thread)
+                    )
+                {
                     state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED (0xFFFFFFFF)
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                state.set(Register::Rax, 0); // previous suspend count
+                // A queued (not-yet-started) guest thread gets one more
+                // suspension; each one needs a matching ResumeThread.  Threads
+                // already running cannot be paused in this cooperative model,
+                // so their previous suspend count is 0 (Windows-compatible
+                // for an unsuspended thread).
+                let mut previous = 0_u32;
+                for thread in &mut self.pending_guest_threads {
+                    if thread.handle == handle {
+                        previous = thread.suspended;
+                        thread.suspended = thread.suspended.saturating_add(1);
+                        break;
+                    }
+                }
+                state.set(Register::Rax, previous as u64);
+                self.last_error = 0;
             }
             HostThunk::ResumeThread => {
                 let handle = arg(0) as u32;
-                if handle == 0 {
+                if handle == 0
+                    || !matches!(
+                        self.win32.handle_object_type(handle),
+                        Ok(crate::win32::ObjectType::Thread)
+                    )
+                {
                     state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED (0xFFFFFFFF)
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                state.set(Register::Rax, 1); // previous suspend count
+                // Decrement the pending thread's suspend count (returning the
+                // previous count); once it reaches 0 the pump starts it.
+                let mut previous = 0_u32;
+                for thread in &mut self.pending_guest_threads {
+                    if thread.handle == handle {
+                        previous = thread.suspended;
+                        if thread.suspended > 0 {
+                            thread.suspended -= 1;
+                        }
+                        break;
+                    }
+                }
+                state.set(Register::Rax, previous as u64);
+                self.last_error = 0;
             }
             HostThunk::SetThreadAffinityMask => {
                 state.set(Register::Rax, 1); // previous affinity mask (non-zero = success)
@@ -40740,26 +41228,15 @@ impl PeHostRuntime {
                 }
                 let timeout = arg(1) as u32;
                 let alertable = arg(2) != 0;
-                // Deliver pending APCs if alertable
-                let apc_entries = if alertable {
-                    // Look up the APC queue for the current guest thread by its actual thread ID,
-                    // so that QueueUserAPC (which keys by thread_id_for_handle) can deliver correctly.
-                    let current_tid = self.win32.current_thread_id() as u64;
-                    if let Some(apc_queue) = self.apc_queues.get_mut(&current_tid) {
-                        apc_queue.deliver_apcs(usize::MAX)
-                    } else {
-                        Vec::new()
-                    }
+                // Deliver already-pending APCs before blocking; alertable
+                // waits also re-check the APC queue after every pump
+                // iteration inside the wait helpers below, so an APC queued
+                // DURING the wait by a pumped worker is delivered too.
+                let apc_delivered = if alertable {
+                    self.deliver_current_thread_apcs(state, memory)?
                 } else {
-                    Vec::new()
+                    false
                 };
-                let apc_delivered = !apc_entries.is_empty();
-                // Actually invoke the APC callbacks in the guest
-                for apc in apc_entries {
-                    let _ = self.execute_guest_callback(
-                        state, memory, apc.callback, &[apc.context], "ApcCallback",
-                    );
-                }
                 if apc_delivered {
                     state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                     self.last_error = 0;
@@ -40774,13 +41251,17 @@ impl PeHostRuntime {
                         // Thread targets: pump pending guest threads and
                         // never report WAIT_TIMEOUT for INFINITE while the
                         // target thread can still complete.
-                        self.wait_for_single_object_pumping(memory, handle, timeout)
+                        self.wait_for_single_object_pumping(state, memory, handle, timeout, alertable)
                     } else {
-                        self.wait_for_single_object_non_thread(memory, handle, timeout)
+                        self.wait_for_single_object_non_thread(state, memory, handle, timeout, alertable)
                     };
                     match wait_result {
                         Ok(PumpWaitOutcome::Wait(result)) => {
                             state.set(Register::Rax, u64::from(result.code()));
+                            self.last_error = 0;
+                        }
+                        Ok(PumpWaitOutcome::IoCompletion) => {
+                            state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                             self.last_error = 0;
                         }
                         Ok(PumpWaitOutcome::Unreported) => {
@@ -50279,19 +50760,70 @@ impl PeHostRuntime {
         }
     }
 
+    /// Deliver pending APCs for the CURRENT guest thread (alertable wait
+    /// points: `SleepEx`/`WaitForSingleObjectEx`).  Each queued APC callback
+    /// is executed in the guest via the standard callback machinery; returns
+    /// true when at least one APC was delivered, in which case the caller
+    /// must report WAIT_IO_COMPLETION (0xC0).
+    ///
+    /// The queue is keyed by the guest thread ID (`QueueUserAPC` resolves
+    /// the target handle to a thread ID), and `current_thread_id` reflects
+    /// the pumped thread's identity, so an APC queued for a pumped worker is
+    /// delivered while that worker is active.
+    fn deliver_current_thread_apcs(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<bool> {
+        let current_tid = self.win32.current_thread_id() as u64;
+        // `deliver_apcs(max_count)` allocates a Vec with `max_count`
+        // capacity, so the count must stay sane (usize::MAX overflows);
+        // pending_count() bounds it to what the queue actually holds.
+        let apc_entries = self
+            .apc_queues
+            .get_mut(&current_tid)
+            .map(|queue| {
+                let count = queue.pending_count().max(1);
+                queue.deliver_apcs(count)
+            })
+            .unwrap_or_default();
+        if apc_entries.is_empty() {
+            return Ok(false);
+        }
+        for apc in apc_entries {
+            let _ = self.execute_guest_callback(
+                state,
+                memory,
+                apc.callback,
+                &[apc.context],
+                "ApcCallback",
+            );
+        }
+        Ok(true)
+    }
+
     /// Record an explicit exit request for the calling guest thread.
     ///
     /// While a pumped thread is active, the request is handed to the pump,
     /// which ends the thread immediately (`ExitThread`/`_endthreadex` fire
     /// DLL_THREAD_DETACH, `TerminateThread` does not).  On a non-pumped
-    /// context (the main thread) the request becomes a process-exit request:
-    /// Windows ends the process when its last thread exits.
+    /// context (the main thread) the request ends only the MAIN thread's
+    /// execution: Windows ends the process when its LAST thread exits, so
+    /// the run keeps pumping pending guest threads while
+    /// `main_thread_exit_code` is set, and ends with that code once no
+    /// pending threads remain (or a process-exit API is called).
     fn request_current_thread_exit(&mut self, code: u32, fire_detach: bool) {
         if self.active_pumped_guest_thread.is_some() {
             self.pumped_thread_exit_requested = Some(code);
             self.pumped_thread_exit_with_detach = fire_detach;
         } else {
-            self.process_exit_requested = Some(code);
+            self.main_thread_exit_code = Some(code);
+            // Record the code in the kernel thread state so a wait on the
+            // main thread's handle completes (Windows: a thread handle is
+            // signaled once the thread exits, even mid-process).
+            let _ = self
+                .win32
+                .set_thread_exit_code_by_id(self.win32.current_thread_id(), code);
         }
     }
 
@@ -50398,6 +50930,7 @@ impl PeHostRuntime {
             parameter,
             initial_rsp,
             started: false,
+            suspended: 0,
             wake_tick: self.win32.get_tick_count64(),
             teb_base,
             tls_vector_ptr,
@@ -50411,8 +50944,20 @@ impl PeHostRuntime {
 
     fn pump_pending_guest_thread(&mut self, memory: &mut MemoryImage) -> AppResult<PumpOutcome> {
         let now = self.win32.get_tick_count64();
+        // The state machine drives readiness: `Runnable` threads are ready;
+        // `Waiting`/`AlertableWaiting` threads are only ready once their
+        // wake_tick has expired; `Exiting` threads are mid-teardown inside
+        // their own pump cycle (they never sit in the queue across cycles)
+        // and `Exited` threads are gone.
         let Some(ready_index) = self.pending_guest_threads.iter().position(|thread| {
-            thread.wake_tick <= now && thread.state_machine != GuestThreadState::Exited
+            thread.suspended == 0
+                && match thread.state_machine {
+                    GuestThreadState::Waiting | GuestThreadState::AlertableWaiting => {
+                        thread.wake_tick <= now
+                    }
+                    GuestThreadState::Runnable => true,
+                    GuestThreadState::Exiting | GuestThreadState::Exited => false,
+                }
         }) else {
             return Ok(PumpOutcome {
                 did_work: false,
@@ -50480,18 +51025,30 @@ impl PeHostRuntime {
             let resume_rsp = pending_thread.started.then_some(pending_thread.initial_rsp);
             pending_thread.started = true;
 
-            let disposition = self.execute_guest_callback_inner(
-                &mut pending_thread.state,
-                memory,
-                pending_thread.start_address,
-                &[pending_thread.parameter],
-                &format!(
-                    "CreateThread thread_id={} start_address={:#x}",
-                    pending_thread.thread_id, pending_thread.start_address
-                ),
-                true,
-                resume_rsp,
-            )?;
+            // An ATTACH TLS callback may have called an explicit exit API
+            // (ExitThread/_endthreadex/_endthread/TerminateThread on self)
+            // before the thread's start routine ran.  Windows never runs the
+            // start routine in that case (the thread was created and then
+            // immediately exited), so skip the entry entirely — the
+            // explicit-exit path below ends the thread without executing a
+            // single entry slice.
+            let exit_requested_by_attach = self.pumped_thread_exit_requested;
+            let disposition = if let Some(code) = exit_requested_by_attach {
+                GuestCallbackDisposition::Returned(code as u64)
+            } else {
+                self.execute_guest_callback_inner(
+                    &mut pending_thread.state,
+                    memory,
+                    pending_thread.start_address,
+                    &[pending_thread.parameter],
+                    &format!(
+                        "CreateThread thread_id={} start_address={:#x}",
+                        pending_thread.thread_id, pending_thread.start_address
+                    ),
+                    true,
+                    resume_rsp,
+                )?
+            };
 
             // An explicit exit API (ExitThread/_endthreadex/_endthread/
             // TerminateThread) recorded its request in the runtime fields
@@ -50533,6 +51090,16 @@ impl PeHostRuntime {
                 // thread ends here.  ExitThread/_endthreadex fire
                 // DLL_THREAD_DETACH; TerminateThread does not.
                 pending_thread.state_machine = GuestThreadState::Exiting;
+                // Materialize the explicit exit code onto the thread record.
+                // The request path (`request_current_thread_exit`) recorded
+                // it in `pumped_thread_exit_requested` while the thread was
+                // executing (the record itself is unreachable from the
+                // thunk); the pump now stores it as the durable
+                // `exit_code_override` consumed by the exit-code selection
+                // below.  While the thread is `Exiting`, GetExitCodeThread
+                // still reports STILL_ACTIVE (the kernel exit code is only
+                // published at the `Exited` transition, per Windows).
+                pending_thread.exit_code_override = Some(exit_code);
                 if explicit_exit_detach {
                     // Fire TLS thread-detach callbacks for all loaded modules.
                     // These run after the thread's start function exits, before
@@ -50552,6 +51119,16 @@ impl PeHostRuntime {
                             DLL_THREAD_DETACH,
                         )?;
                     }
+                }
+                // A TLS DETACH callback may itself call an explicit exit
+                // API.  The thread is already exiting, so the request needs
+                // no new state transition — but it must be consumed here and
+                // propagated into the exit-code selection instead of leaking
+                // into the enclosing pump's exit-request slot (which would
+                // corrupt the `previous_exit_request` restore in a nested
+                // pump).
+                if let Some(detach_code) = self.pumped_thread_exit_requested.take() {
+                    pending_thread.exit_code_override = Some(detach_code);
                 }
                 let final_code = pending_thread.exit_code_override.unwrap_or(exit_code);
                 self.win32
@@ -50585,6 +51162,13 @@ impl PeHostRuntime {
                                 memory,
                                 DLL_THREAD_DETACH,
                             )?;
+                        }
+                        // A TLS DETACH callback may itself call an explicit
+                        // exit API; propagate the request into the exit-code
+                        // selection (and consume it so it cannot corrupt the
+                        // enclosing pump's `previous_exit_request` restore).
+                        if let Some(detach_code) = self.pumped_thread_exit_requested.take() {
+                            pending_thread.exit_code_override = Some(detach_code);
                         }
                         let final_code = pending_thread.exit_code_override.unwrap_or(exit_code as u32);
                         self.win32
@@ -50674,6 +51258,38 @@ impl PeHostRuntime {
         }
     }
 
+    /// Pump pending guest threads to completion after the MAIN thread exited
+    /// via an explicit thread-exit API (`ExitThread`/`_endthreadex`/
+    /// `_endthread`/`TerminateThread` on self) while workers were still
+    /// queued.  Windows only ends the process when the LAST thread exits, so
+    /// the run must keep pumping until no pending threads remain.
+    ///
+    /// Returns the final process exit code: a worker that calls a
+    /// process-exit API (`ExitProcess`/`exit`/...) wins (process exit
+    /// abandons every thread, per Windows); otherwise the main thread's exit
+    /// code ends the run.
+    fn drain_pending_guest_threads_after_main_exit(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<i32> {
+        let main_thread_code = self.main_thread_exit_code.unwrap_or(0) as i32;
+        loop {
+            if self.pending_guest_threads.is_empty() {
+                return Ok(main_thread_code);
+            }
+            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+            if let Some(code) = pump_outcome.process_exit {
+                return Ok(code);
+            }
+            if !pump_outcome.did_work {
+                // Nothing runnable (sleeping/suspended workers): advance the
+                // guest clock so wake_ticks expire, then retry.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                self.win32.record_sleep_observation(1, 1);
+            }
+        }
+    }
+
     /// Cooperative wait on a single handle: poll the signaled state, pump
     /// pending guest threads (one per cycle, honoring wake_tick), and when
     /// nothing could be pumped host-sleep 1 ms while advancing the guest
@@ -50687,18 +51303,38 @@ impl PeHostRuntime {
     /// INFINITE (pump while the queue is non-empty, then report the timeout)
     /// so guests that busy-poll objects in a loop (Steam/CEF) stay responsive.
     ///
+    /// Alertable waits (`alertable == true`) re-check the waiting thread's
+    /// APC queue after every pump iteration and deliver any APC queued during
+    /// the wait (e.g. by a pumped worker via QueueUserAPC), returning
+    /// `PumpWaitOutcome::IoCompletion` so the thunk reports WAIT_IO_COMPLETION.
+    ///
+    /// Documented divergence: joining the CURRENTLY ACTIVE pumped thread
+    /// (a nested pump where thread B is active and dispatches thread A, and
+    /// A waits INFINITE on B's handle) cannot make progress — B is not in
+    /// `pending_guest_threads` (it was removed when its pump began) and B
+    /// cannot reach `Exited` while it is dispatching A.  On Windows this
+    /// resolves because threads are preemptively scheduled; in the
+    /// cooperative model we return WAIT_TIMEOUT immediately so the guest can
+    /// retry the join (a plain self-join would deadlock on Windows too).
+    ///
     /// Returns `PumpWaitOutcome::ProcessExit` when a pumped thread requested
     /// process exit; the caller must propagate it as a thunk `Some(code)`.
     fn wait_for_single_object_pumping(
         &mut self,
+        state: &mut CpuState,
         memory: &mut MemoryImage,
         handle: u32,
         timeout_ms: u32,
+        alertable: bool,
     ) -> AppResult<PumpWaitOutcome> {
         if timeout_ms == 0 {
             return Ok(PumpWaitOutcome::Wait(
                 self.win32.wait_for_single_object(handle, 0, false, None)?,
             ));
+        }
+        // Self-join / active-thread join detection (see the doc comment).
+        if Some(handle) == self.active_pumped_guest_thread {
+            return Ok(PumpWaitOutcome::Wait(crate::win32::WaitStatus::Timeout));
         }
         let deadline = (timeout_ms != u32::MAX)
             .then(|| self.win32.get_tick_count64().saturating_add(timeout_ms as u64));
@@ -50714,7 +51350,11 @@ impl PeHostRuntime {
             if let Some(code) = pump_outcome.process_exit {
                 return Ok(PumpWaitOutcome::ProcessExit(code));
             }
-            // (c) Nothing could be pumped — the target thread may be a
+            // (c) Alertable waits: deliver APCs queued during the wait.
+            if alertable && self.deliver_current_thread_apcs(state, memory)? {
+                return Ok(PumpWaitOutcome::IoCompletion);
+            }
+            // (d) Nothing could be pumped — the target thread may be a
             // sleeping worker with its wake_tick in the future.  Host-sleep
             // 1 ms and advance the guest clock (as the existing pump path
             // does) so the worker's sleep expires.  The wait must NOT report
@@ -50741,11 +51381,16 @@ impl PeHostRuntime {
     /// saw its pre-call RAX).  Pump-phase signals therefore surface as
     /// `PumpWaitOutcome::Unreported` and the thunk leaves RAX untouched,
     /// keeping the guest on its historical path.
+    ///
+    /// Alertable waits re-check the waiting thread's APC queue after each
+    /// pump iteration (see `wait_for_single_object_pumping`).
     fn wait_for_single_object_non_thread(
         &mut self,
+        state: &mut CpuState,
         memory: &mut MemoryImage,
         handle: u32,
         timeout_ms: u32,
+        alertable: bool,
     ) -> AppResult<PumpWaitOutcome> {
         let result = self.win32.wait_for_single_object(handle, timeout_ms, false, None)?;
         if !matches!(result, crate::win32::WaitStatus::Timeout) {
@@ -50755,6 +51400,9 @@ impl PeHostRuntime {
             let pump_outcome = self.pump_pending_guest_thread(memory)?;
             if let Some(code) = pump_outcome.process_exit {
                 return Ok(PumpWaitOutcome::ProcessExit(code));
+            }
+            if alertable && self.deliver_current_thread_apcs(state, memory)? {
+                return Ok(PumpWaitOutcome::IoCompletion);
             }
             let polled = self.win32.wait_for_single_object(handle, 0, false, None)?;
             if !matches!(polled, crate::win32::WaitStatus::Timeout) {
@@ -50776,6 +51424,11 @@ impl PeHostRuntime {
     /// This is called from the main message loop (e.g. inside `GetMessageW`)
     /// so that timer and wait callbacks created by `CreateTimerQueueTimer`
     /// and `RegisterWaitForSingleObject` are dispatched cooperatively.
+    ///
+    /// A timer callback that requests process exit (ExitProcess/exit/_exit/
+    /// abort sets `process_exit_requested`) stops the drain; the caller must
+    /// propagate the code so the run ends (a process-exit API never
+    /// returns, so remaining callbacks must not run).
     fn drain_timer_work_queue(
         &mut self,
         state: &mut CpuState,
@@ -50797,6 +51450,11 @@ impl PeHostRuntime {
                         &[parameter],
                         "TimerQueueCallback",
                     );
+                    if self.process_exit_requested.is_some() {
+                        // A timer callback requested process exit — stop
+                        // draining so the caller can end the run.
+                        break;
+                    }
                 }
                 None => break,
             }
@@ -51538,6 +52196,15 @@ impl PeHostRuntime {
         size: usize,
         zeroed: bool,
     ) -> AppResult<u64> {
+        // Test-only failure injection: one-shot ENOMEM for the next heap
+        // allocation (see `crt_alloc_fail_next`).
+        if self.crt_alloc_fail_next {
+            self.crt_alloc_fail_next = false;
+            return Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                "injected heap allocation failure (ENOMEM)",
+            ));
+        }
         let requested_size = size.max(1);
         let mapped_size = align_up_u64(requested_size as u64 + 15, 16) as usize;
         let mut address = align_up_u64(self.next_heap_address, 16);
@@ -51688,6 +52355,51 @@ impl PeHostRuntime {
                 .tls_vector_ptr
                 .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
             write_guest_pointer(memory, slot_address, value, self.guest_arch)?;
+        }
+        Ok(())
+    }
+
+    /// Read a TLS slot value from the guest-visible TLS array.
+    ///
+    /// The array is the truth for in-range indices: freed and never-allocated
+    /// slots read as zero (the array is zeroed at allocation and on TlsFree).
+    /// x86 guests carry the array at `tls_vector_ptr`; x64 guests have no
+    /// modelled array, so the host map (values of allocated slots) is used.
+    fn read_guest_tls_value(&self, memory: &MemoryImage, slot: u32) -> AppResult<u64> {
+        if self.tls_vector_ptr != 0 {
+            let slot_address = self
+                .tls_vector_ptr
+                .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
+            read_guest_pointer(memory, slot_address, self.guest_arch)
+        } else {
+            Ok(self.tls_slots.get(&slot).copied().unwrap_or(0))
+        }
+    }
+
+    /// Write a TLS slot value into the guest-visible TLS array.
+    ///
+    /// Any in-range index is writable. For x86 the guest array is written
+    /// directly; the map mirror of *allocated* slots is kept in sync so the
+    /// thread-switch machinery round-trips values. x64 guests have no array,
+    /// so the map itself is the store (a never-allocated in-range slot is
+    /// recorded there; the slot remains allocatable on x86 where TlsAlloc
+    /// bookkeeping is independent of stored values).
+    fn write_guest_tls_value(
+        &mut self,
+        memory: &mut MemoryImage,
+        slot: u32,
+        value: u64,
+    ) -> AppResult<()> {
+        if self.tls_vector_ptr != 0 {
+            let slot_address = self
+                .tls_vector_ptr
+                .wrapping_add(slot as u64 * self.guest_arch.pointer_bytes() as u64);
+            write_guest_pointer(memory, slot_address, value, self.guest_arch)?;
+            if let Some(entry) = self.tls_slots.get_mut(&slot) {
+                *entry = value;
+            }
+        } else {
+            self.tls_slots.insert(slot, value);
         }
         Ok(())
     }
@@ -51882,9 +52594,12 @@ impl PeHostRuntime {
     /// Allocate a guest FILE block (zeroed 0x80 bytes, mirroring the
     /// `__acrt_iob_func` blocks) and register host state for it.  The fd is
     /// written at offset 0x10 (the `_iobuf::_file` field offset on x86) so
-    /// `_fileno` and guest code reading the struct directly agree.
+    /// `_fileno` and guest code reading the struct directly agree.  The block
+    /// is carved from the guest heap so `fclose` can free it (see
+    /// `crt_close_stream`); repeated fopen/fclose cycles therefore do not
+    /// leak guest memory.
     fn crt_alloc_file(&mut self, memory: &mut MemoryImage, state: &CrtFileState) -> AppResult<u64> {
-        let file_ptr = self.alloc_zeroed(memory, 0x80, 16)?;
+        let file_ptr = self.alloc_heap(memory, 0x80, true)?;
         memory.map_bytes(file_ptr + 0x10, &state.handle.to_le_bytes());
         self.crt_files.insert(file_ptr, state.clone());
         Ok(file_ptr)
@@ -51912,6 +52627,9 @@ impl PeHostRuntime {
     fn crt_close_stream(&mut self, stream: u64) -> AppResult<bool> {
         if let Some(state) = self.crt_files.remove(&stream) {
             let _ = self.win32.close_handle(state.handle);
+            // Free the guest FILE block (0x80-byte heap allocation) so
+            // repeated fopen/fclose cycles do not leak guest memory.
+            self.heap_allocations.remove(&stream);
             return Ok(true);
         }
         Ok(false)
@@ -51921,12 +52639,14 @@ impl PeHostRuntime {
     /// Parse a UCRT `__stdio_common_*` format specification starting at the
     /// `%` in a wide format string and render one conversion.  `va` is the
     /// x86-cdecl vararg cursor; `out` receives the rendered bytes.
+    #[allow(clippy::too_many_arguments)]
     fn crt_render_conversion(
         &mut self,
-        memory: &MemoryImage,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
         format: &[u16],
         index: &mut usize,
-        va: &mut CrtVaReader<'_>,
+        va: &mut CrtVaReader,
         out: &mut Vec<u8>,
         guest_arch: GuestArch,
     ) -> AppResult<()> {
@@ -52018,15 +52738,28 @@ impl PeHostRuntime {
                 let mut padded = vec![b' '; width];
                 let start = width - rendered.len();
                 if flags_zero {
-                    let first = rendered[0];
-                    for (i, slot) in padded.iter_mut().enumerate().take(start) {
-                        if i == 0 && matches!(first, b'-' | b'+' | b' ') {
-                            *slot = first;
-                        } else {
-                            *slot = b'0';
-                        }
+                    // Zero padding must only fill the DIGIT region: the sign
+                    // ('-', '+', ' ') and hex prefix ("0x"/"0X") stay at the
+                    // front, so "%05d" of -12 → "-0012" (not "-0-12") and
+                    // "%#08x" of 0xCAFE → "0x00cafe" (not "00xcafe").
+                    let mut head: Vec<u8> = Vec::new();
+                    let mut digits = rendered.as_slice();
+                    if let Some(&first) = rendered.first()
+                        && matches!(first, b'-' | b'+' | b' ')
+                    {
+                        head.push(first);
+                        digits = &rendered[1..];
                     }
-                    padded[start..].copy_from_slice(rendered);
+                    if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
+                        head.extend_from_slice(&digits[..2]);
+                        digits = &digits[2..];
+                    }
+                    let digit_start = start + head.len();
+                    for slot in padded.iter_mut().take(digit_start).skip(head.len()) {
+                        *slot = b'0';
+                    }
+                    padded[..head.len()].copy_from_slice(&head);
+                    padded[digit_start..].copy_from_slice(digits);
                 } else {
                     padded[start..].copy_from_slice(rendered);
                 }
@@ -52062,19 +52795,19 @@ impl PeHostRuntime {
                 // %d %i — signed integer
                 let (value, negative) = match length {
                     CrtLengthModifier::None | CrtLengthModifier::L => {
-                        let raw = va.read_u32()? as i32;
+                        let raw = va.read_u32(memory)? as i32;
                         (raw.unsigned_abs() as u64, raw < 0)
                     }
                     CrtLengthModifier::H => {
-                        let raw = (va.read_u32()? as u16 as i16) as i32;
+                        let raw = (va.read_u32(memory)? as u16 as i16) as i32;
                         (raw.unsigned_abs() as u64, raw < 0)
                     }
                     CrtLengthModifier::Hh => {
-                        let raw = (va.read_u32()? as u8 as i8) as i32;
+                        let raw = (va.read_u32(memory)? as u8 as i8) as i32;
                         (raw.unsigned_abs() as u64, raw < 0)
                     }
                     CrtLengthModifier::Ll => {
-                        let raw = va.read_u64()? as i64;
+                        let raw = va.read_u64(memory)? as i64;
                         (raw.unsigned_abs(), raw < 0)
                     }
                 };
@@ -52104,10 +52837,10 @@ impl PeHostRuntime {
             }
             0x75 => {
                 let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
-                    CrtLengthModifier::Ll => va.read_u64()?,
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
+                    CrtLengthModifier::Ll => va.read_u64(memory)?,
                 };
                 let mut digits = Vec::new();
                 let mut remaining = value;
@@ -52135,10 +52868,10 @@ impl PeHostRuntime {
             }
             0x78 | 0x58 => {
                 let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
-                    CrtLengthModifier::Ll => va.read_u64()?,
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
+                    CrtLengthModifier::Ll => va.read_u64(memory)?,
                 };
                 let upper = conversion == 0x58;
                 let mut digits = Vec::new();
@@ -52168,10 +52901,10 @@ impl PeHostRuntime {
             }
             0x6F => {
                 let value = match length {
-                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32()? as u64,
-                    CrtLengthModifier::H => u64::from(va.read_u32()? as u16),
-                    CrtLengthModifier::Hh => u64::from(va.read_u32()? as u8),
-                    CrtLengthModifier::Ll => va.read_u64()?,
+                    CrtLengthModifier::None | CrtLengthModifier::L => va.read_u32(memory)? as u64,
+                    CrtLengthModifier::H => u64::from(va.read_u32(memory)? as u16),
+                    CrtLengthModifier::Hh => u64::from(va.read_u32(memory)? as u8),
+                    CrtLengthModifier::Ll => va.read_u64(memory)?,
                 };
                 let mut digits = Vec::new();
                 let mut remaining = value;
@@ -52198,40 +52931,92 @@ impl PeHostRuntime {
                 out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
             }
             0x63 => {
-                let ch = va.read_u32()? as u8;
-                out.extend(pad(&mut [ch].to_vec(), width, flags_minus, false));
+                let raw = va.read_u32(memory)?;
+                if length == CrtLengthModifier::L {
+                    // %lc — wide char (2-byte unit), converted to UTF-8.
+                    let ch = char::from_u32(u32::from(raw as u16)).unwrap_or('\u{FFFD}');
+                    let mut encoded = [0_u8; 4];
+                    let mut bytes = ch.encode_utf8(&mut encoded).as_bytes().to_vec();
+                    out.extend(pad(&mut bytes, width, flags_minus, false));
+                } else {
+                    // %c / %hc — narrow char.
+                    out.extend(pad(&mut [raw as u8].to_vec(), width, flags_minus, false));
+                }
             }
             0x73 => {
-                // %s — narrow (ANSI) guest string
-                let ptr = va.read_pointer()?;
+                // %s / %hs — narrow (ANSI) guest string; %ls — wide string
+                // (2-byte units).  NULL prints "(null)" per UCRT.
+                let ptr = va.read_pointer(memory)?;
                 let max = if precision >= 0 {
                     precision as usize
                 } else {
                     usize::MAX
                 };
-                let bytes = read_c_string_limit(memory, ptr, max)?;
-                let mut rendered = bytes;
-                if precision >= 0 {
-                    rendered.truncate(precision as usize);
+                if length == CrtLengthModifier::L {
+                    if ptr == 0 {
+                        out.extend(pad(&mut b"(null)".to_vec(), width, flags_minus, false));
+                    } else {
+                        let wide = read_utf16_string(memory, ptr)?;
+                        let wide_units = wide.encode_utf16().collect::<Vec<_>>();
+                        let mut bytes = self
+                            .win32
+                            .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
+                            .unwrap_or_else(|_| wide.as_bytes().to_vec());
+                        if precision >= 0 {
+                            bytes.truncate(precision as usize);
+                        }
+                        out.extend(pad(&mut bytes, width, flags_minus, false));
+                    }
+                } else {
+                    let mut rendered = if ptr == 0 {
+                        b"(null)".to_vec()
+                    } else {
+                        read_c_string_limit(memory, ptr, max)?
+                    };
+                    if precision >= 0 {
+                        rendered.truncate(precision as usize);
+                    }
+                    out.extend(pad(&mut rendered, width, flags_minus, false));
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, false));
             }
             0x53 => {
-                // %S / %ls — wide guest string, narrowed to the ANSI page
-                let ptr = va.read_pointer()?;
-                let wide = read_utf16_string(memory, ptr)?;
-                let wide_units = wide.encode_utf16().collect::<Vec<_>>();
-                let mut bytes = self
-                    .win32
-                    .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
-                    .unwrap_or_else(|_| wide.as_bytes().to_vec());
-                if precision >= 0 {
-                    bytes.truncate(precision as usize);
+                // %S — wide guest string, narrowed to the ANSI page.  NULL
+                // prints "(null)" per UCRT.
+                let ptr = va.read_pointer(memory)?;
+                if ptr == 0 {
+                    out.extend(pad(&mut b"(null)".to_vec(), width, flags_minus, false));
+                } else {
+                    let wide = read_utf16_string(memory, ptr)?;
+                    let wide_units = wide.encode_utf16().collect::<Vec<_>>();
+                    let mut bytes = self
+                        .win32
+                        .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &wide_units)
+                        .unwrap_or_else(|_| wide.as_bytes().to_vec());
+                    if precision >= 0 {
+                        bytes.truncate(precision as usize);
+                    }
+                    out.extend(pad(&mut bytes, width, flags_minus, false));
                 }
-                out.extend(pad(&mut bytes, width, flags_minus, false));
+            }
+            0x6E => {
+                // %n — writes the count of chars emitted so far into the
+                // int* argument (%hn → short, %hhn → char).  A NULL target is
+                // EINVAL + invalid-parameter handler per UCRT.
+                let target = va.read_pointer(memory)?;
+                if target == 0 {
+                    self.set_crt_errno(memory, EINVAL);
+                    let _ = self.raise_invalid_parameter(state, memory, 0, 0, 0);
+                    return Ok(());
+                }
+                let count = out.len() as u64;
+                match length {
+                    CrtLengthModifier::Hh => memory.write_u8(target, count as u8),
+                    CrtLengthModifier::H => memory.write_u16(target, count as u16),
+                    _ => write_u32(memory, target, count as u32),
+                }
             }
             0x70 => {
-                let ptr = va.read_pointer()?;
+                let ptr = va.read_pointer(memory)?;
                 let digits = if guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let mut rendered = format!("{:0width$X}", ptr, width = digits).into_bytes();
                 out.extend(pad(&mut rendered, width, flags_minus, true));
@@ -52240,7 +53025,7 @@ impl PeHostRuntime {
                 out.push(b'%');
             }
             0x66 | 0x65 | 0x67 | 0x46 | 0x45 | 0x47 => {
-                let value = va.read_f64()?;
+                let value = va.read_f64(memory)?;
                 let precision_explicit = precision >= 0;
                 let precision = if precision < 0 { 6 } else { precision };
                 let uppercase = conversion == 0x46 || conversion == 0x45 || conversion == 0x47;
@@ -52268,7 +53053,10 @@ impl PeHostRuntime {
             }
             _ => {
                 // Unknown conversion: UCRT renders the '%' and the offending
-                // character literally.
+                // character literally.  This deliberately covers %a (hex
+                // float) and the %z/%t length prefixes, which are
+                // DOCUMENTED-UNSUPPORTED in this engine: they are left
+                // literal rather than silently mis-rendered.
                 out.push(b'%');
                 if conversion != 0 {
                     let mut bytes = [0_u8; 2];
@@ -52287,6 +53075,7 @@ impl PeHostRuntime {
     /// vararg list at `argptr` and returns the produced narrow bytes.
     fn crt_vfprintf_render(
         &mut self,
+        state: &mut CpuState,
         memory: &mut MemoryImage,
         format_ptr: u64,
         argptr: u64,
@@ -52297,12 +53086,12 @@ impl PeHostRuntime {
         }
         let wide = read_utf16_string(memory, format_ptr)?;
         let format_units = wide.encode_utf16().collect::<Vec<_>>();
-        let mut va = CrtVaReader::new(&*memory, argptr, self.guest_arch);
+        let mut va = CrtVaReader::new(argptr, self.guest_arch);
         let mut out = Vec::new();
         let mut index = 0_usize;
         while index < format_units.len() {
             if format_units[index] == 0x25 {
-                self.crt_render_conversion(&*memory, &format_units, &mut index, &mut va, &mut out, self.guest_arch)?;
+                self.crt_render_conversion(&mut *memory, state, &format_units, &mut index, &mut va, &mut out, self.guest_arch)?;
             } else {
                 let mut encoded = [0_u8; 4];
                 if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
@@ -52333,7 +53122,7 @@ impl PeHostRuntime {
         if let Some(state) = self.crt_stream_state(stream) {
             if !state.writable {
                 self.set_crt_errno(memory, EBADF);
-                return Ok(0);
+                return Ok((EOF as i64) as u64);
             }
             if state.append {
                 let _ = self.win32.set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
@@ -52342,12 +53131,12 @@ impl PeHostRuntime {
                 Ok(_) => Ok(bytes.len() as u64),
                 Err(_) => {
                     self.set_crt_errno(memory, EIO);
-                    Ok(0)
+                    Ok((EOF as i64) as u64)
                 }
             }
         } else {
             self.set_crt_errno(memory, EBADF);
-            Ok(0)
+            Ok((EOF as i64) as u64)
         }
     }
 
@@ -52391,6 +53180,18 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         path: &str,
         mode: &str,
+    ) -> AppResult<Option<u64>> {
+        self.crt_fopen_impl_at(memory, path, mode, None)
+    }
+
+    /// Like `crt_fopen_impl`, but when `existing_ptr` is Some the FILE block at
+    /// that address is reused (freopen semantics: the same FILE* is returned).
+    fn crt_fopen_impl_at(
+        &mut self,
+        memory: &mut MemoryImage,
+        path: &str,
+        mode: &str,
+        existing_ptr: Option<u64>,
     ) -> AppResult<Option<u64>> {
         let resolved = resolve_guest_path(&self.current_directory, path);
         let Some((readable, writable, append, update, base)) = Self::crt_parse_fopen_mode(mode)
@@ -52453,7 +53254,14 @@ impl PeHostRuntime {
             append,
             update,
         };
-        let file_ptr = self.crt_alloc_file(memory, &file_state)?;
+        let file_ptr = match existing_ptr {
+            Some(ptr) => {
+                memory.map_bytes(ptr + 0x10, &handle.to_le_bytes());
+                ptr
+            }
+            None => self.crt_alloc_file(memory, &file_state)?,
+        };
+        self.crt_files.insert(file_ptr, file_state);
         Ok(Some(file_ptr))
     }
 
@@ -53486,9 +54294,6 @@ impl PeHostRuntime {
         } else {
             return Ok(E_INVALIDARG);
         };
-        if let Some(parent) = windows_parent_directory(&save_path) {
-            self.ensure_guest_directory_path(&parent)?;
-        }
         let bytes = self.shell_link_file_bytes(&snapshot)?;
         match self.win32.write_file_overwrite_w(&save_path, &bytes) {
             Ok(_) => {
@@ -58399,7 +59204,7 @@ impl PeHostRuntime {
                 scene_id: "pe-runtime-d3d11".to_string(),
                 frame_index: self.next_frame_index,
                 hash: frame_hash,
-                ssim: 0.0,
+                ssim: None,
                 metadata,
             });
             self.next_frame_index = self.next_frame_index.saturating_add(1);
@@ -58465,7 +59270,7 @@ impl PeHostRuntime {
                 scene_id: "pe-runtime-d3d12".to_string(),
                 frame_index: self.next_frame_index,
                 hash: util::sha256_bytes(&frame.bytes),
-                ssim: 0.0,
+                ssim: None,
                 metadata: BTreeMap::from([
                     ("source".to_string(), "dxgi_d3d12".to_string()),
                     ("width".to_string(), frame.width.to_string()),
@@ -70426,57 +71231,52 @@ enum CrtLengthModifier {
 /// Cursor over an x86-cdecl vararg list (the UCRT `va_list` for x86 guests is
 /// a pointer into the caller's stack).  32-bit values advance 4 bytes; 64-bit
 /// values (ll/I64 integers and doubles) advance 8 bytes across two slots.
-struct CrtVaReader<'a> {
-    memory: &'a MemoryImage,
+struct CrtVaReader {
     cursor: u64,
     arch: GuestArch,
 }
 
-impl<'a> CrtVaReader<'a> {
-    fn new(memory: &'a MemoryImage, cursor: u64, arch: GuestArch) -> Self {
-        Self {
-            memory,
-            cursor,
-            arch,
-        }
+impl CrtVaReader {
+    fn new(cursor: u64, arch: GuestArch) -> Self {
+        Self { cursor, arch }
     }
 
-    fn read_u32(&mut self) -> AppResult<u32> {
-        let value = read_u32(self.memory, self.cursor)?;
+    fn read_u32(&mut self, memory: &MemoryImage) -> AppResult<u32> {
+        let value = read_u32(memory, self.cursor)?;
         self.cursor = self.cursor.wrapping_add(4);
         Ok(value)
     }
 
-    fn read_u64(&mut self) -> AppResult<u64> {
+    fn read_u64(&mut self, memory: &MemoryImage) -> AppResult<u64> {
         let value = match self.arch {
             GuestArch::X86 => {
-                let low = read_u32(self.memory, self.cursor)? as u64;
-                let high = read_u32(self.memory, self.cursor.wrapping_add(4))? as u64;
+                let low = read_u32(memory, self.cursor)? as u64;
+                let high = read_u32(memory, self.cursor.wrapping_add(4))? as u64;
                 low | (high << 32)
             }
-            GuestArch::X64 => self.memory.read_u64(self.cursor)?,
+            GuestArch::X64 => memory.read_u64(self.cursor)?,
         };
         self.cursor = self.cursor.wrapping_add(8);
         Ok(value)
     }
 
-    fn read_pointer(&mut self) -> AppResult<u64> {
+    fn read_pointer(&mut self, memory: &MemoryImage) -> AppResult<u64> {
         match self.arch {
             GuestArch::X86 => {
-                let value = read_u32(self.memory, self.cursor)? as u64;
+                let value = read_u32(memory, self.cursor)? as u64;
                 self.cursor = self.cursor.wrapping_add(4);
                 Ok(value)
             }
             GuestArch::X64 => {
-                let value = self.memory.read_u64(self.cursor)?;
+                let value = memory.read_u64(self.cursor)?;
                 self.cursor = self.cursor.wrapping_add(8);
                 Ok(value)
             }
         }
     }
 
-    fn read_f64(&mut self) -> AppResult<f64> {
-        let bits = self.read_u64()?;
+    fn read_f64(&mut self, memory: &MemoryImage) -> AppResult<f64> {
+        let bits = self.read_u64(memory)?;
         Ok(f64::from_bits(bits))
     }
 }
@@ -70580,8 +71380,11 @@ fn crt_ticks_to_unix(ticks: u64) -> i64 {
     (seconds.saturating_sub(WINDOWS_TO_UNIX_OFFSET)) as i64
 }
 
-/// Write a `struct _stat` (32-bit variant, offsets 0,4,8,10,12,14,16,20,24,28,32)
-/// or `struct _stat64` (64-bit time/size) into guest memory.
+/// Write a `struct _stat` (x86: st_dev u32@0, st_ino u16@4, st_mode u16@6,
+/// st_nlink u16@8, st_uid u16@10, st_gid u16@12, st_rdev u32@14, st_size u32@18,
+/// st_atime u32@22, st_mtime u32@26, st_ctime u32@30 — 34 bytes) or
+/// `struct _stat64` (st_size/st_atime/st_mtime/st_ctime as i64 at 16/24/32/40 —
+/// 48 bytes) into guest memory.
 fn crt_write_stat(memory: &mut MemoryImage, stat_ptr: u64, info: &CrtStatInfo, wide64: bool) {
     let mode = if info.is_directory {
         S_IFDIR
@@ -70592,35 +71395,35 @@ fn crt_write_stat(memory: &mut MemoryImage, stat_ptr: u64, info: &CrtStatInfo, w
     let atime = crt_ticks_to_unix(info.last_access_time_ticks);
     let ctime = crt_ticks_to_unix(info.creation_time_ticks);
     if wide64 {
-        // _stat64: st_dev u32 @0, st_ino u32 @4, st_mode u16 @8,
-        // st_nlink u16 @10, st_uid u16 @12, st_gid u16 @14, st_rdev u32 @16,
-        // pad u32 @20, st_size i64 @24, st_atime i64 @32, st_mtime i64 @40,
-        // st_ctime i64 @48.
+        // _stat64: st_dev u32 @0, st_ino u16 @4, st_mode u16 @6,
+        // st_nlink u16 @8, st_uid u16 @10, st_gid u16 @12, st_rdev u32 @14,
+        // st_size i64 @16, st_atime i64 @24, st_mtime i64 @32, st_ctime i64 @40.
         write_u32(memory, stat_ptr, 0);
-        write_u32(memory, stat_ptr + 4, 0);
-        write_u32(memory, stat_ptr + 8, mode);
-        write_u32(memory, stat_ptr + 12, 0);
-        write_u32(memory, stat_ptr + 16, 0);
-        write_u32(memory, stat_ptr + 20, 0);
-        write_u64(memory, stat_ptr + 24, info.size);
-        write_u64(memory, stat_ptr + 32, atime as u64);
-        write_u64(memory, stat_ptr + 40, mtime as u64);
-        write_u64(memory, stat_ptr + 48, ctime as u64);
-    } else {
-        // _stat: st_dev u32 @0, st_ino u32 @4, st_mode u16 @8, st_nlink u16
-        // @10, st_uid u16 @12, st_gid u16 @14, st_rdev u32 @16, st_size u32
-        // @20, st_atime u32 @24, st_mtime u32 @28, st_ctime u32 @32.
-        write_u32(memory, stat_ptr, 0);
-        write_u32(memory, stat_ptr + 4, 0);
-        write_u16(memory, stat_ptr + 8, mode as u16);
-        write_u16(memory, stat_ptr + 10, 1);
+        write_u16(memory, stat_ptr + 4, 0);
+        write_u16(memory, stat_ptr + 6, mode as u16);
+        write_u16(memory, stat_ptr + 8, 1);
+        write_u16(memory, stat_ptr + 10, 0);
         write_u16(memory, stat_ptr + 12, 0);
-        write_u16(memory, stat_ptr + 14, 0);
-        write_u32(memory, stat_ptr + 16, 0);
-        write_u32(memory, stat_ptr + 20, info.size.min(u32::MAX as u64) as u32);
-        write_u32(memory, stat_ptr + 24, atime as u32);
-        write_u32(memory, stat_ptr + 28, mtime as u32);
-        write_u32(memory, stat_ptr + 32, ctime as u32);
+        write_u32(memory, stat_ptr + 14, 0);
+        write_u64(memory, stat_ptr + 16, info.size);
+        write_u64(memory, stat_ptr + 24, atime as u64);
+        write_u64(memory, stat_ptr + 32, mtime as u64);
+        write_u64(memory, stat_ptr + 40, ctime as u64);
+    } else {
+        // _stat: st_dev u32 @0, st_ino u16 @4, st_mode u16 @6, st_nlink u16
+        // @8, st_uid u16 @10, st_gid u16 @12, st_rdev u32 @14, st_size u32
+        // @18, st_atime u32 @22, st_mtime u32 @26, st_ctime u32 @30.
+        write_u32(memory, stat_ptr, 0);
+        write_u16(memory, stat_ptr + 4, 0);
+        write_u16(memory, stat_ptr + 6, mode as u16);
+        write_u16(memory, stat_ptr + 8, 1);
+        write_u16(memory, stat_ptr + 10, 0);
+        write_u16(memory, stat_ptr + 12, 0);
+        write_u32(memory, stat_ptr + 14, 0);
+        write_u32(memory, stat_ptr + 18, info.size.min(u32::MAX as u64) as u32);
+        write_u32(memory, stat_ptr + 22, atime as u32);
+        write_u32(memory, stat_ptr + 26, mtime as u32);
+        write_u32(memory, stat_ptr + 30, ctime as u32);
     }
 }
 
@@ -70681,7 +71484,9 @@ fn crt_split_path(path: &str) -> (String, String, String, String) {
 }
 
 /// Windows `_makepath` assembly: drive (adding ':' if absent), dir (adding a
-/// trailing separator if non-empty and missing one), name, ext.
+/// trailing separator if non-empty and missing one), name, ext.  A bare
+/// extension (without a leading '.') gets a '.' prepended: _makepath(buf,
+/// "c", "dir", "file", "txt") → "c:dir\file.txt".
 fn crt_make_path(drive: &str, dir: &str, name: &str, ext: &str) -> String {
     let mut out = String::new();
     if !drive.is_empty() {
@@ -70697,7 +71502,12 @@ fn crt_make_path(drive: &str, dir: &str, name: &str, ext: &str) -> String {
         }
     }
     out.push_str(name);
-    out.push_str(ext);
+    if !ext.is_empty() {
+        if !ext.starts_with('.') {
+            out.push('.');
+        }
+        out.push_str(ext);
+    }
     out
 }
 
@@ -70715,7 +71525,6 @@ fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
         index += 1;
     }
     let mut base = base;
-    let consumed = index;
     let mut digits_start = index;
     if base == 0 {
         if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
@@ -70751,9 +71560,10 @@ fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
         index += 1;
     }
     if index == digits_start {
-        return (0, consumed, false);
+        // No conversion: consumed == 0 so callers write *endptr = nptr.
+        return (0, 0, false);
     }
-    (if negative { -value } else { value }, index, overflow)
+    (if negative { value.wrapping_neg() } else { value }, index, overflow)
 }
 
 /// _strtoi64 core: same parsing with 64-bit range clamping.
@@ -70823,7 +71633,7 @@ fn crt_parse_strtoll_full(bytes: &str, base: i32) -> (i64, usize, bool) {
     if index == digits_start {
         return (0, 0, false);
     }
-    (if negative { -value } else { value }, index, overflow)
+    (if negative { value.wrapping_neg() } else { value }, index, overflow)
 }
 
 /// Simple strtol: parse with a fixed base, clamp at i32 range (strtol on
@@ -70841,9 +71651,32 @@ fn crt_parse_strtol(bytes: &str, base: i32, _end: Option<&mut usize>) -> i64 {
     }
 }
 
-/// Minimal strtod (C locale): optional whitespace, sign, digits, '.', exponent.
+/// Minimal strtod (C locale): optional whitespace, sign, digits, '.',
+/// exponent.  Also recognizes inf/infinity/nan and C99 hex floats
+/// ("0x1p4" → 16.0).
 fn crt_parse_strtod(bytes: &str) -> f64 {
     let bytes = bytes.trim_start();
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    // inf / infinity / nan (with an optional leading sign), case-insensitive.
+    let lower = bytes.to_ascii_lowercase();
+    let magnitude = lower.trim_start_matches(['+', '-']);
+    let negative = bytes.starts_with('-');
+    if magnitude.starts_with("inf") {
+        return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    if magnitude.starts_with("nan") {
+        return if negative { -f64::NAN } else { f64::NAN };
+    }
+    // C99 hex float ("0x1p4" → 16.0): parse manually since Rust's f64
+    // parser has no hex-float support.  Falls through to the decimal path
+    // when the string is not a well-formed hex float.
+    if magnitude.starts_with("0x")
+        && let Ok(value) = crt_parse_hex_float(bytes)
+    {
+        return value;
+    }
     let mut index = 0_usize;
     if index < bytes.len() && (bytes.as_bytes()[index] == b'+' || bytes.as_bytes()[index] == b'-') {
         index += 1;
@@ -70860,25 +71693,114 @@ fn crt_parse_strtod(bytes: &str) -> f64 {
             index += 1;
         }
     }
+    let mut mantissa_end = index;
     let mut exponent = String::new();
     if index < bytes.len() && (bytes.as_bytes()[index] == b'e' || bytes.as_bytes()[index] == b'E') {
+        // `index` points AT the 'e': the mantissa ends here, and the exponent
+        // ('e' + optional sign + digits) is appended exactly once below.
+        mantissa_end = index;
         let mut exp_index = index + 1;
         if exp_index < bytes.len() && (bytes.as_bytes()[exp_index] == b'+' || bytes.as_bytes()[exp_index] == b'-') {
             exp_index += 1;
         }
         if exp_index < bytes.len() && bytes.as_bytes()[exp_index].is_ascii_digit() {
-            exponent = bytes[index + 1..].to_string();
+            exponent = bytes[index..exp_index].to_string();
             index = exp_index;
             while index < bytes.len() && bytes.as_bytes()[index].is_ascii_digit() {
                 index += 1;
             }
+            exponent.push_str(&bytes[exp_index..index]);
         }
     }
-    if index == start && !has_dot {
+    if mantissa_end == start && !has_dot {
         return 0.0;
     }
-    let token = format!("{}{}", &bytes[..index], exponent);
+    let token = format!("{}{}", &bytes[..mantissa_end], exponent);
     token.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Parse a C99 hex float ("0x1p4" → 16.0, "0x1.8p-3" → 0.1875).  Returns
+/// `Ok(value)` only for a well-formed hex float (leading "0x"/"0X" with a
+/// mandatory 'p' exponent); anything else yields `Err` so the caller falls
+/// back to decimal parsing.
+fn crt_parse_hex_float(bytes: &str) -> Result<f64, ()> {
+    let bytes = bytes.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+    if index + 1 >= bytes.len()
+        || bytes[index] != b'0'
+        || (bytes[index + 1] != b'x' && bytes[index + 1] != b'X')
+    {
+        return Err(());
+    }
+    index += 2;
+    let hex_digit = |ch: u8| -> Option<u32> {
+        match ch {
+            b'0'..=b'9' => Some(u32::from(ch - b'0')),
+            b'a'..=b'f' => Some(u32::from(ch - b'a' + 10)),
+            b'A'..=b'F' => Some(u32::from(ch - b'A' + 10)),
+            _ => None,
+        }
+    };
+    let mut value = 0_u64;
+    let mut frac_value = 0_u64;
+    let mut frac_digits = 0_u32;
+    let mut any_digit = false;
+    while index < bytes.len()
+        && let Some(digit) = hex_digit(bytes[index])
+    {
+        value = value.wrapping_mul(16).wrapping_add(u64::from(digit));
+        any_digit = true;
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+        while index < bytes.len()
+            && let Some(digit) = hex_digit(bytes[index])
+        {
+            frac_value = frac_value.wrapping_mul(16).wrapping_add(u64::from(digit));
+            frac_digits = frac_digits.saturating_add(1);
+            any_digit = true;
+            index += 1;
+        }
+    }
+    if !any_digit || index >= bytes.len() || (bytes[index] != b'p' && bytes[index] != b'P') {
+        return Err(());
+    }
+    index += 1;
+    let mut exp_negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        exp_negative = bytes[index] == b'-';
+        index += 1;
+    }
+    let mut exponent: i32 = 0;
+    let mut exp_digits = false;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        exponent = exponent
+            .saturating_mul(10)
+            .saturating_add(i32::from(bytes[index] - b'0'));
+        exp_digits = true;
+        index += 1;
+    }
+    if !exp_digits {
+        return Err(());
+    }
+    if exp_negative {
+        exponent = -exponent;
+    }
+    let mut result = value as f64;
+    if frac_digits > 0 {
+        result += (frac_value as f64) / 16f64.powi(frac_digits as i32);
+    }
+    result *= 2f64.powi(exponent);
+    Ok(if negative { -result } else { result })
 }
 
 fn crt_format_fixed(value: f64, precision: i32) -> Vec<u8> {
@@ -70905,12 +71827,17 @@ fn crt_format_exponential(value: f64, precision: i32, uppercase: bool) -> Vec<u8
     // Normalise to d.ddd… × 10^exp
     let mut exponent = value.log10().floor() as i32;
     let mut mantissa = value / 10f64.powi(exponent);
-    // Rounding can push the mantissa past 10 (e.g. 9.9999… → 10.0).
-    if mantissa >= 10.0 {
+    let precision = precision.max(0) as usize;
+    // Rounding can push the ROUNDED mantissa past 10 (e.g. 9.9999995 with
+    // precision 2 → "10.00"): renormalise so the output is "1.00e+01",
+    // never "10.00e+00".
+    let rounded = format!("{:.*}", precision, mantissa)
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    if mantissa >= 10.0 || rounded >= 10.0 {
         mantissa /= 10.0;
         exponent += 1;
     }
-    let precision = precision.max(0) as usize;
     let mut out = format!("{:.*}", precision, mantissa).into_bytes();
     out.push(if uppercase { b'E' } else { b'e' });
     if exponent < 0 {
@@ -70923,7 +71850,7 @@ fn crt_format_exponential(value: f64, precision: i32, uppercase: bool) -> Vec<u8
     out
 }
 
-fn crt_format_general(value: f64, precision: i32, uppercase: bool, _hash: bool) -> Vec<u8> {
+fn crt_format_general(value: f64, precision: i32, uppercase: bool, hash: bool) -> Vec<u8> {
     if !value.is_finite() {
         return if value.is_nan() {
             b"nan".to_vec()
@@ -70937,12 +71864,15 @@ fn crt_format_general(value: f64, precision: i32, uppercase: bool, _hash: bool) 
     }
     let exponent = value.abs().log10().floor() as i32;
     if exponent < -4 || exponent >= precision as i32 {
-        // %e with precision-1, then strip trailing zeros from the mantissa.
+        // %e with precision-1.  With the '#' flag trailing zeros in the
+        // mantissa are retained; otherwise they are stripped.
         let mut out = crt_format_exponential(value, (precision.saturating_sub(1)) as i32, uppercase);
         if let Some(e_pos) = out.iter().position(|byte| *byte == b'e' || *byte == b'E') {
             let mut mantissa = out[..e_pos].to_vec();
-            while mantissa.len() > 2 && mantissa.last() == Some(&b'0') {
-                mantissa.pop();
+            if !hash {
+                while mantissa.len() > 2 && mantissa.last() == Some(&b'0') {
+                    mantissa.pop();
+                }
             }
             let mut rest = out[e_pos..].to_vec();
             mantissa.append(&mut rest);
@@ -70950,12 +71880,16 @@ fn crt_format_general(value: f64, precision: i32, uppercase: bool, _hash: bool) 
         }
         out
     } else {
+        // Fixed format.  With the '#' flag trailing zeros are retained:
+        // "%#g" of 1.0 → "1.00000".
         let mut out = crt_format_fixed(value, (precision as i32 - exponent - 1).max(0));
-        while out.last() == Some(&b'0') {
-            out.pop();
-        }
-        if out.last() == Some(&b'.') {
-            out.pop();
+        if !hash {
+            while out.last() == Some(&b'0') {
+                out.pop();
+            }
+            if out.last() == Some(&b'.') {
+                out.pop();
+            }
         }
         out
     }
@@ -71221,19 +72155,13 @@ fn expand_generic_access(desired_access: u32) -> u32 {
 /// on the handle for per-operation enforcement (see `require_access` in
 /// win32.rs).  `FILE_EXECUTE` deliberately does NOT imply read-data: execute
 /// access alone must not allow reading the file's contents.
+///
+/// Attribute/EA access does NOT participate in share classification (Windows:
+/// an attribute-only open succeeds even against a share=0 holder); those bits
+/// are only enforced per-operation via the granted mask.
 fn file_access_from_win32(desired_access: u32) -> crate::ge::FileAccess {
-    let read_bits = GENERIC_READ
-        | GENERIC_ALL
-        | FILE_READ_DATA
-        | FILE_READ_EA
-        | FILE_READ_ATTRIBUTES;
-    let write_bits = GENERIC_WRITE
-        | GENERIC_ALL
-        | FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | FILE_DELETE_CHILD;
+    let read_bits = GENERIC_READ | GENERIC_ALL | FILE_READ_DATA;
+    let write_bits = GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD;
     crate::ge::FileAccess {
         read: desired_access & read_bits != 0,
         write: desired_access & write_bits != 0,
@@ -71263,7 +72191,11 @@ fn creation_disposition_from_win32(value: u32) -> AppResult<CreationDisposition>
     }
 }
 
-fn last_error_from_app_error(error: &AppError) -> u32 {
+/// Maps an `AppError` to the Win32 `GetLastError` value the thunks record.
+/// Public so the release gates can pin Steam's observed error codes against
+/// the exact mapping the thunks use (this is the guest-visible mapping, not
+/// `AppError::last_error()`).
+pub fn last_error_from_app_error(error: &AppError) -> u32 {
     match error.code {
         ReasonCode::RcFsNotFound => ERROR_FILE_NOT_FOUND,
         ReasonCode::RcFsPathInvalid => ERROR_PATH_NOT_FOUND,
@@ -72935,6 +73867,381 @@ mod tests {
     }
 
     #[test]
+    fn attribute_only_open_succeeds_against_exclusive_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "attr-only-open",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\exclusive-attr.tmp")
+            .expect("path");
+
+        // First open: exclusive (share=0), read+write.
+        let h1 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(h1, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        // Attribute/EA access does not affect share classification: an
+        // attribute-only open (FILE_READ_ATTRIBUTES = 0x80) must SUCCEED
+        // even against a share=0 holder.
+        let h2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                OPEN_EXISTING,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(
+            h2, INVALID_HANDLE_VALUE,
+            "attribute-only open must not participate in the share matrix"
+        );
+        assert_eq!(runtime.last_error, 0);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h1 as u32]);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h2 as u32]);
+    }
+
+    #[test]
+    fn delete_on_close_conflicts_with_non_delete_sharing_holder() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "doc-share-conflict",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\doc-share.tmp")
+            .expect("path");
+
+        // Open A exclusively (share=0) without delete access.
+        let h1 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(h1, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        // A FILE_FLAG_DELETE_ON_CLOSE open behaves like a DELETE access
+        // request: it must conflict with the share=0 holder.
+        let h2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                OPEN_EXISTING,
+                0x0400_0000,
+                0,
+            ],
+        );
+        // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
+        assert_eq!(h2, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_SHARING_VIOLATION);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h1 as u32]);
+    }
+
+    #[test]
+    fn ads_read_denied_on_zero_access_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "ads-read-denied",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\ads-base.tmp:Zone.Identifier")
+            .expect("path");
+
+        // access=0: the handle carries no granted bits, so an ADS read must
+        // be ERROR_ACCESS_DENIED (not silently bypass the check).
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let buffer = 0x30_000_u32;
+        memory.map_bytes(buffer as u64, &[0_u8; 64]);
+        let read_file = runtime.alloc_host_thunk(HostThunk::ReadFile);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_file,
+            &[handle as u32, buffer, 16, 0, 0],
+        );
+        assert_eq!(result, 0, "ADS read must fail on a zero-access handle");
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+    }
+
+    #[test]
+    fn ads_write_denied_on_read_only_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "ads-write-denied",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\ads-base.tmp:Zone.Identifier")
+            .expect("path");
+
+        // GENERIC_READ-only: an ADS write must be ERROR_ACCESS_DENIED.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        let buffer = 0x30_000_u32;
+        memory.map_bytes(buffer as u64, b"zone-data");
+        let write_file = runtime.alloc_host_thunk(HostThunk::WriteFile);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            write_file,
+            &[handle as u32, buffer, 9, 0, 0],
+        );
+        assert_eq!(result, 0, "ADS write must fail on a read-only handle");
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+    }
+
+    #[test]
+    fn create_always_open_always_existing_file_sets_last_error_183() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "already-exists-183",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\already-exists.tmp")
+            .expect("path");
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+        // CREATE_ALWAYS on a NEW file: valid handle, last_error 0.
+        let h1 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[path as u32, GENERIC_WRITE, share, 0, CREATE_ALWAYS, 0, 0],
+        );
+        assert_ne!(h1, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h1 as u32]);
+
+        // CREATE_ALWAYS on an EXISTING file: valid handle + last_error 183.
+        let h2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[path as u32, GENERIC_WRITE, share, 0, CREATE_ALWAYS, 0, 0],
+        );
+        assert_ne!(h2, INVALID_HANDLE_VALUE);
+        assert_eq!(
+            runtime.last_error, ERROR_ALREADY_EXISTS,
+            "CREATE_ALWAYS on an existing file must set last_error 183"
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h2 as u32]);
+
+        // OPEN_ALWAYS on an EXISTING file: valid handle + last_error 183.
+        let h3 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[path as u32, GENERIC_WRITE, share, 0, OPEN_ALWAYS, 0, 0],
+        );
+        assert_ne!(h3, INVALID_HANDLE_VALUE);
+        assert_eq!(
+            runtime.last_error, ERROR_ALREADY_EXISTS,
+            "OPEN_ALWAYS on an existing file must set last_error 183"
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h3 as u32]);
+
+        // OPEN_EXISTING on an existing file: valid handle, last_error 0.
+        let h4 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[path as u32, GENERIC_WRITE, share, 0, OPEN_EXISTING, 0, 0],
+        );
+        assert_ne!(h4, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h4 as u32]);
+    }
+
+    #[test]
+    fn write_private_profile_string_w_missing_parent_fails_without_creating_directory() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "ini-missing-parent", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::WritePrivateProfileStringW);
+        let ini_path = "C:\\users\\casa1\\AppData\\Roaming\\MissingIniDir\\test.ini";
+        let path_ptr = runtime
+            .alloc_utf16_string(&mut memory, ini_path)
+            .expect("path ptr");
+        let section_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Steam")
+            .expect("section ptr");
+        let key_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Language")
+            .expect("key ptr");
+        let value_ptr = runtime
+            .alloc_utf16_string(&mut memory, "english")
+            .expect("value ptr");
+
+        // Windows never creates parent directories for WritePrivateProfileStringW:
+        // the write fails and no directory is manufactured.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                section_ptr as u32,
+                key_ptr as u32,
+                value_ptr as u32,
+                path_ptr as u32,
+            ],
+        );
+        assert_eq!(result, 0, "missing parent must fail the write");
+        assert!(
+            !runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path("C:\\users\\casa1\\AppData\\Roaming\\MissingIniDir")
+                .expect("resolve host dir")
+                .exists(),
+            "missing parent directory must not be created"
+        );
+    }
+
+    #[test]
     fn delete_on_close_removes_file() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(
@@ -72957,6 +74264,8 @@ mod tests {
             .alloc_utf16_string(&mut memory, r"C:\package\delete-on-close.tmp")
             .expect("path");
 
+        // FILE_FLAG_DELETE_ON_CLOSE is 0x0400_0000 (0x0800_0000 is
+        // FILE_FLAG_SEQUENTIAL_SCAN and must never delete).
         let handle = dispatch_x86_thunk(
             &mut runtime,
             &mut memory,
@@ -72967,7 +74276,7 @@ mod tests {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 0,
                 CREATE_ALWAYS,
-                FILE_FLAG_DELETE_ON_CLOSE,
+                0x0400_0000,
                 0,
             ],
         );
@@ -72985,7 +74294,64 @@ mod tests {
         assert_eq!(result, 1);
         assert!(
             !host_path.exists(),
-            "FILE_FLAG_DELETE_ON_CLOSE must remove the file on CloseHandle"
+            "FILE_FLAG_DELETE_ON_CLOSE (0x0400_0000) must remove the file on CloseHandle"
+        );
+    }
+
+    #[test]
+    fn sequential_scan_open_does_not_delete_on_close() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "sequential-scan",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\sequential-scan.tmp")
+            .expect("path");
+
+        // FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) must NOT delete the file on
+        // CloseHandle — only FILE_FLAG_DELETE_ON_CLOSE (0x0400_0000) may.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0x0800_0000,
+                0,
+            ],
+        );
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        let host_path = runtime
+            .win32
+            .ge()
+            .host_path_for_windows_path(r"C:\package\sequential-scan.tmp")
+            .expect("host path");
+        assert!(host_path.exists(), "file exists before close");
+
+        let close = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]);
+        assert_eq!(result, 1);
+        assert!(
+            host_path.exists(),
+            "FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) must NOT delete the file on CloseHandle"
         );
     }
 
@@ -73092,6 +74458,13 @@ mod tests {
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
         let mut memory = MemoryImage::default();
+
+        // IShellLink::Save never creates parent directories; the guest
+        // provisions the Desktop folder first, as on Windows.
+        runtime
+            .win32
+            .create_directory_w(r"C:\users\casa1\Desktop")
+            .expect("create desktop dir");
 
         let co_create_instance = runtime.alloc_host_thunk(HostThunk::CoCreateInstance);
         let clsid_ptr = 0x40_000;
@@ -73593,7 +74966,8 @@ mod tests {
             value
         );
 
-        // TlsFree invalidates: entry zeroed and TlsGetValue fails afterwards.
+        // TlsFree invalidates: entry zeroed; TlsGetValue on the freed slot
+        // reads the (zeroed) array with success, last_error 0.
         assert_eq!(
             dispatch_x86_thunk(&mut runtime, &mut memory, free_thunk, &[slot as u32]),
             1
@@ -73606,7 +74980,614 @@ mod tests {
             dispatch_x86_thunk(&mut runtime, &mut memory, get_thunk, &[slot as u32]),
             0
         );
-        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn tls_set_value_on_unallocated_in_range_slot_writes_guest_array() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "tls-unallocated-set",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let tls_vector = 0x70_000;
+        memory.map_bytes(tls_vector, &[0_u8; 4096 * 4]);
+        runtime.tls_vector_ptr = tls_vector;
+        let static_tls_block = 0x80_000;
+        runtime.tls_slots.insert(0, static_tls_block);
+
+        let set_thunk = runtime.alloc_host_thunk(HostThunk::TlsSetValue);
+        let get_thunk = runtime.alloc_host_thunk(HostThunk::TlsGetValue);
+        let alloc_thunk = runtime.alloc_host_thunk(HostThunk::TlsAlloc);
+
+        // Slot 5 was never allocated: TlsSetValue still succeeds and writes
+        // the guest-visible TLS array.
+        let value = 0x0BAD_F00D_u64;
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_thunk, &[5, value as u32]),
+            1
+        );
+        assert_eq!(runtime.last_error, 0);
+        assert_eq!(
+            read_guest_u32(&memory, tls_vector + 5 * 4).expect("tls slot 5"),
+            value as u32
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_thunk, &[5]),
+            value
+        );
+        assert_eq!(runtime.last_error, 0);
+
+        // The unallocated write must not consume the slot: TlsAlloc still
+        // hands out the first free dynamic index (1, after the static slot 0).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]),
+            1
+        );
+    }
+
+    #[test]
+    fn tls_alloc_exhaustion_reports_not_enough_memory() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "tls-exhaustion",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let tls_vector = 0x70_000;
+        memory.map_bytes(tls_vector, &[0_u8; 4096 * 4]);
+        runtime.tls_vector_ptr = tls_vector;
+
+        let alloc_thunk = runtime.alloc_host_thunk(HostThunk::TlsAlloc);
+        for expected in 0_u32..4096 {
+            assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]), u64::from(expected));
+            assert_eq!(runtime.last_error, 0);
+        }
+        // Exhausted: TlsAlloc returns TLS_OUT_OF_INDEXES (0xFFFFFFFF) with
+        // ERROR_NOT_ENOUGH_MEMORY (8).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]),
+            u32::MAX as u64
+        );
+        assert_eq!(runtime.last_error, ERROR_NOT_ENOUGH_MEMORY);
+    }
+
+    #[test]
+    fn get_full_path_name_w_truncation_and_query_last_error() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "full-path-name-w-last-error",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.current_directory = "C:\\Games".to_string();
+        let mut memory = MemoryImage::default();
+        let path_ptr = runtime
+            .alloc_utf16_string(&mut memory, "sub\\file.exe")
+            .expect("alloc raw path");
+        let full_path = resolve_full_guest_path(&runtime.current_directory, "sub\\file.exe");
+        let path_length = full_path.encode_utf16().count() as u32;
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetFullPathNameW);
+
+        // (NULL, 0) required-size query: required size INCLUDING the NUL,
+        // last_error stays 0.
+        let query = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[path_ptr as u32, 0, 0, 0]);
+        assert_eq!(query, (path_length + 1) as u64);
+        assert_eq!(runtime.last_error, 0);
+
+        // Real truncation into a non-NULL buffer (size == path_length):
+        // required size incl NUL + ERROR_INSUFFICIENT_BUFFER (122).
+        let buffer = 0x42_000;
+        memory.map_bytes(buffer, &[0xFF; 128]);
+        let truncated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[path_ptr as u32, path_length, buffer as u32, 0],
+        );
+        assert_eq!(truncated, (path_length + 1) as u64);
+        assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+
+        // Exact fit: success returns the length excluding the NUL, last_error 0.
+        let exact = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[path_ptr as u32, path_length + 1, buffer as u32, 0],
+        );
+        assert_eq!(exact, path_length as u64);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn get_full_path_name_w_empty_path_fails_with_path_not_found() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "full-path-name-w-empty",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.current_directory = "C:\\Games".to_string();
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let buffer = 0x42_000;
+        memory.map_bytes(buffer, &[0xFF; 128]);
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetFullPathNameW);
+
+        // Empty wide string: fails with ERROR_PATH_NOT_FOUND (3), never
+        // resolves to the current directory.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[empty_path as u32, 128, buffer as u32, 0],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        // NULL pointer reads as an empty string: same failure.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, 128, buffer as u32, 0],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_module_file_name_w_query_and_truncation_return_required_size() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "module-file-name-w-sizes",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let module_path = "C:\\Program Files (x86)\\Steam\\Steam.exe";
+        runtime.main_module_path = module_path.to_string();
+        let path_length = module_path.encode_utf16().count() as u32;
+        let required_with_nul = path_length + 1;
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetModuleFileNameW);
+
+        // (NULL, 0) query idiom: required size INCLUDING the NUL, no write,
+        // last_error 0.
+        let query = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, 0]);
+        assert_eq!(query, required_with_nul as u64);
+        assert_eq!(runtime.last_error, 0);
+
+        // Truncation: size-1 units + NUL, required size incl NUL,
+        // ERROR_INSUFFICIENT_BUFFER.
+        let small_buffer = 0x42_000;
+        memory.map_bytes(small_buffer, &[0xFF; 128]);
+        let trunc_size = 8_u32;
+        let truncated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, small_buffer as u32, trunc_size],
+        );
+        assert_eq!(truncated, required_with_nul as u64);
+        assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+        let bytes = memory
+            .read_bytes(small_buffer, (trunc_size as usize) * 2)
+            .expect("truncated bytes");
+        let expected_prefix = module_path
+            .encode_utf16()
+            .take((trunc_size - 1) as usize)
+            .collect::<Vec<_>>();
+        for (index, unit) in expected_prefix.iter().enumerate() {
+            let stored = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+            assert_eq!(stored, *unit);
+        }
+        let terminator =
+            u16::from_le_bytes([bytes[(trunc_size - 1) as usize * 2], bytes[(trunc_size - 1) as usize * 2 + 1]]);
+        assert_eq!(terminator, 0);
+
+        // Exact fit: success returns the length excluding the NUL, last_error 0.
+        let exact = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, small_buffer as u32, required_with_nul],
+        );
+        assert_eq!(exact, path_length as u64);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn create_file_w_null_path_fails_with_path_not_found() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-null-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+
+        // NULL path: INVALID_HANDLE_VALUE + ERROR_PATH_NOT_FOUND (3).
+        // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[0, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0],
+        );
+        assert_eq!(handle, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        // Empty wide string: same failure.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                empty_path as u32,
+                GENERIC_READ,
+                0,
+                0,
+                OPEN_EXISTING,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(handle, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn create_file_a_null_path_fails_with_path_not_found() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-a-null-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let empty_ansi = 0x60_000;
+        memory.map_bytes(empty_ansi, &[0_u8; 1]);
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileA);
+
+        // NULL path: INVALID_HANDLE_VALUE + ERROR_PATH_NOT_FOUND (3).
+        // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[0, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0],
+        );
+        assert_eq!(handle, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        // Empty ANSI string: same failure.
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                empty_ansi as u32,
+                GENERIC_READ,
+                0,
+                0,
+                OPEN_EXISTING,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(handle, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_file_attributes_w_empty_path_returns_invalid_file_attributes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "attributes-empty-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.current_directory = "C:\\Games".to_string();
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetFileAttributesW);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[empty_path as u32]);
+        assert_eq!(result, INVALID_FILE_ATTRIBUTES);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn set_current_directory_w_empty_path_returns_false() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "set-cwd-empty-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.current_directory = "C:\\Games".to_string();
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let thunk = runtime.alloc_host_thunk(HostThunk::SetCurrentDirectoryW);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[empty_path as u32]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+        assert_eq!(runtime.current_directory, "C:\\Games");
+    }
+
+    #[test]
+    fn delete_file_w_empty_path_returns_false() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "delete-file-empty-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let thunk = runtime.alloc_host_thunk(HostThunk::DeleteFileW);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[empty_path as u32]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn empty_paths_fail_remaining_path_thunks_with_path_not_found() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "empty-path-thunks",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let empty_path = runtime
+            .alloc_utf16_string(&mut memory, "")
+            .expect("empty path");
+        let empty_ansi = 0x60_000;
+        memory.map_bytes(empty_ansi, &[0_u8; 1]);
+
+        let create_dir = runtime.alloc_host_thunk(HostThunk::CreateDirectoryW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_dir, &[empty_path as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        let remove_dir = runtime.alloc_host_thunk(HostThunk::RemoveDirectoryW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, remove_dir, &[empty_path as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        let attributes_ex = runtime.alloc_host_thunk(HostThunk::GetFileAttributesExW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                attributes_ex,
+                &[empty_path as u32, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        let move_file = runtime.alloc_host_thunk(HostThunk::MoveFileExW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                move_file,
+                &[empty_path as u32, empty_path as u32, 0],
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        let remove_dir_a = runtime.alloc_host_thunk(HostThunk::RemoveDirectoryA);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, remove_dir_a, &[empty_ansi as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+
+        let attributes_a = runtime.alloc_host_thunk(HostThunk::GetFileAttributesA);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, attributes_a, &[empty_ansi as u32]),
+            INVALID_FILE_ATTRIBUTES
+        );
+        assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn resolve_guest_path_drive_only_uses_per_drive_current_directory() {
+        // cwd on C: → "C:" resolves to the cwd, not the drive root.
+        assert_eq!(resolve_guest_path("C:\\Users\\me", "C:"), "C:\\Users\\me");
+        // cwd on D: → "C:" resolves to the C: drive root.
+        assert_eq!(resolve_guest_path("D:\\somewhere", "C:"), "C:\\");
+        // Drive-relative with a remainder still joins onto the per-drive base.
+        assert_eq!(resolve_guest_path("C:\\Users\\me", "C:sub"), "C:\\Users\\me\\sub");
+        assert_eq!(resolve_guest_path("D:\\x", "C:sub"), "C:\\sub");
+        // Root-relative forms are unchanged.
+        assert_eq!(resolve_guest_path("D:\\x", "C:\\"), "C:\\");
+        assert_eq!(resolve_guest_path("D:\\x", "C:\\abs"), "C:\\abs");
+    }
+
+    #[test]
+    fn create_file_w_template_ignored_for_create_always_on_existing_file() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-template-overwrite",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let template_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\template.tmp")
+            .expect("template path");
+        let template_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                template_path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(template_handle, INVALID_HANDLE_VALUE);
+        // Give the template distinctive attributes to observe copying.
+        runtime
+            .win32
+            .set_file_attributes_w(r"C:\package\template.tmp", &["hidden"])
+            .expect("set template attributes");
+
+        // Pre-existing target created without the attribute.
+        let target_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\existing.tmp")
+            .expect("target path");
+        let first = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                target_path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_NEW,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(first, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+
+        // CREATE_ALWAYS on the EXISTING file with a template is
+        // FILE_OVERWRITE_IF: the template attributes must NOT be copied.
+        let second = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                target_path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                template_handle as u32,
+            ],
+        );
+        assert_ne!(second, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, ERROR_ALREADY_EXISTS);
+        let target_attributes = runtime
+            .win32
+            .get_file_attributes_w(r"C:\package\existing.tmp")
+            .expect("target attributes");
+        assert!(
+            !target_attributes.iter().any(|attribute| attribute == "hidden"),
+            "CREATE_ALWAYS on an existing file must not copy template attributes"
+        );
+
+        // CREATE_ALWAYS on a MISSING file with a template: genuinely new
+        // file, the template attributes ARE copied.
+        let missing_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\fresh.tmp")
+            .expect("missing path");
+        let fresh = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                missing_path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                template_handle as u32,
+            ],
+        );
+        assert_ne!(fresh, INVALID_HANDLE_VALUE);
+        let fresh_attributes = runtime
+            .win32
+            .get_file_attributes_w(r"C:\package\fresh.tmp")
+            .expect("fresh attributes");
+        assert_eq!(fresh_attributes, vec!["hidden".to_string()]);
     }
 
     #[test]
@@ -73653,6 +75634,17 @@ mod tests {
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
         let mut memory = MemoryImage::default();
+
+        // WritePrivateProfileStringW never creates parent directories; the
+        // guest provisions them first, as on Windows.
+        runtime
+            .win32
+            .create_directory_w(r"C:\users\casa1\AppData\Roaming\Steam")
+            .expect("create Steam dir");
+        runtime
+            .win32
+            .create_directory_w(r"C:\users\casa1\AppData\Roaming\Steam\config")
+            .expect("create config dir");
 
         let thunk = runtime.alloc_host_thunk(HostThunk::WritePrivateProfileStringW);
         let ini_path = "C:\\users\\casa1\\AppData\\Roaming\\Steam\\config\\steam.ini";
@@ -75292,6 +77284,924 @@ mod tests {
             Some(7)
         );
         assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn main_thread_exit_thread_drains_pending_workers() {
+        // `ExitThread` on the MAIN thread only ends the main thread's
+        // execution; Windows ends the process when its LAST thread exits.
+        // With a worker still pending, the run must keep pumping it to
+        // completion, then end with the main thread's exit code.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "main-exit-drain",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        // dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the guest
+        // mappings must live above that range.
+        let worker_entry = 0x61_000_u64;
+        let thread_id_ptr = 0x61_100_u64;
+        let mut worker_bytes = vec![0x90; 0x10];
+        worker_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        memory.map_bytes(worker_entry, &worker_bytes);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        // The MAIN thread calls ExitThread(5) while the worker is pending:
+        // only the main thread ends; this must NOT become a process-exit
+        // request (the worker would be abandoned).
+        let exit_result = dispatch_x86_thunk_result(&mut runtime, &mut memory, exit_thread, &[5]);
+        assert_eq!(exit_result, Some(5));
+        assert_eq!(runtime.main_thread_exit_code, Some(5));
+        assert!(
+            runtime.process_exit_requested.is_none(),
+            "main-thread ExitThread must not set process_exit_requested"
+        );
+        assert_eq!(runtime.pending_guest_threads.len(), 1, "worker still pending");
+        // The main thread's exit code is observable via its handle
+        // (OpenThread on tid 1), so waits on the main thread complete.
+        let main_handle = runtime
+            .win32
+            .open_thread(1, 0x1F03FF, false)
+            .expect("open main thread");
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(main_handle)
+                .expect("main thread exit code"),
+            Some(5)
+        );
+
+        // Drain phase: the worker runs to completion; the run ends with the
+        // main thread's code (5), not the worker's return value (7).
+        let final_code = runtime
+            .drain_pending_guest_threads_after_main_exit(&mut memory)
+            .expect("drain pending workers");
+        assert_eq!(final_code, 5);
+        assert!(runtime.pending_guest_threads.is_empty());
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(worker_handle as u32)
+                .expect("worker exit code"),
+            Some(7)
+        );
+        })
+    }
+
+    #[test]
+    fn main_thread_exit_process_is_immediate() {
+        // `ExitProcess` on the main thread is a PROCESS exit: the run ends
+        // immediately and pending threads are abandoned — there is no drain
+        // phase (Windows: process exit kills every thread).
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "main-exit-process",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let worker_entry = 0x61_000_u64;
+        let flag_ptr = 0x61_100_u64;
+        let thread_id_ptr = 0x61_200_u64;
+        let mut worker_bytes = vec![0x90; 0x10];
+        worker_bytes[..12].copy_from_slice(&[
+            0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x11, 0x06, 0x00, 0xC3, 0x90,
+        ]);
+        memory.map_bytes(worker_entry, &worker_bytes);
+        memory.map_bytes(flag_ptr, &[0_u8; 4]);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        let exit_result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            exit_process,
+            &[0xFFFF_FFFE],
+        );
+        assert_eq!(exit_result, Some(-2));
+        assert!(runtime.main_thread_exit_code.is_none());
+        assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
+        assert_eq!(
+            runtime.pending_guest_threads.len(),
+            1,
+            "process exit abandons pending threads"
+        );
+        assert_eq!(
+            read_u32(&memory, flag_ptr).expect("worker flag"),
+            0,
+            "abandoned worker must never run"
+        );
+        })
+    }
+
+    #[test]
+    fn alertable_wait_delivers_apc_queued_during_wait() {
+        // WaitForSingleObjectEx(INFINITE, alertable) on an unsignaled event:
+        // a pumped worker queues an APC for the waiting thread DURING the
+        // wait.  The wait must deliver it and return WAIT_IO_COMPLETION
+        // (0xC0), not WAIT_TIMEOUT/WAIT_OBJECT_0.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "alertable-wait-apc",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
+        let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+        let wait_for_single_object_ex = runtime.alloc_host_thunk(HostThunk::WaitForSingleObjectEx);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let open_thread_slot = 0x41_000_u64;
+        let queue_slot = 0x41_010_u64;
+        let worker_entry = 0x42_000_u64;
+        let apc_callback = 0x42_100_u64;
+        let apc_flag = 0x42_200_u64;
+        let thread_id_ptr = 0x42_204_u64;
+
+        // APC callback: mov eax, 0xABCD; mov [apc_flag], eax; ret
+        let mut apc_bytes = vec![0x90; 0x10];
+        apc_bytes[..11].copy_from_slice(&[
+            0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+        ]);
+        // Worker: OpenThread(0x1F03FF, 0, 1); QueueUserAPC(apc_callback,
+        // hThread, 0); ret — the APC targets the main thread (tid 1).
+        let mut worker_bytes = vec![0x90; 0x40];
+        worker_bytes[..36].copy_from_slice(&[
+            0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+            0x6A, 0x00, // push 0 (inherit)
+            0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
+            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
+            0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
+            0x50, // push eax (hThread — arg2)
+            0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+            0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
+            0xC3, // ret
+        ]);
+        write_u32(&mut memory, open_thread_slot, open_thread as u32);
+        write_u32(&mut memory, queue_slot, queue_user_apc as u32);
+        memory.map_bytes(worker_entry, &worker_bytes);
+        memory.map_bytes(apc_callback, &apc_bytes);
+        memory.map_bytes(apc_flag, &[0_u8; 4]);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_for_single_object_ex,
+            &[event_handle, u32::MAX, 1],
+        );
+        assert_eq!(
+            result,
+            crate::win32::WAIT_IO_COMPLETION as u64,
+            "alertable wait must return WAIT_IO_COMPLETION when an APC is queued during the wait"
+        );
+        assert_eq!(runtime.last_error, 0);
+        assert_eq!(
+            read_u32(&memory, apc_flag).expect("apc flag"),
+            0xABCD,
+            "the APC callback must have run"
+        );
+        })
+    }
+
+    #[test]
+    fn sleep_ex_advances_guest_clock_waking_sibling() {
+        // SleepEx(50) on one thread must advance the guest clock while
+        // pumping, so a sibling sleeping 10 ms actually wakes — otherwise
+        // its wake_tick never expires (starvation).
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "sleep-ex-clock",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
+        let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let sleep_slot = 0x41_000_u64;
+        let worker_entry = 0x42_000_u64;
+        let flag_ptr = 0x42_200_u64;
+        let thread_id_ptr = 0x42_204_u64;
+        // push 10; call [Sleep]; mov eax,1; mov [flag],eax; ret
+        let mut worker_bytes = vec![0x90; 0x20];
+        worker_bytes[..21].copy_from_slice(&[
+            0x6A, 0x0A, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3,
+            0x00, 0x22, 0x04, 0x00, 0xC3, 0x90, 0x90,
+        ]);
+        write_u32(&mut memory, sleep_slot, sleep as u32);
+        memory.map_bytes(worker_entry, &worker_bytes);
+        memory.map_bytes(flag_ptr, &[0_u8; 4]);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        let tick_before = runtime.win32.get_tick_count64();
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[50, 0]);
+        assert_eq!(result, 0, "SleepEx(50, FALSE) returns WAIT_OBJECT_0");
+        assert_eq!(
+            read_u32(&memory, flag_ptr).expect("sibling flag"),
+            1,
+            "the sleeping sibling must wake during another thread's SleepEx"
+        );
+        let tick_after = runtime.win32.get_tick_count64();
+        assert!(
+            tick_after >= tick_before + 10,
+            "guest clock must advance during SleepEx: {tick_before} -> {tick_after}"
+        );
+        })
+    }
+
+    #[test]
+    fn sleep_ex_infinite_blocks_until_apc() {
+        // SleepEx(INFINITE, TRUE) must block like an infinite alertable
+        // wait: pump pending threads, deliver APCs queued during the sleep,
+        // and return WAIT_IO_COMPLETION — never return early.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "sleep-ex-infinite",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
+        let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+        let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let open_thread_slot = 0x41_000_u64;
+        let queue_slot = 0x41_010_u64;
+        let worker_entry = 0x42_000_u64;
+        let apc_callback = 0x42_100_u64;
+        let apc_flag = 0x42_200_u64;
+        let thread_id_ptr = 0x42_204_u64;
+
+        let mut apc_bytes = vec![0x90; 0x10];
+        apc_bytes[..11].copy_from_slice(&[
+            0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+        ]);
+        let mut worker_bytes = vec![0x90; 0x40];
+        worker_bytes[..36].copy_from_slice(&[
+            0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+            0x6A, 0x00, // push 0 (inherit)
+            0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
+            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
+            0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
+            0x50, // push eax (hThread — arg2)
+            0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+            0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
+            0xC3, // ret
+        ]);
+        write_u32(&mut memory, open_thread_slot, open_thread as u32);
+        write_u32(&mut memory, queue_slot, queue_user_apc as u32);
+        memory.map_bytes(worker_entry, &worker_bytes);
+        memory.map_bytes(apc_callback, &apc_bytes);
+        memory.map_bytes(apc_flag, &[0_u8; 4]);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[u32::MAX, 1]);
+        assert_eq!(
+            result,
+            crate::win32::WAIT_IO_COMPLETION as u64,
+            "SleepEx(INFINITE, TRUE) must block until an APC is delivered"
+        );
+        assert_eq!(
+            read_u32(&memory, apc_flag).expect("apc flag"),
+            0xABCD,
+            "the APC callback must have run"
+        );
+        })
+    }
+
+    #[test]
+    fn exiting_thread_reports_still_active_until_exited() {
+        // A thread in `Exiting` state (between the exit request and the
+        // `Exited` transition — observable from its DLL_THREAD_DETACH
+        // callback) still reports STILL_ACTIVE via GetExitCodeThread; the
+        // code is only visible once the pump completes the exit.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "exiting-still-active",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let callback_address = 0x1001_0000_u64;
+        let reason_flag = 0x41_300_u32;
+        let handle_slot = 0x41_308_u32;
+        let exit_code_ptr = 0x41_30C_u32;
+        let get_slot = 0x41_000_u64;
+        let exit_slot = 0x41_010_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+
+        // TLS callback: record the reason; on DLL_THREAD_DETACH (3) call
+        // GetExitCodeThread([handle_slot], [exit_code_ptr]).
+        let mut callback_bytes = Vec::new();
+        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+        callback_bytes.extend(&[0xA3]); // mov [reason_flag], eax
+        callback_bytes.extend(&reason_flag.to_le_bytes());
+        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
+        callback_bytes.extend(&[0x75, 0x11]); // jne done
+        callback_bytes.extend(&[0xA1]); // mov eax, [handle_slot]
+        callback_bytes.extend(&handle_slot.to_le_bytes());
+        callback_bytes.extend(&[0x68]); // push exit_code_ptr (arg1)
+        callback_bytes.extend(&exit_code_ptr.to_le_bytes());
+        callback_bytes.extend(&[0x50]); // push eax (handle — arg0)
+        callback_bytes.extend(&[0xFF, 0x15]); // call [get_slot]
+        callback_bytes.extend(&get_slot.to_le_bytes());
+        callback_bytes.extend(&[0xC3]); // ret
+        memory.map_bytes(callback_address, &callback_bytes);
+        runtime.dll_info_table.insert(
+            0x1000_0000,
+            DllInfo {
+                handle: 0x1000_0000,
+                image_size: 0x10000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "test.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: vec![callback_address - 0x1000_0000],
+            },
+        );
+
+        let get_exit_code_thread = runtime.alloc_host_thunk(HostThunk::GetExitCodeThread);
+        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        // push 5; call [ExitThread]; ret
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..9].copy_from_slice(&[
+            0x6A, 0x05, 0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, 0xC3,
+        ]);
+        write_u32(&mut memory, get_slot, get_exit_code_thread as u32);
+        write_u32(&mut memory, exit_slot, exit_thread as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+        memory.map_bytes(handle_slot as u64, &[0_u8; 4]);
+        memory.map_bytes(exit_code_ptr as u64, &[0_u8; 4]);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+        write_u32(&mut memory, handle_slot as u64, thread_handle as u32);
+
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump exiting-observable thread")
+                .did_work
+        );
+        assert_eq!(
+            read_u32(&memory, reason_flag as u64).expect("reason flag"),
+            DLL_THREAD_DETACH
+        );
+        assert_eq!(
+            read_u32(&memory, exit_code_ptr as u64).expect("exit code observed in Exiting"),
+            STILL_ACTIVE,
+            "a thread in Exiting state must still report STILL_ACTIVE"
+        );
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after Exited"),
+            Some(5),
+            "the exit code is visible only after the thread fully stops"
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn detach_callback_exit_request_propagates_to_exit_code() {
+        // A DLL_THREAD_DETACH callback that calls ExitThread(9) while the
+        // thread is already exiting: the request must propagate into the
+        // thread's exit-code selection (and be consumed so it cannot corrupt
+        // an enclosing pump's exit-request restore), not be silently lost.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "detach-exit-prop",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let callback_address = 0x1001_0000_u64;
+        let exit_slot = 0x41_000_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+
+        // TLS callback: if reason == 3 (DLL_THREAD_DETACH), call ExitThread(9).
+        let mut callback_bytes = Vec::new();
+        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
+        callback_bytes.extend(&[0x75, 0x08]); // jne done
+        callback_bytes.extend(&[0x6A, 0x09]); // push 9
+        callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
+        callback_bytes.extend(&exit_slot.to_le_bytes());
+        callback_bytes.extend(&[0xC3]); // ret
+        memory.map_bytes(callback_address, &callback_bytes);
+        runtime.dll_info_table.insert(
+            0x1000_0000,
+            DllInfo {
+                handle: 0x1000_0000,
+                image_size: 0x10000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "test.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: vec![callback_address - 0x1000_0000],
+            },
+        );
+
+        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        // push 5; call [ExitThread]; ret — the entry's exit code is 5.
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..9].copy_from_slice(&[
+            0x6A, 0x05, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xC3,
+        ]);
+        write_u32(&mut memory, exit_slot, exit_thread as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump detach-exit thread")
+                .did_work
+        );
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after pump"),
+            Some(9),
+            "the DETACH callback's ExitThread request must propagate to the exit code"
+        );
+        assert!(
+            runtime.pumped_thread_exit_requested.is_none(),
+            "the DETACH callback's request must be consumed, not leaked"
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn state_machine_controls_pump_readiness() {
+        // The pump's ready predicate is driven by the state machine:
+        // `Waiting` with a future wake_tick is not ready, `Exiting` is never
+        // pumped, and `Waiting` with an expired wake_tick / `Runnable` is
+        // ready.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "state-machine-ready",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let entrypoint = 0x41_100_u64;
+        let mut entry_bytes = vec![0x90; 0x10];
+        entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        memory.map_bytes(entrypoint, &entry_bytes);
+
+        // Waiting with a future wake_tick: not ready.
+        let handle_a = runtime.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let mut pending = runtime
+            .prepare_guest_thread_entry(&mut memory, handle_a, 0x1000, entrypoint, 0)
+            .expect("prepare waiting thread");
+        pending.state_machine = GuestThreadState::Waiting;
+        pending.wake_tick = runtime.win32.get_tick_count64() + 100_000;
+        runtime.pending_guest_threads.push_back(pending);
+        assert!(
+            !runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump waiting thread")
+                .did_work,
+            "a Waiting thread with a future wake_tick must not be pumped"
+        );
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        // Exiting: never pumped (mid-teardown state).
+        let handle_b = runtime.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let mut pending = runtime
+            .prepare_guest_thread_entry(&mut memory, handle_b, 0x1000, entrypoint, 0)
+            .expect("prepare exiting thread");
+        pending.state_machine = GuestThreadState::Exiting;
+        runtime.pending_guest_threads.push_back(pending);
+        assert!(
+            !runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump exiting thread")
+                .did_work,
+            "an Exiting thread must never be pumped"
+        );
+        assert_eq!(runtime.pending_guest_threads.len(), 2);
+
+        // Waiting with an expired wake_tick: ready and pumped to completion.
+        let handle_c = runtime.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let mut pending = runtime
+            .prepare_guest_thread_entry(&mut memory, handle_c, 0x1000, entrypoint, 0)
+            .expect("prepare ready thread");
+        pending.state_machine = GuestThreadState::Waiting;
+        pending.wake_tick = runtime.win32.get_tick_count64();
+        runtime.pending_guest_threads.push_back(pending);
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump ready thread")
+                .did_work
+        );
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(handle_c)
+                .expect("ready thread exit code"),
+            Some(7)
+        );
+        })
+    }
+
+    #[test]
+    fn join_of_active_pumped_thread_returns_timeout_without_hang() {
+        // Nested-pump indirect self-join: pumped thread B (active) dispatches
+        // thread A, and A waits INFINITE on B's handle.  B is not in
+        // `pending_guest_threads` (removed when its pump began) and cannot
+        // reach `Exited` while dispatching A, so the wait can never make
+        // progress.  On Windows this resolves via preemptive scheduling; in
+        // the cooperative model we return WAIT_TIMEOUT immediately
+        // (documented divergence) so the guest can retry the join.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "active-join-timeout",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+        let mut entry_bytes = vec![0x90; 0x10];
+        entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+        memory.map_bytes(entrypoint, &entry_bytes);
+
+        let worker_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(worker_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        // Simulate the nested-pump cycle: the worker handle is the currently
+        // ACTIVE pumped thread while the caller waits INFINITE on it.
+        runtime.active_pumped_guest_thread = Some(worker_handle as u32);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_for_single_object,
+            &[worker_handle as u32, u32::MAX],
+        );
+        assert_eq!(
+            result,
+            crate::win32::WAIT_TIMEOUT as u64,
+            "joining the active pumped thread must return WAIT_TIMEOUT immediately (documented divergence)"
+        );
+        assert_eq!(
+            runtime.pending_guest_threads.len(),
+            1,
+            "the target thread stays queued for a later retry"
+        );
+
+        // A zero-timeout poll is unaffected (non-blocking by definition).
+        runtime.active_pumped_guest_thread = None;
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_for_single_object,
+            &[worker_handle as u32, 0],
+        );
+        assert_eq!(result, crate::win32::WAIT_TIMEOUT as u64);
+        })
+    }
+
+    #[test]
+    fn exit_thread_from_attach_callback_skips_entry() {
+        // An ATTACH TLS callback calling ExitThread must prevent the thread's
+        // start routine from running at all (Windows: TLS ATTACH fires
+        // before the start routine; an exit there means the entry never
+        // executes).  The thread still fires DLL_THREAD_DETACH.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "attach-exit-skips-entry",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let callback_address = 0x1001_0000_u64;
+        let entry_flag = 0x41_300_u32;
+        let detach_flag = 0x41_304_u32;
+        let exit_slot = 0x41_000_u64;
+        let entrypoint = 0x41_100_u64;
+        let thread_id_ptr = 0x41_204_u64;
+
+        // TLS callback: on DLL_THREAD_ATTACH (2) call ExitThread(9); on
+        // DLL_THREAD_DETACH (3) record the reason at [detach_flag].
+        let mut callback_bytes = Vec::new();
+        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+        callback_bytes.extend(&[0x83, 0xF8, 0x02]); // cmp eax, 2
+        callback_bytes.extend(&[0x75, 0x08]); // jne check_detach
+        callback_bytes.extend(&[0x6A, 0x09]); // push 9
+        callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
+        callback_bytes.extend(&exit_slot.to_le_bytes());
+        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // check_detach: cmp eax, 3
+        callback_bytes.extend(&[0x75, 0x0A]); // jne done
+        callback_bytes.extend(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        callback_bytes.extend(&[0xA3]); // mov [detach_flag], eax
+        callback_bytes.extend(&detach_flag.to_le_bytes());
+        callback_bytes.extend(&[0xC3]); // ret
+        memory.map_bytes(callback_address, &callback_bytes);
+        runtime.dll_info_table.insert(
+            0x1000_0000,
+            DllInfo {
+                handle: 0x1000_0000,
+                image_size: 0x10000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "test.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: vec![callback_address - 0x1000_0000],
+            },
+        );
+
+        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        // mov eax,1; mov [entry_flag],eax; ret — must never run.
+        let mut entrypoint_bytes = vec![0x90; 0x20];
+        entrypoint_bytes[..12].copy_from_slice(&[
+            0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x13, 0x04, 0x00, 0xC3, 0x90,
+        ]);
+        write_u32(&mut memory, exit_slot, exit_thread as u32);
+        memory.map_bytes(entrypoint, &entrypoint_bytes);
+        memory.map_bytes(entry_flag as u64, &[0_u8; 4]);
+        memory.map_bytes(detach_flag as u64, &[0_u8; 4]);
+
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+        );
+        assert_ne!(thread_handle, 0);
+
+        assert!(
+            runtime
+                .pump_pending_guest_thread(&mut memory)
+                .expect("pump attach-exit thread")
+                .did_work
+        );
+        assert_eq!(
+            read_u32(&memory, entry_flag as u64).expect("entry flag"),
+            0,
+            "the thread entry must never run when an ATTACH callback exits the thread"
+        );
+        assert_eq!(
+            runtime
+                .win32
+                .get_exit_code_thread(thread_handle as u32)
+                .expect("exit code after attach exit"),
+            Some(9)
+        );
+        assert_eq!(
+            read_u32(&memory, detach_flag as u64).expect("detach flag"),
+            DLL_THREAD_DETACH,
+            "DLL_THREAD_DETACH fires for the explicit exit"
+        );
+        assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn timer_callback_process_exit_ends_run() {
+        // A timer callback (drained from the timer_work_sink by GetMessageW)
+        // that calls ExitProcess must end the guest run with the code.
+        with_big_stack(|| {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "timer-exit",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+        let import_slot = 0x60_000_u64;
+        let callback = 0x61_000_u64;
+        // push 0xFFFFFFFE; call [ExitProcess]; ret
+        let mut callback_bytes = vec![0x90; 0x20];
+        callback_bytes[..13].copy_from_slice(&[
+            0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC3, 0x90,
+        ]);
+        write_u32(&mut memory, import_slot, exit_process as u32);
+        memory.map_bytes(callback, &callback_bytes);
+        runtime
+            .timer_work_sink
+            .lock()
+            .unwrap()
+            .push_back((callback, 0));
+
+        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, get_message, &[0, 0, 0, 0]);
+        assert_eq!(
+            result,
+            Some(-2),
+            "a timer callback calling ExitProcess must end the run with the code"
+        );
+        assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
         })
     }
 
@@ -80849,6 +83759,323 @@ mod tests {
         assert_eq!(live_frame.height, 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Item F1/F4: window-surface pixel provenance.  Host-invented chrome
+    // (builtin control paints) must never publish to the live channel, and a
+    // window DC with no REAL surface must never fabricate a blank frame.
+    // -----------------------------------------------------------------------
+
+    /// Helper: register a class and create a WS_CHILD window so the test runs
+    /// without touching AppKit (the non-child creation path would block on
+    /// `run_on_main` from a test thread).
+    fn create_probe_window(
+        runtime: &mut PeHostRuntime,
+        class_name: &str,
+        title: &str,
+        width: u32,
+        height: u32,
+    ) -> u32 {
+        const WS_CHILD: u32 = 0x4000_0000;
+        runtime.user32.register_class_ex_w(class_name);
+        runtime
+            .user32
+            .create_window_ex_styled(
+                class_name,
+                title,
+                width,
+                height,
+                true,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create probe window")
+    }
+
+    #[test]
+    fn builtin_chrome_never_publishes_until_a_real_guest_blit_lands() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "f1-builtin-provenance",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let (host_session, live_session) = crate::live::new_live_session();
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), Some(live_session), None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Drive the guest through the builtin-control path: a BUTTON window
+        // receives WM_PAINT, which paints host-invented chrome into the
+        // window surface.
+        let hwnd = create_probe_window(&mut runtime, "BUTTON", "OK", 120, 30);
+        runtime
+            .dispatch_builtin_window_message(hwnd, 0x000f, 0, 0)
+            .expect("builtin paint");
+        let surface = runtime
+            .window_surfaces
+            .get(&hwnd)
+            .expect("builtin chrome surface must exist for guest-visible behavior");
+        assert!(
+            !surface.real_pixels,
+            "host-invented chrome must never carry real-pixel provenance"
+        );
+        assert!(surface.bytes.iter().any(|byte| *byte != 0));
+
+        // The publish path must refuse to publish: no REAL surface exists.
+        runtime.publish_live_window_preview_if_needed();
+        assert!(
+            runtime.last_real_gdi_frame.is_none(),
+            "synthetic chrome must never be cached as a real GDI frame"
+        );
+        assert_eq!(runtime.real_guest_frames, 0);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // Now a REAL guest blit (memory DC → window DC) lands guest pixels.
+        runtime.device_contexts.insert(0x100, Some(hwnd));
+        runtime.device_contexts.insert(0x200, None);
+        runtime.dc_selected_objects.insert(0x200, 0x300);
+        runtime.gdi_bitmaps.insert(
+            0x300,
+            MemoryBitmap {
+                width: 120,
+                height: 30,
+                bpp: 4,
+                bytes: [0x11, 0x22, 0x33, 0xff].repeat(120 * 30),
+                guest_pixel_ptr: 0,
+            },
+        );
+        runtime.blit_dc_to_dc(
+            &mut memory,
+            0x100,
+            0,
+            0,
+            120,
+            30,
+            0x200,
+            0,
+            0,
+            120,
+            30,
+            0x00CC0020,
+        );
+        let surface = runtime
+            .window_surfaces
+            .get(&hwnd)
+            .expect("window surface after blit");
+        assert!(
+            surface.real_pixels,
+            "a real guest blit must mark the surface as real"
+        );
+        assert!(
+            runtime.last_real_gdi_frame.is_some(),
+            "a real guest blit must cache the real GDI frame"
+        );
+        // Rate limit is 33 ms from the previous publish timestamp; the
+        // publish timestamp is only advanced by actual publishes, so wait
+        // out the window before the first real publish.
+        std::thread::sleep(std::time::Duration::from_millis(35));
+        runtime.publish_live_window_preview_if_needed();
+        let live_frame = host_session
+            .frame_rx
+            .try_recv()
+            .expect("a real guest blit must publish a live frame");
+        assert!(live_frame.width > 0 && live_frame.height > 0);
+    }
+
+    #[test]
+    fn blit_from_surfaceless_window_dc_publishes_nothing() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "f4-no-surface-blit",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let (host_session, live_session) = crate::live::new_live_session();
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), Some(live_session), None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Two window DCs; neither window has ever received real pixels.
+        let hwnd_src = create_probe_window(&mut runtime, "STATIC", "src", 64, 16);
+        let hwnd_dest = create_probe_window(&mut runtime, "STATIC", "dest", 64, 16);
+        runtime.device_contexts.insert(0x100, Some(hwnd_dest));
+        runtime.device_contexts.insert(0x200, Some(hwnd_src));
+
+        // Gathering pixels from a window DC with no surface must return
+        // None instead of a fabricated blank buffer.
+        let gathered = runtime.gather_dc_pixels(&mut memory, 0x200);
+        assert!(
+            gathered.is_none(),
+            "a window DC without a real surface must yield no pixels"
+        );
+        assert!(
+            runtime.last_real_gdi_frame.is_none(),
+            "no-surface readback must not cache a real GDI frame"
+        );
+
+        // A guest blit whose source has no real surface must be a no-op for
+        // the live pipeline: nothing cached, nothing published.
+        runtime.blit_dc_to_dc(
+            &mut memory,
+            0x100,
+            0,
+            0,
+            64,
+            16,
+            0x200,
+            0,
+            0,
+            64,
+            16,
+            0x00CC0020,
+        );
+        assert!(
+            runtime.last_real_gdi_frame.is_none(),
+            "blit from a surfaceless window DC must not cache a frame"
+        );
+        assert_eq!(runtime.real_guest_frames, 0);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // Builtin chrome alone still does not count: paint the source window
+        // synthetically and repeat the blit.
+        runtime
+            .dispatch_builtin_window_message(hwnd_src, 0x000f, 0, 0)
+            .expect("builtin paint");
+        runtime.blit_dc_to_dc(
+            &mut memory,
+            0x100,
+            0,
+            0,
+            64,
+            16,
+            0x200,
+            0,
+            0,
+            64,
+            16,
+            0x00CC0020,
+        );
+        assert!(
+            runtime.last_real_gdi_frame.is_none(),
+            "blit of synthetic chrome must not be cached as real"
+        );
+        assert!(host_session.frame_rx.try_recv().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Item F3: D3D9 present provenance.  The fixed-function placeholder
+    // rasterizer and the blank present fallback are host-synthesized; they
+    // must never increment `real_guest_frames` or publish to the live
+    // channel.  Only a render target holding real guest pixels may.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn d3d9_synthesized_presents_never_count_or_publish() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "f3-d3d9-provenance",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let (host_session, live_session) = crate::live::new_live_session();
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), Some(live_session), None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Set up the D3D9 shim + device exactly as D3d9FactoryCreateDevice
+        // would leave them.
+        let mut shim = crate::d3d11::direct3d_create9(true);
+        let device = shim.create_device().expect("create d3d9 device");
+        let (swapchain_width, swapchain_height) = (device.swapchain_width, device.swapchain_height);
+        runtime.d3d9_shim = Some(shim);
+        runtime.d3d9_devices.insert(0x1000, device);
+
+        let present_thunk = runtime.alloc_host_thunk(HostThunk::D3d9DevicePresent);
+        let mut present_state = CpuState::new(GuestArch::X86);
+        present_state.set(Register::Rcx, 0x1000);
+        runtime
+            .dispatch_import(present_thunk, &mut present_state, &mut memory)
+            .expect("dispatch blank-fallback present");
+        // Blank fallback: no render target at all — host-fabricated pixels.
+        assert_eq!(runtime.real_guest_frames, 0);
+        assert!(!runtime.first_real_guest_frame_seen);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // A guest DrawPrimitive routes through the fixed-function placeholder
+        // rasterizer (host-synthesized pixels) into the render target.
+        let draw_thunk = runtime.alloc_host_thunk(HostThunk::D3d9DeviceDrawPrimitive);
+        let mut draw_state = CpuState::new(GuestArch::X86);
+        draw_state.set(Register::Rcx, 0x1000);
+        draw_state.set(Register::Rdx, 4); // D3DPT_TRIANGLELIST
+        draw_state.set(Register::R8, 0);
+        draw_state.set(Register::R9, 3);
+        runtime
+            .dispatch_import(draw_thunk, &mut draw_state, &mut memory)
+            .expect("dispatch DrawPrimitive");
+        assert!(
+            runtime
+                .d3d9_shim
+                .as_ref()
+                .expect("shim")
+                .render_target
+                .as_ref()
+                .expect("render target")
+                .synthesized,
+            "fixed-function rasterizer output must be marked synthesized"
+        );
+
+        // Presenting that synthesized render target must NOT count as a real
+        // guest frame and must NOT publish to the live channel.
+        let mut present_state = CpuState::new(GuestArch::X86);
+        present_state.set(Register::Rcx, 0x1000);
+        runtime
+            .dispatch_import(present_thunk, &mut present_state, &mut memory)
+            .expect("dispatch synthesized present");
+        assert_eq!(
+            runtime.real_guest_frames, 0,
+            "a synthesized D3D9 present must not count as a real guest frame"
+        );
+        assert!(!runtime.first_real_guest_frame_seen);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // A render target holding REAL guest pixels (e.g. a guest-driven
+        // Clear color) counts and publishes.
+        runtime.d3d9_shim.as_mut().expect("shim").render_target = Some(
+            crate::d3d11::D3d9RenderTarget {
+                width: swapchain_width,
+                height: swapchain_height,
+                pixels: vec![0x11; (swapchain_width as usize) * (swapchain_height as usize) * 4],
+                synthesized: false,
+            },
+        );
+        let mut real_state = CpuState::new(GuestArch::X86);
+        real_state.set(Register::Rcx, 0x1000);
+        runtime
+            .dispatch_import(present_thunk, &mut real_state, &mut memory)
+            .expect("dispatch real present");
+        assert_eq!(
+            runtime.real_guest_frames, 1,
+            "a real D3D9 present must count exactly once"
+        );
+        assert!(runtime.first_real_guest_frame_seen);
+        let live_frame = host_session
+            .frame_rx
+            .try_recv()
+            .expect("a real D3D9 present must publish a live frame");
+        assert_eq!(live_frame.width, swapchain_width);
+        assert_eq!(live_frame.height, swapchain_height);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Patch 6b: CRT / UCRT / MSVCRT host-thunk surface tests
     // ═══════════════════════════════════════════════════════════════════════
@@ -81502,6 +84729,7 @@ mod tests {
         let guest_path = "C:\\game\\st.txt";
         write_guest_pe_file(&runtime, guest_path, b"hello world");
         let stat = runtime.alloc_host_thunk(HostThunk::Stat);
+        let stat64 = runtime.alloc_host_thunk(HostThunk::Stat64);
         let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
         let stat_buf = 0x62_000;
         memory.map_bytes(stat_buf, &[0_u8; 64]);
@@ -81513,13 +84741,33 @@ mod tests {
             &[path_ptr as u32, stat_buf as u32],
         );
         assert_eq!(ret, 0);
-        // st_mode @8 = S_IFREG | S_IREAD | S_IWRITE (u16 field)
+        // x86 struct _stat: st_mode u16 @6 = S_IFREG | S_IREAD | S_IWRITE.
         assert_eq!(
-            read_u32(&memory, stat_buf + 8).expect("st_mode") & 0xFFFF,
+            read_u16(&memory, stat_buf + 6).expect("st_mode") as u32 & 0xFFFF,
             0x8180
         );
-        // st_size @20
-        assert_eq!(read_u32(&memory, stat_buf + 20).expect("st_size"), 11);
+        // st_nlink u16 @8 = 1 for a regular file.
+        assert_eq!(read_u16(&memory, stat_buf + 8).expect("st_nlink"), 1);
+        // st_rdev u32 @14 = 0.
+        assert_eq!(read_u32(&memory, stat_buf + 14).expect("st_rdev"), 0);
+        // st_size u32 @18
+        assert_eq!(read_u32(&memory, stat_buf + 18).expect("st_size"), 11);
+
+        // _stat64: st_mode u16 @6, st_size i64 @16.
+        memory.map_bytes(stat_buf, &[0_u8; 64]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            stat64,
+            &[path_ptr as u32, stat_buf as u32],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(
+            read_u16(&memory, stat_buf + 6).expect("st_mode") as u32 & 0xFFFF,
+            0x8180
+        );
+        assert_eq!(read_u16(&memory, stat_buf + 8).expect("st_nlink"), 1);
+        assert_eq!(memory.read_u64(stat_buf + 16).expect("st_size"), 11);
 
         // Directory: st_mode = S_IFDIR | permissions.
         let dir_ptr = runtime.alloc_c_string(&mut memory, "C:\\game").expect("dir");
@@ -81531,7 +84779,7 @@ mod tests {
         );
         assert_eq!(ret, 0);
         assert_eq!(
-            read_u32(&memory, stat_buf + 8).expect("st_mode") & 0xF000,
+            read_u16(&memory, stat_buf + 6).expect("st_mode") as u32 & 0xF000,
             S_IFDIR
         );
 
@@ -81789,6 +85037,779 @@ mod tests {
         );
         assert_eq!(status, ERANGE as u64);
         assert_eq!(memory.read_u64(out).expect("value"), i64::MAX as u64);
+    }
+
+    // ── Adversarial-review regressions ───────────────────────────────────────
+
+    #[test]
+    fn crt_printf_zero_pad_with_sign_and_prefix() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%05d|%+05d|% 05d|%#08x|%05d")
+            .expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        // -12, +12, 5, 0xCAFE, 42
+        write_u32(&mut memory, va_area, (-12_i32) as u32);
+        write_u32(&mut memory, va_area + 4, 12);
+        write_u32(&mut memory, va_area + 8, 5);
+        write_u32(&mut memory, va_area + 12, 0xCAFE);
+        write_u32(&mut memory, va_area + 16, 42);
+        let stream = runtime.globals.iob_streams[1];
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(runtime.stdout, "-0012|+0012| 0005|0x00cafe|00042");
+    }
+
+    #[test]
+    fn crt_printf_wide_length_modifiers_and_null_string() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%ls|%lc|%s|%S|%hs")
+            .expect("format");
+        let wide = runtime
+            .alloc_utf16_string(&mut memory, "wide")
+            .expect("wide");
+        let narrow = runtime.alloc_c_string(&mut memory, "abc").expect("narrow");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        write_u32(&mut memory, va_area, wide as u32); // %ls
+        write_u32(&mut memory, va_area + 4, u32::from(b'Z' as u16)); // %lc
+        write_u32(&mut memory, va_area + 8, 0); // %s NULL → "(null)"
+        write_u32(&mut memory, va_area + 12, 0); // %S NULL → "(null)"
+        write_u32(&mut memory, va_area + 16, narrow as u32); // %hs
+        let stream = runtime.globals.iob_streams[1];
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(runtime.stdout, "wide|Z|(null)|(null)|abc");
+    }
+
+    #[test]
+    fn crt_printf_n_writes_count_and_e_mantissa_and_hash_g() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "ab%n|%e|%#g|%g")
+            .expect("format");
+        let n_target = 0x62_100;
+        memory.map_bytes(n_target, &[0_u8; 4]);
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        write_u32(&mut memory, va_area, n_target as u32); // %n
+        // %e of 9.9999999: the rounded mantissa crosses 10 → "1.000000e+01".
+        let e_value = 9.999_999_9_f64;
+        let bits = e_value.to_bits();
+        write_u32(&mut memory, va_area + 4, bits as u32);
+        write_u32(&mut memory, va_area + 8, (bits >> 32) as u32);
+        // %#g / %g of 1.5: hash retains the trailing zeros.
+        let g_value = 1.5_f64;
+        let g_bits = g_value.to_bits();
+        write_u32(&mut memory, va_area + 12, g_bits as u32);
+        write_u32(&mut memory, va_area + 16, (g_bits >> 32) as u32);
+        write_u32(&mut memory, va_area + 20, g_bits as u32);
+        write_u32(&mut memory, va_area + 24, (g_bits >> 32) as u32);
+        let stream = runtime.globals.iob_streams[1];
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(
+            read_u32(&memory, n_target).expect("n target"),
+            b"ab".len() as u32
+        );
+        assert_eq!(runtime.stdout, "ab|1.000000e+01|1.50000|1.5");
+    }
+
+    #[test]
+    fn crt_strtod_exponent_not_doubled_and_special_strings() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let atof = runtime.alloc_host_thunk(HostThunk::Atof);
+        let check = |runtime: &mut PeHostRuntime,
+                     memory: &mut MemoryImage,
+                     text: &str,
+                     expected: f64| {
+            let ptr = runtime.alloc_c_string(memory, text).expect("string");
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, 0x50_000);
+            memory.map_bytes(0x50_000, &[0_u8; 0x1000]);
+            write_u32(memory, 0x50_000, 0);
+            write_u32(memory, 0x50_004, ptr as u32);
+            runtime
+                .dispatch_import(atof, &mut state, memory)
+                .expect("atof");
+            let got = state.x87.stack.last().copied().unwrap_or(0.0);
+            let ok = if expected.is_nan() {
+                got.is_nan()
+            } else {
+                got == expected || (got - expected).abs() <= expected.abs().max(1.0) * 1e-12
+            };
+            assert!(ok, "atof({text:?}) = {got}, expected {expected}");
+        };
+        check(&mut runtime, &mut memory, "1.5e3", 1500.0);
+        check(&mut runtime, &mut memory, "1e10", 1e10);
+        check(&mut runtime, &mut memory, "1.5e-3", 0.0015);
+        check(&mut runtime, &mut memory, "0x1p4", 16.0);
+        check(&mut runtime, &mut memory, "inf", f64::INFINITY);
+        check(&mut runtime, &mut memory, "-inf", f64::NEG_INFINITY);
+        check(&mut runtime, &mut memory, "nan", f64::NAN);
+        check(&mut runtime, &mut memory, "42", 42.0);
+    }
+
+    #[test]
+    fn crt_strtol_negative_overflow_and_base_validation() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strtol = runtime.alloc_host_thunk(HostThunk::Strtol);
+        let strtoul = runtime.alloc_host_thunk(HostThunk::Strtoul);
+        let strtoi64 = runtime.alloc_host_thunk(HostThunk::Strtoi64);
+        let strtoui64 = runtime.alloc_host_thunk(HostThunk::Strtoui64);
+        let end = 0x61_000;
+        memory.map_bytes(end, &[0_u8; 4]);
+
+        // strtoul("-1") → 0xFFFFFFFF (no ERANGE — the magnitude fits).
+        let s = runtime.alloc_c_string(&mut memory, "-1").expect("s");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoul,
+            &[s as u32, end as u32, 10],
+        );
+        assert_eq!(ret, u32::MAX as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), 0);
+
+        // strtoul negative magnitude overflow → 0xFFFFFFFF + ERANGE.
+        let big = runtime
+            .alloc_c_string(&mut memory, "-999999999999999999999")
+            .expect("big");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoul,
+            &[big as u32, end as u32, 10],
+        );
+        assert_eq!(ret, u32::MAX as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+
+        // _strtoui64("-1") → u64::MAX (EAX:EDX); negative overflow → same + ERANGE.
+        let dispatch_64 = |runtime: &mut PeHostRuntime,
+                           memory: &mut MemoryImage,
+                           thunk: u64,
+                           arg: u32|
+         -> u64 {
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, 0x50_000);
+            write_u32(memory, 0x50_000, 0);
+            write_u32(memory, 0x50_004, arg);
+            write_u32(memory, 0x50_008, end as u32);
+            write_u32(memory, 0x50_00C, 10);
+            runtime
+                .dispatch_import(thunk, &mut state, memory)
+                .expect("dispatch 64-bit strtoi64 family");
+            let low = state.get(Register::Rax);
+            let high = state.get(Register::Rdx);
+            low | (high << 32)
+        };
+        assert_eq!(dispatch_64(&mut runtime, &mut memory, strtoui64, s as u32), u64::MAX);
+        assert_eq!(
+            dispatch_64(&mut runtime, &mut memory, strtoui64, big as u32),
+            u64::MAX
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+        // _strtoi64("-1") stays i64 -1.
+        assert_eq!(
+            dispatch_64(&mut runtime, &mut memory, strtoi64, s as u32),
+            (-1_i64) as u64
+        );
+
+        // strtoul("5") still parses; errno reset by a successful call.
+        let set_errno = runtime.alloc_host_thunk(HostThunk::SetErrno);
+        dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
+        let five = runtime.alloc_c_string(&mut memory, "5").expect("5");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoul,
+            &[five as u32, end as u32, 10],
+        );
+        assert_eq!(ret, 5);
+        assert_eq!(runtime.crt_errno_get(&mut memory), 0);
+
+        // Invalid bases: 1 and 37 → EINVAL, *endptr = nptr, value 0.
+        for base in [1_i32, 37] {
+            let s = runtime.alloc_c_string(&mut memory, "123").expect("s");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                strtol,
+                &[s as u32, end as u32, base as u32],
+            );
+            assert_eq!(ret, 0);
+            assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+            assert_eq!(read_u32(&memory, end).expect("end"), s as u32);
+        }
+
+        // No conversion with whitespace: *endptr = nptr (the ORIGINAL ptr).
+        dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
+        let ws = runtime.alloc_c_string(&mut memory, "  xyz").expect("ws");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtol,
+            &[ws as u32, end as u32, 10],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), 0);
+        assert_eq!(read_u32(&memory, end).expect("end"), ws as u32);
+
+        // _strtoi64_s with invalid base: *value = 0 + EINVAL.
+        let strtoi64_s = runtime.alloc_host_thunk(HostThunk::Strtoi64S);
+        let out = 0x61_008;
+        memory.map_bytes(out, &[0_u8; 8]);
+        let s = runtime.alloc_c_string(&mut memory, "123").expect("s");
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoi64_s,
+            &[s as u32, end as u32, 1, out as u32],
+        );
+        assert_eq!(status, EINVAL as u64);
+        assert_eq!(memory.read_u64(out).expect("value"), 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_strtoi64_s_null_value_aborts_with_einval() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strtoi64_s = runtime.alloc_host_thunk(HostThunk::Strtoi64S);
+        let s = runtime.alloc_c_string(&mut memory, "123").expect("s");
+        let result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            strtoi64_s,
+            &[s as u32, 0, 10, 0],
+        );
+        assert_eq!(result, Some(134));
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_strchr_and_wide_find_nul() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strchr = runtime.alloc_host_thunk(HostThunk::Strchr);
+        let wcschr = runtime.alloc_host_thunk(HostThunk::Wcschr);
+        let wcsrchr = runtime.alloc_host_thunk(HostThunk::Wcsrchr);
+        let s = runtime.alloc_c_string(&mut memory, "abc").expect("s");
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, strchr, &[s as u32, 0]);
+        assert_eq!(found, s + 3);
+        let wide = runtime.alloc_utf16_string(&mut memory, "abc").expect("wide");
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcschr, &[wide as u32, 0]);
+        assert_eq!(found, wide + 6);
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcsrchr, &[wide as u32, 0]);
+        assert_eq!(found, wide + 6);
+        // Non-zero targets keep working.
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcsrchr, &[wide as u32, u32::from(b'b')]);
+        assert_eq!(found, wide + 2);
+    }
+
+    #[test]
+    fn crt_strnicmp_compares_through_nul_and_cmp_magnitudes() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let strnicmp = runtime.alloc_host_thunk(HostThunk::Strnicmp);
+        let wcsnicmp = runtime.alloc_host_thunk(HostThunk::Wcsnicmp);
+        let strcmp = runtime.alloc_host_thunk(HostThunk::Strcmp);
+        let strncmp = runtime.alloc_host_thunk(HostThunk::Strncmp);
+        let memcmp = runtime.alloc_host_thunk(HostThunk::Memcmp);
+
+        // _strnicmp("ab", "abc", 3): NUL vs 'c' → negative.
+        let a = runtime.alloc_c_string(&mut memory, "ab").expect("a");
+        let b = runtime.alloc_c_string(&mut memory, "abc").expect("b");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[a as u32, b as u32, 3]);
+        assert_eq!(ret, (-99_i32) as u32 as u64);
+        // Reverse: 'c' vs NUL → positive.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[b as u32, a as u32, 3]);
+        assert_eq!(ret, 99);
+        // Same prefix within n → 0.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[a as u32, b as u32, 2]);
+        assert_eq!(ret, 0);
+
+        // _wcsnicmp("ab", "abc", 3) → NUL vs 'c' → negative.
+        let wa = runtime.alloc_utf16_string(&mut memory, "ab").expect("wa");
+        let wb = runtime.alloc_utf16_string(&mut memory, "abc").expect("wb");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, wcsnicmp, &[wa as u32, wb as u32, 3]);
+        assert_eq!(ret, (-99_i32) as u32 as u64);
+
+        // strcmp includes the terminator: strcmp("a", "ab") → 0 - 'b' = -98.
+        let sa = runtime.alloc_c_string(&mut memory, "a").expect("sa");
+        let sb = runtime.alloc_c_string(&mut memory, "ab").expect("sb");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strcmp, &[sa as u32, sb as u32]);
+        assert_eq!(ret, (-98_i32) as u32 as u64);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strcmp, &[sb as u32, sa as u32]);
+        assert_eq!(ret, 98);
+
+        // strncmp("abc", "abcd", 4): NUL vs 'd' → -100 (byte diff).
+        let s1 = runtime.alloc_c_string(&mut memory, "abc").expect("s1");
+        let s2 = runtime.alloc_c_string(&mut memory, "abcd").expect("s2");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strncmp, &[s1 as u32, s2 as u32, 4]);
+        assert_eq!(ret, (-100_i32) as u32 as u64);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strncmp, &[s1 as u32, s2 as u32, 3]);
+        assert_eq!(ret, 0);
+
+        // memcmp compares UNSIGNED bytes: "\x80" vs "\x7f" → +1.
+        let hi = 0x64_000;
+        let lo = 0x64_010;
+        memory.map_bytes(hi, &[0x80_u8]);
+        memory.map_bytes(lo, &[0x7F_u8]);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, memcmp, &[hi as u32, lo as u32, 1]);
+        assert_eq!(ret, 1);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, memcmp, &[lo as u32, hi as u32, 1]);
+        assert_eq!(ret, (-1_i32) as u32 as u64);
+    }
+
+    #[test]
+    fn crt_vsnprintf_s_null_buffer_with_count_aborts() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vsnprintf_s = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintfS);
+        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 16]);
+        write_u32(&mut memory, va_area, 12);
+        let result = dispatch_x86_thunk_result(
+            &mut runtime,
+            &mut memory,
+            vsnprintf_s,
+            &[0, 0, 4, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(result, Some(134));
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_get_errno_null_aborts_with_einval() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let get_errno = runtime.alloc_host_thunk(HostThunk::GetErrno);
+        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, get_errno, &[0]);
+        assert_eq!(result, Some(134));
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_fwrite_overflow_returns_zero_with_einval() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let fwrite = runtime.alloc_host_thunk(HostThunk::Fwrite);
+        let buf = 0x64_000;
+        memory.map_bytes(buf, &[0_u8; 16]);
+        let stream = runtime.globals.iob_streams[1];
+        // size * count overflows u64.
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fwrite,
+            &[buf as u32, u32::MAX, u32::MAX, stream as u32],
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_putenv_empty_value_removes_variable() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .process_environment
+            .insert("DEL_ME".to_string(), "value".to_string());
+        let putenv = runtime.alloc_host_thunk(HostThunk::Putenv);
+        let s = runtime.alloc_c_string(&mut memory, "DEL_ME=").expect("s");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, putenv, &[s as u32]);
+        assert_eq!(ret, 0);
+        assert!(
+            !runtime
+                .process_environment
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("DEL_ME"))
+        );
+    }
+
+    #[test]
+    fn crt_makepath_prepends_dot_to_bare_extension() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let makepath = runtime.alloc_host_thunk(HostThunk::Makepath);
+        let buf = 0x62_000;
+        memory.map_bytes(buf, &[0_u8; 64]);
+        let drive = runtime.alloc_c_string(&mut memory, "c").expect("drive");
+        let dir = runtime.alloc_c_string(&mut memory, "dir").expect("dir");
+        let name = runtime.alloc_c_string(&mut memory, "file").expect("name");
+        let ext = runtime.alloc_c_string(&mut memory, "txt").expect("ext");
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            makepath,
+            &[buf as u32, drive as u32, dir as u32, name as u32, ext as u32],
+        );
+        assert_eq!(read_c_string(&memory, buf).expect("path"), "c:dir\\file.txt");
+        // A dotted extension is not double-dotted.
+        let ext = runtime.alloc_c_string(&mut memory, ".log").expect("ext");
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            makepath,
+            &[buf as u32, 0, 0, name as u32, ext as u32],
+        );
+        assert_eq!(read_c_string(&memory, buf).expect("path"), "file.log");
+    }
+
+    #[test]
+    fn crt_freopen_returns_same_file_pointer() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .win32
+            .create_directory_w("C:\\game")
+            .expect("create guest dir");
+        let path_a = "C:\\game\\a.txt";
+        let path_b = "C:\\game\\b.txt";
+        fs::write(
+            runtime.win32.guest_path_to_host_path(path_a).expect("host a"),
+            b"a",
+        )
+        .expect("write a");
+        fs::write(
+            runtime.win32.guest_path_to_host_path(path_b).expect("host b"),
+            b"b",
+        )
+        .expect("write b");
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let freopen = runtime.alloc_host_thunk(HostThunk::Freopen);
+        let path_a_ptr = runtime.alloc_c_string(&mut memory, path_a).expect("pa");
+        let path_b_ptr = runtime.alloc_c_string(&mut memory, path_b).expect("pb");
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "r").expect("mode");
+
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path_a_ptr as u32, mode_ptr as u32],
+        );
+        assert_ne!(fp, 0);
+        let reopened = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            freopen,
+            &[path_b_ptr as u32, mode_ptr as u32, fp as u32],
+        );
+        assert_eq!(reopened, fp, "freopen must reuse the same FILE*");
+        // The old stream's host handle is closed; the new one is live.
+        assert_eq!(runtime.crt_files.len(), 1);
+        let state = runtime.crt_stream_state(fp).expect("stream state");
+        assert_eq!(state.path, path_b);
+        // fclose works on the reused block.
+        let fclose = runtime.alloc_host_thunk(HostThunk::Fclose);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, fclose, &[fp as u32]),
+            0
+        );
+    }
+
+    #[test]
+    fn crt_fgetc_and_fgets_set_errno_eio_on_read_error() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .win32
+            .create_directory_w("C:\\game")
+            .expect("create guest dir");
+        let path = "C:\\game\\eio.txt";
+        fs::write(
+            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            b"data",
+        )
+        .expect("write");
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let fgetc = runtime.alloc_host_thunk(HostThunk::Fgetc);
+        let fgets = runtime.alloc_host_thunk(HostThunk::Fgets);
+        let path_ptr = runtime.alloc_c_string(&mut memory, path).expect("path");
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "r").expect("mode");
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path_ptr as u32, mode_ptr as u32],
+        );
+        assert_ne!(fp, 0);
+
+        // Break the backing handle behind the stream's back.
+        let handle = runtime.crt_stream_state(fp).expect("state").handle;
+        runtime.win32.close_handle(handle).expect("close handle");
+
+        // fgetc → EOF with errno EIO.
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, fgetc, &[fp as u32]);
+        assert_eq!(ret, EOF as u32 as u64);
+        assert_eq!(runtime.crt_errno_get(&mut memory), EIO);
+
+        // fgets → NULL with errno EIO.
+        let set_errno = runtime.alloc_host_thunk(HostThunk::SetErrno);
+        dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
+        let buf = 0x62_000;
+        memory.map_bytes(buf, &[0_u8; 16]);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, fgets, &[buf as u32, 16, fp as u32]);
+        assert_eq!(ret, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), EIO);
+    }
+
+    #[test]
+    fn crt_fclose_frees_guest_file_block() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .win32
+            .create_directory_w("C:\\game")
+            .expect("create guest dir");
+        let path = "C:\\game\\leak.txt";
+        fs::write(
+            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            b"x",
+        )
+        .expect("write");
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let fclose = runtime.alloc_host_thunk(HostThunk::Fclose);
+        let path_ptr = runtime.alloc_c_string(&mut memory, path).expect("path");
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "r").expect("mode");
+
+        for _ in 0..1000 {
+            let fp = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fopen,
+                &[path_ptr as u32, mode_ptr as u32],
+            );
+            assert_ne!(fp, 0);
+            assert_eq!(
+                runtime.heap_allocations.get(&fp).copied(),
+                Some(0x80),
+                "FILE block is a 0x80-byte heap allocation"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, fclose, &[fp as u32]),
+                0
+            );
+            assert!(
+                !runtime.heap_allocations.contains_key(&fp),
+                "FILE block freed on fclose"
+            );
+        }
+        // The heap bookkeeping holds no live FILE blocks.
+        assert_eq!(runtime.heap_allocations.len(), 0);
+    }
+
+    #[test]
+    fn crt_alloc_fail_hook_yields_null_and_enomem() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let malloc = runtime.alloc_host_thunk(HostThunk::Malloc);
+        runtime.crt_alloc_fail_next = true;
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, malloc, &[64]);
+        assert_eq!(ret, 0, "injected allocation failure returns NULL");
+        assert_eq!(runtime.crt_errno_get(&mut memory), ENOMEM);
+        // The hook is one-shot: the next malloc succeeds.
+        let set_errno = runtime.alloc_host_thunk(HostThunk::SetErrno);
+        dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, malloc, &[64]);
+        assert_ne!(ret, 0);
+        assert_eq!(runtime.crt_errno_get(&mut memory), 0);
+    }
+
+    #[test]
+    fn crt_beginthreadex_suspended_starts_on_resume() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "thread-suspended",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let beginthreadex = runtime.alloc_host_thunk(HostThunk::Beginthreadex);
+            let resume_thread = runtime.alloc_host_thunk(HostThunk::ResumeThread);
+            let suspend_thread = runtime.alloc_host_thunk(HostThunk::SuspendThread);
+            let entrypoint = 0x41_100_u64;
+            let flag_ptr = 0x41_200_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            // mov eax, flag_ptr; mov dword ptr [eax], 1; ret
+            let mut entrypoint_bytes = vec![0x90; 0x40];
+            entrypoint_bytes[..12].copy_from_slice(&[
+                0xB8, 0x00, 0x12, 0x04, 0x00, 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00, 0xC3,
+            ]);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+            memory.map_bytes(flag_ptr, &[0_u8; 8]);
+
+            // CREATE_SUSPENDED (0x4): queued with suspend count 1.
+            let handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                beginthreadex,
+                &[0, 0, entrypoint as u32, 0, CREATE_SUSPENDED, thread_id_ptr as u32],
+            );
+            assert_ne!(handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+            assert_eq!(runtime.pending_guest_threads[0].suspended, 1);
+
+            // Pump: the suspended thread must NOT run.
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump while suspended")
+                    .did_work
+            );
+            assert_eq!(read_u32(&memory, flag_ptr).expect("flag"), 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+            // SuspendThread again → previous count 1, count now 2.
+            let prev = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                suspend_thread,
+                &[handle as u32],
+            );
+            assert_eq!(prev, 1);
+            assert_eq!(runtime.pending_guest_threads[0].suspended, 2);
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump while double-suspended")
+                    .did_work
+            );
+
+            // One resume → still suspended (counted semantics).
+            let prev = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                resume_thread,
+                &[handle as u32],
+            );
+            assert_eq!(prev, 2);
+            assert_eq!(runtime.pending_guest_threads[0].suspended, 1);
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump after one resume")
+                    .did_work
+            );
+
+            // Final resume → thread runs to completion.
+            let prev = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                resume_thread,
+                &[handle as u32],
+            );
+            assert_eq!(prev, 1);
+            assert_eq!(runtime.pending_guest_threads[0].suspended, 0);
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump after final resume")
+                    .did_work
+            );
+            assert_eq!(read_u32(&memory, flag_ptr).expect("flag"), 1);
+            assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn crt_vfprintf_write_error_returns_negative() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        runtime
+            .win32
+            .create_directory_w("C:\\game")
+            .expect("create guest dir");
+        let path = "C:\\game\\ro.txt";
+        fs::write(
+            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            b"x",
+        )
+        .expect("write");
+        let fopen = runtime.alloc_host_thunk(HostThunk::Fopen);
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let path_ptr = runtime.alloc_c_string(&mut memory, path).expect("path");
+        let mode_ptr = runtime.alloc_c_string(&mut memory, "w").expect("mode");
+        let fp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fopen,
+            &[path_ptr as u32, mode_ptr as u32],
+        );
+        assert_ne!(fp, 0);
+        // Break the backing handle behind the stream's back.
+        let handle = runtime.crt_stream_state(fp).expect("state").handle;
+        runtime.win32.close_handle(handle).expect("close handle");
+        let format = runtime.alloc_utf16_string(&mut memory, "hi").expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 16]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, fp as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(written, u32::MAX as u64, "write error → EOF (32-bit RAX)");
+        assert_eq!(runtime.crt_errno_get(&mut memory), EIO);
+    }
+
+    #[test]
+    fn crt_vfprintf_nul_target_raises_einval_and_continues() {
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
+        let format = runtime.alloc_utf16_string(&mut memory, "%n").expect("format");
+        let va_area = 0x63_000;
+        memory.map_bytes(va_area, &[0_u8; 16]);
+        write_u32(&mut memory, va_area, 0); // NULL %n target
+        let stream = runtime.globals.iob_streams[1];
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vfprintf,
+            &[0, stream as u32, format as u32, 0, va_area as u32],
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
+    }
+
+    #[test]
+    fn crt_atof_x64_writes_xmm0() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "atof-x64",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let atof = runtime.alloc_host_thunk(HostThunk::Atof);
+        let ptr = runtime.alloc_c_string(&mut memory, "1.25").expect("str");
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, 0x50_000);
+        state.set(Register::Rcx, ptr); // x64 arg0
+        memory.map_bytes(0x50_000, &[0_u8; 0x1000]);
+        runtime
+            .dispatch_import(atof, &mut state, &mut memory)
+            .expect("atof");
+        assert_eq!(state.xmm[0].low, 1.25_f64.to_bits());
+        assert_eq!(state.get(Register::Rax), 1.25_f64.to_bits());
     }
 
 
@@ -82941,20 +86962,24 @@ fn render_live_window_preview(
 ) -> Option<LiveFrame> {
     let layout = build_preview_layout(previews)?;
 
-    // Real frames only: zero real guest surfaces means no frame to publish.
-    let has_real_surface = window_surfaces.contains_key(&layout.root.hwnd)
+    // Real frames only: zero REAL guest surfaces means no frame to publish.
+    // `real_pixels` provenance is set exclusively by guest-driven blits, so
+    // a surface that only ever received host-invented chrome does not count.
+    let has_real_surface = window_surfaces
+        .get(&layout.root.hwnd)
+        .is_some_and(|surface| surface.real_pixels)
         || layout
             .children
             .iter()
-            .any(|(child, _)| window_surfaces.contains_key(&child.hwnd));
+            .any(|(child, _)| window_surfaces.get(&child.hwnd).is_some_and(|s| s.real_pixels));
     if !has_real_surface {
         return None;
     }
 
     let mut bytes = vec![0_u8; layout.width.checked_mul(layout.height)?.checked_mul(4)?];
 
-    // Blit the root window's GDI-rendered surface (real guest pixels).
-    if let Some(surface) = window_surfaces.get(&layout.root.hwnd) {
+    // Blit the root window's GDI-rendered surface (real guest pixels only).
+    if let Some(surface) = window_surfaces.get(&layout.root.hwnd).filter(|s| s.real_pixels) {
         blit_window_surface(
             &mut bytes,
             layout.width,
@@ -82967,7 +86992,7 @@ fn render_live_window_preview(
     // Blit each child window surface at its real position (guest-driven
     // blits landed here via BitBlt/StretchBlt on the child's DC).
     for (child, rect) in &layout.children {
-        if let Some(surface) = window_surfaces.get(&child.hwnd) {
+        if let Some(surface) = window_surfaces.get(&child.hwnd).filter(|s| s.real_pixels) {
             blit_window_surface(&mut bytes, layout.width, rect.x, rect.y, surface);
         }
     }
@@ -84222,6 +88247,13 @@ fn read_u32(memory: &MemoryImage, address: u64) -> AppResult<u32> {
     ]))
 }
 
+fn read_u16(memory: &MemoryImage, address: u64) -> AppResult<u16> {
+    Ok(u16::from_le_bytes([
+        memory.read_u8(address)?,
+        memory.read_u8(address + 1)?,
+    ]))
+}
+
 fn write_i32(memory: &mut MemoryImage, address: u64, value: i32) {
     write_u32(memory, address, value as u32);
 }
@@ -84763,7 +88795,10 @@ fn resolve_guest_path(current_directory: &str, path: &str) -> String {
     if let Some(drive_prefix) = windows_drive_prefix(path) {
         let remainder = &path[2..];
         if remainder.is_empty() {
-            return format!("{drive_prefix}\\");
+            // Drive-only path ("C:"): Windows resolves it to the per-drive
+            // current directory (the CWD when the CWD is on that drive,
+            // the drive root otherwise) — never unconditionally to the root.
+            return drive_relative_base(current_directory, drive_prefix);
         }
         if remainder.starts_with(['\\', '/']) {
             let trimmed = remainder.trim_start_matches(['\\', '/']);
@@ -84774,11 +88809,7 @@ fn resolve_guest_path(current_directory: &str, path: &str) -> String {
             };
         }
         let base = drive_relative_base(current_directory, drive_prefix);
-        return if remainder.is_empty() {
-            base
-        } else {
-            format!("{}\\{}", base.trim_end_matches(['\\', '/']), remainder)
-        };
+        return format!("{}\\{}", base.trim_end_matches(['\\', '/']), remainder);
     }
     if path.starts_with(['\\', '/']) {
         let drive_prefix = windows_drive_prefix(current_directory).unwrap_or("C:");
@@ -85072,18 +89103,6 @@ fn shell_special_folder_path(
         _ => return None,
     };
     Some(path)
-}
-
-fn windows_parent_directory(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches(['\\', '/']);
-    let separator = trimmed.rfind(['\\', '/'])?;
-    if separator == 2 && trimmed.as_bytes().get(1) == Some(&b':') {
-        Some(trimmed[..=separator].to_string())
-    } else if separator == 0 {
-        None
-    } else {
-        Some(trimmed[..separator].to_string())
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

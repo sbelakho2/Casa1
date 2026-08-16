@@ -2485,6 +2485,25 @@ impl CefBridge {
         }
     }
 
+    /// Publish the accelerated-paint IOSurface readback to the live channel.
+    ///
+    /// Only REAL GPU pixels are ever published: a failed readback publishes
+    /// nothing.  A host-fabricated placeholder frame would be dishonest —
+    /// the live channel must never show pixels the guest did not produce.
+    fn publish_io_surface_readback(&mut self, width: u32, height: u32) {
+        if self.live_frame_tx.is_none() {
+            return;
+        }
+        if let Some(pixel_data) = self.read_io_surface_pixels(width, height) {
+            self.publish_live_frame_from_pixels(width, height, pixel_data);
+        } else {
+            crate::live::live_trace(
+                "[CefBridge] publish_io_surface_readback: IOSurface readback failed — \
+                 nothing published (no fabricated fallback)",
+            );
+        }
+    }
+
     /// Attempt to read back pixel data from an IOSurface for live frame publishing.
     /// Uses the IOSurface C API (via `IOSurfaceLock` / `IOSurfaceGetBaseAddress`) to
     /// read pixel data directly from the GPU surface to CPU memory.
@@ -4239,9 +4258,30 @@ impl CefBridge {
             let frame_number = self.next_frame_number();
 
             // Publish as LiveFrame if live session is active (clone only
-            // when a subscriber is actually connected).
+            // when a subscriber is actually connected).  Only the REAL
+            // received bytes are ever published: an undersized OnPaint
+            // buffer is published as-is with its TRUE dimensions (the
+            // guest's view really is that size) — padding would invent
+            // pixels.  Invalid dimensions (no full row of pixels) skip
+            // publishing entirely.
             if self.live_frame_tx.is_some() {
-                self.publish_live_frame_from_pixels(width, height, pixels.clone());
+                if padded {
+                    let row_bytes = (width as usize).saturating_mul(4);
+                    let true_height = buffer.len().checked_div(row_bytes);
+                    if let Some(true_height) = true_height.filter(|height| *height > 0) {
+                        self.publish_live_frame_from_pixels(
+                            width,
+                            true_height as u32,
+                            buffer.to_vec(),
+                        );
+                    }
+                } else {
+                    self.publish_live_frame_from_pixels(
+                        width,
+                        height,
+                        buffer[..expected_size].to_vec(),
+                    );
+                }
             }
 
             let rendered = RenderedFrame {
@@ -4358,27 +4398,10 @@ impl CefBridge {
                 b.dirty = false;
             }
             // For IOSurface accelerated paint, we can't easily read back
-            // pixels in this callback. Publish a solid-color placeholder
-            // that will be replaced when the IOSurface is read back later.
-            if self.live_frame_tx.is_some() {
-                // Try to read back from IOSurface if available
-                let surface_pixels = self.read_io_surface_pixels(fw, fh);
-                if let Some(pixel_data) = surface_pixels {
-                    self.publish_live_frame_from_pixels(fw, fh, pixel_data);
-                } else {
-                    // Fallback: publish a dark-gray frame (BGRA) while
-                    // IOSurface readback is temporarily unavailable.
-                    let pixel_count = fw as usize * fh as usize;
-                    let mut fallback_pixels = Vec::with_capacity(pixel_count * 4);
-                    for _ in 0..pixel_count {
-                        fallback_pixels.push(0x1b); // B
-                        fallback_pixels.push(0x1b); // G
-                        fallback_pixels.push(0x1b); // R
-                        fallback_pixels.push(0xff); // A
-                    }
-                    self.publish_live_frame_from_pixels(fw, fh, fallback_pixels);
-                }
-            }
+            // pixels in this callback.  Publish the readback when it
+            // succeeds; a failed readback publishes NOTHING (never a
+            // host-fabricated placeholder).
+            self.publish_io_surface_readback(fw, fh);
             eprintln!(
                 "[CefBridge] on_paint: browser {browser_handle:#x} \
                  frame {} rendered ({}x{})",
@@ -8007,6 +8030,124 @@ mod tests {
         let pixels = vec![0xFFu8; 10]; // much smaller than 100x50x4 = 20000
         bridge.on_paint(browser, 0, &[], &pixels, 100, 50);
         // Should not panic; buffer gets padded internally
+    }
+
+    /// F2: an undersized OnPaint buffer must publish the REAL received bytes
+    /// with the TRUE dimensions — never 0xFF padding inventing pixels.
+    #[test]
+    fn cef_undersized_on_paint_publishes_real_bytes() {
+        let mut bridge = CefBridge::new();
+        let (host_session, live_session) = crate::live::new_live_session();
+        bridge.set_live_frame_tx(Some(live_session.frame_tx));
+
+        let browser_handle: CefHandle = 7;
+        bridge.browsers.insert(
+            browser_handle,
+            CefBrowser {
+                id: 1,
+                host_handle: 1,
+                main_frame_handle: 1,
+                can_go_back: false,
+                can_go_forward: false,
+                is_loading: false,
+                current_url: "about:blank".to_string(),
+                title: String::new(),
+                zoom_level: 1.0,
+                wk_handle: None,
+                dirty: false,
+                metal_texture_id: None,
+            },
+        );
+
+        // OnPaint advertises 100x50 but only delivers 100x3 rows of pixels.
+        let received: Vec<u8> = (0..(100 * 3 * 4) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        bridge.on_paint(browser_handle, 0, &[], &received, 100, 50);
+
+        let frame = host_session
+            .frame_rx
+            .try_recv()
+            .expect("an undersized OnPaint must still publish the real bytes");
+        assert_eq!(frame.width, 100, "width is preserved from the paint");
+        assert_eq!(
+            frame.height, 3,
+            "the true height is derived from the received byte count"
+        );
+        assert_eq!(
+            frame.bytes, received,
+            "the published bytes must be exactly the received data — no padding"
+        );
+        assert!(
+            host_session.frame_rx.try_recv().is_err(),
+            "exactly one frame may be published"
+        );
+
+        // The compositor path is unchanged: padded buffer + dirty flag so
+        // the snapshot is retried.
+        let rendered = bridge.get_rendered_frame(1).expect("rendered frame");
+        assert_eq!((rendered.width, rendered.height), (100, 50));
+        assert_eq!(rendered.pixels.len(), 100 * 50 * 4);
+        assert!(
+            bridge.browsers.get(&browser_handle).unwrap().dirty,
+            "undersized paint must keep the browser dirty for snapshot retry"
+        );
+    }
+
+    /// F2: a failed IOSurface readback publishes NOTHING — the host must
+    /// never fabricate a dark-gray placeholder for the live channel.
+    #[test]
+    fn cef_readback_failure_publishes_nothing() {
+        let mut bridge = CefBridge::new();
+        let (host_session, live_session) = crate::live::new_live_session();
+        bridge.set_live_frame_tx(Some(live_session.frame_tx));
+
+        // No IOSurface is cached, so the readback necessarily fails.
+        bridge.publish_io_surface_readback(64, 64);
+
+        assert_eq!(
+            bridge.live_frame_counter, 0,
+            "a failed readback must never count a fabricated frame"
+        );
+        assert!(
+            host_session.frame_rx.try_recv().is_err(),
+            "a failed readback must never publish a frame"
+        );
+    }
+
+    /// F2: when the IOSurface readback succeeds, the published frame is the
+    /// surface's real bytes; a platform that cannot read the surface back
+    /// publishes nothing (never a fabricated placeholder).
+    #[test]
+    fn cef_accelerated_paint_readback_publishes_only_real_surface_bytes() {
+        let Ok(device) = crate::metal_backend::MetalDevice::system_default() else {
+            return;
+        };
+        let Some(pair) = IoSurfaceTexturePair::new(device.device(), 64, 64) else {
+            return;
+        };
+        let mut bridge = CefBridge::new();
+        let (host_session, live_session) = crate::live::new_live_session();
+        bridge.set_live_frame_tx(Some(live_session.frame_tx));
+        bridge.io_surface_cache.insert(1, pair);
+        bridge.publish_io_surface_readback(64, 64);
+
+        match host_session.frame_rx.try_recv() {
+            Ok(frame) => {
+                assert_eq!(frame.width, 64);
+                assert_eq!(frame.height, 64);
+                assert_eq!(frame.bytes.len(), 64 * 64 * 4);
+            }
+            Err(_) => {
+                // Surface lock/read unavailable on this machine: publishing
+                // nothing is acceptable.  The invariant being pinned is that
+                // a FABRICATED frame is never published.
+            }
+        }
+        assert!(
+            host_session.frame_rx.try_recv().is_err(),
+            "no fabricated placeholder may follow"
+        );
     }
 
     /// Test CefRenderHandler: OnPopupShow and OnPopupSize track popup state.

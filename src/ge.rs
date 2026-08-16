@@ -858,8 +858,19 @@ impl GameEnvironment {
 
     pub fn create_directory(&mut self, windows_path: &str, dtm: bool) -> AppResult<String> {
         self.reject_write_to_read_only_drive(windows_path)?;
+        // A missing parent is ERROR_PATH_NOT_FOUND (Windows), not
+        // ERROR_FILE_NOT_FOUND: the parent resolution surfaces RcFsNotFound.
         let (parent, requested_name, normalized_path) =
-            self.resolve_parent_for_create(windows_path, None)?;
+            self.resolve_parent_for_create(windows_path, None).map_err(|error| {
+                if error.code == ReasonCode::RcFsNotFound {
+                    AppError::new(
+                        ReasonCode::RcFsPathInvalid,
+                        format!("parent directory of {windows_path} does not exist"),
+                    )
+                } else {
+                    error
+                }
+            })?;
         let target = parent.host_path.join(&requested_name);
         fs::create_dir(&target).map_err(|error| {
             AppError::from_io(
@@ -1197,6 +1208,19 @@ impl GameEnvironment {
         self.with_shared_file_runtime(|runtime| {
             Ok(runtime.open_handles.iter().all(|state| {
                 state.normalized_path != resolved.normalized_path || state.share_mode.delete
+            }))
+        })
+    }
+
+    /// Whether reading `windows_path` (e.g. a copy or a
+    /// MOVEFILE_COPY_ALLOWED move fallback) is permitted by the share-state
+    /// matrix: `true` when no open handle exists for the path, or every open
+    /// handle was opened with `FILE_SHARE_READ`.
+    pub fn check_read_sharing(&self, windows_path: &str) -> AppResult<bool> {
+        let resolved = self.resolve_existing_path(windows_path, None, 0)?;
+        self.with_shared_file_runtime(|runtime| {
+            Ok(runtime.open_handles.iter().all(|state| {
+                state.normalized_path != resolved.normalized_path || state.share_mode.read
             }))
         })
     }
