@@ -516,6 +516,10 @@ pub const WM_TOUCHDOWN: u32 = 0x0240;
 pub const WM_TOUCHUP: u32 = 0x0240;
 pub const WM_TOUCHMOVE: u32 = 0x0240;
 
+/// WM_TIMER — posted to a window's owning thread queue when a SetTimer
+/// timer (registered with a null TIMERPROC) comes due.
+pub const WM_TIMER: u32 = 0x0113;
+
 pub const WM_POINTERDOWN: u32 = 0x0246;
 pub const WM_POINTERUP: u32 = 0x0247;
 pub const WM_POINTERUPDATE: u32 = 0x0245;
@@ -3024,6 +3028,26 @@ impl User32Subsystem {
             kind,
             wparam,
             lparam,
+            translated: false,
+            device_id: None,
+        })
+    }
+
+    /// Post a WM_TIMER message for a due `SetTimer` timer to the owning
+    /// thread's message queue (wParam = timer_id, lParam = 0).
+    ///
+    /// Win32 delivers timers as WM_TIMER messages to the queue of the
+    /// thread that created the window (all Casa1 windows are created by
+    /// thread 1, whose queue is the shared message queue).  Unlike
+    /// `post_message_w`, this does NOT require the window record to still
+    /// exist: the timer has already fired and the window may have been
+    /// destroyed between `poll_timers` and the post.
+    pub fn post_timer_message(&mut self, hwnd: Hwnd, timer_id: usize) -> AppResult<()> {
+        self.enqueue(Message {
+            hwnd: Some(hwnd),
+            kind: MessageKind::Other(WM_TIMER),
+            wparam: timer_id as i64,
+            lparam: 0,
             translated: false,
             device_id: None,
         })

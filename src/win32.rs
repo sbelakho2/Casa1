@@ -48,6 +48,22 @@ const WRITE_DAC: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const STANDARD_RIGHTS_REQUIRED: u32 = DELETE_ACCESS | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+// ── Non-file object access-right constants (winnt.h) ────────────────────────
+// Handles carry the granted mask in `HandleDescriptor.access_mask`; every
+// per-operation check evaluates the required bits against it.
+const EVENT_MODIFY_STATE: u32 = 0x0000_0002;
+const MUTEX_MODIFY_STATE: u32 = 0x0000_0001;
+const SEMAPHORE_MODIFY_STATE: u32 = 0x0000_0002;
+const THREAD_TERMINATE: u32 = 0x0000_0001;
+const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
+const THREAD_SET_INFORMATION: u32 = 0x0000_0020;
+const THREAD_QUERY_INFORMATION: u32 = 0x0000_0040;
+const PROCESS_TERMINATE: u32 = 0x0000_0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+// ── GetFileType result constants ─────────────────────────────────────────────
+const FILE_TYPE_UNKNOWN: u32 = 0;
+const FILE_TYPE_DISK: u32 = 1;
+const FILE_TYPE_PIPE: u32 = 3;
 const FILE_GENERIC_READ: u32 =
     FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
 const FILE_GENERIC_WRITE: u32 =
@@ -302,6 +318,7 @@ pub enum ObjectType {
     Timer,
     Pipe,
     DirectorySearch,
+    Socket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -532,6 +549,17 @@ enum KernelObject {
     Timer(TimerObject),
     Pipe(PipeObject),
     DirectorySearch(DirectorySearchObject),
+    Socket(SocketObject),
+}
+
+/// A winsock socket.  The payload is the socket's id, which is ALWAYS the
+/// win32 handle value itself: sockets now live in the SAME handle namespace
+/// as every other kernel object, so a socket value can never alias a live
+/// win32 object (and vice versa).  The per-socket transport state lives in
+/// the `NetworkStack`, keyed by this id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SocketObject {
+    pub id: u64,
 }
 
 #[derive(Debug)]
@@ -778,6 +806,11 @@ enum OverlappedState {
 #[derive(Debug, Clone)]
 struct OverlappedRequest {
     handle: Handle,
+    /// Generation of `handle` captured when the request was queued.  A
+    /// completion arriving after the handle was closed AND its value
+    /// recycled to a different object is stale and must be dropped instead
+    /// of writing results into the wrong object.
+    generation: u32,
     event_handle: Option<Handle>,
     state: OverlappedState,
 }
@@ -1006,7 +1039,7 @@ impl Win32Subsystem {
         } else {
             self.insert_object(
                 ObjectType::Process,
-                0x1F0FFF,
+                0x1F1FFF,
                 false,
                 KernelObject::Process(ProcessObject {
                     process_id: self.current_process_id,
@@ -1085,9 +1118,25 @@ impl Win32Subsystem {
         close_source: bool,
     ) -> AppResult<Handle> {
         let source_entry = self.handle_entry(source_handle)?.clone();
+        if source_entry.descriptor.object_type == ObjectType::Socket {
+            // Sockets are winsock handles, not kernel handles — Windows
+            // `DuplicateHandle` on a SOCKET fails with ERROR_INVALID_HANDLE.
+            return invalid_handle("socket handles cannot be duplicated");
+        }
         let access_mask = if same_access || desired_access == 0 {
             source_entry.descriptor.access_mask
         } else {
+            // The requested access must be a subset of what the source
+            // handle was granted; requesting more is ERROR_ACCESS_DENIED.
+            if desired_access & !source_entry.descriptor.access_mask != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcHelperPermissionDenied,
+                    format!(
+                        "duplicate requests access {desired_access:#x}, source granted {:#x}",
+                        source_entry.descriptor.access_mask
+                    ),
+                ));
+            }
             desired_access
         };
         let duplicated_handle = self.insert_object(
@@ -1327,6 +1376,13 @@ impl Win32Subsystem {
     }
 
     pub fn set_event(&mut self, handle: Handle) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Event(_) => {
+                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+            }
+            _ => return invalid_handle("handle is not an event"),
+        }
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Event(event) => {
@@ -1338,6 +1394,13 @@ impl Win32Subsystem {
     }
 
     pub fn reset_event(&mut self, handle: Handle) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Event(_) => {
+                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+            }
+            _ => return invalid_handle("handle is not an event"),
+        }
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Event(event) => {
@@ -1373,6 +1436,13 @@ impl Win32Subsystem {
     }
 
     pub fn release_mutex(&mut self, handle: Handle) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Mutex(_) => {
+                Self::require_access(entry, MUTEX_MODIFY_STATE)?;
+            }
+            _ => return invalid_handle("handle is not a mutex"),
+        }
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Mutex(mutex) => {
@@ -1402,6 +1472,13 @@ impl Win32Subsystem {
     }
 
     pub fn release_semaphore(&mut self, handle: Handle, release_count: u32) -> AppResult<u32> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Semaphore(_) => {
+                Self::require_access(entry, SEMAPHORE_MODIFY_STATE)?;
+            }
+            _ => return invalid_handle("handle is not a semaphore"),
+        }
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Semaphore(semaphore) => {
@@ -1508,6 +1585,31 @@ impl Win32Subsystem {
         current_thread_id: u32,
     ) -> AppResult<WaitStatus> {
         let now = self.time.ticks_ms;
+        // Only waitable objects can be waited on at all: files, keys, pipes,
+        // I/O completion ports, directory searches, sections and sockets
+        // fail with ERROR_INVALID_HANDLE (Windows: these are not waitable
+        // handles).  Waitable objects additionally require SYNCHRONIZE in
+        // the granted access mask.
+        match object_type {
+            ObjectType::Event
+            | ObjectType::Mutex
+            | ObjectType::Semaphore
+            | ObjectType::Thread
+            | ObjectType::Timer => {
+                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
+            }
+            ObjectType::Process => {
+                // Process waits take the blocking `wait_for_single_object_process`
+                // path, but a zero-timeout poll can still land here.
+                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
+            }
+            _ => {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("handle {handle} is not a waitable object"),
+                ));
+            }
+        }
         match object_type {
             ObjectType::Event => {
                 let entry = self.handle_entry_mut(handle)?;
@@ -1576,7 +1678,19 @@ impl Win32Subsystem {
                     invalid_handle("handle is not a timer")
                 }
             }
-            _ => Ok(WaitStatus::Object0),
+            ObjectType::Process => {
+                let entry = self.handle_entry_mut(handle)?;
+                if let KernelObject::Process(process) = &mut entry.object {
+                    if process.exit_code.is_some() {
+                        Ok(WaitStatus::Object0)
+                    } else {
+                        Ok(WaitStatus::Timeout)
+                    }
+                } else {
+                    invalid_handle("handle is not a process")
+                }
+            }
+            _ => unreachable!("non-waitable types rejected above"),
         }
     }
 
@@ -1587,6 +1701,14 @@ impl Win32Subsystem {
         handle: Handle,
         timeout_ms: u32,
     ) -> AppResult<WaitStatus> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Process(_) => {
+                // Waits require SYNCHRONIZE in the granted access mask.
+                Self::require_access(entry, SYNCHRONIZE)?;
+            }
+            _ => return invalid_handle("handle is not a process"),
+        }
         let entry = self.handle_entry(handle)?;
         if let KernelObject::Process(process) = &entry.object {
             if process.exit_code.is_some() {
@@ -1701,6 +1823,26 @@ impl Win32Subsystem {
     /// auto-reset signals are not consumed before the final acquiring pass.
     fn object_is_signaled(&self, handle: Handle) -> AppResult<bool> {
         let entry = self.handle_entry(handle)?;
+        // Mirror `wait_for_single_object_instant`: only waitable types are
+        // probeable, and probing requires SYNCHRONIZE access.  Files, keys,
+        // pipes, I/O completion ports, directory searches, sections and
+        // sockets fail with ERROR_INVALID_HANDLE.
+        match entry.descriptor.object_type {
+            ObjectType::Event
+            | ObjectType::Mutex
+            | ObjectType::Semaphore
+            | ObjectType::Thread
+            | ObjectType::Process
+            | ObjectType::Timer => {
+                Self::require_access(entry, SYNCHRONIZE)?;
+            }
+            _ => {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("handle {handle} is not a waitable object"),
+                ));
+            }
+        }
         Ok(match &entry.object {
             KernelObject::Event(event) => event.borrow().signaled,
             KernelObject::Mutex(mutex) => mutex.abandoned || mutex.owner_thread_id.is_none(),
@@ -1711,7 +1853,7 @@ impl Win32Subsystem {
                 .is_some_and(|state| state.exit_code.is_some()),
             KernelObject::Process(process) => process.exit_code.is_some(),
             KernelObject::Timer(timer) => timer.signaled || self.time.ticks_ms >= timer.due_tick,
-            _ => true,
+            _ => unreachable!("non-waitable types rejected above"),
         })
     }
 
@@ -2085,6 +2227,20 @@ impl Win32Subsystem {
                 format!("handle {handle} is protected from close"),
             ));
         }
+        // Sockets are winsock handles, not kernel handles: Windows
+        // `CloseHandle` on a SOCKET fails with ERROR_INVALID_HANDLE.  With
+        // the unified namespace this is enforced by type, so a socket value
+        // can never close a (recycled) win32 object.
+        if self
+            .handles
+            .get(&handle)
+            .is_some_and(|entry| entry.descriptor.object_type == ObjectType::Socket)
+        {
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("handle {handle} is a socket, not a kernel handle"),
+            ));
+        }
         let entry = self.handles.remove(&handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -2161,6 +2317,87 @@ impl Win32Subsystem {
             self.cleanup_exited_thread_state(thread.thread_id);
         }
         Ok(())
+    }
+
+    // ── Socket handle management ─────────────────────────────────────────
+    //
+    // Sockets are first-class kernel objects in the SAME handle namespace as
+    // everything else: `insert_socket` mints a handle through the win32
+    // allocator (no separate base), and the value IS the socket id used by
+    // the `NetworkStack`.  This makes cross-type misuse (CloseHandle on a
+    // socket, closesocket on a file) fail by construction instead of by
+    // accident of two colliding numeric spaces.
+
+    /// Allocate a win32 handle for a new winsock socket.  The returned
+    /// value is both the handle and the socket id: the caller registers the
+    /// id with the `NetworkStack` (which keys its socket records by this
+    /// value).  The address family is validated by the winsock layer before
+    /// this is reached.
+    pub fn insert_socket(&mut self) -> Handle {
+        let handle = self.insert_object(
+            ObjectType::Socket,
+            0,
+            false,
+            KernelObject::Socket(SocketObject { id: 0 }),
+        );
+        if let Some(entry) = self.handles.get_mut(&handle)
+            && let KernelObject::Socket(socket) = &mut entry.object
+        {
+            socket.id = u64::from(handle);
+        }
+        handle
+    }
+
+    /// The socket id behind a handle: type-checks the entry as a Socket
+    /// (anything else is `RcWin32InvalidHandle`, which the winsock thunks
+    /// map to WSAENOTSOCK).
+    pub fn socket_id(&self, handle: Handle) -> AppResult<u64> {
+        match self.handles.get(&handle).map(|entry| &entry.object) {
+            Some(KernelObject::Socket(socket)) => Ok(socket.id),
+            Some(_) => invalid_handle("handle is not a socket"),
+            None => Err(self.invalid_handle_error(handle)),
+        }
+    }
+
+    /// Remove a socket handle from the table (same generation/recycle
+    /// bookkeeping as `close_handle`) and return the socket id so the caller
+    /// can tear down the `NetworkStack` record.
+    pub fn close_socket(&mut self, handle: Handle) -> AppResult<u64> {
+        let id = match self.handles.get(&handle).map(|entry| &entry.object) {
+            Some(KernelObject::Socket(socket)) => socket.id,
+            Some(_) => return invalid_handle("handle is not a socket"),
+            None => return Err(self.invalid_handle_error(handle)),
+        };
+        self.handles.remove(&handle);
+        self.protected_close_handles.remove(&handle);
+        let generation = self.handle_generations.entry(handle).or_insert(0);
+        *generation = generation.saturating_add(1);
+        self.closed_handle_values.push_back(handle);
+        self.record_closed_handle(handle, ObjectType::Socket);
+        Ok(id)
+    }
+
+    /// `GetFileType` — consult the handle table instead of assuming every
+    /// non-null handle is a disk file.  Files → FILE_TYPE_DISK, pipes →
+    /// FILE_TYPE_PIPE, anything else (or closed) → error, which the caller
+    /// turns into FILE_TYPE_UNKNOWN + ERROR_INVALID_HANDLE.
+    pub fn file_type(&self, handle: Handle) -> AppResult<u32> {
+        let entry = self.handle_entry(handle)?;
+        match entry.descriptor.object_type {
+            ObjectType::File => Ok(FILE_TYPE_DISK),
+            ObjectType::Pipe => Ok(FILE_TYPE_PIPE),
+            _ => invalid_handle("handle is not a file or pipe"),
+        }
+    }
+
+    /// `RegCloseKey` — like `close_handle` but type-checks the Key first so
+    /// a non-key handle cannot be closed through the registry API.
+    pub fn close_registry_key(&mut self, handle: Handle) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        if !matches!(entry.object, KernelObject::Key(_)) {
+            return invalid_handle("handle is not a registry key");
+        }
+        self.close_handle(handle)
     }
 
     /// Enforce a per-operation granted-access check: the operation requires
@@ -2431,10 +2668,18 @@ impl Win32Subsystem {
 
     pub fn flush_file_buffers(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
+        // Type-first: a non-file handle fails with ERROR_INVALID_HANDLE
+        // regardless of its access mask (Windows reports the wrong type
+        // before checking access).
+        match &entry.object {
+            KernelObject::File(_) => {}
+            _ => return invalid_handle("handle is not a file"),
+        }
         // Windows FlushFileBuffers requires GENERIC_WRITE access to the file
         // (the expanded mask grants FILE_WRITE_DATA|FILE_APPEND_DATA); a
         // read-only handle must fail with ERROR_ACCESS_DENIED.
         Self::require_access(entry, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
+        let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::File(file) => {
                 let file = file.borrow();
@@ -2465,6 +2710,12 @@ impl Win32Subsystem {
 
     pub fn get_file_size_ex(&self, handle: Handle) -> AppResult<u64> {
         let entry = self.handle_entry(handle)?;
+        // Type-first: a non-file handle fails with ERROR_INVALID_HANDLE
+        // regardless of its access mask.
+        match &entry.object {
+            KernelObject::File(_) => {}
+            _ => return invalid_handle("handle is not a file"),
+        }
         Self::require_access(entry, FILE_READ_ATTRIBUTES)?;
         match &entry.object {
             KernelObject::File(file) => {
@@ -2489,6 +2740,12 @@ impl Win32Subsystem {
         distance: i64,
         origin: SeekOrigin,
     ) -> AppResult<u64> {
+        // Type-first: a non-file handle fails with ERROR_INVALID_HANDLE
+        // regardless of its access mask.
+        let entry = self.handle_entry(handle)?;
+        if !matches!(entry.object, KernelObject::File(_)) {
+            return invalid_handle("handle is not a file");
+        }
         let size = self.get_file_size_ex(handle)? as i128;
         // Seeking moves the file pointer, which both reads and writes build
         // on; a handle granted neither FILE_READ_DATA nor FILE_WRITE_DATA
@@ -3065,6 +3322,16 @@ impl Win32Subsystem {
                         format!("invalid overlapped id {id}"),
                     )
                 })?;
+                if self.overlapped_request_is_stale(&request) {
+                    // The handle this I/O was issued on was closed (and
+                    // possibly its value recycled) before the completion was
+                    // consumed — drop the stale completion entirely.
+                    self.overlapped.remove(&id);
+                    return Err(AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("overlapped request {id} refers to a closed handle"),
+                    ));
+                }
                 match request.state {
                     OverlappedState::Completed(bytes_transferred) => {
                         self.overlapped.remove(&id);
@@ -3101,6 +3368,16 @@ impl Win32Subsystem {
                 format!("invalid overlapped id {id}"),
             )
         })?;
+        if self.overlapped_request_is_stale(&request) {
+            // Stale completion on a closed-and-recycled handle: drop it so
+            // the caller can never observe (or write) results against the
+            // wrong object.
+            self.overlapped.remove(&id);
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("overlapped request {id} refers to a closed handle"),
+            ));
+        }
         match request.state {
             OverlappedState::Completed(bytes_transferred) => {
                 // A completed request is final; drop it so long-running
@@ -3252,6 +3529,17 @@ impl Win32Subsystem {
             .collect::<Vec<_>>();
         let mut events = Vec::new();
         for id in pending_ids {
+            // Drop completions whose handle was closed (and possibly its
+            // value recycled to a different object) since the request was
+            // queued — never signal an event owned by the wrong object.
+            let stale = self
+                .overlapped
+                .get(&id)
+                .is_none_or(|request| self.overlapped_request_is_stale(request));
+            if stale {
+                self.overlapped.remove(&id);
+                continue;
+            }
             if let Some(overlapped) = self.overlapped.get_mut(&id) {
                 // Complete pending connect requests with the actual byte
                 // count written by this call.
@@ -3644,7 +3932,11 @@ impl Win32Subsystem {
         };
         let process_handle = self.insert_object(
             ObjectType::Process,
-            0x1F0FFF,
+            // PROCESS_ALL_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION:
+            // CreateProcessW grants full access, and the per-operation
+            // checks (GetExitCodeProcess requires 0x1000) must pass on the
+            // handle it returns.
+            0x1F1FFF,
             false,
             KernelObject::Process(ProcessObject {
                 process_id,
@@ -3698,6 +3990,32 @@ impl Win32Subsystem {
             }
             _ => invalid_handle("handle is not a process"),
         }
+    }
+
+    /// `GetExitCodeProcess` — type-checked, and requires
+    /// PROCESS_QUERY_LIMITED_INFORMATION (0x1000) in the granted mask.
+    pub fn get_exit_code_process(&self, handle: Handle) -> AppResult<Option<u32>> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Process(process) => {
+                Self::require_access(entry, PROCESS_QUERY_LIMITED_INFORMATION)?;
+                Ok(process.exit_code)
+            }
+            _ => invalid_handle("handle is not a process"),
+        }
+    }
+
+    /// `TerminateProcess` — type-checked, and requires PROCESS_TERMINATE
+    /// (0x0001) in the granted mask.
+    pub fn terminate_process(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Process(_) => {
+                Self::require_access(entry, PROCESS_TERMINATE)?;
+            }
+            _ => return invalid_handle("handle is not a process"),
+        }
+        self.set_process_exit_code(handle, exit_code)
     }
 
     /// Like `set_process_exit_code` but also notifies any thread that is
@@ -4273,17 +4591,20 @@ impl Win32Subsystem {
     }
 
     pub fn get_exit_code_thread(&self, handle: Handle) -> AppResult<Option<u32>> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         Ok(self.thread_state(thread_id)?.exit_code)
     }
 
     pub fn set_thread_priority(&mut self, handle: Handle, priority: i32) -> AppResult<()> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_SET_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         self.thread_state_mut(thread_id)?.priority = priority;
         Ok(())
     }
 
     pub fn get_thread_priority(&self, handle: Handle) -> AppResult<i32> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         Ok(self.thread_state(thread_id)?.priority)
     }
@@ -4307,6 +4628,7 @@ impl Win32Subsystem {
     }
 
     pub fn suspend_thread(&mut self, handle: Handle) -> AppResult<u32> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         let prev = state.suspend_count;
@@ -4315,6 +4637,7 @@ impl Win32Subsystem {
     }
 
     pub fn resume_thread(&mut self, handle: Handle) -> AppResult<u32> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         let prev = state.suspend_count;
@@ -4323,6 +4646,7 @@ impl Win32Subsystem {
     }
 
     pub fn terminate_thread(&mut self, handle: Handle, exit_code: u32) -> AppResult<bool> {
+        Self::require_access(self.handle_entry(handle)?, THREAD_TERMINATE)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         if state.exit_code.is_some() {
@@ -5048,15 +5372,25 @@ impl Win32Subsystem {
     ) -> u64 {
         let id = self.next_overlapped_id;
         self.next_overlapped_id += 1;
+        let generation = self.handle_generations.get(&handle).copied().unwrap_or(0);
         self.overlapped.insert(
             id,
             OverlappedRequest {
                 handle,
+                generation,
                 event_handle,
                 state,
             },
         );
         id
+    }
+
+    /// True when the overlapped request's handle has been closed (or closed
+    /// and its value recycled) since the request was queued — its completion
+    /// must be dropped, never applied to whatever object now owns the value.
+    fn overlapped_request_is_stale(&self, request: &OverlappedRequest) -> bool {
+        self.validate_handle_generation(request.handle, request.generation)
+            .is_err()
     }
 
     fn signal_event_if_needed(&mut self, event_handle: Option<Handle>) -> AppResult<()> {
@@ -5410,11 +5744,13 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 mod tests {
     use super::{
         CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, KernelObject,
-        MemoryProtection, SeekOrigin, ShareMode, WaitStatus, Win32Subsystem, iconv_ffi,
-        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches,
+        MemoryProtection, MutexObject, ObjectType, SeekOrigin, SemaphoreObject, ShareMode,
+        ThreadPlan, WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms,
+        split_find_search_pattern, windows_pattern_matches,
     };
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use crate::reason::ReasonCode;
+    use std::collections::BTreeMap;
     use std::fs;
 
     #[test]
@@ -5947,6 +6283,421 @@ mod tests {
             "non-signalled event with 0ms timeout should return Timeout"
         );
         win32.close_handle(h).expect("close");
+    }
+
+    // ── Unified handle manager tests ────────────────────────────────────
+
+    #[test]
+    fn socket_handles_share_the_win32_namespace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "sock-ns", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // The first allocation in a fresh subsystem is handle 4: sockets use
+        // the win32 allocator, not a separate 0x1000 base.
+        let socket = win32.insert_socket();
+        assert_eq!(socket, 4, "sockets mint handles from the win32 allocator");
+        assert_eq!(win32.socket_id(socket).expect("socket id"), u64::from(socket));
+
+        // CloseHandle(socket) is ERROR_INVALID_HANDLE by type, and the
+        // socket survives.
+        let err = win32.close_handle(socket).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        assert_eq!(
+            win32.socket_id(socket).expect("socket still alive"),
+            u64::from(socket)
+        );
+
+        // closesocket on a non-socket fails the type check.
+        let (event, _) = win32.create_event(true, false, false, None);
+        let err = win32.close_socket(event).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+
+        // close_socket removes the entry and returns the socket id.
+        let id = win32.close_socket(socket).expect("close socket");
+        assert_eq!(id, u64::from(socket));
+        let err = win32.socket_id(socket).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        win32.close_handle(event).expect("close event");
+    }
+
+    #[test]
+    fn wait_for_single_object_rejects_non_waitable_types() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wait-nw", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        win32
+            .create_directory_w("C:\\logs")
+            .expect("create log directory");
+        let path = win32
+            .write_file_overwrite_w("C:\\logs\\probe.txt", b"x")
+            .expect("seed file");
+        let file = win32
+            .create_file_w(
+                &path,
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("open file");
+
+        // WaitForSingleObject(file) → ERROR_INVALID_HANDLE (not WAIT_OBJECT_0).
+        let err = win32
+            .wait_for_single_object(file, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        // WaitForMultipleObjects containing a file → ERROR_INVALID_HANDLE.
+        let err = win32
+            .wait_for_multiple_objects(&[file], false, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        let (event, _) = win32.create_event(true, false, false, None);
+        let err = win32
+            .wait_for_multiple_objects(&[file, event], false, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+
+        // A socket handle is also not waitable.
+        let socket = win32.insert_socket();
+        let err = win32
+            .wait_for_single_object(socket, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        let err = win32
+            .wait_for_multiple_objects(&[socket, event], false, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+
+        win32.close_handle(file).expect("close file");
+        win32.close_handle(event).expect("close event");
+        win32.close_socket(socket).expect("close socket");
+    }
+
+    #[test]
+    fn file_functions_type_check_before_access() {
+        // GetFileSizeEx/SetFilePointerEx/FlushFileBuffers on an event must
+        // fail with ERROR_INVALID_HANDLE — the event's access bits are
+        // irrelevant because the type is wrong.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "type-first", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (event, _) = win32.create_event(true, false, false, None);
+        let err = win32.get_file_size_ex(event).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        let err = win32.set_file_pointer_ex(event, 0, SeekOrigin::Begin).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        let err = win32.flush_file_buffers(event).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        // RegCloseKey-style close helper also type-checks.
+        let err = win32.close_registry_key(event).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        win32.close_handle(event).expect("close event");
+    }
+
+    #[test]
+    fn set_event_enforces_modify_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "evt-mod", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (created, _) = win32.create_event(true, false, false, Some("evt-access"));
+        // open_event records the requested mask: access 0 grants nothing.
+        let zero_access = win32.open_event(0, false, "evt-access").expect("open event");
+        let err = win32.set_event(zero_access).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.reset_event(zero_access).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        // A full-access handle still works.
+        win32.set_event(created).expect("set full-access event");
+        win32.close_handle(zero_access).expect("close zero-access");
+        win32.close_handle(created).expect("close event");
+    }
+
+    #[test]
+    fn release_operations_enforce_modify_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mod-state", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Mutex: ReleaseMutex requires MUTEX_MODIFY_STATE (0x1).
+        let full_mutex = win32.create_mutex(true, false);
+        let zero_mutex = win32.insert_object(
+            ObjectType::Mutex,
+            0,
+            false,
+            KernelObject::Mutex(MutexObject {
+                owner_thread_id: None,
+                abandoned: false,
+            }),
+        );
+        let err = win32.release_mutex(zero_mutex).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        win32.release_mutex(full_mutex).expect("release full-access mutex");
+
+        // Semaphore: ReleaseSemaphore requires SEMAPHORE_MODIFY_STATE (0x2).
+        let full_sem = win32.create_semaphore(1, 2, false);
+        let zero_sem = win32.insert_object(
+            ObjectType::Semaphore,
+            0,
+            false,
+            KernelObject::Semaphore(SemaphoreObject { count: 1, maximum: 2 }),
+        );
+        let err = win32.release_semaphore(zero_sem, 1).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        win32.release_semaphore(full_sem, 1).expect("release full-access semaphore");
+
+        win32.close_handle(zero_mutex).expect("close zero mutex");
+        win32.close_handle(full_mutex).expect("close mutex");
+        win32.close_handle(zero_sem).expect("close zero semaphore");
+        win32.close_handle(full_sem).expect("close semaphore");
+    }
+
+    #[test]
+    fn waits_enforce_synchronize_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "sync-w", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (created, _) = win32.create_event(true, false, false, Some("evt-sync"));
+
+        // EVENT_MODIFY_STATE only (no SYNCHRONIZE): waits are denied.
+        let no_sync = win32.open_event(0x0000_0002, false, "evt-sync").expect("open event");
+        let err = win32.wait_for_single_object(no_sync, 0, false, None).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32
+            .wait_for_multiple_objects(&[no_sync, created], true, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+
+        // SYNCHRONIZE granted → the wait works.
+        let with_sync = win32
+            .open_event(0x0010_0000 | 0x0000_0002, false, "evt-sync")
+            .expect("open with synchronize");
+        win32.set_event(created).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_single_object(with_sync, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0
+        );
+
+        // A mutex handle granted only MUTEX_MODIFY_STATE cannot be waited on.
+        let no_sync_mutex = win32.insert_object(
+            ObjectType::Mutex,
+            0x0000_0001,
+            false,
+            KernelObject::Mutex(MutexObject {
+                owner_thread_id: None,
+                abandoned: false,
+            }),
+        );
+        let err = win32
+            .wait_for_single_object(no_sync_mutex, 0, false, None)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+
+        win32.close_handle(no_sync).expect("close no-sync");
+        win32.close_handle(with_sync).expect("close with-sync");
+        win32.close_handle(created).expect("close created");
+        win32.close_handle(no_sync_mutex).expect("close mutex");
+    }
+
+    #[test]
+    fn thread_operations_enforce_query_information() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "thr-acc", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let handle = win32.create_thread(
+            ThreadPlan {
+                exit_code: Some(7),
+                priority: 0,
+                signaled: true,
+            },
+            false,
+        );
+        let thread_id = win32.thread_id_for_handle(handle).expect("thread id");
+
+        // open_thread records the guest's desired access: 0 grants nothing.
+        let zero = win32.open_thread(thread_id, 0, false).expect("open thread");
+        let err = win32.get_exit_code_thread(zero).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.get_thread_priority(zero).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.set_thread_priority(zero, 1).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.suspend_thread(zero).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.resume_thread(zero).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.terminate_thread(zero, 0).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+
+        // The create_thread default mask (0x1F03FF) satisfies all checks.
+        assert_eq!(
+            win32.get_exit_code_thread(handle).expect("exit code"),
+            Some(7)
+        );
+        win32.close_handle(zero).expect("close zero thread");
+        win32.close_handle(handle).expect("close thread");
+    }
+
+    #[test]
+    fn process_operations_enforce_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "proc-acc", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let result = win32
+            .create_process_w("app.exe", "app.exe -arg", &BTreeMap::new(), "C:\\", false)
+            .expect("create process");
+
+        // CreateProcessW grants full access incl. PROCESS_QUERY_LIMITED_INFORMATION.
+        assert_eq!(
+            win32
+                .get_exit_code_process(result.process_handle)
+                .expect("exit code"),
+            None
+        );
+
+        // open_process records the requested mask: 0 grants nothing.
+        let zero = win32
+            .open_process(0, false, result.process_id)
+            .expect("open process");
+        let err = win32.get_exit_code_process(zero).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+        let err = win32.terminate_process(zero, 1).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+
+        win32
+            .terminate_process(result.process_handle, 1)
+            .expect("terminate full-access process");
+        assert_eq!(
+            win32
+                .get_exit_code_process(result.process_handle)
+                .expect("exit code after terminate"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn duplicate_handle_validates_access_subset() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "dup-acc", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (event, _) = win32.create_event(true, false, false, None);
+
+        // FILE_APPEND_DATA (0x4) is not granted by the event's 0x1F0003 mask.
+        let err = win32
+            .duplicate_handle(event, 0x0000_0004, false, false, false)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
+
+        // A granted subset duplicates fine.
+        let dup = win32
+            .duplicate_handle(event, 0x0000_0002, false, false, false)
+            .expect("duplicate subset");
+        win32.set_event(dup).expect("set via duplicate");
+
+        // Sockets cannot be duplicated (they are winsock handles).
+        let socket = win32.insert_socket();
+        let err = win32
+            .duplicate_handle(socket, 0, false, true, false)
+            .unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+
+        win32.close_handle(dup).expect("close duplicate");
+        win32.close_handle(event).expect("close event");
+        win32.close_socket(socket).expect("close socket");
+    }
+
+    #[test]
+    fn overlapped_completion_is_dropped_after_handle_recycled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "ovl-gen", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        win32
+            .create_directory_w("C:\\logs")
+            .expect("create log directory");
+        let path = win32
+            .write_file_overwrite_w("C:\\logs\\io.txt", b"payload")
+            .expect("seed file");
+        let file = win32
+            .create_file_w(
+                &path,
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("open file");
+        let overlapped = win32
+            .read_file_overlapped(file, 3, 0, None)
+            .expect("queue overlapped read");
+        let id = overlapped.id;
+
+        // Close the file and recycle the value onto a different object.
+        win32.close_handle(file).expect("close file");
+        let (recycled, _) = win32.create_event(true, false, false, None);
+        assert_eq!(recycled, file, "closed handle value is recycled FIFO");
+
+        // The stale completion is dropped: it neither reports success nor
+        // touches the recycled object, and the request is removed.
+        let err = win32.get_overlapped_result(id, false).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        let err = win32.get_overlapped_result(id, false).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle, "stale request removed");
+        win32.close_handle(recycled).expect("close recycled event");
+    }
+
+    #[test]
+    fn pending_overlapped_connect_is_dropped_after_handle_recycled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "ovl-pipe", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let pipe = win32.create_named_pipe("C:\\probe\\pipe", false);
+        let (event, _) = win32.create_event(true, false, false, None);
+        let request_id = win32
+            .connect_named_pipe_internal(pipe, Some(event), true)
+            .expect("pending connect")
+            .expect("overlapped id");
+
+        // Close the pipe and recycle its value onto a NEW pipe with the
+        // same name: the completion path matches pending requests by handle
+        // VALUE, so the stale request would otherwise be completed against
+        // the new object (and its event signaled) — a wrong-object write.
+        win32.close_handle(pipe).expect("close pipe");
+        let recycled_pipe = win32.create_named_pipe("C:\\probe\\pipe", false);
+        assert_eq!(recycled_pipe, pipe, "closed pipe value is recycled FIFO");
+
+        win32
+            .call_named_pipe("C:\\probe\\pipe", b"data")
+            .expect("call pipe");
+        // The stale completion is dropped: the request is gone and the
+        // original event was never signaled.
+        let err = win32.get_overlapped_result(request_id, false).unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
+        assert_eq!(
+            win32
+                .wait_for_single_object(event, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "original event must not be signaled by the stale completion"
+        );
+        win32.close_handle(recycled_pipe).expect("close recycled pipe");
+        win32.close_handle(event).expect("close event");
     }
 
     // ── File I/O semantics tests ───────────────────────────────────────

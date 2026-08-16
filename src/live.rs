@@ -268,20 +268,32 @@ fn run_live_host_loop<T>(
         }
 
         // ── JIT watchdog: force chain-breaking across threads ────────────
-        // If the PE runtime worker is stuck inside JIT-compiled block
-        // chains (pure ARM64 B instructions that never return to the
-        // dispatcher), neither the main loop's yield check NOR its
-        // chain-break timer will ever fire.
+        // Scheduling model: the HOST-SIDE block-dispatch safepoint (2 ms)
+        // in pe_runtime.rs is the PRIMARY mechanism — every 2 ms of wall
+        // time between dispatched blocks it pumps pending guest threads,
+        // drains timer/APC queues and advances the guest clock, so a guest
+        // spin can neither freeze the clock nor starve event sources.
         //
-        // This watchdog calls `force_break_all_chains()` every ~500 ms,
+        // This watchdog remains as a JIT-chain FALLBACK for when chains
+        // are re-enabled: if the PE runtime worker is stuck inside
+        // JIT-compiled block chains (pure ARM64 B instructions that never
+        // return to the dispatcher), neither the main loop's safepoint nor
+        // the block-dispatch timer will ever fire.
+        //
+        // The watchdog calls `force_break_all_chains()` every ~500 ms,
         // which physically writes RET instructions over every chain patch
         // location in the compiled code.  On the next chained-block
         // boundary, execution will return to the dispatcher where the
-        // CPU yield and GDI frame pipeline can run.
+        // safepoint and frame pipeline can run.
         //
         // Also set `JIT_CHAIN_BREAK_REQUESTED` so that `chain_blocks()`
         // (called from `get_or_compile`) refuses to form new chains
         // until the flag is cleared by the main loop.
+        //
+        // Behavior is intentionally unchanged: the host-side safepoint is
+        // the active scheduler today (the JIT is dormant), and the
+        // watchdog is dormant code that activates automatically when JIT
+        // execution and chain formation are re-enabled.
         if last_jit_watchdog.elapsed().as_millis() >= 500 {
             crate::jit::JIT_CHAIN_BREAK_REQUESTED
                 .store(true, std::sync::atomic::Ordering::Relaxed);

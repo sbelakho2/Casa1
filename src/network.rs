@@ -469,6 +469,9 @@ struct AddressFamilyRecord {
 
 #[derive(Debug)]
 pub struct NetworkStack {
+    /// Standalone id source for host-side/test sockets and non-socket id
+    /// spaces (http/websocket handles).  Guest-visible winsock sockets are
+    /// registered under win32-table-minted values via `socket_register`.
     next_id: u64,
     wsa_refcount: u32,
     last_wsa_error: i32,
@@ -1050,6 +1053,38 @@ impl NetworkStack {
         );
         self.last_wsa_error = 0;
         Ok(id)
+    }
+
+    /// Register a socket whose id was minted by the win32 handle table (the
+    /// runtime WSA path): `Win32Subsystem::insert_socket` allocates the
+    /// value, this registers the transport record under that SAME value.
+    /// The unified namespace means a socket value can never collide with a
+    /// live kernel handle, so the record is keyed by the win32-validated id.
+    /// NOTE: `socket()`/`alloc_id` (a standalone id space starting at 0x1000,
+    /// step 4) remain only for host-side/test use — the guest-visible WSA
+    /// path goes through here.
+    pub fn socket_register(&mut self, id: u64, family: AddressFamily) -> AppResult<()> {
+        self.ensure_wsa_started()?;
+        if self.sockets.contains_key(&id) {
+            self.last_wsa_error = WSAEINVAL;
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("socket id {id} is already registered"),
+            ));
+        }
+        self.sockets.insert(
+            id,
+            SocketRecord {
+                family,
+                nonblocking: false,
+                bound_addr: None,
+                state: SocketState::Created,
+                recv_queue: VecDeque::new(),
+                real_eof: false,
+            },
+        );
+        self.last_wsa_error = 0;
+        Ok(())
     }
 
     pub fn bind(&mut self, socket: SocketId, addr: SockAddr) -> AppResult<()> {
@@ -2215,6 +2250,13 @@ impl NetworkStack {
         }
     }
 
+    /// Standalone id allocator (base 0x1000, step 4) used only by the
+    /// host-side `socket()` API, internal peer sockets created for local
+    /// listener connects, and the WS2_32-independent id spaces (http
+    /// sessions, websockets).  Guest-visible sockets from the runtime no
+    /// longer use this allocator: `socket_register` keys records by the
+    /// win32-table-validated handle value, so this space can never collide
+    /// with kernel handles.
     fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 4;

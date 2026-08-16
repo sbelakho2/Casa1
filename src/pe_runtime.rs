@@ -243,6 +243,13 @@ const D3D12_RESOURCE_HEAP_TIER_2: u32 = 2;
 const D3D12_CONSERVATIVE_RASTERIZATION_TIER_1: u32 = 1;
 const D3D12_TILED_RESOURCES_TIER_2: u32 = 2;
 const PE_RUNTIME_INSTRUCTION_BUDGET: u64 = 25_000_000;
+/// Wall-clock interval (ms) of the host-side block-dispatch safepoint.
+///
+/// The GUI scheduler requires this: it is an order of magnitude faster
+/// than Steam's own 250 ms polls, so a guest spin cannot freeze the
+/// guest clock or starve pending threads, timers, APCs and the live
+/// watchdog for longer than this interval.
+const SAFEPOINT_INTERVAL_MS: u64 = 2;
 const KEYBOARD_REPLAY_ENV: &str = "CASA1_KEYBOARD_REPLAY_JSON";
 const PE_RUNTIME_BUDGET_ENV: &str = "CASA1_PE_RUNTIME_BUDGET";
 const EXPORT_FINAL_FRAME_ENV: &str = "CASA1_EXPORT_FINAL_FRAME";
@@ -4756,14 +4763,13 @@ pub fn execute_with_options(
     let mut block_count: u64 = 0;
     let mut thunk_count: u64 = 0;
     let mut last_progress_log = std::time::Instant::now();
-    let mut last_cpu_yield = std::time::Instant::now();
+    let mut last_safepoint = std::time::Instant::now();
     let mut last_rip_for_loop_detect = 0u64;
     let mut same_rip_consecutive_count = 0u32;
     // RIP seen two iterations ago, for detecting tight A↔B cycles.
     let mut two_rip_prev_rip: u64 = 0;
     // Count of consecutive A↔B alternations (resets on any other RIP).
     let mut two_rip_cycle_count: u32 = 0;
-    let mut last_chain_break = std::time::Instant::now();
     crate::live::live_trace("[pe] entering main execution loop");
 
     // Register the JIT runtime so the live-session watchdog can
@@ -4774,61 +4780,41 @@ pub fn execute_with_options(
 
     loop {
         block_count += 1;
-        // Time-based CPU yield: sleep 2 ms every 2 ms of wall-clock
-        // execution (50% duty cycle).  This caps CPU usage at ~50% even
-        // when the guest is in a tight compute loop without any host-call
-        // or message-pump yield points.  Instant::elapsed() is a simple
-        // counter read (~1 ns) so checking it every iteration is negligible.
-        if last_cpu_yield.elapsed().as_millis() >= 1000 {
-            // Yield once per second to let the live host session pump frames.
-            std::thread::sleep(std::time::Duration::from_micros(100));
-            last_cpu_yield = std::time::Instant::now();
-
-            // ── Periodic JIT chain break ───────────────────────────────────
-            // Every ~50 ms of wall-clock time, break all JIT block chains
-            // and set the yield-requested flag so that no *new* chains are
-            // formed until the flag clears (done below).
-            //
-            // This ensures that even when JIT-compiled blocks are chained
-            // together, execution periodically returns to the dispatcher where
-            // the yield check fires and the frame pipeline can run.
-            //
-            // Without this, a tight guest loop that gets fully JIT-compiled
-            // and chained will never return to the main loop, starving both
-            // the CPU yield and the frame pipeline.
-            if last_chain_break.elapsed().as_millis() >= 50 {
-                last_chain_break = std::time::Instant::now();
-
-                // Clear the chain-break flag only when D3D11 presents are
-                // flowing (first_real_guest_frame_seen == true).  During the
-                // bootstrapping phase (pure GDI, no D3D swapchain yet), keep
-                // the flag asserted so the JIT refuses to form new chains.
-                // Every block will return to the dispatcher where the CPU
-                // yield and frame pipeline can service the live session.
-                //
-                // Without this guard, a tight guest loop compiled into a
-                // single JIT block with a conditional backward branch
-                // (e.g. `dec ecx; jnz loop_start`) will execute *inside*
-                // the native block indefinitely — never reaching the
-                // patched epilogue — and neither the 50 ms chain break
-                // nor the live watchdog's force_break_all_chains can
-                // interrupt it.  The result is a permanently stalled
-                // worker thread and a blank live window.
-                //
-                // During pure-GDI bootstrapping (before a D3D swapchain
-                // is created), `first_real_guest_frame_seen` is always
-                // false, so
-                // the flag would stay asserted permanently — starving the
-                // bootstrapper of JIT block chains and reducing throughput
-                // to ~1500 steps/sec (every block returns to the dispatcher
-                // with a 2 ms CPU yield).  After the chain break fires,
-                // clear the flag unconditionally so that chains can form
-                // again.  The 50 ms periodic chain break and the watchdog's
-                // 500 ms force_break_all_chains continue to provide safety,
-                // ensuring that even with chains, execution returns to the
-                // dispatcher at least every 500 ms.
-                crate::jit::JIT_CHAIN_BREAK_REQUESTED
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+        // ── Host-side block-dispatch safepoint ───────────────────────────
+        // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
+        // guest scheduler between dispatched blocks: pump a pending guest
+        // thread, drain timer callbacks, deliver APCs to the main thread,
+        // poll due SetTimer timers, and advance the guest clock by the
+        // measured wall elapsed.  The GUI scheduler requires this — an
+        // order of magnitude faster than Steam's own 250 ms polls — so a
+        // guest spin loop (which never reaches a wait site) cannot freeze
+        // the clock or starve pending threads, timers, APCs and the live
+        // frame pipeline.
+        //
+        // The safepoint must NOT run while a pumped guest thread is active
+        // (nested execution): the pump services scheduling for the pumped
+        // thread's own lifetime, and running the safepoint inside it would
+        // recurse into another pump.
+        //
+        // The live watchdog's `JIT_CHAIN_BREAK_REQUESTED` path remains
+        // intact as a fallback for when JIT block chains are re-enabled;
+        // the old 50 ms main-loop chain-break timer is replaced by this
+        // safepoint.
+        if runtime.active_pumped_guest_thread.is_none()
+            && last_safepoint.elapsed().as_millis() as u64 >= SAFEPOINT_INTERVAL_MS
+        {
+            // Measure the wall elapsed since the previous safepoint BEFORE
+            // running the body so a pumped thread's execution time lands in
+            // the NEXT interval (the pump advances the clock itself via the
+            // guest's own wait/sleep APIs).
+            let elapsed_ms = last_safepoint.elapsed().as_millis() as u64;
+            last_safepoint = std::time::Instant::now();
+            if let Some(code) =
+                runtime.run_block_dispatch_safepoint(&mut state, &mut memory, elapsed_ms)?
+            {
+                // A pumped thread or timer callback requested process exit.
+                exit_code = code;
+                break;
             }
         }
 
@@ -22701,6 +22687,15 @@ impl PeHostRuntime {
                 let elapse = guest_call_arg(state, memory, 2)? as u32;
                 let callback = guest_call_arg(state, memory, 3)?;
                 let result = if timer_id == 0 { 1 } else { timer_id };
+                // Register the timer with user32 so the scheduler's
+                // poll_guest_timers (GetMessageW idle drain + block-dispatch
+                // safepoint) fires WM_TIMER for it.  user32's set_timer
+                // stores no guest timer proc, so only WM_TIMER-style timers
+                // (callback == 0) are registered — a non-null TIMERPROC
+                // cannot be invoked by the host and stays a no-op.
+                if self.user32.has_window(hwnd) && callback == 0 {
+                    self.user32.set_timer(hwnd, timer_id as usize, elapse);
+                }
                 state.set(Register::Rax, result as u64);
                 self.last_error = if hwnd == 0 || self.user32.has_window(hwnd) { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
                 self.push_trace(
@@ -24725,6 +24720,12 @@ impl PeHostRuntime {
                         return Ok(Some(code));
                     }
                     if pump_outcome.did_work {
+                        continue;
+                    }
+                    // Poll due SetTimer timers and post WM_TIMER messages so
+                    // guest timers fire during message-loop idle — not only
+                    // at block-dispatch safepoints.
+                    if self.poll_guest_timers()? {
                         continue;
                     }
                     // Drain expired timer and wait callbacks from the
@@ -28696,9 +28697,9 @@ impl PeHostRuntime {
                             Ok(_) => {
                                 result_code = crate::win32::WAIT_TIMEOUT;
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 result_code = u32::MAX; // WAIT_FAILED
-                                self.last_error = ERROR_INVALID_HANDLE;
+                                self.last_error = last_error_from_app_error(&error);
                             }
                         }
                     } else {
@@ -28746,9 +28747,9 @@ impl PeHostRuntime {
                                             self.last_error = 0;
                                         }
                                         Ok(_) => {}
-                                        Err(_) => {
+                                        Err(error) => {
                                             result_code = u32::MAX; // WAIT_FAILED
-                                            self.last_error = ERROR_INVALID_HANDLE;
+                                            self.last_error = last_error_from_app_error(&error);
                                         }
                                     }
                                     if result_code == crate::win32::WAIT_TIMEOUT {
@@ -28786,9 +28787,9 @@ impl PeHostRuntime {
                                         }
                                     }
                                 }
-                                Err(_) => {
+                                Err(error) => {
                                     result_code = u32::MAX; // WAIT_FAILED
-                                    self.last_error = ERROR_INVALID_HANDLE;
+                                    self.last_error = last_error_from_app_error(&error);
                                 }
                             }
                         } else {
@@ -28824,9 +28825,9 @@ impl PeHostRuntime {
                                         break;
                                     }
                                     Ok(_) => {}
-                                    Err(_) => {
+                                    Err(error) => {
                                         result_code = u32::MAX; // WAIT_FAILED
-                                        self.last_error = ERROR_INVALID_HANDLE;
+                                        self.last_error = last_error_from_app_error(&error);
                                         break;
                                     }
                                 }
@@ -28901,9 +28902,9 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                match self.win32.process_state(handle) {
-                    Ok(process) => {
-                        let exit_code = process.exit_code.unwrap_or(STILL_ACTIVE);
+                match self.win32.get_exit_code_process(handle) {
+                    Ok(exit_code) => {
+                        let exit_code = exit_code.unwrap_or(STILL_ACTIVE);
                         if exit_code_ptr != 0 {
                             write_u32(memory, exit_code_ptr, exit_code);
                         }
@@ -28925,8 +28926,40 @@ impl PeHostRuntime {
             HostThunk::TerminateProcess => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
                 let exit_code = guest_call_arg_u32(state, memory, 1)?;
-                let process = self.win32.process_state(handle)?;
-                self.win32.set_process_exit_code(handle, exit_code)?;
+                // Type- and access-checked (PROCESS_TERMINATE) by win32.
+                let process = match self.win32.process_state(handle) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                        self.push_trace(
+                            "process",
+                            "TerminateProcess",
+                            BTreeMap::from([
+                                ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                ("exit_code".to_string(), json!(exit_code)),
+                                ("error".to_string(), json!(error.message)),
+                            ]),
+                            json!(0),
+                        );
+                        return Ok(None);
+                    }
+                };
+                if let Err(error) = self.win32.terminate_process(handle, exit_code) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = last_error_from_app_error(&error);
+                    self.push_trace(
+                        "process",
+                        "TerminateProcess",
+                        BTreeMap::from([
+                            ("handle".to_string(), json!(format!("{handle:#x}"))),
+                            ("exit_code".to_string(), json!(exit_code)),
+                            ("error".to_string(), json!(error.message)),
+                        ]),
+                        json!(0),
+                    );
+                    return Ok(None);
+                }
                 let current_process_handle = self.win32.current_process_handle();
                 self.last_error = 0;
                 self.push_trace(
@@ -29962,7 +29995,10 @@ impl PeHostRuntime {
                     HKEY_CLASSES_ROOT | HKEY_CURRENT_USER | HKEY_LOCAL_MACHINE | HKEY_USERS | HKEY_CURRENT_CONFIG => {
                         0
                     }
-                    _ => match self.win32.close_handle(hkey) {
+                    // Non-root keys must be KEY handles in the win32 table;
+                    // RegCloseKey(event) fails with ERROR_INVALID_HANDLE
+                    // instead of closing a non-key object.
+                    _ => match self.win32.close_registry_key(hkey) {
                         Ok(()) => 0,
                         Err(error) => last_error_from_app_error(&error),
                     },
@@ -33939,10 +33975,12 @@ impl PeHostRuntime {
                 let _overlapped = guest_call_arg(state, memory, 1)?;
                 let flags = guest_call_arg_u32(state, memory, 2)?;
                 let _reserved = guest_call_arg_u32(state, memory, 3)?;
-                let result = self
-                    .network
-                    .shutdown(socket)
-                    .and_then(|_| self.network.closesocket(socket));
+                let result = (|| -> AppResult<()> {
+                    let id = self.win32.socket_id(socket as u32)?;
+                    self.network.shutdown(id)?;
+                    let id = self.win32.close_socket(socket as u32)?;
+                    self.network.closesocket(id)
+                })();
                 match result {
                     Ok(()) => {
                         state.set(Register::Rax, 1);
@@ -34080,7 +34118,13 @@ impl PeHostRuntime {
             }
             HostThunk::Closesocket => {
                 let socket = guest_call_arg(state, memory, 0)?;
-                let result = self.network.closesocket(socket);
+                // Type-check through the win32 table first (a non-socket
+                // handle → WSAENOTSOCK), then tear down the transport
+                // record under the returned socket id.
+                let result = (|| -> AppResult<()> {
+                    let id = self.win32.close_socket(socket as u32)?;
+                    self.network.closesocket(id)
+                })();
                 let success = result.is_ok();
                 if !success {
                     self.network.wsa_set_last_error(WSAENOTSOCK);
@@ -34302,20 +34346,27 @@ impl PeHostRuntime {
                 let family = guest_call_arg(state, memory, 0)? as i32;
                 let _socket_type = guest_call_arg(state, memory, 1)?;
                 let _protocol = guest_call_arg(state, memory, 2)?;
+                // Sockets live in the win32 handle namespace: the handle
+                // value IS the socket id, so a socket can never alias a
+                // live kernel handle (CloseHandle(socket) fails by type).
                 let handle = match winsock_address_family(family) {
-                    Some(family) => match self.network.socket(family) {
-                        Ok(handle) => handle,
-                        Err(_) => {
-                            self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
-                            INVALID_HANDLE_VALUE
+                    Some(family) => {
+                        let handle = self.win32.insert_socket();
+                        match self.network.socket_register(u64::from(handle), family) {
+                            Ok(()) => handle,
+                            Err(_) => {
+                                let _ = self.win32.close_socket(handle);
+                                self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                                INVALID_HANDLE_VALUE as u32
+                            }
                         }
-                    },
+                    }
                     None => {
                         self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
-                        INVALID_HANDLE_VALUE
+                        INVALID_HANDLE_VALUE as u32
                     }
                 };
-                state.set(Register::Rax, handle);
+                state.set(Register::Rax, u64::from(handle));
                 self.last_error = 0;
                 self.push_trace(
                     "network",
@@ -34738,20 +34789,25 @@ impl PeHostRuntime {
                 let _protocol_info = guest_call_arg(state, memory, 3)?;
                 let _group = guest_call_arg(state, memory, 4)?;
                 let _flags = guest_call_arg(state, memory, 5)?;
+                // Same unified-namespace path as `socket`.
                 let handle = match winsock_address_family(family) {
-                    Some(family) => match self.network.socket(family) {
-                        Ok(handle) => handle,
-                        Err(_) => {
-                            self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
-                            INVALID_HANDLE_VALUE
+                    Some(family) => {
+                        let handle = self.win32.insert_socket();
+                        match self.network.socket_register(u64::from(handle), family) {
+                            Ok(()) => handle,
+                            Err(_) => {
+                                let _ = self.win32.close_socket(handle);
+                                self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                                INVALID_HANDLE_VALUE as u32
+                            }
                         }
-                    },
+                    }
                     None => {
                         self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
-                        INVALID_HANDLE_VALUE
+                        INVALID_HANDLE_VALUE as u32
                     }
                 };
-                state.set(Register::Rax, handle);
+                state.set(Register::Rax, u64::from(handle));
                 self.last_error = 0;
                 self.push_trace(
                     "network",
@@ -35279,10 +35335,16 @@ impl PeHostRuntime {
             }
             HostThunk::GetFileType => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
+                // Consult the handle table: files → FILE_TYPE_DISK, pipes →
+                // FILE_TYPE_PIPE, anything else (or a closed handle) →
+                // FILE_TYPE_UNKNOWN + ERROR_INVALID_HANDLE.
                 let file_type = match handle {
                     STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => FILE_TYPE_CHAR,
                     0 | u32::MAX => FILE_TYPE_UNKNOWN,
-                    _ => FILE_TYPE_DISK,
+                    _ => match self.win32.file_type(handle) {
+                        Ok(file_type) => file_type,
+                        Err(_) => FILE_TYPE_UNKNOWN,
+                    },
                 };
                 state.set(Register::Rax, u64::from(file_type));
                 self.last_error = if file_type == FILE_TYPE_UNKNOWN {
@@ -51382,6 +51444,15 @@ impl PeHostRuntime {
     /// `PumpWaitOutcome::Unreported` and the thunk leaves RAX untouched,
     /// keeping the guest on its historical path.
     ///
+    /// Documented divergence (signal-loss fix): when the PUMP produced
+    /// work and the event became signaled during that pump, the signal is
+    /// reported as `PumpWaitOutcome::Wait(Object0)` instead — the 0-timeout
+    /// poll already consumed an auto-reset signal, so leaving it
+    /// `Unreported` would drop the wakeup permanently (the caller would
+    /// keep polling or time out on an event that was already consumed).
+    /// The historical `Unreported` behavior is preserved only for
+    /// signals observed without any pumped work.
+    ///
     /// Alertable waits re-check the waiting thread's APC queue after each
     /// pump iteration (see `wait_for_single_object_pumping`).
     fn wait_for_single_object_non_thread(
@@ -51406,9 +51477,18 @@ impl PeHostRuntime {
             }
             let polled = self.win32.wait_for_single_object(handle, 0, false, None)?;
             if !matches!(polled, crate::win32::WaitStatus::Timeout) {
-                // Pump-phase signal — historically unreported: the caller
-                // sees its pre-call RAX (the pre-fix thunk returned
-                // `Ok(None)` without setting RAX).
+                if pump_outcome.did_work {
+                    // Pump-phase signal: the event became signaled while a
+                    // pumped guest thread ran.  The 0-timeout poll above
+                    // already consumed the signal (auto-reset), so report
+                    // it as a real wait result (WAIT_OBJECT_0) instead of
+                    // the historical Unreported — which dropped the signal
+                    // and left RAX stale forever.
+                    return Ok(PumpWaitOutcome::Wait(polled));
+                }
+                // Historical non-pump-phase behavior: a signal observed
+                // without any pumped work stays unreported — the caller
+                // sees its pre-call RAX (Steam's shutdown handshake).
                 return Ok(PumpWaitOutcome::Unreported);
             }
             if !pump_outcome.did_work {
@@ -51460,6 +51540,90 @@ impl PeHostRuntime {
             }
         }
         Ok(did_work)
+    }
+
+    /// Run the host-side block-dispatch safepoint body.
+    ///
+    /// Services the guest scheduler from between-block dispatch contexts
+    /// (the main execution loop's periodic safepoint):
+    ///
+    /// 1. pump one pending guest thread (if any is ready — the pump runs
+    ///    its guest code to the next yield/exit);
+    /// 2. drain the shared timer work sink (`CreateTimerQueueTimer` /
+    ///    `RegisterWaitForSingleObject` callbacks);
+    /// 3. deliver APCs queued for the current (main) thread;
+    /// 4. poll due `SetTimer` timers and post WM_TIMER messages;
+    /// 5. advance the guest clock by the measured wall `elapsed_ms` since
+    ///    the previous safepoint (capped at 100 ms so a host stall cannot
+    ///    jump the clock; only advanced when > 0 ms).
+    ///
+    /// The clock advance gives Windows semantics to guest spins — a
+    /// spinning thread's time still moves, so GetTickCount/QPC advance and
+    /// Sleeping workers' `wake_tick`s expire — which is what lets a
+    /// `Sleep(20)` worker finish while the main thread spins.
+    ///
+    /// Returns the process exit code when a pumped thread or timer
+    /// callback requested process exit; the caller must end the run with
+    /// that code (a process-exit API never returns, so remaining work
+    /// must not run).
+    ///
+    /// The caller must NOT invoke this while a pumped guest thread is
+    /// active (`active_pumped_guest_thread.is_some()`): pumping nests
+    /// guest execution, and running the safepoint inside it would recurse
+    /// into another pump.  The guard below is defense-in-depth for direct
+    /// callers (the main loop checks before calling).
+    fn run_block_dispatch_safepoint(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        elapsed_ms: u64,
+    ) -> AppResult<Option<i32>> {
+        if self.active_pumped_guest_thread.is_some() {
+            return Ok(None);
+        }
+        let pump_outcome = self.pump_pending_guest_thread(memory)?;
+        if let Some(code) = pump_outcome.process_exit {
+            return Ok(Some(code));
+        }
+        if self.drain_timer_work_queue(state, memory)? {
+            // A timer callback may have requested process exit — propagate
+            // the code so the caller ends the run.
+            if let Some(code) = self.process_exit_requested {
+                return Ok(Some(code as i32));
+            }
+        }
+        let _ = self.deliver_current_thread_apcs(state, memory)?;
+        let _ = self.poll_guest_timers()?;
+        // Windows semantics: a spinning thread's time still moves.  Advance
+        // the guest clock by the measured wall elapsed (capped) so
+        // GetTickCount/QPC advance during guest spins and Sleeping
+        // workers' wake_ticks expire.
+        let advance_ms = elapsed_ms.min(100);
+        if advance_ms > 0 {
+            self.win32.record_sleep_observation(advance_ms, advance_ms);
+        }
+        Ok(None)
+    }
+
+    /// Poll due `SetTimer` timers and post WM_TIMER messages for them to
+    /// the owning thread's message queue.
+    ///
+    /// Returns true when at least one WM_TIMER was posted.  Called from
+    /// the GetMessageW idle drain and from the block-dispatch safepoint so
+    /// guest timers fire during message-loop idle, guest spins and other
+    /// waits — not only at the wait sites the guest itself enters.
+    ///
+    /// user32's `set_timer` stores no guest timer proc, so every timer
+    /// fires as a WM_TIMER message with wParam = timer_id (lParam = 0).
+    fn poll_guest_timers(&mut self) -> AppResult<bool> {
+        let due = self.user32.poll_timers();
+        let mut posted = false;
+        for (hwnd, timer_id) in due {
+            if self.user32.post_timer_message(hwnd, timer_id).is_ok() {
+                posted = true;
+            }
+        }
+        Ok(posted)
     }
 
     fn execute_ir_with_guest_exception_delivery(
@@ -78158,6 +78322,290 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_single_object_on_file_handle_is_wait_failed() {
+        // WaitForSingleObject(file) must NOT succeed: WAIT_FAILED
+        // (0xFFFFFFFF) with ERROR_INVALID_HANDLE, not WAIT_OBJECT_0.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wfs-file",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            runtime
+                .win32
+                .create_directory_w("C:\\logs")
+                .expect("create log dir");
+            let path = runtime
+                .win32
+                .write_file_overwrite_w("C:\\logs\\probe.txt", b"x")
+                .expect("seed file");
+            let file = runtime
+                .win32
+                .create_file_w(
+                    &path,
+                    crate::ge::FileAccess::read_only(),
+                    crate::ge::ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open file");
+
+            let wait_thunk = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, wait_thunk, &[file, 0]);
+            assert_eq!(result, u32::MAX as u64, "WAIT_FAILED");
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        })
+    }
+
+    #[test]
+    fn wait_for_multiple_objects_with_file_handle_is_wait_failed() {
+        // A file handle inside the array poisons the whole wait:
+        // WAIT_FAILED + ERROR_INVALID_HANDLE.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wfm-file",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            runtime
+                .win32
+                .create_directory_w("C:\\logs")
+                .expect("create log dir");
+            let path = runtime
+                .win32
+                .write_file_overwrite_w("C:\\logs\\probe2.txt", b"x")
+                .expect("seed file");
+            let file = runtime
+                .win32
+                .create_file_w(
+                    &path,
+                    crate::ge::FileAccess::read_only(),
+                    crate::ge::ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open file");
+            let (event, _) = runtime.win32.create_event(true, false, false, None);
+            let handles_ptr = 0x82_000_u64;
+            write_u32(&mut memory, handles_ptr, file);
+            write_u32(&mut memory, handles_ptr + 4, event);
+
+            let wait_thunk = runtime.alloc_host_thunk(HostThunk::WaitForMultipleObjects);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_thunk,
+                &[2, handles_ptr as u32, 0, 0],
+            );
+            assert_eq!(result, u32::MAX as u64, "WAIT_FAILED");
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        })
+    }
+
+    #[test]
+    fn wait_for_single_object_on_socket_handle_is_wait_failed() {
+        // Sockets are not waitable through WaitForSingleObject: WAIT_FAILED
+        // + ERROR_INVALID_HANDLE.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wfs-socket",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let socket = runtime.win32.insert_socket();
+            runtime
+                .network
+                .wsa_startup();
+            runtime
+                .network
+                .socket_register(u64::from(socket), crate::network::AddressFamily::Ipv4)
+                .expect("register socket");
+
+            let wait_thunk = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, wait_thunk, &[socket, 0]);
+            assert_eq!(result, u32::MAX as u64, "WAIT_FAILED");
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+            // CloseHandle(socket) is also ERROR_INVALID_HANDLE, and the
+            // socket remains alive afterwards.
+            let close_thunk = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, close_thunk, &[socket]);
+            assert_eq!(result, 0);
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+            assert_eq!(
+                runtime.win32.socket_id(socket).expect("socket still alive"),
+                u64::from(socket)
+            );
+
+            // closesocket(file) is WSAENOTSOCK (via the win32 type check).
+            runtime
+                .win32
+                .create_directory_w("C:\\logs")
+                .expect("create log dir");
+            let path = runtime
+                .win32
+                .write_file_overwrite_w("C:\\logs\\probe3.txt", b"x")
+                .expect("seed file");
+            let file = runtime
+                .win32
+                .create_file_w(
+                    &path,
+                    crate::ge::FileAccess::read_only(),
+                    crate::ge::ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open file");
+            let close_socket_thunk = runtime.alloc_host_thunk(HostThunk::Closesocket);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, close_socket_thunk, &[file]);
+            assert_eq!(result, u32::MAX as u64, "SOCKET_ERROR");
+            assert_eq!(runtime.network.wsa_get_last_error(), WSAENOTSOCK);
+            // The file handle is untouched.
+            assert!(runtime.win32.file_type(file).is_ok());
+
+            runtime.win32.close_socket(socket).expect("close socket");
+        })
+    }
+
+    #[test]
+    fn reg_close_key_on_non_key_handle_is_invalid_handle() {
+        // RegCloseKey(event) must fail with ERROR_INVALID_HANDLE and must
+        // NOT close the event.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "rck-event",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let (event, _) = runtime.win32.create_event(true, false, false, None);
+            let close_key_thunk = runtime.alloc_host_thunk(HostThunk::RegCloseKey);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, close_key_thunk, &[event]);
+            assert_eq!(result, ERROR_INVALID_HANDLE as u64);
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+            runtime
+                .win32
+                .set_event(event)
+                .expect("event survives RegCloseKey misuse");
+
+            // A real key still closes.
+            let key = runtime.win32.open_registry_key(
+                "HKEY_CURRENT_USER",
+                "Software\\Casa1\\probe",
+                crate::ge::RegistryView::Native,
+                false,
+            );
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, close_key_thunk, &[key]);
+            assert_eq!(result, 0, "ERROR_SUCCESS");
+            assert_eq!(runtime.last_error, 0);
+        })
+    }
+
+    #[test]
+    fn get_file_type_consults_the_handle_table() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gft-table",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let get_file_type = runtime.alloc_host_thunk(HostThunk::GetFileType);
+
+            // File → FILE_TYPE_DISK (1), no error.
+            runtime
+                .win32
+                .create_directory_w("C:\\logs")
+                .expect("create log dir");
+            let path = runtime
+                .win32
+                .write_file_overwrite_w("C:\\logs\\type.txt", b"x")
+                .expect("seed file");
+            let file = runtime
+                .win32
+                .create_file_w(
+                    &path,
+                    crate::ge::FileAccess::read_only(),
+                    crate::ge::ShareMode::all(),
+                    crate::win32::CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("open file");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, get_file_type, &[file]);
+            assert_eq!(result, FILE_TYPE_DISK as u64);
+            assert_eq!(runtime.last_error, 0);
+
+            // Event → FILE_TYPE_UNKNOWN (0) + ERROR_INVALID_HANDLE.
+            let (event, _) = runtime.win32.create_event(true, false, false, None);
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, get_file_type, &[event]);
+            assert_eq!(result, FILE_TYPE_UNKNOWN as u64);
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+            // Closed handle → FILE_TYPE_UNKNOWN + ERROR_INVALID_HANDLE.
+            runtime.win32.close_handle(event).expect("close event");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, get_file_type, &[event]);
+            assert_eq!(result, FILE_TYPE_UNKNOWN as u64);
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        })
+    }
+
+    #[test]
     fn timer_callback_process_exit_ends_run() {
         // A timer callback (drained from the timer_work_sink by GetMessageW)
         // that calls ExitProcess must end the guest run with the code.
@@ -85812,8 +86260,309 @@ mod tests {
         assert_eq!(state.get(Register::Rax), 1.25_f64.to_bits());
     }
 
+    #[test]
+    fn set_timer_registers_and_safepoint_posts_wm_timer() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wm-timer-safepoint",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
+            // A WS_CHILD window avoids AppKit (only non-child windows create
+            // NSWindows), keeping the test runnable off the main thread.
+            runtime.user32.register_class_ex_w("timer-test");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_styled(
+                    "timer-test",
+                    "t",
+                    100,
+                    100,
+                    false,
+                    false,
+                    None,
+                    1,
+                    crate::user32::WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create child window");
+            // Drain window-creation messages (NcCreate/Create).
+            while runtime.user32.get_message_for_thread(1).is_some() {}
+
+            // Guest SetTimer(hwnd, 7, 1, NULL): the thunk must register the
+            // timer with user32 (the previous no-op thunk never fired
+            // WM_TIMER).
+            let set_timer = runtime.alloc_host_thunk(HostThunk::SetTimer);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_timer,
+                &[hwnd, 7, 1, 0],
+            );
+            assert_eq!(result, 7, "SetTimer returns the timer id");
+            assert_eq!(
+                runtime.user32.timer_count(),
+                1,
+                "SetTimer thunk must register the timer"
+            );
+
+            // Let the 1 ms elapse period expire, then run the block-dispatch
+            // safepoint: the due timer must be posted as a WM_TIMER message
+            // (wParam = timer id) for the hwnd.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            let mut state = CpuState::new(GuestArch::X86);
+            let exit = runtime
+                .run_block_dispatch_safepoint(&mut state, &mut memory, 3)
+                .expect("safepoint");
+            assert_eq!(exit, None, "no process exit requested");
+
+            let message = runtime
+                .user32
+                .get_message_for_thread(1)
+                .expect("WM_TIMER queued");
+            assert_eq!(message.hwnd, Some(hwnd));
+            assert_eq!(message.kind, MessageKind::Other(crate::user32::WM_TIMER));
+            assert_eq!(message.wparam, 7, "wParam must carry the timer id");
+        })
+    }
+
+    #[test]
+    fn wfso_infinite_reports_signal_set_by_pumped_worker() {
+        // Signal-loss regression: an auto-reset event set by a pumped guest
+        // thread during the wait's pump phase must be reported as
+        // WAIT_OBJECT_0 — previously the 0-timeout poll consumed the signal
+        // and the wait returned Unreported (RAX left stale forever).
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wfso-pump-signal",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
+            assert!(!runtime.win32.wait_for_single_object(event_handle, 0, false, None)
+                .expect("initial poll")
+                .eq(&crate::win32::WaitStatus::Object0),
+                "auto-reset event starts unsignaled");
+
+            let set_event = runtime.alloc_host_thunk(HostThunk::SetEvent);
+            let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let import_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            write_u32(&mut memory, import_slot, set_event as u32);
+
+            // Worker: push event_handle; call [slot]; mov eax, 1; ret 4 —
+            // sets the event and exits.
+            let mut entry_bytes = vec![0x90; 0x20];
+            entry_bytes[0] = 0x68; // push imm32
+            entry_bytes[1..5].copy_from_slice(&event_handle.to_le_bytes());
+            entry_bytes[5..11].copy_from_slice(&[0xFF, 0x15, 0x00, 0x10, 0x04, 0x00]);
+            entry_bytes[11..16].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            entry_bytes[16..19].copy_from_slice(&[0xC2, 0x04, 0x00]);
+            memory.map_bytes(entrypoint, &entry_bytes);
+
+            let worker_handle = runtime.win32.create_thread(
+                crate::win32::ThreadPlan {
+                    exit_code: None,
+                    priority: 0,
+                    signaled: false,
+                },
+                false,
+            );
+            let pending = runtime
+                .prepare_guest_thread_entry(&mut memory, worker_handle, 0x1000, entrypoint, 0)
+                .expect("prepare worker");
+            runtime.pending_guest_threads.push_back(pending);
+
+            // WfSO(INFINITE) on the auto-reset event: the wait must pump the
+            // worker (which sets the event) and report WAIT_OBJECT_0.
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object,
+                &[event_handle, u32::MAX],
+            );
+            assert_eq!(
+                result,
+                crate::win32::WAIT_OBJECT_0 as u64,
+                "pump-phase signal must be reported as WAIT_OBJECT_0"
+            );
+            // The signal was consumed by the wait (auto-reset).
+            assert!(!runtime.win32.wait_for_single_object(event_handle, 0, false, None)
+                .expect("post-wait poll")
+                .eq(&crate::win32::WaitStatus::Object0),
+                "auto-reset signal must be consumed");
+            // The worker ran to completion inside the wait.
+            assert!(runtime.pending_guest_threads.is_empty());
+        })
+    }
+
+    #[test]
+    fn safepoint_advances_clock_and_completes_sleeping_worker_during_spin() {
+        // Guest spin (no thunks) for ~50 ms of wall time: the host-side
+        // block-dispatch safepoint must advance the guest clock (so
+        // GetTickCount moves during the spin) and pump a pending
+        // Sleep(20)-then-exit worker to completion while the main thread
+        // spins.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "spin-safepoint",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            // Pending worker: push 20; call [sleep_slot]; mov eax, 0; ret 4.
+            let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
+            let import_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            write_u32(&mut memory, import_slot, sleep as u32);
+            let mut entry_bytes = vec![0x90; 0x20];
+            entry_bytes[..16].copy_from_slice(&[
+                0x6A, 0x14, // push 20
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [sleep_slot]
+                0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+                0xC2, 0x04, 0x00, // ret 4
+            ]);
+            memory.map_bytes(entrypoint, &entry_bytes);
+
+            let worker_handle = runtime.win32.create_thread(
+                crate::win32::ThreadPlan {
+                    exit_code: None,
+                    priority: 0,
+                    signaled: false,
+                },
+                false,
+            );
+            let pending = runtime
+                .prepare_guest_thread_entry(&mut memory, worker_handle, 0x1000, entrypoint, 0)
+                .expect("prepare worker");
+            runtime.pending_guest_threads.push_back(pending);
+
+            // Guest spin loop: mov ecx, 0x40000000; dec ecx; jnz -3; jmp -10.
+            let spin_rip = 0x41_200_u64;
+            let mut spin_bytes = vec![0x90; 0x20];
+            spin_bytes[..10].copy_from_slice(&[
+                0xB9, 0x00, 0x00, 0x00, 0x40, // mov ecx, 0x40000000
+                0x49, // dec ecx
+                0x75, 0xFD, // jnz 0x41205
+                0xEB, 0xF6, // jmp 0x41200
+            ]);
+            memory.map_bytes(spin_rip, &spin_bytes);
+
+            let config = CpuEngineConfig::from_profile(
+                GuestArch::X86,
+                &runtime.win32.ge().config.winver,
+                env!("CARGO_PKG_VERSION"),
+                None,
+            )
+            .expect("cpu config");
+            let mut engine = CpuExecutionEngine::new(config);
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, 0x50_000);
+            memory.map_bytes(0x50_000, &[0_u8; 0x1000]);
+            state.rip = spin_rip;
+
+            let tick_before = runtime.win32.get_tick_count64();
+            let spin_deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(50);
+            let mut last_safepoint = std::time::Instant::now();
+            while std::time::Instant::now() < spin_deadline {
+                // Main-loop block dispatch: decode + execute one block of
+                // the guest spin (no thunks on this path).
+                let cached_block = decode_basic_block_cached(
+                    &mut engine,
+                    &memory,
+                    &mut runtime.instruction_cache,
+                    &mut runtime.instruction_cache_lru,
+                    &mut runtime.instruction_cache_generation,
+                    INSTRUCTION_CACHE_LIMIT,
+                    &mut runtime.basic_block_cache,
+                    &mut runtime.basic_block_cache_lru,
+                    &mut runtime.basic_block_cache_generation,
+                    BASIC_BLOCK_CACHE_LIMIT,
+                    state.rip,
+                )
+                .expect("decode spin block");
+                runtime
+                    .execute_ir_with_guest_exception_delivery(
+                        &engine,
+                        &mut state,
+                        &mut memory,
+                        &cached_block.translated.ir,
+                        "spin",
+                    )
+                    .expect("execute spin block");
+                let last_instruction = cached_block
+                    .translated
+                    .decoded
+                    .last()
+                    .expect("decoded spin block");
+                if !instruction_controls_rip(last_instruction.opcode) {
+                    state.rip = cached_block.end_rip;
+                }
+
+                // Host-side block-dispatch safepoint, exactly as the main
+                // loop runs it.
+                if runtime.active_pumped_guest_thread.is_none()
+                    && last_safepoint.elapsed().as_millis() as u64 >= SAFEPOINT_INTERVAL_MS
+                {
+                    let elapsed_ms = last_safepoint.elapsed().as_millis() as u64;
+                    last_safepoint = std::time::Instant::now();
+                    let exit = runtime
+                        .run_block_dispatch_safepoint(&mut state, &mut memory, elapsed_ms)
+                        .expect("safepoint");
+                    assert_eq!(exit, None, "no process exit during spin");
+                }
+            }
+
+            let tick_after = runtime.win32.get_tick_count64();
+            assert!(
+                tick_after >= tick_before + 40,
+                "guest clock must advance during a thunk-free spin (safepoint): {tick_before} -> {tick_after}"
+            );
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "Sleep(20) worker must complete during the spin (safepoint pumped it)"
+            );
+            assert_eq!(
+                runtime.win32.get_exit_code_thread(worker_handle).expect("exit code"),
+                Some(0),
+                "Sleep(20)-then-exit worker must have exited cleanly"
+            );
+        })
+    }
 
 }
 

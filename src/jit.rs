@@ -194,6 +194,27 @@ static FAST_THUNK_MAP: LazyLock<Mutex<HashMap<u64, usize>>> =
 ///   and yielding, it clears the flag.
 pub static JIT_CHAIN_BREAK_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// When set to `true`, the host-side scheduler has requested that the
+/// next JIT-compiled block exit to the dispatcher so the safepoint body
+/// can run (pump pending guest threads, drain timers/APCs, advance the
+/// guest clock).
+///
+/// # Protocol
+/// - **Host scheduler (PE runtime main loop / live watchdog)** sets this
+///   flag when the block-dispatch safepoint has been overdue.
+/// - **JIT-compiled blocks** check the flag at their prologue (see
+///   [`JitCompiler::emit_safepoint_check`]) and exit with `EXIT_SAFEPOINT`
+///   when set; the dispatcher maps that to
+///   [`JitExitReason::Safepoint`], runs the safepoint body, then
+///   re-dispatches the block.
+///
+/// Dormant: the JIT is disabled (macOS 26 blocks MAP_JIT execution for
+/// ad-hoc-signed binaries), so no compiled block reads this flag yet —
+/// the host-side 2 ms block-dispatch safepoint in `pe_runtime.rs` is the
+/// active scheduling mechanism.  This flag is the wired-up, ready-to-use
+/// counterpart for when JIT execution is re-enabled.
+pub static JIT_SAFEPOINT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 
 /// Global pointer to the active [`JitRuntime`] instance, used by the live
 /// session's watchdog thread to force chain-breaking when the worker thread
@@ -1635,6 +1656,11 @@ pub struct JitCompiledBlock {
     /// self-modifying code on subsequent `get_or_compile` calls.
     /// A hash of 0 means integrity verification is disabled for this block.
     pub source_hash: u64,
+    /// Control-flow metadata for the block's final instruction (the JIT
+    /// never writes `state.rip` for jump-family exits, so the dispatcher
+    /// reconstructs it from this metadata — see
+    /// [`map_exit_reason`](crate::jit::map_exit_reason)).
+    pub last_exit_info: Option<BlockExitInfo>,
 }
 
 /// Result of executing a JIT-compiled block.
@@ -1662,6 +1688,51 @@ pub enum JitExitReason {
     Cpuid,
     /// Block needs host-side exception handling.
     Exception { code: u32, address: u64 },
+    /// Block ended in an unconditional Jump: the JIT never writes
+    /// state.rip for jumps, so the dispatcher must set RIP to `target`
+    /// and dispatch the target block next.
+    Jump { target: u64 },
+    /// Block hit the host safepoint flag (see `JIT_SAFEPOINT_REQUESTED`):
+    /// the dispatcher must run the host-side safepoint body (pump pending
+    /// guest threads, drain timers/APCs, advance the guest clock) and then
+    /// re-dispatch the block.
+    Safepoint,
+}
+
+/// Static control-flow metadata captured at compile time for a block's
+/// final instruction, so the dispatcher can reconstruct guest RIP for
+/// jump-family JIT exits — the compiled code records only an exit code
+/// and never writes `state.rip` for these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockExitInfo {
+    /// Last instruction was an unconditional `Jump`.
+    Jump { target: u64 },
+    /// Last instruction was a `JumpIf` — the dispatcher evaluates the
+    /// condition against `state.flags` and sets RIP to `target` or
+    /// `fallthrough`.
+    JumpIf {
+        condition: ConditionCode,
+        target: u64,
+        fallthrough: u64,
+    },
+}
+
+/// Extract the [`BlockExitInfo`] for a compiled IR sequence, if its final
+/// instruction is a jump-family instruction.
+fn block_exit_info(ir: &[IrInstruction]) -> Option<BlockExitInfo> {
+    match ir.last() {
+        Some(IrInstruction::Jump { target }) => Some(BlockExitInfo::Jump { target: *target }),
+        Some(IrInstruction::JumpIf {
+            condition,
+            target,
+            fallthrough,
+        }) => Some(BlockExitInfo::JumpIf {
+            condition: *condition,
+            target: *target,
+            fallthrough: *fallthrough,
+        }),
+        _ => None,
+    }
 }
 
 /// Compute a simple hash of IR instructions for self-modifying code detection.
@@ -1710,6 +1781,10 @@ const EXIT_EXCEPTION: u64 = 8;
 /// dispatches the target block next.  Without this, EXIT_NORMAL leaves rip at
 /// the block start and the main loop re-dispatches the same block forever.
 const EXIT_JUMP: u64 = 9;
+/// Block hit the host safepoint flag (`JIT_SAFEPOINT_REQUESTED`) — the
+/// dispatcher must run the host-side safepoint body and re-dispatch the
+/// block.  Emitted by `emit_safepoint_check`.
+const EXIT_SAFEPOINT: u64 = 10;
 
 /// Compiles a sequence of IR instructions into ARM64 machine code.
 pub struct JitCompiler {
@@ -1804,6 +1879,7 @@ impl JitCompiler {
         // Compute a simple hash of the source IR for integrity verification.
         // Uses FNV-1a style hashing of the instruction discriminants and guest_address.
         let source_hash = compute_ir_hash(ir, guest_address);
+        let last_exit_info = block_exit_info(ir);
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
@@ -1811,6 +1887,7 @@ impl JitCompiler {
             guest_address,
             instruction_count: ir.len(),
             source_hash,
+            last_exit_info,
         })
     }
 
@@ -3119,6 +3196,42 @@ impl JitRuntime {
         eprintln!("[jit] break_all_chains: broke {count} chain(s)");
     }
 
+    /// Emit a host safepoint check at the start of a compiled block.
+    ///
+    /// When the JIT is re-enabled, every compiled block must begin with a
+    /// check of the host safepoint flag so that guest code executing
+    /// inside long chained blocks can still be interrupted — the host-side
+    /// 2 ms block-dispatch safepoint in `pe_runtime.rs` only fires between
+    /// dispatches, and a fully-chained loop never returns to the
+    /// dispatcher.
+    ///
+    /// The intended emission (ARM64):
+    ///
+    /// ```text
+    /// mov_imm64 xT, &JIT_SAFEPOINT_REQUESTED   // address of the flag
+    /// ldr  wT,  [xT]                            // load the flag
+    /// cbnz xT,  safepoint_stub                  // branch when set
+    /// ...
+    /// safepoint_stub:
+    ///   emit_store_guest_registers(arch)
+    ///   movz x0, EXIT_SAFEPOINT
+    ///   emit_epilogue()                          // return EXIT_SAFEPOINT
+    /// ```
+    ///
+    /// The dispatcher maps `EXIT_SAFEPOINT` to
+    /// [`JitExitReason::Safepoint`], runs the host safepoint body (pump
+    /// pending guest threads, drain timers/APCs, advance the guest clock),
+    /// then re-dispatches the block.
+    ///
+    /// Dormant: the JIT is disabled (macOS 26 blocks MAP_JIT execution for
+    /// ad-hoc-signed binaries), so this emits nothing today.  The flag
+    /// (`JIT_SAFEPOINT_REQUESTED`), the exit code (`EXIT_SAFEPOINT`) and
+    /// the reason mapping are all wired, so re-enabling the JIT only
+    /// requires calling this from `compile_block`.
+    #[allow(dead_code)]
+    pub fn emit_safepoint_check(&mut self, _arch: GuestArch) {
+        // No-op while the JIT is dormant — see the doc comment above.
+    }
 
     /// Execute a JIT-compiled block.
     ///
@@ -3177,21 +3290,7 @@ impl JitRuntime {
 
             let result = entry_fn(state_ptr, mem_base, mem_image_ptr, exit_ptr);
 
-            // Process exit reason
-            match exit_reason {
-                EXIT_NORMAL => JitExitReason::Normal { new_rip: state.rip },
-                EXIT_THUNK => JitExitReason::ThunkDispatch {
-                    target_rip: state.rip,
-                    return_rip: result,
-                },
-                EXIT_UNIMPL => JitExitReason::UnimplementedInstruction {
-                    rip: state.rip,
-                    opcode: result as u8,
-                },
-                EXIT_RET => JitExitReason::Return { return_rip: result },
-                EXIT_CPUID => JitExitReason::Cpuid,
-                _ => JitExitReason::Normal { new_rip: state.rip },
-            }
+            map_exit_reason(exit_reason, state, result, block.last_exit_info)
         }
     }
 
@@ -3525,6 +3624,75 @@ impl JitRuntime {
     /// Returns the number of pages currently in the synced set.
     pub fn synced_page_count(&self) -> usize {
         self.synced_pages.len()
+    }
+}
+
+/// Map a raw JIT exit code (written by a compiled block's epilogue into
+/// the `exit_reason` slot) to a [`JitExitReason`].
+///
+/// The jump-family exit codes (`EXIT_JUMP`, `EXIT_COND_BRANCH`,
+/// `EXIT_INDIRECT_CALL`) must NOT collapse into `Normal`: the compiled
+/// code never writes `state.rip` for these (see the emission comments in
+/// `compile_instruction`), so the dispatcher must reconstruct RIP from
+/// the reason.  `block_exit_info` carries the block's final control-flow
+/// metadata captured at compile time.
+///
+/// `result` is the block's X0 return value (for `EXIT_THUNK`/`EXIT_RET`
+/// it carries the guest return RIP; the dormant jump-family arms use it
+/// as a best-effort carrier — a re-enabled JIT must either populate it or
+/// have the dispatcher re-derive the target from `state`).
+fn map_exit_reason(
+    exit_reason: u64,
+    state: &CpuState,
+    result: u64,
+    block_exit_info: Option<BlockExitInfo>,
+) -> JitExitReason {
+    match exit_reason {
+        EXIT_NORMAL => JitExitReason::Normal { new_rip: state.rip },
+        EXIT_THUNK => JitExitReason::ThunkDispatch {
+            target_rip: state.rip,
+            return_rip: result,
+        },
+        EXIT_UNIMPL => JitExitReason::UnimplementedInstruction {
+            rip: state.rip,
+            opcode: result as u8,
+        },
+        EXIT_COND_BRANCH => {
+            let taken = match block_exit_info {
+                Some(BlockExitInfo::JumpIf { condition, .. }) => {
+                    crate::cpu::evaluate_condition(condition, &state.flags)
+                }
+                _ => result != 0,
+            };
+            JitExitReason::ConditionalBranch {
+                rip: state.rip,
+                taken,
+            }
+        }
+        EXIT_INDIRECT_CALL => JitExitReason::IndirectCall {
+            target: result,
+            return_address: state.rip,
+        },
+        EXIT_RET => JitExitReason::Return { return_rip: result },
+        EXIT_MEM_ACCESS => JitExitReason::MemoryAccess {
+            address: result,
+            is_write: false,
+            width: 0,
+        },
+        EXIT_CPUID => JitExitReason::Cpuid,
+        EXIT_EXCEPTION => JitExitReason::Exception {
+            code: result as u32,
+            address: state.rip,
+        },
+        EXIT_JUMP => {
+            let target = match block_exit_info {
+                Some(BlockExitInfo::Jump { target }) => target,
+                _ => state.rip,
+            };
+            JitExitReason::Jump { target }
+        }
+        EXIT_SAFEPOINT => JitExitReason::Safepoint,
+        _ => JitExitReason::Normal { new_rip: state.rip },
     }
 }
 
@@ -3874,6 +4042,7 @@ impl JitCompiler {
         }
 
         let source_hash = compute_ir_hash(ir, guest_address);
+        let last_exit_info = block_exit_info(ir);
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
@@ -3881,6 +4050,7 @@ impl JitCompiler {
             guest_address,
             instruction_count: ir.len(),
             source_hash,
+            last_exit_info,
         })
     }
 
@@ -3930,6 +4100,7 @@ impl JitCompiler {
         }
 
         let source_hash = compute_ir_hash(ir, guest_address);
+        let last_exit_info = block_exit_info(&unrolled_ir);
 
         Ok(JitCompiledBlock {
             entry: code_ptr,
@@ -3937,6 +4108,7 @@ impl JitCompiler {
             guest_address,
             instruction_count: ir.len(),
             source_hash,
+            last_exit_info,
         })
     }
 
@@ -5863,6 +6035,86 @@ mod tests {
         assert_eq!(block.instruction_count, 1);
         assert!(block.code_size > 0);
         assert!(!block.entry.is_null());
+    }
+
+    #[test]
+    fn exit_reason_mapping_never_collapses_jump_family_or_safepoint() {
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x1000;
+
+        // EXIT_SAFEPOINT decodes to JitExitReason::Safepoint, never Normal.
+        assert_eq!(
+            map_exit_reason(EXIT_SAFEPOINT, &state, 0, None),
+            JitExitReason::Safepoint
+        );
+
+        // EXIT_JUMP decodes to Jump carrying the compile-time target — the
+        // JIT never writes state.rip for jumps, so the dispatcher must set
+        // it from the reason.
+        assert_eq!(
+            map_exit_reason(EXIT_JUMP, &state, 0, Some(BlockExitInfo::Jump { target: 0x2000 })),
+            JitExitReason::Jump { target: 0x2000 }
+        );
+
+        // EXIT_COND_BRANCH decodes to ConditionalBranch, evaluating the
+        // block's stored condition against the guest flags.
+        let jump_if = Some(BlockExitInfo::JumpIf {
+            condition: ConditionCode::Below,
+            target: 0x3000,
+            fallthrough: 0x4000,
+        });
+        state.flags.cf = true;
+        assert_eq!(
+            map_exit_reason(EXIT_COND_BRANCH, &state, 0, jump_if),
+            JitExitReason::ConditionalBranch {
+                rip: 0x1000,
+                taken: true
+            }
+        );
+        state.flags.cf = false;
+        assert_eq!(
+            map_exit_reason(EXIT_COND_BRANCH, &state, 0, jump_if),
+            JitExitReason::ConditionalBranch {
+                rip: 0x1000,
+                taken: false
+            }
+        );
+
+        // EXIT_INDIRECT_CALL decodes to IndirectCall, never Normal.
+        assert!(matches!(
+            map_exit_reason(EXIT_INDIRECT_CALL, &state, 0x5000, None),
+            JitExitReason::IndirectCall {
+                target: 0x5000,
+                return_address: 0x1000
+            }
+        ));
+
+        // Plain normal completion is unchanged.
+        assert_eq!(
+            map_exit_reason(EXIT_NORMAL, &state, 0, None),
+            JitExitReason::Normal { new_rip: 0x1000 }
+        );
+    }
+
+    #[test]
+    fn block_exit_info_captures_final_jump_instruction() {
+        assert_eq!(
+            block_exit_info(&[IrInstruction::Nop, IrInstruction::Jump { target: 0x2000 }]),
+            Some(BlockExitInfo::Jump { target: 0x2000 })
+        );
+        assert_eq!(
+            block_exit_info(&[IrInstruction::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: 0x3000,
+                fallthrough: 0x4000,
+            }]),
+            Some(BlockExitInfo::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: 0x3000,
+                fallthrough: 0x4000,
+            })
+        );
+        assert_eq!(block_exit_info(&[IrInstruction::Nop]), None);
     }
 
     #[test]
