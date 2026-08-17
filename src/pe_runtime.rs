@@ -596,6 +596,12 @@ pub struct PeExecutionResult {
     pub gfx_frames: Vec<GfxFrame>,
     pub perf: Vec<PerfMetric>,
     pub trace_events: Vec<TraceEvent>,
+    /// Steam run instrumentation: milestone counters and first-failure
+    /// records snapshotted from the shared static at the end of the run.
+    pub milestones: crate::steam_milestones::SteamMilestones,
+    /// Steam run instrumentation: self-identifying run provenance (env-side
+    /// fields; content hashes are filled in by the runner for Steam jobs).
+    pub provenance: crate::steam_milestones::RunProvenance,
 }
 
 #[derive(Debug, Default)]
@@ -4785,6 +4791,9 @@ pub fn execute_with_options(
 
     loop {
         block_count += 1;
+        // Steam run instrumentation (no behavior change): the first block
+        // dispatch marks bootstrap as started.
+        crate::steam_milestones::note_bootstrap_started();
         // ── Host-side block-dispatch safepoint ───────────────────────────
         // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
         // guest scheduler between dispatched blocks: pump a pending guest
@@ -8269,6 +8278,8 @@ pub fn execute_with_options(
         gfx_frames: runtime.gfx_frames,
         perf,
         trace_events,
+        milestones: crate::steam_milestones::snapshot_milestones(),
+        provenance: crate::steam_milestones::RunProvenance::from_env(),
     })
 }
 
@@ -10251,6 +10262,16 @@ impl PeHostRuntime {
             let result = session.frame_tx.try_send(frame);
             if result.is_err() {
                 crate::live::live_trace("[pe] publish_live_frame — channel full, frame dropped");
+                // Steam run instrumentation (no behavior change): record the
+                // first dropped frame as the graphics first-failure.
+                crate::steam_milestones::record_first_failure(
+                    crate::steam_milestones::FailureCategory::Gfx,
+                    0,
+                    crate::steam_milestones::host_thread_id(),
+                    Some("LiveFramePublish".to_string()),
+                    None,
+                    "live frame channel full — frame dropped".to_string(),
+                );
             }
         }
     }
@@ -11897,6 +11918,21 @@ impl PeHostRuntime {
             thunk_address,
         ));
         result
+    }
+
+    /// Steam run instrumentation (no behavior change): record the FIRST
+    /// filesystem failure for the run (guest_pc from `state.rip`, error code
+    /// from `self.last_error`).  Later failures in the same category are
+    /// ignored by the shared milestone static.
+    fn record_fs_first_failure(&self, state: &CpuState, api: &str, detail: &str) {
+        crate::steam_milestones::record_first_failure(
+            crate::steam_milestones::FailureCategory::Fs,
+            state.rip as u32,
+            self.win32.current_thread_id(),
+            Some(api.to_string()),
+            (self.last_error != 0).then_some(self.last_error),
+            detail.to_string(),
+        );
     }
 
     fn dispatch_import(
@@ -14939,6 +14975,9 @@ impl PeHostRuntime {
                 self.dispatch_dxgi_swapchain_get_buffer(memory, state)?;
             }
             HostThunk::DXGISwapChainPresent => {
+                // Steam run instrumentation (no behavior change): count every
+                // DXGI Present call.
+                crate::steam_milestones::note_dxgi_present();
                 self.dispatch_dxgi_swapchain_present(state)?;
             }
             HostThunk::DXGISwapChainResizeBuffers => {
@@ -27865,6 +27904,12 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, command_line_ptr)?
                 };
+                // Steam run instrumentation (no behavior change): count
+                // steamwebhelper child-process launches.
+                crate::steam_milestones::note_webhelper_process(
+                    &application_name,
+                    &command_line,
+                );
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
                 } else {
@@ -27994,6 +28039,12 @@ impl PeHostRuntime {
                 } else {
                     read_c_string(memory, command_line_ptr)?
                 };
+                // Steam run instrumentation (no behavior change): count
+                // steamwebhelper child-process launches.
+                crate::steam_milestones::note_webhelper_process(
+                    &application_name,
+                    &command_line,
+                );
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
                 } else {
@@ -28113,6 +28164,13 @@ impl PeHostRuntime {
                     }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
+                // Steam run instrumentation (no behavior change): count the
+                // thread creation; the first CreateThread from the initial
+                // synthetic process (main thread) after bootstrap marks
+                // client_main_started.
+                crate::steam_milestones::note_thread_created(
+                    self.win32.current_thread_id() == 1,
+                );
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
                 self.push_trace(
@@ -29134,6 +29192,7 @@ impl PeHostRuntime {
                         Err(error) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = last_error_from_app_error(&error);
+                            self.record_fs_first_failure(state, "CreateFileW", "named-pipe client open failed");
                             self.push_trace(
                                 "file",
                                 "CreateFileW",
@@ -29160,6 +29219,7 @@ impl PeHostRuntime {
                     // the current directory.
                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                     self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.record_fs_first_failure(state, "CreateFileW", "empty file path");
                     self.push_trace(
                         "file",
                         "CreateFileW",
@@ -29312,6 +29372,7 @@ impl PeHostRuntime {
                                             Err(error) => {
                                                 state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                                 self.last_error = last_error_from_app_error(&error);
+                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed");
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29337,6 +29398,7 @@ impl PeHostRuntime {
                                     Err(error) => {
                                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                         self.last_error = last_error_from_app_error(&error);
+                                        self.record_fs_first_failure(state, "CreateFileW", "ADS stream create failed");
                                         self.push_trace(
                                             "file",
                                             "CreateFileW",
@@ -29421,6 +29483,7 @@ impl PeHostRuntime {
                                             Err(error) => {
                                                 state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                                 self.last_error = last_error_from_app_error(&error);
+                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed");
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29444,6 +29507,7 @@ impl PeHostRuntime {
                                     Err(error) => {
                                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                         self.last_error = last_error_from_app_error(&error);
+                                        self.record_fs_first_failure(state, "CreateFileW", "file create failed");
                                         self.push_trace(
                                             "file",
                                             "CreateFileW",
@@ -32547,6 +32611,8 @@ impl PeHostRuntime {
                 // `_endthreadex` is noreturn: record the exit code and end
                 // the thread immediately.  The subsequent sentinel `ret` must
                 // never overwrite this code (the pump uses the override).
+                // Steam run instrumentation (no behavior change): clean exit.
+                crate::steam_milestones::note_thread_normal_exit();
                 self.request_current_thread_exit(code, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -32576,11 +32642,17 @@ impl PeHostRuntime {
                     )?;
                     self.pending_guest_threads.push_back(pending_thread);
                 }
+                // Steam run instrumentation (no behavior change): count the
+                // thread creation (`_beginthread` is not CreateThread, so it
+                // never marks client_main_started).
+                crate::steam_milestones::note_thread_created(false);
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
             }
             HostThunk::Endthread => {
                 // `_endthread` is noreturn; the thread ends with code 0.
+                // Steam run instrumentation (no behavior change): clean exit.
+                crate::steam_milestones::note_thread_normal_exit();
                 self.request_current_thread_exit(0, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -33927,6 +33999,24 @@ impl PeHostRuntime {
                             };
                             self.network.wsa_set_last_error(code);
                         }
+                        // Steam run instrumentation (no behavior change):
+                        // record the first network failure for the run.
+                        crate::steam_milestones::record_first_failure(
+                            crate::steam_milestones::FailureCategory::Network,
+                            state.rip as u32,
+                            self.win32.current_thread_id(),
+                            Some("connect".to_string()),
+                            Some(self.network.wsa_get_last_error() as u32),
+                            format!(
+                                "connect to {}:{} failed",
+                                read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)
+                                    .map(|a| a.host)
+                                    .unwrap_or_default(),
+                                read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)
+                                    .map(|a| a.port)
+                                    .unwrap_or(0),
+                            ),
+                        );
                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                         self.last_error = 0;
                     }
@@ -33977,6 +34067,16 @@ impl PeHostRuntime {
                             };
                             self.network.wsa_set_last_error(code);
                         }
+                        // Steam run instrumentation (no behavior change):
+                        // record the first network failure for the run.
+                        crate::steam_milestones::record_first_failure(
+                            crate::steam_milestones::FailureCategory::Network,
+                            state.rip as u32,
+                            self.win32.current_thread_id(),
+                            Some("ConnectEx".to_string()),
+                            Some(self.network.wsa_get_last_error() as u32),
+                            error.message.clone(),
+                        );
                         self.push_trace(
                             "network",
                             "ConnectEx",
@@ -34328,10 +34428,30 @@ impl PeHostRuntime {
                 let result = (|| -> AppResult<u32> {
                     if buffer == 0 && length != 0 {
                         self.network.wsa_set_last_error(WSAEFAULT);
+                        // Steam run instrumentation (no behavior change):
+                        // record the first network failure for the run.
+                        crate::steam_milestones::record_first_failure(
+                            crate::steam_milestones::FailureCategory::Network,
+                            state.rip as u32,
+                            self.win32.current_thread_id(),
+                            Some("send".to_string()),
+                            Some(WSAEFAULT as u32),
+                            "send with null buffer and non-zero length".to_string(),
+                        );
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     if flags != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
+                        // Steam run instrumentation (no behavior change):
+                        // record the first network failure for the run.
+                        crate::steam_milestones::record_first_failure(
+                            crate::steam_milestones::FailureCategory::Network,
+                            state.rip as u32,
+                            self.win32.current_thread_id(),
+                            Some("send".to_string()),
+                            Some(WSAEINVAL as u32),
+                            "send with unsupported flags".to_string(),
+                        );
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     let bytes = if length == 0 {
@@ -34361,6 +34481,16 @@ impl PeHostRuntime {
                             };
                             self.network.wsa_set_last_error(code);
                         }
+                        // Steam run instrumentation (no behavior change):
+                        // record the first network failure for the run.
+                        crate::steam_milestones::record_first_failure(
+                            crate::steam_milestones::FailureCategory::Network,
+                            state.rip as u32,
+                            self.win32.current_thread_id(),
+                            Some("send".to_string()),
+                            Some(self.network.wsa_get_last_error() as u32),
+                            error.message.clone(),
+                        );
                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                         self.last_error = 0;
                     }
@@ -40379,6 +40509,7 @@ impl PeHostRuntime {
                         Err(error) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = last_error_from_app_error(&error);
+                            self.record_fs_first_failure(state, "CreateFileA", "named-pipe client open failed");
                         }
                     }
                 } else if raw_path.is_empty() {
@@ -40387,6 +40518,7 @@ impl PeHostRuntime {
                     // the current directory.
                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                     self.last_error = ERROR_PATH_NOT_FOUND;
+                    self.record_fs_first_failure(state, "CreateFileA", "empty file path");
                 } else {
                     // hTemplateFile (arg 6) resolution — same Win32 semantics
                     // as CreateFileW: NULL means no template; a non-NULL value
@@ -40414,6 +40546,7 @@ impl PeHostRuntime {
                         Err(_) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = ERROR_INVALID_HANDLE;
+                            self.record_fs_first_failure(state, "CreateFileA", "invalid template handle");
                         }
                         Ok(template_attributes) => {
                             // A template only applies when the disposition
@@ -40476,12 +40609,14 @@ impl PeHostRuntime {
                                         Err(error) => {
                                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                             self.last_error = last_error_from_app_error(&error);
+                                            self.record_fs_first_failure(state, "CreateFileA", "template attribute apply failed");
                                         }
                                     }
                                 }
                                 Err(error) => {
                                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                     self.last_error = last_error_from_app_error(&error);
+                                    self.record_fs_first_failure(state, "CreateFileA", "file create failed");
                                 }
                             }
                         }
@@ -40674,6 +40809,8 @@ impl PeHostRuntime {
                 // consumes the request; from the main thread the process
                 // exits with the code (Windows: the last thread exiting
                 // terminates the process).
+                // Steam run instrumentation (no behavior change): clean exit.
+                crate::steam_milestones::note_thread_normal_exit();
                 self.request_current_thread_exit(code, true);
                 self.last_error = 0;
                 return Ok(Some(code as i32));
@@ -40699,6 +40836,9 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 };
+                // Steam run instrumentation (no behavior change): a
+                // TerminateThread call was observed.
+                crate::steam_milestones::note_thread_terminated();
                 // A queued (not-yet-run) guest thread is terminated outright:
                 // remove it (marking it Exited) so it never runs, and record
                 // the exit code in the thread state below.
@@ -50924,6 +51064,19 @@ impl PeHostRuntime {
         parameter: u64,
     ) -> AppResult<PendingGuestThread> {
         if self.guest_arch != GuestArch::X86 {
+            // Steam run instrumentation (no behavior change): the host
+            // refused to schedule a guest thread — an illegal host-side
+            // termination, recorded as both a counter and the thread
+            // first-failure (should be 0 on Steam's x86 guest).
+            crate::steam_milestones::note_illegal_host_termination();
+            crate::steam_milestones::record_first_failure(
+                crate::steam_milestones::FailureCategory::Thread,
+                0,
+                self.win32.current_thread_id(),
+                Some("CreateThread".to_string()),
+                None,
+                "guest thread scheduling refused on non-x86 guest".to_string(),
+            );
             return Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
                 format!(
@@ -51260,6 +51413,9 @@ impl PeHostRuntime {
                             .unwrap_or(exit_code as u32);
                         self.win32
                             .set_thread_exit_code_by_id(pending_thread.thread_id, final_code)?;
+                        // Steam run instrumentation (no behavior change): the
+                        // thread procedure returned — a clean exit.
+                        crate::steam_milestones::note_thread_normal_exit();
                         pending_thread.state_machine = GuestThreadState::Exited;
                         Ok((
                             PumpedThreadOutcome {
@@ -52777,6 +52933,16 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         errno_value: i32,
     ) -> AppResult<Option<i32>> {
+        // Steam run instrumentation (no behavior change): record the first
+        // CRT invalid-parameter invocation for the run.
+        crate::steam_milestones::record_first_failure(
+            crate::steam_milestones::FailureCategory::Crt,
+            state.rip as u32,
+            self.win32.current_thread_id(),
+            Some("_invalid_parameter_handler".to_string()),
+            Some(errno_value.unsigned_abs()),
+            "CRT invalid-parameter handler invoked".to_string(),
+        );
         self.set_crt_errno(memory, errno_value);
         if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {
             state.set(Register::Rax, errno_value as u64);
@@ -59425,6 +59591,9 @@ impl PeHostRuntime {
         // Real D3D11 guest present — count it regardless of live mode.
         self.real_guest_frames += 1;
         if let Some((frame_hash, metadata)) = frame_record {
+            // Steam run instrumentation (no behavior change): count the
+            // frame by its metadata source.
+            crate::steam_milestones::note_gfx_frame(&metadata);
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d11".to_string(),
                 frame_index: self.next_frame_index,
@@ -59491,21 +59660,25 @@ impl PeHostRuntime {
             self.publish_live_frame(live_frame);
             self.first_real_guest_frame_seen = true;
         } else {
+            let metadata = BTreeMap::from([
+                ("source".to_string(), "dxgi_d3d12".to_string()),
+                ("width".to_string(), frame.width.to_string()),
+                ("height".to_string(), frame.height.to_string()),
+                ("format".to_string(), format!("{:?}", frame.format)),
+                (
+                    "displayed_frame_index".to_string(),
+                    displayed_frame_index.to_string(),
+                ),
+            ]);
+            // Steam run instrumentation (no behavior change): count the
+            // frame by its metadata source.
+            crate::steam_milestones::note_gfx_frame(&metadata);
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d12".to_string(),
                 frame_index: self.next_frame_index,
                 hash: util::sha256_bytes(&frame.bytes),
                 ssim: None,
-                metadata: BTreeMap::from([
-                    ("source".to_string(), "dxgi_d3d12".to_string()),
-                    ("width".to_string(), frame.width.to_string()),
-                    ("height".to_string(), frame.height.to_string()),
-                    ("format".to_string(), format!("{:?}", frame.format)),
-                    (
-                        "displayed_frame_index".to_string(),
-                        displayed_frame_index.to_string(),
-                    ),
-                ]),
+                metadata,
             });
             self.next_frame_index = self.next_frame_index.saturating_add(1);
         }

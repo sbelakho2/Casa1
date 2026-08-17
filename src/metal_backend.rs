@@ -47,6 +47,11 @@ static NEXT_GPU_ID: AtomicU64 = AtomicU64::new(1);
 pub static METAL_ENCODERS_CREATED: AtomicU64 = AtomicU64::new(0);
 pub static METAL_ENCODERS_ENDED: AtomicU64 = AtomicU64::new(0);
 
+/// Steam run telemetry: Metal presents (drawable commits) observed by this
+/// backend.  Instrumentation only — folded into the steam-bootstrap artifact
+/// via `SteamMilestones::snapshot_milestones`.
+pub static METAL_PRESENTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// Common contract for Metal command encoders that must be ended exactly
 /// once before release.
 pub trait MetalEncoderLifecycle {
@@ -1099,6 +1104,7 @@ impl MetalSwapchain {
         let now_instant = Instant::now();
         let now_system = std::time::SystemTime::now();
         self.present_count += 1;
+        METAL_PRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed);
         self.frame_stats.present_count = self.present_count;
         self.frame_stats.present_refresh_count += 1;
         self.frame_stats.sync_refresh_count = self.frame_stats.present_refresh_count;

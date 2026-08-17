@@ -358,6 +358,16 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         runner_events.extend(pe_output.trace_events.clone());
         runner_events.push(log_process_end_code(&mut logger, pe_output.exit_code)?);
 
+        // Steam run instrumentation: write the self-identifying run artifact
+        // for Steam.exe jobs.  Instrumentation only — a failed artifact write
+        // is reported but never fails the run.
+        if let Err(error) = write_steam_bootstrap_artifacts(&ge, &pe_output, job) {
+            eprintln!(
+                "[runner] steam bootstrap artifact write failed: {}",
+                error.message
+            );
+        }
+
         let after_files = ge.snapshot_files(job.dtm, started)?;
         let after_registry = ge.snapshot_registry()?;
         let canonical_output = CanonicalTestOutput {
@@ -927,6 +937,8 @@ fn try_recover_budget_exhausted_steam_install(
         gfx_frames: Vec::new(),
         perf: Vec::new(),
         trace_events: Vec::new(),
+        milestones: crate::steam_milestones::SteamMilestones::default(),
+        provenance: crate::steam_milestones::RunProvenance::default(),
     }))
 }
 
@@ -1120,4 +1132,225 @@ fn guest_exceptions(status: &std::process::ExitStatus, program: &Path) -> Vec<Gu
         }],
         None => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Steam run instrumentation artifacts
+// ---------------------------------------------------------------------------
+
+/// True when the job program basename is `steam.exe` (case-insensitive) —
+/// the only jobs that get the steam-bootstrap artifact.
+fn is_steam_executable(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("steam.exe"))
+}
+
+/// The full JSON artifact payload: provenance, milestones, and the run
+/// summary lines.
+#[derive(Debug, Clone, Serialize)]
+struct SteamBootstrapArtifact {
+    provenance: crate::steam_milestones::RunProvenance,
+    milestones: crate::steam_milestones::SteamMilestones,
+    exit_code: i32,
+    instruction_count: Option<u64>,
+    network_summary: Vec<String>,
+}
+
+/// Instruction count from the run's `pe_runtime_steps` perf metric, if the
+/// runtime published one.
+fn instruction_count_from_perf(pe_output: &pe_runtime::PeExecutionResult) -> Option<u64> {
+    pe_output
+        .perf
+        .iter()
+        .find(|metric| metric.metric_id == "pe_runtime_steps")
+        .map(|metric| metric.value as u64)
+}
+
+/// Compact network summary lines from the run's trace events.
+fn network_summary_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<String> {
+    pe_output
+        .trace_events
+        .iter()
+        .filter(|event| event.category == "network")
+        .map(|event| format!("{} -> {}", event.call_id, event.return_value))
+        .collect()
+}
+
+/// Human-readable milestone block for the log artifact.
+fn milestones_log_lines(milestones: &crate::steam_milestones::SteamMilestones) -> Vec<String> {
+    let steam = &milestones.steam;
+    let graphics = &milestones.graphics;
+    let threads = &milestones.threads;
+    let failures = &milestones.first_failures;
+    let mut lines = Vec::new();
+    lines.push("milestones:".to_string());
+    lines.push(format!(
+        "  steam.bootstrap_started: {}",
+        steam.bootstrap_started
+    ));
+    lines.push(format!(
+        "  steam.manifest_opened: {}",
+        steam.manifest_opened
+    ));
+    lines.push(format!(
+        "  steam.manifest_verified: {}",
+        steam.manifest_verified
+    ));
+    lines.push(format!(
+        "  steam.package_writability_probe: {}",
+        steam.package_writability_probe
+    ));
+    lines.push(format!(
+        "  steam.client_main_started: {}",
+        steam.client_main_started
+    ));
+    lines.push(format!(
+        "  steam.webhelper_processes: {}",
+        steam.webhelper_processes
+    ));
+    lines.push(format!(
+        "  steam.cef_browser_created: {}",
+        steam.cef_browser_created
+    ));
+    lines.push(format!(
+        "  steam.cef_first_paint: {}",
+        steam.cef_first_paint
+    ));
+    lines.push(format!(
+        "  steam.cef_software_paints: {}",
+        steam.cef_software_paints
+    ));
+    lines.push(format!(
+        "  steam.cef_accelerated_paints: {}",
+        steam.cef_accelerated_paints
+    ));
+    lines.push("graphics:".to_string());
+    lines.push(format!(
+        "  graphics.host_placeholder_frames: {}",
+        graphics.host_placeholder_frames
+    ));
+    lines.push(format!("  graphics.gdi_frames: {}", graphics.gdi_frames));
+    lines.push(format!(
+        "  graphics.cef_software_frames: {}",
+        graphics.cef_software_frames
+    ));
+    lines.push(format!(
+        "  graphics.cef_accelerated_frames: {}",
+        graphics.cef_accelerated_frames
+    ));
+    lines.push(format!(
+        "  graphics.dxgi_presents: {}",
+        graphics.dxgi_presents
+    ));
+    lines.push(format!(
+        "  graphics.metal_presented_frames: {}",
+        graphics.metal_presented_frames
+    ));
+    lines.push("threads:".to_string());
+    lines.push(format!("  threads.created: {}", threads.created));
+    lines.push(format!("  threads.normal_exits: {}", threads.normal_exits));
+    lines.push(format!("  threads.terminated: {}", threads.terminated));
+    lines.push(format!(
+        "  threads.illegal_host_terminations: {}",
+        threads.illegal_host_terminations
+    ));
+    lines.push(format!(
+        "  threads.live_at_process_exit: {}",
+        threads.live_at_process_exit
+    ));
+    lines.push("first_failures:".to_string());
+    for (name, failure) in [
+        ("fs", &failures.fs),
+        ("crt", &failures.crt),
+        ("thread", &failures.thread),
+        ("network", &failures.network),
+        ("cef", &failures.cef),
+        ("gfx", &failures.gfx),
+    ] {
+        match failure {
+            Some(failure) => {
+                let api = failure.api.as_deref().unwrap_or("<none>").to_string();
+                let guest_error = failure
+                    .guest_error
+                    .map(|code| format!("{code:#x}"))
+                    .unwrap_or_else(|| "<none>".to_string());
+                lines.push(format!(
+                    "  first_failures.{name}: guest_pc={:#x} thread_id={} api={api} guest_error={guest_error} detail={}",
+                    failure.guest_pc, failure.thread_id, failure.detail
+                ));
+            }
+            None => lines.push(format!("  first_failures.{name}: none")),
+        }
+    }
+    lines
+}
+
+/// Write `<short-sha>-steam-bootstrap.json` and `.log` under the GE's
+/// diagnostics directory.  Only called for Steam.exe jobs; any failure is
+/// reported to the caller, which logs it without failing the run.
+fn write_steam_bootstrap_artifacts(
+    ge: &GameEnvironment,
+    pe_output: &pe_runtime::PeExecutionResult,
+    job: &RunnerJob,
+) -> AppResult<()> {
+    let provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
+    let short_sha = if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
+        "unknown".to_string()
+    } else {
+        provenance.commit_sha.chars().take(8).collect()
+    };
+    let artifact = SteamBootstrapArtifact {
+        provenance: provenance.clone(),
+        milestones: pe_output.milestones.clone(),
+        exit_code: pe_output.exit_code,
+        instruction_count: instruction_count_from_perf(pe_output),
+        network_summary: network_summary_from_trace(pe_output),
+    };
+
+    let diagnostics_dir = ge.diagnostics_dir();
+    fs::create_dir_all(&diagnostics_dir).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!(
+                "failed to create steam artifact dir {}",
+                diagnostics_dir.display()
+            ),
+            &error,
+        )
+    })?;
+    let json_path = diagnostics_dir.join(format!("{short_sha}-steam-bootstrap.json"));
+    let log_path = diagnostics_dir.join(format!("{short_sha}-steam-bootstrap.log"));
+
+    let json_body = util::stable_json(&artifact)?;
+    util::write_string(&json_path, &json_body)?;
+
+    let mut log_lines = Vec::new();
+    log_lines.push(format!("Casa1 commit: {}", provenance.commit_sha));
+    log_lines.push(format!("dirty tree: {}", provenance.dirty_tree));
+    log_lines.push(format!("fixture hash: {}", provenance.fixture_hash));
+    log_lines.push(format!("GE hash: {}", provenance.ge_hash));
+    log_lines.push(format!(
+        "Steam executable hash: {}",
+        provenance.steam_executable_hash
+    ));
+    log_lines.push(format!("timestamp: {}", provenance.timestamp_utc_rfc3339));
+    log_lines.push(format!("host macOS: {}", provenance.host_os));
+    log_lines.push(format!("host architecture: {}", provenance.host_arch));
+    log_lines.extend(milestones_log_lines(&pe_output.milestones));
+    log_lines.push(format!("exit_code: {}", pe_output.exit_code));
+    log_lines.push(format!(
+        "instruction_count: {}",
+        artifact
+            .instruction_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unavailable".to_string())
+    ));
+    log_lines.push("network_summary:".to_string());
+    for line in &artifact.network_summary {
+        log_lines.push(format!("  {line}"));
+    }
+    util::write_string(&log_path, &format!("{}\n", log_lines.join("\n")))?;
+    Ok(())
 }

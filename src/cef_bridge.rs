@@ -4233,10 +4233,21 @@ impl CefBridge {
         width: u32,
         height: u32,
     ) {
+        // Steam run instrumentation (no behavior change): a CEF software
+        // paint was observed.
+        crate::steam_milestones::note_cef_paint(false);
         let browser_id = match self.browsers.get(&browser_handle) {
             Some(b) => b.id,
             None => {
                 eprintln!("[CefBridge] OnPaint: browser {browser_handle:#x} not found",);
+                crate::steam_milestones::record_first_failure(
+                    crate::steam_milestones::FailureCategory::Cef,
+                    0,
+                    crate::steam_milestones::host_thread_id(),
+                    Some("CefRenderHandler::OnPaint".to_string()),
+                    None,
+                    format!("OnPaint for unknown browser handle {browser_handle:#x}"),
+                );
                 return;
             }
         };
@@ -4350,10 +4361,21 @@ impl CefBridge {
         _paint_type: u32,
         shared_handle: *mut std::ffi::c_void,
     ) -> bool {
+        // Steam run instrumentation (no behavior change): a CEF accelerated
+        // paint was observed.
+        crate::steam_milestones::note_cef_paint(true);
         if shared_handle.is_null() {
             eprintln!(
                 "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} \
                  null shared handle — ignoring",
+            );
+            crate::steam_milestones::record_first_failure(
+                crate::steam_milestones::FailureCategory::Cef,
+                0,
+                crate::steam_milestones::host_thread_id(),
+                Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
+                None,
+                format!("null shared handle for browser {browser_handle:#x}"),
             );
             return false;
         }
@@ -4362,6 +4384,14 @@ impl CefBridge {
             Some(b) => b.id,
             None => {
                 eprintln!("[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} not found",);
+                crate::steam_milestones::record_first_failure(
+                    crate::steam_milestones::FailureCategory::Cef,
+                    0,
+                    crate::steam_milestones::host_thread_id(),
+                    Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
+                    None,
+                    format!("accelerated paint for unknown browser handle {browser_handle:#x}"),
+                );
                 return false;
             }
         };

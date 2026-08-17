@@ -2005,6 +2005,13 @@ impl Win32Subsystem {
         delete_on_close: bool,
     ) -> AppResult<Handle> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
+        // Steam run instrumentation (no behavior change): note the
+        // package-writability probe (`C:\package` or `C:\*.crash` opened for
+        // write) in the shared milestone static.
+        crate::steam_milestones::note_package_writability_probe(
+            &normalized_path,
+            granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0,
+        );
         let exists = host_path.exists();
         if exists && host_path.is_dir() {
             if !backup_semantics
@@ -2026,6 +2033,10 @@ impl Win32Subsystem {
             // open without compatible share modes fails with a sharing
             // violation.
             let ge_handle = Some(self.ge.open_file(path, desired_access, share_mode)?);
+            // Steam run instrumentation (no behavior change): record a
+            // successful manifest open (the directory branch opens a
+            // `C:\package` handle with backup semantics).
+            crate::steam_milestones::note_manifest_path(&normalized_path);
             return Ok(self.insert_object(
                 ObjectType::File,
                 granted_access,
@@ -2208,6 +2219,9 @@ impl Win32Subsystem {
             .write(desired_access.write)
             .open(&host_path)
             .ok();
+        // Steam run instrumentation (no behavior change): record a successful
+        // manifest open in the shared milestone static.
+        crate::steam_milestones::note_manifest_path(&normalized_path);
         Ok(self.insert_object(
             ObjectType::File,
             granted_access,
@@ -2485,6 +2499,9 @@ impl Win32Subsystem {
                         }
                         data.truncate(read_total);
                         file.position = start.saturating_add(read_total as u64);
+                        // Steam run instrumentation (no behavior change): a
+                        // full read of the manifest file completed.
+                        crate::steam_milestones::note_manifest_read(&file.normalized_path);
                         return Ok(data);
                     }
                     // Fallback for handles without an open descriptor
@@ -2500,6 +2517,9 @@ impl Win32Subsystem {
                     let start = (file.position as usize).min(bytes.len());
                     let end = start.saturating_add(length).min(bytes.len());
                     file.position = end as u64;
+                    // Steam run instrumentation (no behavior change): a full
+                    // read of the manifest file completed.
+                    crate::steam_milestones::note_manifest_read(&file.normalized_path);
                     return Ok(bytes[start..end].to_vec());
                 }
                 invalid_handle("handle is not a file")

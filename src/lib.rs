@@ -208,6 +208,7 @@ pub mod steam;
 pub mod steam_input;
 pub mod steam_integration;
 pub mod steam_launch;
+pub mod steam_milestones;
 pub mod steam_protocol;
 pub mod steamvr;
 pub mod telemetry;
