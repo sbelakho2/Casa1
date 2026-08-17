@@ -1814,6 +1814,11 @@ pub struct JitCompiler {
     /// address is stable (Vec reallocation won't move it).
     #[allow(clippy::vec_box)]
     helper_insns: Vec<Box<IrInstruction>>,
+    /// Byte offset of the safepoint `cbnz` instruction emitted by
+    /// `emit_safepoint_check`; patched with the stub offset when the block
+    /// body and stub have been emitted.  `None` when the block has no
+    /// safepoint check (or it has already been patched).
+    safepoint_cbnz_patch: Option<usize>,
 }
 
 impl Default for JitCompiler {
@@ -1828,6 +1833,7 @@ impl JitCompiler {
             emitter: Emitter::new(),
             memory_manager: JitMemoryManager::new(),
             helper_insns: Vec::new(),
+            safepoint_cbnz_patch: None,
         }
     }
 
@@ -1867,6 +1873,12 @@ impl JitCompiler {
         // x0 = &CpuState, x1 = memory base, x2 = &MemoryImage, x3 = &exit_reason
         self.emit_load_guest_registers(arch);
 
+        // Host safepoint check: every compiled block polls the safepoint
+        // flag at entry, so a chained loop re-entering its first block is
+        // still interruptible by the scheduler.  The stub is emitted and
+        // the branch patched after the body below.
+        self.emit_safepoint_check(arch);
+
         // Compile each IR instruction, optionally using fast-thunk info
         // to emit direct calls for known host thunks.
         for insn in ir {
@@ -1876,6 +1888,10 @@ impl JitCompiler {
         // Epilogue: store guest GPRs back to CpuState and return
         self.emit_store_guest_registers(arch);
         self.emit_epilogue();
+
+        // Safepoint stub: the prologue cbnz branches here when the
+        // safepoint flag is set; store guest state and return EXIT_SAFEPOINT.
+        self.finish_safepoint_stub(arch);
 
         // Allocate executable memory and copy the code
         let code_size = self.emitter.len();
@@ -1909,6 +1925,54 @@ impl JitCompiler {
             source_hash,
             last_exit_info,
         })
+    }
+
+    pub fn emit_safepoint_check(&mut self, _arch: GuestArch) {
+        // The check is emitted into every compiled block so that translated
+        // execution polls the host safepoint flag even when block chains
+        // never return to the dispatcher.  The JIT is dormant on macOS 26
+        // (MAP_JIT is blocked for ad-hoc-signed binaries), so this code is
+        // not executed today — but the mechanism lives in the translated
+        // bytes, not in a doc comment: re-enabling the JIT requires no
+        // further work.
+        //
+        // Layout:
+        //   mov_imm64 x26, &JIT_SAFEPOINT_REQUESTED   // flag address
+        //   ldrb  w26, [x26]                          // 1-byte atomic load
+        //   cbnz  w26, safepoint_stub                 // patched at block end
+        //   <block body>
+        //   <normal exit: store guest regs; movz x0, EXIT_NORMAL; epilogue>
+        //   safepoint_stub:                           // (forward branch target)
+        //     store guest regs
+        //     movz x0, EXIT_SAFEPOINT
+        //     epilogue
+        //
+        // x26 is a scratch temp (guest GPRs live in x4-x17) and is
+        // initialized by the block body before any use, so the check
+        // clobbering it at block entry is safe.
+        let flag_addr = &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64;
+        self.emitter.mov_imm64(regmap::X26, flag_addr);
+        self.emitter.ldr8(regmap::X26, regmap::X26, 0);
+        self.safepoint_cbnz_patch = Some(self.emitter.len());
+        self.emitter.cbnz(regmap::X26, 0);
+    }
+
+    /// Emit the safepoint stub (store guest registers, return EXIT_SAFEPOINT)
+    /// at the end of the block and patch the prologue `cbnz` to branch to it.
+    /// Must be called after the block body and its normal epilogue.
+    fn finish_safepoint_stub(&mut self, arch: GuestArch) {
+        let Some(cbnz_pos) = self.safepoint_cbnz_patch.take() else {
+            return;
+        };
+        let stub_pos = self.emitter.len();
+        self.emit_store_guest_registers(arch);
+        self.emitter.movz(regmap::X0, EXIT_SAFEPOINT as u16, 0);
+        self.emit_epilogue();
+        let offset = (stub_pos as i32 - cbnz_pos as i32) / 4;
+        debug_assert!(offset > 0 && (offset as u32) <= 0x7ffff);
+        let insn = 0xb5000000u32 | (((offset as u32) & 0x7ffff) << 5) | regmap::X26;
+        let bytes = insn.to_le_bytes();
+        self.emitter.code[cbnz_pos..cbnz_pos + 4].copy_from_slice(&bytes);
     }
 
     fn emit_prologue(&mut self, arch: GuestArch) {
@@ -3296,17 +3360,6 @@ impl JitRuntime {
     /// [`JitExitReason::Safepoint`], runs the host safepoint body (pump
     /// pending guest threads, drain timers/APCs, advance the guest clock),
     /// then re-dispatches the block.
-    ///
-    /// Dormant: the JIT is disabled (macOS 26 blocks MAP_JIT execution for
-    /// ad-hoc-signed binaries), so this emits nothing today.  The flag
-    /// (`JIT_SAFEPOINT_REQUESTED`), the exit code (`EXIT_SAFEPOINT`) and
-    /// the reason mapping are all wired, so re-enabling the JIT only
-    /// requires calling this from `compile_block`.
-    #[allow(dead_code)]
-    pub fn emit_safepoint_check(&mut self, _arch: GuestArch) {
-        // No-op while the JIT is dormant — see the doc comment above.
-    }
-
     /// Execute a JIT-compiled block.
     ///
     /// # Safety
@@ -6095,6 +6148,142 @@ mod tests {
         let rt = JitRuntime::new(GuestArch::X64);
         assert_eq!(rt.blocks_compiled, 0);
         assert_eq!(rt.blocks_executed, 0);
+    }
+
+    #[test]
+    fn compiled_block_contains_patched_safepoint_check_and_stub() {
+        // Every compiled block must poll the host safepoint flag in the
+        // translated code itself (not just at dispatch boundaries): the
+        // emitted bytes must contain movz/movk x26 (flag address), an LDRB
+        // of the flag, a CBNZ W26 whose patched target lands exactly on the
+        // stub's `movz x0, EXIT_SAFEPOINT`, and the stub must end with RET.
+        let mut compiler = JitCompiler::new();
+        let ir = vec![IrInstruction::Nop];
+        let block = compiler
+            .compile_block(&ir, 0x1000, GuestArch::X64, None)
+            .expect("compile block");
+        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // LDRB W26, [X26] — 0x39400000 | (26 << 5) | 26
+        let ldrb = 0x39400000u32 | (26 << 5) | 26;
+        let ldrb_pos = words.iter().position(|w| *w == ldrb);
+        assert!(
+            ldrb_pos.is_some(),
+            "block must load the safepoint flag byte"
+        );
+
+        // CBNZ W26, <imm19> — 0xb5000000 | (imm19 << 5) | 26
+        let cbnz_pos = words
+            .iter()
+            .position(|w| (w & 0xff00001fu32) == 0xb5000000u32 | 26);
+        assert!(
+            cbnz_pos.is_some(),
+            "block must branch on the safepoint flag (cbnz)"
+        );
+        let cbnz_pos = cbnz_pos.unwrap();
+        let cbnz = words[cbnz_pos];
+        let imm19 = ((cbnz >> 5) & 0x7ffff) as i32;
+        let stub_pos = cbnz_pos as i32 + imm19;
+        assert!(
+            imm19 > 0,
+            "safepoint branch must be a forward branch to the stub"
+        );
+        assert!(
+            stub_pos > ldrb_pos.unwrap() as i32,
+            "stub must come after the flag load"
+        );
+        assert!(
+            (stub_pos as usize) < words.len(),
+            "stub position {} must be inside the block ({} words)",
+            stub_pos,
+            words.len()
+        );
+
+        // The stub begins by storing guest registers back to CpuState
+        // (stp pre-indexed, 0xa9bc0000-family encodings), then loads
+        // EXIT_SAFEPOINT into x0 and ends with RET.
+        let stub_words = &words[stub_pos as usize..];
+        assert!(
+            stub_words[0] & 0xffc00000 == 0xa9000000 || stub_words[0] & 0xffc00000 == 0xa9800000,
+            "stub must begin by storing guest registers (stp), got {:08x}",
+            stub_words[0]
+        );
+        let movz_exit = 0xd2800000u32 | (10 << 5);
+        assert!(
+            stub_words.contains(&movz_exit),
+            "stub must load EXIT_SAFEPOINT into x0"
+        );
+
+        // Stub must end with RET (0xd65f03c0) within a small window.
+        let tail = &words[stub_pos as usize..];
+        assert!(tail.contains(&0xd65f03c0), "stub must end with ret");
+
+        // The patch must have been consumed.
+        assert!(
+            compiler.safepoint_cbnz_patch.is_none(),
+            "safepoint patch position must be consumed by finish_safepoint_stub"
+        );
+    }
+
+    #[test]
+    fn safepoint_flag_address_is_wired() {
+        // The emitted movz/movk sequence must target the address of the
+        // JIT_SAFEPOINT_REQUESTED static, so the translated load reads the
+        // very flag the host scheduler sets.
+        let flag_addr = &JIT_SAFEPOINT_REQUESTED as *const AtomicBool as u64;
+        let mut compiler = JitCompiler::new();
+        let ir = vec![IrInstruction::Nop];
+        let block = compiler
+            .compile_block(&ir, 0x1000, GuestArch::X64, None)
+            .expect("compile block");
+        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Reconstruct the 64-bit immediate from the first movz/movk chain
+        // targeting x26 (0xd2800000 | (26) for movz x26; movk 0xf2800000).
+        // Locate the safepoint's own LDRB W26, [X26] (there may be earlier
+        // movz x26 chains from the load phase), then decode the movz/movk
+        // chain immediately preceding it.
+        let ldrb = 0x39400000u32 | (26 << 5) | 26;
+        let ldrb_pos = words
+            .iter()
+            .position(|w| *w == ldrb)
+            .expect("block must load the safepoint flag byte");
+        // The hw field (bits 21-22) must be masked out too, otherwise
+        // movk x26, #imm, LSL 32 (0xf2c0001a) would not match the base.
+        const MASK: u32 = 0xff00_001f;
+        const MOVZ_X26: u32 = 0xd200_001a;
+        const MOVK_X26: u32 = 0xf200_001a;
+        let chain_start = words[..ldrb_pos]
+            .iter()
+            .rposition(|w| (w & MASK) != MOVZ_X26 && (w & MASK) != MOVK_X26)
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let mut imm: u64 = 0;
+        let mut shift = 0;
+        let mut found = false;
+        for w in &words[chain_start..ldrb_pos] {
+            if (w & MASK) == MOVZ_X26 {
+                imm = ((*w >> 5) & 0xffff) as u64;
+                shift = 16;
+                found = true;
+            } else if (w & MASK) == MOVK_X26 {
+                imm |= (((*w >> 5) & 0xffff) as u64) << shift;
+                shift += 16;
+            }
+        }
+        assert!(found, "block must load the safepoint flag address into x26");
+        assert_eq!(
+            imm, flag_addr,
+            "emitted flag address must be JIT_SAFEPOINT_REQUESTED"
+        );
     }
 
     #[test]
