@@ -55,6 +55,8 @@ pub struct FirstFailure {
     pub api: Option<String>,
     /// Guest-visible error code (GetLastError / WSAGetLastError / errno).
     pub guest_error: Option<u32>,
+    /// The Windows path involved (file failures), when known.
+    pub windows_path: Option<String>,
     /// Short human-readable detail string.
     pub detail: String,
 }
@@ -97,6 +99,7 @@ pub struct FirstFailureGroup {
 /// Record `failure` into `slot` only when the category slot is still empty.
 ///
 /// Pure: callers may apply it to a local struct or to the shared static.
+#[allow(clippy::too_many_arguments)]
 pub fn record_first_failure_in(
     milestones: &mut SteamMilestones,
     category: FailureCategory,
@@ -105,6 +108,7 @@ pub fn record_first_failure_in(
     api: Option<String>,
     guest_error: Option<u32>,
     detail: String,
+    path_value: Option<String>,
 ) -> bool {
     let slot = match category {
         FailureCategory::Fs => &mut milestones.first_failures.fs,
@@ -123,6 +127,7 @@ pub fn record_first_failure_in(
         api,
         guest_error,
         detail,
+        windows_path: path_value,
     });
     true
 }
@@ -135,6 +140,7 @@ pub fn record_first_failure(
     api: Option<String>,
     guest_error: Option<u32>,
     detail: String,
+    path_value: Option<String>,
 ) -> bool {
     with_milestones(|milestones| {
         record_first_failure_in(
@@ -145,6 +151,7 @@ pub fn record_first_failure(
             api,
             guest_error,
             detail,
+            path_value,
         )
     })
     .unwrap_or(false)

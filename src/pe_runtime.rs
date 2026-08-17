@@ -10305,6 +10305,7 @@ impl PeHostRuntime {
                     Some("LiveFramePublish".to_string()),
                     None,
                     "live frame channel full — frame dropped".to_string(),
+                    None,
                 );
             }
         }
@@ -11958,7 +11959,7 @@ impl PeHostRuntime {
     /// filesystem failure for the run (guest_pc from `state.rip`, error code
     /// from `self.last_error`).  Later failures in the same category are
     /// ignored by the shared milestone static.
-    fn record_fs_first_failure(&self, state: &CpuState, api: &str, detail: &str) {
+    fn record_fs_first_failure(&self, state: &CpuState, api: &str, detail: &str, path: &str) {
         crate::steam_milestones::record_first_failure(
             crate::steam_milestones::FailureCategory::Fs,
             state.rip as u32,
@@ -11966,6 +11967,7 @@ impl PeHostRuntime {
             Some(api.to_string()),
             (self.last_error != 0).then_some(self.last_error),
             detail.to_string(),
+            Some(path.to_string()),
         );
     }
 
@@ -29226,7 +29228,7 @@ impl PeHostRuntime {
                         Err(error) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = last_error_from_app_error(&error);
-                            self.record_fs_first_failure(state, "CreateFileW", "named-pipe client open failed");
+                            self.record_fs_first_failure(state, "CreateFileW", "named-pipe client open failed", "");
                             self.push_trace(
                                 "file",
                                 "CreateFileW",
@@ -29253,7 +29255,7 @@ impl PeHostRuntime {
                     // the current directory.
                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                     self.last_error = ERROR_PATH_NOT_FOUND;
-                    self.record_fs_first_failure(state, "CreateFileW", "empty file path");
+                    self.record_fs_first_failure(state, "CreateFileW", "empty file path", "");
                     self.push_trace(
                         "file",
                         "CreateFileW",
@@ -29406,7 +29408,7 @@ impl PeHostRuntime {
                                             Err(error) => {
                                                 state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                                 self.last_error = last_error_from_app_error(&error);
-                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed");
+                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed", "");
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29432,7 +29434,7 @@ impl PeHostRuntime {
                                     Err(error) => {
                                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                         self.last_error = last_error_from_app_error(&error);
-                                        self.record_fs_first_failure(state, "CreateFileW", "ADS stream create failed");
+                                        self.record_fs_first_failure(state, "CreateFileW", "ADS stream create failed", "");
                                         self.push_trace(
                                             "file",
                                             "CreateFileW",
@@ -29517,7 +29519,7 @@ impl PeHostRuntime {
                                             Err(error) => {
                                                 state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                                 self.last_error = last_error_from_app_error(&error);
-                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed");
+                                                self.record_fs_first_failure(state, "CreateFileW", "template attribute apply failed", "");
                                                 self.push_trace(
                                                     "file",
                                                     "CreateFileW",
@@ -29541,7 +29543,7 @@ impl PeHostRuntime {
                                     Err(error) => {
                                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                         self.last_error = last_error_from_app_error(&error);
-                                        self.record_fs_first_failure(state, "CreateFileW", "file create failed");
+                                        self.record_fs_first_failure(state, "CreateFileW", "file create failed", &path);
                                         self.push_trace(
                                             "file",
                                             "CreateFileW",
@@ -34050,7 +34052,7 @@ impl PeHostRuntime {
                                     .map(|a| a.port)
                                     .unwrap_or(0),
                             ),
-                        );
+                        None);
                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                         self.last_error = 0;
                     }
@@ -34110,7 +34112,7 @@ impl PeHostRuntime {
                             Some("ConnectEx".to_string()),
                             Some(self.network.wsa_get_last_error() as u32),
                             error.message.clone(),
-                        );
+                        None);
                         self.push_trace(
                             "network",
                             "ConnectEx",
@@ -34471,7 +34473,7 @@ impl PeHostRuntime {
                             Some("send".to_string()),
                             Some(WSAEFAULT as u32),
                             "send with null buffer and non-zero length".to_string(),
-                        );
+                        None);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     if flags != 0 {
@@ -34485,7 +34487,7 @@ impl PeHostRuntime {
                             Some("send".to_string()),
                             Some(WSAEINVAL as u32),
                             "send with unsupported flags".to_string(),
-                        );
+                        None);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     let bytes = if length == 0 {
@@ -34524,7 +34526,7 @@ impl PeHostRuntime {
                             Some("send".to_string()),
                             Some(self.network.wsa_get_last_error() as u32),
                             error.message.clone(),
-                        );
+                        None);
                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                         self.last_error = 0;
                     }
@@ -40543,7 +40545,7 @@ impl PeHostRuntime {
                         Err(error) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = last_error_from_app_error(&error);
-                            self.record_fs_first_failure(state, "CreateFileA", "named-pipe client open failed");
+                            self.record_fs_first_failure(state, "CreateFileA", "named-pipe client open failed", "");
                         }
                     }
                 } else if raw_path.is_empty() {
@@ -40552,7 +40554,7 @@ impl PeHostRuntime {
                     // the current directory.
                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                     self.last_error = ERROR_PATH_NOT_FOUND;
-                    self.record_fs_first_failure(state, "CreateFileA", "empty file path");
+                    self.record_fs_first_failure(state, "CreateFileA", "empty file path", "");
                 } else {
                     // hTemplateFile (arg 6) resolution — same Win32 semantics
                     // as CreateFileW: NULL means no template; a non-NULL value
@@ -40580,7 +40582,7 @@ impl PeHostRuntime {
                         Err(_) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                             self.last_error = ERROR_INVALID_HANDLE;
-                            self.record_fs_first_failure(state, "CreateFileA", "invalid template handle");
+                            self.record_fs_first_failure(state, "CreateFileA", "invalid template handle", "");
                         }
                         Ok(template_attributes) => {
                             // A template only applies when the disposition
@@ -40643,14 +40645,14 @@ impl PeHostRuntime {
                                         Err(error) => {
                                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                             self.last_error = last_error_from_app_error(&error);
-                                            self.record_fs_first_failure(state, "CreateFileA", "template attribute apply failed");
+                                            self.record_fs_first_failure(state, "CreateFileA", "template attribute apply failed", "");
                                         }
                                     }
                                 }
                                 Err(error) => {
                                     state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                     self.last_error = last_error_from_app_error(&error);
-                                    self.record_fs_first_failure(state, "CreateFileA", "file create failed");
+                                    self.record_fs_first_failure(state, "CreateFileA", "file create failed", &path);
                                 }
                             }
                         }
@@ -51110,6 +51112,7 @@ impl PeHostRuntime {
                 Some("CreateThread".to_string()),
                 None,
                 "guest thread scheduling refused on non-x86 guest".to_string(),
+                None,
             );
             return Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
@@ -52976,6 +52979,7 @@ impl PeHostRuntime {
             Some("_invalid_parameter_handler".to_string()),
             Some(errno_value.unsigned_abs()),
             "CRT invalid-parameter handler invoked".to_string(),
+            None,
         );
         self.set_crt_errno(memory, errno_value);
         if self.raise_invalid_parameter(state, memory, 0, 0, 0)? {

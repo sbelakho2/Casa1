@@ -4247,6 +4247,7 @@ impl CefBridge {
                     Some("CefRenderHandler::OnPaint".to_string()),
                     None,
                     format!("OnPaint for unknown browser handle {browser_handle:#x}"),
+                    None,
                 );
                 return;
             }
@@ -4376,6 +4377,7 @@ impl CefBridge {
                 Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
                 None,
                 format!("null shared handle for browser {browser_handle:#x}"),
+                None,
             );
             return false;
         }
@@ -4391,6 +4393,7 @@ impl CefBridge {
                     Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
                     None,
                     format!("accelerated paint for unknown browser handle {browser_handle:#x}"),
+                    None,
                 );
                 return false;
             }
