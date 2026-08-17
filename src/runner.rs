@@ -342,7 +342,26 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         } {
             Ok(pe_output) => pe_output,
             Err(error) => {
-                if let Some(recovered) = try_recover_budget_exhausted_steam_install(
+                if is_wall_clock_deadline(&error) {
+                    // The wall-clock run deadline (CASA1_PE_RUNTIME_DEADLINE_SECS)
+                    // ended a guest that never exits (Steam's wait-bound main
+                    // loop).  Convert it into a completed result with exit
+                    // code -2 so the telemetry artifacts are produced; the
+                    // milestone counters and provenance live in shared
+                    // statics, so nothing is lost.
+                    crate::pe_runtime::PeExecutionResult {
+                        synthetic_pid: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: -2,
+                        guest_exceptions: Vec::new(),
+                        gfx_frames: Vec::new(),
+                        perf: Vec::new(),
+                        trace_events: Vec::new(),
+                        milestones: crate::steam_milestones::snapshot_milestones(),
+                        provenance: crate::steam_milestones::RunProvenance::from_env(),
+                    }
+                } else if let Some(recovered) = try_recover_budget_exhausted_steam_install(
                     &mut logger,
                     &mut runner_events,
                     &mut ge,
@@ -998,6 +1017,13 @@ fn budget_exhausted(error: &AppError) -> bool {
             || error.message.contains("wall-clock deadline"))
 }
 
+/// True when the error is the wall-clock run deadline marker.  These runs
+/// end deliberately (exit code -2) and must NOT go through the NSIS
+/// install-recovery path, which targets budget-exhausted installs.
+fn is_wall_clock_deadline(error: &AppError) -> bool {
+    error.code == ReasonCode::RcUnimplInsn && error.message.contains("wall-clock deadline")
+}
+
 fn steam_zero_touch_request(job: &RunnerJob) -> AppResult<Option<SteamZeroTouchRequest>> {
     if job.env.get("CASA1_STEAM_ZERO_TOUCH").map(String::as_str) != Some("1") {
         return Ok(None);
@@ -1154,6 +1180,7 @@ fn is_steam_executable(program: &Path) -> bool {
 struct SteamBootstrapArtifact {
     provenance: crate::steam_milestones::RunProvenance,
     milestones: crate::steam_milestones::SteamMilestones,
+    last_thunk: Option<crate::steam_milestones::LastThunk>,
     exit_code: i32,
     instruction_count: Option<u64>,
     network_summary: Vec<String>,
@@ -1305,6 +1332,7 @@ fn write_steam_bootstrap_artifacts(
     let artifact = SteamBootstrapArtifact {
         provenance: provenance.clone(),
         milestones: pe_output.milestones.clone(),
+        last_thunk: crate::steam_milestones::snapshot_last_thunk(),
         exit_code: pe_output.exit_code,
         instruction_count: instruction_count_from_perf(pe_output),
         network_summary: network_summary_from_trace(pe_output),
@@ -1348,6 +1376,12 @@ fn write_steam_bootstrap_artifacts(
             .map(|count| count.to_string())
             .unwrap_or_else(|| "unavailable".to_string())
     ));
+    if let Some(last) = &artifact.last_thunk {
+        log_lines.push(format!(
+            "last_thunk: {} at guest_pc={:#x} after {}s of wall time",
+            last.name, last.guest_pc, last.wall_secs_since_start
+        ));
+    }
     log_lines.push("network_summary:".to_string());
     for line in &artifact.network_summary {
         log_lines.push(format!("  {line}"));

@@ -4803,7 +4803,14 @@ impl Win32Subsystem {
         }
         // Advance guest clock; pace the host sleep like `sleep`.
         self.record_sleep_observation(milliseconds, milliseconds);
-        let host_sleep_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing);
+        // Cap the HOST sleep at 100 ms regardless of pacing: the guest clock
+        // already advanced by the full requested amount, and an uncapped
+        // live-pacing sleep would block the host for the full duration —
+        // Sleep(INFINITE)/Sleep(huge) (Steam's shutdown handshake) stalls
+        // the whole emulator with no way to service timers or the run
+        // deadline.  The guest observes the full sleep via its clock; the
+        // host only paces a bounded slice.
+        let host_sleep_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing).min(100);
         std::thread::sleep(Duration::from_millis(host_sleep_ms));
         Ok(WaitStatus::Object0)
     }

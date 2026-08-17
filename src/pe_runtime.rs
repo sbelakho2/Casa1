@@ -4438,6 +4438,7 @@ pub fn execute_with_options(
 ) -> AppResult<PeExecutionResult> {
     // ── Entry trace ─────────────────────────────────────────────────────────
     crate::live::live_trace("[pe] execute_with_options ENTERED");
+    crate::steam_milestones::mark_run_start();
     // ── Diagnostic markers (DISABLED: file I/O was too slow) ─────────────────
     // Was writing to /tmp/casa1_diag.txt but file open/write/flush/close on
     // every call throttled execution to ~10 iterations/second.  All diag()
@@ -11997,6 +11998,7 @@ impl PeHostRuntime {
                 )
             })?;
         let thunk_name = format!("{thunk:?}");
+        crate::steam_milestones::record_last_thunk(&thunk_name, state.rip as u32);
         let callee_saved_before = if self.guest_arch == GuestArch::X86 {
             Some((
                 state.get(Register::Rbx),
@@ -29443,7 +29445,16 @@ impl PeHostRuntime {
                                     Err(error) => {
                                         state.set(Register::Rax, INVALID_HANDLE_VALUE);
                                         self.last_error = last_error_from_app_error(&error);
-                                        self.record_fs_first_failure(state, "CreateFileW", "ADS stream create failed", "", None);
+                                        self.record_fs_first_failure(
+                                                    state,
+                                                    "CreateFileW",
+                                                    "ADS stream create failed",
+                                                    &base_guest_path,
+                                                    Some(format!(
+                                                        "{{\"stream\":{:?},\"base\":{base_guest_path:?},\"desired_access\":{desired_access_raw:#x},\"creation\":{creation_raw:#x}}}",
+                                                        stream.stream_name
+                                                    )),
+                                                );
                                         self.push_trace(
                                             "file",
                                             "CreateFileW",
@@ -50881,6 +50892,12 @@ impl PeHostRuntime {
         }
 
         let mut steps = 0_u64;
+        // Spin detection for the nested callback loop: the main loop has
+        // same-RIP detection, but a guest spin INSIDE a window callback
+        // (message dispatch) never returns there.  Record where the guest
+        // is stuck so the artifact's first-failure diagnostics localize it.
+        let mut nested_same_rip: u32 = 0;
+        let mut nested_last_rip: u64 = 0;
         loop {
             // The callback was invoked with a synthetic return address of 0
             // pushed at [rsp]; the guest's terminating `ret` sets RIP to that
@@ -51030,6 +51047,30 @@ impl PeHostRuntime {
                 }
             } else if !instruction_controls_rip(last_instruction.opcode) {
                 state.rip = cached_block.end_rip;
+            }
+
+            // Spin detection INSIDE the callback loop: a guest spin in a
+            // window callback never returns to the main loop's own
+            // same-RIP detector; record where the guest is stuck.
+            if state.rip == nested_last_rip {
+                nested_same_rip += 1;
+                if nested_same_rip == 100_000 {
+                    crate::steam_milestones::record_first_failure(
+                        crate::steam_milestones::FailureCategory::Thread,
+                        state.rip as u32,
+                        self.win32.current_thread_id(),
+                        Some(format!("guest spin in {label}")),
+                        None,
+                        format!(
+                            "guest spun {nested_same_rip} iterations at the same RIP inside a callback"
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            } else {
+                nested_last_rip = state.rip;
+                nested_same_rip = 0;
             }
         }
 

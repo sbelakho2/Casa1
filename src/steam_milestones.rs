@@ -137,6 +137,43 @@ pub fn record_first_failure_in(
     true
 }
 
+/// Wall-clock timestamp and identity of the most recently dispatched guest
+/// thunk — the run's "where was the guest when it stopped" marker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LastThunk {
+    pub name: String,
+    pub guest_pc: u32,
+    pub wall_secs_since_start: u64,
+}
+
+static LAST_THUNK: std::sync::Mutex<Option<LastThunk>> = std::sync::Mutex::new(None);
+static RUN_START_WALL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Mark the run start (called once per execute_with_options).
+pub fn mark_run_start() {
+    *RUN_START_WALL.lock().unwrap() = Some(std::time::Instant::now());
+    *LAST_THUNK.lock().unwrap() = None;
+}
+
+/// Record the most recently dispatched thunk (instrumentation only).
+pub fn record_last_thunk(name: &str, guest_pc: u32) {
+    let wall = RUN_START_WALL
+        .lock()
+        .unwrap()
+        .map(|start| start.elapsed().as_secs())
+        .unwrap_or(0);
+    *LAST_THUNK.lock().unwrap() = Some(LastThunk {
+        name: name.to_string(),
+        guest_pc,
+        wall_secs_since_start: wall,
+    });
+}
+
+/// Snapshot the last dispatched thunk for the run artifact.
+pub fn snapshot_last_thunk() -> Option<LastThunk> {
+    LAST_THUNK.lock().unwrap().clone()
+}
+
 /// Record the first failure for `category` into the shared static.
 #[allow(clippy::too_many_arguments)]
 pub fn record_first_failure(
