@@ -994,7 +994,8 @@ fn budget_exhausted(error: &AppError) -> bool {
         && (error
             .message
             .starts_with("PE runtime exceeded the instruction budget")
-            || error.message.contains("instruction budget"))
+            || error.message.contains("instruction budget")
+            || error.message.contains("wall-clock deadline"))
 }
 
 fn steam_zero_touch_request(job: &RunnerJob) -> AppResult<Option<SteamZeroTouchRequest>> {

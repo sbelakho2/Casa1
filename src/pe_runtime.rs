@@ -252,6 +252,13 @@ const PE_RUNTIME_INSTRUCTION_BUDGET: u64 = 25_000_000;
 const SAFEPOINT_INTERVAL_MS: u64 = 2;
 const KEYBOARD_REPLAY_ENV: &str = "CASA1_KEYBOARD_REPLAY_JSON";
 const PE_RUNTIME_BUDGET_ENV: &str = "CASA1_PE_RUNTIME_BUDGET";
+
+/// Set by the deadline watchdog thread (or the main loop) once the
+/// wall-clock run deadline has elapsed.  Checked by the main loop AND by
+/// `advance_runtime_steps`, so a run blocked inside nested guest callbacks
+/// (message dispatch / window procs) still terminates.
+pub static RUN_DEADLINE_EXPIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Optional wall-clock run deadline in seconds (e.g. `CASA1_PE_RUNTIME_DEADLINE_SECS=600`).
 /// Steam's main loop is wait-bound and never exits on its own; the deadline
 /// ends the run with exit code -2 (the timeout convention) so diagnostic
@@ -4751,6 +4758,15 @@ pub fn execute_with_options(
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+    // Deadline watchdog: independent of the main loop, so a run stuck
+    // inside nested thunk/callback execution still terminates.
+    if let Some(deadline) = run_deadline {
+        std::thread::spawn(move || {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(remaining);
+            RUN_DEADLINE_EXPIRED.store(true, std::sync::atomic::Ordering::Release);
+        });
+    }
     let mut state = CpuState::new(guest_arch);
     let guest_pointer_bytes = guest_arch.pointer_bytes() as u64;
     let stack_bottom = stack_base_for_arch(guest_arch);
@@ -4823,9 +4839,7 @@ pub fn execute_with_options(
         // intact as a fallback for when JIT block chains are re-enabled;
         // the old 50 ms main-loop chain-break timer is replaced by this
         // safepoint.
-        if let Some(deadline) = run_deadline
-            && std::time::Instant::now() >= deadline
-        {
+        if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
             // Wall-clock run deadline (instrumentation): end the run with
             // exit code -2 so artifacts are produced even though Steam's
             // main loop never exits on its own.
@@ -70969,6 +70983,17 @@ fn advance_runtime_steps(
     test_id: &str,
 ) -> AppResult<()> {
     let next_steps = steps.saturating_add(consumed_instructions);
+    if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
+        // Mirrors the instruction-budget error so the runner's recovery
+        // path produces diagnostic artifacts for deadline-capped runs.
+        return Err(AppError::new(
+            ReasonCode::RcUnimplInsn,
+            format!(
+                "PE runtime exceeded the wall-clock deadline for {test_id} at {:#x}: steps={next_steps}",
+                state.rip
+            ),
+        ));
+    }
     if state.arch == GuestArch::X86 && runtime.enable_steam_tracing {
         let rip = state.rip;
         let rva = rip.saturating_sub(runtime.mapped_image_base);
