@@ -164,13 +164,32 @@ fn is_drive_letter_colon(path: &str, pos: usize) -> bool {
         return false;
     }
     let prev = path.as_bytes()[pos - 1];
+    if !prev.is_ascii_alphabetic() {
+        return false;
+    }
     // A colon at position 1 preceded by a letter is a drive spec ("C:"),
     // including drive-relative forms like "C:foo" (no drive semantics
     // are applied here, but the colon must not be treated as an ADS
     // separator either).
-    pos == 1 && prev.is_ascii_alphabetic()
+    if pos == 1 {
+        return true;
+    }
+    // Verbatim prefix: "\\?\C:\..." — the drive colon sits after the
+    // letter following the prefix, e.g. index 5 in "\\?\C:\Steam".
+    // Treating it as an ADS separator would split the drive letter off the
+    // path (base "\\?\C", stream "\Steam\logs\bootstrap_log.txt").
+    let prefix_len = if path.starts_with("\\\\?\\") {
+        4
+    } else if path.starts_with("\\.\\") {
+        3
+    } else {
+        0
+    };
+    if prefix_len > 0 && pos == prefix_len + 1 {
+        return true;
+    }
+    false
 }
-
 /// Parse a stream specification string into name and type.
 /// Stream spec can be:
 /// - `Zone.Identifier` → name="Zone.Identifier", type="$DATA"
@@ -1936,6 +1955,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn parse_ntfs_path_verbatim_drive_colon_is_not_ads() {
+        // Verbatim paths: the drive colon after "\\\\?\\C" must NOT be
+        // treated as an ADS separator (regression: base was "\\\\?\\C"
+        // with the whole rest of the path as the stream name, failing
+        // "\\\\?\\C:\\Steam\\logs\\bootstrap_log.txt" opens with
+        // ERROR_PATH_NOT_FOUND).
+        let (base, ads) = parse_ntfs_path("\\\\?\\C:\\Steam\\logs\\bootstrap_log.txt");
+        assert_eq!(base, "\\\\?\\C:\\Steam\\logs\\bootstrap_log.txt");
+        assert!(
+            ads.is_none(),
+            "verbatim path must not be split on the drive colon"
+        );
+
+        let (base, ads) = parse_ntfs_path("\\.\\C:\\Steam\\x.txt");
+        assert_eq!(base, "\\.\\C:\\Steam\\x.txt");
+        assert!(ads.is_none());
+
+        // A REAL ADS after a verbatim prefix still splits at the stream colon.
+        let (base, ads) = parse_ntfs_path("\\\\?\\C:\\Steam\\x.txt:Zone.Identifier");
+        assert_eq!(base, "\\\\?\\C:\\Steam\\x.txt");
+        let ads = ads.expect("real ADS must still be detected");
+        assert_eq!(ads.stream_name, "Zone.Identifier");
+
+        // Plain drive paths keep working.
+        let (base, ads) = parse_ntfs_path("C:\\Steam\\file.txt:Zone.Identifier");
+        assert_eq!(base, "C:\\Steam\\file.txt");
+        assert_eq!(ads.unwrap().stream_name, "Zone.Identifier");
+        let (base, ads) = parse_ntfs_path("C:\\Steam\\file.txt");
+        assert_eq!(base, "C:\\Steam\\file.txt");
+        assert!(ads.is_none());
+    }
+
     fn parse_ntfs_path_simple() {
         let (file_path, stream) = parse_ntfs_path("file.exe:Zone.Identifier");
         assert_eq!(file_path, "file.exe");
