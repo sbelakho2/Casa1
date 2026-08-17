@@ -342,6 +342,7 @@ const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_OPERATION_ABORTED: u32 = 995;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -3795,6 +3796,15 @@ struct PeHostRuntime {
     pending_guest_threads: VecDeque<PendingGuestThread>,
     active_pumped_guest_thread: Option<u32>,
     yield_pumped_guest_thread: bool,
+    /// Wait descriptor attached by a pumped thread's blocking-wait thunk;
+    /// the pump moves it onto the requeued thread record.
+    pump_yield_with_wait: Option<GuestWait>,
+    /// True while the MAIN loop's thread is parked in the scheduler wait
+    /// queue; the main loop then runs pump-driven until the run ends.
+    main_thread_parked: bool,
+    /// Wait descriptor handed off by a wait thunk; the dispatch epilogue
+    /// (after stack fixup + return-address restore) parks the thread with it.
+    parked_wait: Option<GuestWait>,
     yield_pumped_guest_thread_wake_tick: Option<u64>,
     /// Set by `ExitThread`/`_endthreadex`/`_endthread`/`TerminateThread` while
     /// a pumped thread is active: the pump consumes it and ends the thread
@@ -4254,6 +4264,50 @@ enum GuestThreadState {
     Exited,
 }
 
+/// What a parked guest wait is waiting for.  The scheduler resumes the
+/// thread only when the descriptor becomes satisfiable — object signals,
+/// overlapped completion, pipe connection, deadline expiry or (alertable)
+/// APC delivery.
+#[derive(Debug)]
+enum WaitOperation {
+    /// Sleep / SleepEx: no objects; resume at the deadline or via APC
+    /// (alertable).  An infinite non-alertable sleep never resumes.
+    Sleep,
+    /// WaitForSingleObject[Ex] / WaitForMultipleObjects[Ex].
+    Objects,
+    /// GetOverlappedResult(TRUE): resume when the overlapped operation
+    /// completes (no deadline — Windows gives this API no timeout).
+    Overlapped {
+        overlapped_id: u64,
+        /// Guest pointer to the `lpNumberOfBytesTransferred` out-parameter.
+        bytes_ptr: u64,
+    },
+    /// Blocking ConnectNamedPipe: resume when a client connects.
+    PipeConnect { pipe_handle: u32 },
+}
+
+/// A parked guest wait: the thread, the objects, the policy, the deadline
+/// and the alertability, as one scheduler wait descriptor.
+struct GuestWait {
+    objects: Vec<u32>,
+    wait_all: bool,
+    /// Guest-clock deadline ticks; `None` = infinite.
+    deadline_ticks: Option<u64>,
+    alertable: bool,
+    operation: WaitOperation,
+}
+
+/// The result delivered to a resumed waiter.
+struct WaitResume {
+    /// WAIT_OBJECT_0 (+ index for wait-any) / WAIT_TIMEOUT /
+    /// WAIT_IO_COMPLETION / WAIT_ABANDONED_0.
+    code: u32,
+    /// Bytes transferred (overlapped completions).
+    bytes: Option<u32>,
+    /// Last-error value to publish on resume.
+    last_error: Option<u32>,
+}
+
 struct PendingGuestThread {
     handle: u32,
     thread_id: u32,
@@ -4280,6 +4334,12 @@ struct PendingGuestThread {
     /// `exit_code_override.or(Some(RAX))`: an explicit exit is noreturn, so
     /// the procedure's return value only matters when no explicit exit ran.
     exit_code_override: Option<u32>,
+    /// Scheduler wait descriptor when the thread is parked in a wait
+    /// (`None` for plain timeslice yields).
+    wait: Option<GuestWait>,
+    /// Result to apply on resume (RAX + last_error), set by the pump's
+    /// readiness pass.
+    wait_resume: Option<WaitResume>,
 }
 
 enum GuestCallbackDisposition {
@@ -4302,24 +4362,6 @@ struct PumpOutcome {
 struct PumpedThreadOutcome {
     requeue: Option<PendingGuestThread>,
     process_exit: Option<i32>,
-}
-
-/// Outcome of a cooperative wait (`wait_for_single_object_pumping`): either
-/// the final wait status or a process-exit request that the caller must
-/// propagate as a thunk `Some(code)` result.
-enum PumpWaitOutcome {
-    Wait(crate::win32::WaitStatus),
-    /// An APC was delivered to the waiting thread from an alertable wait
-    /// (queued during the wait by a pumped worker); the thunk must return
-    /// WAIT_IO_COMPLETION (0xC0).
-    IoCompletion,
-    /// Historical non-thread behavior: a signal that arrives during the
-    /// pump phase was returned with RAX untouched (the pre-fix thunk did
-    /// `return Ok(None)` without setting RAX).  Steam's shutdown handshake
-    /// depends on the caller seeing its pre-call RAX in this case, so the
-    /// thunk must leave the register alone.
-    Unreported,
-    ProcessExit(i32),
 }
 
 impl Default for ProgressBarState {
@@ -4994,6 +5036,14 @@ pub fn execute_with_options(
             )?;
             if let Some(code) = result {
                 exit_code = code;
+                break;
+            }
+            if runtime.main_thread_parked {
+                // A wait thunk parked the main thread in the scheduler wait
+                // queue: switch to pump-driven execution until the run ends.
+                // The parked thread resumes (and runs) inside the pump, so
+                // `state` here is stale and must not be used again.
+                exit_code = runtime.run_pump_driven(&mut memory, &mut steps, instruction_budget)?;
                 break;
             }
             runtime.drain_pending_dll_main_calls(&mut state, &mut memory)?;
@@ -8585,6 +8635,9 @@ impl PeHostRuntime {
             pending_guest_threads: VecDeque::new(),
             active_pumped_guest_thread: None,
             yield_pumped_guest_thread: false,
+            pump_yield_with_wait: None,
+            main_thread_parked: false,
+            parked_wait: None,
             yield_pumped_guest_thread_wake_tick: None,
             pumped_thread_exit_requested: None,
             pumped_thread_exit_with_detach: true,
@@ -28747,49 +28800,67 @@ impl PeHostRuntime {
                     return Ok(None);
                 }
                 let timeout = guest_call_arg_u32(state, memory, 1)?;
-                let is_thread = matches!(
-                    self.win32.handle_object_type(handle),
-                    Ok(crate::win32::ObjectType::Thread)
-                );
-                let wait_result = if is_thread {
-                    self.wait_for_single_object_pumping(state, memory, handle, timeout, false)
-                } else {
-                    self.wait_for_single_object_non_thread(state, memory, handle, timeout, false)
-                };
-                match wait_result {
-                    Ok(PumpWaitOutcome::Wait(result)) => {
-                        state.set(Register::Rax, u64::from(result.code()));
-                        self.last_error = 0;
-                        self.push_trace(
-                            "process",
-                            "WaitForSingleObject",
-                            BTreeMap::from([
-                                ("handle".to_string(), json!(format!("{handle:#x}"))),
-                                ("timeout_ms".to_string(), json!(timeout)),
-                            ]),
-                            json!(result.code()),
-                        );
-                    }
-                    Ok(PumpWaitOutcome::IoCompletion) => {
-                        state.set(Register::Rax, crate::win32::WAIT_IO_COMPLETION as u64);
-                        self.last_error = 0;
-                    }
-                    Ok(PumpWaitOutcome::Unreported) => {
-                        // Historical behavior: leave RAX untouched so the
-                        // caller sees its pre-call value.
-                        self.last_error = 0;
-                    }
-                    Ok(PumpWaitOutcome::ProcessExit(code)) => {
-                        // A pumped thread requested process exit while we
-                        // were pumping — end the guest run.
-                        return Ok(Some(code));
-                    }
+                // Documented divergence: the ACTIVE pumped thread can never
+                // reach `Exited` while the current dispatch is running, so a
+                // wait on it could never make progress — report WAIT_TIMEOUT
+                // immediately (Windows resolves this via preemptive
+                // scheduling; the guest retries the join).
+                if self.active_pumped_guest_thread == Some(handle) {
+                    state.set(Register::Rax, u64::from(crate::win32::WAIT_TIMEOUT));
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // Scheduler-backed wait: one consuming poll, then park.
+                let object_type = match self.win32.handle_object_type(handle) {
+                    Ok(object_type) => object_type,
                     Err(error) => {
                         state.set(Register::Rax, u64::from(u32::MAX));
                         self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
                     }
+                };
+                let status = match self.win32.wait_for_single_object_instant(
+                    handle,
+                    object_type,
+                    self.win32.current_thread_id(),
+                ) {
+                    Ok(status) => status,
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(u32::MAX));
+                        self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
+                    }
+                };
+                if !matches!(status, crate::win32::WaitStatus::Timeout) {
+                    state.set(Register::Rax, u64::from(status.code()));
+                    self.last_error = 0;
+                } else if timeout == 0 {
+                    state.set(Register::Rax, u64::from(crate::win32::WAIT_TIMEOUT));
+                    self.last_error = 0;
+                } else {
+                    let now = self.win32.get_tick_count64();
+                    self.parked_wait = Some(GuestWait {
+                        objects: vec![handle],
+                        wait_all: false,
+                        deadline_ticks: (timeout != u32::MAX)
+                            .then(|| now.saturating_add(timeout as u64)),
+                        alertable: false,
+                        operation: WaitOperation::Objects,
+                    });
+                    // Fall through: the dispatch epilogue pops the args,
+                    // restores the return address and parks the thread.
+                    self.push_trace(
+                        "process",
+                        "WaitForSingleObject",
+                        BTreeMap::from([
+                            ("handle".to_string(), json!(format!("{handle:#x}"))),
+                            ("timeout_ms".to_string(), json!(timeout)),
+                        ]),
+                        json!(0),
+                    );
                 }
             }
+
             HostThunk::WaitForMultipleObjects => {
                 let count = guest_call_arg_u32(state, memory, 0)?;
                 let handles_ptr = guest_call_arg(state, memory, 1)?;
@@ -28808,186 +28879,87 @@ impl PeHostRuntime {
                         handles.push(handle);
                     }
 
-                    if timeout == 0 {
-                        // Non-blocking single poll pass.
-                        match self
-                            .win32
-                            .wait_for_multiple_objects(&handles, wait_all, 0, false, None)
-                        {
-                            Ok((status, index))
-                                if !matches!(
-                                    status,
-                                    crate::win32::WaitStatus::Timeout
-                                ) =>
-                            {
-                                result_code = status.code().wrapping_add(index as u32);
-                                self.last_error = 0;
+                    // Single non-blocking evaluation pass.
+                    let mut satisfied: Option<(u32, u32)> = None; // (code, index)
+                    if wait_all {
+                        match self.win32.evaluate_wait_all(
+                            &handles,
+                            self.win32.current_thread_id(),
+                        ) {
+                            Ok(Some(status)) => {
+                                satisfied = Some((status.code(), 0));
                             }
-                            Ok(_) => {
-                                result_code = crate::win32::WAIT_TIMEOUT;
-                            }
+                            Ok(None) => {}
                             Err(error) => {
-                                result_code = u32::MAX; // WAIT_FAILED
+                                state.set(Register::Rax, u64::from(u32::MAX)); // WAIT_FAILED
                                 self.last_error = last_error_from_app_error(&error);
+                                return Ok(None);
                             }
                         }
                     } else {
-                        let any_thread = handles.iter().any(|&handle| {
-                            matches!(
-                                self.win32.handle_object_type(handle),
-                                Ok(crate::win32::ObjectType::Thread)
-                            )
-                        });
-                        if !any_thread {
-                            // Historical non-thread behavior (mirrors the
-                            // pre-fix thunk): a non-blocking poll pass, then a
-                            // blocking win32 wait on the first handle (finite
-                            // timeouts advance the guest clock; process
-                            // handles block on the exit_sync condvar), then
-                            // pump pending guest threads while the queue is
-                            // non-empty, then report.  Guests rely on this
-                            // interleaving for event handshakes, so do not
-                            // pump DURING the timeout window.
-                            match self
-                                .win32
-                                .wait_for_multiple_objects(&handles, wait_all, 0, false, None)
-                            {
-                                Ok((status, index))
-                                    if !matches!(
-                                        status,
-                                        crate::win32::WaitStatus::Timeout
-                                    ) =>
-                                {
-                                    result_code = status.code().wrapping_add(index as u32);
-                                    self.last_error = 0;
-                                }
-                                Ok(_) => {
-                                    match self
-                                        .win32
-                                        .wait_for_single_object(handles[0], timeout, false, None)
-                                    {
-                                        Ok(status)
-                                            if !matches!(
-                                                status,
-                                                crate::win32::WaitStatus::Timeout
-                                            ) =>
-                                        {
-                                            result_code = status.code();
-                                            self.last_error = 0;
-                                        }
-                                        Ok(_) => {}
-                                        Err(error) => {
-                                            result_code = u32::MAX; // WAIT_FAILED
-                                            self.last_error = last_error_from_app_error(&error);
-                                        }
-                                    }
-                                    if result_code == crate::win32::WAIT_TIMEOUT {
-                                        loop {
-                                            let pump_outcome =
-                                                self.pump_pending_guest_thread(memory)?;
-                                            if let Some(code) = pump_outcome.process_exit {
-                                                return Ok(Some(code));
-                                            }
-                                            let polled = self
-                                                .win32
-                                                .wait_for_multiple_objects(
-                                                    &handles,
-                                                    wait_all,
-                                                    0,
-                                                    false,
-                                                    None,
-                                                );
-                                            if let Ok((status, _index)) = polled
-                                                && !matches!(
-                                                    status,
-                                                    crate::win32::WaitStatus::Timeout
-                                                )
-                                            {
-                                                // Pump-phase signal —
-                                                // historically unreported
-                                                // (the old thunk returned
-                                                // without updating RAX);
-                                                // keep the timeout result.
-                                                break;
-                                            }
-                                            if !pump_outcome.did_work {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                        for (index, &handle) in handles.iter().enumerate() {
+                            let object_type = match self.win32.handle_object_type(handle) {
+                                Ok(object_type) => object_type,
                                 Err(error) => {
-                                    result_code = u32::MAX; // WAIT_FAILED
+                                    state.set(Register::Rax, u64::from(u32::MAX)); // WAIT_FAILED
                                     self.last_error = last_error_from_app_error(&error);
+                                    return Ok(None);
                                 }
-                            }
-                        } else {
-                            // Thread targets can be sleeping workers whose
-                            // wake_tick is in the future, so pump one thread
-                            // per cycle, host-sleep 1 ms and advance the guest
-                            // clock until they become runnable.  Never report
-                            // WAIT_TIMEOUT for INFINITE while a target thread
-                            // can still complete (the CThread::JoinThread
-                            // regression).
-                            let deadline = (timeout != u32::MAX).then(|| {
-                                self.win32.get_tick_count64().saturating_add(timeout as u64)
-                            });
-                            loop {
-                                match self.win32.wait_for_multiple_objects(
-                                    &handles,
-                                    wait_all,
-                                    0,
-                                    false,
-                                    None,
-                                ) {
-                                    Ok((status, index))
-                                        if !matches!(
-                                            status,
-                                            crate::win32::WaitStatus::Timeout
-                                        ) =>
-                                    {
-                                        // WAIT_OBJECT_0 + index (wait-any) or
-                                        // WAIT_OBJECT_0 (wait-all).
-                                        result_code =
-                                            status.code().wrapping_add(index as u32);
-                                        self.last_error = 0;
-                                        break;
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        result_code = u32::MAX; // WAIT_FAILED
-                                        self.last_error = last_error_from_app_error(&error);
-                                        break;
-                                    }
+                            };
+                            let status = match self.win32.wait_for_single_object_instant(
+                                handle,
+                                object_type,
+                                self.win32.current_thread_id(),
+                            ) {
+                                Ok(status) => status,
+                                Err(error) => {
+                                    state.set(Register::Rax, u64::from(u32::MAX)); // WAIT_FAILED
+                                    self.last_error = last_error_from_app_error(&error);
+                                    return Ok(None);
                                 }
-                                let pump_outcome = self.pump_pending_guest_thread(memory)?;
-                                if let Some(code) = pump_outcome.process_exit {
-                                    return Ok(Some(code));
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                                self.win32.record_sleep_observation(1, 1);
-                                if let Some(deadline) = deadline
-                                    && self.win32.get_tick_count64() >= deadline
-                                {
-                                    result_code = crate::win32::WAIT_TIMEOUT;
-                                    break;
-                                }
+                            };
+                            if !matches!(status, crate::win32::WaitStatus::Timeout) {
+                                satisfied = Some((status.code(), index as u32));
+                                break;
                             }
                         }
+                    }
+                    if let Some((code, index)) = satisfied {
+                        result_code = code.wrapping_add(index);
+                        self.last_error = 0;
+                    } else if timeout == 0 {
+                        result_code = crate::win32::WAIT_TIMEOUT;
+                        self.last_error = 0;
+                    } else {
+                        // Park: resume when any (wait-any) or every
+                        // (wait-all, consumed atomically) object signals,
+                        // the deadline expires, or an APC arrives.
+                        let now = self.win32.get_tick_count64();
+                        self.parked_wait = Some(GuestWait {
+                            objects: handles,
+                            wait_all,
+                            deadline_ticks: (timeout != u32::MAX)
+                                .then(|| now.saturating_add(timeout as u64)),
+                            alertable: false,
+                            operation: WaitOperation::Objects,
+                        });
+                        // Fall through: the dispatch epilogue pops the args,
+                        // restores the return address and parks the thread.
                     }
                     state.set(Register::Rax, u64::from(result_code));
                 }
                 self.push_trace(
-                    "process",
+                    "sync",
                     "WaitForMultipleObjects",
                     BTreeMap::from([
                         ("count".to_string(), json!(count)),
                         ("wait_all".to_string(), json!(wait_all)),
-                        ("timeout_ms".to_string(), json!(timeout)),
+                        ("timeout".to_string(), json!(timeout)),
                     ]),
                     json!(result_code),
                 );
             }
+
             HostThunk::GetExitCodeThread => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
                 let exit_code_ptr = guest_call_arg(state, memory, 1)?;
@@ -36217,15 +36189,26 @@ impl PeHostRuntime {
                         milliseconds,
                     ));
                 }
-                if self.active_pumped_guest_thread.is_some() {
-                    self.yield_pumped_guest_thread = true;
-                    self.yield_pumped_guest_thread_wake_tick =
-                        Some(self.win32.get_tick_count64().saturating_add(milliseconds));
+                if milliseconds == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
                 } else {
-                    self.win32.sleep(milliseconds);
+                    // Scheduler-backed sleep: park the thread with a
+                    // Sleeping deadline.  The thread resumes only when the
+                    // guest clock reaches the deadline — the host never
+                    // sleeps "for" the guest, and Sleep(INFINITE) never
+                    // returns normally.
+                    let now = self.win32.get_tick_count64();
+                    self.parked_wait = Some(GuestWait {
+                        objects: Vec::new(),
+                        wait_all: false,
+                        deadline_ticks: Some(now.saturating_add(milliseconds)),
+                        alertable: false,
+                        operation: WaitOperation::Sleep,
+                    });
+                    // Fall through: the dispatch epilogue pops the args,
+                    // restores the return address and parks the thread.
                 }
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
                 self.push_trace(
                     "time",
                     "Sleep",
@@ -40416,7 +40399,7 @@ impl PeHostRuntime {
                 let milliseconds = arg(0) as u32;
                 let alertable = arg(1) != 0;
                 // Deliver already-pending APCs first (alertable sleep).
-                let mut apc_delivered = if alertable {
+                let apc_delivered = if alertable {
                     self.deliver_current_thread_apcs(state, memory)?
                 } else {
                     false
@@ -40425,80 +40408,26 @@ impl PeHostRuntime {
                     // APCs were delivered — return WAIT_IO_COMPLETION
                     state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                     self.last_error = 0;
-                } else if milliseconds == u32::MAX {
-                    // SleepEx(INFINITE, alertable): block like an infinite
-                    // alertable wait — pump pending guest threads and check
-                    // the APC queue until an APC is delivered.  Never return
-                    // early (Windows: an alertable INFINITE sleep only
-                    // completes via APC delivery).  Non-alertable INFINITE
-                    // blocks forever, as on Windows.
-                    loop {
-                        if alertable
-                            && self.deliver_current_thread_apcs(state, memory)?
-                        {
-                            state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
-                            self.last_error = 0;
-                            break;
-                        }
-                        if !self.pending_guest_threads.is_empty() {
-                            let pump_outcome = self.pump_pending_guest_thread(memory)?;
-                            if let Some(code) = pump_outcome.process_exit {
-                                return Ok(Some(code));
-                            }
-                        } else {
-                            // Nothing to pump: host-sleep 1 ms and advance
-                            // the guest clock so sleeping workers' wake_ticks
-                            // can expire and produce APCs.
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                            self.win32.record_sleep_observation(1, 1);
-                        }
-                    }
                 } else if milliseconds == 0 {
                     state.set(Register::Rax, 0); // WAIT_OBJECT_0
                 } else {
-                    // Finite sleep: pump pending guest threads while
-                    // advancing the guest clock (wait-loop style) so a
-                    // sleeping sibling's wake_tick expires — otherwise the
-                    // loop spins on wall time and the sibling starves.
-                    // Alertable sleeps also re-check the APC queue after
-                    // each pump iteration, delivering APCs queued DURING the
-                    // wait by a pumped worker.
-                    let sleep_start = std::time::Instant::now();
-                    let max_sleep = std::time::Duration::from_millis(milliseconds.min(100) as u64);
-                    while sleep_start.elapsed() < max_sleep {
-                        if alertable
-                            && self.deliver_current_thread_apcs(state, memory)?
-                        {
-                            apc_delivered = true;
-                            break;
-                        }
-                        if !self.pending_guest_threads.is_empty() {
-                            let pump_outcome = self.pump_pending_guest_thread(memory)?;
-                            if let Some(code) = pump_outcome.process_exit {
-                                return Ok(Some(code));
-                            }
-                        } else {
-                            // No pending threads at all: complete the sleep
-                            // with a full guest-clock advance (matching
-                            // `Sleep` semantics) instead of spinning.
-                            self.win32.sleep(milliseconds as u64);
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        self.win32.record_sleep_observation(1, 1);
-                    }
-                    if apc_delivered {
-                        state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
-                        self.last_error = 0;
-                    } else {
-                        // Still sleep a bit for non-trivial timeouts
-                        if milliseconds > 5 {
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                (milliseconds.min(100) as u64).min(5),
-                            ));
-                        }
-                        state.set(Register::Rax, 0); // WAIT_OBJECT_0
-                    }
+                    // Scheduler-backed alertable sleep: park with a
+                    // Sleeping deadline.  Finite sleeps resume when the
+                    // guest clock reaches the deadline; alertable sleeps
+                    // also resume via APC delivery (WAIT_IO_COMPLETION).
+                    // An infinite alertable sleep only completes through an
+                    // APC; a non-alertable infinite sleep never returns.
+                    let now = self.win32.get_tick_count64();
+                    self.parked_wait = Some(GuestWait {
+                        objects: Vec::new(),
+                        wait_all: false,
+                        deadline_ticks: (milliseconds != u32::MAX)
+                            .then(|| now.saturating_add(milliseconds as u64)),
+                        alertable,
+                        operation: WaitOperation::Sleep,
+                    });
+                    // Fall through: the dispatch epilogue pops the args,
+                    // restores the return address and parks the thread.
                 }
             }
             HostThunk::CopyFileW => {
@@ -41523,6 +41452,16 @@ impl PeHostRuntime {
                 }
                 let timeout = arg(1) as u32;
                 let alertable = arg(2) != 0;
+                // Documented divergence: the ACTIVE pumped thread can never
+                // reach `Exited` while the current dispatch is running, so a
+                // wait on it could never make progress — report WAIT_TIMEOUT
+                // immediately (Windows resolves this via preemptive
+                // scheduling; the guest retries the join).
+                if self.active_pumped_guest_thread == Some(handle) {
+                    state.set(Register::Rax, u64::from(crate::win32::WAIT_TIMEOUT));
+                    self.last_error = 0;
+                    return Ok(None);
+                }
                 // Deliver already-pending APCs before blocking; alertable
                 // waits also re-check the APC queue after every pump
                 // iteration inside the wait helpers below, so an APC queued
@@ -41536,39 +41475,49 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
                     self.last_error = 0;
                 } else {
-                    // With no APCs pending, an alertable wait is equivalent
-                    // to a non-alertable one.
-                    let is_thread = matches!(
-                        self.win32.handle_object_type(handle),
-                        Ok(crate::win32::ObjectType::Thread)
-                    );
-                    let wait_result = if is_thread {
-                        // Thread targets: pump pending guest threads and
-                        // never report WAIT_TIMEOUT for INFINITE while the
-                        // target thread can still complete.
-                        self.wait_for_single_object_pumping(state, memory, handle, timeout, alertable)
-                    } else {
-                        self.wait_for_single_object_non_thread(state, memory, handle, timeout, alertable)
-                    };
-                    match wait_result {
-                        Ok(PumpWaitOutcome::Wait(result)) => {
-                            state.set(Register::Rax, u64::from(result.code()));
-                            self.last_error = 0;
-                        }
-                        Ok(PumpWaitOutcome::IoCompletion) => {
-                            state.set(Register::Rax, 0xC0); // WAIT_IO_COMPLETION
-                            self.last_error = 0;
-                        }
-                        Ok(PumpWaitOutcome::Unreported) => {
-                            self.last_error = 0;
-                        }
-                        Ok(PumpWaitOutcome::ProcessExit(code)) => {
-                            return Ok(Some(code));
-                        }
+                    // Single non-blocking poll (consuming for single
+                    // objects): satisfied immediately, or park the thread
+                    // on a scheduler wait descriptor.
+                    let object_type = match self.win32.handle_object_type(handle) {
+                        Ok(object_type) => object_type,
                         Err(error) => {
-                            state.set(Register::Rax, 0xFFFFFFFF); // WAIT_FAILED
+                            state.set(Register::Rax, u64::from(u32::MAX)); // WAIT_FAILED
                             self.last_error = last_error_from_app_error(&error);
+                            return Ok(None);
                         }
+                    };
+                    let status = match self.win32.wait_for_single_object_instant(
+                        handle,
+                        object_type,
+                        self.win32.current_thread_id(),
+                    ) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            state.set(Register::Rax, u64::from(u32::MAX)); // WAIT_FAILED
+                            self.last_error = last_error_from_app_error(&error);
+                            return Ok(None);
+                        }
+                    };
+                    if !matches!(status, crate::win32::WaitStatus::Timeout) {
+                        state.set(Register::Rax, u64::from(status.code()));
+                        self.last_error = 0;
+                    } else if timeout == 0 {
+                        state.set(Register::Rax, u64::from(crate::win32::WAIT_TIMEOUT));
+                        self.last_error = 0;
+                    } else {
+                        // Park: resume when the object signals, the deadline
+                        // expires, or (alertable) an APC arrives.
+                        let now = self.win32.get_tick_count64();
+                        self.parked_wait = Some(GuestWait {
+                            objects: vec![handle],
+                            wait_all: false,
+                            deadline_ticks: (timeout != u32::MAX)
+                                .then(|| now.saturating_add(timeout as u64)),
+                            alertable,
+                            operation: WaitOperation::Objects,
+                        });
+                        // Fall through: the dispatch epilogue pops the args,
+                        // restores the return address and parks the thread.
                     }
                 }
             }
@@ -50556,6 +50505,12 @@ impl PeHostRuntime {
         if popped_return_address {
             state.rip = return_address;
         }
+        // A wait thunk parked the current thread: the state is now fully
+        // fixed up (args popped, return address restored), so the scheduler
+        // can clone it into the wait queue.
+        if let Some(wait) = self.parked_wait.take() {
+            self.park_for_wait(state, wait);
+        }
         Ok(None)
     }
 
@@ -51280,7 +51235,254 @@ impl PeHostRuntime {
             state: thread_state,
             state_machine: GuestThreadState::Runnable,
             exit_code_override: None,
+            wait: None,
+            wait_resume: None,
         })
+    }
+
+    /// Non-consuming satisfiability of a parked thread's wait descriptor.
+    /// Read-only (`&self`) so it can run inside the readiness scan.
+    fn wait_satisfiable(&self, thread: &PendingGuestThread) -> bool {
+        let Some(wait) = &thread.wait else {
+            return false;
+        };
+        // Alertable waits complete through APC delivery.
+        if wait.alertable
+            && self
+                .apc_queues
+                .get(&u64::from(thread.thread_id))
+                .is_some_and(|queue| queue.pending_count() > 0)
+        {
+            return true;
+        }
+        // Finite waits complete when the guest clock reaches the deadline.
+        if let Some(deadline) = wait.deadline_ticks
+            && self.win32.get_tick_count64() >= deadline
+        {
+            return true;
+        }
+        match &wait.operation {
+            WaitOperation::Sleep => false,
+            WaitOperation::Objects => {
+                let satisfiable = |handle: &u32| {
+                    self.win32
+                        .handle_object_type(*handle)
+                        .and_then(|object_type| {
+                            self.win32.wait_object_satisfiable(
+                                *handle,
+                                object_type,
+                                thread.thread_id,
+                            )
+                        })
+                        .is_ok_and(|satisfaction| {
+                            !matches!(satisfaction, crate::win32::WaitSatisfaction::NotSignaled)
+                        })
+                };
+                if wait.wait_all {
+                    wait.objects.iter().all(satisfiable)
+                } else {
+                    wait.objects.iter().any(satisfiable)
+                }
+            }
+            WaitOperation::Overlapped { overlapped_id, .. } => {
+                self.win32.overlapped_completed(*overlapped_id)
+            }
+            WaitOperation::PipeConnect { pipe_handle } => {
+                self.win32.pipe_is_connected(*pipe_handle)
+            }
+        }
+    }
+
+    /// Consume the wait atomically and produce the resume result.  Runs in
+    /// the pump's run step (no guest code runs between the readiness pass
+    /// and this call, so wait-all consumption is atomic).
+    fn complete_wait(&mut self, wait: &GuestWait, tid: u32) -> AppResult<WaitResume> {
+        // Alertable waits complete through APC delivery (WAIT_IO_COMPLETION):
+        // the readiness pass detected a queued APC; the resume reports it.
+        // The APC procs are delivered by the pump's run step before the
+        // thread continues.
+        if wait.alertable
+            && self
+                .apc_queues
+                .get(&u64::from(tid))
+                .is_some_and(|queue| queue.pending_count() > 0)
+        {
+            return Ok(WaitResume {
+                code: crate::win32::WAIT_IO_COMPLETION,
+                bytes: None,
+                last_error: None,
+            });
+        }
+        if let Some(deadline) = wait.deadline_ticks
+            && self.win32.get_tick_count64() >= deadline
+        {
+            return Ok(WaitResume {
+                code: crate::win32::WAIT_TIMEOUT,
+                bytes: None,
+                last_error: None,
+            });
+        }
+        match &wait.operation {
+            WaitOperation::Sleep => Ok(WaitResume {
+                code: 0,
+                bytes: None,
+                last_error: None,
+            }),
+            WaitOperation::Objects => {
+                if wait.wait_all {
+                    match self.win32.evaluate_wait_all(&wait.objects, tid)? {
+                        Some(status) => Ok(WaitResume {
+                            code: status.code(),
+                            bytes: None,
+                            last_error: None,
+                        }),
+                        None => Ok(WaitResume {
+                            code: crate::win32::WAIT_TIMEOUT,
+                            bytes: None,
+                            last_error: None,
+                        }),
+                    }
+                } else {
+                    for (index, &handle) in wait.objects.iter().enumerate() {
+                        let object_type = self.win32.handle_object_type(handle)?;
+                        let status =
+                            self.win32
+                                .wait_for_single_object_instant(handle, object_type, tid)?;
+                        if !matches!(status, crate::win32::WaitStatus::Timeout) {
+                            return Ok(WaitResume {
+                                code: status.code().wrapping_add(index as u32),
+                                bytes: None,
+                                last_error: None,
+                            });
+                        }
+                    }
+                    Ok(WaitResume {
+                        code: crate::win32::WAIT_TIMEOUT,
+                        bytes: None,
+                        last_error: None,
+                    })
+                }
+            }
+            WaitOperation::Overlapped { overlapped_id, .. } => {
+                let result = self.win32.get_overlapped_result(*overlapped_id, false)?;
+                if result.completed {
+                    Ok(WaitResume {
+                        code: 1, // TRUE
+                        bytes: Some(result.bytes_transferred),
+                        last_error: None,
+                    })
+                } else if result.cancelled {
+                    Ok(WaitResume {
+                        code: 0,
+                        bytes: None,
+                        last_error: Some(ERROR_OPERATION_ABORTED),
+                    })
+                } else {
+                    Ok(WaitResume {
+                        code: crate::win32::WAIT_TIMEOUT,
+                        bytes: None,
+                        last_error: None,
+                    })
+                }
+            }
+            WaitOperation::PipeConnect { .. } => Ok(WaitResume {
+                code: 1, // TRUE
+                bytes: None,
+                last_error: None,
+            }),
+        }
+    }
+
+    /// Park the current thread in the scheduler wait queue with `wait`.
+    ///
+    /// Pumped threads park via the cooperative-yield machinery (the pump
+    /// requeues them with the descriptor).  The main loop's thread parks
+    /// directly in the queue; the main loop then switches to pump-driven
+    /// mode (see `run_pump_driven`) until the run ends.
+    fn park_for_wait(&mut self, state: &mut CpuState, wait: GuestWait) {
+        if self.active_pumped_guest_thread.is_some() {
+            self.pump_yield_with_wait = Some(wait);
+            self.yield_pumped_guest_thread = true;
+            return;
+        }
+        let handle = self.win32.current_thread_handle();
+        let thread_id = self.win32.current_thread_id();
+        let rsp = state.get(Register::Rsp);
+        self.pending_guest_threads.push_back(PendingGuestThread {
+            handle,
+            thread_id,
+            start_address: state.rip,
+            parameter: 0,
+            initial_rsp: rsp,
+            started: true,
+            suspended: 0,
+            wake_tick: 0,
+            teb_base: self.teb_base,
+            tls_vector_ptr: self.tls_vector_ptr,
+            tls_slots: self.tls_slots.clone(),
+            fls_slots: self.fls_slots.clone(),
+            state: state.clone(),
+            state_machine: GuestThreadState::Waiting,
+            exit_code_override: None,
+            wait: Some(wait),
+            wait_resume: None,
+        });
+        self.main_thread_parked = true;
+    }
+
+    /// Pump-driven execution mode: the main thread is parked in the wait
+    /// queue.  Run runnable guest threads, service timers/APCs, and advance
+    /// the guest clock; the HOST sleeps only when nothing is runnable, and
+    /// only briefly (1 ms) so finite deadlines progress.  Returns the process
+    /// exit code when the run ends (including the run deadline, which is
+    /// harness cancellation — never a fake wait result).
+    fn run_pump_driven(
+        &mut self,
+        memory: &mut MemoryImage,
+        _steps: &mut u64,
+        _instruction_budget: u64,
+    ) -> AppResult<i32> {
+        let mut exit_code = 0_i32;
+        // Scratch guest state for timer-callback dispatch (the parked main
+        // thread lives in the wait queue; timer callbacks run against this
+        // throwaway context, matching the main loop's usage).
+        let mut scratch_state = CpuState::new(self.guest_arch);
+        scratch_state.segment_bases.fs = self.teb_base;
+        loop {
+            if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
+                crate::live::live_trace(
+                    "[pe] run deadline reached in pump-driven mode — ending run with exit -2",
+                );
+                return Ok(-2);
+            }
+            let pump_outcome = self.pump_pending_guest_thread(memory)?;
+            if let Some(code) = pump_outcome.process_exit {
+                exit_code = code;
+                break;
+            }
+            if self.pending_guest_threads.is_empty() {
+                // All threads exited (the main thread's exit is reported as
+                // process_exit by the pump; this is the belt-and-braces end).
+                break;
+            }
+            if self.poll_guest_timers()? {
+                continue;
+            }
+            if self.drain_timer_work_queue(&mut scratch_state, memory)? {
+                if let Some(code) = self.process_exit_requested {
+                    exit_code = code as i32;
+                    break;
+                }
+                continue;
+            }
+            if !pump_outcome.did_work {
+                // Nothing runnable: the host sleeps briefly and the guest
+                // clock advances so finite deadlines expire.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                self.win32.record_sleep_observation(1, 1);
+            }
+        }
+        Ok(exit_code)
     }
 
     fn pump_pending_guest_thread(&mut self, memory: &mut MemoryImage) -> AppResult<PumpOutcome> {
@@ -51294,7 +51496,17 @@ impl PeHostRuntime {
             thread.suspended == 0
                 && match thread.state_machine {
                     GuestThreadState::Waiting | GuestThreadState::AlertableWaiting => {
-                        thread.wake_tick <= now
+                        if thread.wait.is_some() {
+                            // Scheduler wait descriptor: ready when the
+                            // descriptor is satisfiable (non-consuming pass —
+                            // the atomic consumption happens in the run step,
+                            // and no guest code runs in between, so another
+                            // waiter cannot steal the set).
+                            self.wait_satisfiable(thread)
+                        } else {
+                            // Plain timeslice yield: ready at wake_tick.
+                            thread.wake_tick <= now
+                        }
                     }
                     GuestThreadState::Runnable => true,
                     GuestThreadState::Exiting | GuestThreadState::Exited => false,
@@ -51363,6 +51575,39 @@ impl PeHostRuntime {
 
             let resume_rsp = pending_thread.started.then_some(pending_thread.initial_rsp);
             pending_thread.started = true;
+
+            // Scheduler wait resume: the readiness pass determined the
+            // descriptor is satisfiable; consume it atomically and apply the
+            // result (RAX + last_error), then run the thread.
+            let _resumed_from_wait = if let Some(wait) = pending_thread.wait.take() {
+                let tid = pending_thread.thread_id;
+                let resume = self.complete_wait(&wait, tid)?;
+                // Alertable waits complete via APC delivery: deliver queued
+                // APCs in the thread's context before the wait result is
+                // published (Windows runs the APC, then the wait reports
+                // WAIT_IO_COMPLETION).
+                if resume.code == crate::win32::WAIT_IO_COMPLETION {
+                    // The APC procs run in the thread's context via the
+                    // callback machinery, which ends with RIP at the
+                    // synthetic return sentinel (0); restore the waiter's
+                    // continuation address so it resumes after the wait
+                    // call once delivery completes.
+                    let continue_rip = pending_thread.state.rip;
+                    let _ = self.deliver_current_thread_apcs(&mut pending_thread.state, memory)?;
+                    pending_thread.state.rip = continue_rip;
+                }
+                pending_thread
+                    .state
+                    .set(Register::Rax, u64::from(resume.code));
+                if let Some(error) = resume.last_error {
+                    self.last_error = error;
+                } else {
+                    self.last_error = 0;
+                }
+                Some(wait)
+            } else {
+                None
+            };
 
             // An ATTACH TLS callback may have called an explicit exit API
             // (ExitThread/_endthreadex/_endthread/TerminateThread on self)
@@ -51534,6 +51779,11 @@ impl PeHostRuntime {
                             .yield_pumped_guest_thread_wake_tick
                             .take()
                             .unwrap_or_else(|| self.win32.get_tick_count64());
+                        // A blocking-wait thunk parked via
+                        // `park_for_wait`; move the descriptor onto the
+                        // requeued record so the readiness pass evaluates it.
+                        pending_thread.wait = self.pump_yield_with_wait.take();
+                        pending_thread.wait_resume = None;
                         pending_thread.state_machine = GuestThreadState::Waiting;
                         Ok((
                             PumpedThreadOutcome {
@@ -51662,129 +51912,6 @@ impl PeHostRuntime {
     /// retry the join (a plain self-join would deadlock on Windows too).
     ///
     /// Returns `PumpWaitOutcome::ProcessExit` when a pumped thread requested
-    /// process exit; the caller must propagate it as a thunk `Some(code)`.
-    fn wait_for_single_object_pumping(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        handle: u32,
-        timeout_ms: u32,
-        alertable: bool,
-    ) -> AppResult<PumpWaitOutcome> {
-        if timeout_ms == 0 {
-            return Ok(PumpWaitOutcome::Wait(
-                self.win32.wait_for_single_object(handle, 0, false, None)?,
-            ));
-        }
-        // Self-join / active-thread join detection (see the doc comment).
-        if Some(handle) == self.active_pumped_guest_thread {
-            return Ok(PumpWaitOutcome::Wait(crate::win32::WaitStatus::Timeout));
-        }
-        let deadline = (timeout_ms != u32::MAX).then(|| {
-            self.win32
-                .get_tick_count64()
-                .saturating_add(timeout_ms as u64)
-        });
-        loop {
-            // (a) Poll the target's signaled state (non-blocking).
-            let status = self.win32.wait_for_single_object(handle, 0, false, None)?;
-            if !matches!(status, crate::win32::WaitStatus::Timeout) {
-                return Ok(PumpWaitOutcome::Wait(status));
-            }
-            // (b) Pump pending guest threads (one at a time, honoring
-            // wake_tick).
-            let pump_outcome = self.pump_pending_guest_thread(memory)?;
-            if let Some(code) = pump_outcome.process_exit {
-                return Ok(PumpWaitOutcome::ProcessExit(code));
-            }
-            // (c) Alertable waits: deliver APCs queued during the wait.
-            if alertable && self.deliver_current_thread_apcs(state, memory)? {
-                return Ok(PumpWaitOutcome::IoCompletion);
-            }
-            // (d) Nothing could be pumped — the target thread may be a
-            // sleeping worker with its wake_tick in the future.  Host-sleep
-            // 1 ms and advance the guest clock (as the existing pump path
-            // does) so the worker's sleep expires.  The wait must NOT report
-            // WAIT_TIMEOUT for INFINITE while the target thread is still
-            // queued — this is the CThread::JoinThread regression.
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            self.win32.record_sleep_observation(1, 1);
-            if let Some(deadline) = deadline
-                && self.win32.get_tick_count64() >= deadline
-            {
-                return Ok(PumpWaitOutcome::Wait(crate::win32::WaitStatus::Timeout));
-            }
-        }
-    }
-
-    /// Historical non-thread wait behavior, replicated from the pre-fix
-    /// `WaitForSingleObject` thunk: first the blocking win32 wait (finite
-    /// timeouts advance the guest clock; process handles block on the
-    /// `exit_sync` condvar), then pump pending guest threads, then report.
-    ///
-    /// Steam's shutdown handshake depends on this exact interleaving: a
-    /// signal that arrives during the pump phase is historically NOT
-    /// reported (the old thunk returned without updating RAX, so the caller
-    /// saw its pre-call RAX).  Pump-phase signals therefore surface as
-    /// `PumpWaitOutcome::Unreported` and the thunk leaves RAX untouched,
-    /// keeping the guest on its historical path.
-    ///
-    /// Documented divergence (signal-loss fix): when the PUMP produced
-    /// work and the event became signaled during that pump, the signal is
-    /// reported as `PumpWaitOutcome::Wait(Object0)` instead — the 0-timeout
-    /// poll already consumed an auto-reset signal, so leaving it
-    /// `Unreported` would drop the wakeup permanently (the caller would
-    /// keep polling or time out on an event that was already consumed).
-    /// The historical `Unreported` behavior is preserved only for
-    /// signals observed without any pumped work.
-    ///
-    /// Alertable waits re-check the waiting thread's APC queue after each
-    /// pump iteration (see `wait_for_single_object_pumping`).
-    fn wait_for_single_object_non_thread(
-        &mut self,
-        state: &mut CpuState,
-        memory: &mut MemoryImage,
-        handle: u32,
-        timeout_ms: u32,
-        alertable: bool,
-    ) -> AppResult<PumpWaitOutcome> {
-        let result = self
-            .win32
-            .wait_for_single_object(handle, timeout_ms, false, None)?;
-        if !matches!(result, crate::win32::WaitStatus::Timeout) {
-            return Ok(PumpWaitOutcome::Wait(result));
-        }
-        loop {
-            let pump_outcome = self.pump_pending_guest_thread(memory)?;
-            if let Some(code) = pump_outcome.process_exit {
-                return Ok(PumpWaitOutcome::ProcessExit(code));
-            }
-            if alertable && self.deliver_current_thread_apcs(state, memory)? {
-                return Ok(PumpWaitOutcome::IoCompletion);
-            }
-            let polled = self.win32.wait_for_single_object(handle, 0, false, None)?;
-            if !matches!(polled, crate::win32::WaitStatus::Timeout) {
-                if pump_outcome.did_work {
-                    // Pump-phase signal: the event became signaled while a
-                    // pumped guest thread ran.  The 0-timeout poll above
-                    // already consumed the signal (auto-reset), so report
-                    // it as a real wait result (WAIT_OBJECT_0) instead of
-                    // the historical Unreported — which dropped the signal
-                    // and left RAX stale forever.
-                    return Ok(PumpWaitOutcome::Wait(polled));
-                }
-                // Historical non-pump-phase behavior: a signal observed
-                // without any pumped work stays unreported — the caller
-                // sees its pre-call RAX (Steam's shutdown handshake).
-                return Ok(PumpWaitOutcome::Unreported);
-            }
-            if !pump_outcome.did_work {
-                break;
-            }
-        }
-        Ok(PumpWaitOutcome::Wait(result))
-    }
-
     /// Drain the shared timer work sink and execute each expired timer
     /// callback in the guest context.
     ///
@@ -72764,6 +72891,7 @@ pub fn last_error_from_app_error(error: &AppError) -> u32 {
         ReasonCode::RcFsLockViolation => ERROR_LOCK_VIOLATION,
         ReasonCode::RcFsAlreadyExists => ERROR_ALREADY_EXISTS,
         ReasonCode::RcCliInvalid => ERROR_INVALID_PARAMETER,
+        ReasonCode::RcWin32NotOwner => 288, // ERROR_NOT_OWNER
         _ => ERROR_ACCESS_DENIED,
     }
 }
@@ -77204,10 +77332,9 @@ mod tests {
 
     #[test]
     fn wait_for_single_object_pumps_pending_guest_thread() {
-        // The guest-callback decode path (the generated x86 decoder probes a
-        // ~185 KiB stack frame) plus the GE setup consumes nearly all of
-        // libtest's default 2 MiB thread stack; run on an 8 MiB stack so the
-        // test is not dependent on compiler codegen details.
+        // WfSO(INFINITE) on a thread handle: a pending worker that exits
+        // with 7 must be pumped to completion; the join succeeds with
+        // WAIT_OBJECT_0 (the Steam shutdown regression).
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
@@ -77227,22 +77354,22 @@ mod tests {
 
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
             let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-            let entrypoint = 0x41_100_u64;
-            let thread_id_ptr = 0x41_200_u64;
-            let mut entrypoint_bytes = vec![0x90; 0x20];
-
-            memory.map_bytes(thread_id_ptr, &[0; 4]);
-            entrypoint_bytes[..8]
-                .copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-            memory.map_bytes(entrypoint, &entrypoint_bytes);
+            let wfso_slot = 0x41_000_u64;
+            let worker_entry = 0x41_100_u64;
+            let joiner_entry = 0x41_200_u64;
+            let result_ptr = 0x41_300_u64;
+            let worker_tid_ptr = 0x41_400_u64;
+            let joiner_tid_ptr = 0x41_404_u64;
+            let mut worker_bytes = vec![0x90; 0x20];
+            worker_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(worker_entry, &worker_bytes);
 
             let thread_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create_thread,
-                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+                &[0, 0, worker_entry as u32, 0, 0, worker_tid_ptr as u32],
             );
-
             assert_ne!(thread_handle, 0);
             assert_eq!(
                 runtime
@@ -77252,14 +77379,45 @@ mod tests {
                 None
             );
 
-            let result = dispatch_x86_thunk(
+            // Joiner: push INFINITE; push thread_handle; call [WfSO];
+            // mov [result], eax; ret
+            let mut joiner_bytes = vec![0x90; 0x20];
+            joiner_bytes[..22].copy_from_slice(&[
+                0x68, 0xFF, 0xFF, 0xFF, 0xFF, // push INFINITE
+                0x68, 0x00, 0x00, 0x00, 0x00, // push thread_handle (patched)
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [WfSO]
+                0xA3, 0x00, 0x23, 0x04, 0x00, // mov [result], eax
+                0xC3,
+            ]);
+            joiner_bytes[6..10].copy_from_slice(&(thread_handle as u32).to_le_bytes());
+            write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
+            memory.map_bytes(joiner_entry, &joiner_bytes);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+
+            let joiner_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
-                wait_for_single_object,
-                &[thread_handle as u32, u32::MAX],
+                create_thread,
+                &[0, 0, joiner_entry as u32, 0, 0, joiner_tid_ptr as u32],
             );
+            assert_ne!(joiner_handle, 0);
 
-            assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64);
+            for _ in 0..500 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
+            );
+            assert_eq!(
+                read_u32(&memory, result_ptr).expect("join result"),
+                crate::win32::WAIT_OBJECT_0
+            );
             assert_eq!(
                 runtime
                     .win32
@@ -77781,7 +77939,8 @@ mod tests {
     fn infinite_join_of_sleeping_thread_succeeds() {
         // The Steam shutdown regression: a worker thread that Sleeps(50) then
         // exits with 7 must be joinable with WaitForSingleObject(INFINITE) —
-        // no spurious WAIT_TIMEOUT.
+        // no spurious WAIT_TIMEOUT.  The joiner is a real guest thread so
+        // the scheduler parks it and resumes it when the worker exits.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
@@ -77802,52 +77961,88 @@ mod tests {
             let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
             let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-            let import_slot = 0x41_000_u64;
-            let entrypoint = 0x41_100_u64;
-            let thread_id_ptr = 0x41_204_u64;
-            // push 50; call [Sleep]; mov eax,7; ret 4
-            let mut entrypoint_bytes = vec![0x90; 0x20];
-            entrypoint_bytes[..16].copy_from_slice(&[
+            let sleep_slot = 0x41_000_u64;
+            let wfso_slot = 0x41_010_u64;
+            let worker_entry = 0x41_100_u64;
+            let joiner_entry = 0x41_200_u64;
+            let result_ptr = 0x41_300_u64;
+            let worker_tid_ptr = 0x41_304_u64;
+            let joiner_tid_ptr = 0x41_308_u64;
+            // Worker: push 50; call [Sleep]; mov eax,7; ret 4
+            let mut worker_bytes = vec![0x90; 0x20];
+            worker_bytes[..16].copy_from_slice(&[
                 0x6A, 0x32, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2,
                 0x04, 0x00,
             ]);
-            write_u32(&mut memory, import_slot, sleep as u32);
-            memory.map_bytes(entrypoint, &entrypoint_bytes);
+            write_u32(&mut memory, sleep_slot, sleep as u32);
+            memory.map_bytes(worker_entry, &worker_bytes);
 
-            let thread_handle = dispatch_x86_thunk(
+            let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create_thread,
-                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+                &[0, 0, worker_entry as u32, 0, 0, worker_tid_ptr as u32],
             );
-            assert_ne!(thread_handle, 0);
+            assert_ne!(worker_handle, 0);
             assert_eq!(
                 runtime
                     .win32
-                    .get_exit_code_thread(thread_handle as u32)
+                    .get_exit_code_thread(worker_handle as u32)
                     .expect("exit code before wait"),
                 None
             );
 
-            let result = dispatch_x86_thunk(
+            // Joiner: push INFINITE; push worker_handle; call [WfSO];
+            // mov [result], eax; ret
+            let mut joiner_bytes = vec![0x90; 0x20];
+            joiner_bytes[..22].copy_from_slice(&[
+                0x68, 0xFF, 0xFF, 0xFF, 0xFF, // push INFINITE
+                0x68, 0x00, 0x00, 0x00, 0x00, // push worker_handle (patched)
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [WfSO]
+                0xA3, 0x00, 0x23, 0x04, 0x00, // mov [result], eax
+                0xC3,
+            ]);
+            joiner_bytes[6..10].copy_from_slice(&(worker_handle as u32).to_le_bytes());
+            write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
+            memory.map_bytes(joiner_entry, &joiner_bytes);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+
+            let joiner_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
-                wait_for_single_object,
-                &[thread_handle as u32, u32::MAX],
+                create_thread,
+                &[0, 0, joiner_entry as u32, 0, 0, joiner_tid_ptr as u32],
+            );
+            assert_ne!(joiner_handle, 0);
+
+            for _ in 0..1000 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+                if !_outcome.did_work {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    runtime.win32.record_sleep_observation(1, 1);
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
             );
             assert_eq!(
-                result,
-                crate::win32::WAIT_OBJECT_0 as u64,
+                read_u32(&memory, result_ptr).expect("join result"),
+                crate::win32::WAIT_OBJECT_0,
                 "INFINITE join of a sleeping worker must succeed, not return WAIT_TIMEOUT"
             );
             assert_eq!(
                 runtime
                     .win32
-                    .get_exit_code_thread(thread_handle as u32)
+                    .get_exit_code_thread(worker_handle as u32)
                     .expect("exit code after wait"),
                 Some(7)
             );
-            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 
@@ -78005,8 +78200,9 @@ mod tests {
     fn alertable_wait_delivers_apc_queued_during_wait() {
         // WaitForSingleObjectEx(INFINITE, alertable) on an unsignaled event:
         // a pumped worker queues an APC for the waiting thread DURING the
-        // wait.  The wait must deliver it and return WAIT_IO_COMPLETION
-        // (0xC0), not WAIT_TIMEOUT/WAIT_OBJECT_0.
+        // wait.  The scheduler-backed wait must deliver the APC and resume
+        // the waiter with WAIT_IO_COMPLETION (0xC0), not WAIT_TIMEOUT or
+        // WAIT_OBJECT_0.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
@@ -78029,61 +78225,106 @@ mod tests {
             let wait_for_single_object_ex =
                 runtime.alloc_host_thunk(HostThunk::WaitForSingleObjectEx);
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-            let open_thread_slot = 0x41_000_u64;
-            let queue_slot = 0x41_010_u64;
-            let worker_entry = 0x42_000_u64;
-            let apc_callback = 0x42_100_u64;
-            let apc_flag = 0x42_200_u64;
-            let thread_id_ptr = 0x42_204_u64;
+            let wfsoex_slot = 0x41_000_u64;
+            let open_thread_slot = 0x41_010_u64;
+            let queue_slot = 0x41_020_u64;
+            let waiter_entry = 0x42_000_u64;
+            let worker_entry = 0x42_100_u64;
+            let apc_callback = 0x42_200_u64;
+            let apc_flag = 0x42_300_u64;
+            let result_slot = 0x42_400_u64;
+            let waiter_tid_ptr = 0x42_404_u64;
+            let worker_tid_ptr = 0x42_408_u64;
 
             // APC callback: mov eax, 0xABCD; mov [apc_flag], eax; ret
             let mut apc_bytes = vec![0x90; 0x10];
             apc_bytes[..11].copy_from_slice(&[
-                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x23, 0x04, 0x00, 0xC3,
             ]);
-            // Worker: OpenThread(0x1F03FF, 0, 1); QueueUserAPC(apc_callback,
-            // hThread, 0); ret — the APC targets the main thread (tid 1).
+            memory.map_bytes(apc_callback, &apc_bytes);
+            memory.map_bytes(apc_flag, &[0_u8; 4]);
+            memory.map_bytes(result_slot, &[0_u8; 4]);
+
+            let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
+
+            // Waiter thread: push 1; push 0xFFFFFFFF; push event_handle;
+            // call [WfSOEx]; mov [result_slot], eax; ret
+            let mut waiter_bytes = vec![0x90; 0x30];
+            waiter_bytes[..24].copy_from_slice(&[
+                0x6A, 0x01, // push 1 (alertable)
+                0x68, 0xFF, 0xFF, 0xFF, 0xFF, // push INFINITE
+                0x68, 0x00, 0x00, 0x00, 0x00, // push event_handle (patched)
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [WfSOEx]
+                0xA3, 0x00, 0x24, 0x04, 0x00, // mov [result_slot], eax
+                0xC3, // ret
+            ]);
+            waiter_bytes[8..12].copy_from_slice(&event_handle.to_le_bytes());
+            write_u32(&mut memory, wfsoex_slot, wait_for_single_object_ex as u32);
+            memory.map_bytes(waiter_entry, &waiter_bytes);
+
+            // Worker: OpenThread(0x1F03FF, 0, waiter_tid); QueueUserAPC(apc,
+            // hThread, 0); ret — the APC targets the waiting thread.
             let mut worker_bytes = vec![0x90; 0x40];
             worker_bytes[..36].copy_from_slice(&[
-                0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+                0x68, 0x01, 0x00, 0x00, 0x00, // push waiter_tid (patched)
                 0x6A, 0x00, // push 0 (inherit)
                 0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
-                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [OpenThread]
                 0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
                 0x50, // push eax (hThread — arg2)
-                0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
-                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
+                0x68, 0x00, 0x22, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+                0xFF, 0x15, 0x20, 0x10, 0x04, 0x00, // call [QueueUserAPC]
                 0xC3, // ret
             ]);
             write_u32(&mut memory, open_thread_slot, open_thread as u32);
             write_u32(&mut memory, queue_slot, queue_user_apc as u32);
             memory.map_bytes(worker_entry, &worker_bytes);
-            memory.map_bytes(apc_callback, &apc_bytes);
-            memory.map_bytes(apc_flag, &[0_u8; 4]);
+
+            let waiter_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, waiter_entry as u32, 0, 0, waiter_tid_ptr as u32],
+            );
+            assert_ne!(waiter_handle, 0);
+            let waiter_tid = read_u32(&memory, waiter_tid_ptr).expect("waiter tid");
+            worker_bytes[1..5].copy_from_slice(&waiter_tid.to_le_bytes());
+            memory.map_bytes(worker_entry, &worker_bytes);
 
             let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create_thread,
-                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+                &[0, 0, worker_entry as u32, 0, 0, worker_tid_ptr as u32],
             );
             assert_ne!(worker_handle, 0);
-            assert_eq!(runtime.pending_guest_threads.len(), 1);
 
-            let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
-
-            let result = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                wait_for_single_object_ex,
-                &[event_handle, u32::MAX, 1],
+            // Pump until every thread has run to completion (both procs ret).
+            for _ in 0..500 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if !_outcome.did_work && runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
+            );
+            eprintln!(
+                "[test] result_slot={:#x} apc_flag={:#x}",
+                read_u32(&memory, result_slot).expect("wait result"),
+                read_u32(&memory, apc_flag).expect("apc flag"),
             );
             assert_eq!(
-                result,
-                crate::win32::WAIT_IO_COMPLETION as u64,
+                read_u32(&memory, result_slot).expect("wait result"),
+                crate::win32::WAIT_IO_COMPLETION,
                 "alertable wait must return WAIT_IO_COMPLETION when an APC is queued during the wait"
             );
-            assert_eq!(runtime.last_error, 0);
             assert_eq!(
                 read_u32(&memory, apc_flag).expect("apc flag"),
                 0xABCD,
@@ -78094,9 +78335,9 @@ mod tests {
 
     #[test]
     fn sleep_ex_advances_guest_clock_waking_sibling() {
-        // SleepEx(50) on one thread must advance the guest clock while
-        // pumping, so a sibling sleeping 10 ms actually wakes — otherwise
-        // its wake_tick never expires (starvation).
+        // Scheduler-backed sleeping: a thread's Sleep(10) must wake while
+        // another thread sleeps for 50 — the pump advances the guest clock
+        // and resumes each sleeper at its own deadline, so neither starves.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
@@ -78118,10 +78359,13 @@ mod tests {
             let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
             let sleep_slot = 0x41_000_u64;
+            let sleepex_slot = 0x41_010_u64;
             let worker_entry = 0x42_000_u64;
+            let sleeper_entry = 0x42_100_u64;
             let flag_ptr = 0x42_200_u64;
-            let thread_id_ptr = 0x42_204_u64;
-            // push 10; call [Sleep]; mov eax,1; mov [flag],eax; ret
+            let done_ptr = 0x42_204_u64;
+            let thread_id_ptr = 0x42_208_u64;
+            // Worker: push 10; call [Sleep]; mov eax,1; mov [flag],eax; ret
             let mut worker_bytes = vec![0x90; 0x20];
             worker_bytes[..21].copy_from_slice(&[
                 0x6A, 0x0A, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3,
@@ -78130,6 +78374,18 @@ mod tests {
             write_u32(&mut memory, sleep_slot, sleep as u32);
             memory.map_bytes(worker_entry, &worker_bytes);
             memory.map_bytes(flag_ptr, &[0_u8; 4]);
+            // Sleeper: push 50; push 0; call [SleepEx]; mov [done],eax; ret
+            let mut sleeper_bytes = vec![0x90; 0x20];
+            sleeper_bytes[..16].copy_from_slice(&[
+                0x6A, 0x32, // push 50
+                0x6A, 0x00, // push 0 (alertable)
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [SleepEx]
+                0xA3, 0x04, 0x22, 0x04, 0x00, // mov [done], eax
+                0xC3,
+            ]);
+            write_u32(&mut memory, sleepex_slot, sleep_ex as u32);
+            memory.map_bytes(sleeper_entry, &sleeper_bytes);
+            memory.map_bytes(done_ptr, &[0_u8; 4]);
 
             let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
@@ -78138,20 +78394,45 @@ mod tests {
                 &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
             );
             assert_ne!(worker_handle, 0);
-            assert_eq!(runtime.pending_guest_threads.len(), 1);
+            let sleeper_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, sleeper_entry as u32, 0, 0, 0x42_20c],
+            );
+            assert_ne!(sleeper_handle, 0);
 
             let tick_before = runtime.win32.get_tick_count64();
-            let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[50, 0]);
-            assert_eq!(result, 0, "SleepEx(50, FALSE) returns WAIT_OBJECT_0");
+            for _ in 0..1000 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+                if !_outcome.did_work {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    runtime.win32.record_sleep_observation(1, 1);
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
+            );
             assert_eq!(
                 read_u32(&memory, flag_ptr).expect("sibling flag"),
                 1,
-                "the sleeping sibling must wake during another thread's SleepEx"
+                "the sleeping sibling must wake during the other thread's sleep"
+            );
+            assert_eq!(
+                read_u32(&memory, done_ptr).expect("sleeper done"),
+                0,
+                "SleepEx(50, FALSE) returns WAIT_OBJECT_0"
             );
             let tick_after = runtime.win32.get_tick_count64();
             assert!(
                 tick_after >= tick_before + 10,
-                "guest clock must advance during SleepEx: {tick_before} -> {tick_after}"
+                "guest clock must advance during the sleeps: {tick_before} -> {tick_after}"
             );
         })
     }
@@ -78159,8 +78440,8 @@ mod tests {
     #[test]
     fn sleep_ex_infinite_blocks_until_apc() {
         // SleepEx(INFINITE, TRUE) must block like an infinite alertable
-        // wait: pump pending threads, deliver APCs queued during the sleep,
-        // and return WAIT_IO_COMPLETION — never return early.
+        // wait: the scheduler resumes it only through APC delivery, and it
+        // returns WAIT_IO_COMPLETION — never early.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
@@ -78184,45 +78465,84 @@ mod tests {
             let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
             let open_thread_slot = 0x41_000_u64;
             let queue_slot = 0x41_010_u64;
-            let worker_entry = 0x42_000_u64;
-            let apc_callback = 0x42_100_u64;
-            let apc_flag = 0x42_200_u64;
-            let thread_id_ptr = 0x42_204_u64;
+            let sleepex_slot = 0x41_020_u64;
+            let sleeper_entry = 0x42_000_u64;
+            let worker_entry = 0x42_100_u64;
+            let apc_callback = 0x42_200_u64;
+            let apc_flag = 0x42_300_u64;
+            let result_ptr = 0x42_400_u64;
+            let sleeper_tid_ptr = 0x42_404_u64;
+            let worker_tid_ptr = 0x42_408_u64;
 
             let mut apc_bytes = vec![0x90; 0x10];
             apc_bytes[..11].copy_from_slice(&[
-                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x23, 0x04, 0x00, 0xC3,
             ]);
+            memory.map_bytes(apc_callback, &apc_bytes);
+            memory.map_bytes(apc_flag, &[0_u8; 4]);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+            // Sleeper: push 1; push INFINITE; call [SleepEx]; mov [result],eax; ret
+            let mut sleeper_bytes = vec![0x90; 0x20];
+            sleeper_bytes[..19].copy_from_slice(&[
+                0x6A, 0x01, // push 1 (alertable)
+                0x68, 0xFF, 0xFF, 0xFF, 0xFF, // push INFINITE
+                0xFF, 0x15, 0x20, 0x10, 0x04, 0x00, // call [SleepEx]
+                0xA3, 0x00, 0x24, 0x04, 0x00, // mov [result], eax
+                0xC3,
+            ]);
+            write_u32(&mut memory, sleepex_slot, sleep_ex as u32);
+            memory.map_bytes(sleeper_entry, &sleeper_bytes);
+            // Worker: OpenThread(0x1F03FF, 0, sleeper_tid); QueueUserAPC(apc,
+            // hThread, 0); ret
             let mut worker_bytes = vec![0x90; 0x40];
             worker_bytes[..36].copy_from_slice(&[
-                0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+                0x68, 0x01, 0x00, 0x00, 0x00, // push sleeper_tid (patched)
                 0x6A, 0x00, // push 0 (inherit)
                 0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
                 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
                 0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
                 0x50, // push eax (hThread — arg2)
-                0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+                0x68, 0x00, 0x22, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
                 0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
                 0xC3, // ret
             ]);
             write_u32(&mut memory, open_thread_slot, open_thread as u32);
             write_u32(&mut memory, queue_slot, queue_user_apc as u32);
             memory.map_bytes(worker_entry, &worker_bytes);
-            memory.map_bytes(apc_callback, &apc_bytes);
-            memory.map_bytes(apc_flag, &[0_u8; 4]);
 
+            let sleeper_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, sleeper_entry as u32, 0, 0, sleeper_tid_ptr as u32],
+            );
+            assert_ne!(sleeper_handle, 0);
+            let sleeper_tid = read_u32(&memory, sleeper_tid_ptr).expect("sleeper tid");
+            worker_bytes[1..5].copy_from_slice(&sleeper_tid.to_le_bytes());
+            memory.map_bytes(worker_entry, &worker_bytes);
             let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 create_thread,
-                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+                &[0, 0, worker_entry as u32, 0, 0, worker_tid_ptr as u32],
             );
             assert_ne!(worker_handle, 0);
 
-            let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[u32::MAX, 1]);
+            for _ in 0..500 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
+            );
             assert_eq!(
-                result,
-                crate::win32::WAIT_IO_COMPLETION as u64,
+                read_u32(&memory, result_ptr).expect("sleep result"),
+                crate::win32::WAIT_IO_COMPLETION,
                 "SleepEx(INFINITE, TRUE) must block until an APC is delivered"
             );
             assert_eq!(
@@ -86795,15 +87115,14 @@ mod tests {
 
     #[test]
     fn wfso_infinite_reports_signal_set_by_pumped_worker() {
-        // Signal-loss regression: an auto-reset event set by a pumped guest
-        // thread during the wait's pump phase must be reported as
-        // WAIT_OBJECT_0 — previously the 0-timeout poll consumed the signal
-        // and the wait returned Unreported (RAX left stale forever).
+        // WfSO(INFINITE) on an auto-reset event: a pumped worker sets the
+        // event DURING the wait; the scheduler must resume the waiter with
+        // WAIT_OBJECT_0 and the signal must be consumed.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
             let ge = GameEnvironment::create_in(
                 temp_dir.path(),
-                "wfso-pump-signal",
+                "wfso-infinite-signal",
                 GeArch::X86,
                 "win11-23h2",
             )
@@ -86828,44 +87147,71 @@ mod tests {
 
             let set_event = runtime.alloc_host_thunk(HostThunk::SetEvent);
             let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-            let import_slot = 0x41_000_u64;
-            let entrypoint = 0x41_100_u64;
-            write_u32(&mut memory, import_slot, set_event as u32);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let set_slot = 0x41_000_u64;
+            let wfso_slot = 0x41_010_u64;
+            let worker_entry = 0x41_100_u64;
+            let waiter_entry = 0x41_200_u64;
+            let result_ptr = 0x41_300_u64;
+            let worker_tid_ptr = 0x41_304_u64;
+            let waiter_tid_ptr = 0x41_308_u64;
+            write_u32(&mut memory, set_slot, set_event as u32);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
 
             // Worker: push event_handle; call [slot]; mov eax, 1; ret 4 —
             // sets the event and exits.
-            let mut entry_bytes = vec![0x90; 0x20];
-            entry_bytes[0] = 0x68; // push imm32
-            entry_bytes[1..5].copy_from_slice(&event_handle.to_le_bytes());
-            entry_bytes[5..11].copy_from_slice(&[0xFF, 0x15, 0x00, 0x10, 0x04, 0x00]);
-            entry_bytes[11..16].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
-            entry_bytes[16..19].copy_from_slice(&[0xC2, 0x04, 0x00]);
-            memory.map_bytes(entrypoint, &entry_bytes);
+            let mut worker_bytes = vec![0x90; 0x20];
+            worker_bytes[0] = 0x68; // push imm32
+            worker_bytes[1..5].copy_from_slice(&event_handle.to_le_bytes());
+            worker_bytes[5..11].copy_from_slice(&[0xFF, 0x15, 0x00, 0x10, 0x04, 0x00]);
+            worker_bytes[11..16].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            worker_bytes[16..19].copy_from_slice(&[0xC2, 0x04, 0x00]);
+            memory.map_bytes(worker_entry, &worker_bytes);
 
-            let worker_handle = runtime.win32.create_thread(
-                crate::win32::ThreadPlan {
-                    exit_code: None,
-                    priority: 0,
-                    signaled: false,
-                },
-                false,
-            );
-            let pending = runtime
-                .prepare_guest_thread_entry(&mut memory, worker_handle, 0x1000, entrypoint, 0)
-                .expect("prepare worker");
-            runtime.pending_guest_threads.push_back(pending);
+            // Waiter: push INFINITE; push event_handle; call [WfSO];
+            // mov [result], eax; ret
+            let mut waiter_bytes = vec![0x90; 0x20];
+            waiter_bytes[..22].copy_from_slice(&[
+                0x68, 0xFF, 0xFF, 0xFF, 0xFF, // push INFINITE
+                0x68, 0x00, 0x00, 0x00, 0x00, // push event_handle (patched)
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [WfSO]
+                0xA3, 0x00, 0x23, 0x04, 0x00, // mov [result], eax
+                0xC3,
+            ]);
+            waiter_bytes[6..10].copy_from_slice(&event_handle.to_le_bytes());
+            write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
+            memory.map_bytes(waiter_entry, &waiter_bytes);
 
-            // WfSO(INFINITE) on the auto-reset event: the wait must pump the
-            // worker (which sets the event) and report WAIT_OBJECT_0.
-            let result = dispatch_x86_thunk(
+            let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
-                wait_for_single_object,
-                &[event_handle, u32::MAX],
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, worker_tid_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            let waiter_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, waiter_entry as u32, 0, 0, waiter_tid_ptr as u32],
+            );
+            assert_ne!(waiter_handle, 0);
+
+            for _ in 0..500 {
+                let _outcome = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "both threads must complete"
             );
             assert_eq!(
-                result,
-                crate::win32::WAIT_OBJECT_0 as u64,
+                read_u32(&memory, result_ptr).expect("wait result"),
+                crate::win32::WAIT_OBJECT_0,
                 "pump-phase signal must be reported as WAIT_OBJECT_0"
             );
             // The signal was consumed by the wait (auto-reset).
@@ -86877,8 +87223,6 @@ mod tests {
                     .eq(&crate::win32::WaitStatus::Object0),
                 "auto-reset signal must be consumed"
             );
-            // The worker ran to completion inside the wait.
-            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 

@@ -635,6 +635,11 @@ struct IoCompletionPortObject {
 #[derive(Debug, Clone)]
 struct MutexObject {
     owner_thread_id: Option<u32>,
+    /// Recursion count: a thread waiting on its own mutex succeeds and
+    /// increments recursion; ReleaseMutex decrements and only releases the
+    /// ownership at recursion 0.  This is Windows mutex semantics — a mutex
+    /// is not a Boolean signal.
+    recursion: u32,
     abandoned: bool,
 }
 
@@ -934,6 +939,14 @@ pub struct Win32Subsystem {
     last_config_save_wall_ms: u64,
     current_process_id: u32,
     current_thread_id: u32,
+}
+
+/// Non-consuming satisfiability result for scheduler wait evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitSatisfaction {
+    NotSignaled,
+    Signaled,
+    Abandoned,
 }
 
 impl Win32Subsystem {
@@ -1421,6 +1434,7 @@ impl Win32Subsystem {
             inheritable,
             KernelObject::Mutex(MutexObject {
                 owner_thread_id: initially_owned.then_some(self.current_thread_id),
+                recursion: 0,
                 abandoned: false,
             }),
         )
@@ -1446,9 +1460,21 @@ impl Win32Subsystem {
             }
             _ => return invalid_handle("handle is not a mutex"),
         }
+        let current_thread_id = self.current_thread_id;
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Mutex(mutex) => {
+                if mutex.owner_thread_id != Some(current_thread_id) {
+                    return Err(AppError::new(
+                        ReasonCode::RcWin32NotOwner,
+                        "ReleaseMutex failed: caller does not own the mutex",
+                    ));
+                }
+                if mutex.recursion > 1 {
+                    mutex.recursion -= 1;
+                    return Ok(());
+                }
+                mutex.recursion = 0;
                 mutex.owner_thread_id = None;
                 mutex.abandoned = false;
                 Ok(())
@@ -1558,31 +1584,255 @@ impl Win32Subsystem {
         } else {
             Some(self.time.ticks_ms.saturating_add(timeout_ms as u64))
         };
-        loop {
-            let status =
-                self.wait_for_single_object_instant(handle, object_type, current_thread_id)?;
-            if !matches!(status, WaitStatus::Timeout) {
-                return Ok(status);
+        // Non-blocking wait: one instant check, plus the deadline check.
+        // The guest scheduler (pe_runtime wait descriptors) is responsible
+        // for parking the thread and resuming it when the wait becomes
+        // satisfiable — this layer never host-sleeps inside a guest wait.
+        let status = self.wait_for_single_object_instant(handle, object_type, current_thread_id)?;
+        if !matches!(status, WaitStatus::Timeout) {
+            return Ok(status);
+        }
+        if timeout_ms == 0 {
+            return Ok(WaitStatus::Timeout);
+        }
+        if let Some(deadline) = deadline
+            && self.time.ticks_ms >= deadline
+        {
+            return Ok(WaitStatus::Timeout);
+        }
+        Ok(WaitStatus::Timeout)
+    }
+
+    /// Non-consuming signal-state check for a waitable object.
+    ///
+    /// Used by the scheduler's wait-all evaluation: every object in the set
+    /// must be satisfiable WITHOUT consuming, so the complete set can be
+    /// acquired atomically by [`consume_wait_set`] as one dispatcher
+    /// operation (otherwise a concurrent waiter could steal an auto-reset
+    /// event or mutex between observation and acquisition).
+    ///
+    /// [`consume_wait_set`]: Self::consume_wait_set
+    pub fn wait_object_satisfiable(
+        &self,
+        handle: Handle,
+        object_type: ObjectType,
+        current_thread_id: u32,
+    ) -> AppResult<WaitSatisfaction> {
+        let now = self.time.ticks_ms;
+        match object_type {
+            ObjectType::Event
+            | ObjectType::Mutex
+            | ObjectType::Semaphore
+            | ObjectType::Thread
+            | ObjectType::Timer
+            | ObjectType::Process => {
+                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
             }
-            if timeout_ms == 0 {
-                return Ok(WaitStatus::Timeout);
+            _ => {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("handle {handle} is not a waitable object"),
+                ));
             }
-            if let Some(deadline) = deadline
-                && self.time.ticks_ms >= deadline
+        }
+        match object_type {
+            ObjectType::Event => {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Event(event) = &entry.object {
+                    if event.borrow().signaled {
+                        Ok(WaitSatisfaction::Signaled)
+                    } else {
+                        Ok(WaitSatisfaction::NotSignaled)
+                    }
+                } else {
+                    invalid_handle("handle is not an event")
+                }
+            }
+            ObjectType::Mutex => {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Mutex(mutex) = &entry.object {
+                    if mutex.abandoned {
+                        Ok(WaitSatisfaction::Abandoned)
+                    } else if mutex.owner_thread_id.is_none()
+                        || mutex.owner_thread_id == Some(current_thread_id)
+                    {
+                        // Unlocked, or already owned by the waiting thread
+                        // (recursive acquisition always succeeds).
+                        Ok(WaitSatisfaction::Signaled)
+                    } else {
+                        Ok(WaitSatisfaction::NotSignaled)
+                    }
+                } else {
+                    invalid_handle("handle is not a mutex")
+                }
+            }
+            ObjectType::Semaphore => {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Semaphore(semaphore) = &entry.object {
+                    if semaphore.count > 0 {
+                        Ok(WaitSatisfaction::Signaled)
+                    } else {
+                        Ok(WaitSatisfaction::NotSignaled)
+                    }
+                } else {
+                    invalid_handle("handle is not a semaphore")
+                }
+            }
+            ObjectType::Thread => {
+                let thread_id = self.thread_id(handle)?;
+                if self.thread_state(thread_id)?.exit_code.is_some() {
+                    Ok(WaitSatisfaction::Signaled)
+                } else {
+                    Ok(WaitSatisfaction::NotSignaled)
+                }
+            }
+            ObjectType::Timer => {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Timer(timer) = &entry.object {
+                    if timer.signaled || now >= timer.due_tick {
+                        Ok(WaitSatisfaction::Signaled)
+                    } else {
+                        Ok(WaitSatisfaction::NotSignaled)
+                    }
+                } else {
+                    invalid_handle("handle is not a timer")
+                }
+            }
+            ObjectType::Process => {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Process(process) = &entry.object {
+                    if process.exit_code.is_some() {
+                        Ok(WaitSatisfaction::Signaled)
+                    } else {
+                        Ok(WaitSatisfaction::NotSignaled)
+                    }
+                } else {
+                    invalid_handle("handle is not a process")
+                }
+            }
+            _ => unreachable!("non-waitable types rejected above"),
+        }
+    }
+
+    /// Atomically consume the signals of a satisfied wait set — the complete
+    /// set is observed and acquired as one dispatcher operation.
+    fn consume_wait_set(&mut self, handles: &[Handle], current_thread_id: u32) -> AppResult<()> {
+        for &handle in handles {
+            let object_type = self.handle_entry(handle)?.descriptor.object_type;
+            match object_type {
+                ObjectType::Event => {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Event(event) = &mut entry.object {
+                        let mut event = event.borrow_mut();
+                        if !event.manual_reset {
+                            event.signaled = false;
+                        }
+                    }
+                }
+                ObjectType::Mutex => {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Mutex(mutex) = &mut entry.object {
+                        if mutex.abandoned {
+                            mutex.abandoned = false;
+                            mutex.owner_thread_id = Some(current_thread_id);
+                            mutex.recursion = 1;
+                        } else if mutex.owner_thread_id == Some(current_thread_id) {
+                            mutex.recursion += 1;
+                        } else {
+                            mutex.owner_thread_id = Some(current_thread_id);
+                            mutex.recursion = 1;
+                        }
+                    }
+                }
+                ObjectType::Semaphore => {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Semaphore(semaphore) = &mut entry.object {
+                        semaphore.count = semaphore.count.saturating_sub(1);
+                    }
+                }
+                ObjectType::Timer => {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Timer(timer) = &mut entry.object {
+                        timer.signaled = true;
+                    }
+                }
+                ObjectType::Thread | ObjectType::Process => {}
+                _ => {
+                    return Err(AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("handle {handle} is not a waitable object"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate a wait-all set atomically: every object must be satisfiable
+    /// (non-consuming), then the complete set is consumed as one operation.
+    /// Returns the wait result: `Abandoned` when any acquired mutex was
+    /// abandoned (ownership still transfers), `Object0` otherwise, `None`
+    /// when not all objects are satisfiable.
+    pub fn evaluate_wait_all(
+        &mut self,
+        handles: &[Handle],
+        current_thread_id: u32,
+    ) -> AppResult<Option<WaitStatus>> {
+        let mut any_abandoned = false;
+        for &handle in handles {
+            let object_type = self.handle_entry(handle)?.descriptor.object_type;
+            match self.wait_object_satisfiable(handle, object_type, current_thread_id)? {
+                WaitSatisfaction::Signaled => {}
+                WaitSatisfaction::Abandoned => any_abandoned = true,
+                WaitSatisfaction::NotSignaled => return Ok(None),
+            }
+        }
+        self.consume_wait_set(handles, current_thread_id)?;
+        Ok(Some(if any_abandoned {
+            WaitStatus::Abandoned
+        } else {
+            WaitStatus::Object0
+        }))
+    }
+
+    /// Mark every mutex owned by `thread_id` abandoned (the owner
+    /// terminated).  Called from the thread-exit paths.
+    /// Non-consuming check: has the overlapped operation completed?
+    pub fn overlapped_completed(&self, id: u64) -> bool {
+        self.overlapped
+            .get(&id)
+            .is_some_and(|request| !matches!(request.state, OverlappedState::Pending))
+    }
+
+    /// Non-consuming check: is the pipe connected (server side)?
+    pub fn pipe_is_connected(&self, handle: Handle) -> bool {
+        self.handle_entry(handle)
+            .ok()
+            .and_then(|entry| match &entry.object {
+                KernelObject::Pipe(pipe) => Some(pipe.connected),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn mark_owned_mutexes_abandoned(&mut self, thread_id: u32) {
+        for entry in self.handles.values_mut() {
+            if let KernelObject::Mutex(mutex) = &mut entry.object
+                && mutex.owner_thread_id == Some(thread_id)
             {
-                return Ok(WaitStatus::Timeout);
+                mutex.owner_thread_id = None;
+                mutex.recursion = 0;
+                mutex.abandoned = true;
             }
-            std::thread::sleep(Duration::from_millis(1));
-            // Advance the guest clock so the deadline above can expire.
-            self.record_sleep_observation(1, 1);
         }
     }
 
     /// Single non-blocking signal-state check for a waitable object.
+    /// Single non-blocking signal-state check for a waitable object.
     /// Consumes the signal only on success (auto-reset events, mutex
     /// acquisition, semaphore decrement), matching `wait_for_single_object`
     /// semantics for a zero-timeout poll.
-    fn wait_for_single_object_instant(
+    pub fn wait_for_single_object_instant(
         &mut self,
         handle: Handle,
         object_type: ObjectType,
@@ -1635,14 +1885,25 @@ impl Win32Subsystem {
                 let entry = self.handle_entry_mut(handle)?;
                 if let KernelObject::Mutex(mutex) = &mut entry.object {
                     if mutex.abandoned {
+                        // The previous owner terminated without releasing;
+                        // the next successful waiter receives WAIT_ABANDONED
+                        // and takes ownership.
                         mutex.abandoned = false;
                         mutex.owner_thread_id = Some(current_thread_id);
+                        mutex.recursion = 1;
                         Ok(WaitStatus::Abandoned)
-                    } else if mutex.owner_thread_id.is_none() {
-                        mutex.owner_thread_id = Some(current_thread_id);
-                        Ok(WaitStatus::Object0)
+                    } else if let Some(owner) = mutex.owner_thread_id {
+                        if owner == current_thread_id {
+                            // Recursive acquisition succeeds and increments.
+                            mutex.recursion += 1;
+                            Ok(WaitStatus::Object0)
+                        } else {
+                            Ok(WaitStatus::Timeout)
+                        }
                     } else {
-                        Ok(WaitStatus::Timeout)
+                        mutex.owner_thread_id = Some(current_thread_id);
+                        mutex.recursion = 1;
+                        Ok(WaitStatus::Object0)
                     }
                 } else {
                     invalid_handle("handle is not a mutex")
@@ -3353,55 +3614,58 @@ impl Win32Subsystem {
 
     pub fn get_overlapped_result(&mut self, id: u64, wait: bool) -> AppResult<OverlappedResult> {
         if wait {
-            // Blocking GetOverlappedResult: poll for completion for a bounded
-            // period (an unbounded block would starve cooperatively scheduled
-            // guest threads that complete the request).
-            for _ in 0..BLOCKING_POLL_ITERATIONS {
-                let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcWin32InvalidHandle,
-                        format!("invalid overlapped id {id}"),
-                    )
-                })?;
-                if self.overlapped_request_is_stale(&request) {
-                    // The handle this I/O was issued on was closed (and
-                    // possibly its value recycled) before the completion was
-                    // consumed — drop the stale completion entirely.
+            // GetOverlappedResult(TRUE) waits for completion — Windows gives
+            // this API no timeout.  The wait is a guest-scheduler wait (the
+            // pe_runtime thunk parks the thread on the overlapped completion
+            // state); this layer never host-sleeps or fabricates a timeout.
+            // A Pending result signals the caller to park.
+            let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("invalid overlapped id {id}"),
+                )
+            })?;
+            if self.overlapped_request_is_stale(&request) {
+                // The handle this I/O was issued on was closed (and
+                // possibly its value recycled) before the completion was
+                // consumed — drop the stale completion entirely.
+                self.overlapped.remove(&id);
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("overlapped request {id} refers to a closed handle"),
+                ));
+            }
+            match request.state {
+                OverlappedState::Completed(bytes_transferred) => {
                     self.overlapped.remove(&id);
-                    return Err(AppError::new(
-                        ReasonCode::RcWin32InvalidHandle,
-                        format!("overlapped request {id} refers to a closed handle"),
-                    ));
+                    return Ok(OverlappedResult {
+                        id,
+                        bytes_transferred,
+                        completed: true,
+                        cancelled: false,
+                    });
                 }
-                match request.state {
-                    OverlappedState::Completed(bytes_transferred) => {
-                        self.overlapped.remove(&id);
-                        return Ok(OverlappedResult {
-                            id,
-                            bytes_transferred,
-                            completed: true,
-                            cancelled: false,
-                        });
-                    }
-                    OverlappedState::Cancelled => {
-                        self.overlapped.remove(&id);
-                        return Ok(OverlappedResult {
-                            id,
-                            bytes_transferred: 0,
-                            completed: false,
-                            cancelled: true,
-                        });
-                    }
-                    OverlappedState::Pending => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        self.record_sleep_observation(1, 1);
-                    }
+                OverlappedState::Cancelled => {
+                    self.overlapped.remove(&id);
+                    return Ok(OverlappedResult {
+                        id,
+                        bytes_transferred: 0,
+                        completed: false,
+                        cancelled: true,
+                    });
+                }
+                OverlappedState::Pending => {
+                    // Not complete yet: the caller must park the guest
+                    // thread on the overlapped completion and re-poll when
+                    // the scheduler resumes it.
+                    return Ok(OverlappedResult {
+                        id,
+                        bytes_transferred: 0,
+                        completed: false,
+                        cancelled: false,
+                    });
                 }
             }
-            return Err(AppError::new(
-                ReasonCode::RcWin32Timeout,
-                format!("overlapped request {id} is still pending"),
-            ));
         }
         let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
             AppError::new(
@@ -4584,6 +4848,10 @@ impl Win32Subsystem {
     pub fn set_thread_exit_code_by_id(&mut self, thread_id: u32, exit_code: u32) -> AppResult<()> {
         self.ensure_thread_state(thread_id);
         self.thread_state_mut(thread_id)?.exit_code = Some(exit_code);
+        // Windows mutex semantics: a thread that terminates while owning a
+        // mutex abandons it — the next successful waiter receives
+        // WAIT_ABANDONED and takes ownership.
+        self.mark_owned_mutexes_abandoned(thread_id);
         self.cleanup_exited_thread_state(thread_id);
         Ok(())
     }
@@ -6153,6 +6421,80 @@ mod tests {
     }
 
     #[test]
+    fn mutex_ownership_recursion_and_abandonment() {
+        // Windows mutex semantics at the dispatcher level: ownership by TID,
+        // recursion count, non-owner release failure, and abandonment when
+        // the owner terminates.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mtx-own", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Recursive acquisition by the same thread succeeds and increments.
+        let h = win32.create_mutex(false, false);
+        win32.current_thread_id = 1;
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("acquire 1"),
+            WaitStatus::Object0
+        );
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("recursive acquire"),
+            WaitStatus::Object0,
+            "a thread recursively waiting on its own mutex succeeds"
+        );
+
+        // ReleaseMutex from a non-owner fails with ERROR_NOT_OWNER.
+        win32.current_thread_id = 2;
+        let error = win32.release_mutex(h).expect_err("non-owner release");
+        assert_eq!(error.code, ReasonCode::RcWin32NotOwner);
+
+        // The owner releases once (recursion 2 -> 1) — still owned.
+        win32.current_thread_id = 1;
+        win32.release_mutex(h).expect("release 1");
+        // A DIFFERENT thread waiting on it cannot acquire (owner is thread 1):
+        // the wait returns WAIT_TIMEOUT (a normal status — the mutex is a
+        // valid waitable object owned by someone else).
+        win32.current_thread_id = 2;
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait on foreign-owned mutex"),
+            WaitStatus::Timeout,
+            "a mutex owned by another thread is not satisfiable"
+        );
+
+        // Full release by the owner makes it free again.
+        win32.current_thread_id = 1;
+        win32.release_mutex(h).expect("release 2");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("reacquire after full release"),
+            WaitStatus::Object0,
+            "a fully released mutex is free"
+        );
+
+        // Termination while owning abandons the mutex: the next successful
+        // waiter receives WAIT_ABANDONED and takes ownership.
+        win32
+            .set_thread_exit_code_by_id(1, 0)
+            .expect("thread 1 exits while owning the mutex");
+        win32.current_thread_id = 4;
+        let status = win32
+            .wait_for_single_object(h, 0, false, None)
+            .expect("wait after owner exit");
+        assert!(
+            matches!(status, WaitStatus::Abandoned),
+            "owner termination must abandon the mutex, got {status:?}"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
     fn semaphore_release_increments_count() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "sem-inc", GeArch::X86, "win11-23h2")
@@ -6479,6 +6821,7 @@ mod tests {
             false,
             KernelObject::Mutex(MutexObject {
                 owner_thread_id: None,
+                recursion: 0,
                 abandoned: false,
             }),
         );
@@ -6551,6 +6894,7 @@ mod tests {
             false,
             KernelObject::Mutex(MutexObject {
                 owner_thread_id: None,
+                recursion: 0,
                 abandoned: false,
             }),
         );

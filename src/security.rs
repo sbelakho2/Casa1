@@ -207,14 +207,19 @@ pub fn detect_driver_requirement_on_disk(
 ) -> AppResult<Option<DriverRequirementReport>> {
     let launch_target = executable.display().to_string();
     let mut paths = Vec::new();
-    for root in candidate_scan_roots(executable) {
+    for (root, max_depth) in candidate_scan_roots(executable) {
         if !root.exists() {
             continue;
         }
+        // Hard cap on scanned entries: the walk must stay O(game directory),
+        // never O(build tree) — a host binary's parent can hold ~850k files
+        // (target/debug).  Driver indicators are found in the first few
+        // hundred entries of a real game install.
         for entry in WalkDir::new(root)
-            .max_depth(4)
+            .max_depth(max_depth)
             .into_iter()
             .filter_map(Result::ok)
+            .take(DRIVER_SCAN_ENTRY_CAP)
         {
             paths.push(entry.path().display().to_string());
         }
@@ -224,6 +229,9 @@ pub fn detect_driver_requirement_on_disk(
         paths.iter().map(String::as_str),
     ))
 }
+
+/// Maximum number of directory entries scanned for driver indicators.
+const DRIVER_SCAN_ENTRY_CAP: usize = 10_000;
 
 pub fn detect_driver_requirement_paths<'a, I>(
     launch_target: &str,
@@ -541,18 +549,19 @@ pub fn nightly_sanitizer_commands(target: &str) -> Vec<String> {
     )]
 }
 
-fn candidate_scan_roots(executable: &Path) -> Vec<PathBuf> {
+fn candidate_scan_roots(executable: &Path) -> Vec<(PathBuf, usize)> {
+    // The executable's own directory (depth 4 — the game's Bin/ tree) and
+    // its grandparent (depth 2 — the game root holding sibling indicator
+    // dirs like EasyAntiCheat/).  NEVER walk further up: the repo/build
+    // root walk was O(entire tree) (~850k paths, ~27 s per run).  The entry
+    // cap keeps the scan O(game directory) even for host binaries.
     let mut roots = Vec::new();
-    let mut current = executable.parent();
-    for _ in 0..3 {
-        let Some(path) = current else {
-            break;
-        };
-        roots.push(path.to_path_buf());
-        current = path.parent();
+    if let Some(parent) = executable.parent() {
+        roots.push((parent.to_path_buf(), 4));
+        if let Some(grandparent) = parent.parent() {
+            roots.push((grandparent.to_path_buf(), 2));
+        }
     }
-    roots.sort();
-    roots.dedup();
     roots
 }
 

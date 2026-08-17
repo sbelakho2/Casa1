@@ -120,12 +120,24 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             return Err(e);
         }
     };
-    let driver_report = job
-        .program
-        .exists()
-        .then(|| detect_driver_requirement_on_disk(&job.program))
-        .transpose()?
-        .flatten();
+    // Driver-requirement detection is a Windows-executable concept: the
+    // indicators (EAC/BattlEye/…) are Windows driver files sitting next to
+    // the game.  Scanning host binaries (MACH-O test fixtures, tools) would
+    // walk the whole build tree (~850k files under target/debug) for no
+    // signal, costing seconds per run across the suite.
+    // The walk is bounded to the executable's own directory, so the check
+    // is cheap even for host binaries; the gate still skips the scan for
+    // clearly non-Windows executables.
+    let looks_windows_executable = pe_runtime::is_pe_image(&job.program).unwrap_or(false)
+        || job
+            .program
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    let driver_report = if job.program.exists() && looks_windows_executable {
+        detect_driver_requirement_on_disk(&job.program)?
+    } else {
+        None
+    };
     if let Some(report) = driver_report {
         return Err(driver_requirement_error(&report));
     }
@@ -318,7 +330,8 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         }
     }
 
-    if job.program.exists() && pe_runtime::is_pe_image(&job.program)? {
+    let is_pe = job.program.exists() && pe_runtime::is_pe_image(&job.program)?;
+    if is_pe {
         let child_pid = pe_runtime::synthetic_pid(job.dtm); // real implementation: generates PID based on dtm mode
         let log_path = ge.log_path(&job.test_id, child_pid);
         let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
