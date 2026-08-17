@@ -252,6 +252,11 @@ const PE_RUNTIME_INSTRUCTION_BUDGET: u64 = 25_000_000;
 const SAFEPOINT_INTERVAL_MS: u64 = 2;
 const KEYBOARD_REPLAY_ENV: &str = "CASA1_KEYBOARD_REPLAY_JSON";
 const PE_RUNTIME_BUDGET_ENV: &str = "CASA1_PE_RUNTIME_BUDGET";
+/// Optional wall-clock run deadline in seconds (e.g. `CASA1_PE_RUNTIME_DEADLINE_SECS=600`).
+/// Steam's main loop is wait-bound and never exits on its own; the deadline
+/// ends the run with exit code -2 (the timeout convention) so diagnostic
+/// artifacts are still produced.  Unset means unbounded (existing behavior).
+const PE_RUNTIME_DEADLINE_ENV: &str = "CASA1_PE_RUNTIME_DEADLINE_SECS";
 const EXPORT_FINAL_FRAME_ENV: &str = "CASA1_EXPORT_FINAL_FRAME";
 const TRACE_CATEGORIES_ENV: &str = "CASA1_TRACE_CATEGORIES";
 const INSTRUCTION_CACHE_LIMIT: usize = 65_536;
@@ -4742,6 +4747,10 @@ pub fn execute_with_options(
     )?;
     let mut engine = CpuExecutionEngine::new(config);
     let instruction_budget = runtime.current_instruction_budget()?;
+    let run_deadline = std::env::var(PE_RUNTIME_DEADLINE_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
     let mut state = CpuState::new(guest_arch);
     let guest_pointer_bytes = guest_arch.pointer_bytes() as u64;
     let stack_bottom = stack_base_for_arch(guest_arch);
@@ -4814,6 +4823,17 @@ pub fn execute_with_options(
         // intact as a fallback for when JIT block chains are re-enabled;
         // the old 50 ms main-loop chain-break timer is replaced by this
         // safepoint.
+        if let Some(deadline) = run_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            // Wall-clock run deadline (instrumentation): end the run with
+            // exit code -2 so artifacts are produced even though Steam's
+            // main loop never exits on its own.
+            exit_code = -2;
+            crate::live::live_trace("[pe] run deadline reached — ending run with exit -2");
+            break;
+        }
+
         if runtime.active_pumped_guest_thread.is_none()
             && last_safepoint.elapsed().as_millis() as u64 >= SAFEPOINT_INTERVAL_MS
         {
