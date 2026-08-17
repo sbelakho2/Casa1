@@ -425,7 +425,11 @@ fn t10_4_underflow_overflow_torture_randomized_buffer_sizes_recover_without_dead
             .expect("drain torture frames");
         // Every drain must return exactly 3 frames x 2 channels — no dropped
         // or mis-sized buffers.
-        assert_eq!(drained.samples.len(), 6, "drain must return 3 stereo frames");
+        assert_eq!(
+            drained.samples.len(),
+            6,
+            "drain must return 3 stereo frames"
+        );
         let underflow_delta = drained.underflow_frames - previous_underflow;
         let _overflow_delta = drained.overflow_frames - previous_overflow;
         assert!(
@@ -446,7 +450,8 @@ fn t10_4_underflow_overflow_torture_randomized_buffer_sizes_recover_without_dead
     let remaining = audio
         .drain_audio_client(client, written_frames)
         .expect("drain remaining torture frames");
-    let remaining_real = written_frames as u64 - u64::from(remaining.underflow_frames - last_underflow);
+    let remaining_real =
+        written_frames as u64 - u64::from(remaining.underflow_frames - last_underflow);
     assert_eq!(
         drained_real_frames + remaining_real + u64::from(last_overflow),
         written_frames as u64,

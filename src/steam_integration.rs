@@ -510,28 +510,34 @@ impl SteamServiceProcess {
             // after launch.
             let args: Vec<String> = Vec::new();
             let env = BTreeMap::new();
-            let cwd = self.service_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let cwd = self
+                .service_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
             let service_exe = self.service_path.clone();
             let ge_clone = ge.clone();
             std::thread::Builder::new()
                 .name("steam-service".to_string())
-                .spawn(move || match pe_runtime::execute(
-                    &service_exe,
-                    &args,
-                    &ge_clone,
-                    &cwd,
-                    &env,
-                    false, // dtm
-                    "steam-service",
-                ) {
-                    Ok(result) => {
-                        eprintln!(
-                            "SteamService: PE service exited with code {}",
-                            result.exit_code
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("SteamService: PE execution failed: {e}");
+                .spawn(move || {
+                    match pe_runtime::execute(
+                        &service_exe,
+                        &args,
+                        &ge_clone,
+                        &cwd,
+                        &env,
+                        false, // dtm
+                        "steam-service",
+                    ) {
+                        Ok(result) => {
+                            eprintln!(
+                                "SteamService: PE service exited with code {}",
+                                result.exit_code
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("SteamService: PE execution failed: {e}");
+                        }
                     }
                 })
                 .map_err(|e| {
@@ -559,9 +565,7 @@ impl SteamServiceProcess {
                 let pid = child.id() as i32;
                 let kill_result = unsafe { libc::kill(pid, libc::SIGTERM) };
                 if kill_result != 0 {
-                    eprintln!(
-                        "SteamService: SIGTERM to PID {pid} failed (errno {kill_result})"
-                    );
+                    eprintln!("SteamService: SIGTERM to PID {pid} failed (errno {kill_result})");
                 }
                 // Wait briefly for graceful shutdown
                 for _ in 0..50 {
@@ -943,12 +947,14 @@ impl SteamIpcManager {
                 format!("SteamIpcManager: connect to {addr} failed: {e}"),
             )
         })?;
-        stream.set_read_timeout(Some(IPC_RESPONSE_TIMEOUT)).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetSocketCreateFailed,
-                format!("SteamIpcManager: failed to set read timeout: {e}"),
-            )
-        })?;
+        stream
+            .set_read_timeout(Some(IPC_RESPONSE_TIMEOUT))
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetSocketCreateFailed,
+                    format!("SteamIpcManager: failed to set read timeout: {e}"),
+                )
+            })?;
 
         // Send length-prefixed message
         let len = msg.len() as u32;
@@ -1126,9 +1132,7 @@ impl SteamLibraryScanner {
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
                         !(e.file_type().is_dir()
-                            && (name == "shadercache"
-                                || name == "htmlcache"
-                                || name == "dumps"))
+                            && (name == "shadercache" || name == "htmlcache" || name == "dumps"))
                     })
                     .filter_map(|e: Result<walkdir::DirEntry, _>| e.ok())
                     .filter(|e: &walkdir::DirEntry| e.file_type().is_file())
@@ -1240,8 +1244,7 @@ fn percent_encode(segment: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(segment.len());
     for &byte in segment.as_bytes() {
-        let unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
         if unreserved {
             out.push(byte as char);
         } else {
@@ -1854,9 +1857,10 @@ impl SteamNetworkingSockets {
         for msg in messages {
             // Claim unowned connections for this listen socket so messages
             // are not cross-delivered between sockets.
-            let is_owned_elsewhere = self.listen_sockets.iter().any(|(handle, (_, conns))| {
-                *handle != listen_handle && conns.contains(&msg.conn)
-            });
+            let is_owned_elsewhere = self
+                .listen_sockets
+                .iter()
+                .any(|(handle, (_, conns))| *handle != listen_handle && conns.contains(&msg.conn));
             if !is_owned_elsewhere
                 && let Some((_, conns)) = self.listen_sockets.get_mut(&listen_handle)
                 && !conns.contains(&msg.conn)
@@ -1926,12 +1930,8 @@ impl SteamNetworkingSockets {
         Ok(SteamNetworkingConnectionStatus {
             state: state.map(|s| s as i32).unwrap_or(0),
             ping: detail.map(|d| d.ping_ms).unwrap_or(0),
-            connection_quality_local: detail
-                .map(|d| d.connection_quality_local)
-                .unwrap_or(1.0),
-            connection_quality_remote: detail
-                .map(|d| d.connection_quality_remote)
-                .unwrap_or(1.0),
+            connection_quality_local: detail.map(|d| d.connection_quality_local).unwrap_or(1.0),
+            connection_quality_remote: detail.map(|d| d.connection_quality_remote).unwrap_or(1.0),
             out_packets_per_sec: detail.map(|d| d.out_packets_per_sec).unwrap_or(0.0),
             in_packets_per_sec: detail.map(|d| d.in_packets_per_sec).unwrap_or(0.0),
             send_rate_bytes_per_sec: detail
@@ -2132,9 +2132,7 @@ impl SteamNetworkingMessages {
                 // memory without limit; the oldest session is evicted first.
                 const MAX_USER_SESSIONS: usize = 256;
                 while self.sessions.len() >= MAX_USER_SESSIONS {
-                    if let Some((oldest, _)) =
-                        self.sessions.iter().next().map(|(k, v)| (*k, *v))
-                    {
+                    if let Some((oldest, _)) = self.sessions.iter().next().map(|(k, v)| (*k, *v)) {
                         if let Err(err) = self.gns.close_session(oldest) {
                             eprintln!(
                                 "SteamNetworkingMessages: failed to close evicted session: {err}"
@@ -2339,7 +2337,9 @@ where
 {
     // Recover from a poisoned lock (a previous panic while holding it) so
     // overlay callbacks never become fatal.
-    let mut guard = GLOBAL_STEAM_OVERLAY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = GLOBAL_STEAM_OVERLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
@@ -2781,10 +2781,7 @@ impl SteamUserStats {
         score: i32,
         details: Vec<i32>,
     ) -> AppResult<()> {
-        let board = self
-            .leaderboards
-            .entry(name.to_string())
-            .or_default();
+        let board = self.leaderboards.entry(name.to_string()).or_default();
         board.push((score, 0, details));
         board.sort_by_key(|e| std::cmp::Reverse(e.0));
         self.save_to_config();
@@ -3993,8 +3990,7 @@ impl SteamRemoteStorage {
                                 format!("RemoteStorage: cannot create temp file: {e}"),
                             )
                         })?;
-                        let mut limited =
-                            std::io::Read::take(dl_resp, MAX_CLOUD_DOWNLOAD_SIZE);
+                        let mut limited = std::io::Read::take(dl_resp, MAX_CLOUD_DOWNLOAD_SIZE);
                         std::io::copy(&mut limited, &mut out).map_err(|e| {
                             AppError::new(
                                 ReasonCode::RcNetReadFailed,
@@ -4005,7 +4001,9 @@ impl SteamRemoteStorage {
                         if size == 0 && remote_info.size > 0 {
                             return Err(AppError::new(
                                 ReasonCode::RcNetReadFailed,
-                                format!("RemoteStorage: download of '{rel_path}' returned an empty body"),
+                                format!(
+                                    "RemoteStorage: download of '{rel_path}' returned an empty body"
+                                ),
                             ));
                         }
                         fs::rename(&tmp_path, &full_path).map_err(|e| {
@@ -4203,7 +4201,10 @@ impl SteamRemoteStorage {
         // that would push the storage usage over `quota_total`.
         let old_size = self.files.get(rel_path).copied().unwrap_or(0);
         let new_size = data.len() as u64;
-        let projected = self.quota_used.saturating_sub(old_size).saturating_add(new_size);
+        let projected = self
+            .quota_used
+            .saturating_sub(old_size)
+            .saturating_add(new_size);
         if self.quota_total > 0 && projected > self.quota_total {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
@@ -4559,7 +4560,11 @@ impl SteamScreenshots {
     pub fn write_screenshot(&mut self, rgba: &[u8], width: u32, height: u32) -> AppResult<u64> {
         // Validate dimensions before any arithmetic: reject overflow and
         // absurd sizes so a guest cannot drive a giant allocation.
-        if width == 0 || height == 0 || width > MAX_SCREENSHOT_DIMENSION || height > MAX_SCREENSHOT_DIMENSION {
+        if width == 0
+            || height == 0
+            || width > MAX_SCREENSHOT_DIMENSION
+            || height > MAX_SCREENSHOT_DIMENSION
+        {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
                 format!("SteamScreenshots: invalid dimensions {width}x{height}"),
@@ -4782,9 +4787,9 @@ impl SteamScreenshots {
 /// Each row gets a filter byte of 0 (None filter) prepended. All dimension
 /// arithmetic is overflow-checked and reported as an `AppError`.
 fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> AppResult<Vec<u8>> {
-    let stride = width.checked_mul(4).ok_or_else(|| {
-        AppError::new(ReasonCode::RcCliInvalid, "PNG encode: stride overflow")
-    })?;
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| AppError::new(ReasonCode::RcCliInvalid, "PNG encode: stride overflow"))?;
     let raw_len = height.checked_mul(1 + stride).ok_or_else(|| {
         AppError::new(ReasonCode::RcCliInvalid, "PNG encode: raw length overflow")
     })?;

@@ -155,7 +155,6 @@ fn t16_1b_entitlement_audit_treats_metadata_only_codesign_output_as_empty_entitl
 #[test]
 #[cfg(target_os = "macos")]
 fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {
-
     let runner_xml = r#"<?xml version="1.0"?><plist><dict>
         <key>com.apple.security.cs.allow-jit</key><true/>
     </dict></plist>"#;
@@ -188,7 +187,6 @@ fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {
 #[test]
 #[cfg(target_os = "macos")]
 fn t16_1d_entitlement_audit_cli_enforces_signed_binary_set_end_to_end() {
-
     let runner_xml = r#"<?xml version="1.0"?><plist><dict>
         <key>com.apple.security.cs.allow-jit</key><true/>
     </dict></plist>"#;
@@ -499,8 +497,7 @@ fn t16_5_shader_resource_binding_translation() {
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 65, 0x00, 0x00]);
         bytes
     };
-    let bindless_info =
-        shader::parse_root_signature(&bindless).expect("parse bindless root sig");
+    let bindless_info = shader::parse_root_signature(&bindless).expect("parse bindless root sig");
     let bindless_bufs = shader::build_argument_buffers(&bindless_info);
     assert_eq!(bindless_bufs.len(), 1);
     assert!(
@@ -628,9 +625,18 @@ fn t16_7_glsl_translation_errors() {
     let texture_source = "void main() {\n    gl_FragColor = texture2D(tex, vec2(0.5));\n}";
     let msl = GlslToMslTranslator::translate(texture_source, GlslShaderStage::Fragment)
         .expect("texture shader must translate");
-    assert!(msl.contains("tex.sample(tex_sampler, tex, float2(0.5))"), "MSL:\n{msl}");
-    assert!(msl.contains("texture2d<float> tex [[texture(0)]]"), "MSL:\n{msl}");
-    assert!(msl.contains("sampler tex_sampler [[sampler(0)]]"), "MSL:\n{msl}");
+    assert!(
+        msl.contains("tex.sample(tex_sampler, tex, float2(0.5))"),
+        "MSL:\n{msl}"
+    );
+    assert!(
+        msl.contains("texture2d<float> tex [[texture(0)]]"),
+        "MSL:\n{msl}"
+    );
+    assert!(
+        msl.contains("sampler tex_sampler [[sampler(0)]]"),
+        "MSL:\n{msl}"
+    );
 
     // Documented lenient behavior: unrecognised/broken input must NOT panic, and
     // unrecognised lines are passed through rather than dropped.
@@ -644,7 +650,10 @@ fn t16_7_glsl_translation_errors() {
 
     let empty = GlslToMslTranslator::translate("", GlslShaderStage::Vertex)
         .expect("empty source must translate");
-    assert!(empty.contains("vertex float4 casa1_entry("), "MSL:\n{empty}");
+    assert!(
+        empty.contains("vertex float4 casa1_entry("),
+        "MSL:\n{empty}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -684,7 +693,10 @@ fn t16_8_cbuffer_and_structured_packing() {
     assert_eq!(packed.fields[0].offset, 0);
     assert_eq!(packed.fields[0].size_bytes, 4);
     assert_eq!(packed.fields[1].name, "offsetB");
-    assert_eq!(packed.fields[1].offset, 16, "float4 must align to the next register");
+    assert_eq!(
+        packed.fields[1].offset, 16,
+        "float4 must align to the next register"
+    );
     assert_eq!(packed.fields[1].size_bytes, 16);
     assert_eq!(packed.size_bytes, 32);
     assert!(!packed.packing_hash.is_empty());
@@ -735,7 +747,10 @@ fn t16_8_cbuffer_and_structured_packing() {
     ];
     let arrays_packed = shader::pack_cbuffer(&arrays);
     assert_eq!(arrays_packed.fields[0].offset, 0);
-    assert_eq!(arrays_packed.fields[0].size_bytes, 32, "2-element array = 2 × 16 B");
+    assert_eq!(
+        arrays_packed.fields[0].size_bytes, 32,
+        "2-element array = 2 × 16 B"
+    );
     assert_eq!(arrays_packed.fields[1].offset, 32);
     assert_eq!(arrays_packed.size_bytes, 48);
 
@@ -750,7 +765,10 @@ fn t16_8_cbuffer_and_structured_packing() {
     }];
     let matrix_packed = shader::pack_cbuffer(&matrix);
     assert_eq!(matrix_packed.fields[0].offset, 0);
-    assert_eq!(matrix_packed.fields[0].size_bytes, 64, "4×4 matrix = 4 × 16 B");
+    assert_eq!(
+        matrix_packed.fields[0].size_bytes, 64,
+        "4×4 matrix = 4 × 16 B"
+    );
     assert_eq!(matrix_packed.size_bytes, 64);
 
     // Pack structured buffer fields. Each field is aligned to its declared alignment

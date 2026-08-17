@@ -267,7 +267,12 @@ pub fn dib_to_png(data: &[u8], width: u32, height: u32, bpp: u16) -> AppResult<V
                 if src_pixel + 3 > data.len() {
                     continue;
                 }
-                (data[src_pixel + 2], data[src_pixel + 1], data[src_pixel], 255)
+                (
+                    data[src_pixel + 2],
+                    data[src_pixel + 1],
+                    data[src_pixel],
+                    255,
+                )
             } else {
                 // Palette-indexed: extract the index (MSB-first bit order)
                 let bits = x * bpp as usize;
@@ -284,11 +289,9 @@ pub fn dib_to_png(data: &[u8], width: u32, height: u32, bpp: u16) -> AppResult<V
                 }
                 // Palette entries are BGRX (4 bytes each)
                 let entry = palette_offset + index * 4;
-                let (Some(&b), Some(&g), Some(&r)) = (
-                    data.get(entry),
-                    data.get(entry + 1),
-                    data.get(entry + 2),
-                ) else {
+                let (Some(&b), Some(&g), Some(&r)) =
+                    (data.get(entry), data.get(entry + 1), data.get(entry + 2))
+                else {
                     continue;
                 };
                 (r, g, b, 255)
@@ -609,10 +612,7 @@ mod tests {
         dib.extend_from_slice(&vec![0u8; (4 * row_size) as usize]);
 
         let png = dib_to_png(&dib, 4, 4, 32).unwrap();
-        assert_eq!(
-            png[0..8],
-            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        );
+        assert_eq!(png[0..8], [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
 
         // The PNG must be 4x4 (logical height), not 4x2 (double-halved).
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
@@ -644,10 +644,7 @@ mod tests {
             }
         }
         let png = dib_to_png(&dib, width, height, bpp).unwrap();
-        assert_eq!(
-            png[0..8],
-            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        );
+        assert_eq!(png[0..8], [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     }
 
     #[test]

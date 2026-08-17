@@ -66,9 +66,12 @@ const FILE_TYPE_DISK: u32 = 1;
 const FILE_TYPE_PIPE: u32 = 3;
 const FILE_GENERIC_READ: u32 =
     FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
-const FILE_GENERIC_WRITE: u32 =
-    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | READ_CONTROL
-        | SYNCHRONIZE;
+const FILE_GENERIC_WRITE: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | READ_CONTROL
+    | SYNCHRONIZE;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
@@ -1556,7 +1559,8 @@ impl Win32Subsystem {
             Some(self.time.ticks_ms.saturating_add(timeout_ms as u64))
         };
         loop {
-            let status = self.wait_for_single_object_instant(handle, object_type, current_thread_id)?;
+            let status =
+                self.wait_for_single_object_instant(handle, object_type, current_thread_id)?;
             if !matches!(status, WaitStatus::Timeout) {
                 return Ok(status);
             }
@@ -1757,7 +1761,10 @@ impl Win32Subsystem {
         if alertable
             && let Some(thread_handle) = thread_handle
             && let Ok(thread_id) = self.thread_id(thread_handle)
-            && self.thread_apcs.get(&thread_id).is_some_and(|queue| !queue.is_empty())
+            && self
+                .thread_apcs
+                .get(&thread_id)
+                .is_some_and(|queue| !queue.is_empty())
         {
             return Ok((WaitStatus::IoCompletion, 0));
         }
@@ -1769,12 +1776,10 @@ impl Win32Subsystem {
                 // (destructive) pass can never succeed and INFINITE waits
                 // loop forever.  Peek at the signal state, then do a single
                 // consuming pass once everything is ready.
-                let all_signaled = handles
-                    .iter()
-                    .try_fold(true, |acc, &handle| {
-                        let signaled = self.object_is_signaled(handle)?;
-                        Ok::<_, AppError>(acc && signaled)
-                    })?;
+                let all_signaled = handles.iter().try_fold(true, |acc, &handle| {
+                    let signaled = self.object_is_signaled(handle)?;
+                    Ok::<_, AppError>(acc && signaled)
+                })?;
                 if all_signaled {
                     let mut abandoned = false;
                     for &handle in handles {
@@ -2060,13 +2065,12 @@ impl Win32Subsystem {
             {
                 return Err(AppError::new(
                     ReasonCode::RcFsPathInvalid,
-                    format!(
-                        "parent directory of {} does not exist",
-                        normalized_path
-                    ),
+                    format!("parent directory of {} does not exist", normalized_path),
                 ));
             }
-            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting if !exists => {
+            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting
+                if !exists =>
+            {
                 return Err(if parent_resolves {
                     AppError::new(
                         ReasonCode::RcFsNotFound,
@@ -2075,10 +2079,7 @@ impl Win32Subsystem {
                 } else {
                     AppError::new(
                         ReasonCode::RcFsPathInvalid,
-                        format!(
-                            "parent directory of {} does not exist",
-                            normalized_path
-                        ),
+                        format!("parent directory of {} does not exist", normalized_path),
                     )
                 });
             }
@@ -2099,17 +2100,24 @@ impl Win32Subsystem {
                 CreationDisposition::CreateAlways | CreationDisposition::TruncateExisting
             )
         {
-            let metadata = self.ge.get_file_metadata(&normalized_path).map_err(|error| {
-                if matches!(error.code, ReasonCode::RcFsNotFound) {
-                    AppError::new(
-                        ReasonCode::RcIo,
-                        format!("failed to stat {}", normalized_path),
-                    )
-                } else {
-                    error
-                }
-            })?;
-            if metadata.attributes.iter().any(|attribute| attribute == "readonly") {
+            let metadata = self
+                .ge
+                .get_file_metadata(&normalized_path)
+                .map_err(|error| {
+                    if matches!(error.code, ReasonCode::RcFsNotFound) {
+                        AppError::new(
+                            ReasonCode::RcIo,
+                            format!("failed to stat {}", normalized_path),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if metadata
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "readonly")
+            {
                 return Err(AppError::new(
                     ReasonCode::RcHelperPermissionDenied,
                     format!("{} is read-only", normalized_path),
@@ -2438,13 +2446,16 @@ impl Win32Subsystem {
                     let path_display = file.host_path.display().to_string();
                     let position = file.position;
                     if let Some(host_file) = file.host_file.as_mut() {
-                        let size = host_file.metadata().map_err(|error| {
-                            AppError::from_io(
-                                ReasonCode::RcIo,
-                                format!("failed to stat {path_display}"),
-                                &error,
-                            )
-                        })?.len();
+                        let size = host_file
+                            .metadata()
+                            .map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!("failed to stat {path_display}"),
+                                    &error,
+                                )
+                            })?
+                            .len();
                         // Clamp the start position: a guest may seek past EOF
                         // (Windows allows it) and reads must yield zero bytes,
                         // not panic on a slice.
@@ -2536,7 +2547,10 @@ impl Win32Subsystem {
         let object_type = self.handle_entry(handle)?.descriptor.object_type;
         match object_type {
             ObjectType::File => {
-                Self::require_access(self.handle_entry(handle)?, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
+                Self::require_access(
+                    self.handle_entry(handle)?,
+                    FILE_WRITE_DATA | FILE_APPEND_DATA,
+                )?;
                 let (normalized_path, host_path) = {
                     let entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
@@ -2553,15 +2567,13 @@ impl Win32Subsystem {
                             })?;
                             let mut written = 0usize;
                             while written < bytes.len() {
-                                let n = host_file
-                                    .write(&bytes[written..])
-                                    .map_err(|error| {
-                                        AppError::from_io(
-                                            ReasonCode::RcIo,
-                                            format!("failed to write {path_display}"),
-                                            &error,
-                                        )
-                                    })?;
+                                let n = host_file.write(&bytes[written..]).map_err(|error| {
+                                    AppError::from_io(
+                                        ReasonCode::RcIo,
+                                        format!("failed to write {path_display}"),
+                                        &error,
+                                    )
+                                })?;
                                 if n == 0 {
                                     return Err(AppError::new(
                                         ReasonCode::RcIo,
@@ -2817,7 +2829,15 @@ impl Win32Subsystem {
         // to host-derived times per field so GetFileInformationByHandleEx
         // (the boot-sequence bootstrap_log metadata reader) never surfaces a
         // zero timestamp.
+        // Host-derived fallback for zero timestamps: only legitimate for
+        // live (non-DTM) subsystems. Under DTM the fs_state record carries
+        // zero ticks BY CONTRACT (current_windows_ticks(dtm=true) == 0), so
+        // populating host times here would break deterministic replay and
+        // the section-5/38 determinism assertions.
         let host_ticks = |time: std::io::Result<SystemTime>| {
+            if self.time.dtm {
+                return 0;
+            }
             time.ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| {
@@ -2965,7 +2985,10 @@ impl Win32Subsystem {
         // Windows refuses to delete a file carrying the readonly attribute:
         // DeleteFileW on a read-only file fails with ERROR_ACCESS_DENIED.
         if let Ok(metadata) = self.ge.get_file_metadata(&normalized_path)
-            && metadata.attributes.iter().any(|attribute| attribute == "readonly")
+            && metadata
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "readonly")
         {
             return Err(AppError::new(
                 ReasonCode::RcHelperPermissionDenied,
@@ -2978,9 +3001,7 @@ impl Win32Subsystem {
         if !self.ge.check_delete_sharing(path)? {
             return Err(AppError::new(
                 ReasonCode::RcFsSharingViolation,
-                format!(
-                    "sharing violation: {normalized_path} is open without FILE_SHARE_DELETE"
-                ),
+                format!("sharing violation: {normalized_path} is open without FILE_SHARE_DELETE"),
             ));
         }
         fs::remove_file(&host_path).map_err(|error| {
@@ -3768,10 +3789,8 @@ impl Win32Subsystem {
             if block_size > size {
                 // Keep the remainder free; re-align it so future reuse keeps
                 // the heap's alignment guarantee.
-                let remainder_addr = align_up(
-                    address.saturating_add(size as u64),
-                    state.alignment as u64,
-                );
+                let remainder_addr =
+                    align_up(address.saturating_add(size as u64), state.alignment as u64);
                 let used = remainder_addr - address;
                 if remainder_addr > address
                     && remainder_addr < address.saturating_add(block_size as u64)
@@ -3781,9 +3800,8 @@ impl Win32Subsystem {
                         .insert(remainder_addr, block_size - used as usize);
                 }
             }
-            let mut allocation = Vec::with_capacity(
-                align_up(size as u64, state.alignment as u64) as usize,
-            );
+            let mut allocation =
+                Vec::with_capacity(align_up(size as u64, state.alignment as u64) as usize);
             allocation.resize(size, 0);
             state.allocations.insert(address, allocation);
             return Ok(address);
@@ -3798,9 +3816,8 @@ impl Win32Subsystem {
                     "heap address space exhausted",
                 )
             })?;
-        let mut allocation = Vec::with_capacity(
-            align_up(size as u64, state.alignment as u64) as usize,
-        );
+        let mut allocation =
+            Vec::with_capacity(align_up(size as u64, state.alignment as u64) as usize);
         allocation.resize(size, 0);
         state.allocations.insert(address, allocation);
         Ok(address)
@@ -4120,9 +4137,7 @@ impl Win32Subsystem {
         if buf_size > MAX_ALLOCATION_SIZE {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
-                format!(
-                    "pipe buffer size {buf_size} exceeds the {MAX_ALLOCATION_SIZE}-byte cap"
-                ),
+                format!("pipe buffer size {buf_size} exceeds the {MAX_ALLOCATION_SIZE}-byte cap"),
             ));
         }
 
@@ -4463,9 +4478,7 @@ impl Win32Subsystem {
         if offset > section_size as u64 {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
-                format!(
-                    "map offset {offset:#x} exceeds section size {section_size:#x}"
-                ),
+                format!("map offset {offset:#x} exceeds section size {section_size:#x}"),
             ));
         }
         let remaining = section_size as u64 - offset;
@@ -4478,27 +4491,25 @@ impl Win32Subsystem {
         // `next_power_of_two` panics on overflow; reject absurd sizes instead.
         let size = view_size
             .checked_next_power_of_two()
-            .ok_or_else(|| {
-                AppError::new(ReasonCode::RcCliInvalid, "mapping size is too large")
-            })? as usize;
+            .ok_or_else(|| AppError::new(ReasonCode::RcCliInvalid, "mapping size is too large"))?
+            as usize;
         let page_count = (size / 0x1000) as u64;
         if page_count > MAX_COMMIT_PAGES {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
-                format!(
-                    "mapping of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"
-                ),
+                format!("mapping of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"),
             ));
         }
         let base = self.next_virtual_address;
-        self.next_virtual_address = self.next_virtual_address.checked_add(size as u64).ok_or_else(
-            || {
+        self.next_virtual_address = self
+            .next_virtual_address
+            .checked_add(size as u64)
+            .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcMemoryAccessViolation,
                     "virtual address space exhausted",
                 )
-            },
-        )?;
+            })?;
         let mut committed = BTreeSet::new();
         for page in 0..page_count {
             committed.insert(base + page * 0x1000);
@@ -4537,14 +4548,12 @@ impl Win32Subsystem {
     /// region was created by `map_view_of_file`.  Lets the memory model route
     /// guest accesses to the section's shared storage.
     pub fn mapped_view_section(&self, base_address: u64) -> Option<(u64, Arc<Mutex<Vec<u8>>>)> {
-        self.memory_regions
-            .get(&base_address)
-            .and_then(|region| {
-                region
-                    .backing
-                    .clone()
-                    .map(|backing| (region.backing_offset, backing))
-            })
+        self.memory_regions.get(&base_address).and_then(|region| {
+            region
+                .backing
+                .clone()
+                .map(|backing| (region.backing_offset, backing))
+        })
     }
 
     pub fn set_thread_exit_code(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
@@ -6298,7 +6307,10 @@ mod tests {
         // the win32 allocator, not a separate 0x1000 base.
         let socket = win32.insert_socket();
         assert_eq!(socket, 4, "sockets mint handles from the win32 allocator");
-        assert_eq!(win32.socket_id(socket).expect("socket id"), u64::from(socket));
+        assert_eq!(
+            win32.socket_id(socket).expect("socket id"),
+            u64::from(socket)
+        );
 
         // CloseHandle(socket) is ERROR_INVALID_HANDLE by type, and the
         // socket survives.
@@ -6384,13 +6396,16 @@ mod tests {
         // fail with ERROR_INVALID_HANDLE — the event's access bits are
         // irrelevant because the type is wrong.
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "type-first", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "type-first", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
         let mut win32 = Win32Subsystem::new(ge, false);
         let (event, _) = win32.create_event(true, false, false, None);
         let err = win32.get_file_size_ex(event).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
-        let err = win32.set_file_pointer_ex(event, 0, SeekOrigin::Begin).unwrap_err();
+        let err = win32
+            .set_file_pointer_ex(event, 0, SeekOrigin::Begin)
+            .unwrap_err();
         assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
         let err = win32.flush_file_buffers(event).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
@@ -6408,7 +6423,9 @@ mod tests {
         let mut win32 = Win32Subsystem::new(ge, false);
         let (created, _) = win32.create_event(true, false, false, Some("evt-access"));
         // open_event records the requested mask: access 0 grants nothing.
-        let zero_access = win32.open_event(0, false, "evt-access").expect("open event");
+        let zero_access = win32
+            .open_event(0, false, "evt-access")
+            .expect("open event");
         let err = win32.set_event(zero_access).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
         let err = win32.reset_event(zero_access).unwrap_err();
@@ -6422,8 +6439,9 @@ mod tests {
     #[test]
     fn release_operations_enforce_modify_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "mod-state", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "mod-state", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
         let mut win32 = Win32Subsystem::new(ge, false);
 
         // Mutex: ReleaseMutex requires MUTEX_MODIFY_STATE (0x1).
@@ -6439,7 +6457,9 @@ mod tests {
         );
         let err = win32.release_mutex(zero_mutex).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
-        win32.release_mutex(full_mutex).expect("release full-access mutex");
+        win32
+            .release_mutex(full_mutex)
+            .expect("release full-access mutex");
 
         // Semaphore: ReleaseSemaphore requires SEMAPHORE_MODIFY_STATE (0x2).
         let full_sem = win32.create_semaphore(1, 2, false);
@@ -6447,11 +6467,16 @@ mod tests {
             ObjectType::Semaphore,
             0,
             false,
-            KernelObject::Semaphore(SemaphoreObject { count: 1, maximum: 2 }),
+            KernelObject::Semaphore(SemaphoreObject {
+                count: 1,
+                maximum: 2,
+            }),
         );
         let err = win32.release_semaphore(zero_sem, 1).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
-        win32.release_semaphore(full_sem, 1).expect("release full-access semaphore");
+        win32
+            .release_semaphore(full_sem, 1)
+            .expect("release full-access semaphore");
 
         win32.close_handle(zero_mutex).expect("close zero mutex");
         win32.close_handle(full_mutex).expect("close mutex");
@@ -6468,8 +6493,12 @@ mod tests {
         let (created, _) = win32.create_event(true, false, false, Some("evt-sync"));
 
         // EVENT_MODIFY_STATE only (no SYNCHRONIZE): waits are denied.
-        let no_sync = win32.open_event(0x0000_0002, false, "evt-sync").expect("open event");
-        let err = win32.wait_for_single_object(no_sync, 0, false, None).unwrap_err();
+        let no_sync = win32
+            .open_event(0x0000_0002, false, "evt-sync")
+            .expect("open event");
+        let err = win32
+            .wait_for_single_object(no_sync, 0, false, None)
+            .unwrap_err();
         assert_eq!(err.code, ReasonCode::RcHelperPermissionDenied);
         let err = win32
             .wait_for_multiple_objects(&[no_sync, created], true, 0, false, None)
@@ -6657,7 +6686,11 @@ mod tests {
         let err = win32.get_overlapped_result(id, false).unwrap_err();
         assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle);
         let err = win32.get_overlapped_result(id, false).unwrap_err();
-        assert_eq!(err.code, ReasonCode::RcWin32InvalidHandle, "stale request removed");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcWin32InvalidHandle,
+            "stale request removed"
+        );
         win32.close_handle(recycled).expect("close recycled event");
     }
 
@@ -6696,7 +6729,9 @@ mod tests {
             WaitStatus::Timeout,
             "original event must not be signaled by the stale completion"
         );
-        win32.close_handle(recycled_pipe).expect("close recycled pipe");
+        win32
+            .close_handle(recycled_pipe)
+            .expect("close recycled pipe");
         win32.close_handle(event).expect("close event");
     }
 
@@ -6771,7 +6806,8 @@ mod tests {
             );
             let error = result.expect_err("missing parent must fail");
             assert_eq!(
-                error.code, ReasonCode::RcFsPathInvalid,
+                error.code,
+                ReasonCode::RcFsPathInvalid,
                 "missing parent must surface as ERROR_PATH_NOT_FOUND (3) for {disposition:?}"
             );
             let host_parent = win32
@@ -6917,9 +6953,12 @@ mod tests {
             .expect("seed source file");
         win32.close_handle(h).expect("close");
 
-        let result = win32.move_file_ex_w("C:\\src.txt", "C:\\no_dest_parent\\dst.txt", false, false);
+        let result =
+            win32.move_file_ex_w("C:\\src.txt", "C:\\no_dest_parent\\dst.txt", false, false);
         assert_eq!(
-            result.expect_err("missing destination parent must fail").code,
+            result
+                .expect_err("missing destination parent must fail")
+                .code,
             ReasonCode::RcFsPathInvalid,
             "MoveFileEx with a missing destination parent must be ERROR_PATH_NOT_FOUND"
         );
@@ -7280,7 +7319,9 @@ mod tests {
         win32
             .set_file_attributes_w(path, &[])
             .expect("clear readonly attribute");
-        win32.delete_file_w(path).expect("delete after clearing readonly");
+        win32
+            .delete_file_w(path)
+            .expect("delete after clearing readonly");
     }
 
     #[test]
@@ -7755,7 +7796,9 @@ mod tests {
         assert_ne!(h2, 0, "open must return a real handle");
         win32.set_event(h2).expect("set via opened handle");
         assert_eq!(
-            win32.wait_for_single_object(h1, 0, false, None).expect("wait"),
+            win32
+                .wait_for_single_object(h1, 0, false, None)
+                .expect("wait"),
             WaitStatus::Object0,
             "opened handle must reference the same event"
         );
@@ -7887,8 +7930,9 @@ mod tests {
     #[test]
     fn wait_for_single_object_honors_finite_timeout() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "wto-finite", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "wto-finite", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
         let mut win32 = Win32Subsystem::new(ge, false);
         let (h, _) = win32.create_event(true, false, false, None);
         // A finite wait must block (polling) until the signal arrives rather

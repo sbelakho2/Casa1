@@ -378,12 +378,10 @@ fn read_xmm128_from_guest(memory_reader: &MemoryReader<'_>, addr: u64) -> Option
         // Split the 16-byte buffer into two 8-byte arrays using direct element
         // access, avoiding any `.unwrap()` or `.expect()` calls.
         let low_bytes: [u8; 8] = [
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ];
         let high_bytes: [u8; 8] = [
-            buf[8], buf[9], buf[10], buf[11],
-            buf[12], buf[13], buf[14], buf[15],
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ];
         let low = u64::from_le_bytes(low_bytes);
         let high = u64::from_le_bytes(high_bytes);
@@ -573,9 +571,10 @@ pub fn virtual_unwind(
 
     // If the function has an exception handler (EHANDLER or UHANDLER),
     // return the handler RVA so the caller can dispatch to it.
-    if let Some(handler_rva) = unwind_info.handler_rva.filter(|_| {
-        unwind_info.flags & 0x01 != 0 || unwind_info.flags & 0x02 != 0
-    }) {
+    if let Some(handler_rva) = unwind_info
+        .handler_rva
+        .filter(|_| unwind_info.flags & 0x01 != 0 || unwind_info.flags & 0x02 != 0)
+    {
         return UnwindResult::HandlerFound(handler_rva);
     }
 
@@ -666,7 +665,9 @@ pub fn unwind_frames(
     let mut prev_rsp = context.rsp;
     loop {
         if frames_unwound >= MAX_UNWIND_FRAMES {
-            eprintln!("[seh] unwind_frames: frame limit ({MAX_UNWIND_FRAMES}) exceeded — cyclic or corrupt guest stack");
+            eprintln!(
+                "[seh] unwind_frames: frame limit ({MAX_UNWIND_FRAMES}) exceeded — cyclic or corrupt guest stack"
+            );
             return UnwindResult::NotFound;
         }
         frames_unwound += 1;
@@ -847,10 +848,7 @@ pub fn rtl_unwind(
             None => {
                 return Err(crate::error::AppError::new(
                     ReasonCode::SehException,
-                    format!(
-                        "rtl_unwind: no unwind info for RVA {:#x}",
-                        unwind_info_addr
-                    ),
+                    format!("rtl_unwind: no unwind info for RVA {:#x}", unwind_info_addr),
                 ));
             }
         };
@@ -895,9 +893,7 @@ pub fn rtl_unwind(
                 if context.rsp <= prev_rsp {
                     return Err(crate::error::AppError::new(
                         ReasonCode::SehException,
-                        format!(
-                            "rtl_unwind: no stack progress at RVA {rva:#x} — corrupt stack"
-                        ),
+                        format!("rtl_unwind: no stack progress at RVA {rva:#x} — corrupt stack"),
                     ));
                 }
                 prev_rsp = context.rsp;
@@ -1398,7 +1394,8 @@ impl SehSubsystem {
     /// from the fresh data.
     pub fn register_unwind_data(&mut self, image_base: u64, data: Vec<u8>) {
         self.unwind_data.insert(image_base, data);
-        self.unwind_cache.retain(|(cached_base, _), _| *cached_base != image_base);
+        self.unwind_cache
+            .retain(|(cached_base, _), _| *cached_base != image_base);
     }
 
     /// Get a reference to the raw unwind data blob for a given image base.
@@ -1434,11 +1431,7 @@ impl SehSubsystem {
     /// JIT image), so lookups must be scoped to the image being unwound.
     /// Entries are cached under `(image_base, rva)` and parsed only from that
     /// image's own unwind-data blob.
-    pub fn get_unwind_info_for_image(
-        &mut self,
-        image_base: u64,
-        rva: u32,
-    ) -> Option<&UnwindInfo> {
+    pub fn get_unwind_info_for_image(&mut self, image_base: u64, rva: u32) -> Option<&UnwindInfo> {
         let key = (image_base, rva);
         if !self.unwind_cache.contains_key(&key) {
             let data = self.unwind_data.get(&image_base)?;
@@ -1602,8 +1595,7 @@ impl SehSubsystem {
                             );
                             break;
                         }
-                        let Some(next) =
-                            self.get_unwind_info_for_image(image_base, rva).cloned()
+                        let Some(next) = self.get_unwind_info_for_image(image_base, rva).cloned()
                         else {
                             break;
                         };
@@ -2017,9 +2009,9 @@ mod tests {
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
         let mut ctx = X64Context {
-            rbp: 0xdeadbeef,     // current RBP (matches saved value)
-            rsp: stack_base,     // RSP points to local alloc start
-            rip: 0x140001000,    // current RIP inside function
+            rbp: 0xdeadbeef,  // current RBP (matches saved value)
+            rsp: stack_base,  // RSP points to local alloc start
+            rip: 0x140001000, // current RIP inside function
             ..X64Context::default()
         };
 
@@ -4021,15 +4013,27 @@ mod tests {
         seh.register_unwind_data(base_a, da);
         seh.register_unwind_data(base_b, db);
 
-        let ia = seh.get_unwind_info_for_image(base_a, 0x2000).unwrap().clone();
-        let ib = seh.get_unwind_info_for_image(base_b, 0x2000).unwrap().clone();
+        let ia = seh
+            .get_unwind_info_for_image(base_a, 0x2000)
+            .unwrap()
+            .clone();
+        let ib = seh
+            .get_unwind_info_for_image(base_b, 0x2000)
+            .unwrap()
+            .clone();
         assert_eq!(ia.codes[0], UnwindCode::PushNonVolatile { register: 5 });
         assert_eq!(ib.codes[0], UnwindCode::PushNonVolatile { register: 3 });
 
         // Re-fetching in the opposite order must still return the same info
         // for each image (no cross-image cache poisoning).
-        let ib2 = seh.get_unwind_info_for_image(base_b, 0x2000).unwrap().clone();
-        let ia2 = seh.get_unwind_info_for_image(base_a, 0x2000).unwrap().clone();
+        let ib2 = seh
+            .get_unwind_info_for_image(base_b, 0x2000)
+            .unwrap()
+            .clone();
+        let ia2 = seh
+            .get_unwind_info_for_image(base_a, 0x2000)
+            .unwrap()
+            .clone();
         assert_eq!(ib2.codes[0], UnwindCode::PushNonVolatile { register: 3 });
         assert_eq!(ia2.codes[0], UnwindCode::PushNonVolatile { register: 5 });
     }
@@ -4159,7 +4163,10 @@ mod tests {
             ..X64Context::default()
         };
 
-        let unwind_info = seh.get_unwind_info_for_image(image_base, 0x2000).unwrap().clone();
+        let unwind_info = seh
+            .get_unwind_info_for_image(image_base, 0x2000)
+            .unwrap()
+            .clone();
         let find = |ib: u64, rva: u32| seh.find_runtime_function(ib, rva).cloned();
         let get = move |_rva: u32| Some(unwind_info.clone());
         let mut handler_calls = 0u32;

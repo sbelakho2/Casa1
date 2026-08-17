@@ -192,7 +192,9 @@ fn run_live_host_loop<T>(
         let mut frames_this_iteration = drain_frames(&session.frame_rx, &mut latest_frame);
 
         if frames_this_iteration > 0 {
-            live_trace(&format!("[live] received {frames_this_iteration} frame(s) — showing content now"));
+            live_trace(&format!(
+                "[live] received {frames_this_iteration} frame(s) — showing content now"
+            ));
             trace_no_frame_counter = 0;
         } else {
             trace_no_frame_counter += 1;
@@ -295,14 +297,13 @@ fn run_live_host_loop<T>(
         // watchdog is dormant code that activates automatically when JIT
         // execution and chain formation are re-enabled.
         if last_jit_watchdog.elapsed().as_millis() >= 500 {
-            crate::jit::JIT_CHAIN_BREAK_REQUESTED
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::jit::JIT_CHAIN_BREAK_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
             crate::jit::force_break_all_chains();
             last_jit_watchdog = std::time::Instant::now();
-            let sigbus_total = crate::jit::SIGBUS_TOTAL_EVENTS
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let storm = crate::jit::JIT_FAULT_STORM_DISABLED
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let sigbus_total =
+                crate::jit::SIGBUS_TOTAL_EVENTS.load(std::sync::atomic::Ordering::Relaxed);
+            let storm =
+                crate::jit::JIT_FAULT_STORM_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
             live_trace(&format!(
                 "[live] jit watchdog: requested chain break (sigbus_total={sigbus_total} storm_disabled={storm})"
             ));
@@ -333,9 +334,7 @@ fn run_live_host_loop<T>(
                 title,
                 export_live_frame_path.as_deref().map(Path::new),
             )?;
-            if final_changed
-                && let Some(window) = window.as_mut()
-            {
+            if final_changed && let Some(window) = window.as_mut() {
                 window
                     .update_with_buffer(&frame_buffer, frame_width, frame_height)
                     .map_err(|error| {
@@ -436,7 +435,9 @@ where
 {
     let mut scancodes = BTreeSet::new();
     for key in ALL_MAPPED_KEYS {
-        if is_key_down(*key) && let Some(scancode) = map_key_to_scancode(*key) {
+        if is_key_down(*key)
+            && let Some(scancode) = map_key_to_scancode(*key)
+        {
             scancodes.insert(scancode);
         }
     }
@@ -1270,7 +1271,10 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(worker.is_finished());
-        worker.join().expect("worker join").expect("worker succeeded");
+        worker
+            .join()
+            .expect("worker join")
+            .expect("worker succeeded");
 
         // The finish-path final drain must consume the frame that arrived
         // between the top-of-loop drain and the finish check.

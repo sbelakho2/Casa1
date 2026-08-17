@@ -530,10 +530,8 @@ impl AntiCheatDriverShim {
                 // No expected hash — first check for this region; record it.
                 // Deduplicate by base address and bound the list so a long
                 // session cannot grow the module set without limit.
-                let already_registered = self
-                    .modules
-                    .iter()
-                    .any(|m| m.base_address == base_address);
+                let already_registered =
+                    self.modules.iter().any(|m| m.base_address == base_address);
                 if !already_registered && self.modules.len() < MAX_AUTO_REGIONS {
                     let base_name = format!("region_{base_address:X}");
                     self.add_module(base_address, size, &base_name, computed_hash);

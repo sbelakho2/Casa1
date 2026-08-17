@@ -119,7 +119,10 @@ impl AudioRingBuffer {
         // A zero-channel buffer cannot be read or written without dividing
         // by zero on every path; reject it up front. No caller reaches this
         // with guest-controlled values.
-        assert!(channels > 0, "AudioRingBuffer requires at least one channel");
+        assert!(
+            channels > 0,
+            "AudioRingBuffer requires at least one channel"
+        );
         let capacity_samples = capacity_frames.next_power_of_two() * channels as usize;
         let mask = capacity_samples - 1;
         let buffer = vec![0.0f32; capacity_samples].into_boxed_slice();
@@ -165,7 +168,11 @@ impl AudioRingBuffer {
         // Never write more than the ring holds; if the input is larger,
         // keep only the newest `capacity` samples.
         let write_count = len.min(capacity);
-        let src = if len > capacity { &samples[len - capacity..] } else { samples };
+        let src = if len > capacity {
+            &samples[len - capacity..]
+        } else {
+            samples
+        };
 
         // Write samples into the ring buffer (wrapping)
         for (i, &sample) in src.iter().enumerate() {

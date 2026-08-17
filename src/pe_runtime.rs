@@ -284,9 +284,12 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const STANDARD_RIGHTS_REQUIRED: u32 = DELETE_ACCESS | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
 const FILE_GENERIC_READ: u32 =
     FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
-const FILE_GENERIC_WRITE: u32 =
-    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | READ_CONTROL
-        | SYNCHRONIZE;
+const FILE_GENERIC_WRITE: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | READ_CONTROL
+    | SYNCHRONIZE;
 const FILE_GENERIC_EXECUTE: u32 = FILE_READ_ATTRIBUTES | FILE_EXECUTE | FILE_TRAVERSE | SYNCHRONIZE;
 const FILE_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1FF;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -4340,17 +4343,18 @@ pub fn is_pe_image(path: &Path) -> AppResult<bool> {
 pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
     // 1. Next to current executable
     if let Ok(exe_path) = std::env::current_exe()
-        && let Some(exe_dir) = exe_path.parent() {
-            let candidate = exe_dir.join("casa1-runner");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-            // Also check for casa1-runner with .exe suffix (cross-compile scenarios)
-            let candidate_exe = exe_dir.join("casa1-runner.exe");
-            if candidate_exe.exists() {
-                return Ok(candidate_exe);
-            }
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        let candidate = exe_dir.join("casa1-runner");
+        if candidate.exists() {
+            return Ok(candidate);
         }
+        // Also check for casa1-runner with .exe suffix (cross-compile scenarios)
+        let candidate_exe = exe_dir.join("casa1-runner.exe");
+        if candidate_exe.exists() {
+            return Ok(candidate_exe);
+        }
+    }
 
     // 2. Cargo target directory (dev/test)
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
@@ -4596,30 +4600,31 @@ pub fn execute_with_options(
     }
     // Also check the external manifest for comctl32 v6
     if !runtime.comctl32_v6_active
-        && let Some(ref external_manifest) = image.external_manifest {
-            for asm in &external_manifest.assemblies {
-                if asm.name == "Microsoft.Windows.Common-Controls"
-                    && asm.version.as_deref() == Some("6.0.0.0")
-                {
-                    runtime.comctl32_v6_active = true;
-                    let handle = runtime.next_activation_context_handle;
-                    runtime.next_activation_context_handle =
-                        runtime.next_activation_context_handle.wrapping_add(1);
-                    let ctx = crate::pe::ActivationContext {
-                        handle,
-                        cookie: 0,
-                        source: staged_program_path.clone(),
-                        assembly_directory: None,
-                        manifest_info: Some(external_manifest.clone()),
-                    };
-                    runtime.activation_contexts.insert(handle, ctx);
-                    eprintln!(
-                        "[pe_runtime] SxS: comctl32 v6 active via external manifest (ctx handle={handle:#x})"
-                    );
-                    break;
-                }
+        && let Some(ref external_manifest) = image.external_manifest
+    {
+        for asm in &external_manifest.assemblies {
+            if asm.name == "Microsoft.Windows.Common-Controls"
+                && asm.version.as_deref() == Some("6.0.0.0")
+            {
+                runtime.comctl32_v6_active = true;
+                let handle = runtime.next_activation_context_handle;
+                runtime.next_activation_context_handle =
+                    runtime.next_activation_context_handle.wrapping_add(1);
+                let ctx = crate::pe::ActivationContext {
+                    handle,
+                    cookie: 0,
+                    source: staged_program_path.clone(),
+                    assembly_directory: None,
+                    manifest_info: Some(external_manifest.clone()),
+                };
+                runtime.activation_contexts.insert(handle, ctx);
+                eprintln!(
+                    "[pe_runtime] SxS: comctl32 v6 active via external manifest (ctx handle={handle:#x})"
+                );
+                break;
             }
         }
+    }
 
     // Parse Steam command-line flags if running Steam.exe.
     if staged_program_path.contains("Steam.exe") || staged_program_path.contains("steam.exe") {
@@ -4920,11 +4925,15 @@ pub fn execute_with_options(
         // Progress via stderr — every 5 seconds
         if runtime.live_session.is_some() && last_progress_log.elapsed().as_secs() >= 5 {
             last_progress_log = std::time::Instant::now();
-            let msg = format!("[pe] live blocks={} steps={} thunks={} elapsed_ms={}",
-                block_count, steps, thunk_count, start_time.elapsed().as_millis());
+            let msg = format!(
+                "[pe] live blocks={} steps={} thunks={} elapsed_ms={}",
+                block_count,
+                steps,
+                thunk_count,
+                start_time.elapsed().as_millis()
+            );
             let _ = std::fs::write("/tmp/casa1_progress.txt", &msg);
         }
-
 
         if let Some(result) =
             runtime.dispatch_import_if_present(state.rip, &mut state, &mut memory)?
@@ -4950,59 +4959,61 @@ pub fn execute_with_options(
         let opcode = memory
             .read_u8(state.rip)
             .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
-        if opcode == 0xFF { match memory.read_u8(state.rip + 1)? {
-            0x15 | 0x25 => {
-                advance_runtime_steps(
-                    &mut runtime,
-                    &mut steps,
-                    instruction_budget,
-                    1,
-                    &memory,
-                    &state,
-                    test_id,
-                )?;
-                let next_rip = state.rip + 6;
-                let slot_address = if guest_arch == GuestArch::X64 {
-                    let displacement = read_i32_from_memory(&memory, state.rip + 2)?;
-                    (next_rip as i128 + displacement as i128) as u64
-                } else {
-                    read_u32(&memory, state.rip + 2)? as u64
-                };
-                let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
-                let is_call = memory.read_u8(state.rip + 1)? == 0x15;
+        if opcode == 0xFF {
+            match memory.read_u8(state.rip + 1)? {
+                0x15 | 0x25 => {
+                    advance_runtime_steps(
+                        &mut runtime,
+                        &mut steps,
+                        instruction_budget,
+                        1,
+                        &memory,
+                        &state,
+                        test_id,
+                    )?;
+                    let next_rip = state.rip + 6;
+                    let slot_address = if guest_arch == GuestArch::X64 {
+                        let displacement = read_i32_from_memory(&memory, state.rip + 2)?;
+                        (next_rip as i128 + displacement as i128) as u64
+                    } else {
+                        read_u32(&memory, state.rip + 2)? as u64
+                    };
+                    let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
+                    let is_call = memory.read_u8(state.rip + 1)? == 0x15;
 
-                if is_call {
-                    let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
-                    write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
-                    state.set(Register::Rsp, call_rsp);
-                }
-
-                if let Some(result) =
-                    runtime.dispatch_import_if_present(target, &mut state, &mut memory)?
-                {
-                    thunk_count += 1;
-                    if let Some(code) = result {
-                        exit_code = code;
-                        break;
-                    }
-                    // Host thunk was dispatched successfully. For a CALL, advance
-                    // RIP past the call instruction so the subsequent block decode
-                    // (line 4807) starts from the instruction AFTER the call.
-                    // Without this, the decoded block will contain the same call
-                    // instruction, causing a second dispatch through the IR
-                    // interpreter — a double-dispatch bug.
                     if is_call {
-                        state.rip = next_rip;
+                        let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
+                        write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
+                        state.set(Register::Rsp, call_rsp);
                     }
-                    // For a JMP (ModRM 0x25), the thunk handles control flow
-                    // internally.  Just continue the loop — dispatch_import
-                    // will have updated state.rip as needed.
-                } else {
-                    state.rip = target;
+
+                    if let Some(result) =
+                        runtime.dispatch_import_if_present(target, &mut state, &mut memory)?
+                    {
+                        thunk_count += 1;
+                        if let Some(code) = result {
+                            exit_code = code;
+                            break;
+                        }
+                        // Host thunk was dispatched successfully. For a CALL, advance
+                        // RIP past the call instruction so the subsequent block decode
+                        // (line 4807) starts from the instruction AFTER the call.
+                        // Without this, the decoded block will contain the same call
+                        // instruction, causing a second dispatch through the IR
+                        // interpreter — a double-dispatch bug.
+                        if is_call {
+                            state.rip = next_rip;
+                        }
+                        // For a JMP (ModRM 0x25), the thunk handles control flow
+                        // internally.  Just continue the loop — dispatch_import
+                        // will have updated state.rip as needed.
+                    } else {
+                        state.rip = target;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        } }
+        }
 
         // --- Steam.exe crash point: zero-filled record at 0x401389/0x401390 ---
         // Steam's main loop iterates over a table of 0x1c-byte records whose base
@@ -5082,24 +5093,25 @@ pub fn execute_with_options(
         if guest_arch == GuestArch::X86
             && state.rip == runtime.mapped_image_base + 0x13a8
             && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-            && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take() {
-                runtime.steam_401389_saved_esi_slot_addr = None;
-                let actual_esi = state.get(Register::Rsi) as u32;
-                if actual_esi != expected_esi {
-                    runtime.push_trace(
-                        "process",
-                        "SteamEsiClobber",
-                        BTreeMap::from([
-                            (
-                                "expected_esi".to_string(),
-                                json!(format!("{expected_esi:#x}")),
-                            ),
-                            ("actual_esi".to_string(), json!(format!("{actual_esi:#x}"))),
-                        ]),
-                        json!(actual_esi),
-                    );
-                }
+            && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take()
+        {
+            runtime.steam_401389_saved_esi_slot_addr = None;
+            let actual_esi = state.get(Register::Rsi) as u32;
+            if actual_esi != expected_esi {
+                runtime.push_trace(
+                    "process",
+                    "SteamEsiClobber",
+                    BTreeMap::from([
+                        (
+                            "expected_esi".to_string(),
+                            json!(format!("{expected_esi:#x}")),
+                        ),
+                        ("actual_esi".to_string(), json!(format!("{actual_esi:#x}"))),
+                    ]),
+                    json!(actual_esi),
+                );
             }
+        }
         // Per-block diagnostic writes removed.
         let cached_block = decode_basic_block_cached(
             &mut engine,
@@ -5139,10 +5151,11 @@ pub fn execute_with_options(
             // Steam diagnostic tracking of block RVAs (only when tracing is active).
             if runtime.enable_steam_tracing {
                 if runtime.recent_main_block_rvas.len() == 32
-                    && runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400) {
-                        runtime.recent_main_cc400_count =
-                            runtime.recent_main_cc400_count.saturating_sub(1);
-                    }
+                    && runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400)
+                {
+                    runtime.recent_main_cc400_count =
+                        runtime.recent_main_cc400_count.saturating_sub(1);
+                }
                 runtime.recent_main_block_rvas.push_back(block_rva);
                 if block_rva == 0x000c_c400 {
                     runtime.recent_main_cc400_count += 1;
@@ -5183,220 +5196,219 @@ pub fn execute_with_options(
             None
         };
         if runtime.enable_steam_tracing
-            && let Some(block_rva) = block_rva {
-                if guest_arch == GuestArch::X86 {
-                    let cookie_watch_site = match block_rva {
-                        0x0017_5f4e => Some("after_get_module_file_name_w"),
-                        0x0017_5f94 => Some("after_175f8f_call"),
-                        0x0017_5faf => Some("after_175faa_call"),
-                        0x0017_5fb8 => Some("before_security_check"),
-                        _ => None,
+            && let Some(block_rva) = block_rva
+        {
+            if guest_arch == GuestArch::X86 {
+                let cookie_watch_site = match block_rva {
+                    0x0017_5f4e => Some("after_get_module_file_name_w"),
+                    0x0017_5f94 => Some("after_175f8f_call"),
+                    0x0017_5faf => Some("after_175faa_call"),
+                    0x0017_5fb8 => Some("before_security_check"),
+                    _ => None,
+                };
+                if let Some(site) = cookie_watch_site {
+                    let ebp = state.get(Register::Rbp) as u32;
+                    let frame_cookie_addr = ebp.wrapping_sub(4) as u64;
+                    let frame_cookie = match read_guest_u32(&memory, frame_cookie_addr) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            eprintln!(
+                                "[pe_runtime] SteamCookieWatch: failed to read frame cookie at {:#x}: {}",
+                                frame_cookie_addr, error
+                            );
+                            None
+                        }
                     };
-                    if let Some(site) = cookie_watch_site {
-                        let ebp = state.get(Register::Rbp) as u32;
-                        let frame_cookie_addr = ebp.wrapping_sub(4) as u64;
-                        let frame_cookie = match read_guest_u32(&memory, frame_cookie_addr) {
-                            Ok(value) => Some(value),
-                            Err(error) => {
-                                eprintln!(
-                                    "[pe_runtime] SteamCookieWatch: failed to read frame cookie at {:#x}: {}",
-                                    frame_cookie_addr, error
-                                );
-                                None
-                            }
-                        };
-                        let global_cookie_addr = runtime.mapped_image_base + 0x003c_bfd4;
-                        let global_cookie = match read_guest_u32(&memory, global_cookie_addr) {
-                            Ok(value) => Some(value),
-                            Err(error) => {
-                                eprintln!(
-                                    "[pe_runtime] SteamCookieWatch: failed to read global cookie at {:#x}: {}",
-                                    global_cookie_addr, error
-                                );
-                                None
-                            }
-                        };
-                        let decoded_cookie = frame_cookie.map(|value| value ^ ebp);
-                        runtime.push_trace(
-                            "process",
-                            "SteamCookieWatch",
-                            BTreeMap::from([
-                                ("site".to_string(), json!(site)),
-                                ("ebp".to_string(), json!(format!("{ebp:#x}"))),
-                                (
-                                    "esp".to_string(),
-                                    json!(format!("{:#x}", state.get(Register::Rsp))),
-                                ),
-                                (
-                                    "frame_cookie_addr".to_string(),
-                                    json!(format!("{frame_cookie_addr:#x}")),
-                                ),
-                                (
-                                    "frame_cookie".to_string(),
-                                    json!(
-                                        frame_cookie
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<unavailable>".to_string())
-                                    ),
-                                ),
-                                (
-                                    "decoded_cookie".to_string(),
-                                    json!(
-                                        decoded_cookie
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<unavailable>".to_string())
-                                    ),
-                                ),
-                                (
-                                    "global_cookie".to_string(),
-                                    json!(
-                                        global_cookie
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<unavailable>".to_string())
-                                    ),
-                                ),
-                            ]),
-                            json!(site),
-                        );
-                    }
-                }
-                let in_final_assert_window = (0x0013_6400..=0x0013_6f00).contains(&block_rva)
-                    || (0x0013_d180..=0x0013_d1b0).contains(&block_rva)
-                    || (0x0013_ea00..=0x0013_f800).contains(&block_rva)
-                    || (0x0014_ca80..=0x0014_cd50).contains(&block_rva);
-                let in_pre_report_window = (0x0014_dee0..=0x0014_df40).contains(&block_rva)
-                    || (0x0015_e6d0..=0x0015_e720).contains(&block_rva)
-                    || (0x0016_c040..=0x0016_c0c0).contains(&block_rva)
-                    || (0x0016_ddf0..=0x0016_e120).contains(&block_rva);
-                runtime.trace_steam_pre_report_pointer_state(&memory, &state, block_rva);
-                if in_final_assert_window || in_pre_report_window {
-                    let decoded_instructions = cached_block
-                        .translated
-                        .decoded
-                        .iter()
-                        .map(|instruction| {
-                            format!(
-                                "{:#x}:{:?} {:?}",
-                                instruction
-                                    .address
-                                    .saturating_sub(runtime.mapped_image_base),
-                                instruction.opcode,
-                                instruction.operands
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let return_addr = read_guest_u32(&memory, state.get(Register::Rsp))
-                        .ok()
-                        .map(u64::from)
-                        .map(|value| {
-                            format!("{:#x}", value.saturating_sub(runtime.mapped_image_base))
-                        })
-                        .unwrap_or_else(|| "<unavailable>".to_string());
-                    let final_assert_tls_state = if guest_arch == GuestArch::X86
-                        && block_rva == 0x0013_ea80
-                    {
-                        let format_opt = |value: Option<u64>| {
-                            value
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<unavailable>".to_string())
-                        };
-                        let tls_index_address = runtime.mapped_image_base + 0x0045_71a8;
-                        let compare_left_address = runtime.mapped_image_base + 0x0042_6400;
-                        let tls_vector = match read_guest_pointer(
-                            &memory,
-                            runtime.teb_base + 0x2c,
-                            guest_arch,
-                        ) {
-                            Ok(value) => Some(value),
-                            Err(error) => {
-                                eprintln!(
-                                    "[pe_runtime] SteamTLSWatch: failed to read TLS vector at {:#x}: {}",
-                                    runtime.teb_base + 0x2c,
-                                    error
-                                );
-                                None
-                            }
-                        };
-                        let tls_index = read_guest_u32(&memory, tls_index_address)
-                            .ok()
-                            .map(u64::from);
-                        let tls_slot = match (tls_vector, tls_index) {
-                            (Some(vector), Some(index)) if vector != 0 => read_guest_pointer(
-                                &memory,
-                                vector + index * guest_arch.pointer_bytes() as u64,
-                                guest_arch,
-                            )
-                            .ok(),
-                            _ => None,
-                        };
-                        let compare_left = read_guest_u32(&memory, compare_left_address)
-                            .ok()
-                            .map(u64::from);
-                        let compare_right = match tls_slot {
-                            Some(slot) if slot != 0 => {
-                                read_guest_u32(&memory, slot + 0x480).ok().map(u64::from)
-                            }
-                            _ => None,
-                        };
-                        format!(
-                            " tls_index={} tls_vector={} tls_slot={} compare_lhs={} compare_rhs={}",
-                            format_opt(tls_index),
-                            format_opt(tls_vector),
-                            format_opt(tls_slot),
-                            format_opt(compare_left),
-                            format_opt(compare_right),
-                        )
-                    } else {
-                        String::new()
+                    let global_cookie_addr = runtime.mapped_image_base + 0x003c_bfd4;
+                    let global_cookie = match read_guest_u32(&memory, global_cookie_addr) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            eprintln!(
+                                "[pe_runtime] SteamCookieWatch: failed to read global cookie at {:#x}: {}",
+                                global_cookie_addr, error
+                            );
+                            None
+                        }
                     };
-                    let block_summary = format!(
-                        "block_start={block_rva:#x} ret_rva={return_addr} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x}{final_assert_tls_state} decoded=[{decoded_instructions}]",
-                        state.get(Register::Rax),
-                        state.get(Register::Rcx),
-                        state.get(Register::Rdx),
-                        state.get(Register::Rsi),
-                        state.get(Register::Rdi),
-                        state.get(Register::Rsp),
-                        state.get(Register::Rbp),
+                    let decoded_cookie = frame_cookie.map(|value| value ^ ebp);
+                    runtime.push_trace(
+                        "process",
+                        "SteamCookieWatch",
+                        BTreeMap::from([
+                            ("site".to_string(), json!(site)),
+                            ("ebp".to_string(), json!(format!("{ebp:#x}"))),
+                            (
+                                "esp".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                            ),
+                            (
+                                "frame_cookie_addr".to_string(),
+                                json!(format!("{frame_cookie_addr:#x}")),
+                            ),
+                            (
+                                "frame_cookie".to_string(),
+                                json!(
+                                    frame_cookie
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "decoded_cookie".to_string(),
+                                json!(
+                                    decoded_cookie
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "global_cookie".to_string(),
+                                json!(
+                                    global_cookie
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                        ]),
+                        json!(site),
                     );
-                    if in_final_assert_window {
-                        if runtime.steam_final_assert_recent_blocks.len() == 32 {
-                            runtime.steam_final_assert_recent_blocks.pop_front();
-                        }
-                        runtime
-                            .steam_final_assert_recent_blocks
-                            .push_back(block_summary.clone());
-                        if (0x0013_eaf0..=0x0013_eb10).contains(&block_rva)
-                            || (0x0014_ca80..=0x0014_cd80).contains(&block_rva)
-                        {
-                            if runtime.steam_final_status_writer_blocks.len() == 40 {
-                                runtime.steam_final_status_writer_blocks.pop_front();
-                            }
-                            runtime
-                                .steam_final_status_writer_blocks
-                                .push_back(block_summary.clone());
-                        } else if (0x0013_c3d0..=0x0013_c410).contains(&block_rva)
-                            || (0x0013_d190..=0x0013_d197).contains(&block_rva)
-                            || (0x0013_f0a0..=0x0013_f0d0).contains(&block_rva)
-                            || (0x0013_f560..=0x0013_f790).contains(&block_rva)
-                        {
-                            if runtime.steam_final_lock_blocks.len() == 64 {
-                                runtime.steam_final_lock_blocks.pop_front();
-                            }
-                            runtime
-                                .steam_final_lock_blocks
-                                .push_back(block_summary.clone());
-                        }
-                    }
-                    if in_pre_report_window {
-                        if runtime.steam_pre_report_blocks.len() == 64 {
-                            runtime.steam_pre_report_blocks.pop_front();
-                        }
-                        runtime.steam_pre_report_blocks.push_back(block_summary);
-                    }
                 }
             }
+            let in_final_assert_window = (0x0013_6400..=0x0013_6f00).contains(&block_rva)
+                || (0x0013_d180..=0x0013_d1b0).contains(&block_rva)
+                || (0x0013_ea00..=0x0013_f800).contains(&block_rva)
+                || (0x0014_ca80..=0x0014_cd50).contains(&block_rva);
+            let in_pre_report_window = (0x0014_dee0..=0x0014_df40).contains(&block_rva)
+                || (0x0015_e6d0..=0x0015_e720).contains(&block_rva)
+                || (0x0016_c040..=0x0016_c0c0).contains(&block_rva)
+                || (0x0016_ddf0..=0x0016_e120).contains(&block_rva);
+            runtime.trace_steam_pre_report_pointer_state(&memory, &state, block_rva);
+            if in_final_assert_window || in_pre_report_window {
+                let decoded_instructions = cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .map(|instruction| {
+                        format!(
+                            "{:#x}:{:?} {:?}",
+                            instruction
+                                .address
+                                .saturating_sub(runtime.mapped_image_base),
+                            instruction.opcode,
+                            instruction.operands
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let return_addr = read_guest_u32(&memory, state.get(Register::Rsp))
+                    .ok()
+                    .map(u64::from)
+                    .map(|value| format!("{:#x}", value.saturating_sub(runtime.mapped_image_base)))
+                    .unwrap_or_else(|| "<unavailable>".to_string());
+                let final_assert_tls_state = if guest_arch == GuestArch::X86
+                    && block_rva == 0x0013_ea80
+                {
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let tls_index_address = runtime.mapped_image_base + 0x0045_71a8;
+                    let compare_left_address = runtime.mapped_image_base + 0x0042_6400;
+                    let tls_vector = match read_guest_pointer(
+                        &memory,
+                        runtime.teb_base + 0x2c,
+                        guest_arch,
+                    ) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            eprintln!(
+                                "[pe_runtime] SteamTLSWatch: failed to read TLS vector at {:#x}: {}",
+                                runtime.teb_base + 0x2c,
+                                error
+                            );
+                            None
+                        }
+                    };
+                    let tls_index = read_guest_u32(&memory, tls_index_address)
+                        .ok()
+                        .map(u64::from);
+                    let tls_slot = match (tls_vector, tls_index) {
+                        (Some(vector), Some(index)) if vector != 0 => read_guest_pointer(
+                            &memory,
+                            vector + index * guest_arch.pointer_bytes() as u64,
+                            guest_arch,
+                        )
+                        .ok(),
+                        _ => None,
+                    };
+                    let compare_left = read_guest_u32(&memory, compare_left_address)
+                        .ok()
+                        .map(u64::from);
+                    let compare_right = match tls_slot {
+                        Some(slot) if slot != 0 => {
+                            read_guest_u32(&memory, slot + 0x480).ok().map(u64::from)
+                        }
+                        _ => None,
+                    };
+                    format!(
+                        " tls_index={} tls_vector={} tls_slot={} compare_lhs={} compare_rhs={}",
+                        format_opt(tls_index),
+                        format_opt(tls_vector),
+                        format_opt(tls_slot),
+                        format_opt(compare_left),
+                        format_opt(compare_right),
+                    )
+                } else {
+                    String::new()
+                };
+                let block_summary = format!(
+                    "block_start={block_rva:#x} ret_rva={return_addr} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x}{final_assert_tls_state} decoded=[{decoded_instructions}]",
+                    state.get(Register::Rax),
+                    state.get(Register::Rcx),
+                    state.get(Register::Rdx),
+                    state.get(Register::Rsi),
+                    state.get(Register::Rdi),
+                    state.get(Register::Rsp),
+                    state.get(Register::Rbp),
+                );
+                if in_final_assert_window {
+                    if runtime.steam_final_assert_recent_blocks.len() == 32 {
+                        runtime.steam_final_assert_recent_blocks.pop_front();
+                    }
+                    runtime
+                        .steam_final_assert_recent_blocks
+                        .push_back(block_summary.clone());
+                    if (0x0013_eaf0..=0x0013_eb10).contains(&block_rva)
+                        || (0x0014_ca80..=0x0014_cd80).contains(&block_rva)
+                    {
+                        if runtime.steam_final_status_writer_blocks.len() == 40 {
+                            runtime.steam_final_status_writer_blocks.pop_front();
+                        }
+                        runtime
+                            .steam_final_status_writer_blocks
+                            .push_back(block_summary.clone());
+                    } else if (0x0013_c3d0..=0x0013_c410).contains(&block_rva)
+                        || (0x0013_d190..=0x0013_d197).contains(&block_rva)
+                        || (0x0013_f0a0..=0x0013_f0d0).contains(&block_rva)
+                        || (0x0013_f560..=0x0013_f790).contains(&block_rva)
+                    {
+                        if runtime.steam_final_lock_blocks.len() == 64 {
+                            runtime.steam_final_lock_blocks.pop_front();
+                        }
+                        runtime
+                            .steam_final_lock_blocks
+                            .push_back(block_summary.clone());
+                    }
+                }
+                if in_pre_report_window {
+                    if runtime.steam_pre_report_blocks.len() == 64 {
+                        runtime.steam_pre_report_blocks.pop_front();
+                    }
+                    runtime.steam_pre_report_blocks.push_back(block_summary);
+                }
+            }
+        }
         // --- Steam tracing pre-execution state captures ---
         // These variable declarations capture guest state before block execution so
         // that tracing emission blocks (C, D, E below) can compare before/after values.
@@ -5960,10 +5972,11 @@ pub fn execute_with_options(
                 runtime.steam_4dea00_expected_edi = None;
             }
             if watch_steam_4dea00_edi_preservation
-                && let Some(expected_edi) = runtime.steam_4dea00_expected_edi {
-                    let actual_edi = state.get(Register::Rdi);
-                    if actual_edi != expected_edi {
-                        return Err(AppError::new(
+                && let Some(expected_edi) = runtime.steam_4dea00_expected_edi
+            {
+                let actual_edi = state.get(Register::Rdi);
+                if actual_edi != expected_edi {
+                    return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!(
                                 "steam 0x4dea00 callee lost edi inside block={block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}, ebp={:#x}",
@@ -5981,20 +5994,21 @@ pub fn execute_with_options(
                             state.get(Register::Rcx),
                             state.get(Register::Rdx),
                         )));
-                    }
                 }
+            }
             if watch_steam_install_dir_edi_preservation
-                && let Some(expected_edi) = runtime.steam_install_dir_expected_edi {
-                    let actual_edi = state.get(Register::Rdi);
-                    if actual_edi != expected_edi {
-                        let decoded_addresses = cached_block
-                            .translated
-                            .decoded
-                            .iter()
-                            .map(|instruction| format!("{:#x}", instruction.address))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        return Err(AppError::new(
+                && let Some(expected_edi) = runtime.steam_install_dir_expected_edi
+            {
+                let actual_edi = state.get(Register::Rdi);
+                if actual_edi != expected_edi {
+                    let decoded_addresses = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| format!("{:#x}", instruction.address))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!(
                                 "steam install-dir callee lost edi before block {block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}"
@@ -6011,8 +6025,8 @@ pub fn execute_with_options(
                             state.get(Register::Rbp),
                             state.get(Register::Rsp),
                         )));
-                    }
                 }
+            }
             if watch_steam_adf60_edi_preservation {
                 let expected_edi =
                     read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
@@ -6153,20 +6167,22 @@ pub fn execute_with_options(
                     );
                 }
             }
-            if guest_arch == GuestArch::X86 && contains_steam_402a57
-                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
-                    let saved_esi =
-                        read_guest_u32(&memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
-                            .unwrap_or(0);
-                    if saved_esi != expected_esi {
-                        return Err(AppError::new(
-                            ReasonCode::RcUnimplInsn,
-                            format!(
-                                "steam 401434 corrupted its saved ESI slot before epilogue: expected {expected_esi:#x}, saved slot holds {saved_esi:#x}"
-                            ),
-                        ));
-                    }
+            if guest_arch == GuestArch::X86
+                && contains_steam_402a57
+                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
+            {
+                let saved_esi =
+                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
+                        .unwrap_or(0);
+                if saved_esi != expected_esi {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
+                            "steam 401434 corrupted its saved ESI slot before epilogue: expected {expected_esi:#x}, saved slot holds {saved_esi:#x}"
+                        ),
+                    ));
                 }
+            }
         }
         if state.rip <= 0x19026bf1 && cached_block.end_rip > 0x19026bf1 {
             let this_ptr = state.get(Register::Rcx) & state.arch.register_mask();
@@ -7938,29 +7954,31 @@ pub fn execute_with_options(
             if guest_arch == GuestArch::X86
                 && runtime.steam_401389_expected_esi_after_401434.is_some()
                 && runtime.steam_401389_saved_esi_slot_addr.is_none()
-                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
-                    let candidate = state.get(Register::Rbp).wrapping_sub(0x2b8);
-                    if read_guest_u32(&memory, candidate).ok() == Some(expected_esi) {
-                        runtime.steam_401389_saved_esi_slot_addr = Some(candidate);
-                    }
+                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
+            {
+                let candidate = state.get(Register::Rbp).wrapping_sub(0x2b8);
+                if read_guest_u32(&memory, candidate).ok() == Some(expected_esi) {
+                    runtime.steam_401389_saved_esi_slot_addr = Some(candidate);
                 }
+            }
             if let Some((watched_address, before_value)) = watched_esi_slot_before
                 && let Ok(after_value) = read_guest_u32(&memory, watched_address)
-                    && after_value != before_value {
-                        let decoded_addresses = cached_block
-                            .translated
-                            .decoded
-                            .iter()
-                            .map(|instruction| format!("{:#x}", instruction.address))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        return Err(AppError::new(
-                            ReasonCode::RcUnimplInsn,
-                            format!(
-                                "steam 401434 overwrote saved ESI slot at {watched_address:#x} from {before_value:#x} to {after_value:#x} while executing block {block_start_rip:#x} addrs=[{decoded_addresses}]"
-                            ),
-                        ));
-                    }
+                && after_value != before_value
+            {
+                let decoded_addresses = cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .map(|instruction| format!("{:#x}", instruction.address))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!(
+                        "steam 401434 overwrote saved ESI slot at {watched_address:#x} from {before_value:#x} to {after_value:#x} while executing block {block_start_rip:#x} addrs=[{decoded_addresses}]"
+                    ),
+                ));
+            }
             if steam_install_dir_set_edi {
                 let expected_edi = runtime.mapped_image_base + 0x003d_6168;
                 let actual_edi = state.get(Register::Rdi);
@@ -8747,18 +8765,19 @@ impl PeHostRuntime {
         };
         let normalized_source = runtime_guest_path(self.win32.ge(), &source_program);
         if is_windows_absolute_path(&normalized_source)
-            && let Some(drive_prefix) = windows_drive_prefix(&normalized_source) {
-                let drive = &drive_prefix[..1];
-                if self
-                    .win32
-                    .ge()
-                    .active_drive_mappings()
-                    .iter()
-                    .any(|mapping| mapping.drive.eq_ignore_ascii_case(drive))
-                {
-                    return Ok(normalized_source);
-                }
+            && let Some(drive_prefix) = windows_drive_prefix(&normalized_source)
+        {
+            let drive = &drive_prefix[..1];
+            if self
+                .win32
+                .ge()
+                .active_drive_mappings()
+                .iter()
+                .any(|mapping| mapping.drive.eq_ignore_ascii_case(drive))
+            {
+                return Ok(normalized_source);
             }
+        }
         let file_name = source_program
             .file_name()
             .and_then(|name| name.to_str())
@@ -8915,9 +8934,10 @@ impl PeHostRuntime {
         // 5. Fallback: try the original guest-to-host path resolution
         let guest_path = resolve_full_guest_path(&self.current_directory, module_name);
         if let Ok(host_path) = self.win32.guest_path_to_host_path(&guest_path)
-            && host_path.exists() {
-                return self.load_real_dll(module_name, &host_path);
-            }
+            && host_path.exists()
+        {
+            return self.load_real_dll(module_name, &host_path);
+        }
 
         (0, ERROR_MOD_NOT_FOUND)
     }
@@ -8958,9 +8978,10 @@ impl PeHostRuntime {
                 }
             };
             if let Some(addr) = export_addr
-                && addr != 0 {
-                    return addr;
-                }
+                && addr != 0
+            {
+                return addr;
+            }
         }
 
         // Check if this is a synthetic module with an export table that contains
@@ -9069,11 +9090,12 @@ impl PeHostRuntime {
 
         // Cache the result (address or None if address is 0).
         if let Some(addr) = result
-            && addr != 0 {
-                self.forwarder_export_cache
-                    .insert(forwarder.to_string(), Some(addr));
-                return Some(addr);
-            }
+            && addr != 0
+        {
+            self.forwarder_export_cache
+                .insert(forwarder.to_string(), Some(addr));
+            return Some(addr);
+        }
         self.forwarder_export_cache
             .insert(forwarder.to_string(), None);
         None
@@ -9586,13 +9608,11 @@ impl PeHostRuntime {
         let raw_reason = reason.to_raw();
         for &handle in dll_handles {
             if let Some(info) = self.dll_info_table.get(&handle)
-                && info.entry_point_rva != 0 {
-                    self.pending_dll_main_calls.push_back((
-                        handle,
-                        info.entry_point_rva,
-                        raw_reason,
-                    ));
-                }
+                && info.entry_point_rva != 0
+            {
+                self.pending_dll_main_calls
+                    .push_back((handle, info.entry_point_rva, raw_reason));
+            }
         }
     }
 
@@ -10135,7 +10155,7 @@ impl PeHostRuntime {
         Ok(())
     }
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_live_mouse_input(
         &mut self,
         x: i32,
@@ -10268,7 +10288,9 @@ impl PeHostRuntime {
             // No real GDI pixels: do not fabricate a frame.  Drop any cached
             // value so a stale surface never re-publishes as if it were fresh.
             self.last_real_gdi_frame = None;
-            crate::live::live_trace("[pe] publish_live_window_preview_if_needed — render_live_window_preview returned None (no real GDI surface)");
+            crate::live::live_trace(
+                "[pe] publish_live_window_preview_if_needed — render_live_window_preview returned None (no real GDI surface)",
+            );
         }
     }
 
@@ -10311,19 +10333,17 @@ impl PeHostRuntime {
     /// host-side pixel mirror from guest memory first (DIB sections give the
     /// guest a direct pointer to the pixel buffer, so the guest writes pixels
     /// without going through any GDI thunk).
-    fn refresh_dc_bitmap(
-        &mut self,
-        memory: &MemoryImage,
-        hdc: u64,
-    ) -> Option<(u64, MemoryBitmap)> {
+    fn refresh_dc_bitmap(&mut self, memory: &MemoryImage, hdc: u64) -> Option<(u64, MemoryBitmap)> {
         let object = self.dc_selected_objects.get(&hdc).copied()?;
         let bitmap = self.gdi_bitmaps.get_mut(&object)?;
         // Refresh the host-side mirror from guest memory.
-        if bitmap.guest_pixel_ptr != 0 && !bitmap.bytes.is_empty()
+        if bitmap.guest_pixel_ptr != 0
+            && !bitmap.bytes.is_empty()
             && let Ok(slice) = memory.read_bytes(bitmap.guest_pixel_ptr, bitmap.bytes.len())
-                && slice.len() == bitmap.bytes.len() {
-                    bitmap.bytes.copy_from_slice(&slice);
-                }
+            && slice.len() == bitmap.bytes.len()
+        {
+            bitmap.bytes.copy_from_slice(&slice);
+        }
         Some((object, bitmap.clone()))
     }
 
@@ -10338,7 +10358,7 @@ impl PeHostRuntime {
     /// Only `SRCCOPY` (0x00CC0020) is implemented pixel-faithfully; the other
     /// ternary raster ops fall back to a plain copy (good enough for the vast
     /// majority of app-side BitBlt usage, which is SRCCOPY).
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn blit_dc_to_dc(
         &mut self,
         memory: &mut MemoryImage,
@@ -10368,9 +10388,7 @@ impl PeHostRuntime {
         }
 
         // Determine destination.
-        let dest_is_window = self
-            .hdc_target_window(hdc_dest)
-            .is_some();
+        let dest_is_window = self.hdc_target_window(hdc_dest).is_some();
         if dest_is_window {
             let hwnd = self.hdc_target_window(hdc_dest).unwrap();
             let Some(preview) = self.window_preview(hwnd) else {
@@ -10538,7 +10556,12 @@ impl PeHostRuntime {
                             (b, g, r, 0xff)
                         }
                         3 => (px[0], px[1], px[2], 0xff), // BGR
-                        _ => (px[0], px[1], px[2], if px.len() >= 4 { px[3] } else { 0xff }),
+                        _ => (
+                            px[0],
+                            px[1],
+                            px[2],
+                            if px.len() >= 4 { px[3] } else { 0xff },
+                        ),
                     };
                     out[d_idx] = b;
                     out[d_idx + 1] = g;
@@ -11809,51 +11832,52 @@ impl PeHostRuntime {
         // and provides a measurable speed-up for frequently-called thunks.
         if let Some(idx) = self.thunk_to_fast_index.get(&thunk_address)
             && let Some(jit) = self.jit_runtime.as_ref()
-                && let Some(trampoline) = jit.lookup_thunk_address(*idx) {
-                    emit_live_ui_debug(format!(
-                        "fast-thunk dispatch for thunk {:#x} (idx={})",
-                        thunk_address, idx
-                    ));
-                    // SAFETY: the trampoline calls fast_thunk_host_dispatcher
-                    // with the same signature. We pass `self` as a raw pointer;
-                    // the bridge re-borrows it synchronously, so there is no
-                    // aliasing.
-                    //
-                    // The transmute converts a JIT-compiled code pointer (usize)
-                    // to a function pointer with the correct ABI:
-                    //   (runtime_ptr, cpu_state_ptr, memory_ptr, thunk_addr) -> i32
-                    // This is valid because:
-                    // 1. `trampoline` was produced by JitRuntime::lookup_thunk_address
-                    //    which returns the address of JIT-compiled ARM64 code.
-                    // 2. The JIT compiler emits code conforming to this exact
-                    //    calling convention (4 arguments in x0-x3, return in x0).
-                    // 3. The function pointer signature matches the JIT-emitted
-                    //    prologue/epilogue and argument passing.
-                    // 4. No guest-controlled data influences the function pointer
-                    //    value — it comes from the trusted thunk table.
-                    let result: i32 = unsafe {
-                        let func: unsafe extern "C" fn(
-                            *mut std::ffi::c_void,
-                            *mut CpuState,
-                            *mut MemoryImage,
-                            u64,
-                        ) -> i32 = std::mem::transmute(trampoline);
-                        func(
-                            self as *mut Self as *mut std::ffi::c_void,
-                            state as *mut CpuState,
-                            memory as *mut MemoryImage,
-                            thunk_address,
-                        )
-                    };
-                    return match result {
-                        -1 => Ok(Some(None)), // Continue execution
-                        -2 => Err(AppError::new(
-                            ReasonCode::RcUnimplInsn,
-                            format!("fast-thunk dispatch failed for thunk {thunk_address:#x}"),
-                        )),
-                        code => Ok(Some(Some(code))), // Guest exit code
-                    };
-                }
+            && let Some(trampoline) = jit.lookup_thunk_address(*idx)
+        {
+            emit_live_ui_debug(format!(
+                "fast-thunk dispatch for thunk {:#x} (idx={})",
+                thunk_address, idx
+            ));
+            // SAFETY: the trampoline calls fast_thunk_host_dispatcher
+            // with the same signature. We pass `self` as a raw pointer;
+            // the bridge re-borrows it synchronously, so there is no
+            // aliasing.
+            //
+            // The transmute converts a JIT-compiled code pointer (usize)
+            // to a function pointer with the correct ABI:
+            //   (runtime_ptr, cpu_state_ptr, memory_ptr, thunk_addr) -> i32
+            // This is valid because:
+            // 1. `trampoline` was produced by JitRuntime::lookup_thunk_address
+            //    which returns the address of JIT-compiled ARM64 code.
+            // 2. The JIT compiler emits code conforming to this exact
+            //    calling convention (4 arguments in x0-x3, return in x0).
+            // 3. The function pointer signature matches the JIT-emitted
+            //    prologue/epilogue and argument passing.
+            // 4. No guest-controlled data influences the function pointer
+            //    value — it comes from the trusted thunk table.
+            let result: i32 = unsafe {
+                let func: unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *mut CpuState,
+                    *mut MemoryImage,
+                    u64,
+                ) -> i32 = std::mem::transmute(trampoline);
+                func(
+                    self as *mut Self as *mut std::ffi::c_void,
+                    state as *mut CpuState,
+                    memory as *mut MemoryImage,
+                    thunk_address,
+                )
+            };
+            return match result {
+                -1 => Ok(Some(None)), // Continue execution
+                -2 => Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!("fast-thunk dispatch failed for thunk {thunk_address:#x}"),
+                )),
+                code => Ok(Some(Some(code))), // Guest exit code
+            };
+        }
 
         // Fallback: check the standard host_thunks table
         let Some(thunk) = self.host_thunks.get(&thunk_address).cloned() else {
@@ -37116,7 +37140,7 @@ impl PeHostRuntime {
                     let stride = if src_pitch != 0 { src_pitch } else { width * 4 };
                     let data_len = (stride * height) as usize;
                     let data = if src_data_ptr != 0 && data_len > 0 {
-                        
+
                         memory.read_bytes(src_data_ptr, data_len as usize)?
                     } else {
                         vec![0u8; data_len]
@@ -50347,7 +50371,7 @@ impl PeHostRuntime {
         self.user32.dispatch_message_w(message)
     }
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_window_message(
         &mut self,
         state: &mut CpuState,
@@ -50588,7 +50612,7 @@ impl PeHostRuntime {
     }
 
     #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn execute_guest_callback_inner(
         &mut self,
         state: &mut CpuState,
@@ -50790,9 +50814,11 @@ impl PeHostRuntime {
                         }
 
                         if let Some(crate::cpu::IrInstruction::Jump { target }) = ir.last()
-                            && *target > block_start && jit.is_compiled(*target) {
-                                let _ = jit.chain_blocks(block_start, *target);
-                            }
+                            && *target > block_start
+                            && jit.is_compiled(*target)
+                        {
+                            let _ = jit.chain_blocks(block_start, *target);
+                        }
                     }
                 }
             }
@@ -50979,9 +51005,8 @@ impl PeHostRuntime {
         // memory. A frame pointer into the thread's own fresh stack keeps
         // those accesses within the mapped stack area.
         let thread_callback_args: u64 = 1;
-        let callback_rsp = initial_rsp.wrapping_sub(
-            (thread_callback_args + 1) * self.guest_arch.pointer_bytes() as u64,
-        );
+        let callback_rsp = initial_rsp
+            .wrapping_sub((thread_callback_args + 1) * self.guest_arch.pointer_bytes() as u64);
         let thread_frame_ebp = callback_rsp.wrapping_sub(self.guest_arch.pointer_bytes() as u64);
         thread_state.set(Register::Rbp, thread_frame_ebp);
 
@@ -51033,7 +51058,6 @@ impl PeHostRuntime {
             });
         };
 
-
         let previous_thread_id = self.win32.set_current_thread_id(pending_thread.thread_id);
         let previous_teb_base = self.teb_base;
         let previous_tls_vector_ptr = self.tls_vector_ptr;
@@ -51043,8 +51067,7 @@ impl PeHostRuntime {
         // outer pumped thread's identity, yield request and exit request;
         // otherwise a nested pump clobbers the outer thread's state.
         let previous_active_thread = self.active_pumped_guest_thread;
-        let previous_yield_request =
-            std::mem::replace(&mut self.yield_pumped_guest_thread, false);
+        let previous_yield_request = std::mem::replace(&mut self.yield_pumped_guest_thread, false);
         let previous_yield_wake_tick = self.yield_pumped_guest_thread_wake_tick.take();
         let previous_exit_request = self.pumped_thread_exit_requested.take();
         let previous_exit_detach =
@@ -51232,7 +51255,9 @@ impl PeHostRuntime {
                         if let Some(detach_code) = self.pumped_thread_exit_requested.take() {
                             pending_thread.exit_code_override = Some(detach_code);
                         }
-                        let final_code = pending_thread.exit_code_override.unwrap_or(exit_code as u32);
+                        let final_code = pending_thread
+                            .exit_code_override
+                            .unwrap_or(exit_code as u32);
                         self.win32
                             .set_thread_exit_code_by_id(pending_thread.thread_id, final_code)?;
                         pending_thread.state_machine = GuestThreadState::Exited;
@@ -51398,8 +51423,11 @@ impl PeHostRuntime {
         if Some(handle) == self.active_pumped_guest_thread {
             return Ok(PumpWaitOutcome::Wait(crate::win32::WaitStatus::Timeout));
         }
-        let deadline = (timeout_ms != u32::MAX)
-            .then(|| self.win32.get_tick_count64().saturating_add(timeout_ms as u64));
+        let deadline = (timeout_ms != u32::MAX).then(|| {
+            self.win32
+                .get_tick_count64()
+                .saturating_add(timeout_ms as u64)
+        });
         loop {
             // (a) Poll the target's signaled state (non-blocking).
             let status = self.win32.wait_for_single_object(handle, 0, false, None)?;
@@ -51463,7 +51491,9 @@ impl PeHostRuntime {
         timeout_ms: u32,
         alertable: bool,
     ) -> AppResult<PumpWaitOutcome> {
-        let result = self.win32.wait_for_single_object(handle, timeout_ms, false, None)?;
+        let result = self
+            .win32
+            .wait_for_single_object(handle, timeout_ms, false, None)?;
         if !matches!(result, crate::win32::WaitStatus::Timeout) {
             return Ok(PumpWaitOutcome::Wait(result));
         }
@@ -52061,9 +52091,10 @@ impl PeHostRuntime {
         return_value: Value,
     ) {
         if let Some(allowed_trace_categories) = &self.allowed_trace_categories
-            && !allowed_trace_categories.contains(category) {
-                return;
-            }
+            && !allowed_trace_categories.contains(category)
+        {
+            return;
+        }
         self.trace_events.push(trace_event(
             self.next_trace_index,
             category,
@@ -52608,12 +52639,12 @@ impl PeHostRuntime {
         if self.crt_errno_slot == 0 {
             if self.tls_vector_ptr == 0 {
                 if self.crt_errno_storage == 0 {
-                    self.crt_errno_storage =
-                        self.alloc_u32(memory, self.crt_errno_value as u32)?;
+                    self.crt_errno_storage = self.alloc_u32(memory, self.crt_errno_value as u32)?;
                 }
                 return Ok(self.crt_errno_storage);
             }
-            self.crt_errno_slot = self.allocate_crt_tls_storage(memory, self.crt_errno_value as u32)?;
+            self.crt_errno_slot =
+                self.allocate_crt_tls_storage(memory, self.crt_errno_value as u32)?;
         }
         let ptr = self.crt_tls_storage(memory, self.crt_errno_slot)?;
         if ptr != 0 {
@@ -52833,7 +52864,10 @@ impl PeHostRuntime {
         }
         let mut width: i32 = -1;
         while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
-            width = width.max(0).saturating_mul(10).saturating_add(i32::from(format[*index] - b'0' as u16));
+            width = width
+                .max(0)
+                .saturating_mul(10)
+                .saturating_add(i32::from(format[*index] - b'0' as u16));
             *index += 1;
         }
         let mut precision: i32 = -1;
@@ -52841,7 +52875,9 @@ impl PeHostRuntime {
             *index += 1;
             precision = 0;
             while *index < format.len() && (format[*index] as u8).is_ascii_digit() {
-                precision = precision.saturating_mul(10).saturating_add(i32::from(format[*index] - b'0' as u16));
+                precision = precision
+                    .saturating_mul(10)
+                    .saturating_add(i32::from(format[*index] - b'0' as u16));
                 *index += 1;
             }
         }
@@ -52888,61 +52924,56 @@ impl PeHostRuntime {
         let conversion = *format.get(*index).unwrap_or(&0);
         *index += 1;
 
-        let pad = |rendered: &mut Vec<u8>,
-                   width: i32,
-                   flags_minus: bool,
-                   flags_zero: bool|
-         -> Vec<u8> {
-            let width = width.max(rendered.len() as i32) as usize;
-            if flags_minus {
-                let mut padded = rendered.clone();
-                padded.resize(width, b' ');
-                padded
-            } else {
-                let mut padded = vec![b' '; width];
-                let start = width - rendered.len();
-                if flags_zero {
-                    // Zero padding must only fill the DIGIT region: the sign
-                    // ('-', '+', ' ') and hex prefix ("0x"/"0X") stay at the
-                    // front, so "%05d" of -12 → "-0012" (not "-0-12") and
-                    // "%#08x" of 0xCAFE → "0x00cafe" (not "00xcafe").
-                    let mut head: Vec<u8> = Vec::new();
-                    let mut digits = rendered.as_slice();
-                    if let Some(&first) = rendered.first()
-                        && matches!(first, b'-' | b'+' | b' ')
-                    {
-                        head.push(first);
-                        digits = &rendered[1..];
-                    }
-                    if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
-                        head.extend_from_slice(&digits[..2]);
-                        digits = &digits[2..];
-                    }
-                    let digit_start = start + head.len();
-                    for slot in padded.iter_mut().take(digit_start).skip(head.len()) {
-                        *slot = b'0';
-                    }
-                    padded[..head.len()].copy_from_slice(&head);
-                    padded[digit_start..].copy_from_slice(digits);
+        let pad =
+            |rendered: &mut Vec<u8>, width: i32, flags_minus: bool, flags_zero: bool| -> Vec<u8> {
+                let width = width.max(rendered.len() as i32) as usize;
+                if flags_minus {
+                    let mut padded = rendered.clone();
+                    padded.resize(width, b' ');
+                    padded
                 } else {
-                    padded[start..].copy_from_slice(rendered);
+                    let mut padded = vec![b' '; width];
+                    let start = width - rendered.len();
+                    if flags_zero {
+                        // Zero padding must only fill the DIGIT region: the sign
+                        // ('-', '+', ' ') and hex prefix ("0x"/"0X") stay at the
+                        // front, so "%05d" of -12 → "-0012" (not "-0-12") and
+                        // "%#08x" of 0xCAFE → "0x00cafe" (not "00xcafe").
+                        let mut head: Vec<u8> = Vec::new();
+                        let mut digits = rendered.as_slice();
+                        if let Some(&first) = rendered.first()
+                            && matches!(first, b'-' | b'+' | b' ')
+                        {
+                            head.push(first);
+                            digits = &rendered[1..];
+                        }
+                        if digits.starts_with(b"0x") || digits.starts_with(b"0X") {
+                            head.extend_from_slice(&digits[..2]);
+                            digits = &digits[2..];
+                        }
+                        let digit_start = start + head.len();
+                        for slot in padded.iter_mut().take(digit_start).skip(head.len()) {
+                            *slot = b'0';
+                        }
+                        padded[..head.len()].copy_from_slice(&head);
+                        padded[digit_start..].copy_from_slice(digits);
+                    } else {
+                        padded[start..].copy_from_slice(rendered);
+                    }
+                    padded
                 }
-                padded
-            }
-        };
+            };
 
-        let sign_prefix = |rendered: &mut Vec<u8>,
-                           negative: bool,
-                           flags_plus: bool,
-                           flags_space: bool| {
-            if negative {
-                rendered.insert(0, b'-');
-            } else if flags_plus {
-                rendered.insert(0, b'+');
-            } else if flags_space {
-                rendered.insert(0, b' ');
-            }
-        };
+        let sign_prefix =
+            |rendered: &mut Vec<u8>, negative: bool, flags_plus: bool, flags_space: bool| {
+                if negative {
+                    rendered.insert(0, b'-');
+                } else if flags_plus {
+                    rendered.insert(0, b'+');
+                } else if flags_space {
+                    rendered.insert(0, b' ');
+                }
+            };
 
         let hex_digit = |digit: u8, upper: bool| -> u8 {
             if digit < 10 {
@@ -52997,7 +53028,12 @@ impl PeHostRuntime {
                 if !(rendered.is_empty() && precision == 0 && value == 0) {
                     sign_prefix(&mut rendered, negative, flags_plus, flags_space);
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+                out.extend(pad(
+                    &mut rendered,
+                    width,
+                    flags_minus,
+                    precision < 0 && flags_zero,
+                ));
             }
             0x75 => {
                 let value = match length {
@@ -53028,7 +53064,12 @@ impl PeHostRuntime {
                 if flags_space && !flags_plus && !rendered.is_empty() {
                     rendered.insert(0, b' ');
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+                out.extend(pad(
+                    &mut rendered,
+                    width,
+                    flags_minus,
+                    precision < 0 && flags_zero,
+                ));
             }
             0x78 | 0x58 => {
                 let value = match length {
@@ -53061,7 +53102,12 @@ impl PeHostRuntime {
                     rendered.insert(0, if upper { b'X' } else { b'x' });
                     rendered.insert(0, b'0');
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+                out.extend(pad(
+                    &mut rendered,
+                    width,
+                    flags_minus,
+                    precision < 0 && flags_zero,
+                ));
             }
             0x6F => {
                 let value = match length {
@@ -53092,7 +53138,12 @@ impl PeHostRuntime {
                 if flags_hash && value != 0 && !rendered.starts_with(b"0") {
                     rendered.insert(0, b'0');
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, precision < 0 && flags_zero));
+                out.extend(pad(
+                    &mut rendered,
+                    width,
+                    flags_minus,
+                    precision < 0 && flags_zero,
+                ));
             }
             0x63 => {
                 let raw = va.read_u32(memory)?;
@@ -53213,7 +53264,12 @@ impl PeHostRuntime {
                 } else if flags_space {
                     rendered.insert(0, b' ');
                 }
-                out.extend(pad(&mut rendered, width, flags_minus, !precision_explicit && flags_zero));
+                out.extend(pad(
+                    &mut rendered,
+                    width,
+                    flags_minus,
+                    !precision_explicit && flags_zero,
+                ));
             }
             _ => {
                 // Unknown conversion: UCRT renders the '%' and the offending
@@ -53255,7 +53311,15 @@ impl PeHostRuntime {
         let mut index = 0_usize;
         while index < format_units.len() {
             if format_units[index] == 0x25 {
-                self.crt_render_conversion(&mut *memory, state, &format_units, &mut index, &mut va, &mut out, self.guest_arch)?;
+                self.crt_render_conversion(
+                    &mut *memory,
+                    state,
+                    &format_units,
+                    &mut index,
+                    &mut va,
+                    &mut out,
+                    self.guest_arch,
+                )?;
             } else {
                 let mut encoded = [0_u8; 4];
                 if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
@@ -53270,7 +53334,12 @@ impl PeHostRuntime {
     /// Deliver rendered printf output to a stream: iob streams go to the
     /// runtime stdout/stderr buffers; CRT-opened FILE* streams go through the
     /// win32 handle; a NULL stream is treated as stdout (best-effort).
-    fn crt_vfprintf_deliver(&mut self, memory: &mut MemoryImage, stream: u64, bytes: &[u8]) -> AppResult<u64> {
+    fn crt_vfprintf_deliver(
+        &mut self,
+        memory: &mut MemoryImage,
+        stream: u64,
+        bytes: &[u8],
+    ) -> AppResult<u64> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -53289,7 +53358,9 @@ impl PeHostRuntime {
                 return Ok((EOF as i64) as u64);
             }
             if state.append {
-                let _ = self.win32.set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
+                let _ =
+                    self.win32
+                        .set_file_pointer_ex(state.handle, 0, crate::win32::SeekOrigin::End);
             }
             match self.win32.write_file(state.handle, bytes) {
                 Ok(_) => Ok(bytes.len() as u64),
@@ -53383,25 +53454,23 @@ impl PeHostRuntime {
             'a' => crate::win32::CreationDisposition::OpenAlways,
             _ => crate::win32::CreationDisposition::OpenExisting,
         };
-        let handle = match self.win32.create_file_w(
-            &resolved,
-            access,
-            share,
-            creation,
-            false,
-            false,
-            false,
-        ) {
+        let handle = match self
+            .win32
+            .create_file_w(&resolved, access, share, creation, false, false, false)
+        {
             Ok(handle) => handle,
             Err(error) => {
                 self.set_crt_doserrno(memory, last_error_from_app_error(&error) as i32);
-                self.set_crt_errno(memory, match error.code {
-                    ReasonCode::RcFsNotFound => ENOENT,
-                    ReasonCode::RcFsAlreadyExists => EEXIST,
-                    ReasonCode::RcFsPathInvalid => ENOENT,
-                    ReasonCode::RcIo => EACCES,
-                    _ => EACCES,
-                });
+                self.set_crt_errno(
+                    memory,
+                    match error.code {
+                        ReasonCode::RcFsNotFound => ENOENT,
+                        ReasonCode::RcFsAlreadyExists => EEXIST,
+                        ReasonCode::RcFsPathInvalid => ENOENT,
+                        ReasonCode::RcIo => EACCES,
+                        _ => EACCES,
+                    },
+                );
                 return Ok(None);
             }
         };
@@ -53574,10 +53643,10 @@ impl PeHostRuntime {
         };
         // Heap sort (in-place, O(n log n) comparisons).
         let sift_down = |runtime: &mut Self,
-                             memory: &mut MemoryImage,
-                             state: &mut CpuState,
-                             root: usize,
-                             bottom: usize|
+                         memory: &mut MemoryImage,
+                         state: &mut CpuState,
+                         root: usize,
+                         bottom: usize|
          -> AppResult<()> {
             let mut root = root;
             loop {
@@ -53585,9 +53654,7 @@ impl PeHostRuntime {
                 if child >= bottom {
                     return Ok(());
                 }
-                if child + 1 < bottom
-                    && compare_at(runtime, memory, state, child, child + 1)? < 0
-                {
+                if child + 1 < bottom && compare_at(runtime, memory, state, child, child + 1)? < 0 {
                     child += 1;
                 }
                 if compare_at(runtime, memory, state, root, child)? < 0 {
@@ -54798,9 +54865,10 @@ impl PeHostRuntime {
         let mut frames = 0_usize;
         for source_object in &source_objects {
             if let Some(source) = self.xaudio_source_voices.get(source_object)
-                && self.audio.voice_started(source.voice_id)? {
-                    frames = frames.max(self.audio.queued_source_frames(source.voice_id)?);
-                }
+                && self.audio.voice_started(source.voice_id)?
+            {
+                frames = frames.max(self.audio.queued_source_frames(source.voice_id)?);
+            }
         }
         if frames == 0 {
             return Ok(());
@@ -55205,9 +55273,10 @@ impl PeHostRuntime {
             context_meta.refcount = 0;
         }
         if let Some(swapchain_object) = swapchain_object
-            && let Some(swapchain_meta) = self.guest_objects.get_mut(&swapchain_object) {
-                swapchain_meta.refcount = 0;
-            }
+            && let Some(swapchain_meta) = self.guest_objects.get_mut(&swapchain_object)
+        {
+            swapchain_meta.refcount = 0;
+        }
 
         self.add_ref_guest_object(device_object)?;
         if swapchain_object.is_some() {
@@ -56407,10 +56476,7 @@ impl PeHostRuntime {
             "ID3D11Device::CreateDepthStencilState",
             BTreeMap::from([
                 ("depth_enable".to_string(), json!(desc.depth_enable)),
-                (
-                    "depth_write_mask".to_string(),
-                    json!(desc.depth_write_mask),
-                ),
+                ("depth_write_mask".to_string(), json!(desc.depth_write_mask)),
                 ("depth_func".to_string(), json!(desc.depth_func)),
                 ("stencil_enable".to_string(), json!(desc.stencil_enable)),
             ]),
@@ -58076,9 +58142,8 @@ impl PeHostRuntime {
             HostThunk::WebView2EnvGetBrowserVersionString,                   // 5
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        
-        self
-            .alloc_guest_object(memory, GuestObjectKind::WebView2Environment, vtable)
+
+        self.alloc_guest_object(memory, GuestObjectKind::WebView2Environment, vtable)
             .unwrap_or(0)
     }
 
@@ -58104,9 +58169,8 @@ impl PeHostRuntime {
             HostThunk::WebView2CtrlGetCoreWebView2,                          // 12
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        
-        self
-            .alloc_guest_object(memory, GuestObjectKind::WebView2Controller, vtable)
+
+        self.alloc_guest_object(memory, GuestObjectKind::WebView2Controller, vtable)
             .unwrap_or(0)
     }
 
@@ -58150,9 +58214,8 @@ impl PeHostRuntime {
         methods[30] = HostThunk::WebView2RemoveProcessFailed;
         // ICoreWebView2_4 would follow at indices 31+
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        
-        self
-            .alloc_guest_object(memory, GuestObjectKind::WebView2WebView, vtable)
+
+        self.alloc_guest_object(memory, GuestObjectKind::WebView2WebView, vtable)
             .unwrap_or(0)
     }
 
@@ -58177,9 +58240,8 @@ impl PeHostRuntime {
         methods[13] = HostThunk::WebView2SettingsGetIsBuiltInErrorPageEnabled;
         methods[14] = HostThunk::WebView2SettingsPutIsBuiltInErrorPageEnabled;
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        
-        self
-            .alloc_guest_object(memory, GuestObjectKind::WebView2Settings, vtable)
+
+        self.alloc_guest_object(memory, GuestObjectKind::WebView2Settings, vtable)
             .unwrap_or(0)
     }
 
@@ -58201,9 +58263,8 @@ impl PeHostRuntime {
             ), // 4
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        
-        self
-            .alloc_guest_object(memory, GuestObjectKind::WebView2WebResourceResponse, vtable)
+
+        self.alloc_guest_object(memory, GuestObjectKind::WebView2WebResourceResponse, vtable)
             .unwrap_or(0)
     }
 
@@ -61025,9 +61086,10 @@ impl PeHostRuntime {
         if output_size > 0 && dest_buffer != 0 {
             let mut output_buf = vec![0u8; output_size];
             if memory.is_range_mapped(dest_buffer, output_size)
-                && let Ok(bytes) = memory.read_bytes(dest_buffer, output_size) {
-                    output_buf.copy_from_slice(&bytes);
-                }
+                && let Ok(bytes) = memory.read_bytes(dest_buffer, output_size)
+            {
+                output_buf.copy_from_slice(&bytes);
+            }
 
             self.d3d12_runtime
                 .emit_raytracing_acceleration_structure_postbuild_info(
@@ -61202,10 +61264,13 @@ impl PeHostRuntime {
                         Ok(len) => len as usize,
                         _ => continue,
                     };
-                    if p_bytecode != 0 && bytecode_len > 0 && bytecode_len <= 1024 * 1024
-                        && let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len) {
-                            return bytes;
-                        }
+                    if p_bytecode != 0
+                        && bytecode_len > 0
+                        && bytecode_len <= 1024 * 1024
+                        && let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len)
+                    {
+                        return bytes;
+                    }
                 }
                 SUBOBJECT_SHADER_CONFIG => {
                     // D3D12_RAYTRACING_SHADER_CONFIG:
@@ -63765,7 +63830,7 @@ impl PeHostRuntime {
     ///
     /// Returns `(Option<(bitmap_handle, compositing_mode, smoothing_mode, pen_width, color)>, _, _, _)`
     /// where the trailing three values are unused (kept for destructuring compatibility).
-#[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     fn resolve_gdiplus_draw_target(
         &mut self,
         graphics_handle: u64,
@@ -63786,55 +63851,60 @@ impl PeHostRuntime {
 
         // Resolve pen (if provided)
         if pen_handle != 0
-            && let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
-                let pw = pen.width.max(1.0);
-                let color = crate::gdiplus_render::pen_color(pen, 0.0, 0.0);
-                return (
-                    Some((target_bitmap, compositing_mode, smoothing_mode, pw, color)),
-                    0,
-                    0.0,
-                    0,
-                );
-            }
+            && let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle)
+        {
+            let pw = pen.width.max(1.0);
+            let color = crate::gdiplus_render::pen_color(pen, 0.0, 0.0);
+            return (
+                Some((target_bitmap, compositing_mode, smoothing_mode, pw, color)),
+                0,
+                0.0,
+                0,
+            );
+        }
 
         // Resolve brush (if provided)
         if let Some(bh) = brush_handle
-            && let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh) {
-                // For texture brushes, try to look up the bitmap pixels
-                let tex_data: Option<(&[u8], u32, u32, i32)> = match brush.as_ref() {
-                    GdiplusBrush::Texture(tb) => self
-                        .user32
-                        .gdiplus_state
-                        .get(tb.image_handle)
-                        .and_then(|obj| {
-                            if let GdiplusObject::Image(img) = obj {
-                                match img.as_ref() {
-                                    GdiplusImage::Bitmap(bmp) => Some((
-                                        bmp.pixels.as_slice(),
-                                        bmp.width,
-                                        bmp.height,
-                                        bmp.stride,
-                                    )),
-                                    _ => None,
+            && let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh)
+        {
+            // For texture brushes, try to look up the bitmap pixels
+            let tex_data: Option<(&[u8], u32, u32, i32)> = match brush.as_ref() {
+                GdiplusBrush::Texture(tb) => self
+                    .user32
+                    .gdiplus_state
+                    .get(tb.image_handle)
+                    .and_then(|obj| {
+                        if let GdiplusObject::Image(img) = obj {
+                            match img.as_ref() {
+                                GdiplusImage::Bitmap(bmp) => {
+                                    Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
                                 }
-                            } else {
-                                None
+                                _ => None,
                             }
-                        }),
-                    _ => None,
-                };
-                let color = crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0, tex_data);
-                return (
-                    Some((target_bitmap, compositing_mode, smoothing_mode, 1.0, color)),
-                    0,
-                    0.0,
-                    0,
-                );
-            }
+                        } else {
+                            None
+                        }
+                    }),
+                _ => None,
+            };
+            let color = crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0, tex_data);
+            return (
+                Some((target_bitmap, compositing_mode, smoothing_mode, 1.0, color)),
+                0,
+                0.0,
+                0,
+            );
+        }
 
         // Default: red pen width 1
         (
-            Some((target_bitmap, compositing_mode, smoothing_mode, 1.0, 0xFFFF0000)),
+            Some((
+                target_bitmap,
+                compositing_mode,
+                smoothing_mode,
+                1.0,
+                0xFFFF0000,
+            )),
             0,
             0.0,
             0,
@@ -64359,7 +64429,9 @@ impl HostThunk {
             }
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "PatBlt" => Self::PatBlt,
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "BitBlt" => Self::BitBlt,
-            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "StretchBlt" => Self::StretchBlt,
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "StretchBlt" => {
+                Self::StretchBlt
+            }
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "Rectangle" => {
                 Self::Rectangle
             }
@@ -65973,7 +66045,9 @@ impl HostThunk {
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "calloc" => Self::Calloc,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "free" => Self::Free,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "malloc" => Self::Malloc,
-            ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "realloc" => Self::Realloc,
+            ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "realloc" => {
+                Self::Realloc
+            }
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. })
                 if name == "__C_specific_handler" =>
             {
@@ -69851,8 +69925,7 @@ impl HostThunk {
             | Self::BCryptDecrypt
             | Self::ScriptShape => 40,
             Self::CreateWindowExW => 48,
-            Self::CreateFontW
-            | Self::GdipDrawImageRectRect => 56,
+            Self::CreateFontW | Self::GdipDrawImageRectRect => 56,
             _ => 0,
         }
     }
@@ -69959,9 +70032,11 @@ fn decode_current_instruction(
     // FIRST call to decode_block (1 call instead of 15).
     for len in (1..=readable.max(1)).rev() {
         if let Ok(decoded) = engine.decode_block(&bytes[..len], rip)
-            && decoded.len() == 1 && decoded[0].size == len {
-                return Ok(decoded.into_iter().next().expect("decoded instruction"));
-            }
+            && decoded.len() == 1
+            && decoded[0].size == len
+        {
+            return Ok(decoded.into_iter().next().expect("decoded instruction"));
+        }
     }
     let window = bytes[..readable]
         .iter()
@@ -70224,47 +70299,48 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
         }
     }
     if let Ok(bytes) = read_window(memory, rip, 16)
-        && bytes.starts_with(&[0xc5, 0xf5, 0x74, 0x01, 0xc5, 0xfd, 0xd7, 0xc0]) {
-            let caller = read_guest_u32(memory, state.get(Register::Rbp) + 4)
-                .ok()
-                .map(u64::from);
-            let arg0 = read_guest_u32(memory, state.get(Register::Rbp) + 8)
-                .ok()
-                .map(u64::from)
-                .unwrap_or(0);
-            let arg1 = read_guest_u32(memory, state.get(Register::Rbp) + 12)
-                .ok()
-                .map(u64::from)
-                .unwrap_or(0);
-            let mut mapped = Vec::new();
-            let mut first_unmapped = None;
-            if arg0 != 0 {
-                for offset in 0..64_u64 {
-                    match memory.read_u8(arg0 + offset) {
-                        Ok(byte) => mapped.push(byte),
-                        Err(_) => {
-                            first_unmapped = Some(arg0 + offset);
-                            break;
-                        }
+        && bytes.starts_with(&[0xc5, 0xf5, 0x74, 0x01, 0xc5, 0xfd, 0xd7, 0xc0])
+    {
+        let caller = read_guest_u32(memory, state.get(Register::Rbp) + 4)
+            .ok()
+            .map(u64::from);
+        let arg0 = read_guest_u32(memory, state.get(Register::Rbp) + 8)
+            .ok()
+            .map(u64::from)
+            .unwrap_or(0);
+        let arg1 = read_guest_u32(memory, state.get(Register::Rbp) + 12)
+            .ok()
+            .map(u64::from)
+            .unwrap_or(0);
+        let mut mapped = Vec::new();
+        let mut first_unmapped = None;
+        if arg0 != 0 {
+            for offset in 0..64_u64 {
+                match memory.read_u8(arg0 + offset) {
+                    Ok(byte) => mapped.push(byte),
+                    Err(_) => {
+                        first_unmapped = Some(arg0 + offset);
+                        break;
                     }
                 }
             }
-            let hex = mapped
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let ascii = mapped
-                .iter()
-                .map(|byte| {
-                    if byte.is_ascii_graphic() || *byte == b' ' {
-                        char::from(*byte)
-                    } else {
-                        '.'
-                    }
-                })
-                .collect::<String>();
-            wrapped = wrapped.with_hint(format!(
+        }
+        let hex = mapped
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ascii = mapped
+            .iter()
+            .map(|byte| {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '.'
+                }
+            })
+            .collect::<String>();
+        wrapped = wrapped.with_hint(format!(
                 "steam-avx-strscan caller={} arg0={arg0:#x} arg1={arg1:#x} mapped_len={} first_unmapped={} hex=[{hex}] ascii={ascii}",
                 caller
                     .map(|value| format!("{value:#x}"))
@@ -70274,7 +70350,7 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
                     .map(|value| format!("{value:#x}"))
                     .unwrap_or_else(|| "<none>".to_string()),
             ));
-        }
+    }
     if rip == 0x401390 {
         let state_table = read_guest_u32(memory, 0x42a250).ok().map(u64::from);
         let record_base = read_guest_u32(memory, 0x42a270).ok().map(u64::from);
@@ -70353,12 +70429,44 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
         ));
     }
     if let Some(fault_address) = guest_access_violation_address(&error)
-        && fault_address < 0x1000 {
-            let frame_probe = [
-                state.get(Register::Rbp) + 4,
-                state.get(Register::Rbp) + 8,
-                state.get(Register::Rbp) + 12,
-                state.get(Register::Rbp) + 16,
+        && fault_address < 0x1000
+    {
+        let frame_probe = [
+            state.get(Register::Rbp) + 4,
+            state.get(Register::Rbp) + 8,
+            state.get(Register::Rbp) + 12,
+            state.get(Register::Rbp) + 16,
+        ]
+        .into_iter()
+        .map(|address| {
+            let value = read_guest_u32(memory, address)
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            format!("{address:#x}={value:#x}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+        let parent_ebp = read_guest_u32(memory, state.get(Register::Rbp))
+            .ok()
+            .map(u64::from)
+            .unwrap_or(0);
+        let parent_arg1 = if parent_ebp != 0 {
+            read_guest_u32(memory, parent_ebp + 12).ok().map(u64::from)
+        } else {
+            None
+        };
+        let parent_arg2 = if parent_ebp != 0 {
+            read_guest_u32(memory, parent_ebp + 16).ok().map(u64::from)
+        } else {
+            None
+        };
+        let parent_frame_probe = if parent_ebp != 0 {
+            [
+                parent_ebp + 4,
+                parent_ebp + 8,
+                parent_ebp + 12,
+                parent_ebp + 16,
             ]
             .into_iter()
             .map(|address| {
@@ -70369,110 +70477,79 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
                 format!("{address:#x}={value:#x}")
             })
             .collect::<Vec<_>>()
-            .join(",");
-            let parent_ebp = read_guest_u32(memory, state.get(Register::Rbp))
-                .ok()
-                .map(u64::from)
-                .unwrap_or(0);
-            let parent_arg1 = if parent_ebp != 0 {
-                read_guest_u32(memory, parent_ebp + 12).ok().map(u64::from)
-            } else {
-                None
-            };
-            let parent_arg2 = if parent_ebp != 0 {
-                read_guest_u32(memory, parent_ebp + 16).ok().map(u64::from)
-            } else {
-                None
-            };
-            let parent_frame_probe = if parent_ebp != 0 {
-                [
-                    parent_ebp + 4,
-                    parent_ebp + 8,
-                    parent_ebp + 12,
-                    parent_ebp + 16,
-                ]
-                .into_iter()
-                .map(|address| {
-                    let value = read_guest_u32(memory, address)
-                        .ok()
-                        .map(u64::from)
-                        .unwrap_or(0);
-                    format!("{address:#x}={value:#x}")
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-            } else {
-                "<unavailable>".to_string()
-            };
-            let parent_arg1_probe = match (parent_arg1, parent_arg2) {
-                (Some(address), Some(length)) if address != 0 && length != 0 && length <= 64 => {
-                    match read_window(memory, address, length as usize) {
-                        Ok(bytes) => {
-                            let hex = bytes
-                                .iter()
-                                .map(|byte| format!("{byte:02x}"))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let ascii = bytes
-                                .iter()
-                                .map(|byte| {
-                                    if byte.is_ascii_graphic() || *byte == b' ' {
-                                        char::from(*byte)
-                                    } else {
-                                        '.'
-                                    }
-                                })
-                                .collect::<String>();
-                            let first_entry_probe = if bytes.len() >= 4 {
-                                let first_entry =
-                                    u64::from(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
-                                if first_entry != 0 {
-                                    match read_window(memory, first_entry, 64) {
-                                        Ok(pointed_bytes) => {
-                                            let end = pointed_bytes
-                                                .iter()
-                                                .position(|byte| *byte == 0)
-                                                .unwrap_or(pointed_bytes.len());
-                                            let pointed_ascii = pointed_bytes[..end]
-                                                .iter()
-                                                .map(|byte| {
-                                                    if byte.is_ascii_graphic() || *byte == b' ' {
-                                                        char::from(*byte)
-                                                    } else {
-                                                        '.'
-                                                    }
-                                                })
-                                                .collect::<String>();
-                                            format!(
-                                                " first_entry={first_entry:#x} first_ascii={pointed_ascii}"
-                                            )
-                                        }
-                                        Err(_) => {
-                                            format!(" first_entry={first_entry:#x} unreadable")
-                                        }
-                                    }
+            .join(",")
+        } else {
+            "<unavailable>".to_string()
+        };
+        let parent_arg1_probe = match (parent_arg1, parent_arg2) {
+            (Some(address), Some(length)) if address != 0 && length != 0 && length <= 64 => {
+                match read_window(memory, address, length as usize) {
+                    Ok(bytes) => {
+                        let hex = bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ascii = bytes
+                            .iter()
+                            .map(|byte| {
+                                if byte.is_ascii_graphic() || *byte == b' ' {
+                                    char::from(*byte)
                                 } else {
-                                    String::new()
+                                    '.'
+                                }
+                            })
+                            .collect::<String>();
+                        let first_entry_probe = if bytes.len() >= 4 {
+                            let first_entry =
+                                u64::from(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                            if first_entry != 0 {
+                                match read_window(memory, first_entry, 64) {
+                                    Ok(pointed_bytes) => {
+                                        let end = pointed_bytes
+                                            .iter()
+                                            .position(|byte| *byte == 0)
+                                            .unwrap_or(pointed_bytes.len());
+                                        let pointed_ascii = pointed_bytes[..end]
+                                            .iter()
+                                            .map(|byte| {
+                                                if byte.is_ascii_graphic() || *byte == b' ' {
+                                                    char::from(*byte)
+                                                } else {
+                                                    '.'
+                                                }
+                                            })
+                                            .collect::<String>();
+                                        format!(
+                                            " first_entry={first_entry:#x} first_ascii={pointed_ascii}"
+                                        )
+                                    }
+                                    Err(_) => {
+                                        format!(" first_entry={first_entry:#x} unreadable")
+                                    }
                                 }
                             } else {
                                 String::new()
-                            };
-                            format!(
-                                "addr={address:#x} len={length:#x} hex=[{hex}] ascii={ascii}{first_entry_probe}"
-                            )
-                        }
-                        Err(_) => format!("addr={address:#x} len={length:#x} unreadable"),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "addr={address:#x} len={length:#x} hex=[{hex}] ascii={ascii}{first_entry_probe}"
+                        )
                     }
+                    Err(_) => format!("addr={address:#x} len={length:#x} unreadable"),
                 }
-                _ => "<unavailable>".to_string(),
-            };
-            wrapped = wrapped.with_hint(format!(
+            }
+            _ => "<unavailable>".to_string(),
+        };
+        wrapped = wrapped.with_hint(format!(
                 "low-fault probe fault={fault_address:#x} rbx={:#x} frame=[{}] parent_ebp={parent_ebp:#x} parent_frame=[{}] parent_arg1={parent_arg1_probe}",
                 state.get(Register::Rbx),
                 frame_probe,
                 parent_frame_probe,
             ));
-        }
+    }
     for hint in error.reproduction_hints {
         wrapped = wrapped.with_hint(hint);
     }
@@ -71507,10 +71584,7 @@ struct CrtStatInfo {
 }
 
 /// Collect stat info for a resolved guest path (GE metadata + host size).
-fn crt_stat_info(
-    runtime: &mut PeHostRuntime,
-    path: &str,
-) -> AppResult<CrtStatInfo> {
+fn crt_stat_info(runtime: &mut PeHostRuntime, path: &str) -> AppResult<CrtStatInfo> {
     let metadata = runtime.win32.ge().get_file_metadata(path)?;
     let host_path = runtime.win32.guest_path_to_host_path(path)?;
     let host_metadata = std::fs::metadata(&host_path).map_err(|error| {
@@ -71550,11 +71624,12 @@ fn crt_ticks_to_unix(ticks: u64) -> i64 {
 /// `struct _stat64` (st_size/st_atime/st_mtime/st_ctime as i64 at 16/24/32/40 —
 /// 48 bytes) into guest memory.
 fn crt_write_stat(memory: &mut MemoryImage, stat_ptr: u64, info: &CrtStatInfo, wide64: bool) {
-    let mode = if info.is_directory {
-        S_IFDIR
-    } else {
-        S_IFREG
-    } | if info.read_only { S_IREAD } else { S_IREAD | S_IWRITE };
+    let mode = if info.is_directory { S_IFDIR } else { S_IFREG }
+        | if info.read_only {
+            S_IREAD
+        } else {
+            S_IREAD | S_IWRITE
+        };
     let mtime = crt_ticks_to_unix(info.last_write_time_ticks);
     let atime = crt_ticks_to_unix(info.last_access_time_ticks);
     let ctime = crt_ticks_to_unix(info.creation_time_ticks);
@@ -71625,9 +71700,7 @@ fn crt_split_path(path: &str) -> (String, String, String, String) {
         None => (String::new(), path),
     };
     // Locate the last separator after the drive.
-    let separator = rest
-        .rfind(['\\', '/'])
-        .map(|index| index + 1);
+    let separator = rest.rfind(['\\', '/']).map(|index| index + 1);
     let (dir, name_ext) = match separator {
         Some(index) => (rest[..index].to_string(), &rest[index..]),
         None => (String::new(), rest),
@@ -71691,7 +71764,10 @@ fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
     let mut base = base;
     let mut digits_start = index;
     if base == 0 {
-        if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+        if index + 1 < bytes.len()
+            && bytes[index] == b'0'
+            && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X')
+        {
             base = 16;
             index += 2;
             digits_start = index;
@@ -71700,7 +71776,11 @@ fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
         } else {
             base = 10;
         }
-    } else if base == 16 && index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+    } else if base == 16
+        && index + 1 < bytes.len()
+        && bytes[index] == b'0'
+        && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X')
+    {
         index += 2;
         digits_start = index;
     }
@@ -71727,7 +71807,15 @@ fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
         // No conversion: consumed == 0 so callers write *endptr = nptr.
         return (0, 0, false);
     }
-    (if negative { value.wrapping_neg() } else { value }, index, overflow)
+    (
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        },
+        index,
+        overflow,
+    )
 }
 
 /// _strtoi64 core: same parsing with 64-bit range clamping.
@@ -71745,7 +71833,10 @@ fn crt_parse_strtoll_full(bytes: &str, base: i32) -> (i64, usize, bool) {
     let mut base = base;
     let mut digits_start = index;
     if base == 0 {
-        if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+        if index + 1 < bytes.len()
+            && bytes[index] == b'0'
+            && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X')
+        {
             base = 16;
             index += 2;
             digits_start = index;
@@ -71754,7 +71845,11 @@ fn crt_parse_strtoll_full(bytes: &str, base: i32) -> (i64, usize, bool) {
         } else {
             base = 10;
         }
-    } else if base == 16 && index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X') {
+    } else if base == 16
+        && index + 1 < bytes.len()
+        && bytes[index] == b'0'
+        && (bytes[index + 1] == b'x' || bytes[index + 1] == b'X')
+    {
         index += 2;
         digits_start = index;
     }
@@ -71797,7 +71892,15 @@ fn crt_parse_strtoll_full(bytes: &str, base: i32) -> (i64, usize, bool) {
     if index == digits_start {
         return (0, 0, false);
     }
-    (if negative { value.wrapping_neg() } else { value }, index, overflow)
+    (
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        },
+        index,
+        overflow,
+    )
 }
 
 /// Simple strtol: parse with a fixed base, clamp at i32 range (strtol on
@@ -71828,7 +71931,11 @@ fn crt_parse_strtod(bytes: &str) -> f64 {
     let magnitude = lower.trim_start_matches(['+', '-']);
     let negative = bytes.starts_with('-');
     if magnitude.starts_with("inf") {
-        return if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     if magnitude.starts_with("nan") {
         return if negative { -f64::NAN } else { f64::NAN };
@@ -71864,7 +71971,9 @@ fn crt_parse_strtod(bytes: &str) -> f64 {
         // ('e' + optional sign + digits) is appended exactly once below.
         mantissa_end = index;
         let mut exp_index = index + 1;
-        if exp_index < bytes.len() && (bytes.as_bytes()[exp_index] == b'+' || bytes.as_bytes()[exp_index] == b'-') {
+        if exp_index < bytes.len()
+            && (bytes.as_bytes()[exp_index] == b'+' || bytes.as_bytes()[exp_index] == b'-')
+        {
             exp_index += 1;
         }
         if exp_index < bytes.len() && bytes.as_bytes()[exp_index].is_ascii_digit() {
@@ -71969,7 +72078,11 @@ fn crt_parse_hex_float(bytes: &str) -> Result<f64, ()> {
 
 fn crt_format_fixed(value: f64, precision: i32) -> Vec<u8> {
     if !value.is_finite() {
-        return if value.is_nan() { b"nan".to_vec() } else { b"inf".to_vec() };
+        return if value.is_nan() {
+            b"nan".to_vec()
+        } else {
+            b"inf".to_vec()
+        };
     }
     format!("{:.*}", precision.max(0) as usize, value).into_bytes()
 }
@@ -72030,7 +72143,8 @@ fn crt_format_general(value: f64, precision: i32, uppercase: bool, hash: bool) -
     if exponent < -4 || exponent >= precision as i32 {
         // %e with precision-1.  With the '#' flag trailing zeros in the
         // mantissa are retained; otherwise they are stripped.
-        let mut out = crt_format_exponential(value, (precision.saturating_sub(1)) as i32, uppercase);
+        let mut out =
+            crt_format_exponential(value, (precision.saturating_sub(1)) as i32, uppercase);
         if let Some(e_pos) = out.iter().position(|byte| *byte == b'e' || *byte == b'E') {
             let mut mantissa = out[..e_pos].to_vec();
             if !hash {
@@ -72119,11 +72233,7 @@ fn read_utf16_string(memory: &MemoryImage, address: u64) -> AppResult<String> {
 /// A NULL pointer yields an empty string, matching the existing
 /// `read_utf16_string` behavior. Strings written by the guest immediately
 /// before the call are visible directly (same address space, no cache).
-fn read_utf16z(
-    memory: &MemoryImage,
-    ptr: u64,
-    max_chars: usize,
-) -> AppResult<String> {
+fn read_utf16z(memory: &MemoryImage, ptr: u64, max_chars: usize) -> AppResult<String> {
     if ptr == 0 {
         return Ok(String::new());
     }
@@ -72135,9 +72245,7 @@ fn read_utf16z(
         if count > max_chars {
             return Err(AppError::new(
                 ReasonCode::RcGuestPointerOutOfRange,
-                format!(
-                    "UTF-16 string at {ptr:#x} exceeds the {max_chars}-unit limit"
-                ),
+                format!("UTF-16 string at {ptr:#x} exceeds the {max_chars}-unit limit"),
             ));
         }
         let low_address = cursor;
@@ -72325,7 +72433,8 @@ fn expand_generic_access(desired_access: u32) -> u32 {
 /// are only enforced per-operation via the granted mask.
 fn file_access_from_win32(desired_access: u32) -> crate::ge::FileAccess {
     let read_bits = GENERIC_READ | GENERIC_ALL | FILE_READ_DATA;
-    let write_bits = GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD;
+    let write_bits =
+        GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD;
     crate::ge::FileAccess {
         read: desired_access & read_bits != 0,
         write: desired_access & write_bits != 0,
@@ -73491,10 +73600,7 @@ mod tests {
     fn read_utf16z_unaligned_pointer() {
         let mut memory = MemoryImage::default();
         memory.map_bytes(0x10_001, &utf16_bytes("xyz"));
-        assert_eq!(
-            read_utf16z(&memory, 0x10_001, 1024).expect("read"),
-            "xyz"
-        );
+        assert_eq!(read_utf16z(&memory, 0x10_001, 1024).expect("read"), "xyz");
     }
 
     #[test]
@@ -73749,10 +73855,7 @@ mod tests {
     #[test]
     fn file_execute_does_not_imply_read() {
         let access = file_access_from_win32(FILE_EXECUTE);
-        assert!(
-            !access.read,
-            "FILE_EXECUTE must not imply read-data access"
-        );
+        assert!(!access.read, "FILE_EXECUTE must not imply read-data access");
         assert!(!access.write);
         assert!(!access.delete);
     }
@@ -73973,15 +74076,7 @@ mod tests {
             &mut runtime,
             &mut memory,
             create_file,
-            &[
-                path as u32,
-                GENERIC_WRITE,
-                0,
-                0,
-                CREATE_ALWAYS,
-                0,
-                0,
-            ],
+            &[path as u32, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0],
         );
         // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
         assert_eq!(h2, u32::MAX as u64);
@@ -74023,8 +74118,7 @@ mod tests {
             .read_bytes(read_buffer as u64, 17)
             .expect("read guest buffer");
         assert_eq!(
-            bytes,
-            b"important-content",
+            bytes, b"important-content",
             "CREATE_ALWAYS share conflict must not truncate the file"
         );
         dispatch_x86_thunk(&mut runtime, &mut memory, close, &[h3 as u32]);
@@ -74358,9 +74452,13 @@ mod tests {
     #[test]
     fn write_private_profile_string_w_missing_parent_fails_without_creating_directory() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "ini-missing-parent", GeArch::X86, "win11-23h2")
-                .expect("create ge");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "ini-missing-parent",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
         let mut memory = MemoryImage::default();
@@ -75073,13 +75171,9 @@ mod tests {
     #[test]
     fn tls_set_get_roundtrip_static_slot() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "tls-roundtrip",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "tls-roundtrip", GeArch::X86, "win11-23h2")
+                .expect("create ge");
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
         let mut memory = MemoryImage::default();
@@ -75215,7 +75309,10 @@ mod tests {
 
         let alloc_thunk = runtime.alloc_host_thunk(HostThunk::TlsAlloc);
         for expected in 0_u32..4096 {
-            assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]), u64::from(expected));
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]),
+                u64::from(expected)
+            );
             assert_eq!(runtime.last_error, 0);
         }
         // Exhausted: TlsAlloc returns TLS_OUT_OF_INDEXES (0xFFFFFFFF) with
@@ -75250,7 +75347,12 @@ mod tests {
 
         // (NULL, 0) required-size query: required size INCLUDING the NUL,
         // last_error stays 0.
-        let query = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[path_ptr as u32, 0, 0, 0]);
+        let query = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[path_ptr as u32, 0, 0, 0],
+        );
         assert_eq!(query, (path_length + 1) as u64);
         assert_eq!(runtime.last_error, 0);
 
@@ -75370,8 +75472,10 @@ mod tests {
             let stored = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
             assert_eq!(stored, *unit);
         }
-        let terminator =
-            u16::from_le_bytes([bytes[(trunc_size - 1) as usize * 2], bytes[(trunc_size - 1) as usize * 2 + 1]]);
+        let terminator = u16::from_le_bytes([
+            bytes[(trunc_size - 1) as usize * 2],
+            bytes[(trunc_size - 1) as usize * 2 + 1],
+        ]);
         assert_eq!(terminator, 0);
 
         // Exact fit: success returns the length excluding the NUL, last_error 0.
@@ -75419,15 +75523,7 @@ mod tests {
             &mut runtime,
             &mut memory,
             create_file,
-            &[
-                empty_path as u32,
-                GENERIC_READ,
-                0,
-                0,
-                OPEN_EXISTING,
-                0,
-                0,
-            ],
+            &[empty_path as u32, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0],
         );
         assert_eq!(handle, u32::MAX as u64);
         assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
@@ -75466,15 +75562,7 @@ mod tests {
             &mut runtime,
             &mut memory,
             create_file,
-            &[
-                empty_ansi as u32,
-                GENERIC_READ,
-                0,
-                0,
-                OPEN_EXISTING,
-                0,
-                0,
-            ],
+            &[empty_ansi as u32, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0],
         );
         assert_eq!(handle, u32::MAX as u64);
         assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
@@ -75608,14 +75696,24 @@ mod tests {
 
         let remove_dir_a = runtime.alloc_host_thunk(HostThunk::RemoveDirectoryA);
         assert_eq!(
-            dispatch_x86_thunk(&mut runtime, &mut memory, remove_dir_a, &[empty_ansi as u32]),
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                remove_dir_a,
+                &[empty_ansi as u32]
+            ),
             0
         );
         assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
 
         let attributes_a = runtime.alloc_host_thunk(HostThunk::GetFileAttributesA);
         assert_eq!(
-            dispatch_x86_thunk(&mut runtime, &mut memory, attributes_a, &[empty_ansi as u32]),
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                attributes_a,
+                &[empty_ansi as u32]
+            ),
             INVALID_FILE_ATTRIBUTES
         );
         assert_eq!(runtime.last_error, ERROR_PATH_NOT_FOUND);
@@ -75628,7 +75726,10 @@ mod tests {
         // cwd on D: → "C:" resolves to the C: drive root.
         assert_eq!(resolve_guest_path("D:\\somewhere", "C:"), "C:\\");
         // Drive-relative with a remainder still joins onto the per-drive base.
-        assert_eq!(resolve_guest_path("C:\\Users\\me", "C:sub"), "C:\\Users\\me\\sub");
+        assert_eq!(
+            resolve_guest_path("C:\\Users\\me", "C:sub"),
+            "C:\\Users\\me\\sub"
+        );
         assert_eq!(resolve_guest_path("D:\\x", "C:sub"), "C:\\sub");
         // Root-relative forms are unchanged.
         assert_eq!(resolve_guest_path("D:\\x", "C:\\"), "C:\\");
@@ -75723,7 +75824,9 @@ mod tests {
             .get_file_attributes_w(r"C:\package\existing.tmp")
             .expect("target attributes");
         assert!(
-            !target_attributes.iter().any(|attribute| attribute == "hidden"),
+            !target_attributes
+                .iter()
+                .any(|attribute| attribute == "hidden"),
             "CREATE_ALWAYS on an existing file must not copy template attributes"
         );
 
@@ -76459,7 +76562,8 @@ mod tests {
         let first_entry =
             read_utf16_string(&memory, environment_ptr).expect("hidden cwd environment entry");
         assert_eq!(first_entry, format!("=C:={}", runtime.current_directory));
-        let second_entry_ptr = environment_ptr + (first_entry.encode_utf16().count() as u64 + 1) * 2;
+        let second_entry_ptr =
+            environment_ptr + (first_entry.encode_utf16().count() as u64 + 1) * 2;
         assert_eq!(
             read_utf16_string(&memory, second_entry_ptr).expect("environment entry"),
             "FOO=BAR"
@@ -76818,63 +76922,64 @@ mod tests {
         // libtest's default 2 MiB thread stack; run on an 8 MiB stack so the
         // test is not dependent on compiler codegen details.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "wait-pumps-thread",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wait-pumps-thread",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_200_u64;
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-
-        memory.map_bytes(thread_id_ptr, &[0; 4]);
-        entrypoint_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-
-        assert_ne!(thread_handle, 0);
-        assert_eq!(
             runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("thread exit code before wait"),
-            None
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_single_object,
-            &[thread_handle as u32, u32::MAX],
-        );
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_200_u64;
+            let mut entrypoint_bytes = vec![0x90; 0x20];
 
-        assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64);
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("thread exit code after wait"),
-            Some(7)
-        );
+            memory.map_bytes(thread_id_ptr, &[0; 4]);
+            entrypoint_bytes[..8]
+                .copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+
+            assert_ne!(thread_handle, 0);
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("thread exit code before wait"),
+                None
+            );
+
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object,
+                &[thread_handle as u32, u32::MAX],
+            );
+
+            assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64);
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("thread exit code after wait"),
+                Some(7)
+            );
         })
     }
 
@@ -77043,7 +77148,8 @@ mod tests {
         let bytes = fs::read(&steam_path).expect("read real steam exe");
         let image = crate::pe::parse_from_file(&steam_path).expect("parse steam exe");
         let image_hash = util::sha256_bytes(&bytes);
-        let mapped = crate::pe::map_image(&bytes, &image, &image_hash, true).expect("map steam exe");
+        let mapped =
+            crate::pe::map_image(&bytes, &image, &image_hash, true).expect("map steam exe");
         memory.map_bytes(mapped.selected_base, &mapped.memory);
         let thread_start = mapped.selected_base + 0xdcee0;
 
@@ -77100,86 +77206,90 @@ mod tests {
         // A pumped thread that calls ExitThread(9) must end immediately with
         // exit code 9, fire DLL_THREAD_DETACH, and never be re-queued.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "exit-thread", GeArch::X86, "win11-23h2")
-                .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "exit-thread",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        // TLS callback that records the reason code at a guest address so the
-        // test can observe DLL_THREAD_ATTACH (2) / DLL_THREAD_DETACH (3).
-        let callback_address = 0x1001_0000_u64;
-        let detach_flag = 0x41_300_u32;
-        let mut callback_bytes = Vec::new();
-        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]  (reason)
-        callback_bytes.extend(&[0xA3]); // mov [flag], eax
-        callback_bytes.extend(&detach_flag.to_le_bytes());
-        callback_bytes.push(0xC3); // ret
-        memory.map_bytes(callback_address, &callback_bytes);
-        runtime.dll_info_table.insert(
-            0x1000_0000,
-            DllInfo {
-                handle: 0x1000_0000,
-                image_size: 0x10000,
-                entry_point_rva: 0,
-                load_count: 1,
-                module_name: "test.dll".to_string(),
-                host_path: String::new(),
-                tls_callbacks: vec![callback_address - 0x1000_0000],
-            },
-        );
-        memory.map_bytes(detach_flag as u64, &[0; 4]);
-
-        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let import_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        // push 9; call [ExitThread]; mov eax,0; ret 4 — the mov/ret must
-        // never execute.
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..17].copy_from_slice(&[
-            0x6A, 0x09, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC2,
-            0x04, 0x00, 0x90,
-        ]);
-        write_u32(&mut memory, import_slot, exit_thread as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
-
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump exit-thread")
-                .did_work
-        );
-        // The thread ended: not re-queued, exit code 9, DLL_THREAD_DETACH fired.
-        assert!(runtime.pending_guest_threads.is_empty());
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after pump"),
-            Some(9)
-        );
-        assert_eq!(
-            read_u32(&memory, detach_flag as u64).expect("tls detach flag"),
-            DLL_THREAD_DETACH
-        );
-        assert_eq!(runtime.win32.current_thread_id(), 1);
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            // TLS callback that records the reason code at a guest address so the
+            // test can observe DLL_THREAD_ATTACH (2) / DLL_THREAD_DETACH (3).
+            let callback_address = 0x1001_0000_u64;
+            let detach_flag = 0x41_300_u32;
+            let mut callback_bytes = Vec::new();
+            callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]  (reason)
+            callback_bytes.extend(&[0xA3]); // mov [flag], eax
+            callback_bytes.extend(&detach_flag.to_le_bytes());
+            callback_bytes.push(0xC3); // ret
+            memory.map_bytes(callback_address, &callback_bytes);
+            runtime.dll_info_table.insert(
+                0x1000_0000,
+                DllInfo {
+                    handle: 0x1000_0000,
+                    image_size: 0x10000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "test.dll".to_string(),
+                    host_path: String::new(),
+                    tls_callbacks: vec![callback_address - 0x1000_0000],
+                },
+            );
+            memory.map_bytes(detach_flag as u64, &[0; 4]);
+
+            let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let import_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            // push 9; call [ExitThread]; mov eax,0; ret 4 — the mov/ret must
+            // never execute.
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..17].copy_from_slice(&[
+                0x6A, 0x09, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC2,
+                0x04, 0x00, 0x90,
+            ]);
+            write_u32(&mut memory, import_slot, exit_thread as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump exit-thread")
+                    .did_work
+            );
+            // The thread ended: not re-queued, exit code 9, DLL_THREAD_DETACH fired.
+            assert!(runtime.pending_guest_threads.is_empty());
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after pump"),
+                Some(9)
+            );
+            assert_eq!(
+                read_u32(&memory, detach_flag as u64).expect("tls detach flag"),
+                DLL_THREAD_DETACH
+            );
+            assert_eq!(runtime.win32.current_thread_id(), 1);
         })
     }
 
@@ -77188,192 +77298,195 @@ mod tests {
         // `_endthreadex(5)` followed by a return with RAX=7: the explicit
         // exit-code override (5) must win.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "endthreadex-override",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "endthreadex-override",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let endthreadex = runtime.alloc_host_thunk(HostThunk::Endthreadex);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let import_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        // push 5; call [_endthreadex]; mov eax,7; ret 4 — the mov/ret must
-        // never execute.
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..17].copy_from_slice(&[
-            0x68, 0x05, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00,
-            0x00, 0x00, 0xC2,
-        ]);
-        entrypoint_bytes[17..20].copy_from_slice(&[0x04, 0x00, 0x90]);
-        write_u32(&mut memory, import_slot, endthreadex as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump endthreadex thread")
-                .did_work
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after pump"),
-            Some(5)
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let endthreadex = runtime.alloc_host_thunk(HostThunk::Endthreadex);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let import_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            // push 5; call [_endthreadex]; mov eax,7; ret 4 — the mov/ret must
+            // never execute.
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..17].copy_from_slice(&[
+                0x68, 0x05, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00,
+                0x00, 0x00, 0xC2,
+            ]);
+            entrypoint_bytes[17..20].copy_from_slice(&[0x04, 0x00, 0x90]);
+            write_u32(&mut memory, import_slot, endthreadex as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump endthreadex thread")
+                    .did_work
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after pump"),
+                Some(5)
+            );
         })
     }
 
     #[test]
     fn terminate_thread_forces_exit_with_code() {
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "terminate-thread",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "terminate-thread",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        // TLS callback recording the reason code, to verify TerminateThread
-        // does NOT fire DLL_THREAD_DETACH.
-        let callback_address = 0x1001_0000_u64;
-        let detach_flag = 0x41_300_u32;
-        let mut callback_bytes = Vec::new();
-        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
-        callback_bytes.extend(&[0xA3]); // mov [flag], eax
-        callback_bytes.extend(&detach_flag.to_le_bytes());
-        callback_bytes.push(0xC3); // ret
-        memory.map_bytes(callback_address, &callback_bytes);
-        runtime.dll_info_table.insert(
-            0x1000_0000,
-            DllInfo {
-                handle: 0x1000_0000,
-                image_size: 0x10000,
-                entry_point_rva: 0,
-                load_count: 1,
-                module_name: "test.dll".to_string(),
-                host_path: String::new(),
-                tls_callbacks: vec![callback_address - 0x1000_0000],
-            },
-        );
-        memory.map_bytes(detach_flag as u64, &[0; 4]);
-
-        let get_current_thread = runtime.alloc_host_thunk(HostThunk::GetCurrentThread);
-        let terminate_thread = runtime.alloc_host_thunk(HostThunk::TerminateThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let get_ct_slot = 0x41_000_u64;
-        let terminate_slot = 0x41_010_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        // call [GetCurrentThread]; push eax; push 4; call [TerminateThread];
-        // mov eax,9; ret 4 — the mov/ret must never execute.
-        let mut entrypoint_bytes = vec![0x90; 0x30];
-        entrypoint_bytes[..25].copy_from_slice(&[
-            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0x50, 0x6A, 0x04, 0xFF, 0x15, 0x10, 0x10, 0x04,
-            0x00, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00, 0x90, 0x90,
-        ]);
-        write_u32(&mut memory, get_ct_slot, get_current_thread as u32);
-        write_u32(&mut memory, terminate_slot, terminate_thread as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-
-        // Terminate the CURRENT pumped thread: it must end with the code,
-        // without DLL_THREAD_DETACH.
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump terminate-self thread")
-                .did_work
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after terminate-self"),
-            Some(4)
-        );
-        assert_eq!(
-            read_u32(&memory, detach_flag as u64).expect("tls flag after terminate-self"),
-            DLL_THREAD_ATTACH
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        // Terminate a queued (never-run) thread: it must never run, and the
-        // exit code is recorded.
-        let terminate_target = 0x41_200_u64;
-        let target_id_ptr = 0x41_214_u64;
-        let mut target_bytes = vec![0x90; 0x10];
-        target_bytes[..8].copy_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(terminate_target, &target_bytes);
-        let target_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, terminate_target as u32, 0, 0, target_id_ptr as u32],
-        );
-        assert_ne!(target_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
+            // TLS callback recording the reason code, to verify TerminateThread
+            // does NOT fire DLL_THREAD_DETACH.
+            let callback_address = 0x1001_0000_u64;
+            let detach_flag = 0x41_300_u32;
+            let mut callback_bytes = Vec::new();
+            callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+            callback_bytes.extend(&[0xA3]); // mov [flag], eax
+            callback_bytes.extend(&detach_flag.to_le_bytes());
+            callback_bytes.push(0xC3); // ret
+            memory.map_bytes(callback_address, &callback_bytes);
+            runtime.dll_info_table.insert(
+                0x1000_0000,
+                DllInfo {
+                    handle: 0x1000_0000,
+                    image_size: 0x10000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "test.dll".to_string(),
+                    host_path: String::new(),
+                    tls_callbacks: vec![callback_address - 0x1000_0000],
+                },
+            );
+            memory.map_bytes(detach_flag as u64, &[0; 4]);
 
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            terminate_thread,
-            &[target_handle as u32, 3],
-        );
-        assert_eq!(result, 1); // TRUE
-        assert_eq!(runtime.last_error, 0);
-        assert!(runtime.pending_guest_threads.is_empty(), "terminated thread removed");
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(target_handle as u32)
-                .expect("exit code after terminate"),
-            Some(3)
-        );
-        // Nothing left to pump.
-        assert!(
-            !runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump after terminate")
-                .did_work
-        );
+            let get_current_thread = runtime.alloc_host_thunk(HostThunk::GetCurrentThread);
+            let terminate_thread = runtime.alloc_host_thunk(HostThunk::TerminateThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let get_ct_slot = 0x41_000_u64;
+            let terminate_slot = 0x41_010_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            // call [GetCurrentThread]; push eax; push 4; call [TerminateThread];
+            // mov eax,9; ret 4 — the mov/ret must never execute.
+            let mut entrypoint_bytes = vec![0x90; 0x30];
+            entrypoint_bytes[..25].copy_from_slice(&[
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0x50, 0x6A, 0x04, 0xFF, 0x15, 0x10, 0x10, 0x04,
+                0x00, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00, 0x90, 0x90,
+            ]);
+            write_u32(&mut memory, get_ct_slot, get_current_thread as u32);
+            write_u32(&mut memory, terminate_slot, terminate_thread as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+
+            // Terminate the CURRENT pumped thread: it must end with the code,
+            // without DLL_THREAD_DETACH.
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump terminate-self thread")
+                    .did_work
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after terminate-self"),
+                Some(4)
+            );
+            assert_eq!(
+                read_u32(&memory, detach_flag as u64).expect("tls flag after terminate-self"),
+                DLL_THREAD_ATTACH
+            );
+
+            // Terminate a queued (never-run) thread: it must never run, and the
+            // exit code is recorded.
+            let terminate_target = 0x41_200_u64;
+            let target_id_ptr = 0x41_214_u64;
+            let mut target_bytes = vec![0x90; 0x10];
+            target_bytes[..8].copy_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(terminate_target, &target_bytes);
+            let target_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, terminate_target as u32, 0, 0, target_id_ptr as u32],
+            );
+            assert_ne!(target_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                terminate_thread,
+                &[target_handle as u32, 3],
+            );
+            assert_eq!(result, 1); // TRUE
+            assert_eq!(runtime.last_error, 0);
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "terminated thread removed"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(target_handle as u32)
+                    .expect("exit code after terminate"),
+                Some(3)
+            );
+            // Nothing left to pump.
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump after terminate")
+                    .did_work
+            );
         })
     }
 
@@ -77383,71 +77496,71 @@ mod tests {
         // exits with 7 must be joinable with WaitForSingleObject(INFINITE) —
         // no spurious WAIT_TIMEOUT.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "infinite-join-sleeping",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "infinite-join-sleeping",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-        let import_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        // push 50; call [Sleep]; mov eax,7; ret 4
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..16].copy_from_slice(&[
-            0x6A, 0x32, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2,
-            0x04, 0x00,
-        ]);
-        write_u32(&mut memory, import_slot, sleep as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-        assert_eq!(
             runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code before wait"),
-            None
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_single_object,
-            &[thread_handle as u32, u32::MAX],
-        );
-        assert_eq!(
-            result,
-            crate::win32::WAIT_OBJECT_0 as u64,
-            "INFINITE join of a sleeping worker must succeed, not return WAIT_TIMEOUT"
-        );
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after wait"),
-            Some(7)
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
+            let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let import_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            // push 50; call [Sleep]; mov eax,7; ret 4
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..16].copy_from_slice(&[
+                0x6A, 0x32, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2,
+                0x04, 0x00,
+            ]);
+            write_u32(&mut memory, import_slot, sleep as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code before wait"),
+                None
+            );
+
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object,
+                &[thread_handle as u32, u32::MAX],
+            );
+            assert_eq!(
+                result,
+                crate::win32::WAIT_OBJECT_0 as u64,
+                "INFINITE join of a sleeping worker must succeed, not return WAIT_TIMEOUT"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after wait"),
+                Some(7)
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 
@@ -77458,80 +77571,85 @@ mod tests {
         // With a worker still pending, the run must keep pumping it to
         // completion, then end with the main thread's exit code.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "main-exit-drain",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "main-exit-drain",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        // dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the guest
-        // mappings must live above that range.
-        let worker_entry = 0x61_000_u64;
-        let thread_id_ptr = 0x61_100_u64;
-        let mut worker_bytes = vec![0x90; 0x10];
-        worker_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(worker_entry, &worker_bytes);
-
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
-
-        // The MAIN thread calls ExitThread(5) while the worker is pending:
-        // only the main thread ends; this must NOT become a process-exit
-        // request (the worker would be abandoned).
-        let exit_result = dispatch_x86_thunk_result(&mut runtime, &mut memory, exit_thread, &[5]);
-        assert_eq!(exit_result, Some(5));
-        assert_eq!(runtime.main_thread_exit_code, Some(5));
-        assert!(
-            runtime.process_exit_requested.is_none(),
-            "main-thread ExitThread must not set process_exit_requested"
-        );
-        assert_eq!(runtime.pending_guest_threads.len(), 1, "worker still pending");
-        // The main thread's exit code is observable via its handle
-        // (OpenThread on tid 1), so waits on the main thread complete.
-        let main_handle = runtime
-            .win32
-            .open_thread(1, 0x1F03FF, false)
-            .expect("open main thread");
-        assert_eq!(
             runtime
-                .win32
-                .get_exit_code_thread(main_handle)
-                .expect("main thread exit code"),
-            Some(5)
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        // Drain phase: the worker runs to completion; the run ends with the
-        // main thread's code (5), not the worker's return value (7).
-        let final_code = runtime
-            .drain_pending_guest_threads_after_main_exit(&mut memory)
-            .expect("drain pending workers");
-        assert_eq!(final_code, 5);
-        assert!(runtime.pending_guest_threads.is_empty());
-        assert_eq!(
-            runtime
+            let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            // dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the guest
+            // mappings must live above that range.
+            let worker_entry = 0x61_000_u64;
+            let thread_id_ptr = 0x61_100_u64;
+            let mut worker_bytes = vec![0x90; 0x10];
+            worker_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(worker_entry, &worker_bytes);
+
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+            // The MAIN thread calls ExitThread(5) while the worker is pending:
+            // only the main thread ends; this must NOT become a process-exit
+            // request (the worker would be abandoned).
+            let exit_result =
+                dispatch_x86_thunk_result(&mut runtime, &mut memory, exit_thread, &[5]);
+            assert_eq!(exit_result, Some(5));
+            assert_eq!(runtime.main_thread_exit_code, Some(5));
+            assert!(
+                runtime.process_exit_requested.is_none(),
+                "main-thread ExitThread must not set process_exit_requested"
+            );
+            assert_eq!(
+                runtime.pending_guest_threads.len(),
+                1,
+                "worker still pending"
+            );
+            // The main thread's exit code is observable via its handle
+            // (OpenThread on tid 1), so waits on the main thread complete.
+            let main_handle = runtime
                 .win32
-                .get_exit_code_thread(worker_handle as u32)
-                .expect("worker exit code"),
-            Some(7)
-        );
+                .open_thread(1, 0x1F03FF, false)
+                .expect("open main thread");
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(main_handle)
+                    .expect("main thread exit code"),
+                Some(5)
+            );
+
+            // Drain phase: the worker runs to completion; the run ends with the
+            // main thread's code (5), not the worker's return value (7).
+            let final_code = runtime
+                .drain_pending_guest_threads_after_main_exit(&mut memory)
+                .expect("drain pending workers");
+            assert_eq!(final_code, 5);
+            assert!(runtime.pending_guest_threads.is_empty());
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(worker_handle as u32)
+                    .expect("worker exit code"),
+                Some(7)
+            );
         })
     }
 
@@ -77541,62 +77659,58 @@ mod tests {
         // immediately and pending threads are abandoned — there is no drain
         // phase (Windows: process exit kills every thread).
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "main-exit-process",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "main-exit-process",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let worker_entry = 0x61_000_u64;
-        let flag_ptr = 0x61_100_u64;
-        let thread_id_ptr = 0x61_200_u64;
-        let mut worker_bytes = vec![0x90; 0x10];
-        worker_bytes[..12].copy_from_slice(&[
-            0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x11, 0x06, 0x00, 0xC3, 0x90,
-        ]);
-        memory.map_bytes(worker_entry, &worker_bytes);
-        memory.map_bytes(flag_ptr, &[0_u8; 4]);
+            let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let worker_entry = 0x61_000_u64;
+            let flag_ptr = 0x61_100_u64;
+            let thread_id_ptr = 0x61_200_u64;
+            let mut worker_bytes = vec![0x90; 0x10];
+            worker_bytes[..12].copy_from_slice(&[
+                0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x11, 0x06, 0x00, 0xC3, 0x90,
+            ]);
+            memory.map_bytes(worker_entry, &worker_bytes);
+            memory.map_bytes(flag_ptr, &[0_u8; 4]);
 
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
 
-        let exit_result = dispatch_x86_thunk_result(
-            &mut runtime,
-            &mut memory,
-            exit_process,
-            &[0xFFFF_FFFE],
-        );
-        assert_eq!(exit_result, Some(-2));
-        assert!(runtime.main_thread_exit_code.is_none());
-        assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
-        assert_eq!(
-            runtime.pending_guest_threads.len(),
-            1,
-            "process exit abandons pending threads"
-        );
-        assert_eq!(
-            read_u32(&memory, flag_ptr).expect("worker flag"),
-            0,
-            "abandoned worker must never run"
-        );
+            let exit_result =
+                dispatch_x86_thunk_result(&mut runtime, &mut memory, exit_process, &[0xFFFF_FFFE]);
+            assert_eq!(exit_result, Some(-2));
+            assert!(runtime.main_thread_exit_code.is_none());
+            assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
+            assert_eq!(
+                runtime.pending_guest_threads.len(),
+                1,
+                "process exit abandons pending threads"
+            );
+            assert_eq!(
+                read_u32(&memory, flag_ptr).expect("worker flag"),
+                0,
+                "abandoned worker must never run"
+            );
         })
     }
 
@@ -77607,86 +77721,87 @@ mod tests {
         // wait.  The wait must deliver it and return WAIT_IO_COMPLETION
         // (0xC0), not WAIT_TIMEOUT/WAIT_OBJECT_0.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "alertable-wait-apc",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "alertable-wait-apc",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
-        let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
-        let wait_for_single_object_ex = runtime.alloc_host_thunk(HostThunk::WaitForSingleObjectEx);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let open_thread_slot = 0x41_000_u64;
-        let queue_slot = 0x41_010_u64;
-        let worker_entry = 0x42_000_u64;
-        let apc_callback = 0x42_100_u64;
-        let apc_flag = 0x42_200_u64;
-        let thread_id_ptr = 0x42_204_u64;
+            let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
+            let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+            let wait_for_single_object_ex =
+                runtime.alloc_host_thunk(HostThunk::WaitForSingleObjectEx);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let open_thread_slot = 0x41_000_u64;
+            let queue_slot = 0x41_010_u64;
+            let worker_entry = 0x42_000_u64;
+            let apc_callback = 0x42_100_u64;
+            let apc_flag = 0x42_200_u64;
+            let thread_id_ptr = 0x42_204_u64;
 
-        // APC callback: mov eax, 0xABCD; mov [apc_flag], eax; ret
-        let mut apc_bytes = vec![0x90; 0x10];
-        apc_bytes[..11].copy_from_slice(&[
-            0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
-        ]);
-        // Worker: OpenThread(0x1F03FF, 0, 1); QueueUserAPC(apc_callback,
-        // hThread, 0); ret — the APC targets the main thread (tid 1).
-        let mut worker_bytes = vec![0x90; 0x40];
-        worker_bytes[..36].copy_from_slice(&[
-            0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
-            0x6A, 0x00, // push 0 (inherit)
-            0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
-            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
-            0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
-            0x50, // push eax (hThread — arg2)
-            0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
-            0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
-            0xC3, // ret
-        ]);
-        write_u32(&mut memory, open_thread_slot, open_thread as u32);
-        write_u32(&mut memory, queue_slot, queue_user_apc as u32);
-        memory.map_bytes(worker_entry, &worker_bytes);
-        memory.map_bytes(apc_callback, &apc_bytes);
-        memory.map_bytes(apc_flag, &[0_u8; 4]);
+            // APC callback: mov eax, 0xABCD; mov [apc_flag], eax; ret
+            let mut apc_bytes = vec![0x90; 0x10];
+            apc_bytes[..11].copy_from_slice(&[
+                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+            ]);
+            // Worker: OpenThread(0x1F03FF, 0, 1); QueueUserAPC(apc_callback,
+            // hThread, 0); ret — the APC targets the main thread (tid 1).
+            let mut worker_bytes = vec![0x90; 0x40];
+            worker_bytes[..36].copy_from_slice(&[
+                0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+                0x6A, 0x00, // push 0 (inherit)
+                0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
+                0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
+                0x50, // push eax (hThread — arg2)
+                0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
+                0xC3, // ret
+            ]);
+            write_u32(&mut memory, open_thread_slot, open_thread as u32);
+            write_u32(&mut memory, queue_slot, queue_user_apc as u32);
+            memory.map_bytes(worker_entry, &worker_bytes);
+            memory.map_bytes(apc_callback, &apc_bytes);
+            memory.map_bytes(apc_flag, &[0_u8; 4]);
 
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
 
-        let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
+            let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
 
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_single_object_ex,
-            &[event_handle, u32::MAX, 1],
-        );
-        assert_eq!(
-            result,
-            crate::win32::WAIT_IO_COMPLETION as u64,
-            "alertable wait must return WAIT_IO_COMPLETION when an APC is queued during the wait"
-        );
-        assert_eq!(runtime.last_error, 0);
-        assert_eq!(
-            read_u32(&memory, apc_flag).expect("apc flag"),
-            0xABCD,
-            "the APC callback must have run"
-        );
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object_ex,
+                &[event_handle, u32::MAX, 1],
+            );
+            assert_eq!(
+                result,
+                crate::win32::WAIT_IO_COMPLETION as u64,
+                "alertable wait must return WAIT_IO_COMPLETION when an APC is queued during the wait"
+            );
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(
+                read_u32(&memory, apc_flag).expect("apc flag"),
+                0xABCD,
+                "the APC callback must have run"
+            );
         })
     }
 
@@ -77696,61 +77811,61 @@ mod tests {
         // pumping, so a sibling sleeping 10 ms actually wakes — otherwise
         // its wake_tick never expires (starvation).
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "sleep-ex-clock",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "sleep-ex-clock",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
-        let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let sleep_slot = 0x41_000_u64;
-        let worker_entry = 0x42_000_u64;
-        let flag_ptr = 0x42_200_u64;
-        let thread_id_ptr = 0x42_204_u64;
-        // push 10; call [Sleep]; mov eax,1; mov [flag],eax; ret
-        let mut worker_bytes = vec![0x90; 0x20];
-        worker_bytes[..21].copy_from_slice(&[
-            0x6A, 0x0A, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3,
-            0x00, 0x22, 0x04, 0x00, 0xC3, 0x90, 0x90,
-        ]);
-        write_u32(&mut memory, sleep_slot, sleep as u32);
-        memory.map_bytes(worker_entry, &worker_bytes);
-        memory.map_bytes(flag_ptr, &[0_u8; 4]);
+            let sleep = runtime.alloc_host_thunk(HostThunk::Sleep);
+            let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let sleep_slot = 0x41_000_u64;
+            let worker_entry = 0x42_000_u64;
+            let flag_ptr = 0x42_200_u64;
+            let thread_id_ptr = 0x42_204_u64;
+            // push 10; call [Sleep]; mov eax,1; mov [flag],eax; ret
+            let mut worker_bytes = vec![0x90; 0x20];
+            worker_bytes[..21].copy_from_slice(&[
+                0x6A, 0x0A, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3,
+                0x00, 0x22, 0x04, 0x00, 0xC3, 0x90, 0x90,
+            ]);
+            write_u32(&mut memory, sleep_slot, sleep as u32);
+            memory.map_bytes(worker_entry, &worker_bytes);
+            memory.map_bytes(flag_ptr, &[0_u8; 4]);
 
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
 
-        let tick_before = runtime.win32.get_tick_count64();
-        let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[50, 0]);
-        assert_eq!(result, 0, "SleepEx(50, FALSE) returns WAIT_OBJECT_0");
-        assert_eq!(
-            read_u32(&memory, flag_ptr).expect("sibling flag"),
-            1,
-            "the sleeping sibling must wake during another thread's SleepEx"
-        );
-        let tick_after = runtime.win32.get_tick_count64();
-        assert!(
-            tick_after >= tick_before + 10,
-            "guest clock must advance during SleepEx: {tick_before} -> {tick_after}"
-        );
+            let tick_before = runtime.win32.get_tick_count64();
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[50, 0]);
+            assert_eq!(result, 0, "SleepEx(50, FALSE) returns WAIT_OBJECT_0");
+            assert_eq!(
+                read_u32(&memory, flag_ptr).expect("sibling flag"),
+                1,
+                "the sleeping sibling must wake during another thread's SleepEx"
+            );
+            let tick_after = runtime.win32.get_tick_count64();
+            assert!(
+                tick_after >= tick_before + 10,
+                "guest clock must advance during SleepEx: {tick_before} -> {tick_after}"
+            );
         })
     }
 
@@ -77760,74 +77875,74 @@ mod tests {
         // wait: pump pending threads, deliver APCs queued during the sleep,
         // and return WAIT_IO_COMPLETION — never return early.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "sleep-ex-infinite",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "sleep-ex-infinite",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
-        let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
-        let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let open_thread_slot = 0x41_000_u64;
-        let queue_slot = 0x41_010_u64;
-        let worker_entry = 0x42_000_u64;
-        let apc_callback = 0x42_100_u64;
-        let apc_flag = 0x42_200_u64;
-        let thread_id_ptr = 0x42_204_u64;
+            let open_thread = runtime.alloc_host_thunk(HostThunk::OpenThread);
+            let queue_user_apc = runtime.alloc_host_thunk(HostThunk::QueueUserAPC);
+            let sleep_ex = runtime.alloc_host_thunk(HostThunk::SleepEx);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let open_thread_slot = 0x41_000_u64;
+            let queue_slot = 0x41_010_u64;
+            let worker_entry = 0x42_000_u64;
+            let apc_callback = 0x42_100_u64;
+            let apc_flag = 0x42_200_u64;
+            let thread_id_ptr = 0x42_204_u64;
 
-        let mut apc_bytes = vec![0x90; 0x10];
-        apc_bytes[..11].copy_from_slice(&[
-            0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
-        ]);
-        let mut worker_bytes = vec![0x90; 0x40];
-        worker_bytes[..36].copy_from_slice(&[
-            0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
-            0x6A, 0x00, // push 0 (inherit)
-            0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
-            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
-            0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
-            0x50, // push eax (hThread — arg2)
-            0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
-            0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
-            0xC3, // ret
-        ]);
-        write_u32(&mut memory, open_thread_slot, open_thread as u32);
-        write_u32(&mut memory, queue_slot, queue_user_apc as u32);
-        memory.map_bytes(worker_entry, &worker_bytes);
-        memory.map_bytes(apc_callback, &apc_bytes);
-        memory.map_bytes(apc_flag, &[0_u8; 4]);
+            let mut apc_bytes = vec![0x90; 0x10];
+            apc_bytes[..11].copy_from_slice(&[
+                0xB8, 0xCD, 0xAB, 0x00, 0x00, 0xA3, 0x00, 0x22, 0x04, 0x00, 0xC3,
+            ]);
+            let mut worker_bytes = vec![0x90; 0x40];
+            worker_bytes[..36].copy_from_slice(&[
+                0x68, 0x01, 0x00, 0x00, 0x00, // push 1 (thread_id)
+                0x6A, 0x00, // push 0 (inherit)
+                0x68, 0xFF, 0x03, 0x1F, 0x00, // push 0x1F03FF (desired_access)
+                0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, // call [OpenThread]
+                0x68, 0x00, 0x00, 0x00, 0x00, // push 0 (dwData — arg3)
+                0x50, // push eax (hThread — arg2)
+                0x68, 0x00, 0x21, 0x04, 0x00, // push apc_callback (pfnApc — arg1)
+                0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, // call [QueueUserAPC]
+                0xC3, // ret
+            ]);
+            write_u32(&mut memory, open_thread_slot, open_thread as u32);
+            write_u32(&mut memory, queue_slot, queue_user_apc as u32);
+            memory.map_bytes(worker_entry, &worker_bytes);
+            memory.map_bytes(apc_callback, &apc_bytes);
+            memory.map_bytes(apc_flag, &[0_u8; 4]);
 
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, worker_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
 
-        let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[u32::MAX, 1]);
-        assert_eq!(
-            result,
-            crate::win32::WAIT_IO_COMPLETION as u64,
-            "SleepEx(INFINITE, TRUE) must block until an APC is delivered"
-        );
-        assert_eq!(
-            read_u32(&memory, apc_flag).expect("apc flag"),
-            0xABCD,
-            "the APC callback must have run"
-        );
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, sleep_ex, &[u32::MAX, 1]);
+            assert_eq!(
+                result,
+                crate::win32::WAIT_IO_COMPLETION as u64,
+                "SleepEx(INFINITE, TRUE) must block until an APC is delivered"
+            );
+            assert_eq!(
+                read_u32(&memory, apc_flag).expect("apc flag"),
+                0xABCD,
+                "the APC callback must have run"
+            );
         })
     }
 
@@ -77838,108 +77953,107 @@ mod tests {
         // callback) still reports STILL_ACTIVE via GetExitCodeThread; the
         // code is only visible once the pump completes the exit.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "exiting-still-active",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "exiting-still-active",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let callback_address = 0x1001_0000_u64;
-        let reason_flag = 0x41_300_u32;
-        let handle_slot = 0x41_308_u32;
-        let exit_code_ptr = 0x41_30C_u32;
-        let get_slot = 0x41_000_u64;
-        let exit_slot = 0x41_010_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-
-        // TLS callback: record the reason; on DLL_THREAD_DETACH (3) call
-        // GetExitCodeThread([handle_slot], [exit_code_ptr]).
-        let mut callback_bytes = Vec::new();
-        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
-        callback_bytes.extend(&[0xA3]); // mov [reason_flag], eax
-        callback_bytes.extend(&reason_flag.to_le_bytes());
-        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
-        callback_bytes.extend(&[0x75, 0x11]); // jne done
-        callback_bytes.extend(&[0xA1]); // mov eax, [handle_slot]
-        callback_bytes.extend(&handle_slot.to_le_bytes());
-        callback_bytes.extend(&[0x68]); // push exit_code_ptr (arg1)
-        callback_bytes.extend(&exit_code_ptr.to_le_bytes());
-        callback_bytes.extend(&[0x50]); // push eax (handle — arg0)
-        callback_bytes.extend(&[0xFF, 0x15]); // call [get_slot]
-        callback_bytes.extend(&get_slot.to_le_bytes());
-        callback_bytes.extend(&[0xC3]); // ret
-        memory.map_bytes(callback_address, &callback_bytes);
-        runtime.dll_info_table.insert(
-            0x1000_0000,
-            DllInfo {
-                handle: 0x1000_0000,
-                image_size: 0x10000,
-                entry_point_rva: 0,
-                load_count: 1,
-                module_name: "test.dll".to_string(),
-                host_path: String::new(),
-                tls_callbacks: vec![callback_address - 0x1000_0000],
-            },
-        );
-
-        let get_exit_code_thread = runtime.alloc_host_thunk(HostThunk::GetExitCodeThread);
-        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        // push 5; call [ExitThread]; ret
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..9].copy_from_slice(&[
-            0x6A, 0x05, 0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, 0xC3,
-        ]);
-        write_u32(&mut memory, get_slot, get_exit_code_thread as u32);
-        write_u32(&mut memory, exit_slot, exit_thread as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-        memory.map_bytes(handle_slot as u64, &[0_u8; 4]);
-        memory.map_bytes(exit_code_ptr as u64, &[0_u8; 4]);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-        write_u32(&mut memory, handle_slot as u64, thread_handle as u32);
-
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump exiting-observable thread")
-                .did_work
-        );
-        assert_eq!(
-            read_u32(&memory, reason_flag as u64).expect("reason flag"),
-            DLL_THREAD_DETACH
-        );
-        assert_eq!(
-            read_u32(&memory, exit_code_ptr as u64).expect("exit code observed in Exiting"),
-            STILL_ACTIVE,
-            "a thread in Exiting state must still report STILL_ACTIVE"
-        );
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after Exited"),
-            Some(5),
-            "the exit code is visible only after the thread fully stops"
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let callback_address = 0x1001_0000_u64;
+            let reason_flag = 0x41_300_u32;
+            let handle_slot = 0x41_308_u32;
+            let exit_code_ptr = 0x41_30C_u32;
+            let get_slot = 0x41_000_u64;
+            let exit_slot = 0x41_010_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+
+            // TLS callback: record the reason; on DLL_THREAD_DETACH (3) call
+            // GetExitCodeThread([handle_slot], [exit_code_ptr]).
+            let mut callback_bytes = Vec::new();
+            callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+            callback_bytes.extend(&[0xA3]); // mov [reason_flag], eax
+            callback_bytes.extend(&reason_flag.to_le_bytes());
+            callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
+            callback_bytes.extend(&[0x75, 0x11]); // jne done
+            callback_bytes.extend(&[0xA1]); // mov eax, [handle_slot]
+            callback_bytes.extend(&handle_slot.to_le_bytes());
+            callback_bytes.extend(&[0x68]); // push exit_code_ptr (arg1)
+            callback_bytes.extend(&exit_code_ptr.to_le_bytes());
+            callback_bytes.extend(&[0x50]); // push eax (handle — arg0)
+            callback_bytes.extend(&[0xFF, 0x15]); // call [get_slot]
+            callback_bytes.extend(&get_slot.to_le_bytes());
+            callback_bytes.extend(&[0xC3]); // ret
+            memory.map_bytes(callback_address, &callback_bytes);
+            runtime.dll_info_table.insert(
+                0x1000_0000,
+                DllInfo {
+                    handle: 0x1000_0000,
+                    image_size: 0x10000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "test.dll".to_string(),
+                    host_path: String::new(),
+                    tls_callbacks: vec![callback_address - 0x1000_0000],
+                },
+            );
+
+            let get_exit_code_thread = runtime.alloc_host_thunk(HostThunk::GetExitCodeThread);
+            let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            // push 5; call [ExitThread]; ret
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..9]
+                .copy_from_slice(&[0x6A, 0x05, 0xFF, 0x15, 0x10, 0x10, 0x04, 0x00, 0xC3]);
+            write_u32(&mut memory, get_slot, get_exit_code_thread as u32);
+            write_u32(&mut memory, exit_slot, exit_thread as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+            memory.map_bytes(handle_slot as u64, &[0_u8; 4]);
+            memory.map_bytes(exit_code_ptr as u64, &[0_u8; 4]);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+            write_u32(&mut memory, handle_slot as u64, thread_handle as u32);
+
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump exiting-observable thread")
+                    .did_work
+            );
+            assert_eq!(
+                read_u32(&memory, reason_flag as u64).expect("reason flag"),
+                DLL_THREAD_DETACH
+            );
+            assert_eq!(
+                read_u32(&memory, exit_code_ptr as u64).expect("exit code observed in Exiting"),
+                STILL_ACTIVE,
+                "a thread in Exiting state must still report STILL_ACTIVE"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after Exited"),
+                Some(5),
+                "the exit code is visible only after the thread fully stops"
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 
@@ -77950,87 +78064,86 @@ mod tests {
         // thread's exit-code selection (and be consumed so it cannot corrupt
         // an enclosing pump's exit-request restore), not be silently lost.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "detach-exit-prop",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "detach-exit-prop",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let callback_address = 0x1001_0000_u64;
-        let exit_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-
-        // TLS callback: if reason == 3 (DLL_THREAD_DETACH), call ExitThread(9).
-        let mut callback_bytes = Vec::new();
-        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
-        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
-        callback_bytes.extend(&[0x75, 0x08]); // jne done
-        callback_bytes.extend(&[0x6A, 0x09]); // push 9
-        callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
-        callback_bytes.extend(&exit_slot.to_le_bytes());
-        callback_bytes.extend(&[0xC3]); // ret
-        memory.map_bytes(callback_address, &callback_bytes);
-        runtime.dll_info_table.insert(
-            0x1000_0000,
-            DllInfo {
-                handle: 0x1000_0000,
-                image_size: 0x10000,
-                entry_point_rva: 0,
-                load_count: 1,
-                module_name: "test.dll".to_string(),
-                host_path: String::new(),
-                tls_callbacks: vec![callback_address - 0x1000_0000],
-            },
-        );
-
-        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        // push 5; call [ExitThread]; ret — the entry's exit code is 5.
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..9].copy_from_slice(&[
-            0x6A, 0x05, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xC3,
-        ]);
-        write_u32(&mut memory, exit_slot, exit_thread as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump detach-exit thread")
-                .did_work
-        );
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after pump"),
-            Some(9),
-            "the DETACH callback's ExitThread request must propagate to the exit code"
-        );
-        assert!(
-            runtime.pumped_thread_exit_requested.is_none(),
-            "the DETACH callback's request must be consumed, not leaked"
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let callback_address = 0x1001_0000_u64;
+            let exit_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+
+            // TLS callback: if reason == 3 (DLL_THREAD_DETACH), call ExitThread(9).
+            let mut callback_bytes = Vec::new();
+            callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+            callback_bytes.extend(&[0x83, 0xF8, 0x03]); // cmp eax, 3
+            callback_bytes.extend(&[0x75, 0x08]); // jne done
+            callback_bytes.extend(&[0x6A, 0x09]); // push 9
+            callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
+            callback_bytes.extend(&exit_slot.to_le_bytes());
+            callback_bytes.extend(&[0xC3]); // ret
+            memory.map_bytes(callback_address, &callback_bytes);
+            runtime.dll_info_table.insert(
+                0x1000_0000,
+                DllInfo {
+                    handle: 0x1000_0000,
+                    image_size: 0x10000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "test.dll".to_string(),
+                    host_path: String::new(),
+                    tls_callbacks: vec![callback_address - 0x1000_0000],
+                },
+            );
+
+            let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            // push 5; call [ExitThread]; ret — the entry's exit code is 5.
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..9]
+                .copy_from_slice(&[0x6A, 0x05, 0xFF, 0x15, 0x00, 0x10, 0x04, 0x00, 0xC3]);
+            write_u32(&mut memory, exit_slot, exit_thread as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump detach-exit thread")
+                    .did_work
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after pump"),
+                Some(9),
+                "the DETACH callback's ExitThread request must propagate to the exit code"
+            );
+            assert!(
+                runtime.pumped_thread_exit_requested.is_none(),
+                "the DETACH callback's request must be consumed, not leaked"
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 
@@ -78041,102 +78154,102 @@ mod tests {
         // pumped, and `Waiting` with an expired wake_tick / `Runnable` is
         // ready.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "state-machine-ready",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "state-machine-ready",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let entrypoint = 0x41_100_u64;
-        let mut entry_bytes = vec![0x90; 0x10];
-        entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(entrypoint, &entry_bytes);
-
-        // Waiting with a future wake_tick: not ready.
-        let handle_a = runtime.win32.create_thread(
-            crate::win32::ThreadPlan {
-                exit_code: None,
-                priority: 0,
-                signaled: false,
-            },
-            false,
-        );
-        let mut pending = runtime
-            .prepare_guest_thread_entry(&mut memory, handle_a, 0x1000, entrypoint, 0)
-            .expect("prepare waiting thread");
-        pending.state_machine = GuestThreadState::Waiting;
-        pending.wake_tick = runtime.win32.get_tick_count64() + 100_000;
-        runtime.pending_guest_threads.push_back(pending);
-        assert!(
-            !runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump waiting thread")
-                .did_work,
-            "a Waiting thread with a future wake_tick must not be pumped"
-        );
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
-
-        // Exiting: never pumped (mid-teardown state).
-        let handle_b = runtime.win32.create_thread(
-            crate::win32::ThreadPlan {
-                exit_code: None,
-                priority: 0,
-                signaled: false,
-            },
-            false,
-        );
-        let mut pending = runtime
-            .prepare_guest_thread_entry(&mut memory, handle_b, 0x1000, entrypoint, 0)
-            .expect("prepare exiting thread");
-        pending.state_machine = GuestThreadState::Exiting;
-        runtime.pending_guest_threads.push_back(pending);
-        assert!(
-            !runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump exiting thread")
-                .did_work,
-            "an Exiting thread must never be pumped"
-        );
-        assert_eq!(runtime.pending_guest_threads.len(), 2);
-
-        // Waiting with an expired wake_tick: ready and pumped to completion.
-        let handle_c = runtime.win32.create_thread(
-            crate::win32::ThreadPlan {
-                exit_code: None,
-                priority: 0,
-                signaled: false,
-            },
-            false,
-        );
-        let mut pending = runtime
-            .prepare_guest_thread_entry(&mut memory, handle_c, 0x1000, entrypoint, 0)
-            .expect("prepare ready thread");
-        pending.state_machine = GuestThreadState::Waiting;
-        pending.wake_tick = runtime.win32.get_tick_count64();
-        runtime.pending_guest_threads.push_back(pending);
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump ready thread")
-                .did_work
-        );
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(handle_c)
-                .expect("ready thread exit code"),
-            Some(7)
-        );
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let entrypoint = 0x41_100_u64;
+            let mut entry_bytes = vec![0x90; 0x10];
+            entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(entrypoint, &entry_bytes);
+
+            // Waiting with a future wake_tick: not ready.
+            let handle_a = runtime.win32.create_thread(
+                crate::win32::ThreadPlan {
+                    exit_code: None,
+                    priority: 0,
+                    signaled: false,
+                },
+                false,
+            );
+            let mut pending = runtime
+                .prepare_guest_thread_entry(&mut memory, handle_a, 0x1000, entrypoint, 0)
+                .expect("prepare waiting thread");
+            pending.state_machine = GuestThreadState::Waiting;
+            pending.wake_tick = runtime.win32.get_tick_count64() + 100_000;
+            runtime.pending_guest_threads.push_back(pending);
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump waiting thread")
+                    .did_work,
+                "a Waiting thread with a future wake_tick must not be pumped"
+            );
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+            // Exiting: never pumped (mid-teardown state).
+            let handle_b = runtime.win32.create_thread(
+                crate::win32::ThreadPlan {
+                    exit_code: None,
+                    priority: 0,
+                    signaled: false,
+                },
+                false,
+            );
+            let mut pending = runtime
+                .prepare_guest_thread_entry(&mut memory, handle_b, 0x1000, entrypoint, 0)
+                .expect("prepare exiting thread");
+            pending.state_machine = GuestThreadState::Exiting;
+            runtime.pending_guest_threads.push_back(pending);
+            assert!(
+                !runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump exiting thread")
+                    .did_work,
+                "an Exiting thread must never be pumped"
+            );
+            assert_eq!(runtime.pending_guest_threads.len(), 2);
+
+            // Waiting with an expired wake_tick: ready and pumped to completion.
+            let handle_c = runtime.win32.create_thread(
+                crate::win32::ThreadPlan {
+                    exit_code: None,
+                    priority: 0,
+                    signaled: false,
+                },
+                false,
+            );
+            let mut pending = runtime
+                .prepare_guest_thread_entry(&mut memory, handle_c, 0x1000, entrypoint, 0)
+                .expect("prepare ready thread");
+            pending.state_machine = GuestThreadState::Waiting;
+            pending.wake_tick = runtime.win32.get_tick_count64();
+            runtime.pending_guest_threads.push_back(pending);
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump ready thread")
+                    .did_work
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(handle_c)
+                    .expect("ready thread exit code"),
+                Some(7)
+            );
         })
     }
 
@@ -78150,68 +78263,68 @@ mod tests {
         // the cooperative model we return WAIT_TIMEOUT immediately
         // (documented divergence) so the guest can retry the join.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "active-join-timeout",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "active-join-timeout",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        let mut entry_bytes = vec![0x90; 0x10];
-        entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(entrypoint, &entry_bytes);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            let mut entry_bytes = vec![0x90; 0x10];
+            entry_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(entrypoint, &entry_bytes);
 
-        let worker_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(worker_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 1);
+            let worker_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(worker_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 1);
 
-        // Simulate the nested-pump cycle: the worker handle is the currently
-        // ACTIVE pumped thread while the caller waits INFINITE on it.
-        runtime.active_pumped_guest_thread = Some(worker_handle as u32);
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_single_object,
-            &[worker_handle as u32, u32::MAX],
-        );
-        assert_eq!(
-            result,
-            crate::win32::WAIT_TIMEOUT as u64,
-            "joining the active pumped thread must return WAIT_TIMEOUT immediately (documented divergence)"
-        );
-        assert_eq!(
-            runtime.pending_guest_threads.len(),
-            1,
-            "the target thread stays queued for a later retry"
-        );
+            // Simulate the nested-pump cycle: the worker handle is the currently
+            // ACTIVE pumped thread while the caller waits INFINITE on it.
+            runtime.active_pumped_guest_thread = Some(worker_handle as u32);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object,
+                &[worker_handle as u32, u32::MAX],
+            );
+            assert_eq!(
+                result,
+                crate::win32::WAIT_TIMEOUT as u64,
+                "joining the active pumped thread must return WAIT_TIMEOUT immediately (documented divergence)"
+            );
+            assert_eq!(
+                runtime.pending_guest_threads.len(),
+                1,
+                "the target thread stays queued for a later retry"
+            );
 
-        // A zero-timeout poll is unaffected (non-blocking by definition).
-        runtime.active_pumped_guest_thread = None;
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_single_object,
-            &[worker_handle as u32, 0],
-        );
-        assert_eq!(result, crate::win32::WAIT_TIMEOUT as u64);
+            // A zero-timeout poll is unaffected (non-blocking by definition).
+            runtime.active_pumped_guest_thread = None;
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_single_object,
+                &[worker_handle as u32, 0],
+            );
+            assert_eq!(result, crate::win32::WAIT_TIMEOUT as u64);
         })
     }
 
@@ -78222,102 +78335,102 @@ mod tests {
         // before the start routine; an exit there means the entry never
         // executes).  The thread still fires DLL_THREAD_DETACH.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "attach-exit-skips-entry",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "attach-exit-skips-entry",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
-
-        let callback_address = 0x1001_0000_u64;
-        let entry_flag = 0x41_300_u32;
-        let detach_flag = 0x41_304_u32;
-        let exit_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-
-        // TLS callback: on DLL_THREAD_ATTACH (2) call ExitThread(9); on
-        // DLL_THREAD_DETACH (3) record the reason at [detach_flag].
-        let mut callback_bytes = Vec::new();
-        callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
-        callback_bytes.extend(&[0x83, 0xF8, 0x02]); // cmp eax, 2
-        callback_bytes.extend(&[0x75, 0x08]); // jne check_detach
-        callback_bytes.extend(&[0x6A, 0x09]); // push 9
-        callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
-        callback_bytes.extend(&exit_slot.to_le_bytes());
-        callback_bytes.extend(&[0x83, 0xF8, 0x03]); // check_detach: cmp eax, 3
-        callback_bytes.extend(&[0x75, 0x0A]); // jne done
-        callback_bytes.extend(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
-        callback_bytes.extend(&[0xA3]); // mov [detach_flag], eax
-        callback_bytes.extend(&detach_flag.to_le_bytes());
-        callback_bytes.extend(&[0xC3]); // ret
-        memory.map_bytes(callback_address, &callback_bytes);
-        runtime.dll_info_table.insert(
-            0x1000_0000,
-            DllInfo {
-                handle: 0x1000_0000,
-                image_size: 0x10000,
-                entry_point_rva: 0,
-                load_count: 1,
-                module_name: "test.dll".to_string(),
-                host_path: String::new(),
-                tls_callbacks: vec![callback_address - 0x1000_0000],
-            },
-        );
-
-        let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        // mov eax,1; mov [entry_flag],eax; ret — must never run.
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..12].copy_from_slice(&[
-            0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x13, 0x04, 0x00, 0xC3, 0x90,
-        ]);
-        write_u32(&mut memory, exit_slot, exit_thread as u32);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
-        memory.map_bytes(entry_flag as u64, &[0_u8; 4]);
-        memory.map_bytes(detach_flag as u64, &[0_u8; 4]);
-
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
-
-        assert!(
             runtime
-                .pump_pending_guest_thread(&mut memory)
-                .expect("pump attach-exit thread")
-                .did_work
-        );
-        assert_eq!(
-            read_u32(&memory, entry_flag as u64).expect("entry flag"),
-            0,
-            "the thread entry must never run when an ATTACH callback exits the thread"
-        );
-        assert_eq!(
-            runtime
-                .win32
-                .get_exit_code_thread(thread_handle as u32)
-                .expect("exit code after attach exit"),
-            Some(9)
-        );
-        assert_eq!(
-            read_u32(&memory, detach_flag as u64).expect("detach flag"),
-            DLL_THREAD_DETACH,
-            "DLL_THREAD_DETACH fires for the explicit exit"
-        );
-        assert!(runtime.pending_guest_threads.is_empty());
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let callback_address = 0x1001_0000_u64;
+            let entry_flag = 0x41_300_u32;
+            let detach_flag = 0x41_304_u32;
+            let exit_slot = 0x41_000_u64;
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+
+            // TLS callback: on DLL_THREAD_ATTACH (2) call ExitThread(9); on
+            // DLL_THREAD_DETACH (3) record the reason at [detach_flag].
+            let mut callback_bytes = Vec::new();
+            callback_bytes.extend(&[0x8B, 0x44, 0x24, 0x08]); // mov eax, [esp+8]
+            callback_bytes.extend(&[0x83, 0xF8, 0x02]); // cmp eax, 2
+            callback_bytes.extend(&[0x75, 0x08]); // jne check_detach
+            callback_bytes.extend(&[0x6A, 0x09]); // push 9
+            callback_bytes.extend(&[0xFF, 0x15]); // call [exit_slot]
+            callback_bytes.extend(&exit_slot.to_le_bytes());
+            callback_bytes.extend(&[0x83, 0xF8, 0x03]); // check_detach: cmp eax, 3
+            callback_bytes.extend(&[0x75, 0x0A]); // jne done
+            callback_bytes.extend(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+            callback_bytes.extend(&[0xA3]); // mov [detach_flag], eax
+            callback_bytes.extend(&detach_flag.to_le_bytes());
+            callback_bytes.extend(&[0xC3]); // ret
+            memory.map_bytes(callback_address, &callback_bytes);
+            runtime.dll_info_table.insert(
+                0x1000_0000,
+                DllInfo {
+                    handle: 0x1000_0000,
+                    image_size: 0x10000,
+                    entry_point_rva: 0,
+                    load_count: 1,
+                    module_name: "test.dll".to_string(),
+                    host_path: String::new(),
+                    tls_callbacks: vec![callback_address - 0x1000_0000],
+                },
+            );
+
+            let exit_thread = runtime.alloc_host_thunk(HostThunk::ExitThread);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            // mov eax,1; mov [entry_flag],eax; ret — must never run.
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..12].copy_from_slice(&[
+                0xB8, 0x01, 0x00, 0x00, 0x00, 0xA3, 0x00, 0x13, 0x04, 0x00, 0xC3, 0x90,
+            ]);
+            write_u32(&mut memory, exit_slot, exit_thread as u32);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
+            memory.map_bytes(entry_flag as u64, &[0_u8; 4]);
+            memory.map_bytes(detach_flag as u64, &[0_u8; 4]);
+
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
+
+            assert!(
+                runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump attach-exit thread")
+                    .did_work
+            );
+            assert_eq!(
+                read_u32(&memory, entry_flag as u64).expect("entry flag"),
+                0,
+                "the thread entry must never run when an ATTACH callback exits the thread"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_thread(thread_handle as u32)
+                    .expect("exit code after attach exit"),
+                Some(9)
+            );
+            assert_eq!(
+                read_u32(&memory, detach_flag as u64).expect("detach flag"),
+                DLL_THREAD_DETACH,
+                "DLL_THREAD_DETACH fires for the explicit exit"
+            );
+            assert!(runtime.pending_guest_threads.is_empty());
         })
     }
 
@@ -78327,13 +78440,9 @@ mod tests {
         // (0xFFFFFFFF) with ERROR_INVALID_HANDLE, not WAIT_OBJECT_0.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
-            let ge = GameEnvironment::create_in(
-                temp_dir.path(),
-                "wfs-file",
-                GeArch::X86,
-                "win11-23h2",
-            )
-            .expect("create ge");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "wfs-file", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
             let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
             configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -78375,13 +78484,9 @@ mod tests {
         // WAIT_FAILED + ERROR_INVALID_HANDLE.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
-            let ge = GameEnvironment::create_in(
-                temp_dir.path(),
-                "wfm-file",
-                GeArch::X86,
-                "win11-23h2",
-            )
-            .expect("create ge");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "wfm-file", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
             let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
             configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -78447,9 +78552,7 @@ mod tests {
                 .expect("seed process state");
 
             let socket = runtime.win32.insert_socket();
-            runtime
-                .network
-                .wsa_startup();
+            runtime.network.wsa_startup();
             runtime
                 .network
                 .socket_register(u64::from(socket), crate::network::AddressFamily::Ipv4)
@@ -78509,13 +78612,9 @@ mod tests {
         // NOT close the event.
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
-            let ge = GameEnvironment::create_in(
-                temp_dir.path(),
-                "rck-event",
-                GeArch::X86,
-                "win11-23h2",
-            )
-            .expect("create ge");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "rck-event", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
             let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
             configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -78550,13 +78649,9 @@ mod tests {
     fn get_file_type_consults_the_handle_table() {
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
-            let ge = GameEnvironment::create_in(
-                temp_dir.path(),
-                "gft-table",
-                GeArch::X86,
-                "win11-23h2",
-            )
-            .expect("create ge");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "gft-table", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
             let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
             configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
             let mut memory = MemoryImage::default();
@@ -78610,103 +78705,102 @@ mod tests {
         // A timer callback (drained from the timer_work_sink by GetMessageW)
         // that calls ExitProcess must end the guest run with the code.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "timer-exit",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "timer-exit",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
-        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
-        let import_slot = 0x60_000_u64;
-        let callback = 0x61_000_u64;
-        // push 0xFFFFFFFE; call [ExitProcess]; ret
-        let mut callback_bytes = vec![0x90; 0x20];
-        callback_bytes[..13].copy_from_slice(&[
-            0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC3, 0x90,
-        ]);
-        write_u32(&mut memory, import_slot, exit_process as u32);
-        memory.map_bytes(callback, &callback_bytes);
-        runtime
-            .timer_work_sink
-            .lock()
-            .unwrap()
-            .push_back((callback, 0));
+            let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+            let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+            let import_slot = 0x60_000_u64;
+            let callback = 0x61_000_u64;
+            // push 0xFFFFFFFE; call [ExitProcess]; ret
+            let mut callback_bytes = vec![0x90; 0x20];
+            callback_bytes[..13].copy_from_slice(&[
+                0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC3, 0x90,
+            ]);
+            write_u32(&mut memory, import_slot, exit_process as u32);
+            memory.map_bytes(callback, &callback_bytes);
+            runtime
+                .timer_work_sink
+                .lock()
+                .unwrap()
+                .push_back((callback, 0));
 
-        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, get_message, &[0, 0, 0, 0]);
-        assert_eq!(
-            result,
-            Some(-2),
-            "a timer callback calling ExitProcess must end the run with the code"
-        );
-        assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
+            let result =
+                dispatch_x86_thunk_result(&mut runtime, &mut memory, get_message, &[0, 0, 0, 0]);
+            assert_eq!(
+                result,
+                Some(-2),
+                "a timer callback calling ExitProcess must end the run with the code"
+            );
+            assert_eq!(runtime.process_exit_requested, Some(0xFFFF_FFFE));
         })
     }
 
     #[test]
     fn wait_for_multiple_objects_thread_and_event_wait_any() {
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "wait-multiple-wait-any",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "wait-multiple-wait-any",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let wait_for_multiple = runtime.alloc_host_thunk(HostThunk::WaitForMultipleObjects);
-        let entrypoint = 0x41_100_u64;
-        let thread_id_ptr = 0x41_204_u64;
-        let mut entrypoint_bytes = vec![0x90; 0x20];
-        entrypoint_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let wait_for_multiple = runtime.alloc_host_thunk(HostThunk::WaitForMultipleObjects);
+            let entrypoint = 0x41_100_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            let mut entrypoint_bytes = vec![0x90; 0x20];
+            entrypoint_bytes[..8]
+                .copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            memory.map_bytes(entrypoint, &entrypoint_bytes);
 
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(thread_handle, 0);
+            let thread_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(thread_handle, 0);
 
-        let (event_handle, _created) = runtime.win32.create_event(true, true, false, None);
-        runtime
-            .win32
-            .set_event(event_handle)
-            .expect("set event");
+            let (event_handle, _created) = runtime.win32.create_event(true, true, false, None);
+            runtime.win32.set_event(event_handle).expect("set event");
 
-        // wait-any over [thread, event]: the signaled event is at index 1, so
-        // the result must be WAIT_OBJECT_0 + 1 (and RAX must be set).
-        let handles_ptr = 0x41_400_u64;
-        write_u32(&mut memory, handles_ptr, thread_handle as u32);
-        write_u32(&mut memory, handles_ptr + 4, event_handle);
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            wait_for_multiple,
-            &[2, handles_ptr as u32, 0, u32::MAX],
-        );
-        assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64 + 1);
-        assert_eq!(runtime.last_error, 0);
+            // wait-any over [thread, event]: the signaled event is at index 1, so
+            // the result must be WAIT_OBJECT_0 + 1 (and RAX must be set).
+            let handles_ptr = 0x41_400_u64;
+            write_u32(&mut memory, handles_ptr, thread_handle as u32);
+            write_u32(&mut memory, handles_ptr + 4, event_handle);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wait_for_multiple,
+                &[2, handles_ptr as u32, 0, u32::MAX],
+            );
+            assert_eq!(result, crate::win32::WAIT_OBJECT_0 as u64 + 1);
+            assert_eq!(runtime.last_error, 0);
         })
     }
 
@@ -78715,89 +78809,81 @@ mod tests {
         // A pumped thread calls ExitProcess(-2): the run must terminate with
         // exit code -2 and the remaining pending threads are abandoned.
         with_big_stack(|| {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "process-exit-pumped",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "process-exit-pumped",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
 
-        let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
-        // NOTE: dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the
-        // guest mappings must live above that range.
-        let import_slot = 0x60_000_u64;
-        let exit_entry = 0x61_000_u64;
-        let sleeper_entry = 0x62_000_u64;
-        let thread_id_ptr = 0x61_100_u64;
-        let sleeper_id_ptr = 0x62_100_u64;
-        // push 0xFFFFFFFE; call [ExitProcess]; ret 4
-        let mut exit_bytes = vec![0x90; 0x20];
-        exit_bytes[..13].copy_from_slice(&[
-            0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC2, 0x04,
-        ]);
-        exit_bytes[13..16].copy_from_slice(&[0x00, 0x90, 0x90]);
-        let mut sleeper_bytes = vec![0x90; 0x10];
-        sleeper_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
-        write_u32(&mut memory, import_slot, exit_process as u32);
-        memory.map_bytes(exit_entry, &exit_bytes);
-        memory.map_bytes(sleeper_entry, &sleeper_bytes);
+            let exit_process = runtime.alloc_host_thunk(HostThunk::ExitProcess);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+            // NOTE: dispatch_x86_thunk_result maps 0x40_000..0x52_200, so the
+            // guest mappings must live above that range.
+            let import_slot = 0x60_000_u64;
+            let exit_entry = 0x61_000_u64;
+            let sleeper_entry = 0x62_000_u64;
+            let thread_id_ptr = 0x61_100_u64;
+            let sleeper_id_ptr = 0x62_100_u64;
+            // push 0xFFFFFFFE; call [ExitProcess]; ret 4
+            let mut exit_bytes = vec![0x90; 0x20];
+            exit_bytes[..13].copy_from_slice(&[
+                0x68, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x06, 0x00, 0xC2, 0x04,
+            ]);
+            exit_bytes[13..16].copy_from_slice(&[0x00, 0x90, 0x90]);
+            let mut sleeper_bytes = vec![0x90; 0x10];
+            sleeper_bytes[..8].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+            write_u32(&mut memory, import_slot, exit_process as u32);
+            memory.map_bytes(exit_entry, &exit_bytes);
+            memory.map_bytes(sleeper_entry, &sleeper_bytes);
 
-        // Two threads: one calls ExitProcess, the other would return 7 if it
-        // ever ran.  The ExitProcess thread runs first (FIFO pump order).
-        let exit_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, exit_entry as u32, 0, 0, thread_id_ptr as u32],
-        );
-        assert_ne!(exit_handle, 0);
-        let sleeper_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, sleeper_entry as u32, 0, 0, sleeper_id_ptr as u32],
-        );
-        assert_ne!(sleeper_handle, 0);
-        assert_eq!(runtime.pending_guest_threads.len(), 2);
+            // Two threads: one calls ExitProcess, the other would return 7 if it
+            // ever ran.  The ExitProcess thread runs first (FIFO pump order).
+            let exit_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, exit_entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+            assert_ne!(exit_handle, 0);
+            let sleeper_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, sleeper_entry as u32, 0, 0, sleeper_id_ptr as u32],
+            );
+            assert_ne!(sleeper_handle, 0);
+            assert_eq!(runtime.pending_guest_threads.len(), 2);
 
-        // GetMessageW pumps pending threads; the ExitProcess thread must end
-        // the guest run with exit code -2 (0xFFFFFFFE) and abandon the
-        // remaining pending thread.
-        let result = dispatch_x86_thunk_result(
-            &mut runtime,
-            &mut memory,
-            get_message,
-            &[0, 0, 0, 0],
-        );
-        assert_eq!(result, Some(-2));
-        assert!(
-            runtime.pending_guest_threads.is_empty(),
-            "pending threads abandoned on process exit"
-        );
+            // GetMessageW pumps pending threads; the ExitProcess thread must end
+            // the guest run with exit code -2 (0xFFFFFFFE) and abandon the
+            // remaining pending thread.
+            let result =
+                dispatch_x86_thunk_result(&mut runtime, &mut memory, get_message, &[0, 0, 0, 0]);
+            assert_eq!(result, Some(-2));
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "pending threads abandoned on process exit"
+            );
         })
     }
 
     #[test]
     fn open_thread_returns_thread_handle() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "open-thread",
-            GeArch::X86,
-            "win11-23h2",
-        )
-        .expect("create ge");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "open-thread", GeArch::X86, "win11-23h2")
+                .expect("create ge");
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
         let mut memory = MemoryImage::default();
@@ -78809,12 +78895,7 @@ mod tests {
 
         // OpenThread on the main thread (tid 1) yields a real thread handle
         // that GetExitCodeThread can query.
-        let handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            open_thread,
-            &[0x1F_03FF, 0, 1],
-        );
+        let handle = dispatch_x86_thunk(&mut runtime, &mut memory, open_thread, &[0x1F_03FF, 0, 1]);
         assert_ne!(handle, 0);
         assert_eq!(runtime.last_error, 0);
         assert!(matches!(
@@ -79098,7 +79179,7 @@ mod tests {
         assert_eq!(runtime.last_error, 0);
     }
 
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_feature_support_query(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -79717,8 +79798,10 @@ mod tests {
 
         memory.map_bytes(
             rip,
-            &[0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-              0x90, 0x90, 0x90],
+            &[
+                0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                0x90, 0x90,
+            ],
         );
         let second = decode_basic_block_cached(
             &mut engine,
@@ -84120,9 +84203,13 @@ mod tests {
     #[test]
     fn live_pipeline_reports_zero_real_frames_before_guest_paint() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "live-real-frames", GeArch::X86, "win11-23h2")
-                .expect("create ge");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "live-real-frames",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
         let (host_session, live_session) = crate::live::new_live_session();
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), Some(live_session), None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
@@ -84157,7 +84244,10 @@ mod tests {
             },
         );
         let gathered = runtime.gather_dc_pixels(&mut memory, 0x100);
-        assert!(gathered.is_some(), "real memory-DC pixels must be extractable");
+        assert!(
+            gathered.is_some(),
+            "real memory-DC pixels must be extractable"
+        );
         let (w, h, pixels) = gathered.unwrap();
         assert_eq!((w, h), (2, 1));
         assert_eq!(&pixels[..4], &[0x11, 0x22, 0x33, 0xff]);
@@ -84189,9 +84279,12 @@ mod tests {
                 backbuffer_objects: BTreeMap::new(),
             },
         );
-        runtime
-            .d3d11_swapchains
-            .insert(0x2000, GuestDxgiSwapChain { device_object: 0x1000 });
+        runtime.d3d11_swapchains.insert(
+            0x2000,
+            GuestDxgiSwapChain {
+                device_object: 0x1000,
+            },
+        );
         let mut state = CpuState::new(GuestArch::X64);
         runtime
             .dispatch_d3d11_swapchain_present(1, false, 0x2000, &mut state)
@@ -84228,17 +84321,7 @@ mod tests {
         runtime
             .user32
             .create_window_ex_styled(
-                class_name,
-                title,
-                width,
-                height,
-                true,
-                false,
-                None,
-                1,
-                WS_CHILD,
-                0,
-                None,
+                class_name, title, width, height, true, false, None, 1, WS_CHILD, 0, None,
             )
             .expect("create probe window")
     }
@@ -84498,14 +84581,13 @@ mod tests {
 
         // A render target holding REAL guest pixels (e.g. a guest-driven
         // Clear color) counts and publishes.
-        runtime.d3d9_shim.as_mut().expect("shim").render_target = Some(
-            crate::d3d11::D3d9RenderTarget {
+        runtime.d3d9_shim.as_mut().expect("shim").render_target =
+            Some(crate::d3d11::D3d9RenderTarget {
                 width: swapchain_width,
                 height: swapchain_height,
                 pixels: vec![0x11; (swapchain_width as usize) * (swapchain_height as usize) * 4],
                 synthesized: false,
-            },
-        );
+            });
         let mut real_state = CpuState::new(GuestArch::X86);
         real_state.set(Register::Rcx, 0x1000);
         runtime
@@ -84747,7 +84829,10 @@ mod tests {
             vfprintf,
             &[0, stream as u32, format as u32, 0, va_area as u32],
         );
-        assert_eq!(written, "hello 255 beef|00042|7   |+12|0xcafe|Z".len() as u64);
+        assert_eq!(
+            written,
+            "hello 255 beef|00042|7   |+12|0xcafe|Z".len() as u64
+        );
         assert_eq!(runtime.stdout, "hello 255 beef|00042|7   |+12|0xcafe|Z");
         assert_eq!(runtime.stderr, "");
     }
@@ -84786,7 +84871,9 @@ mod tests {
     fn crt_vsnprintf_s_truncation_returns_required_and_terminates() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let vsnprintf_s = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintfS);
-        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%d")
+            .expect("format");
         let va_area = 0x63_000;
         memory.map_bytes(va_area, &[0_u8; 16]);
         write_u32(&mut memory, va_area, 12_345);
@@ -84830,7 +84917,9 @@ mod tests {
     fn crt_vsnprintf_legacy_returns_minus_one_on_overflow() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let vsnprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintf);
-        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%d")
+            .expect("format");
         let va_area = 0x63_000;
         memory.map_bytes(va_area, &[0_u8; 16]);
         write_u32(&mut memory, va_area, 999);
@@ -84897,10 +84986,7 @@ mod tests {
                 strcpy_s,
                 &[dst as u32, 4, src as u32],
             );
-            assert_eq!(
-                read_u32(&memory, marker_addr).expect("marker"),
-                0xCAFE_5EED
-            );
+            assert_eq!(read_u32(&memory, marker_addr).expect("marker"), 0xCAFE_5EED);
             assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
             assert_eq!(memory.read_u8(dst).expect("dst[0]"), 0);
         })
@@ -84912,12 +84998,8 @@ mod tests {
         let strcpy_s = runtime.alloc_host_thunk(HostThunk::StrcpyS);
         let src = runtime.alloc_c_string(&mut memory, "hello").expect("src");
         // NULL destination with no handler installed → abort (exit code 134).
-        let result = dispatch_x86_thunk_result(
-            &mut runtime,
-            &mut memory,
-            strcpy_s,
-            &[0, 4, src as u32],
-        );
+        let result =
+            dispatch_x86_thunk_result(&mut runtime, &mut memory, strcpy_s, &[0, 4, src as u32]);
         assert_eq!(result, Some(134));
     }
 
@@ -84936,7 +85018,10 @@ mod tests {
             &[dst as u32, 16, src as u32],
         );
         assert_eq!(ret, 0);
-        assert_eq!(memory.read_bytes(dst, 4).expect("dst"), [b'a', b'b', b'c', 0]);
+        assert_eq!(
+            memory.read_bytes(dst, 4).expect("dst"),
+            [b'a', b'b', b'c', 0]
+        );
 
         // Truncation resets the destination and aborts (no handler).
         let result = dispatch_x86_thunk_result(
@@ -84982,7 +85067,10 @@ mod tests {
             strncpy,
             &[dst as u32, src_long as u32, 3],
         );
-        assert_eq!(memory.read_bytes(dst, 4).expect("dst"), [b'a', b'b', b'c', 0xAA]);
+        assert_eq!(
+            memory.read_bytes(dst, 4).expect("dst"),
+            [b'a', b'b', b'c', 0xAA]
+        );
 
         // strcmp: exact match 0, differing bytes give the signed diff.
         let a = runtime.alloc_c_string(&mut memory, "abc").expect("a");
@@ -85004,28 +85092,25 @@ mod tests {
         // _stricmp is case-insensitive.
         let upper = runtime.alloc_c_string(&mut memory, "AbC").expect("u");
         assert_eq!(
-            dispatch_x86_thunk(&mut runtime, &mut memory, stricmp, &[upper as u32, b as u32]),
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                stricmp,
+                &[upper as u32, b as u32]
+            ),
             0
         );
 
         // strchr / strstr return pointers.
-        let found = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            strchr,
-            &[a as u32, b'c' as u32],
-        );
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, strchr, &[a as u32, b'c' as u32]);
         assert_eq!(found, a + 2);
         assert_eq!(
-            dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                strchr,
-                &[a as u32, b'z' as u32],
-            ),
+            dispatch_x86_thunk(&mut runtime, &mut memory, strchr, &[a as u32, b'z' as u32],),
             0
         );
-        let haystack = runtime.alloc_c_string(&mut memory, "hello world").expect("h");
+        let haystack = runtime
+            .alloc_c_string(&mut memory, "hello world")
+            .expect("h");
         let needle = runtime.alloc_c_string(&mut memory, "world").expect("n");
         let found = dispatch_x86_thunk(
             &mut runtime,
@@ -85042,7 +85127,9 @@ mod tests {
         let strtol = runtime.alloc_host_thunk(HostThunk::Strtol);
 
         // base 0 with 0x prefix; endptr advances past the consumed digits.
-        let s = runtime.alloc_c_string(&mut memory, "  0x1F rest").expect("s");
+        let s = runtime
+            .alloc_c_string(&mut memory, "  0x1F rest")
+            .expect("s");
         let end = 0x61_000;
         memory.map_bytes(end, &[0_u8; 4]);
         let ret = dispatch_x86_thunk(
@@ -85055,13 +85142,10 @@ mod tests {
         assert_eq!(read_u32(&memory, end).expect("end"), (s + 6) as u32);
 
         // Overflow clamps to LONG_MAX and sets errno ERANGE.
-        let big = runtime.alloc_c_string(&mut memory, "99999999999").expect("big");
-        let ret = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            strtol,
-            &[big as u32, 0, 10],
-        );
+        let big = runtime
+            .alloc_c_string(&mut memory, "99999999999")
+            .expect("big");
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strtol, &[big as u32, 0, 10]);
         assert_eq!(ret, i32::MAX as u64);
         assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
 
@@ -85140,7 +85224,9 @@ mod tests {
             .expect("host path");
         fs::set_permissions(&host_path, fs::Permissions::from_mode(0o444)).expect("readonly");
         let access = runtime.alloc_host_thunk(HostThunk::Access);
-        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+        let path_ptr = runtime
+            .alloc_c_string(&mut memory, guest_path)
+            .expect("path");
 
         // mode 2 (W_OK) on a read-only file → -1 + EACCES.
         let ret = dispatch_x86_thunk(&mut runtime, &mut memory, access, &[path_ptr as u32, 2]);
@@ -85161,12 +85247,7 @@ mod tests {
         let missing = runtime
             .alloc_c_string(&mut memory, "C:\\game\\missing.txt")
             .expect("missing");
-        let ret = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            access,
-            &[missing as u32, 0],
-        );
+        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, access, &[missing as u32, 0]);
         assert_eq!(ret, (-1_i32) as u32 as u64);
         assert_eq!(runtime.crt_errno_get(&mut memory), ENOENT);
     }
@@ -85178,7 +85259,9 @@ mod tests {
         write_guest_pe_file(&runtime, guest_path, b"hello world");
         let stat = runtime.alloc_host_thunk(HostThunk::Stat);
         let stat64 = runtime.alloc_host_thunk(HostThunk::Stat64);
-        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+        let path_ptr = runtime
+            .alloc_c_string(&mut memory, guest_path)
+            .expect("path");
         let stat_buf = 0x62_000;
         memory.map_bytes(stat_buf, &[0_u8; 64]);
 
@@ -85218,7 +85301,9 @@ mod tests {
         assert_eq!(memory.read_u64(stat_buf + 16).expect("st_size"), 11);
 
         // Directory: st_mode = S_IFDIR | permissions.
-        let dir_ptr = runtime.alloc_c_string(&mut memory, "C:\\game").expect("dir");
+        let dir_ptr = runtime
+            .alloc_c_string(&mut memory, "C:\\game")
+            .expect("dir");
         let ret = dispatch_x86_thunk(
             &mut runtime,
             &mut memory,
@@ -85265,17 +85350,21 @@ mod tests {
             &[buffer_ptr as u32, size_ptr as u32, name as u32],
         );
         assert_eq!(ret, 0);
-        let allocated =
-            read_guest_pointer(&memory, buffer_ptr, GuestArch::X86).expect("buffer");
+        let allocated = read_guest_pointer(&memory, buffer_ptr, GuestArch::X86).expect("buffer");
         assert_ne!(allocated, 0);
         assert_eq!(
             read_guest_pointer(&memory, size_ptr, GuestArch::X86).expect("size"),
             9
         );
-        assert_eq!(read_c_string(&memory, allocated).expect("value"), "value123");
+        assert_eq!(
+            read_c_string(&memory, allocated).expect("value"),
+            "value123"
+        );
 
         // Missing variable → NULL buffer, zero size, success.
-        let missing = runtime.alloc_c_string(&mut memory, "NO_SUCH_VAR").expect("missing");
+        let missing = runtime
+            .alloc_c_string(&mut memory, "NO_SUCH_VAR")
+            .expect("missing");
         let ret = dispatch_x86_thunk(
             &mut runtime,
             &mut memory,
@@ -85350,7 +85439,9 @@ mod tests {
             .win32
             .create_directory_w("C:\\game")
             .expect("create guest dir");
-        let path_ptr = runtime.alloc_c_string(&mut memory, guest_path).expect("path");
+        let path_ptr = runtime
+            .alloc_c_string(&mut memory, guest_path)
+            .expect("path");
         let mode_ptr = runtime.alloc_c_string(&mut memory, "w+").expect("mode");
 
         let fp = dispatch_x86_thunk(
@@ -85365,8 +85456,12 @@ mod tests {
         let data = b"hello world";
         let buf = 0x64_000;
         memory.map_bytes(buf, data);
-        let written =
-            dispatch_x86_thunk(&mut runtime, &mut memory, fwrite, &[buf as u32, 1, 11, fp as u32]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fwrite,
+            &[buf as u32, 1, 11, fp as u32],
+        );
         assert_eq!(written, 11);
 
         // ftell reflects the write position.
@@ -85382,8 +85477,12 @@ mod tests {
         );
         let rbuf = 0x64_100;
         memory.map_bytes(rbuf, &[0_u8; 16]);
-        let read =
-            dispatch_x86_thunk(&mut runtime, &mut memory, fread, &[rbuf as u32, 1, 11, fp as u32]);
+        let read = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fread,
+            &[rbuf as u32, 1, 11, fp as u32],
+        );
         assert_eq!(read, 11);
         assert_eq!(memory.read_bytes(rbuf, 11).expect("readback"), data);
 
@@ -85404,8 +85503,12 @@ mod tests {
             &[path_ptr as u32, mode_ptr as u32],
         );
         assert_ne!(fp, 0);
-        let written =
-            dispatch_x86_thunk(&mut runtime, &mut memory, fwrite, &[buf as u32, 1, 1, fp as u32]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fwrite,
+            &[buf as u32, 1, 1, fp as u32],
+        );
         assert_eq!(written, 1);
         dispatch_x86_thunk(&mut runtime, &mut memory, fclose, &[fp as u32]);
         let mut expected = data.to_vec();
@@ -85432,7 +85535,6 @@ mod tests {
         assert_eq!(runtime.pending_guest_threads[0].start_address, 0x70_300);
     }
 
-
     #[test]
     fn crt_strtoi64_variants() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
@@ -85443,7 +85545,12 @@ mod tests {
             .expect("s");
         let end = 0x61_000;
         memory.map_bytes(end, &[0_u8; 4]);
-        let low = dispatch_x86_thunk(&mut runtime, &mut memory, strtoi64, &[s as u32, end as u32, 10]);
+        let low = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strtoi64,
+            &[s as u32, end as u32, 10],
+        );
         let mut state = CpuState::new(GuestArch::X86);
         state.set(Register::Rsp, 0x50_000);
         write_u32(&mut memory, 0x50_000, 0);
@@ -85584,27 +85691,25 @@ mod tests {
     fn crt_strtod_exponent_not_doubled_and_special_strings() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let atof = runtime.alloc_host_thunk(HostThunk::Atof);
-        let check = |runtime: &mut PeHostRuntime,
-                     memory: &mut MemoryImage,
-                     text: &str,
-                     expected: f64| {
-            let ptr = runtime.alloc_c_string(memory, text).expect("string");
-            let mut state = CpuState::new(GuestArch::X86);
-            state.set(Register::Rsp, 0x50_000);
-            memory.map_bytes(0x50_000, &[0_u8; 0x1000]);
-            write_u32(memory, 0x50_000, 0);
-            write_u32(memory, 0x50_004, ptr as u32);
-            runtime
-                .dispatch_import(atof, &mut state, memory)
-                .expect("atof");
-            let got = state.x87.stack.last().copied().unwrap_or(0.0);
-            let ok = if expected.is_nan() {
-                got.is_nan()
-            } else {
-                got == expected || (got - expected).abs() <= expected.abs().max(1.0) * 1e-12
+        let check =
+            |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, text: &str, expected: f64| {
+                let ptr = runtime.alloc_c_string(memory, text).expect("string");
+                let mut state = CpuState::new(GuestArch::X86);
+                state.set(Register::Rsp, 0x50_000);
+                memory.map_bytes(0x50_000, &[0_u8; 0x1000]);
+                write_u32(memory, 0x50_000, 0);
+                write_u32(memory, 0x50_004, ptr as u32);
+                runtime
+                    .dispatch_import(atof, &mut state, memory)
+                    .expect("atof");
+                let got = state.x87.stack.last().copied().unwrap_or(0.0);
+                let ok = if expected.is_nan() {
+                    got.is_nan()
+                } else {
+                    got == expected || (got - expected).abs() <= expected.abs().max(1.0) * 1e-12
+                };
+                assert!(ok, "atof({text:?}) = {got}, expected {expected}");
             };
-            assert!(ok, "atof({text:?}) = {got}, expected {expected}");
-        };
         check(&mut runtime, &mut memory, "1.5e3", 1500.0);
         check(&mut runtime, &mut memory, "1e10", 1e10);
         check(&mut runtime, &mut memory, "1.5e-3", 0.0015);
@@ -85650,25 +85755,25 @@ mod tests {
         assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
 
         // _strtoui64("-1") → u64::MAX (EAX:EDX); negative overflow → same + ERANGE.
-        let dispatch_64 = |runtime: &mut PeHostRuntime,
-                           memory: &mut MemoryImage,
-                           thunk: u64,
-                           arg: u32|
-         -> u64 {
-            let mut state = CpuState::new(GuestArch::X86);
-            state.set(Register::Rsp, 0x50_000);
-            write_u32(memory, 0x50_000, 0);
-            write_u32(memory, 0x50_004, arg);
-            write_u32(memory, 0x50_008, end as u32);
-            write_u32(memory, 0x50_00C, 10);
-            runtime
-                .dispatch_import(thunk, &mut state, memory)
-                .expect("dispatch 64-bit strtoi64 family");
-            let low = state.get(Register::Rax);
-            let high = state.get(Register::Rdx);
-            low | (high << 32)
-        };
-        assert_eq!(dispatch_64(&mut runtime, &mut memory, strtoui64, s as u32), u64::MAX);
+        let dispatch_64 =
+            |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, thunk: u64, arg: u32| -> u64 {
+                let mut state = CpuState::new(GuestArch::X86);
+                state.set(Register::Rsp, 0x50_000);
+                write_u32(memory, 0x50_000, 0);
+                write_u32(memory, 0x50_004, arg);
+                write_u32(memory, 0x50_008, end as u32);
+                write_u32(memory, 0x50_00C, 10);
+                runtime
+                    .dispatch_import(thunk, &mut state, memory)
+                    .expect("dispatch 64-bit strtoi64 family");
+                let low = state.get(Register::Rax);
+                let high = state.get(Register::Rdx);
+                low | (high << 32)
+            };
+        assert_eq!(
+            dispatch_64(&mut runtime, &mut memory, strtoui64, s as u32),
+            u64::MAX
+        );
         assert_eq!(
             dispatch_64(&mut runtime, &mut memory, strtoui64, big as u32),
             u64::MAX
@@ -85741,12 +85846,8 @@ mod tests {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let strtoi64_s = runtime.alloc_host_thunk(HostThunk::Strtoi64S);
         let s = runtime.alloc_c_string(&mut memory, "123").expect("s");
-        let result = dispatch_x86_thunk_result(
-            &mut runtime,
-            &mut memory,
-            strtoi64_s,
-            &[s as u32, 0, 10, 0],
-        );
+        let result =
+            dispatch_x86_thunk_result(&mut runtime, &mut memory, strtoi64_s, &[s as u32, 0, 10, 0]);
         assert_eq!(result, Some(134));
         assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
     }
@@ -85760,13 +85861,20 @@ mod tests {
         let s = runtime.alloc_c_string(&mut memory, "abc").expect("s");
         let found = dispatch_x86_thunk(&mut runtime, &mut memory, strchr, &[s as u32, 0]);
         assert_eq!(found, s + 3);
-        let wide = runtime.alloc_utf16_string(&mut memory, "abc").expect("wide");
+        let wide = runtime
+            .alloc_utf16_string(&mut memory, "abc")
+            .expect("wide");
         let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcschr, &[wide as u32, 0]);
         assert_eq!(found, wide + 6);
         let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcsrchr, &[wide as u32, 0]);
         assert_eq!(found, wide + 6);
         // Non-zero targets keep working.
-        let found = dispatch_x86_thunk(&mut runtime, &mut memory, wcsrchr, &[wide as u32, u32::from(b'b')]);
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsrchr,
+            &[wide as u32, u32::from(b'b')],
+        );
         assert_eq!(found, wide + 2);
     }
 
@@ -85782,19 +85890,39 @@ mod tests {
         // _strnicmp("ab", "abc", 3): NUL vs 'c' → negative.
         let a = runtime.alloc_c_string(&mut memory, "ab").expect("a");
         let b = runtime.alloc_c_string(&mut memory, "abc").expect("b");
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[a as u32, b as u32, 3]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strnicmp,
+            &[a as u32, b as u32, 3],
+        );
         assert_eq!(ret, (-99_i32) as u32 as u64);
         // Reverse: 'c' vs NUL → positive.
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[b as u32, a as u32, 3]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strnicmp,
+            &[b as u32, a as u32, 3],
+        );
         assert_eq!(ret, 99);
         // Same prefix within n → 0.
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strnicmp, &[a as u32, b as u32, 2]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strnicmp,
+            &[a as u32, b as u32, 2],
+        );
         assert_eq!(ret, 0);
 
         // _wcsnicmp("ab", "abc", 3) → NUL vs 'c' → negative.
         let wa = runtime.alloc_utf16_string(&mut memory, "ab").expect("wa");
         let wb = runtime.alloc_utf16_string(&mut memory, "abc").expect("wb");
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, wcsnicmp, &[wa as u32, wb as u32, 3]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsnicmp,
+            &[wa as u32, wb as u32, 3],
+        );
         assert_eq!(ret, (-99_i32) as u32 as u64);
 
         // strcmp includes the terminator: strcmp("a", "ab") → 0 - 'b' = -98.
@@ -85808,9 +85936,19 @@ mod tests {
         // strncmp("abc", "abcd", 4): NUL vs 'd' → -100 (byte diff).
         let s1 = runtime.alloc_c_string(&mut memory, "abc").expect("s1");
         let s2 = runtime.alloc_c_string(&mut memory, "abcd").expect("s2");
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strncmp, &[s1 as u32, s2 as u32, 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncmp,
+            &[s1 as u32, s2 as u32, 4],
+        );
         assert_eq!(ret, (-100_i32) as u32 as u64);
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, strncmp, &[s1 as u32, s2 as u32, 3]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncmp,
+            &[s1 as u32, s2 as u32, 3],
+        );
         assert_eq!(ret, 0);
 
         // memcmp compares UNSIGNED bytes: "\x80" vs "\x7f" → +1.
@@ -85818,9 +85956,19 @@ mod tests {
         let lo = 0x64_010;
         memory.map_bytes(hi, &[0x80_u8]);
         memory.map_bytes(lo, &[0x7F_u8]);
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, memcmp, &[hi as u32, lo as u32, 1]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            memcmp,
+            &[hi as u32, lo as u32, 1],
+        );
         assert_eq!(ret, 1);
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, memcmp, &[lo as u32, hi as u32, 1]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            memcmp,
+            &[lo as u32, hi as u32, 1],
+        );
         assert_eq!(ret, (-1_i32) as u32 as u64);
     }
 
@@ -85828,7 +85976,9 @@ mod tests {
     fn crt_vsnprintf_s_null_buffer_with_count_aborts() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let vsnprintf_s = runtime.alloc_host_thunk(HostThunk::StdioCommonVsnprintfS);
-        let format = runtime.alloc_utf16_string(&mut memory, "%d").expect("format");
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%d")
+            .expect("format");
         let va_area = 0x63_000;
         memory.map_bytes(va_area, &[0_u8; 16]);
         write_u32(&mut memory, va_area, 12);
@@ -85901,9 +86051,18 @@ mod tests {
             &mut runtime,
             &mut memory,
             makepath,
-            &[buf as u32, drive as u32, dir as u32, name as u32, ext as u32],
+            &[
+                buf as u32,
+                drive as u32,
+                dir as u32,
+                name as u32,
+                ext as u32,
+            ],
         );
-        assert_eq!(read_c_string(&memory, buf).expect("path"), "c:dir\\file.txt");
+        assert_eq!(
+            read_c_string(&memory, buf).expect("path"),
+            "c:dir\\file.txt"
+        );
         // A dotted extension is not double-dotted.
         let ext = runtime.alloc_c_string(&mut memory, ".log").expect("ext");
         dispatch_x86_thunk(
@@ -85925,12 +86084,18 @@ mod tests {
         let path_a = "C:\\game\\a.txt";
         let path_b = "C:\\game\\b.txt";
         fs::write(
-            runtime.win32.guest_path_to_host_path(path_a).expect("host a"),
+            runtime
+                .win32
+                .guest_path_to_host_path(path_a)
+                .expect("host a"),
             b"a",
         )
         .expect("write a");
         fs::write(
-            runtime.win32.guest_path_to_host_path(path_b).expect("host b"),
+            runtime
+                .win32
+                .guest_path_to_host_path(path_b)
+                .expect("host b"),
             b"b",
         )
         .expect("write b");
@@ -85975,7 +86140,10 @@ mod tests {
             .expect("create guest dir");
         let path = "C:\\game\\eio.txt";
         fs::write(
-            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            runtime
+                .win32
+                .guest_path_to_host_path(path)
+                .expect("host path"),
             b"data",
         )
         .expect("write");
@@ -86006,7 +86174,12 @@ mod tests {
         dispatch_x86_thunk(&mut runtime, &mut memory, set_errno, &[0]);
         let buf = 0x62_000;
         memory.map_bytes(buf, &[0_u8; 16]);
-        let ret = dispatch_x86_thunk(&mut runtime, &mut memory, fgets, &[buf as u32, 16, fp as u32]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            fgets,
+            &[buf as u32, 16, fp as u32],
+        );
         assert_eq!(ret, 0);
         assert_eq!(runtime.crt_errno_get(&mut memory), EIO);
     }
@@ -86020,7 +86193,10 @@ mod tests {
             .expect("create guest dir");
         let path = "C:\\game\\leak.txt";
         fs::write(
-            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            runtime
+                .win32
+                .guest_path_to_host_path(path)
+                .expect("host path"),
             b"x",
         )
         .expect("write");
@@ -86108,7 +86284,14 @@ mod tests {
                 &mut runtime,
                 &mut memory,
                 beginthreadex,
-                &[0, 0, entrypoint as u32, 0, CREATE_SUSPENDED, thread_id_ptr as u32],
+                &[
+                    0,
+                    0,
+                    entrypoint as u32,
+                    0,
+                    CREATE_SUSPENDED,
+                    thread_id_ptr as u32,
+                ],
             );
             assert_ne!(handle, 0);
             assert_eq!(runtime.pending_guest_threads.len(), 1);
@@ -86125,12 +86308,8 @@ mod tests {
             assert_eq!(runtime.pending_guest_threads.len(), 1);
 
             // SuspendThread again → previous count 1, count now 2.
-            let prev = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                suspend_thread,
-                &[handle as u32],
-            );
+            let prev =
+                dispatch_x86_thunk(&mut runtime, &mut memory, suspend_thread, &[handle as u32]);
             assert_eq!(prev, 1);
             assert_eq!(runtime.pending_guest_threads[0].suspended, 2);
             assert!(
@@ -86141,12 +86320,8 @@ mod tests {
             );
 
             // One resume → still suspended (counted semantics).
-            let prev = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                resume_thread,
-                &[handle as u32],
-            );
+            let prev =
+                dispatch_x86_thunk(&mut runtime, &mut memory, resume_thread, &[handle as u32]);
             assert_eq!(prev, 2);
             assert_eq!(runtime.pending_guest_threads[0].suspended, 1);
             assert!(
@@ -86157,12 +86332,8 @@ mod tests {
             );
 
             // Final resume → thread runs to completion.
-            let prev = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                resume_thread,
-                &[handle as u32],
-            );
+            let prev =
+                dispatch_x86_thunk(&mut runtime, &mut memory, resume_thread, &[handle as u32]);
             assert_eq!(prev, 1);
             assert_eq!(runtime.pending_guest_threads[0].suspended, 0);
             assert!(
@@ -86185,7 +86356,10 @@ mod tests {
             .expect("create guest dir");
         let path = "C:\\game\\ro.txt";
         fs::write(
-            runtime.win32.guest_path_to_host_path(path).expect("host path"),
+            runtime
+                .win32
+                .guest_path_to_host_path(path)
+                .expect("host path"),
             b"x",
         )
         .expect("write");
@@ -86203,7 +86377,9 @@ mod tests {
         // Break the backing handle behind the stream's back.
         let handle = runtime.crt_stream_state(fp).expect("state").handle;
         runtime.win32.close_handle(handle).expect("close handle");
-        let format = runtime.alloc_utf16_string(&mut memory, "hi").expect("format");
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "hi")
+            .expect("format");
         let va_area = 0x63_000;
         memory.map_bytes(va_area, &[0_u8; 16]);
         let written = dispatch_x86_thunk(
@@ -86220,7 +86396,9 @@ mod tests {
     fn crt_vfprintf_nul_target_raises_einval_and_continues() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
         let vfprintf = runtime.alloc_host_thunk(HostThunk::StdioCommonVfprintf);
-        let format = runtime.alloc_utf16_string(&mut memory, "%n").expect("format");
+        let format = runtime
+            .alloc_utf16_string(&mut memory, "%n")
+            .expect("format");
         let va_area = 0x63_000;
         memory.map_bytes(va_area, &[0_u8; 16]);
         write_u32(&mut memory, va_area, 0); // NULL %n target
@@ -86237,13 +86415,8 @@ mod tests {
     #[test]
     fn crt_atof_x64_writes_xmm0() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(
-            temp_dir.path(),
-            "atof-x64",
-            GeArch::X64,
-            "win11-23h2",
-        )
-        .expect("create ge");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "atof-x64", GeArch::X64, "win11-23h2")
+            .expect("create ge");
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
         let mut memory = MemoryImage::default();
@@ -86305,12 +86478,7 @@ mod tests {
             // timer with user32 (the previous no-op thunk never fired
             // WM_TIMER).
             let set_timer = runtime.alloc_host_thunk(HostThunk::SetTimer);
-            let result = dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                set_timer,
-                &[hwnd, 7, 1, 0],
-            );
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, set_timer, &[hwnd, 7, 1, 0]);
             assert_eq!(result, 7, "SetTimer returns the timer id");
             assert_eq!(
                 runtime.user32.timer_count(),
@@ -86362,10 +86530,14 @@ mod tests {
                 .expect("seed process state");
 
             let (event_handle, _created) = runtime.win32.create_event(false, false, false, None);
-            assert!(!runtime.win32.wait_for_single_object(event_handle, 0, false, None)
-                .expect("initial poll")
-                .eq(&crate::win32::WaitStatus::Object0),
-                "auto-reset event starts unsignaled");
+            assert!(
+                !runtime
+                    .win32
+                    .wait_for_single_object(event_handle, 0, false, None)
+                    .expect("initial poll")
+                    .eq(&crate::win32::WaitStatus::Object0),
+                "auto-reset event starts unsignaled"
+            );
 
             let set_event = runtime.alloc_host_thunk(HostThunk::SetEvent);
             let wait_for_single_object = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
@@ -86410,10 +86582,14 @@ mod tests {
                 "pump-phase signal must be reported as WAIT_OBJECT_0"
             );
             // The signal was consumed by the wait (auto-reset).
-            assert!(!runtime.win32.wait_for_single_object(event_handle, 0, false, None)
-                .expect("post-wait poll")
-                .eq(&crate::win32::WaitStatus::Object0),
-                "auto-reset signal must be consumed");
+            assert!(
+                !runtime
+                    .win32
+                    .wait_for_single_object(event_handle, 0, false, None)
+                    .expect("post-wait poll")
+                    .eq(&crate::win32::WaitStatus::Object0),
+                "auto-reset signal must be consumed"
+            );
             // The worker ran to completion inside the wait.
             assert!(runtime.pending_guest_threads.is_empty());
         })
@@ -86495,8 +86671,7 @@ mod tests {
             state.rip = spin_rip;
 
             let tick_before = runtime.win32.get_tick_count64();
-            let spin_deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(50);
+            let spin_deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             let mut last_safepoint = std::time::Instant::now();
             while std::time::Instant::now() < spin_deadline {
                 // Main-loop block dispatch: decode + execute one block of
@@ -86557,13 +86732,15 @@ mod tests {
                 "Sleep(20) worker must complete during the spin (safepoint pumped it)"
             );
             assert_eq!(
-                runtime.win32.get_exit_code_thread(worker_handle).expect("exit code"),
+                runtime
+                    .win32
+                    .get_exit_code_thread(worker_handle)
+                    .expect("exit code"),
                 Some(0),
                 "Sleep(20)-then-exit worker must have exited cleanly"
             );
         })
     }
-
 }
 
 fn read_d3d12_command_queue_desc(
@@ -87717,10 +87894,11 @@ fn render_live_window_preview(
     let has_real_surface = window_surfaces
         .get(&layout.root.hwnd)
         .is_some_and(|surface| surface.real_pixels)
-        || layout
-            .children
-            .iter()
-            .any(|(child, _)| window_surfaces.get(&child.hwnd).is_some_and(|s| s.real_pixels));
+        || layout.children.iter().any(|(child, _)| {
+            window_surfaces
+                .get(&child.hwnd)
+                .is_some_and(|s| s.real_pixels)
+        });
     if !has_real_surface {
         return None;
     }
@@ -87728,7 +87906,10 @@ fn render_live_window_preview(
     let mut bytes = vec![0_u8; layout.width.checked_mul(layout.height)?.checked_mul(4)?];
 
     // Blit the root window's GDI-rendered surface (real guest pixels only).
-    if let Some(surface) = window_surfaces.get(&layout.root.hwnd).filter(|s| s.real_pixels) {
+    if let Some(surface) = window_surfaces
+        .get(&layout.root.hwnd)
+        .filter(|s| s.real_pixels)
+    {
         blit_window_surface(
             &mut bytes,
             layout.width,
@@ -88859,11 +89040,14 @@ fn systemtime_to_filetime_ticks(
         y * 365 + y.div_ceil(4) - y.div_ceil(100) + y.div_ceil(400) + (m * 153 + 2) / 5 + d - 719468
     } else {
         let yn = y - 1;
-        yn * 365 + yn.div_ceil(4) - yn.div_ceil(100) + yn.div_ceil(400) + ((m + 9) * 153 + 2) / 5 + d
+        yn * 365 + yn.div_ceil(4) - yn.div_ceil(100)
+            + yn.div_ceil(400)
+            + ((m + 9) * 153 + 2) / 5
+            + d
             - 719468
     };
     let total_days = DAYS_1601_TO_1970 + days_from_epoch;
-    
+
     total_days * 864_000_000_000  // days to 100ns
         + hour as u64 * 3_600_000_000
         + minute as u64 * 60_000_000
@@ -89663,29 +89847,31 @@ fn initial_guest_current_directory(
 ) -> String {
     let candidate = runtime_guest_path(ge, host_cwd);
     if is_windows_absolute_path(&candidate)
-        && let Some(drive_prefix) = windows_drive_prefix(&candidate) {
-            let drive = &drive_prefix[..1];
-            if ge
-                .active_drive_mappings()
-                .iter()
-                .any(|mapping| mapping.drive.eq_ignore_ascii_case(drive))
-            {
-                return candidate;
-            }
+        && let Some(drive_prefix) = windows_drive_prefix(&candidate)
+    {
+        let drive = &drive_prefix[..1];
+        if ge
+            .active_drive_mappings()
+            .iter()
+            .any(|mapping| mapping.drive.eq_ignore_ascii_case(drive))
+        {
+            return candidate;
         }
+    }
     windows_parent_path(guest_program_path).unwrap_or_else(|| "C:\\".to_string())
 }
 
 fn drive_relative_base(current_directory: &str, drive_prefix: &str) -> String {
     if let Some(current_drive) = windows_drive_prefix(current_directory)
-        && current_drive.eq_ignore_ascii_case(drive_prefix) {
-            let trimmed = current_directory.trim_end_matches(['\\', '/']);
-            return if trimmed.len() <= 2 {
-                format!("{drive_prefix}\\")
-            } else {
-                trimmed.to_string()
-            };
-        }
+        && current_drive.eq_ignore_ascii_case(drive_prefix)
+    {
+        let trimmed = current_directory.trim_end_matches(['\\', '/']);
+        return if trimmed.len() <= 2 {
+            format!("{drive_prefix}\\")
+        } else {
+            trimmed.to_string()
+        };
+    }
     format!("{drive_prefix}\\")
 }
 
@@ -100522,17 +100708,18 @@ impl SteamCliFlags {
             match arg.as_str() {
                 "-applaunch" | "-launch" => {
                     if i + 1 < args.len()
-                        && let Ok(id) = args[i + 1].parse::<u32>() {
-                            flags.applaunch = Some(id);
-                            i += 2;
-                            // Collect game-specific arguments (everything up
-                            // to the next flag)
-                            while i < args.len() && !args[i].starts_with('-') {
-                                flags.applaunch_args.push(args[i].clone());
-                                i += 1;
-                            }
-                            continue;
+                        && let Ok(id) = args[i + 1].parse::<u32>()
+                    {
+                        flags.applaunch = Some(id);
+                        i += 2;
+                        // Collect game-specific arguments (everything up
+                        // to the next flag)
+                        while i < args.len() && !args[i].starts_with('-') {
+                            flags.applaunch_args.push(args[i].clone());
+                            i += 1;
                         }
+                        continue;
+                    }
                 }
                 "-silent" | "-silentlaunch" => {
                     flags.silent = true;

@@ -102,7 +102,10 @@ fn t15_2_av_sync_stays_under_fifty_ms_over_ten_minutes() {
     // pinned value is the deterministic expected result for this specific 14_400-frame /
     // 14_399-block input (computed once from a known-good run, not re-derived here).
     assert_eq!(drift, GOLDEN_AV_DRIFT_MS, "AV drift regression");
-    assert!(drift < 50, "AV drift {drift} ms violates the 50 ms contract");
+    assert!(
+        drift < 50,
+        "AV drift {drift} ms violates the 50 ms contract"
+    );
 }
 
 #[test]
@@ -155,9 +158,7 @@ fn t15_3_media_fuzz_corpus_never_crashes_and_classifies_errors() {
         MediaInputClassification::Error(ReasonCode::RcMediaInvalid)
     );
 
-    let rogue_path = std::env::temp_dir()
-        .join("casa1-rogue")
-        .join("codec.dylib");
+    let rogue_path = std::env::temp_dir().join("casa1-rogue").join("codec.dylib");
     let untrusted = shim
         .decode_golden_clip(&GoldenClip {
             id: "bad-decoder".to_string(),

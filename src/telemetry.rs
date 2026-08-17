@@ -185,16 +185,16 @@ impl TelemetryCollector {
         {
             let mut data = self.data.lock().unwrap();
             let key = format!("{}!{}", dll, symbol);
-            let entry = data
-                .unsupported_imports
-                .entry(key)
-                .or_insert_with(|| UnsupportedImportEntry {
-                    dll: dll.to_string(),
-                    symbol: symbol.to_string(),
-                    frequency: 0,
-                    first_seen: now,
-                    last_seen: now,
-                });
+            let entry =
+                data.unsupported_imports
+                    .entry(key)
+                    .or_insert_with(|| UnsupportedImportEntry {
+                        dll: dll.to_string(),
+                        symbol: symbol.to_string(),
+                        frequency: 0,
+                        first_seen: now,
+                        last_seen: now,
+                    });
             entry.frequency += 1;
             entry.last_seen = now;
         }

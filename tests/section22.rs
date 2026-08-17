@@ -215,9 +215,7 @@ fn t22_3_vulkan_state_lifecycle() {
         "expected no validation errors, got {:?}",
         frame.validation_errors
     );
-    let repeat = loader
-        .render_sample(&sample)
-        .expect("render sample again");
+    let repeat = loader.render_sample(&sample).expect("render sample again");
     assert_eq!(
         frame.hash, repeat.hash,
         "rendering the same sample must be deterministic"
@@ -388,7 +386,9 @@ fn t22_5_drm_steamstub_decrypt() {
         expected,
         "decrypted bytes must be written back into guest memory"
     );
-    let entry = memory.read_u32(base_addr + pe_offset + 40).expect("read entry");
+    let entry = memory
+        .read_u32(base_addr + pe_offset + 40)
+        .expect("read entry");
     assert_eq!(
         entry, 0x1000,
         "AddressOfEntryPoint must be restored to original_entry_point"
@@ -913,9 +913,7 @@ fn t22_12_end_to_end_integration() {
     );
     assert_eq!(present.displayed_frame_index, 1, "first present is frame 1");
 
-    let presented = runtime
-        .presented_frame(swapchain)
-        .expect("presented frame");
+    let presented = runtime.presented_frame(swapchain).expect("presented frame");
     assert_eq!(presented.width, 1280);
     assert_eq!(presented.height, 720);
     assert_eq!(presented.format, DxgiFormat::R8G8B8A8Unorm);

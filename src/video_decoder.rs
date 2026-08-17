@@ -32,7 +32,9 @@ pub(crate) const HTTP_FETCH_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// Used inside C callbacks where a panic would unwind across the FFI
 /// boundary (undefined behavior in release builds).
 fn lock_poisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Fetch an HTTP(S) URL into memory, rejecting responses larger than `limit`.
@@ -1183,7 +1185,9 @@ impl VideoDecoder {
         let cleanup_on_error = |self_ref: &mut Self, format_desc: CMVideoFormatDescriptionRef| {
             self_ref.context = None;
             if let Some(refcon) = self_ref.callback_refcon.take() {
-                unsafe { let _ = Arc::from_raw(refcon as *const DecoderContext); }
+                unsafe {
+                    let _ = Arc::from_raw(refcon as *const DecoderContext);
+                }
             }
             if !format_desc.is_null() {
                 unsafe { CFRelease(format_desc as CFTypeRef) };
@@ -1416,7 +1420,9 @@ impl VideoDecoder {
         // no new callbacks can start, and any in-flight callback holds its
         // own strong reference via `Arc::increment_strong_count`.
         if let Some(refcon) = self.callback_refcon.take() {
-            unsafe { let _ = Arc::from_raw(refcon as *const DecoderContext); }
+            unsafe {
+                let _ = Arc::from_raw(refcon as *const DecoderContext);
+            }
         }
         self.context = None;
     }
@@ -1580,9 +1586,7 @@ pub fn prepare_metal_texture_upload(
             if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
                 return Err(AppError::new(
                     ReasonCode::RcMediaInvalid,
-                    format!(
-                        "NV12 upload requires even dimensions, got {width}x{height}"
-                    ),
+                    format!("NV12 upload requires even dimensions, got {width}x{height}"),
                 ));
             }
 
@@ -2059,101 +2063,102 @@ fn software_copy(
                     let data_size = CVPixelBufferGetDataSize(imageBuffer);
                     let slice_len = bpr.checked_mul(h).unwrap_or(0).min(data_size);
                     if slice_len == 0 {
-                    None
-                } else {
-                    let src = std::slice::from_raw_parts(base as *const u8, slice_len);
-                    for y in 0..h {
-                        let row = y * bpr;
-                        for x in 0..w {
-                            let si = row + x * 4;
-                            let di = (y * w + x) * 4;
-                            if si + 3 < src.len() {
-                                // BGRA -> RGBA: swap B and R
-                                scratch[di] = src[si + 2]; // R
-                                scratch[di + 1] = src[si + 1]; // G
-                                scratch[di + 2] = src[si]; // B
-                                scratch[di + 3] = src[si + 3]; // A
+                        None
+                    } else {
+                        let src = std::slice::from_raw_parts(base as *const u8, slice_len);
+                        for y in 0..h {
+                            let row = y * bpr;
+                            for x in 0..w {
+                                let si = row + x * 4;
+                                let di = (y * w + x) * 4;
+                                if si + 3 < src.len() {
+                                    // BGRA -> RGBA: swap B and R
+                                    scratch[di] = src[si + 2]; // R
+                                    scratch[di + 1] = src[si + 1]; // G
+                                    scratch[di + 2] = src[si]; // B
+                                    scratch[di + 3] = src[si + 3]; // A
+                                }
                             }
                         }
+                        Some(std::mem::take(&mut *scratch))
                     }
-                    Some(std::mem::take(&mut *scratch))
                 }
             }
-        }
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
-            // NV12 bi-planar: Y plane + interleaved UV plane
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+                // NV12 bi-planar: Y plane + interleaved UV plane
+                let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
+                let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
+                let y_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
+                let uv_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
 
-            if y_base.is_null() || uv_base.is_null() {
-                None
-            } else {
-                let y_slice_len = y_bpr.checked_mul(h).unwrap_or(0);
-                let uv_slice_len = uv_bpr.checked_mul(h.div_ceil(2)).unwrap_or(0);
-                if y_slice_len == 0 || uv_slice_len == 0 {
+                if y_base.is_null() || uv_base.is_null() {
                     None
                 } else {
-                    let y_src = std::slice::from_raw_parts(y_base as *const u8, y_slice_len);
-                    let uv_src = std::slice::from_raw_parts(uv_base as *const u8, uv_slice_len);
-                    let (cr, cg_u, cg_v, cb) = yuv_to_rgb_coeffs(ctx.color_space);
+                    let y_slice_len = y_bpr.checked_mul(h).unwrap_or(0);
+                    let uv_slice_len = uv_bpr.checked_mul(h.div_ceil(2)).unwrap_or(0);
+                    if y_slice_len == 0 || uv_slice_len == 0 {
+                        None
+                    } else {
+                        let y_src = std::slice::from_raw_parts(y_base as *const u8, y_slice_len);
+                        let uv_src = std::slice::from_raw_parts(uv_base as *const u8, uv_slice_len);
+                        let (cr, cg_u, cg_v, cb) = yuv_to_rgb_coeffs(ctx.color_space);
 
-                    for y in 0..h {
-                        for x in 0..w {
-                            let y_idx = y * y_bpr + x;
-                            let uv_idx = (y / 2) * uv_bpr + (x / 2) * 2;
+                        for y in 0..h {
+                            for x in 0..w {
+                                let y_idx = y * y_bpr + x;
+                                let uv_idx = (y / 2) * uv_bpr + (x / 2) * 2;
 
-                            let y_val = *y_src.get(y_idx).unwrap_or(&128) as f32;
-                            let u_val = *uv_src.get(uv_idx).unwrap_or(&128) as f32 - 128.0;
-                            let v_val = *uv_src.get(uv_idx + 1).unwrap_or(&128) as f32 - 128.0;
+                                let y_val = *y_src.get(y_idx).unwrap_or(&128) as f32;
+                                let u_val = *uv_src.get(uv_idx).unwrap_or(&128) as f32 - 128.0;
+                                let v_val = *uv_src.get(uv_idx + 1).unwrap_or(&128) as f32 - 128.0;
 
-                            let r = (y_val + cr * v_val).clamp(0.0, 255.0) as u8;
-                            let g = (y_val - cg_u * u_val - cg_v * v_val).clamp(0.0, 255.0) as u8;
-                            let b = (y_val + cb * u_val).clamp(0.0, 255.0) as u8;
+                                let r = (y_val + cr * v_val).clamp(0.0, 255.0) as u8;
+                                let g =
+                                    (y_val - cg_u * u_val - cg_v * v_val).clamp(0.0, 255.0) as u8;
+                                let b = (y_val + cb * u_val).clamp(0.0, 255.0) as u8;
 
-                            let di = (y * w + x) * 4;
-                            scratch[di] = r;
-                            scratch[di + 1] = g;
-                            scratch[di + 2] = b;
-                            scratch[di + 3] = 255;
-                        }
-                    }
-                    Some(std::mem::take(&mut *scratch))
-                }
-            }
-        }
-        _ => {
-            // Unknown format — try reading as packed BGRA anyway
-            let bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
-            let base = CVPixelBufferGetBaseAddress(imageBuffer);
-            if base.is_null() {
-                None
-            } else {
-                let data_size = CVPixelBufferGetDataSize(imageBuffer);
-                let slice_len = bpr.checked_mul(h).unwrap_or(0).min(data_size);
-                if slice_len == 0 {
-                    None
-                } else {
-                    let src = std::slice::from_raw_parts(base as *const u8, slice_len);
-                    for y in 0..h {
-                        let row = y * bpr;
-                        for x in 0..w {
-                            let si = row + x * 4;
-                            let di = (y * w + x) * 4;
-                            if si + 3 < src.len() {
-                                scratch[di] = src[si + 2];
-                                scratch[di + 1] = src[si + 1];
-                                scratch[di + 2] = src[si];
+                                let di = (y * w + x) * 4;
+                                scratch[di] = r;
+                                scratch[di + 1] = g;
+                                scratch[di + 2] = b;
                                 scratch[di + 3] = 255;
                             }
                         }
+                        Some(std::mem::take(&mut *scratch))
                     }
-                    Some(std::mem::take(&mut *scratch))
                 }
             }
-        }
-    };
+            _ => {
+                // Unknown format — try reading as packed BGRA anyway
+                let bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
+                let base = CVPixelBufferGetBaseAddress(imageBuffer);
+                if base.is_null() {
+                    None
+                } else {
+                    let data_size = CVPixelBufferGetDataSize(imageBuffer);
+                    let slice_len = bpr.checked_mul(h).unwrap_or(0).min(data_size);
+                    if slice_len == 0 {
+                        None
+                    } else {
+                        let src = std::slice::from_raw_parts(base as *const u8, slice_len);
+                        for y in 0..h {
+                            let row = y * bpr;
+                            for x in 0..w {
+                                let si = row + x * 4;
+                                let di = (y * w + x) * 4;
+                                if si + 3 < src.len() {
+                                    scratch[di] = src[si + 2];
+                                    scratch[di + 1] = src[si + 1];
+                                    scratch[di + 2] = src[si];
+                                    scratch[di + 3] = 255;
+                                }
+                            }
+                        }
+                        Some(std::mem::take(&mut *scratch))
+                    }
+                }
+            }
+        };
 
         // Unlock the pixel buffer
         CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
@@ -2439,8 +2444,12 @@ pub fn parse_h264_sps(sps: &[u8]) -> (u32, u32) {
             let crop_unit_x: u64 = 2; // 4:2:0 chroma
             let crop_unit_y: u64 = 2;
 
-            let crop_w = crop_left.saturating_add(crop_right).saturating_mul(crop_unit_x);
-            let crop_h = crop_top.saturating_add(crop_bottom).saturating_mul(crop_unit_y);
+            let crop_w = crop_left
+                .saturating_add(crop_right)
+                .saturating_mul(crop_unit_x);
+            let crop_h = crop_top
+                .saturating_add(crop_bottom)
+                .saturating_mul(crop_unit_y);
             // Reject crops that exceed the frame size (would underflow).
             if crop_w < width && crop_h < height {
                 let width_cropped = width - crop_w;
@@ -3154,7 +3163,9 @@ mod tests {
         let frame = VideoFrame {
             width: 4,
             height: 4,
-            data: std::iter::repeat_n([255u8, 0, 0, 255], 16).flatten().collect(), // Red RGBA pixels
+            data: std::iter::repeat_n([255u8, 0, 0, 255], 16)
+                .flatten()
+                .collect(), // Red RGBA pixels
             pts: 0,
             duration: 33_333,
             texture_id: None,

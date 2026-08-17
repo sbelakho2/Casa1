@@ -921,8 +921,10 @@ impl MslShaderGenerator {
             ));
         }
         if tess_factor_count > 4 {
-            source.push_str("        _hs_tess_factors[4] = 1.0; // inside factor 0 (placeholder)\n");
-            source.push_str("        _hs_tess_factors[5] = 1.0; // inside factor 1 (placeholder)\n");
+            source
+                .push_str("        _hs_tess_factors[4] = 1.0; // inside factor 0 (placeholder)\n");
+            source
+                .push_str("        _hs_tess_factors[5] = 1.0; // inside factor 1 (placeholder)\n");
         }
         source.push_str("    }\n\n");
 
@@ -2055,7 +2057,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(entries.is_empty(), "no files may be written for invalid hashes");
+        assert!(
+            entries.is_empty(),
+            "no files may be written for invalid hashes"
+        );
     }
 
     #[test]

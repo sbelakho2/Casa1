@@ -95,7 +95,9 @@ where
         let boxed: Box<dyn FnMut()> = Box::new(move || {
             if let Some(f) = f.take() {
                 // SAFETY: result_ptr is valid and written exactly once.
-                unsafe { std::ptr::write(result_ptr, f()); }
+                unsafe {
+                    std::ptr::write(result_ptr, f());
+                }
             }
             let (lock, cvar) = &*done_clone;
             let mut completed = lock.lock().unwrap();
@@ -106,8 +108,7 @@ where
         // SAFETY: Box<dyn FnMut()> and Box<dyn FnMut() + Send> have the same
         // layout (data pointer + vtable pointer). The closure is only ever
         // executed on the main thread, so asserting Send is sound.
-        let work: Box<dyn FnMut() + Send> =
-            unsafe { std::mem::transmute(boxed) };
+        let work: Box<dyn FnMut() + Send> = unsafe { std::mem::transmute(boxed) };
 
         // Clone done before moving it into MainQueueItem, so we can
         // still reference it for the wait below.
@@ -431,7 +432,8 @@ pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
                 return result;
             }
             let count: usize = msg_send![screens, count];
-            let num_key: *mut objc::runtime::Object = msg_send![objc::class!(NSString), stringWithUTF8String: c"NSScreenNumber".as_ptr()];
+            let num_key: *mut objc::runtime::Object =
+                msg_send![objc::class!(NSString), stringWithUTF8String: c"NSScreenNumber".as_ptr()];
             for i in 0..count {
                 let screen: *mut objc::runtime::Object = msg_send![screens, objectAtIndex: i];
                 if screen.is_null() {
@@ -442,7 +444,8 @@ pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
                 let scale: f64 = msg_send![screen, backingScaleFactor];
                 let is_main: bool = msg_send![screen, isMainScreen];
                 let desc: *mut objc::runtime::Object = msg_send![screen, deviceDescription];
-                let display_id_obj: *mut objc::runtime::Object = msg_send![desc, objectForKey: num_key];
+                let display_id_obj: *mut objc::runtime::Object =
+                    msg_send![desc, objectForKey: num_key];
                 let display_id: u32 = msg_send![display_id_obj, unsignedIntValue];
                 // Get localized name
                 let name_obj: *mut objc::runtime::Object = msg_send![screen, localizedName];
@@ -838,12 +841,8 @@ pub fn create_nswindow(
             // macOS uses a flipped coordinate system where y=0 is bottom.
             // Resolve the screen that contains the requested position so the
             // flip uses the correct display height on multi-monitor setups.
-            let (screen_top, _screen_height) = target_screen_top(
-                x as f64,
-                y as f64,
-                width as f64,
-                height as f64,
-            );
+            let (screen_top, _screen_height) =
+                target_screen_top(x as f64, y as f64, width as f64, height as f64);
             let flipped_y = screen_top - (y as f64) - (height as f64);
 
             let frame = NSRect::new(

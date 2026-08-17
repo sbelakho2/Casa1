@@ -465,9 +465,10 @@ impl SteamClient {
         // Snapshot the file maps only when a mid-write failure is simulated
         // (test hook); the normal path must not clone every installed byte
         // (potentially gigabytes of game data) for the whole update.
-        let rollback = plan.fail_after_write.is_some().then(|| {
-            (self.files.clone(), self.path_case.clone())
-        });
+        let rollback = plan
+            .fail_after_write
+            .is_some()
+            .then(|| (self.files.clone(), self.path_case.clone()));
 
         for (path, bytes) in &plan.files {
             let normalized = normalize_path(path);
@@ -1371,7 +1372,9 @@ fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
                         "unterminated quoted string in Steam metadata",
                     ));
                 }
-                tokens.push(VdfToken::String(String::from_utf8_lossy(&value).into_owned()));
+                tokens.push(VdfToken::String(
+                    String::from_utf8_lossy(&value).into_owned(),
+                ));
             }
             _ => {
                 return Err(
@@ -1424,7 +1427,10 @@ fn parse_vdf_map(
                     }
                     VdfToken::OpenBrace => {
                         *index += 1;
-                        map.insert(key, VdfNode::Object(parse_vdf_map(tokens, index, depth + 1)?));
+                        map.insert(
+                            key,
+                            VdfNode::Object(parse_vdf_map(tokens, index, depth + 1)?),
+                        );
                     }
                     VdfToken::CloseBrace => {
                         return Err(AppError::new(
@@ -1527,14 +1533,18 @@ fn split_registry_entry(entry_path: &str) -> AppResult<(String, String, String)>
             format!("invalid Steam registry entry {entry_path}"),
         ));
     }
-    let hive = parts
-        .first()
-        .cloned()
-        .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("invalid Steam registry entry {entry_path}")))?;
-    let value_name = parts
-        .last()
-        .cloned()
-        .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("invalid Steam registry entry {entry_path}")))?;
+    let hive = parts.first().cloned().ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("invalid Steam registry entry {entry_path}"),
+        )
+    })?;
+    let value_name = parts.last().cloned().ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("invalid Steam registry entry {entry_path}"),
+        )
+    })?;
     let key = parts[1..parts.len() - 1].join("\\");
     Ok((hive, key, value_name))
 }
@@ -2428,7 +2438,10 @@ impl ContentManager {
             if chunk.offset < offset {
                 return Err(AppError::new(
                     ReasonCode::RcIo,
-                    format!("chunk offset {} below assembled length {offset}", chunk.offset),
+                    format!(
+                        "chunk offset {} below assembled length {offset}",
+                        chunk.offset
+                    ),
                 ));
             }
             let end = chunk.offset.saturating_add(chunk_data.len() as u64);
@@ -2891,10 +2904,7 @@ impl ContentManager {
     /// Stage a downloaded file into the content manager's temporary storage.
     pub fn stage_downloaded_file(&mut self, app_id: u32, filename: &str, data: Vec<u8>) {
         if let Some(session) = self.downloads.get_mut(&app_id)
-            && let Some(file) = session
-                .files
-                .iter_mut()
-                .find(|f| f.filename == filename)
+            && let Some(file) = session.files.iter_mut().find(|f| f.filename == filename)
         {
             file.data = data;
             file.state = DownloadState::Completed;

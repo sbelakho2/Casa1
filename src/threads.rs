@@ -212,7 +212,10 @@ impl GuestMutex {
             }
             // Condvar::wait re-locks the (possibly poisoned) mutex; recover
             // from poison instead of panicking every subsequent waiter.
-            state = self.condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state = self
+                .condvar
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -280,7 +283,10 @@ impl GuestSemaphore {
     pub fn wait(&self) {
         let mut count = lock_with_recovery(&self.inner);
         while *count == 0 {
-            count = self.condvar.wait(count).unwrap_or_else(PoisonError::into_inner);
+            count = self
+                .condvar
+                .wait(count)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         *count -= 1;
     }
@@ -358,7 +364,10 @@ impl GuestEvent {
     pub fn wait(&self) {
         let mut state = lock_with_recovery(&self.inner);
         while !state.signaled {
-            state = self.condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state = self
+                .condvar
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         if state.auto_reset {
             state.signaled = false;
@@ -744,31 +753,33 @@ impl GuestThreadPool {
                 let completed_work = self.completed_work.clone();
                 let work_available = self.work_available.clone();
                 let shutdown = self.shutdown.clone();
-                self.threads.push(std::thread::spawn(move || loop {
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let item = {
-                        let mut queue = lock_with_recovery(&active_work);
-                        while queue.is_empty() && !shutdown.load(Ordering::Acquire) {
-                            queue = work_available
-                                .wait(queue)
-                                .unwrap_or_else(PoisonError::into_inner);
+                self.threads.push(std::thread::spawn(move || {
+                    loop {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
                         }
-                        queue.pop_front()
-                    };
-                    if let Some(item) = item {
-                        // Hand the item to the runtime's dispatch loop instead
-                        // of discarding it — the guest callback must never be
-                        // silently lost.
-                        let mut completed = lock_with_recovery(&completed_work);
-                        if completed.len() >= THREAD_POOL_COMPLETED_CAP {
-                            eprintln!(
-                                "[threads] completed work queue full; dropping callback={:#x}",
-                                item.callback
-                            );
-                        } else {
-                            completed.push_back(item);
+                        let item = {
+                            let mut queue = lock_with_recovery(&active_work);
+                            while queue.is_empty() && !shutdown.load(Ordering::Acquire) {
+                                queue = work_available
+                                    .wait(queue)
+                                    .unwrap_or_else(PoisonError::into_inner);
+                            }
+                            queue.pop_front()
+                        };
+                        if let Some(item) = item {
+                            // Hand the item to the runtime's dispatch loop instead
+                            // of discarding it — the guest callback must never be
+                            // silently lost.
+                            let mut completed = lock_with_recovery(&completed_work);
+                            if completed.len() >= THREAD_POOL_COMPLETED_CAP {
+                                eprintln!(
+                                    "[threads] completed work queue full; dropping callback={:#x}",
+                                    item.callback
+                                );
+                            } else {
+                                completed.push_back(item);
+                            }
                         }
                     }
                 }));
@@ -997,9 +1008,11 @@ impl GuestConditionVariable {
             Some(ms) => {
                 let (guard, timeout_result) = self
                     .inner
-                    .wait_timeout_while(lock_with_recovery(&lock), Duration::from_millis(ms), |_| {
-                        self.wake_generation.load(Ordering::Acquire) == generation
-                    })
+                    .wait_timeout_while(
+                        lock_with_recovery(&lock),
+                        Duration::from_millis(ms),
+                        |_| self.wake_generation.load(Ordering::Acquire) == generation,
+                    )
                     .unwrap_or_else(PoisonError::into_inner);
                 drop(guard);
                 !timeout_result.timed_out()
@@ -1121,12 +1134,12 @@ impl MmapStack {
         // zeroes newly-mapped pages (MAP_ANONYMOUS).
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),     // let the kernel choose the address
+                std::ptr::null_mut(), // let the kernel choose the address
                 total_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,                       // fd (ignored for MAP_ANONYMOUS)
-                0,                        // offset
+                -1, // fd (ignored for MAP_ANONYMOUS)
+                0,  // offset
             )
         };
 
@@ -1139,12 +1152,12 @@ impl MmapStack {
         }
 
         // SAFETY: `mprotect` marks the first page as inaccessible (guard).
-        let ret = unsafe {
-            libc::mprotect(ptr, guard_size, libc::PROT_NONE)
-        };
+        let ret = unsafe { libc::mprotect(ptr, guard_size, libc::PROT_NONE) };
         if ret != 0 {
             // Unmap before failing to avoid leaking the mapping.
-            unsafe { libc::munmap(ptr, total_size); }
+            unsafe {
+                libc::munmap(ptr, total_size);
+            }
             eprintln!(
                 "[threads] mprotect guard page failed: {}",
                 std::io::Error::last_os_error()
@@ -1152,7 +1165,10 @@ impl MmapStack {
             return None;
         }
 
-        Some(Self { ptr: ptr as *mut u8, size: total_size })
+        Some(Self {
+            ptr: ptr as *mut u8,
+            size: total_size,
+        })
     }
 
     /// Pointer to the start of the *usable* stack (just above the guard page).
@@ -1221,7 +1237,12 @@ impl GuestFiberContext {
     /// bottom so that a stack overflow triggers a segfault instead of
     /// silently corrupting adjacent heap memory. Returns `None` if the
     /// allocation fails (the caller maps this to a NULL fiber handle).
-    pub fn new(fiber_id: u32, stack_size: usize, start_address: u64, parameter: u64) -> Option<Self> {
+    pub fn new(
+        fiber_id: u32,
+        stack_size: usize,
+        start_address: u64,
+        parameter: u64,
+    ) -> Option<Self> {
         let mmap_stack = MmapStack::new(stack_size)?;
         let stack_limit = mmap_stack.usable_ptr() as u64;
         // Align stack base to 16 bytes
@@ -1473,9 +1494,7 @@ impl GuestFiberManager {
     /// Save the current CpuState into the currently executing fiber (of the
     /// calling thread).
     pub fn save_current_state(&mut self, state: &CpuState) {
-        if let Some(fiber) =
-            current_fiber_handle().and_then(|h| self.fibers.get_mut(&(h as u32)))
-        {
+        if let Some(fiber) = current_fiber_handle().and_then(|h| self.fibers.get_mut(&(h as u32))) {
             fiber.state = Some(state.clone());
         }
     }
@@ -1560,10 +1579,7 @@ struct WaitRegistration {
 
 /// Push an item to the completed queue, bounding growth if the runtime does
 /// not drain it.
-fn push_completed_item(
-    queue: &Mutex<VecDeque<ThreadPoolWorkItem>>,
-    item: ThreadPoolWorkItem,
-) {
+fn push_completed_item(queue: &Mutex<VecDeque<ThreadPoolWorkItem>>, item: ThreadPoolWorkItem) {
     let mut q = lock_with_recovery(queue);
     if q.len() >= ENHANCED_POOL_CAP {
         eprintln!(
@@ -1668,9 +1684,7 @@ impl EnhancedGuestThreadPool {
                                 .wait_timeout_while(
                                     queue,
                                     Duration::from_millis(ENHANCED_POOL_TIMER_POLL_MS),
-                                    |q| {
-                                        q.is_empty() && !shutdown.load(Ordering::Acquire)
-                                    },
+                                    |q| q.is_empty() && !shutdown.load(Ordering::Acquire),
                                 )
                                 .unwrap_or_else(PoisonError::into_inner);
                             queue = guard;
@@ -1757,8 +1771,7 @@ impl EnhancedGuestThreadPool {
 
     /// Remove a previously registered wait.
     pub fn unregister_wait(&self, handle: u32) {
-        lock_with_recovery(&self.wait_registrations)
-            .retain(|w| w.handle != handle);
+        lock_with_recovery(&self.wait_registrations).retain(|w| w.handle != handle);
     }
 
     /// Shutdown the thread pool.

@@ -373,7 +373,11 @@ fn bench_cpu_decode_nop(c: &mut Criterion) {
     for size in [64usize, 256, 1024] {
         let code = nop_sled(size);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode nop sled");
-        assert_eq!(decoded.len(), size, "NOP decode must yield one instruction per byte");
+        assert_eq!(
+            decoded.len(),
+            size,
+            "NOP decode must yield one instruction per byte"
+        );
         group.bench_function(format!("{size}_bytes"), |b| {
             b.iter(|| {
                 let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
@@ -391,7 +395,11 @@ fn bench_cpu_decode_alu(c: &mut Criterion) {
     for count in [10usize, 50, 200] {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode alu block");
-        assert_eq!(decoded.len(), count * 3, "ALU block is 3 instructions per triplet");
+        assert_eq!(
+            decoded.len(),
+            count * 3,
+            "ALU block is 3 instructions per triplet"
+        );
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
                 let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
@@ -409,7 +417,11 @@ fn bench_cpu_decode_simd(c: &mut Criterion) {
     for count in [10usize, 50, 200] {
         let code = simd_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode simd block");
-        assert_eq!(decoded.len(), count * 2, "SIMD block is 2 instructions per pair");
+        assert_eq!(
+            decoded.len(),
+            count * 2,
+            "SIMD block is 2 instructions per pair"
+        );
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
                 let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
@@ -427,7 +439,11 @@ fn bench_cpu_decode_control_flow(c: &mut Criterion) {
     for count in [10usize, 50, 200] {
         let code = cmp_jcc_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode cmp/jcc block");
-        assert_eq!(decoded.len(), count * 2, "cmp/jcc block is 2 instructions per pair");
+        assert_eq!(
+            decoded.len(),
+            count * 2,
+            "cmp/jcc block is 2 instructions per pair"
+        );
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
                 let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
@@ -446,7 +462,11 @@ fn bench_cpu_lower_to_ir(c: &mut Criterion) {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
-        assert_eq!(ir.len(), decoded.len(), "lowering must preserve instruction count");
+        assert_eq!(
+            ir.len(),
+            decoded.len(),
+            "lowering must preserve instruction count"
+        );
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
                 let ir = casa1::cpu::lower_to_ir(bb(&decoded)).expect("lower");
@@ -503,7 +523,9 @@ fn bench_jit_compile_tier0(c: &mut Criterion) {
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
         let mut probe = casa1::jit::JitCompiler::new();
-        let compiled = probe.compile_tier0(&ir, 0x1000, arch, None).expect("compile tier0");
+        let compiled = probe
+            .compile_tier0(&ir, 0x1000, arch, None)
+            .expect("compile tier0");
         assert!(compiled.code_size > 0, "tier0 must emit code");
         assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
@@ -526,7 +548,9 @@ fn bench_jit_compile_tier1(c: &mut Criterion) {
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
         let mut probe = casa1::jit::JitCompiler::new();
-        let compiled = probe.compile_tier1(&ir, 0x1000, arch, None).expect("compile tier1");
+        let compiled = probe
+            .compile_tier1(&ir, 0x1000, arch, None)
+            .expect("compile tier1");
         assert!(compiled.code_size > 0, "tier1 must emit code");
         assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
@@ -549,7 +573,9 @@ fn bench_jit_compile_tier2(c: &mut Criterion) {
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
         let mut probe = casa1::jit::JitCompiler::new();
-        let compiled = probe.compile_tier2(&ir, 0x1000, arch, None).expect("compile tier2");
+        let compiled = probe
+            .compile_tier2(&ir, 0x1000, arch, None)
+            .expect("compile tier2");
         assert!(compiled.code_size > 0, "tier2 must emit code");
         assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
@@ -657,8 +683,16 @@ fn bench_jit_tier_promotion(c: &mut Criterion) {
             tier2_at = Some(exec);
         }
     }
-    assert_eq!(tier1_at, Some(10), "Tier1 promotion must occur at 10 executions");
-    assert_eq!(tier2_at, Some(50), "Tier2 promotion must occur at 50 executions");
+    assert_eq!(
+        tier1_at,
+        Some(10),
+        "Tier1 promotion must occur at 10 executions"
+    );
+    assert_eq!(
+        tier2_at,
+        Some(50),
+        "Tier2 promotion must occur at 50 executions"
+    );
 
     group.bench_function("100_blocks_x_100_execs", |b| {
         b.iter(|| {
@@ -739,7 +773,11 @@ fn bench_pe_parse_many_sections(c: &mut Criterion) {
     for count in [5usize, 20, 100] {
         let pe_data = many_sections_pe(count);
         let parsed = casa1::pe::parse(&pe_data).expect("many-sections PE must parse");
-        assert_eq!(parsed.sections.len(), count, "parsed section count mismatch");
+        assert_eq!(
+            parsed.sections.len(),
+            count,
+            "parsed section count mismatch"
+        );
         group.bench_function(format!("{count}_sections"), |b| {
             b.iter(|| {
                 let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
@@ -761,9 +799,8 @@ fn bench_pe_parse_and_map(c: &mut Criterion) {
         b.iter_with_setup(
             || casa1::pe::parse(&pe_data).expect("parse"),
             |parsed| {
-                let mapped =
-                    casa1::pe::map_image(bb(&pe_data), bb(&parsed), "bench", bb(false))
-                        .expect("map");
+                let mapped = casa1::pe::map_image(bb(&pe_data), bb(&parsed), "bench", bb(false))
+                    .expect("map");
                 bb(mapped)
             },
         )
@@ -851,7 +888,9 @@ fn bench_gfx_upload_streaming(c: &mut Criterion) {
                     (streamer, buf_id)
                 },
                 |(mut streamer, buf_id)| {
-                    let offset = streamer.allocate(bb(buf_id), bb(alloc_size)).expect("allocate");
+                    let offset = streamer
+                        .allocate(bb(buf_id), bb(alloc_size))
+                        .expect("allocate");
                     bb(offset)
                 },
             )
@@ -1079,7 +1118,14 @@ fn many_imports_pe(count: usize) -> Vec<u8> {
     write_pe32p_optional_header(&mut pe, 0x1000, size_of_image, 0x200, &directories);
 
     write_pe_section(&mut pe, b".text\0\0\0", 0x1000, 0x1000, 0x200, 0x200);
-    write_pe_section(&mut pe, b".idata\0\0", idata_size, 0x2000, idata_size, 0x400);
+    write_pe_section(
+        &mut pe,
+        b".idata\0\0",
+        idata_size,
+        0x2000,
+        idata_size,
+        0x400,
+    );
     pe.resize(0x400, 0); // headers + .text raw data
 
     // Helper: file offset of an .idata RVA
@@ -1316,10 +1362,20 @@ fn bench_network_websocket_buffer(c: &mut Criterion) {
     let req = net
         .win_http_open_request(conn, "GET", "/ws")
         .expect("open request");
-    net.add_route("http", "bench.test", "/ws", 101, BTreeMap::new(), b"", vec![], vec![]);
+    net.add_route(
+        "http",
+        "bench.test",
+        "/ws",
+        101,
+        BTreeMap::new(),
+        b"",
+        vec![],
+        vec![],
+    );
     net.win_http_send_request(req, BTreeMap::new(), b"")
         .expect("send request");
-    net.win_http_receive_response(req).expect("receive response");
+    net.win_http_receive_response(req)
+        .expect("receive response");
 
     for size in [256usize, 4096, 65536] {
         let payload = vec![0xABu8; size];
@@ -1333,7 +1389,8 @@ fn bench_network_websocket_buffer(c: &mut Criterion) {
                 let ws = net
                     .websocket_complete_upgrade(bb(req))
                     .expect("websocket upgrade");
-                net.websocket_send(bb(ws), bb(&payload)).expect("websocket send");
+                net.websocket_send(bb(ws), bb(&payload))
+                    .expect("websocket send");
                 let received = net
                     .websocket_receive(bb(ws), &mut rx_buf)
                     .expect("websocket receive");
@@ -1411,7 +1468,11 @@ fn bench_pe_parse_large_image(c: &mut Criterion) {
     for count in [64usize, 200, 500] {
         let pe_data = many_imports_pe(count);
         let parsed = casa1::pe::parse(&pe_data).expect("import-rich PE must parse");
-        assert_eq!(parsed.imports.len(), 1, "expected exactly one import descriptor");
+        assert_eq!(
+            parsed.imports.len(),
+            1,
+            "expected exactly one import descriptor"
+        );
         assert_eq!(
             parsed.imports[0].imports.len(),
             count,
@@ -1459,7 +1520,11 @@ fn bench_pe_parse_many_sections_large(c: &mut Criterion) {
     for count in [50usize, 100] {
         let pe_data = many_sections_pe(count);
         let parsed = casa1::pe::parse(&pe_data).expect("many-sections PE must parse");
-        assert_eq!(parsed.sections.len(), count, "parsed section count mismatch");
+        assert_eq!(
+            parsed.sections.len(),
+            count,
+            "parsed section count mismatch"
+        );
         group.bench_function(format!("{count}_sections"), |b| {
             b.iter(|| {
                 let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");

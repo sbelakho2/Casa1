@@ -209,7 +209,8 @@ fn t24_01_kernel32_coverage() {
     verify_dll_coverage("kernel32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_01_kernel32_smoke() {
     if !require_steam_ge() {
@@ -237,7 +238,8 @@ fn t24_02_user32_coverage() {
     verify_dll_coverage("user32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_02_user32_smoke() {
     if !require_steam_ge() {
@@ -260,7 +262,8 @@ fn t24_03_ws2_32_coverage() {
     verify_dll_coverage("ws2_32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_03_ws2_32_smoke() {
     if !require_steam_ge() {
@@ -283,7 +286,8 @@ fn t24_04_gdi32_coverage() {
     verify_dll_coverage("gdi32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_04_gdi32_smoke() {
     if !require_steam_ge() {
@@ -306,7 +310,8 @@ fn t24_05_advapi32_coverage() {
     verify_dll_coverage("advapi32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_05_advapi32_smoke() {
     if !require_steam_ge() {
@@ -329,7 +334,8 @@ fn t24_06_crypt32_coverage() {
     verify_dll_coverage("crypt32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_06_crypt32_smoke() {
     if !require_steam_ge() {
@@ -352,7 +358,8 @@ fn t24_07_shell32_coverage() {
     verify_dll_coverage("shell32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_07_shell32_smoke() {
     if !require_steam_ge() {
@@ -375,7 +382,8 @@ fn t24_08_psapi_coverage() {
     verify_dll_coverage("psapi.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_08_psapi_smoke() {
     if !require_steam_ge() {
@@ -398,7 +406,8 @@ fn t24_09_bcrypt_coverage() {
     verify_dll_coverage("bcrypt.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_09_bcrypt_smoke() {
     if !require_steam_ge() {
@@ -421,7 +430,8 @@ fn t24_10_comctl32_coverage() {
     verify_dll_coverage("comctl32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_10_comctl32_smoke() {
     if !require_steam_ge() {
@@ -444,7 +454,8 @@ fn t24_11_ole32_coverage() {
     verify_dll_coverage("ole32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_11_ole32_smoke() {
     if !require_steam_ge() {
@@ -467,7 +478,8 @@ fn t24_12_oleaut32_coverage() {
     verify_dll_coverage("oleaut32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_12_oleaut32_smoke() {
     if !require_steam_ge() {
@@ -490,7 +502,8 @@ fn t24_13_version_coverage() {
     verify_dll_coverage("version.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_13_version_smoke() {
     if !require_steam_ge() {
@@ -513,7 +526,8 @@ fn t24_14_wsock32_coverage() {
     verify_dll_coverage("wsock32.dll");
 }
 
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
+#[ignore]
+// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_14_wsock32_smoke() {
     if !require_steam_ge() {

@@ -10,9 +10,7 @@ use std::collections::HashMap;
 
 use crate::gdiplus_render;
 use crate::metal_backend::MetalD2DRenderer;
-use crate::user32::{
-    GDIPLUS_COMPOSITING_MODE_SOURCE_OVER, GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
-};
+use crate::user32::{GDIPLUS_COMPOSITING_MODE_SOURCE_OVER, GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS};
 
 // ── Forward declarations from dwrite ────────────────────────────────────
 

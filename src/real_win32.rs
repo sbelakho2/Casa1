@@ -1524,13 +1524,11 @@ impl ShellFolderObject {
     /// IShellFolder::BindToObject — navigate into a subfolder.
     pub fn bind_to_object(&self, pidl: &[u16]) -> Option<ShellFolderObject> {
         let inner = self.inner.lock().unwrap();
-        inner.bind_to_object(pidl).map(|child| {
-            ShellFolderObject {
-                clsid: self.clsid,
-                supported: self.supported.clone(),
-                name: format!("ShellFolder({})", child.path.display()),
-                inner: std::sync::Mutex::new(child),
-            }
+        inner.bind_to_object(pidl).map(|child| ShellFolderObject {
+            clsid: self.clsid,
+            supported: self.supported.clone(),
+            name: format!("ShellFolder({})", child.path.display()),
+            inner: std::sync::Mutex::new(child),
         })
     }
 
@@ -1747,8 +1745,7 @@ impl ShellView {
                     height: 600.0,
                 },
             };
-            let view: *mut objc::runtime::Object =
-                objc::msg_send![view, initWithFrame: view_frame];
+            let view: *mut objc::runtime::Object = objc::msg_send![view, initWithFrame: view_frame];
             if view.is_null() {
                 return 0;
             }
@@ -2470,8 +2467,7 @@ impl PropertyStore {
                 let item: *mut objc::runtime::Object = objc::msg_send![cls, alloc];
                 let item: *mut objc::runtime::Object = objc::msg_send![item, initWithPath: nsstr];
                 if !item.is_null() {
-                    let authors_key: *mut objc::runtime::Object =
-                        objc::msg_send![class!(NSString), stringWithUTF8String: c"kMDItemAuthors".as_ptr()];
+                    let authors_key: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: c"kMDItemAuthors".as_ptr()];
                     let authors: *mut objc::runtime::Object =
                         objc::msg_send![item, valueForAttribute: authors_key];
                     if !authors.is_null() {
@@ -2700,7 +2696,6 @@ impl Default for XmlDomDocument {
 }
 
 impl XmlDomDocument {
-
     /// IXMLDOMDocument::loadXML — parse an XML string.
     pub fn load_xml(&mut self, xml: &str) -> bool {
         self.xml_string = xml.to_string();
@@ -2851,7 +2846,10 @@ const MAX_SERIALISE_DEPTH: usize = 256;
 
 /// Escape text/attribute values for inclusion in XML output.
 fn escape_xml(s: &str) -> String {
-    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
@@ -3104,7 +3102,6 @@ impl Default for MsHtmlDocument {
 }
 
 impl MsHtmlDocument {
-
     /// Create a WKWebView for rendering.
     pub fn create_webview(&mut self) -> u64 {
         #[cfg(target_os = "macos")]
@@ -3182,9 +3179,7 @@ impl MsHtmlDocument {
             end = idx;
         }
         self.html_content.push_str(&html[..end]);
-        eprintln!(
-            "[MsHtmlDocument] write: content exceeds {MAX_HTML_CONTENT} bytes; truncating"
-        );
+        eprintln!("[MsHtmlDocument] write: content exceeds {MAX_HTML_CONTENT} bytes; truncating");
     }
 
     /// IHTMLDocument2::open — open the document for writing.
@@ -4763,7 +4758,27 @@ pub fn variant_change_type(
     // guest memory, which this module cannot do — fail loudly rather than
     // silently coercing to 0.
     if matches!(src_vt, VT_BSTR | VT_LPWSTR | VT_LPSTR)
-        && matches!(new_vt_base, VT_I1 | VT_UI1 | VT_I2 | VT_UI2 | VT_I4 | VT_UI4 | VT_I8 | VT_UI8 | VT_INT | VT_UINT | VT_R4 | VT_R8 | VT_CY | VT_DATE | VT_DECIMAL | VT_BOOL | VT_EMPTY | VT_NULL)
+        && matches!(
+            new_vt_base,
+            VT_I1
+                | VT_UI1
+                | VT_I2
+                | VT_UI2
+                | VT_I4
+                | VT_UI4
+                | VT_I8
+                | VT_UI8
+                | VT_INT
+                | VT_UINT
+                | VT_R4
+                | VT_R8
+                | VT_CY
+                | VT_DATE
+                | VT_DECIMAL
+                | VT_BOOL
+                | VT_EMPTY
+                | VT_NULL
+        )
     {
         return Err(AppError::new(
             ReasonCode::RcWin32InvalidHandle,
@@ -4913,7 +4928,6 @@ fn variant_to_f64(v: &Variant) -> f64 {
     }
 }
 
-
 /// SAFEARRAYBOUND structure.
 #[repr(C)]
 pub struct SafeArrayBound {
@@ -4955,7 +4969,9 @@ pub fn safe_array_create(vt: u16, c_dims: u32, bounds: &[SafeArrayBound]) -> Vec
 
     // Calculate descriptor size: header (24 bytes) + c_dims * 8 bytes for bounds
     let header_size = 24 + (c_dims as usize) * 8;
-    let total_size = header_size.saturating_add(data_size as usize).min(MAX_SAFEARRAY_BYTES);
+    let total_size = header_size
+        .saturating_add(data_size as usize)
+        .min(MAX_SAFEARRAY_BYTES);
 
     let mut buf = Vec::new();
     if buf.try_reserve_exact(total_size).is_err() {
@@ -5043,10 +5059,16 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
     }
     let bounds_end = 20usize
         .checked_add(c_dims.checked_mul(8).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY bounds overflow",
+            )
         })?)
         .ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY bounds overflow",
+            )
         })?;
     if bounds_end > sa_data.len() {
         return Err(AppError::new(
@@ -5099,14 +5121,27 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
     }
 
     let offset = base_offset
-        .checked_add((flat_index as usize).checked_mul(elem_size).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
-        })?)
+        .checked_add(
+            (flat_index as usize)
+                .checked_mul(elem_size)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        "SAFEARRAY offset overflow",
+                    )
+                })?,
+        )
         .ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY offset overflow",
+            )
         })?;
     let end = offset.checked_add(elem_size).ok_or_else(|| {
-        AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY offset overflow",
+        )
     })?;
     if end > sa_data.len() {
         return Err(AppError::new(
@@ -5142,10 +5177,16 @@ pub fn safe_array_put_element(
     }
     let bounds_end = 20usize
         .checked_add(c_dims.checked_mul(8).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY bounds overflow",
+            )
         })?)
         .ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY bounds overflow",
+            )
         })?;
     if bounds_end > sa_data.len() {
         return Err(AppError::new(
@@ -5196,14 +5237,27 @@ pub fn safe_array_put_element(
     }
 
     let offset = base_offset
-        .checked_add((flat_index as usize).checked_mul(elem_size).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
-        })?)
+        .checked_add(
+            (flat_index as usize)
+                .checked_mul(elem_size)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        "SAFEARRAY offset overflow",
+                    )
+                })?,
+        )
         .ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY offset overflow",
+            )
         })?;
     let end = offset.checked_add(elem_size).ok_or_else(|| {
-        AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY offset overflow",
+        )
     })?;
     if end > sa_data.len() {
         return Err(AppError::new(
@@ -5554,7 +5608,11 @@ impl MsvcCrt {
                         s = format!("{:<width$}", s, width = w);
                     } else if pad_char == '0' {
                         // Zero-pad between the sign and the digits.
-                        s = format!("{sign}{:0>width$}", &s[sign.len()..], width = w - sign.len());
+                        s = format!(
+                            "{sign}{:0>width$}",
+                            &s[sign.len()..],
+                            width = w - sign.len()
+                        );
                     } else {
                         s = format!("{:>width$}", s, width = w);
                     }
@@ -5867,7 +5925,11 @@ impl MsvcCrt {
                         s = format!("{:<width$}", s, width = w);
                     } else if pad_char == '0' {
                         // Zero-pad between the sign and the digits.
-                        s = format!("{sign}{:0>width$}", &s[sign.len()..], width = w - sign.len());
+                        s = format!(
+                            "{sign}{:0>width$}",
+                            &s[sign.len()..],
+                            width = w - sign.len()
+                        );
                     } else {
                         s = format!("{:>width$}", s, width = w);
                     }
@@ -6620,15 +6682,12 @@ impl FileVersionInfo {
     /// signature.
     pub fn parse(data: &[u8]) -> AppResult<Self> {
         let sig = 0xFEEF_04BD_u32.to_le_bytes();
-        let sig_off = data
-            .windows(4)
-            .position(|w| w == sig)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcWin32InvalidHandle,
-                    "invalid version info signature",
-                )
-            })?;
+        let sig_off = data.windows(4).position(|w| w == sig).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "invalid version info signature",
+            )
+        })?;
         // Fields needed: dwFileVersionMS(+8), dwFileVersionLS(+12),
         // dwFileFlags(+28), dwFileType(+36) — all within 40 bytes of the
         // signature.
@@ -6805,7 +6864,6 @@ impl Default for XInputManager {
 }
 
 impl XInputManager {
-
     /// XInputGetState — get the state of a controller.
     pub fn get_state(&self, index: u32) -> AppResult<&XInputState> {
         if index >= 4 {
@@ -7153,7 +7211,11 @@ impl DirectInputDevice8 {
             ));
         }
 
-        let gain_scaled = effect.gain.min(10000).saturating_mul(self.device_gain.min(10000)) / 10000;
+        let gain_scaled = effect
+            .gain
+            .min(10000)
+            .saturating_mul(self.device_gain.min(10000))
+            / 10000;
         let effective_magnitude = effect.magnitude.min(10000).saturating_mul(gain_scaled) / 10000;
 
         // For periodic and constant effects, map the magnitude to motor speeds.
@@ -7320,7 +7382,6 @@ impl Default for BCryptContext {
 }
 
 impl BCryptContext {
-
     /// BCryptCreateHash — create a hash object.
     pub fn create_hash(&self, algorithm: &str) -> AppResult<BCryptHash> {
         match algorithm {
@@ -8176,7 +8237,6 @@ impl Default for ThreadPoolManager {
 }
 
 impl ThreadPoolManager {
-
     /// CreateThreadpoolWork
     pub fn create_work(&mut self, callback: u64, context: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -8547,7 +8607,6 @@ impl Default for DbgHelpContext {
 }
 
 impl DbgHelpContext {
-
     /// SymInitialize — initialize the symbol handler for a process.
     pub fn sym_initialize(&mut self, _process_handle: u64) -> AppResult<()> {
         self.symbols.clear();
@@ -8565,7 +8624,8 @@ impl DbgHelpContext {
     pub fn sym_load_module(&mut self, module_name: &str, base_address: u64) -> AppResult<()> {
         self.loaded_modules
             .insert(module_name.to_string(), base_address);
-        self.module_bases.insert(base_address, module_name.to_string());
+        self.module_bases
+            .insert(base_address, module_name.to_string());
         Ok(())
     }
 
@@ -9255,7 +9315,6 @@ impl Default for Advapi32Manager {
 }
 
 impl Advapi32Manager {
-
     /// OpenSCManager — open the service control manager.
     pub fn open_sc_manager(&self) -> AppResult<u64> {
         // Return a synthetic handle
@@ -9422,21 +9481,25 @@ impl ServiceControlManager {
     pub fn new() -> Self {
         let mut services = BTreeMap::new();
         let mut next_handle = 1u64;
-        let mut insert = |name: &str, display: &str, pid: u32, services: &mut BTreeMap<String, ScmServiceRecord>| {
-            let handle = next_handle;
-            next_handle += 1;
-            services.insert(
-                name.to_string(),
-                ScmServiceRecord {
-                    name: name.to_string(),
-                    display_name: display.to_string(),
-                    status: ServiceStatus::Running,
-                    handle,
-                    executable_path: PathBuf::new(),
-                    pid: Some(pid),
-                },
-            );
-        };
+        let mut insert =
+            |name: &str,
+             display: &str,
+             pid: u32,
+             services: &mut BTreeMap<String, ScmServiceRecord>| {
+                let handle = next_handle;
+                next_handle += 1;
+                services.insert(
+                    name.to_string(),
+                    ScmServiceRecord {
+                        name: name.to_string(),
+                        display_name: display.to_string(),
+                        status: ServiceStatus::Running,
+                        handle,
+                        executable_path: PathBuf::new(),
+                        pid: Some(pid),
+                    },
+                );
+            };
         insert(
             "SteamClientService",
             "Steam Client Service",
@@ -9465,7 +9528,6 @@ impl Default for ServiceControlManager {
 }
 
 impl ServiceControlManager {
-
     /// OpenSCManagerW — open the service control manager.
     ///
     /// Returns a synthetic handle representing the SCM database. The
@@ -10825,7 +10887,9 @@ impl RegistryChangeTracker {
         // Check child keys if watching subtree
         if watch_subtree {
             for (k, &v) in &self.versions {
-                if is_key_in_subtree(k, &normalized) && k.len() > normalized.len() && v > observed_version
+                if is_key_in_subtree(k, &normalized)
+                    && k.len() > normalized.len()
+                    && v > observed_version
                 {
                     // Subkey version is newer than observed → change detected
                     return true;
@@ -10860,8 +10924,7 @@ impl RegistryChangeTracker {
 /// `notify_change` invokes it for every subscription event handle.
 type RegistryEventSignalHook = dyn Fn(u64) + Send + Sync;
 
-static REGISTRY_EVENT_SIGNAL_HOOK: Mutex<Option<Box<RegistryEventSignalHook>>> =
-    Mutex::new(None);
+static REGISTRY_EVENT_SIGNAL_HOOK: Mutex<Option<Box<RegistryEventSignalHook>>> = Mutex::new(None);
 
 /// Install (or remove, with `None`) the hook used by
 /// [`RegistryChangeTracker::notify_change`] to signal event handles.
@@ -10913,51 +10976,51 @@ pub enum RegNotifyResult {
 /// * `observed_version` - The last version the caller observed.
 /// * `timeout` - Maximum duration to wait (for sync mode).
 ///
-    /// # Returns
-    /// The current version of the key and a `RegNotifyResult`.
-    ///
-    /// A zero `timeout` in sync mode means wait indefinitely (Windows
-    /// semantics); only a finite deadline yields `Timeout`.
-    #[allow(clippy::too_many_arguments)] // mirrors RegNotifyChangeKeyValue's parameter list
-    pub fn reg_notify_change_key_value(
-        tracker: &mut RegistryChangeTracker,
-        key: &str,
-        watch_subtree: bool,
-        flags: u32,
-        async_notify: bool,
-        event_handle: u64,
-        observed_version: u64,
-        timeout: std::time::Duration,
-    ) -> (u64, RegNotifyResult) {
-        let current_version = tracker.version(key);
+/// # Returns
+/// The current version of the key and a `RegNotifyResult`.
+///
+/// A zero `timeout` in sync mode means wait indefinitely (Windows
+/// semantics); only a finite deadline yields `Timeout`.
+#[allow(clippy::too_many_arguments)] // mirrors RegNotifyChangeKeyValue's parameter list
+pub fn reg_notify_change_key_value(
+    tracker: &mut RegistryChangeTracker,
+    key: &str,
+    watch_subtree: bool,
+    flags: u32,
+    async_notify: bool,
+    event_handle: u64,
+    observed_version: u64,
+    timeout: std::time::Duration,
+) -> (u64, RegNotifyResult) {
+    let current_version = tracker.version(key);
 
-        // Check if already changed
-        if tracker.has_changed(key, observed_version, watch_subtree) {
-            return (current_version, RegNotifyResult::Changed);
-        }
+    // Check if already changed
+    if tracker.has_changed(key, observed_version, watch_subtree) {
+        return (current_version, RegNotifyResult::Changed);
+    }
 
-        if async_notify {
-            // Register for future notifications. When a change occurs,
-            // `notify_change` signals `event_handle` through the hook
-            // installed with `set_registry_event_signal_hook`.
-            tracker.subscribe(key, event_handle, flags, watch_subtree);
-            (current_version, RegNotifyResult::Pending)
-        } else {
-            // Sync (blocking) notification — poll until a change is
-            // detected or the finite deadline passes.
-            let start = std::time::Instant::now();
-            let poll_interval = std::time::Duration::from_millis(50);
-            loop {
-                std::thread::sleep(poll_interval);
-                if tracker.has_changed(key, observed_version, watch_subtree) {
-                    return (tracker.version(key), RegNotifyResult::Changed);
-                }
-                if !timeout.is_zero() && start.elapsed() >= timeout {
-                    return (tracker.version(key), RegNotifyResult::Timeout);
-                }
+    if async_notify {
+        // Register for future notifications. When a change occurs,
+        // `notify_change` signals `event_handle` through the hook
+        // installed with `set_registry_event_signal_hook`.
+        tracker.subscribe(key, event_handle, flags, watch_subtree);
+        (current_version, RegNotifyResult::Pending)
+    } else {
+        // Sync (blocking) notification — poll until a change is
+        // detected or the finite deadline passes.
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_millis(50);
+        loop {
+            std::thread::sleep(poll_interval);
+            if tracker.has_changed(key, observed_version, watch_subtree) {
+                return (tracker.version(key), RegNotifyResult::Changed);
+            }
+            if !timeout.is_zero() && start.elapsed() >= timeout {
+                return (tracker.version(key), RegNotifyResult::Timeout);
             }
         }
     }
+}
 
 // ===========================================================================
 // Gap 6.5: Out-of-Process COM Server Support
@@ -10992,14 +11055,10 @@ pub struct ComExeServerRegistry {
 fn terminate_server_process(mut entry: ComExeServerEntry) {
     if let Some(mut child) = entry.process.take() {
         if let Err(error) = child.kill() {
-            eprintln!(
-                "[real_win32] terminate_server_process: failed to kill process: {error}"
-            );
+            eprintln!("[real_win32] terminate_server_process: failed to kill process: {error}");
         }
         if let Err(error) = child.wait() {
-            eprintln!(
-                "[real_win32] terminate_server_process: failed to wait for process: {error}"
-            );
+            eprintln!("[real_win32] terminate_server_process: failed to wait for process: {error}");
         }
     }
 }
@@ -11081,16 +11140,18 @@ impl ComExeServerRegistry {
     pub fn is_server_running(&mut self, clsid: &[u8; 16]) -> bool {
         let guid_str = guid_to_string(clsid);
         self.servers.get_mut(&guid_str).is_some_and(|e| {
-            e.process.as_mut().is_none_or(|process| match process.try_wait() {
-                Ok(status) => status.is_none(),
-                Err(error) => {
-                    eprintln!(
-                        "[real_win32] is_server_running: try_wait failed for {}: {}",
-                        guid_str, error
-                    );
-                    true
-                }
-            })
+            e.process
+                .as_mut()
+                .is_none_or(|process| match process.try_wait() {
+                    Ok(status) => status.is_none(),
+                    Err(error) => {
+                        eprintln!(
+                            "[real_win32] is_server_running: try_wait failed for {}: {}",
+                            guid_str, error
+                        );
+                        true
+                    }
+                })
         })
     }
 

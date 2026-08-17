@@ -165,9 +165,18 @@ fn build_signed_pe() -> Vec<u8> {
     let pe_hash = authenticode_hash(&body);
 
     let spc_der = build_spc_indirect_data(&pe_hash);
+    // The eContent is a `[0] EXPLICIT OCTET STRING` whose content is the
+    // full DER of SpcIndirectDataContent (SEQUENCE tag included). The cms
+    // builder hashes the Any's value() as the messageDigest, so the Any
+    // must be octet-string-tagged with the complete DER as its value —
+    // Any::from_der(&spc_der) would strip the SEQUENCE tag and produce a
+    // messageDigest over different bytes than the verifier (and real
+    // Authenticode) computes.
     let econtent = EncapsulatedContentInfo {
         econtent_type: ObjectIdentifier::from_str(OID_SPC_INDIRECT_DATA).unwrap(),
-        econtent: Some(Any::from_der(&spc_der).unwrap()),
+        econtent: Some(
+            Any::new(der::Tag::OctetString, spc_der.clone()).expect("octet-string econtent"),
+        ),
     };
 
     let certificate = build_certificate(&signer, &private_key);
@@ -225,9 +234,7 @@ fn authenticode_accepts_valid_signature() {
                 "untrusted-root rejection must reference chain/trust validation, got: {reason}"
             );
         }
-        other => panic!(
-            "expected Invalid (untrusted self-signed root), got {other:?}"
-        ),
+        other => panic!("expected Invalid (untrusted self-signed root), got {other:?}"),
     }
 }
 

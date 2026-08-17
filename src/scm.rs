@@ -209,8 +209,7 @@ struct BlockDescriptor {
 /// Descriptor shared by all stack blocks in this module.
 static BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
     reserved: 0,
-    size: std::mem::size_of::<*const std::ffi::c_void>() * 3
-        + std::mem::size_of::<i32>() * 2,
+    size: std::mem::size_of::<*const std::ffi::c_void>() * 3 + std::mem::size_of::<i32>() * 2,
 };
 
 /// An Objective-C block literal for completion handlers.
@@ -902,12 +901,13 @@ pub fn create_vz_virtual_machine(
                             )
                         })?;
                         let ns_initrd: *mut objc::runtime::Object = {
-                            let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
-                                AppError::new(
-                                    ReasonCode::RcVulkanNotSupported,
-                                    "SCM: NSString class not found",
-                                )
-                            })?;
+                            let cls_str =
+                                objc::runtime::Class::get("NSString").ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcVulkanNotSupported,
+                                        "SCM: NSString class not found",
+                                    )
+                                })?;
                             msg_send![cls_str, stringWithUTF8String: initrd_str.as_ptr()]
                         };
                         let initrd_url: *mut objc::runtime::Object = {
@@ -1024,14 +1024,13 @@ pub fn create_vz_virtual_machine(
                                     msg_send![cls_scanout, alloc];
                                 let scanout: *mut objc::runtime::Object = msg_send![so_alloc, init];
                                 let scanouts_array: *mut objc::runtime::Object = {
-                                    let cls_arr = objc::runtime::Class::get("NSArray").ok_or_else(
-                                        || {
+                                    let cls_arr =
+                                        objc::runtime::Class::get("NSArray").ok_or_else(|| {
                                             AppError::new(
                                                 ReasonCode::RcVulkanNotSupported,
                                                 "SCM: NSArray class not found",
                                             )
-                                        },
-                                    )?;
+                                        })?;
                                     let args = [scanout];
                                     msg_send![cls_arr, arrayWithObjects: args.as_ptr() count: 1]
                                 };
@@ -1060,14 +1059,13 @@ pub fn create_vz_virtual_machine(
                                 )
                             })?;
                             let ns_tag: *mut objc::runtime::Object = {
-                                let cls_str = objc::runtime::Class::get("NSString").ok_or_else(
-                                    || {
+                                let cls_str =
+                                    objc::runtime::Class::get("NSString").ok_or_else(|| {
                                         AppError::new(
                                             ReasonCode::RcVulkanNotSupported,
                                             "SCM: NSString class not found",
                                         )
-                                    },
-                                )?;
+                                    })?;
                                 msg_send![cls_str, stringWithUTF8String: tag_str.as_ptr()]
                             };
                             let _: () = msg_send![fs_dev, setTag: ns_tag];
@@ -1079,23 +1077,23 @@ pub fn create_vz_virtual_machine(
                                 )
                             })?;
                             let ns_dir: *mut objc::runtime::Object = {
-                                let cls_str = objc::runtime::Class::get("NSString").ok_or_else(
-                                    || {
+                                let cls_str =
+                                    objc::runtime::Class::get("NSString").ok_or_else(|| {
                                         AppError::new(
                                             ReasonCode::RcVulkanNotSupported,
                                             "SCM: NSString class not found",
                                         )
-                                    },
-                                )?;
+                                    })?;
                                 msg_send![cls_str, stringWithUTF8String: dir_str.as_ptr()]
                             };
                             let dir_url: *mut objc::runtime::Object = {
-                                let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
-                                    AppError::new(
-                                        ReasonCode::RcVulkanNotSupported,
-                                        "SCM: NSURL class not found",
-                                    )
-                                })?;
+                                let cls_url =
+                                    objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                                        AppError::new(
+                                            ReasonCode::RcVulkanNotSupported,
+                                            "SCM: NSURL class not found",
+                                        )
+                                    })?;
                                 msg_send![cls_url, fileURLWithPath: ns_dir]
                             };
                             if let Some(cls_share) = objc::runtime::Class::get("VZSharedDirectory")
@@ -1192,9 +1190,9 @@ pub fn create_vz_virtual_machine(
                                 let fd = file.as_raw_fd();
                                 std::mem::forget(file);
 
-                                if let Some(cls_attach) = objc::runtime::Class::get(
-                                    "VZFileHandleSerialPortAttachment",
-                                ) {
+                                if let Some(cls_attach) =
+                                    objc::runtime::Class::get("VZFileHandleSerialPortAttachment")
+                                {
                                     let attach_alloc: *mut objc::runtime::Object =
                                         msg_send![cls_attach, alloc];
                                     let attach: *mut objc::runtime::Object = msg_send![
@@ -1226,12 +1224,13 @@ pub fn create_vz_virtual_machine(
                             )
                         })?;
                         let ns_storage: *mut objc::runtime::Object = {
-                            let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
-                                AppError::new(
-                                    ReasonCode::RcVulkanNotSupported,
-                                    "SCM: NSString class not found",
-                                )
-                            })?;
+                            let cls_str =
+                                objc::runtime::Class::get("NSString").ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcVulkanNotSupported,
+                                        "SCM: NSString class not found",
+                                    )
+                                })?;
                             msg_send![cls_str, stringWithUTF8String: storage_str.as_ptr()]
                         };
                         let storage_url: *mut objc::runtime::Object = {
@@ -1983,7 +1982,10 @@ impl VirtioFsBridge {
         let canonical_root = std::fs::canonicalize(&self.host_shared_dir).map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcFsNotFound,
-                format!("SCM: shared directory unavailable: {}", self.host_shared_dir),
+                format!(
+                    "SCM: shared directory unavailable: {}",
+                    self.host_shared_dir
+                ),
                 &e,
             )
         })?;
@@ -2403,12 +2405,16 @@ impl VirtioNetBridge {
                 "SCM: virtio-net not connected",
             ));
         }
-        let new_len = self.tx_buffer.len().checked_add(data.len()).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcBufferLimitExceeded,
-                "SCM: virtio-net TX buffer overflow",
-            )
-        })?;
+        let new_len = self
+            .tx_buffer
+            .len()
+            .checked_add(data.len())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    "SCM: virtio-net TX buffer overflow",
+                )
+            })?;
         if new_len > MAX_NET_TX_BUFFER {
             return Err(AppError::new(
                 ReasonCode::RcBufferLimitExceeded,
@@ -3003,7 +3009,9 @@ pub struct ScmController {
 impl ScmController {
     /// Create a new SCM controller with the given configuration.
     pub fn new(config: ScmConfig) -> Self {
-        let guest_memory_size = (config.memory_mb.clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB)
+        let guest_memory_size = (config
+            .memory_mb
+            .clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB)
             as usize)
             * 1024
             * 1024;
@@ -3046,9 +3054,9 @@ impl ScmController {
 
         if self.guest_memory.is_empty() {
             let mut memory = Vec::new();
-            memory.try_reserve_exact(self.guest_memory_size).map_err(|_| {
-                AppError::oom("SCM: failed to allocate guest memory")
-            })?;
+            memory
+                .try_reserve_exact(self.guest_memory_size)
+                .map_err(|_| AppError::oom("SCM: failed to allocate guest memory"))?;
             memory.resize(self.guest_memory_size, 0);
             self.guest_memory = memory;
         }
@@ -4052,9 +4060,12 @@ mod tests {
     fn windows_kernel_shim_dpc_queue() {
         let mut shim = WindowsKernelShim::new(false);
 
-        shim.queue_dpc(0xDEADBEEF, 0x1000, 0x2000).expect("queue DPC 1");
-        shim.queue_dpc(0xCAFEBABE, 0x3000, 0x4000).expect("queue DPC 2");
-        shim.queue_dpc(0x12345678, 0x5000, 0x6000).expect("queue DPC 3");
+        shim.queue_dpc(0xDEADBEEF, 0x1000, 0x2000)
+            .expect("queue DPC 1");
+        shim.queue_dpc(0xCAFEBABE, 0x3000, 0x4000)
+            .expect("queue DPC 2");
+        shim.queue_dpc(0x12345678, 0x5000, 0x6000)
+            .expect("queue DPC 3");
 
         assert_eq!(shim.dpc_queue.len(), 3);
 

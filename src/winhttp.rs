@@ -752,7 +752,11 @@ impl WinHttpStack {
     /// case-insensitively and an optional leading `.` is ignored.
     fn cookie_domain_matches(host: &str, domain_attr: &str) -> bool {
         let host = host.trim_end_matches('.').to_lowercase();
-        let domain = domain_attr.trim().trim_start_matches('.').trim_end_matches('.').to_lowercase();
+        let domain = domain_attr
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
         if domain.is_empty() {
             return false;
         }
@@ -938,13 +942,12 @@ impl WinHttpStack {
         if let Some(cfg) = proxy_cfg
             && !should_bypass
         {
-            let proxy_url = if cfg.server.starts_with("http://")
-                || cfg.server.starts_with("https://")
-            {
-                cfg.server.clone()
-            } else {
-                format!("http://{}", cfg.server)
-            };
+            let proxy_url =
+                if cfg.server.starts_with("http://") || cfg.server.starts_with("https://") {
+                    cfg.server.clone()
+                } else {
+                    format!("http://{}", cfg.server)
+                };
             // https:// proxy URLs must be registered as https proxies;
             // Proxy::http silently rejects them.
             let proxy = if proxy_url.starts_with("https://") {
@@ -995,7 +998,11 @@ impl WinHttpStack {
                     Some(at) => {
                         let scheme_end = proxy_url.find("://").map(|p| p + 3).unwrap_or(0);
                         if at > scheme_end {
-                            format!("{}[redacted]@{}", &proxy_url[..scheme_end], &proxy_url[at + 1..])
+                            format!(
+                                "{}[redacted]@{}",
+                                &proxy_url[..scheme_end],
+                                &proxy_url[at + 1..]
+                            )
                         } else {
                             proxy_url.to_string()
                         }
@@ -1224,7 +1231,11 @@ impl WinHttpStack {
             None
         };
         let proxy_cfg = self.proxy.clone();
-        let req_timeout_ms = self.requests.get(&request_handle).map(|r| r.timeout_ms).unwrap_or(30000);
+        let req_timeout_ms = self
+            .requests
+            .get(&request_handle)
+            .map(|r| r.timeout_ms)
+            .unwrap_or(30000);
 
         // --- 3.1.4: Collect cookies from jar ---
         let cookies = self.get_cookies(&conn_server_name, &req_object_name, conn_is_secure);
@@ -1235,14 +1246,13 @@ impl WinHttpStack {
         // the client instead of silently keeping the first request's settings.
         let client = self.client_for(proxy_cfg.as_ref(), should_bypass, req_timeout_ms)?;
 
-        let method = reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(
-            |_| {
+        let method =
+            reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(|_| {
                 AppError::new(
                     ReasonCode::RcCliInvalid,
                     format!("WinHttpSendRequest: invalid HTTP verb '{req_verb}'"),
                 )
-            },
-        )?;
+            })?;
 
         let mut request_builder = client.request(method.clone(), &url);
 
@@ -1486,7 +1496,9 @@ impl WinHttpStack {
         // First try the HTTP requests map
         if let Some(req) = self.requests.get_mut(&request_handle) {
             let off = req.response_read_offset;
-            let to_read = buffer.len().min(req.response_body.len().saturating_sub(off));
+            let to_read = buffer
+                .len()
+                .min(req.response_body.len().saturating_sub(off));
             buffer[..to_read].copy_from_slice(&req.response_body[off..off + to_read]);
             req.response_read_offset = off + to_read;
             // Release the backing buffer once fully consumed.
@@ -1499,7 +1511,9 @@ impl WinHttpStack {
 
         // Fall back to FTP file data cache (for handles from ftp_open_file_w)
         if let Some((file_data, read_offset)) = self.ftp_file_data.get_mut(&request_handle) {
-            let to_read = buffer.len().min(file_data.len().saturating_sub(*read_offset));
+            let to_read = buffer
+                .len()
+                .min(file_data.len().saturating_sub(*read_offset));
             buffer[..to_read].copy_from_slice(&file_data[*read_offset..*read_offset + to_read]);
             *read_offset += to_read;
             // Release the backing buffer once fully consumed.
@@ -1559,15 +1573,12 @@ impl WinHttpStack {
         // WinHTTP header names are case-insensitive; stored keys are
         // lowercased by reqwest, so lowercase the query before looking up.
         let lower = header_name.to_lowercase();
-        req.response_headers
-            .get(&lower)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcNetHttpHeaderNotFound,
-                    format!("WinHttpQueryHeaders: header '{header_name}' not found"),
-                )
-            })
+        req.response_headers.get(&lower).cloned().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetHttpHeaderNotFound,
+                format!("WinHttpQueryHeaders: header '{header_name}' not found"),
+            )
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1646,7 +1657,8 @@ impl WinHttpStack {
                             });
                             eprintln!(
                                 "WinHttpSetOption: proxy set to {} for session {:#x}",
-                                Self::redact_proxy_url(proxy_url), handle
+                                Self::redact_proxy_url(proxy_url),
+                                handle
                             );
                         }
                     }
@@ -1675,13 +1687,11 @@ impl WinHttpStack {
             match option {
                 4 | 5 if value.len() >= 4 => {
                     // WINHTTP_OPTION_CONNECT_TIMEOUT (4) / WINHTTP_OPTION_SEND_TIMEOUT (5)
-                    req.timeout_ms =
-                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 6 if value.len() >= 4 => {
                     // WINHTTP_OPTION_RECEIVE_TIMEOUT
-                    req.timeout_ms =
-                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 _ => {}
             }
@@ -1980,11 +1990,7 @@ impl WinHttpStack {
     }
 
     #[allow(unused_assignments)]
-    pub fn internet_crack_url_w(
-        &self,
-        url: &str,
-        url_length: u32,
-    ) -> AppResult<CrackedUrl> {
+    pub fn internet_crack_url_w(&self, url: &str, url_length: u32) -> AppResult<CrackedUrl> {
         let url = Self::truncate_url(url, url_length);
 
         let url = url.trim();
@@ -2331,9 +2337,14 @@ impl WinHttpStack {
 
         // Buffer-based fallback
         let ws = self.websockets.get_mut(&ws_handle).unwrap();
-        let bytes_to_read = data.len().min(ws.receive_buffer.len().saturating_sub(ws.receive_read_offset));
-        data[..bytes_to_read]
-            .copy_from_slice(&ws.receive_buffer[ws.receive_read_offset..ws.receive_read_offset + bytes_to_read]);
+        let bytes_to_read = data.len().min(
+            ws.receive_buffer
+                .len()
+                .saturating_sub(ws.receive_read_offset),
+        );
+        data[..bytes_to_read].copy_from_slice(
+            &ws.receive_buffer[ws.receive_read_offset..ws.receive_read_offset + bytes_to_read],
+        );
         ws.receive_read_offset += bytes_to_read;
         if ws.receive_read_offset == ws.receive_buffer.len() {
             ws.receive_buffer.clear();
@@ -2462,10 +2473,7 @@ impl WinHttpStack {
 
         // Read the 220 greeting
         let greeting = Self::ftp_read_reply(&mut stream, 8192)?;
-        let greeting_status = greeting
-            .get(..3)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let greeting_status = greeting.get(..3).map(|s| s.to_string()).unwrap_or_default();
         if !greeting_status.starts_with("220") && !greeting_status.starts_with("120") {
             return Err(AppError::new(
                 ReasonCode::RcIo,
@@ -2580,9 +2588,7 @@ impl WinHttpStack {
             .chars()
             .take(3)
             .collect::<String>();
-        let ok = status.starts_with('1')
-            || status.starts_with('2')
-            || status.starts_with('3');
+        let ok = status.starts_with('1') || status.starts_with('2') || status.starts_with('3');
         if !ok {
             return Err(AppError::new(
                 ReasonCode::RcIo,
@@ -3983,7 +3989,8 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
                 let parts: Vec<&str> = args.split(',').collect();
                 if parts.len() == 2 {
                     let domain = parts[1].trim().trim_matches('"');
-                    if (host_lower.ends_with(domain) || host_lower == domain.trim_start_matches('.'))
+                    if (host_lower.ends_with(domain)
+                        || host_lower == domain.trim_start_matches('.'))
                         && let Some(ret) = find_return_in_block(&lines, idx)
                     {
                         return ret;
@@ -3999,9 +4006,7 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
             } else {
                 !url_lower.contains('.')
             };
-            if has_no_dot
-                && let Some(ret) = find_return_in_block(&lines, idx)
-            {
+            if has_no_dot && let Some(ret) = find_return_in_block(&lines, idx) {
                 return ret;
             }
         }
@@ -4186,8 +4191,7 @@ pub fn winhttp_get_proxy_for_url(url: &str, config: &ProxyDetectionMode) -> Opti
                         .trim_start_matches('.')
                         .trim_end_matches('.')
                         .to_lowercase();
-                    if !entry.is_empty()
-                        && (host == entry || host.ends_with(&format!(".{entry}")))
+                    if !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
                     {
                         return None;
                     }
@@ -4962,14 +4966,13 @@ fn check_crl_revocation(cert_der: &[u8]) -> Result<(), String> {
                                                 || url.starts_with("https://"))
                                         {
                                             // Try to fetch the CRL
-                                            let client =
-                                                match reqwest::blocking::Client::builder()
-                                                    .timeout(Duration::from_secs(10))
-                                                    .build()
-                                                {
-                                                    Ok(c) => c,
-                                                    Err(_) => break,
-                                                };
+                                            let client = match reqwest::blocking::Client::builder()
+                                                .timeout(Duration::from_secs(10))
+                                                .build()
+                                            {
+                                                Ok(c) => c,
+                                                Err(_) => break,
+                                            };
                                             if let Ok(response) = client.get(&url).send()
                                                 && response.status().is_success()
                                             {

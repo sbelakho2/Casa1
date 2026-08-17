@@ -206,7 +206,10 @@ impl Default for HidMonitor {
 /// Returns an empty vector if `ioreg` is unavailable or fails gracefully
 /// (matching the documented contract of [`HidMonitor::poll_for_changes`]).
 fn scan_controllers() -> AppResult<Vec<HostController>> {
-    let output = match Command::new("ioreg").args(["-r", "-c", "IOHIDDevice"]).output() {
+    let output = match Command::new("ioreg")
+        .args(["-r", "-c", "IOHIDDevice"])
+        .output()
+    {
         Ok(output) => output,
         Err(e) => {
             eprintln!("[real_hid] ioreg unavailable, reporting no controllers: {e}");
@@ -343,9 +346,8 @@ fn parse_ioreg_entry_id(line: &str) -> String {
 /// game controller.
 fn is_game_controller(vendor_id: u16, product_id: u16, product: &str) -> bool {
     let lower = product.to_ascii_lowercase();
-    let name_is_controller = lower.contains("gamepad")
-        || lower.contains("controller")
-        || lower.contains("joystick");
+    let name_is_controller =
+        lower.contains("gamepad") || lower.contains("controller") || lower.contains("joystick");
 
     // Strictly-gaming vendors match on VID alone.
     if VID_ONLY_CONTROLLER_VENDORS.contains(&vendor_id) {

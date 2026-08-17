@@ -1689,10 +1689,8 @@ impl User32Subsystem {
             return existing.atom;
         }
         let atom = self.alloc_atom();
-        self.classes.insert(
-            class_name.to_string(),
-            WindowClass { atom, info },
-        );
+        self.classes
+            .insert(class_name.to_string(), WindowClass { atom, info });
         atom
     }
 
@@ -2427,8 +2425,7 @@ impl User32Subsystem {
     /// Set a timer (called from the dispatch side for SetTimer).
     pub fn set_timer(&mut self, hwnd: Hwnd, timer_id: usize, timeout_ms: u32) -> bool {
         let interval = timeout_ms as u64;
-        let expiry =
-            std::time::SystemTime::now() + std::time::Duration::from_millis(interval);
+        let expiry = std::time::SystemTime::now() + std::time::Duration::from_millis(interval);
         self.timers.insert((hwnd, timer_id), (expiry, interval));
         true
     }
@@ -2581,9 +2578,16 @@ impl User32Subsystem {
         let mut formats: Vec<u32> = self.clipboard_data.keys().copied().collect();
         // Probe NSPasteboard for common text/image formats that may have been
         // placed there by another process (e.g., macOS apps).
-        for probe in [1u32 /*CF_TEXT*/, 13 /*CF_UNICODETEXT*/, 7 /*CF_OEMTEXT*/,
-                      2 /*CF_BITMAP*/, 14 /*CF_ENHMETAFILE*/, 15 /*CF_HDROP*/,
-                      8 /*CF_DIB*/, 3 /*CF_METAFILEPICT*/] {
+        for probe in [
+            1u32, /*CF_TEXT*/
+            13,   /*CF_UNICODETEXT*/
+            7,    /*CF_OEMTEXT*/
+            2,    /*CF_BITMAP*/
+            14,   /*CF_ENHMETAFILE*/
+            15,   /*CF_HDROP*/
+            8,    /*CF_DIB*/
+            3,    /*CF_METAFILEPICT*/
+        ] {
             if !formats.contains(&probe) && mac_window::nspasteboard_is_format_available(probe) {
                 formats.push(probe);
             }
@@ -2726,8 +2730,7 @@ impl User32Subsystem {
                 }
                 continue;
             }
-            if class_name
-                .is_some_and(|expected| !window.class_name.eq_ignore_ascii_case(expected))
+            if class_name.is_some_and(|expected| !window.class_name.eq_ignore_ascii_case(expected))
             {
                 continue;
             }
@@ -3138,9 +3141,7 @@ impl User32Subsystem {
             .and_then(|queue| queue.front())
             .cloned()
         {
-            if remove
-                && let Some(queue) = self.thread_message_queues.get_mut(&thread_id)
-            {
+            if remove && let Some(queue) = self.thread_message_queues.get_mut(&thread_id) {
                 queue.pop_front();
             }
             return Some(message);
@@ -4225,9 +4226,7 @@ impl User32Subsystem {
                         let _: () = msg_send![content_view, addSubview: ve_view positioned: 0u64 relativeTo: std::ptr::null_mut::<Object>()];
                         // NSWindowBelow = 0
 
-                        self.blur_effect_views
-                            .entry(hwnd)
-                            .or_insert(ve_view as u64);
+                        self.blur_effect_views.entry(hwnd).or_insert(ve_view as u64);
                     }
                 } else {
                     // Remove the visual effect view, then release the +1 we
@@ -4559,8 +4558,10 @@ impl User32Subsystem {
                 let ns_window = window.ns_window;
                 let visible = window.visible;
                 if visible && !ns_window.is_null() {
-                    let source_width = (rect_from.right as i64 - rect_from.left as i64).max(0) as u32;
-                    let source_height = (rect_from.bottom as i64 - rect_from.top as i64).max(0) as u32;
+                    let source_width =
+                        (rect_from.right as i64 - rect_from.left as i64).max(0) as u32;
+                    let source_height =
+                        (rect_from.bottom as i64 - rect_from.top as i64).max(0) as u32;
                     if source_width > 0 && source_height > 0 {
                         mac_window::set_nswindow_frame(
                             ns_window,
@@ -4945,14 +4946,12 @@ impl User32Subsystem {
     fn vk_code_to_char(&self, vk: u32) -> Option<char> {
         // Search only the ACTIVE layout: iterating every layout can return a
         // character from a non-active layout for multi-layout guests.
-        layout_tables()
-            .get(&self.layout)
-            .and_then(|table| {
-                table
-                    .values()
-                    .find(|entry| virtual_key_to_win32_vk(&entry.vk) == vk)
-                    .and_then(|entry| entry.plain)
-            })
+        layout_tables().get(&self.layout).and_then(|table| {
+            table
+                .values()
+                .find(|entry| virtual_key_to_win32_vk(&entry.vk) == vk)
+                .and_then(|entry| entry.plain)
+        })
     }
 
     /// Query modifier key state from macOS CoreGraphics (modifier keys only).
@@ -6240,8 +6239,10 @@ impl User32Subsystem {
                 work_rect: default_bounds,
                 is_primary: true,
             });
-        let w = (primary.bounds.right as i64 - primary.bounds.left as i64).clamp(0, i32::MAX as i64) as i32;
-        let h = (primary.bounds.bottom as i64 - primary.bounds.top as i64).clamp(0, i32::MAX as i64) as i32;
+        let w = (primary.bounds.right as i64 - primary.bounds.left as i64).clamp(0, i32::MAX as i64)
+            as i32;
+        let h = (primary.bounds.bottom as i64 - primary.bounds.top as i64).clamp(0, i32::MAX as i64)
+            as i32;
         let display_rect = PointerDeviceRect {
             left: 0,
             top: 0,

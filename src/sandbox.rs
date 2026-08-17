@@ -709,7 +709,10 @@ fn path_is_allowed_descendant(path: &str, allowed: &str) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    path == allowed || path.strip_prefix(allowed).is_some_and(|r| r.starts_with('/'))
+    path == allowed
+        || path
+            .strip_prefix(allowed)
+            .is_some_and(|r| r.starts_with('/'))
 }
 
 /// Escape a string for safe interpolation into Windows Sandbox (`.wsb`) XML.
@@ -957,27 +960,43 @@ mod tests {
         let manager = SandboxManager::with_profiles(vec![profile]);
 
         // A sibling directory sharing the prefix must be denied.
-        let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32Malware\\x.exe", false);
-        assert!(result.is_err(), "prefix sibling must be denied, got {result:?}");
+        let result = manager.validate_path_access(
+            "PrefixTest",
+            "C:\\Windows\\System32Malware\\x.exe",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "prefix sibling must be denied, got {result:?}"
+        );
         // Traversal through the allowed root must be denied.
         let result = manager.validate_path_access(
             "PrefixTest",
             "C:\\Windows\\System32\\..\\..\\..\\Users\\Public\\steam.exe",
             false,
         );
-        assert!(result.is_err(), "traversal through allowed root must be denied, got {result:?}");
+        assert!(
+            result.is_err(),
+            "traversal through allowed root must be denied, got {result:?}"
+        );
         // A genuine descendant is allowed.
-        let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32\\cmd.exe", false);
+        let result =
+            manager.validate_path_access("PrefixTest", "C:\\Windows\\System32\\cmd.exe", false);
         assert!(result.is_ok(), "descendant must be allowed, got {result:?}");
         // The allowed root itself is allowed.
         let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32", false);
-        assert!(result.is_ok(), "allowed root itself must be allowed, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "allowed root itself must be allowed, got {result:?}"
+        );
     }
 
     #[test]
     fn test_validate_path_access_disabled_manager_allows() {
         let manager = SandboxManager::new();
-        manager.create_profile("KillSwitch", "kill switch test").unwrap();
+        manager
+            .create_profile("KillSwitch", "kill switch test")
+            .unwrap();
         manager
             .add_read_path("KillSwitch", "/Users/test/Documents")
             .unwrap();
@@ -1081,7 +1100,11 @@ mod tests {
         // All AppContainer SIDs start with the correct prefix.
         assert!(sid1.starts_with("S-1-15-2-"));
         // The full 64-bit hash is used: four 16-bit parts.
-        assert_eq!(sid1.split('-').count(), 8, "SID should be S-1-15-2-p1-p2-p3-p4");
+        assert_eq!(
+            sid1.split('-').count(),
+            8,
+            "SID should be S-1-15-2-p1-p2-p3-p4"
+        );
     }
 
     #[test]
@@ -1171,7 +1194,9 @@ mod tests {
         manager.set_sandbox_config(config);
         let xml = manager.generate_wsb_xml();
         assert!(xml.contains("<HostFolder>/Users/a&amp;b/Projects&lt;1&gt;</HostFolder>"));
-        assert!(xml.contains("<SandboxFolder>C:\\Sandbox\\&quot;Quoted&quot;\\&apos;Path&apos;</SandboxFolder>"));
+        assert!(xml.contains(
+            "<SandboxFolder>C:\\Sandbox\\&quot;Quoted&quot;\\&apos;Path&apos;</SandboxFolder>"
+        ));
         // Raw special characters must not appear inside element text.
         assert!(!xml.contains("<HostFolder>/Users/a&b"));
     }

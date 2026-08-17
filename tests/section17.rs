@@ -187,19 +187,17 @@ fn t17_3_steam_named_pipe_creation() {
     // server's reply back to the client.
     let second = b"SteamIPC:RequestAppState";
     let third = b"SteamIPC:RequestDownload";
-    win32.write_file(client, second).expect("second client write");
+    win32
+        .write_file(client, second)
+        .expect("second client write");
     win32.write_file(client, third).expect("third client write");
     assert_eq!(
-        win32
-            .read_file(server, second.len())
-            .expect("read second"),
+        win32.read_file(server, second.len()).expect("read second"),
         second,
         "messages must be delivered in FIFO order"
     );
     assert_eq!(
-        win32
-            .read_file(server, third.len())
-            .expect("read third"),
+        win32.read_file(server, third.len()).expect("read third"),
         third,
         "messages must be delivered in FIFO order"
     );

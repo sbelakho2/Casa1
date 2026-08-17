@@ -511,7 +511,10 @@ impl WinInetStack {
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
             .unwrap_or_else(|| url.to_lowercase());
-        proxy.bypass_list.iter().any(|b| Self::host_matches_bypass(&host, b))
+        proxy
+            .bypass_list
+            .iter()
+            .any(|b| Self::host_matches_bypass(&host, b))
     }
 
     /// Match a host against a single bypass entry. Supports plain domains,
@@ -677,7 +680,8 @@ impl WinInetStack {
         // and log in with the provided credentials. Failures propagate as
         // errors instead of silently handing out a broken handle.
         if service == INTERNET_SERVICE_FTP
-            && let Err(e) = self.ftp_establish_control(handle, server_name, server_port, user_name, password)
+            && let Err(e) =
+                self.ftp_establish_control(handle, server_name, server_port, user_name, password)
         {
             self.connections.remove(&handle);
             return Err(e);
@@ -783,12 +787,18 @@ impl WinInetStack {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| {
-                AppError::new(ReasonCode::RcIo, format!("FTP set read timeout failed: {e}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("FTP set read timeout failed: {e}"),
+                )
             })?;
         stream
             .set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| {
-                AppError::new(ReasonCode::RcIo, format!("FTP set write timeout failed: {e}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("FTP set write timeout failed: {e}"),
+                )
             })?;
 
         // Read the 220 greeting and validate the banner status code.
@@ -802,9 +812,9 @@ impl WinInetStack {
 
         // Send USER
         let cmd = format!("USER {user}\r\n");
-        stream
-            .write_all(cmd.as_bytes())
-            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP: failed to send USER: {e}")))?;
+        stream.write_all(cmd.as_bytes()).map_err(|e| {
+            AppError::new(ReasonCode::RcIo, format!("FTP: failed to send USER: {e}"))
+        })?;
         let user_reply = Self::ftp_read_reply(&mut stream, 8192)?;
         if user_reply.starts_with("530") {
             return Err(AppError::new(
@@ -816,9 +826,9 @@ impl WinInetStack {
         // Send PASS if we got a password request (331)
         if user_reply.starts_with("331") {
             let cmd = format!("PASS {pass}\r\n");
-            stream
-                .write_all(cmd.as_bytes())
-                .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP: failed to send PASS: {e}")))?;
+            stream.write_all(cmd.as_bytes()).map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP: failed to send PASS: {e}"))
+            })?;
             let pass_reply = Self::ftp_read_reply(&mut stream, 8192)?;
             if pass_reply.starts_with("530") {
                 return Err(AppError::new(
@@ -971,7 +981,11 @@ impl WinInetStack {
             None
         };
         let proxy_cfg = self.proxy.clone();
-        let req_timeout_ms = self.requests.get(&request_handle).map(|r| r.timeout_ms).unwrap_or(30000);
+        let req_timeout_ms = self
+            .requests
+            .get(&request_handle)
+            .map(|r| r.timeout_ms)
+            .unwrap_or(30000);
 
         // Collect cookies from jar
         let cookies = self.get_cookies(&conn_server_name, &req_object_path, conn_is_secure);
@@ -1031,14 +1045,13 @@ impl WinInetStack {
 
         // Unknown verbs are errors, not silent GETs: a PROPFIND sent as GET
         // would change semantics and drop the payload.
-        let method = reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(
-            |_| {
+        let method =
+            reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(|_| {
                 AppError::new(
                     ReasonCode::RcCliInvalid,
                     format!("HttpSendRequestW: invalid HTTP verb '{req_verb}'"),
                 )
-            },
-        )?;
+            })?;
 
         let mut request_builder = client.request(method.clone(), &url);
 
@@ -1218,7 +1231,9 @@ impl WinInetStack {
         // First try the HTTP requests map
         if let Some(req) = self.requests.get_mut(&request_handle) {
             let off = req.read_offset;
-            let to_read = buffer.len().min(req.response_body.len().saturating_sub(off));
+            let to_read = buffer
+                .len()
+                .min(req.response_body.len().saturating_sub(off));
             if to_read > 0 {
                 buffer[..to_read].copy_from_slice(&req.response_body[off..off + to_read]);
             }
@@ -1233,7 +1248,9 @@ impl WinInetStack {
 
         // Fall back to FTP file data cache (for handles from ftp_open_file_w)
         if let Some((file_data, read_offset)) = self.ftp_file_data.get_mut(&request_handle) {
-            let to_read = buffer.len().min(file_data.len().saturating_sub(*read_offset));
+            let to_read = buffer
+                .len()
+                .min(file_data.len().saturating_sub(*read_offset));
             if to_read > 0 {
                 buffer[..to_read].copy_from_slice(&file_data[*read_offset..*read_offset + to_read]);
             }
@@ -1383,13 +1400,11 @@ impl WinInetStack {
             match option {
                 4 if value.len() >= 4 => {
                     // INTERNET_OPTION_CONNECT_TIMEOUT
-                    req.timeout_ms =
-                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 30 if value.len() >= 4 => {
                     // INTERNET_OPTION_RECEIVE_TIMEOUT
-                    req.timeout_ms =
-                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 _ => {}
             }
@@ -1461,11 +1476,7 @@ impl WinInetStack {
     }
 
     #[allow(unused_assignments)]
-    pub fn internet_crack_url_w(
-        &self,
-        url: &str,
-        url_length: u32,
-    ) -> AppResult<CrackedUrl> {
+    pub fn internet_crack_url_w(&self, url: &str, url_length: u32) -> AppResult<CrackedUrl> {
         let url = Self::truncate_url(url, url_length);
 
         // Parse the URL manually (simple approach)
@@ -2385,7 +2396,11 @@ pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>
     if let Some(ctx) = ctx
         && let Some(cb) = ctx.get_bind_status_callback()
     {
-        cb.on_progress(BINDSTATUS_BEGINDOWNLOADDATA, 0, total_size.min(u32::MAX as u64) as u32);
+        cb.on_progress(
+            BINDSTATUS_BEGINDOWNLOADDATA,
+            0,
+            total_size.min(u32::MAX as u64) as u32,
+        );
     }
 
     // Stream the response body into `data` with a size cap, reporting
@@ -2395,14 +2410,12 @@ pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>
     let chunk_size: usize = 8192;
     let mut buf = vec![0u8; chunk_size];
     let mut limited = response.take(MAX_WININET_RESPONSE_BODY as u64 + 1);
-    let mut n = limited
-        .read(&mut buf)
-        .map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetHttpRequestFailed,
-                format!("CreateURLMoniker: read failed for {url}: {e}"),
-            )
-        })?;
+    let mut n = limited.read(&mut buf).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcNetHttpRequestFailed,
+            format!("CreateURLMoniker: read failed for {url}: {e}"),
+        )
+    })?;
     while n > 0 {
         if data.len().saturating_add(n) > MAX_WININET_RESPONSE_BODY {
             return Err(AppError::new(
@@ -2426,14 +2439,12 @@ pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>
             );
         }
 
-        n = limited
-            .read(&mut buf)
-            .map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcNetHttpRequestFailed,
-                    format!("CreateURLMoniker: read failed for {url}: {e}"),
-                )
-            })?;
+        n = limited.read(&mut buf).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!("CreateURLMoniker: read failed for {url}: {e}"),
+            )
+        })?;
     }
 
     // Notify: end download data

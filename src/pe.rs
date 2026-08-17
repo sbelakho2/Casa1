@@ -400,9 +400,9 @@ impl ParsedPe {
     /// IJW assemblies contain native code and a CLR entry point token with the
     /// COMIMAGE_FLAGS_NATIVE_ENTRYPOINT flag set. They require CLR bootstrapping.
     pub fn is_ijw(&self) -> bool {
-        self.clr_header.as_ref().is_some_and(|clr| {
-            (clr.flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT) != 0
-        })
+        self.clr_header
+            .as_ref()
+            .is_some_and(|clr| (clr.flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT) != 0)
     }
 
     /// Returns `true` if this is a pure IL .NET assembly (no native code).
@@ -453,6 +453,14 @@ impl ApiSetResolver {
             return "combase.dll".to_string();
         }
 
+        // ── api-ms-win-core-com-* → ole32.dll
+        // COM api-set contracts (e.g. api-ms-win-core-com-l1-1-0.dll) also
+        // start with api-ms-win-core-, so this arm MUST precede the generic
+        // core catch-all below, exactly like the registry/winrt-string arms.
+        if normalized.starts_with("api-ms-win-core-com-") {
+            return "ole32.dll".to_string();
+        }
+
         // ── api-ms-win-core-* → kernel32.dll ──────────────────────────────
         // Core process, thread, memory, file, sync, library loader,
         // heap, IO, console, error handling, localization, named pipe,
@@ -483,11 +491,9 @@ impl ApiSetResolver {
             return "shell32.dll".to_string();
         }
 
-        // ── api-ms-win-com-* / -ole-* / -core-com-* → ole32.dll
-        if normalized.starts_with("api-ms-win-com-")
-            || normalized.starts_with("api-ms-win-core-com-")
-            || normalized.starts_with("api-ms-win-ole-")
-        {
+        // ── api-ms-win-com-* / -ole-* → ole32.dll
+        // (api-ms-win-core-com-* is handled by the earlier arm.)
+        if normalized.starts_with("api-ms-win-com-") || normalized.starts_with("api-ms-win-ole-") {
             return "ole32.dll".to_string();
         }
 

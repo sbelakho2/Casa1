@@ -371,11 +371,20 @@ struct SocketRecord {
 enum SocketState {
     Created,
     Bound(SockAddr),
-    Listening { _addr: SockAddr, _backlog: usize },
-    Connected { peer: SocketId },
-    ConnectedReal { _peer: SockAddr },
+    Listening {
+        _addr: SockAddr,
+        _backlog: usize,
+    },
+    Connected {
+        peer: SocketId,
+    },
+    ConnectedReal {
+        _peer: SockAddr,
+    },
     /// A non-blocking connect that is still in progress.
-    ConnectingReal { peer: SockAddr },
+    ConnectingReal {
+        peer: SockAddr,
+    },
     Shutdown,
     Closed,
 }
@@ -645,12 +654,14 @@ impl NetworkStack {
 
         // Plain HTTP
         let mut tcp_stream = stream;
-        tcp_stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetReadFailed,
-                format!("NetworkStack: HTTP read-timeout setup failed: {e}"),
-            )
-        })?;
+        tcp_stream
+            .set_read_timeout(Some(HTTP_READ_TIMEOUT))
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetReadFailed,
+                    format!("NetworkStack: HTTP read-timeout setup failed: {e}"),
+                )
+            })?;
         let request = format!(
             "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
         );
@@ -772,9 +783,7 @@ impl Clone for NetworkStack {
         let real_tcp_streams = self
             .real_tcp_streams
             .iter()
-            .filter_map(|(socket, stream)| {
-                stream.try_clone().ok().map(|cloned| (*socket, cloned))
-            })
+            .filter_map(|(socket, stream)| stream.try_clone().ok().map(|cloned| (*socket, cloned)))
             .collect();
         Self {
             next_id: self.next_id,
@@ -1250,15 +1259,14 @@ impl NetworkStack {
 
         // Blocking connect: bound it so an unreachable host cannot stall the
         // caller indefinitely.
-        let stream = TcpStream::connect_timeout(&candidate, Duration::from_secs(15)).map_err(
-            |error| {
+        let stream =
+            TcpStream::connect_timeout(&candidate, Duration::from_secs(15)).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
                 AppError::new(
                     ReasonCode::RcIo,
                     format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
                 )
-            },
-        )?;
+            })?;
         let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
         self.real_tcp_streams.insert(socket, stream);
 
@@ -1348,7 +1356,9 @@ impl NetworkStack {
             })?;
             bytes.truncate(read);
             if read == 0 {
-                let _ = self.socket_record_mut(socket).map(|record| record.real_eof = true);
+                let _ = self
+                    .socket_record_mut(socket)
+                    .map(|record| record.real_eof = true);
             }
             self.last_wsa_error = 0;
             return Ok(bytes);
@@ -1477,34 +1487,33 @@ impl NetworkStack {
         let mut writable = Vec::new();
         for socket in sockets {
             let record = self.socket_record(*socket)?;
-            let (can_read, can_write) =
-                if let SocketState::ConnectingReal { .. } = record.state {
-                    // A non-blocking connect in progress: report writable once
-                    // it completes, and both readable+writable on failure,
-                    // matching WinSock select semantics.
-                    match self.real_tcp_streams.get(socket).map(connect_state) {
-                        Some(ConnectState::Complete) => (false, true),
-                        Some(ConnectState::Failed(_)) => (true, true),
-                        _ => (false, false),
-                    }
+            let (can_read, can_write) = if let SocketState::ConnectingReal { .. } = record.state {
+                // A non-blocking connect in progress: report writable once
+                // it completes, and both readable+writable on failure,
+                // matching WinSock select semantics.
+                match self.real_tcp_streams.get(socket).map(connect_state) {
+                    Some(ConnectState::Complete) => (false, true),
+                    Some(ConnectState::Failed(_)) => (true, true),
+                    _ => (false, false),
+                }
+            } else {
+                let can_read = if let Some(stream) = self.real_tcp_streams.get(socket) {
+                    bytes_available(stream)? > 0 || record.real_eof
                 } else {
-                    let can_read = if let Some(stream) = self.real_tcp_streams.get(socket) {
-                        bytes_available(stream)? > 0 || record.real_eof
-                    } else {
-                        !record.recv_queue.is_empty()
-                            || self
-                                .pending_accept
-                                .get(socket)
-                                .is_some_and(|pending| !pending.is_empty())
-                    };
-                    let can_write = matches!(
-                        record.state,
-                        SocketState::Connected { .. }
-                            | SocketState::ConnectedReal { .. }
-                            | SocketState::Listening { .. }
-                    );
-                    (can_read, can_write)
+                    !record.recv_queue.is_empty()
+                        || self
+                            .pending_accept
+                            .get(socket)
+                            .is_some_and(|pending| !pending.is_empty())
                 };
+                let can_write = matches!(
+                    record.state,
+                    SocketState::Connected { .. }
+                        | SocketState::ConnectedReal { .. }
+                        | SocketState::Listening { .. }
+                );
+                (can_read, can_write)
+            };
             if can_read {
                 readable.push(*socket);
             }
@@ -1968,7 +1977,8 @@ impl NetworkStack {
                 proxy_override: None,
             },
         );
-        self.session_protocol_flags.insert(id, HttpProtocolFlags::new());
+        self.session_protocol_flags
+            .insert(id, HttpProtocolFlags::new());
         id
     }
 
@@ -2229,8 +2239,7 @@ impl NetworkStack {
             .unwrap_or(ConnectState::InProgress);
         match progress {
             ConnectState::Complete => {
-                self.socket_record_mut(socket)?.state =
-                    SocketState::ConnectedReal { _peer: peer };
+                self.socket_record_mut(socket)?.state = SocketState::ConnectedReal { _peer: peer };
                 Ok(())
             }
             ConnectState::Failed(errno) => {
@@ -2349,11 +2358,7 @@ fn so_error(stream: &TcpStream) -> Option<i32> {
             &mut len,
         )
     };
-    if ret == 0 {
-        Some(error)
-    } else {
-        None
-    }
+    if ret == 0 { Some(error) } else { None }
 }
 
 /// The state of a non-blocking connect.
@@ -3401,8 +3406,7 @@ fn load_native_certs() -> Vec<rustls::pki_types::CertificateDer<'static>> {
 
 /// Cached native root store: loading it forks a `security` process and reads
 /// cert files, so it must not happen per connection.
-static NATIVE_ROOT_CERTS: std::sync::OnceLock<rustls::RootCertStore> =
-    std::sync::OnceLock::new();
+static NATIVE_ROOT_CERTS: std::sync::OnceLock<rustls::RootCertStore> = std::sync::OnceLock::new();
 
 /// Build a root certificate store from the system's trust store (cached).
 fn quic_root_certs() -> rustls::RootCertStore {
@@ -3515,7 +3519,12 @@ pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
             socket,
             Arc::new(quinn::TokioRuntime),
         )
-        .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC endpoint creation failed: {e}")));
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("QUIC endpoint creation failed: {e}"),
+            )
+        });
         if result_tx.send(result).is_err() {
             eprintln!("[network] QUIC listener receiver dropped before endpoint creation");
         }
@@ -3536,7 +3545,9 @@ pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
                         state.connections.insert(conn_handle, connection);
                     }
                     Err(_) => {
-                        eprintln!("[network] QUIC state lock poisoned; listener accept loop exiting");
+                        eprintln!(
+                            "[network] QUIC state lock poisoned; listener accept loop exiting"
+                        );
                         break;
                     }
                 },
@@ -5317,7 +5328,10 @@ mod tests {
     fn parse_host_port_handles_unbracketed_ipv6() {
         assert_eq!(parse_host_port("::1", 443), ("::1", 443));
         assert_eq!(parse_host_port("example.com", 443), ("example.com", 443));
-        assert_eq!(parse_host_port("example.com:8080", 443), ("example.com", 8080));
+        assert_eq!(
+            parse_host_port("example.com:8080", 443),
+            ("example.com", 8080)
+        );
         assert_eq!(parse_host_port("[::1]:8443", 443), ("::1", 8443));
     }
 
@@ -5377,7 +5391,10 @@ mod tests {
         network.connect(client, addr).expect("connect");
         let server = network.accept(listener).expect("accept");
         network.send(client, b"data").expect("send");
-        assert_eq!(network.recv(server, 0).expect("zero-length recv"), Vec::<u8>::new());
+        assert_eq!(
+            network.recv(server, 0).expect("zero-length recv"),
+            Vec::<u8>::new()
+        );
         assert_eq!(network.recv(server, 4).expect("recv"), b"data");
     }
 

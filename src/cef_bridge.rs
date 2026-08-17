@@ -1603,16 +1603,14 @@ impl WKWebViewManager {
 
                 // Block signature: void (^)(id _Nullable, NSError * _Nullable)
                 let block = block::ConcreteBlock::new(
-                    move |result: *mut objc::runtime::Object,
-                          error: *mut objc::runtime::Object| {
+                    move |result: *mut objc::runtime::Object, error: *mut objc::runtime::Object| {
                         if !error.is_null() {
                             let desc: *mut objc::runtime::Object =
                                 msg_send![error, localizedDescription];
                             let err_str = ns_string_to_rust(desc);
                             eprintln!("[CefBridge] JS execution error: {err_str}");
                         } else if !result.is_null() {
-                            let desc: *mut objc::runtime::Object =
-                                msg_send![result, description];
+                            let desc: *mut objc::runtime::Object = msg_send![result, description];
                             let result_str = ns_string_to_rust(desc);
                             eprintln!(
                                 "[CefBridge] JS execution result (id={callback_id}): {}",
@@ -1695,12 +1693,10 @@ impl WKWebViewManager {
                             Some(c) => c,
                             None => return,
                         };
-                        let is_nsimage: bool =
-                            msg_send![snapshot, isKindOfClass: cls_nsimage];
+                        let is_nsimage: bool = msg_send![snapshot, isKindOfClass: cls_nsimage];
                         if is_nsimage {
                             // Get CGImage from NSImage
-                            let cg_image: *mut std::ffi::c_void =
-                                msg_send![snapshot, CGImageForProposedRect: std::ptr::null_mut::<std::ffi::c_void>()
+                            let cg_image: *mut std::ffi::c_void = msg_send![snapshot, CGImageForProposedRect: std::ptr::null_mut::<std::ffi::c_void>()
                                                                              context: std::ptr::null_mut::<std::ffi::c_void>()
                                                                              hints: std::ptr::null_mut::<std::ffi::c_void>()];
                             if !cg_image.is_null() {
@@ -1876,7 +1872,11 @@ impl Drop for IoSurfaceReadLockGuard {
         // SAFETY: the surface was successfully locked with
         // K_IO_SURFACE_LOCK_READ_ONLY before this guard was created.
         unsafe {
-            IOSurfaceUnlock(self.surface, K_IO_SURFACE_LOCK_READ_ONLY, std::ptr::null_mut());
+            IOSurfaceUnlock(
+                self.surface,
+                K_IO_SURFACE_LOCK_READ_ONLY,
+                std::ptr::null_mut(),
+            );
         }
     }
 }
@@ -2480,7 +2480,9 @@ impl CefBridge {
                 displayed_frame_index: self.live_frame_counter,
             };
             if tx.try_send(live_frame).is_err() {
-                crate::live::live_trace("[CefBridge] publish_live_frame_from_pixels: receiver lagged or closed");
+                crate::live::live_trace(
+                    "[CefBridge] publish_live_frame_from_pixels: receiver lagged or closed",
+                );
             }
         }
     }
@@ -2521,7 +2523,12 @@ impl CefBridge {
                         // check the return code. A locked surface whose lock
                         // failed must not be read, and every path below must
                         // unlock exactly once (via the RAII guard).
-                        if IOSurfaceLock(io_surface, K_IO_SURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) != 0 {
+                        if IOSurfaceLock(
+                            io_surface,
+                            K_IO_SURFACE_LOCK_READ_ONLY,
+                            std::ptr::null_mut(),
+                        ) != 0
+                        {
                             continue;
                         }
                         let _guard = IoSurfaceReadLockGuard::new(io_surface);
@@ -4375,7 +4382,10 @@ impl CefBridge {
             && let Some(wk_handle) = browser.wk_handle
             && let Some(dims) = mgr.dimensions(wk_handle)
         {
-            let (fw, fh) = (clamp_frame_dim(dims.0.max(1.0) as u32), clamp_frame_dim(dims.1.max(1.0) as u32));
+            let (fw, fh) = (
+                clamp_frame_dim(dims.0.max(1.0) as u32),
+                clamp_frame_dim(dims.1.max(1.0) as u32),
+            );
             let frame_number = self.next_frame_number();
             // Push a placeholder rendered frame with an owned, correctly
             // sized buffer so downstream CPU paths see valid pixels (the
@@ -4461,9 +4471,7 @@ impl CefBridge {
             // steam:// URLs are handled natively — cancel browser navigation
             // and dispatch the parsed action to the Steam protocol handler
             // (WKWebView cannot load the custom scheme itself).
-            use crate::steam_protocol::{
-                SteamProtocolDispatchResult, SteamProtocolHandler,
-            };
+            use crate::steam_protocol::{SteamProtocolDispatchResult, SteamProtocolHandler};
             let result = SteamProtocolHandler::new().handle_url(url);
             match result {
                 SteamProtocolDispatchResult::NavigateBrowser(target) => {
@@ -4481,9 +4489,7 @@ impl CefBridge {
                     );
                 }
                 other => {
-                    eprintln!(
-                        "[CefBridge] OnBeforeBrowse: steam:// dispatch result: {other:?}",
-                    );
+                    eprintln!("[CefBridge] OnBeforeBrowse: steam:// dispatch result: {other:?}",);
                 }
             }
             return true;
@@ -5262,9 +5268,7 @@ impl CefCookieManager {
         };
 
         // Remember the first effective path; ignore later ones.
-        let mut path_guard = GLOBAL_COOKIE_PATH
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut path_guard = GLOBAL_COOKIE_PATH.lock().unwrap_or_else(|e| e.into_inner());
         if path_guard.is_none() {
             *path_guard = Some(std::path::PathBuf::from(&effective));
         }
@@ -5455,7 +5459,9 @@ unsafe fn ns_string_to_rust(obj: *mut objc::runtime::Object) -> String {
         if utf8.is_null() {
             return String::new();
         }
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -6280,9 +6286,7 @@ static GLOBAL_CEF_BRIDGE: std::sync::LazyLock<std::sync::Mutex<Option<CefBridge>
 /// Set the global CefBridge instance. Called during Steam integration setup.
 pub fn set_global_cef_bridge(bridge: CefBridge) {
     // lock(): panic on poison is acceptable
-    let mut guard = GLOBAL_CEF_BRIDGE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(bridge);
 }
 
@@ -6294,9 +6298,7 @@ pub fn set_global_cef_bridge(bridge: CefBridge) {
 /// Returns a mutable reference to the (possibly just-created) bridge.
 pub fn ensure_global_bridge(live_frame_tx: Option<Sender<LiveFrame>>) {
     // lock(): panic on poison is acceptable
-    let mut guard = GLOBAL_CEF_BRIDGE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         let mut bridge = CefBridge::new();
         if let Some(tx) = live_frame_tx {
@@ -6325,16 +6327,12 @@ where
 {
     // lock(): panic on poison is acceptable
     let mut bridge = {
-        let mut guard = GLOBAL_CEF_BRIDGE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
         guard.take()?
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut bridge)));
     {
-        let mut guard = GLOBAL_CEF_BRIDGE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(bridge);
     }
     match result {
@@ -8060,9 +8058,7 @@ mod tests {
         );
 
         // OnPaint advertises 100x50 but only delivers 100x3 rows of pixels.
-        let received: Vec<u8> = (0..(100 * 3 * 4) as u32)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let received: Vec<u8> = (0..(100 * 3 * 4) as u32).map(|i| (i % 251) as u8).collect();
         bridge.on_paint(browser_handle, 0, &[], &received, 100, 50);
 
         let frame = host_session

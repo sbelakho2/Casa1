@@ -19,7 +19,11 @@ fn t7_1_dxgi_swapchain_oracle_suite_matches_expected_present_resize_and_latency_
         "adapter vendor must be Apple/NVIDIA/AMD; got {:#x}",
         backend.adapter().vendor_id
     );
-    assert_ne!(backend.adapter().device_id, 0, "device id must be populated");
+    assert_ne!(
+        backend.adapter().device_id,
+        0,
+        "device id must be populated"
+    );
     assert!(
         backend.adapter().metal_family.starts_with("apple"),
         "metal family must be apple<family>; got {}",

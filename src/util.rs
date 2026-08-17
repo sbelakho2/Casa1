@@ -241,10 +241,8 @@ mod tests {
 
     #[test]
     fn sha256_file_matches_sha256_bytes() {
-        let path = std::env::temp_dir().join(format!(
-            "casa1_sha256_test_{}.bin",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("casa1_sha256_test_{}.bin", std::process::id()));
         let data: &[u8] = b"hello casa1 streaming hash\x00\xff\x10";
         fs::write(&path, data).expect("write temp file");
         let from_file = sha256_file(&path).expect("hash file");

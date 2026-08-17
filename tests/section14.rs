@@ -83,17 +83,28 @@ fn t14_1_vulkan_render_sample_produces_stable_sample_derived_hash() {
     sample = vulkan_sample();
     sample.draw_calls = 4;
     let more_draws = loader.render_sample(&sample).expect("more draw calls");
-    assert_ne!(more_draws.hash, frame.hash, "draw_calls must affect the hash");
+    assert_ne!(
+        more_draws.hash, frame.hash,
+        "draw_calls must affect the hash"
+    );
 
     sample = vulkan_sample();
     sample.compute_dispatches = 2;
-    let more_compute = loader.render_sample(&sample).expect("more compute dispatches");
-    assert_ne!(more_compute.hash, frame.hash, "compute_dispatches must affect the hash");
+    let more_compute = loader
+        .render_sample(&sample)
+        .expect("more compute dispatches");
+    assert_ne!(
+        more_compute.hash, frame.hash,
+        "compute_dispatches must affect the hash"
+    );
 
     sample = vulkan_sample();
     sample.clear_color = [1, 2, 3, 4];
     let other_clear = loader.render_sample(&sample).expect("other clear color");
-    assert_ne!(other_clear.hash, frame.hash, "clear_color must affect the hash");
+    assert_ne!(
+        other_clear.hash, frame.hash,
+        "clear_color must affect the hash"
+    );
 
     let repeat = loader
         .render_sample(&vulkan_sample())
@@ -130,17 +141,26 @@ fn t14_2_opengl_render_sample_produces_stable_sample_derived_hash() {
     sample = opengl_sample();
     sample.triangle_count = 13;
     let more_triangles = driver.render_sample(&sample).expect("more triangles");
-    assert_ne!(more_triangles.hash, frame.hash, "triangle_count must affect the hash");
+    assert_ne!(
+        more_triangles.hash, frame.hash,
+        "triangle_count must affect the hash"
+    );
 
     sample = opengl_sample();
     sample.uses_framebuffer_object = false;
     let no_fbo = driver.render_sample(&sample).expect("no FBO");
-    assert_ne!(no_fbo.hash, frame.hash, "uses_framebuffer_object must affect the hash");
+    assert_ne!(
+        no_fbo.hash, frame.hash,
+        "uses_framebuffer_object must affect the hash"
+    );
 
     sample = opengl_sample();
     sample.clear_color = [1, 2, 3, 4];
     let other_clear = driver.render_sample(&sample).expect("other clear color");
-    assert_ne!(other_clear.hash, frame.hash, "clear_color must affect the hash");
+    assert_ne!(
+        other_clear.hash, frame.hash,
+        "clear_color must affect the hash"
+    );
 
     let repeat = driver
         .render_sample(&opengl_sample())

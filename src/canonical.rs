@@ -362,8 +362,6 @@ mod tests {
             value: 1.5000000001,
             unit: "x".to_string(),
         });
-        assert!(
-            compare_outputs(&expected, &actual, &ToleranceRegistry::default()).is_err()
-        );
+        assert!(compare_outputs(&expected, &actual, &ToleranceRegistry::default()).is_err());
     }
 }

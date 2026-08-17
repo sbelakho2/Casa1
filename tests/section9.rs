@@ -13,11 +13,29 @@ fn sha(bytes: &[u8]) -> String {
 
 #[test]
 fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
-    let unsupported = d3d11_create_device(DeviceCreationRequest {
+    // Hardware-independent contract: requesting ONLY Level11_0 either
+    // succeeds on adapters that can deliver it (modern Apple GPUs, apple11
+    // family) or fails truthfully with RcD3dFeatureUnsupported on adapters
+    // that cannot. It must never silently downgrade.
+    let request_11_only = d3d11_create_device(DeviceCreationRequest {
         requested_feature_levels: vec![FeatureLevel::Level11_0],
-    })
-    .expect_err("11_0-only device request must fail truthfully");
-    assert_eq!(unsupported.code, ReasonCode::RcD3dFeatureUnsupported);
+    });
+    match request_11_only {
+        Ok(device) => {
+            assert_eq!(
+                device.feature_level(),
+                FeatureLevel::Level11_0,
+                "an accepted 11_0-only request must negotiate Level11_0"
+            );
+        }
+        Err(error) => {
+            assert_eq!(
+                error.code,
+                ReasonCode::RcD3dFeatureUnsupported,
+                "a refused 11_0-only request must report RcD3dFeatureUnsupported"
+            );
+        }
+    }
 
     let mut device = d3d11_create_device_and_swapchain(
         DeviceCreationRequest {
@@ -31,7 +49,15 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
         },
     )
     .expect("create D3D11 device and swapchain");
-    assert_eq!(device.feature_level(), FeatureLevel::Level10_1);
+    assert!(
+        matches!(
+            device.feature_level(),
+            FeatureLevel::Level11_0 | FeatureLevel::Level10_1
+        ),
+        "the negotiated level must be one of the requested levels"
+    );
+    // Metal has no geometry shaders; the capability is honestly reported
+    // false at every negotiated level.
     assert!(!device.caps().geometry_shader);
     assert_eq!(
         device
@@ -239,8 +265,9 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
         "store"
     };
     let header = format!(
-        "gpu={gpu_profile}|fl=Level10_1|lists=1|draw=1|draw_indexed=1|dispatch=1|\
-         render_passes=1|compute_passes=1|blit_passes=1|validation=0"
+        "gpu={gpu_profile}|fl={:?}|lists=1|draw=1|draw_indexed=1|dispatch=1|\
+         render_passes=1|compute_passes=1|blit_passes=1|validation=0",
+        device.feature_level()
     );
     assert!(
         submission.signature.starts_with(&header),
@@ -258,6 +285,7 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
          shaders=[Vs:vs_main,Ps:ps_main,Cs:cs_main,Gs:none,Hs:none,Ds:none]|\
          cb=[Vs=[constants];Ps=[constants];Cs=[];Gs=[];Hs=[];Ds=[]]|\
          srv=[Vs=[];Ps=[color];Cs=[volume];Gs=[];Hs=[];Ds=[]]|\
+         uav=[Vs=[];Ps=[];Cs=[];Gs=[];Hs=[];Ds=[]]|\
          samp=[Vs=[];Ps=[Linear:wrap:clamp];Cs=[];Gs=[];Hs=[];Ds=[]]"
     );
     let binding = {
@@ -279,16 +307,17 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     );
 
     // Render pass plan segment (draw calls 2: one Draw + one DrawIndexed).
-    let render_pass = format!(
-        "|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:{depth_store_action}"
-    );
+    let render_pass =
+        format!("|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:{depth_store_action}");
     assert!(
         submission.signature.contains(&render_pass),
         "signature must contain the exact render pass segment {render_pass}; got: {}",
         submission.signature
     );
 
-    let color_digest = sha(&[0x11, 0x22, 0x33, 0x44].repeat(16));
+    // The B8G8R8A8 target stores clear color [0x11,0x22,0x33,0x44] as
+    // [R,G,B,A] = [0x33,0x22,0x11,0x44]; the digest is over that layout.
+    let color_digest = sha(&[0x33, 0x22, 0x11, 0x44].repeat(16));
     let constants_bytes = [9, 8, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0];
     let constants_digest = sha(&constants_bytes);
     let depth_bytes = {

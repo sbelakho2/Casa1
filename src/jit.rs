@@ -33,7 +33,11 @@ use std::sync::{LazyLock, Mutex};
 /// JIT-generated code guarantees this by only passing pointers to live
 /// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_helper_load(memory: *mut MemoryImage, address: u64, width: u64) -> u64 {
+pub unsafe extern "C" fn jit_helper_load(
+    memory: *mut MemoryImage,
+    address: u64,
+    width: u64,
+) -> u64 {
     if memory.is_null() {
         return 0;
     }
@@ -54,7 +58,12 @@ pub unsafe extern "C" fn jit_helper_load(memory: *mut MemoryImage, address: u64,
 /// JIT-generated code guarantees this by only passing pointers to live
 /// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_helper_store(memory: *mut MemoryImage, address: u64, value: u64, width: u64) {
+pub unsafe extern "C" fn jit_helper_store(
+    memory: *mut MemoryImage,
+    address: u64,
+    value: u64,
+    width: u64,
+) {
     if memory.is_null() {
         return;
     }
@@ -93,7 +102,6 @@ pub unsafe extern "C" fn jit_helper_execute_insn(
     let insn_slice = unsafe { std::slice::from_raw_parts(insn_ptr, 1) };
     let _ = crate::cpu::execute_ir_with_hashing(s, m, insn_slice, None, false);
 }
-
 
 /// seg: 0=FS, 1=GS.  Returns the segment base (e.g., TEB address for FS).
 ///
@@ -137,10 +145,16 @@ pub unsafe extern "C" fn jit_helper_set_flags(
     op: u64,
     width: u64,
 ) {
-    if state.is_null() { return; }
+    if state.is_null() {
+        return;
+    }
     let s = unsafe { &mut *state };
     let bits = (width * 8) as u32;
-    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let r = result & mask;
     let a = lhs & mask;
     let b = rhs & mask;
@@ -169,7 +183,6 @@ pub unsafe extern "C" fn jit_helper_set_flags(
         }
     }
 }
-
 
 const JIT_PAGE_SIZE: usize = 64 * 1024;
 
@@ -214,7 +227,6 @@ pub static JIT_CHAIN_BREAK_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// active scheduling mechanism.  This flag is the wired-up, ready-to-use
 /// counterpart for when JIT execution is re-enabled.
 pub static JIT_SAFEPOINT_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 
 /// Global pointer to the active [`JitRuntime`] instance, used by the live
 /// session's watchdog thread to force chain-breaking when the worker thread
@@ -318,7 +330,9 @@ pub fn force_break_all_chains() {
     let _lock = match JIT_EXEC_LOCK.try_write() {
         Ok(guard) => guard,
         Err(_) => {
-            eprintln!("[jit] force_break_all_chains: worker holds read lock — deferring chain break");
+            eprintln!(
+                "[jit] force_break_all_chains: worker holds read lock — deferring chain break"
+            );
             return;
         }
     };
@@ -327,7 +341,9 @@ pub fn force_break_all_chains() {
     if !ptr.is_null() {
         // SAFETY: The worker is not inside entry_fn() (we acquired the write
         // lock), so there is no MAP_JIT permission race.
-        unsafe { (*ptr).break_all_chains(); }
+        unsafe {
+            (*ptr).break_all_chains();
+        }
     }
 }
 
@@ -543,7 +559,11 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
                 // mmap (fault_addr was validated in-range below for prior
                 // faults; defensively bounds-check here too).
                 let page_off = page as usize;
-                if page_off.checked_add(4096).map(|e| e <= flat_size).unwrap_or(false) {
+                if page_off
+                    .checked_add(4096)
+                    .map(|e| e <= flat_size)
+                    .unwrap_or(false)
+                {
                     unsafe {
                         std::ptr::write_bytes(flat_base.add(page_off), 0, 4096);
                     }
@@ -655,16 +675,17 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
         // Use checked arithmetic: offset + 4095 must not overflow usize,
         // and the resulting pointer must fall within the flat memory region.
         if let Some(end_offset) = offset.checked_add(4095)
-            && end_offset < flat_size_val {
-                // SAFETY: end_offset < flat_size_val guarantees the pointer
-                // base + end_offset is within the mmap'd region.
-                unsafe {
-                    std::ptr::write_volatile(
-                        (runtime.flat_memory.base() as *mut u8).add(end_offset),
-                        0u8,
-                    );
-                }
+            && end_offset < flat_size_val
+        {
+            // SAFETY: end_offset < flat_size_val guarantees the pointer
+            // base + end_offset is within the mmap'd region.
+            unsafe {
+                std::ptr::write_volatile(
+                    (runtime.flat_memory.base() as *mut u8).add(end_offset),
+                    0u8,
+                );
             }
+        }
         // Signal-safe zeroing: ptr::write_bytes compiles to an inline memset
         // which is async-signal-safe (memset is in the POSIX safe list).
         // SAFETY: batch_page_data is a stack-local [u8; 4096] array,
@@ -1317,15 +1338,16 @@ impl JitMemoryManager {
         let aligned = size.div_ceil(64) * 64;
 
         if let Some(&(page_ptr, page_size)) = self.pages.last()
-            && self.write_offset + aligned <= page_size {
-                // SAFETY: page_ptr is a valid mmap'd pointer and
-                // write_offset + aligned <= page_size was checked above,
-                // so the resulting pointer is within the allocated region.
-                let ptr = unsafe { page_ptr.add(self.write_offset) };
-                self.write_offset += aligned;
-                self.total_used.fetch_add(aligned, Ordering::Relaxed);
-                return ptr;
-            }
+            && self.write_offset + aligned <= page_size
+        {
+            // SAFETY: page_ptr is a valid mmap'd pointer and
+            // write_offset + aligned <= page_size was checked above,
+            // so the resulting pointer is within the allocated region.
+            let ptr = unsafe { page_ptr.add(self.write_offset) };
+            self.write_offset += aligned;
+            self.total_used.fetch_add(aligned, Ordering::Relaxed);
+            return ptr;
+        }
 
         let new_size = aligned.max(JIT_PAGE_SIZE);
         // SAFETY: allocate_page is an unsafe method that performs mmap.
@@ -1554,14 +1576,12 @@ impl FlatGuestMemory {
             // SAFETY: Checked arithmetic — offset + 4095 must not overflow
             // usize, and the resulting pointer must be within the mmap'd region.
             if let Some(end_offset) = offset.checked_add(4095)
-                && end_offset < self.size {
-                    unsafe {
-                        std::ptr::write_volatile(
-                            self.base.add(end_offset),
-                            0u8,
-                        );
-                    }
+                && end_offset < self.size
+            {
+                unsafe {
+                    std::ptr::write_volatile(self.base.add(end_offset), 0u8);
                 }
+            }
             page += page_size;
         }
     }
@@ -1939,12 +1959,12 @@ impl JitCompiler {
         // Save all guest GPRs to CpuState (x0), then save x0 (CpuState ptr) and
         // x2 (MemoryImage ptr) in callee-saved regs before the call.
         self.emit_store_guest_registers(arch);
-        self.emitter.mov_reg(24, 0);          // x24 = CpuState ptr (callee-saved)
-        self.emitter.mov_reg(28, 2);          // x28 = MemoryImage ptr (callee-saved)
-        self.emitter.mov_reg(27, addr_reg);   // x27 = address (callee-saved)
+        self.emitter.mov_reg(24, 0); // x24 = CpuState ptr (callee-saved)
+        self.emitter.mov_reg(28, 2); // x28 = MemoryImage ptr (callee-saved)
+        self.emitter.mov_reg(27, addr_reg); // x27 = address (callee-saved)
         // Set up helper args.
-        self.emitter.mov_reg(0, 28);          // x0 = MemoryImage ptr
-        self.emitter.mov_reg(1, 27);          // x1 = address
+        self.emitter.mov_reg(0, 28); // x0 = MemoryImage ptr
+        self.emitter.mov_reg(1, 27); // x1 = address
         self.emitter.movz(2, width as u16, 0); // x2 = width
         self.emit_bl_to(jit_helper_load as *const () as usize);
         // Result in x0 → save to x27 (callee-saved).
@@ -1963,25 +1983,31 @@ impl JitCompiler {
     fn emit_helper_store(&mut self, addr_reg: u32, val_reg: u32, width: u64, arch: GuestArch) {
         // Save all guest GPRs to CpuState first.
         self.emit_store_guest_registers(arch);
-        self.emitter.mov_reg(24, 0);          // x24 = CpuState ptr
-        self.emitter.mov_reg(28, 2);          // x28 = MemoryImage ptr
-        self.emitter.mov_reg(27, addr_reg);   // x27 = address
-        self.emitter.mov_reg(25, val_reg);    // x25 = value
+        self.emitter.mov_reg(24, 0); // x24 = CpuState ptr
+        self.emitter.mov_reg(28, 2); // x28 = MemoryImage ptr
+        self.emitter.mov_reg(27, addr_reg); // x27 = address
+        self.emitter.mov_reg(25, val_reg); // x25 = value
         // Set up helper args.
-        self.emitter.mov_reg(0, 28);          // x0 = MemoryImage ptr
-        self.emitter.mov_reg(1, 27);          // x1 = address
-        self.emitter.mov_reg(2, 25);          // x2 = value
+        self.emitter.mov_reg(0, 28); // x0 = MemoryImage ptr
+        self.emitter.mov_reg(1, 27); // x1 = address
+        self.emitter.mov_reg(2, 25); // x2 = value
         self.emitter.movz(3, width as u16, 0); // x3 = width
         self.emit_bl_to(jit_helper_store as *const () as usize);
         // Restore x0 = CpuState, then reload guest GPRs.
         self.emitter.mov_reg(0, 24);
         self.emit_load_guest_registers(arch);
-        self.emitter.mov_reg(2, 28);          // restore MemoryImage ptr
+        self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
     }
 
     /// Compute the effective guest address of a MemoryOperand into `dst_reg`.
     /// Handles base + index*scale + displacement, rip-relative, and absolute.
-    fn emit_effective_address(&mut self, operand: &crate::cpu::MemoryOperand, dst_reg: u32, _rip: u64, arch: GuestArch) {
+    fn emit_effective_address(
+        &mut self,
+        operand: &crate::cpu::MemoryOperand,
+        dst_reg: u32,
+        _rip: u64,
+        arch: GuestArch,
+    ) {
         // Handle segment prefix: if the operand has a segment, call
         // jit_helper_segment_base to get the segment base (FS=TEB address)
         // and start the effective address from there.
@@ -2062,7 +2088,15 @@ impl JitCompiler {
     /// Call jit_helper_set_flags(state, result, lhs, rhs, op, width).
     /// The operands are in ARM64 registers; we save guest state, set up
     /// args, call, and restore.
-    fn emit_set_flags(&mut self, result_reg: u32, lhs_reg: u32, rhs_reg: u32, op: u64, width: u64, arch: GuestArch) {
+    fn emit_set_flags(
+        &mut self,
+        result_reg: u32,
+        lhs_reg: u32,
+        rhs_reg: u32,
+        op: u64,
+        width: u64,
+        arch: GuestArch,
+    ) {
         self.emit_store_guest_registers(arch);
         self.emitter.mov_reg(24, 0); // save CpuState
         // Save the operand regs into callee-saved (they're guest regs that
@@ -2079,10 +2113,10 @@ impl JitCompiler {
         // regs (x4-x20) that get clobbered. So the caller must use callee-saved
         // temps. We assume result_reg/lhs_reg/rhs_reg are already in
         // callee-saved regs (x23-x28).
-        self.emitter.mov_reg(0, 24);          // x0 = CpuState
-        self.emitter.mov_reg(1, result_reg);  // x1 = result
-        self.emitter.mov_reg(2, lhs_reg);     // x2 = lhs
-        self.emitter.mov_reg(3, rhs_reg);     // x3 = rhs
+        self.emitter.mov_reg(0, 24); // x0 = CpuState
+        self.emitter.mov_reg(1, result_reg); // x1 = result
+        self.emitter.mov_reg(2, lhs_reg); // x2 = lhs
+        self.emitter.mov_reg(3, rhs_reg); // x3 = rhs
         // x4 = op, x5 = width — but x4 is a guest reg (RAX). Use movz into
         // a temp after the BL clobberable setup. Actually we can't use x4.
         // Pack op and width: use movz into x3 high bits? No — just use
@@ -2091,20 +2125,27 @@ impl JitCompiler {
         self.emitter.movz(28, width as u16, 0);
         // Re-set x0-x3 (they may have been clobbered by movz — no, movz
         // targets x27/x28).
-        self.emitter.mov_reg(0, 24);          // x0 = CpuState
+        self.emitter.mov_reg(0, 24); // x0 = CpuState
         self.emitter.mov_reg(1, result_reg);
         self.emitter.mov_reg(2, lhs_reg);
         self.emitter.mov_reg(3, rhs_reg);
-        self.emitter.mov_reg(4, 27);          // x4 = op (x4 is caller-saved, but
-                                              // we reload guest regs after)
-        self.emitter.mov_reg(5, 28);          // x5 = width
+        self.emitter.mov_reg(4, 27); // x4 = op (x4 is caller-saved, but
+        // we reload guest regs after)
+        self.emitter.mov_reg(5, 28); // x5 = width
         self.emit_bl_to(jit_helper_set_flags as *const () as usize);
-        self.emitter.mov_reg(0, 24);          // restore CpuState
+        self.emitter.mov_reg(0, 24); // restore CpuState
         self.emit_load_guest_registers(arch);
     }
 
     /// Emit a Compare or Test instruction: evaluate operands, call set_flags.
-    fn emit_compare_test(&mut self, lhs: &crate::cpu::CompareOperand, rhs: &crate::cpu::CompareOperand, width: u64, op: u64, arch: GuestArch) {
+    fn emit_compare_test(
+        &mut self,
+        lhs: &crate::cpu::CompareOperand,
+        rhs: &crate::cpu::CompareOperand,
+        width: u64,
+        op: u64,
+        arch: GuestArch,
+    ) {
         // Resolve lhs into x25, rhs into x26 (callee-saved temps).
         match lhs {
             crate::cpu::CompareOperand::Register(r) => {
@@ -2113,7 +2154,9 @@ impl JitCompiler {
             crate::cpu::CompareOperand::ImmediateU64(v) => {
                 self.emitter.mov_imm64(25, *v);
             }
-            _ => { self.emitter.mov_imm64(25, 0); }
+            _ => {
+                self.emitter.mov_imm64(25, 0);
+            }
         }
         match rhs {
             crate::cpu::CompareOperand::Register(r) => {
@@ -2122,7 +2165,9 @@ impl JitCompiler {
             crate::cpu::CompareOperand::ImmediateU64(v) => {
                 self.emitter.mov_imm64(26, *v);
             }
-            _ => { self.emitter.mov_imm64(26, 0); }
+            _ => {
+                self.emitter.mov_imm64(26, 0);
+            }
         }
         // result = lhs - rhs (for cmp) or lhs & rhs (for test).
         if op == 3 {
@@ -2167,9 +2212,8 @@ impl JitCompiler {
             let arm_lo = regmap::guest_to_arm(i);
             let arm_hi = regmap::guest_to_arm(i + 1);
             let offset = gpr_base + (i as u32) * 8;
-            self.emitter.emit(
-                (0xa9000000 | ((offset >> 3) & 0x7f) << 15 | (arm_hi << 10)) | arm_lo,
-            );
+            self.emitter
+                .emit((0xa9000000 | ((offset >> 3) & 0x7f) << 15 | (arm_hi << 10)) | arm_lo);
         }
     }
 
@@ -2251,7 +2295,11 @@ impl JitCompiler {
 
             IrInstruction::AndImm { dst, value, width } => {
                 let arm_dst = regmap::guest_to_arm(dst.index());
-                let mask = if *width == 4 { (*value as u32) as u64 } else { *value };
+                let mask = if *width == 4 {
+                    (*value as u32) as u64
+                } else {
+                    *value
+                };
                 self.emitter.mov_imm64(regmap::X21, mask);
                 self.emitter.and_reg(arm_dst, arm_dst, regmap::X21);
             }
@@ -2352,12 +2400,20 @@ impl JitCompiler {
                     // Save lhs (dst) for flags, do the op, then set flags.
                     self.emitter.mov_reg(27, arm_dst); // lhs
                     match insn {
-                        IrInstruction::XorReg { .. } => self.emitter.eor_reg(arm_dst, arm_dst, arm_src),
-                        IrInstruction::OrReg { .. } => self.emitter.orr_reg(arm_dst, arm_dst, arm_src),
-                        IrInstruction::AndReg { .. } => self.emitter.and_reg(arm_dst, arm_dst, arm_src),
+                        IrInstruction::XorReg { .. } => {
+                            self.emitter.eor_reg(arm_dst, arm_dst, arm_src)
+                        }
+                        IrInstruction::OrReg { .. } => {
+                            self.emitter.orr_reg(arm_dst, arm_dst, arm_src)
+                        }
+                        IrInstruction::AndReg { .. } => {
+                            self.emitter.and_reg(arm_dst, arm_dst, arm_src)
+                        }
                         _ => {}
                     }
-                    if *width == 4 { self.emitter.uxtw_reg(arm_dst, arm_dst); }
+                    if *width == 4 {
+                        self.emitter.uxtw_reg(arm_dst, arm_dst);
+                    }
                     // Set flags: op=2 (logic), result=dst, lhs=x27, rhs=arm_src
                     self.emit_set_flags(arm_dst, 27, arm_src, 2, *width as u64, arch);
                 } else {
@@ -2375,7 +2431,11 @@ impl JitCompiler {
                 self.emit_compare_test(lhs, rhs, *width as u64, 2, arch);
             }
 
-            IrInstruction::LoadEffectiveAddress { dst, address, width } => {
+            IrInstruction::LoadEffectiveAddress {
+                dst,
+                address,
+                width,
+            } => {
                 // LEA: compute effective address into dst (no memory access).
                 let arm_dst = regmap::guest_to_arm(dst.index());
                 self.emit_effective_address(address, arm_dst, 0, arch);
@@ -2415,67 +2475,68 @@ impl JitCompiler {
                 // the trampoline instead of returning EXIT_THUNK. This
                 // bypasses the full dispatch loop and is significantly faster.
                 if let Some(addrs) = fast_thunk_addrs
-                    && addrs.contains(target) {
-                        // Look up the trampoline address from the global map.
-                        // Propagate lock poisoning as an explicit error rather
-                        // than silently recovering — the caller can decide how
-                        // to handle a poisoned lock (e.g., retry or abort).
-                        let map = FAST_THUNK_MAP.lock().map_err(|e| {
-                            AppError::new(
-                                ReasonCode::RcLockPoisoned,
-                                format!("FAST_THUNK_MAP lock poisoned during compile: {e}"),
-                            )
-                        })?;
-                        let thunk_opt = map.get(target).copied();
-                        if let Some(thunk_addr) = thunk_opt {
-                            // ── Push return_address onto guest stack ──
-                            let arm_sp = regmap::guest_to_arm(4);
-                            self.emitter.sub_imm(arm_sp, arm_sp, 8);
-                            self.emitter.mov_imm64(regmap::X21, *return_address);
-                            self.emitter.str64_reg(regmap::X21, 1, arm_sp);
+                    && addrs.contains(target)
+                {
+                    // Look up the trampoline address from the global map.
+                    // Propagate lock poisoning as an explicit error rather
+                    // than silently recovering — the caller can decide how
+                    // to handle a poisoned lock (e.g., retry or abort).
+                    let map = FAST_THUNK_MAP.lock().map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcLockPoisoned,
+                            format!("FAST_THUNK_MAP lock poisoned during compile: {e}"),
+                        )
+                    })?;
+                    let thunk_opt = map.get(target).copied();
+                    if let Some(thunk_addr) = thunk_opt {
+                        // ── Push return_address onto guest stack ──
+                        let arm_sp = regmap::guest_to_arm(4);
+                        self.emitter.sub_imm(arm_sp, arm_sp, 8);
+                        self.emitter.mov_imm64(regmap::X21, *return_address);
+                        self.emitter.str64_reg(regmap::X21, 1, arm_sp);
 
-                            // ── Save JIT entry context in callee-saved regs ──
-                            // x0 = CpuState ptr, x1 = mem_base, x2 = MemoryImage
-                            // x3 = exit_reason ptr
-                            self.emitter.mov_reg(regmap::X21, regmap::X0);
-                            self.emitter.mov_reg(regmap::X22, regmap::X1);
-                            self.emitter.mov_reg(regmap::X23, regmap::X2);
-                            self.emitter.mov_reg(regmap::X24, regmap::X3);
+                        // ── Save JIT entry context in callee-saved regs ──
+                        // x0 = CpuState ptr, x1 = mem_base, x2 = MemoryImage
+                        // x3 = exit_reason ptr
+                        self.emitter.mov_reg(regmap::X21, regmap::X0);
+                        self.emitter.mov_reg(regmap::X22, regmap::X1);
+                        self.emitter.mov_reg(regmap::X23, regmap::X2);
+                        self.emitter.mov_reg(regmap::X24, regmap::X3);
 
-                            // ── Load PeHostRuntime ptr from global static ──
-                            let static_addr = &SIGBUS_PE_RUNTIME as *const _ as u64;
-                            self.emitter.mov_imm64(regmap::X25, static_addr);
-                            self.emitter.ldr64(regmap::X0, regmap::X25, 0);
+                        // ── Load PeHostRuntime ptr from global static ──
+                        let static_addr = &SIGBUS_PE_RUNTIME as *const _ as u64;
+                        self.emitter.mov_imm64(regmap::X25, static_addr);
+                        self.emitter.ldr64(regmap::X0, regmap::X25, 0);
 
-                            // ── Set up bridge arguments ──
-                            self.emitter.mov_reg(regmap::X1, regmap::X21); // CpuState
-                            self.emitter.mov_reg(regmap::X2, regmap::X23); // MemoryImage
-                            self.emitter.mov_imm64(regmap::X3, *target); // thunk_address
+                        // ── Set up bridge arguments ──
+                        self.emitter.mov_reg(regmap::X1, regmap::X21); // CpuState
+                        self.emitter.mov_reg(regmap::X2, regmap::X23); // MemoryImage
+                        self.emitter.mov_imm64(regmap::X3, *target); // thunk_address
 
-                            // ── Call the trampoline ──
-                            self.emitter.mov_imm64(regmap::X26, thunk_addr as u64);
-                            self.emitter.blr(regmap::X26);
+                        // ── Call the trampoline ──
+                        self.emitter.mov_imm64(regmap::X26, thunk_addr as u64);
+                        self.emitter.blr(regmap::X26);
 
-                            // ── Restore JIT entry context ──
-                            self.emitter.mov_reg(regmap::X0, regmap::X21);
-                            self.emitter.mov_reg(regmap::X1, regmap::X22);
-                            self.emitter.mov_reg(regmap::X2, regmap::X23);
-                            self.emitter.mov_reg(regmap::X3, regmap::X24);
+                        // ── Restore JIT entry context ──
+                        self.emitter.mov_reg(regmap::X0, regmap::X21);
+                        self.emitter.mov_reg(regmap::X1, regmap::X22);
+                        self.emitter.mov_reg(regmap::X2, regmap::X23);
+                        self.emitter.mov_reg(regmap::X3, regmap::X24);
 
-                            // Reload guest GPRs from CpuState (the bridge may
-                            // have modified them via dispatch_import).
-                            let gpr_base: u32 = 32;
-                            for i in (0..16).step_by(2) {
-                                let arm_lo = regmap::guest_to_arm(i);
-                                let arm_hi = regmap::guest_to_arm(i + 1);
-                                let offset = gpr_base + (i as u32) * 8;
-                                self.emitter
-                                    .ldp64(arm_lo, arm_hi, regmap::X0, offset as i32);
-                            }
-
-                            return Ok(());
+                        // Reload guest GPRs from CpuState (the bridge may
+                        // have modified them via dispatch_import).
+                        let gpr_base: u32 = 32;
+                        for i in (0..16).step_by(2) {
+                            let arm_lo = regmap::guest_to_arm(i);
+                            let arm_hi = regmap::guest_to_arm(i + 1);
+                            let offset = gpr_base + (i as u32) * 8;
+                            self.emitter
+                                .ldp64(arm_lo, arm_hi, regmap::X0, offset as i32);
                         }
+
+                        return Ok(());
                     }
+                }
 
                 // Fallback: standard EXIT_THUNK path.
                 //
@@ -2607,7 +2668,11 @@ impl JitCompiler {
                 }
                 self.emitter.str_q_imm(0, 0, dst_off as u16);
             }
-            IrInstruction::LoadMemory { dst, address, width } => {
+            IrInstruction::LoadMemory {
+                dst,
+                address,
+                width,
+            } => {
                 if address.rip_relative {
                     // RIP-relative addressing needs the instruction's RIP,
                     // unavailable at IR level.  Fall back to interpreter.
@@ -2631,7 +2696,11 @@ impl JitCompiler {
                 let arm_dst = regmap::guest_to_arm(dst.full_register().index());
                 self.emit_helper_load(arm_dst, 21, 1, arch);
             }
-            IrInstruction::StoreMemory { src, address, width } => {
+            IrInstruction::StoreMemory {
+                src,
+                address,
+                width,
+            } => {
                 if address.rip_relative {
                     self.emit_store_guest_registers(arch);
                     self.emitter.movz(regmap::X0, EXIT_UNIMPL as u16, 0);
@@ -2653,7 +2722,11 @@ impl JitCompiler {
                 let arm_src = regmap::guest_to_arm(src.full_register().index());
                 self.emit_helper_store(21, arm_src, 1, arch);
             }
-            IrInstruction::StoreImmediate { address, value, width } => {
+            IrInstruction::StoreImmediate {
+                address,
+                value,
+                width,
+            } => {
                 if address.rip_relative {
                     self.emit_store_guest_registers(arch);
                     self.emitter.movz(regmap::X0, EXIT_UNIMPL as u16, 0);
@@ -2698,15 +2771,15 @@ impl JitCompiler {
         self.helper_insns.push(boxed);
         // Save guest GPRs to CpuState, call helper, reload.
         self.emit_store_guest_registers(arch);
-        self.emitter.mov_reg(24, 0);  // save CpuState
-        self.emitter.mov_reg(28, 2);  // save MemoryImage ptr
-        self.emitter.mov_reg(0, 24);           // x0 = CpuState
-        self.emitter.mov_reg(1, 28);           // x1 = MemoryImage
-        self.emitter.mov_imm64(2, insn_ptr);   // x2 = &insn
+        self.emitter.mov_reg(24, 0); // save CpuState
+        self.emitter.mov_reg(28, 2); // save MemoryImage ptr
+        self.emitter.mov_reg(0, 24); // x0 = CpuState
+        self.emitter.mov_reg(1, 28); // x1 = MemoryImage
+        self.emitter.mov_imm64(2, insn_ptr); // x2 = &insn
         self.emit_bl_to(jit_helper_execute_insn as *const () as usize);
-        self.emitter.mov_reg(0, 24);           // restore CpuState
+        self.emitter.mov_reg(0, 24); // restore CpuState
         self.emit_load_guest_registers(arch);
-        self.emitter.mov_reg(2, 28);           // restore MemoryImage ptr
+        self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
         Ok(())
     }
 
@@ -2871,28 +2944,29 @@ impl JitRuntime {
             // Auto-chain: if the last instruction is an unconditional jump
             // to a block that is already compiled, chain them.
             if let Some(last_ir) = ir.last()
-                && let IrInstruction::Jump { target } = last_ir {
-                    // Skip auto-chaining when a chain break has been
-                    // requested — see JIT_CHAIN_BREAK_REQUESTED.
-                    if JIT_CHAIN_BREAK_REQUESTED.load(Ordering::Relaxed) {
-                        // Chain will be formed on a subsequent execution.
-                    } else if *target <= guest_address {
-                        // Backward jump (potential loop): skip chaining to
-                        // prevent forming chains that never return to the
-                        // dispatcher. Forward jumps are safe — they
-                        // eventually reach a block whose last instruction
-                        // is not Jump, and return to the dispatcher.
-                    } else if self.block_cache.contains_key(target) {
-                        // Best-effort block chaining; failure is non-fatal
-                        // (the block will just exit via EXIT_NORMAL instead of chaining)
-                        if let Err(e) = self.chain_blocks(guest_address, *target) {
-                            eprintln!(
-                                "[jit] failed to chain block {:#x} -> {:#x}: {}",
-                                guest_address, target, e
-                            );
-                        }
+                && let IrInstruction::Jump { target } = last_ir
+            {
+                // Skip auto-chaining when a chain break has been
+                // requested — see JIT_CHAIN_BREAK_REQUESTED.
+                if JIT_CHAIN_BREAK_REQUESTED.load(Ordering::Relaxed) {
+                    // Chain will be formed on a subsequent execution.
+                } else if *target <= guest_address {
+                    // Backward jump (potential loop): skip chaining to
+                    // prevent forming chains that never return to the
+                    // dispatcher. Forward jumps are safe — they
+                    // eventually reach a block whose last instruction
+                    // is not Jump, and return to the dispatcher.
+                } else if self.block_cache.contains_key(target) {
+                    // Best-effort block chaining; failure is non-fatal
+                    // (the block will just exit via EXIT_NORMAL instead of chaining)
+                    if let Err(e) = self.chain_blocks(guest_address, *target) {
+                        eprintln!(
+                            "[jit] failed to chain block {:#x} -> {:#x}: {}",
+                            guest_address, target, e
+                        );
                     }
                 }
+            }
         }
         Ok(self.block_cache.get(&guest_address).unwrap())
     }
@@ -3327,19 +3401,20 @@ impl JitRuntime {
                 // usize, and the resulting pointer must fall within the
                 // flat memory region (end_offset < flat_size).
                 if let Some(end_offset) = offset.checked_add(4095)
-                    && end_offset < flat_size {
-                        // SAFETY: end_offset < flat_size guarantees the
-                        // pointer base + end_offset is within the mmap'd
-                        // region. write_volatile forces physical page
-                        // allocation. Writing 0 to a zero-initialized
-                        // page is harmless.
-                        unsafe {
-                            std::ptr::write_volatile(
-                                (self.flat_memory.base() as *mut u8).add(end_offset),
-                                0u8,
-                            );
-                        }
+                    && end_offset < flat_size
+                {
+                    // SAFETY: end_offset < flat_size guarantees the
+                    // pointer base + end_offset is within the mmap'd
+                    // region. write_volatile forces physical page
+                    // allocation. Writing 0 to a zero-initialized
+                    // page is harmless.
+                    unsafe {
+                        std::ptr::write_volatile(
+                            (self.flat_memory.base() as *mut u8).add(end_offset),
+                            0u8,
+                        );
                     }
+                }
             }
             page_data.fill(0);
         }
@@ -3463,16 +3538,17 @@ impl JitRuntime {
                 let offset = *page_addr as usize;
                 let flat_size = self.flat_memory.size();
                 if let Some(end_offset) = offset.checked_add(4095)
-                    && end_offset < flat_size {
-                        // SAFETY: end_offset < flat_size guarantees the pointer
-                        // base + end_offset is within the mmap'd region.
-                        unsafe {
-                            std::ptr::write_volatile(
-                                (self.flat_memory.base() as *mut u8).add(end_offset),
-                                0u8,
-                            );
-                        }
+                    && end_offset < flat_size
+                {
+                    // SAFETY: end_offset < flat_size guarantees the pointer
+                    // base + end_offset is within the mmap'd region.
+                    unsafe {
+                        std::ptr::write_volatile(
+                            (self.flat_memory.base() as *mut u8).add(end_offset),
+                            0u8,
+                        );
                     }
+                }
             }
             page_data.fill(0);
         }
@@ -3851,8 +3927,7 @@ pub struct BlockChainEntry {
 /// hotter they are promoted to Tier1 (full optimization with register
 /// allocation) and eventually Tier2 (aggressive optimization with inlining
 /// and loop unrolling).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CompilationTier {
     /// Fast compilation, minimal optimization — direct 1:1 IR-to-native.
     #[default]
@@ -3863,7 +3938,6 @@ pub enum CompilationTier {
     /// Aggressive optimization with block inlining and loop unrolling.
     Tier2,
 }
-
 
 /// Manages tiered compilation by tracking execution counts and promoting
 /// blocks to higher optimization tiers when they cross configured thresholds.
@@ -3899,8 +3973,6 @@ impl TieredCompiler {
             current_tiers: BTreeMap::new(),
         }
     }
-
-
 
     /// Create a `TieredCompiler` with custom thresholds.
     pub fn with_thresholds(tier0_to_tier1: u32, tier1_to_tier2: u32) -> Self {
@@ -4867,9 +4939,10 @@ impl JitCompiler {
         // Scan backwards to find the last MovImm that sets this register
         for insn in instructions.iter().rev() {
             if let IrInstruction::MovImm { dst, value } = insn
-                && dst == counter {
-                    return Some(*value);
-                }
+                && dst == counter
+            {
+                return Some(*value);
+            }
             // If we find any other instruction writing to counter before MovImm, stop
             if Self::instruction_writes_register(insn, counter) {
                 return None;
@@ -6052,7 +6125,12 @@ mod tests {
         // JIT never writes state.rip for jumps, so the dispatcher must set
         // it from the reason.
         assert_eq!(
-            map_exit_reason(EXIT_JUMP, &state, 0, Some(BlockExitInfo::Jump { target: 0x2000 })),
+            map_exit_reason(
+                EXIT_JUMP,
+                &state,
+                0,
+                Some(BlockExitInfo::Jump { target: 0x2000 })
+            ),
             JitExitReason::Jump { target: 0x2000 }
         );
 
@@ -6163,15 +6241,9 @@ mod tests {
     /// makes the chain unit tests lose the lock race against other parallel
     /// JIT tests and silently skip creating the chain.  Tests have no
     /// watchdog, so we can afford to spin until the lock is acquired.
-    fn chain_blocks_until_locked(
-        rt: &mut JitRuntime,
-        from: u64,
-        to: u64,
-    ) -> Result<(), AppError> {
+    fn chain_blocks_until_locked(rt: &mut JitRuntime, from: u64, to: u64) -> Result<(), AppError> {
         for _ in 0..1000 {
-            let before = rt
-                .block_chains
-                .contains_key(&(from, to));
+            let before = rt.block_chains.contains_key(&(from, to));
             let res = rt.chain_blocks(from, to);
             // chain_blocks returns Ok(()) both on success and on a skipped
             // try_write, so detect success by observing the chain entry
@@ -6198,8 +6270,10 @@ mod tests {
         let ir_a = vec![IrInstruction::Nop];
         let ir_b = vec![IrInstruction::Nop, IrInstruction::Nop];
 
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
+            .unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None)
+            .unwrap();
 
         let _ = rt.chain_blocks(0x1000, 0x2000);
         assert!(
@@ -6214,9 +6288,13 @@ mod tests {
         // the target is compiled.
         let mut rt = JitRuntime::new(GuestArch::X64);
         let ir_a = vec![IrInstruction::Nop];
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
+            .unwrap();
         let result = rt.chain_blocks(0x1000, 0x2000);
-        assert!(result.is_ok(), "chaining disabled; chain_blocks is a no-op Ok");
+        assert!(
+            result.is_ok(),
+            "chaining disabled; chain_blocks is a no-op Ok"
+        );
     }
 
     // --- Phase 7: Tiered Compiler Tests ---
@@ -6771,7 +6849,10 @@ mod tests {
         // MovImm(rcx, 3), AddImm(rax,1), AddImm(rax,1), AddImm(rax,1)
         // The SubImm and JumpIf are removed
         // (plus constant folding may reduce further)
-        assert!(!unrolled.is_empty(), "unrolled loop should have instructions");
+        assert!(
+            !unrolled.is_empty(),
+            "unrolled loop should have instructions"
+        );
         // The loop back-edge should be gone
         let has_jumpif = unrolled
             .iter()
@@ -7096,8 +7177,10 @@ mod tests {
         let ir_a = vec![IrInstruction::Nop];
         let ir_b = vec![IrInstruction::Nop, IrInstruction::Nop];
 
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None)
+            .unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None)
+            .unwrap();
         let _ = rt.chain_blocks(0x1000, 0x2000); // no-op
 
         rt.invalidate_block(0x2000);

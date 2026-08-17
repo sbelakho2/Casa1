@@ -284,12 +284,9 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
                 return;
             };
             // Update navigation state
-            state
-                .nav_states
-                .entry(webview_id)
-                .and_modify(|ns| {
-                    ns.navigation_completed = true;
-                });
+            state.nav_states.entry(webview_id).and_modify(|ns| {
+                ns.navigation_completed = true;
+            });
 
             // Collect NavigationCompleted callbacks
             let uri = state
@@ -347,13 +344,10 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
             let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
                 return;
             };
-            state
-                .nav_states
-                .entry(webview_id)
-                .and_modify(|ns| {
-                    ns.navigation_completed = true;
-                    ns.navigation_error = Some(error_desc.clone());
-                });
+            state.nav_states.entry(webview_id).and_modify(|ns| {
+                ns.navigation_completed = true;
+                ns.navigation_error = Some(error_desc.clone());
+            });
 
             // Collect NavigationCompleted callbacks
             let uri = state
@@ -386,12 +380,9 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
         let ptr_val = webview as *const _ as u64;
         let mut state = delegate_state();
         if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-            state
-                .nav_states
-                .entry(webview_id)
-                .and_modify(|ns| {
-                    ns.navigation_started = true;
-                });
+            state.nav_states.entry(webview_id).and_modify(|ns| {
+                ns.navigation_started = true;
+            });
         }
     }
 
@@ -408,8 +399,7 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
             if url.is_null() {
                 String::new()
             } else {
-                let url_str: *mut objc::runtime::Object =
-                    msg_send![url, absoluteString];
+                let url_str: *mut objc::runtime::Object = msg_send![url, absoluteString];
                 if url_str.is_null() {
                     String::new()
                 } else {
@@ -430,15 +420,12 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
             let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
                 return;
             };
-            state
-                .nav_states
-                .entry(webview_id)
-                .and_modify(|ns| {
-                    ns.current_uri = uri.clone();
-                    ns.navigation_started = true;
-                    ns.navigation_completed = false;
-                    ns.navigation_error = None;
-                });
+            state.nav_states.entry(webview_id).and_modify(|ns| {
+                ns.current_uri = uri.clone();
+                ns.navigation_started = true;
+                ns.navigation_completed = false;
+                ns.navigation_error = None;
+            });
 
             let content_loading_cbs = std::mem::take(&mut state.on_content_loading);
             let nav_starting_cbs = std::mem::take(&mut state.on_navigation_starting);
@@ -740,7 +727,9 @@ impl WebView2Settings {
             }
             SettingsMethod::get_UserAgent => self.user_agent.len() as u64,
             SettingsMethod::put_UserAgent => 0,
-            SettingsMethod::get_BrowserExecutableFolder => self.browser_executable_folder.len() as u64,
+            SettingsMethod::get_BrowserExecutableFolder => {
+                self.browser_executable_folder.len() as u64
+            }
             SettingsMethod::put_BrowserExecutableFolder => 0,
             SettingsMethod::get_Language => self.language.len() as u64,
             SettingsMethod::put_Language => 0,
@@ -860,8 +849,7 @@ fn create_wkwebview_native(
 
         // Create WKWebView with frame and configuration
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
-        let view: *mut objc::runtime::Object =
-            msg_send![cls_wk_view, alloc];
+        let view: *mut objc::runtime::Object = msg_send![cls_wk_view, alloc];
         let view: *mut objc::runtime::Object =
             msg_send![view, initWithFrame: frame configuration: config];
 
@@ -1049,9 +1037,7 @@ fn get_uri_wkwebview_native(native_ptr: *mut std::ffi::c_void) -> String {
 /// (`_NSConcreteStackBlock`) and a proper descriptor with copy/dispose
 /// helpers. WKWebView copies the block before invoking it asynchronously,
 /// and the copy is kept alive for the process lifetime.
-struct JsCompletionBlock(
-    RcBlock<(*mut objc::runtime::Object, *mut objc::runtime::Object), ()>,
-);
+struct JsCompletionBlock(RcBlock<(*mut objc::runtime::Object, *mut objc::runtime::Object), ()>);
 
 // SAFETY: the block has no captures, is created once at first use, is never
 // mutated or freed (owned by the static), and is only ever passed by
@@ -1136,7 +1122,7 @@ fn execute_js_wkwebview_native(native_ptr: *mut std::ffi::c_void, script: &str) 
 fn add_user_script_wkwebview_native(
     native_ptr: *mut std::ffi::c_void,
     script: &str,
-    injection_time: i64,  // 0 = at document start, 1 = at document end
+    injection_time: i64, // 0 = at document start, 1 = at document end
     for_main_frame_only: bool,
 ) {
     if native_ptr.is_null() {
@@ -1158,10 +1144,7 @@ fn add_user_script_wkwebview_native(
             }
 
             // Create WKUserScript: -initWithString:injectionTime:forMainFrameOnly:
-            let user_script: *mut objc::runtime::Object = msg_send![
-                cls_script,
-                alloc
-            ];
+            let user_script: *mut objc::runtime::Object = msg_send![cls_script, alloc];
             let user_script: *mut objc::runtime::Object = msg_send![
                 user_script,
                 initWithString: script_str
@@ -1175,8 +1158,7 @@ fn add_user_script_wkwebview_native(
                 // Get the configuration's user content controller
                 let config: *mut objc::runtime::Object = msg_send![view, configuration];
                 if !config.is_null() {
-                    let uc: *mut objc::runtime::Object =
-                        msg_send![config, userContentController];
+                    let uc: *mut objc::runtime::Object = msg_send![config, userContentController];
                     if !uc.is_null() {
                         let _: () = msg_send![uc, addUserScript: user_script];
                     }
@@ -1441,12 +1423,20 @@ impl WebView2Environment {
 
             let nav_delegate = nav_cls.and_then(|cls| unsafe {
                 let obj: *mut objc::runtime::Object = msg_send![cls, new];
-                if obj.is_null() { None } else { Some(obj as *mut std::ffi::c_void) }
+                if obj.is_null() {
+                    None
+                } else {
+                    Some(obj as *mut std::ffi::c_void)
+                }
             });
 
             let msg_handler = msg_cls.and_then(|cls| unsafe {
                 let obj: *mut objc::runtime::Object = msg_send![cls, new];
-                if obj.is_null() { None } else { Some(obj as *mut std::ffi::c_void) }
+                if obj.is_null() {
+                    None
+                } else {
+                    Some(obj as *mut std::ffi::c_void)
+                }
             });
 
             let config = create_wkwebview_configuration(
@@ -1456,7 +1446,11 @@ impl WebView2Environment {
                 msg_handler.map(|p| p as *mut objc::runtime::Object),
             );
 
-            let native_config = if config.is_null() { None } else { Some(config as *mut std::ffi::c_void) };
+            let native_config = if config.is_null() {
+                None
+            } else {
+                Some(config as *mut std::ffi::c_void)
+            };
 
             Self {
                 browser_exe_path: None,
@@ -1589,8 +1583,8 @@ impl WebView2Controller {
             let native_ptr = create_wkwebview_native(
                 width as f64,
                 height as f64,
-                true,      // js_enabled
-                None,      // user_agent (set separately)
+                true, // js_enabled
+                None, // user_agent (set separately)
                 config,
             );
 
@@ -1599,18 +1593,12 @@ impl WebView2Controller {
             if !native_ptr.is_null() {
                 let nav_delegate = env.nav_delegate_ptr();
                 if !nav_delegate.is_null() {
-                    set_navigation_delegate(
-                        native_ptr,
-                        nav_delegate as *mut objc::runtime::Object,
-                    );
+                    set_navigation_delegate(native_ptr, nav_delegate as *mut objc::runtime::Object);
                     // Retain the shared delegate so it stays alive until this
                     // controller is closed, even if the environment is
                     // dropped first.
                     unsafe {
-                        let _: () = msg_send![
-                            nav_delegate as *mut objc::runtime::Object,
-                            retain
-                        ];
+                        let _: () = msg_send![nav_delegate as *mut objc::runtime::Object, retain];
                     }
                     nav_delegate_ref = Some(nav_delegate);
                 }
@@ -1691,14 +1679,11 @@ impl WebView2Controller {
         // Collect NavigationStarting callbacks under the lock...
         let callbacks: Vec<(u64, NavigationStartingCallback)> = {
             let mut state = delegate_state();
-            state
-                .nav_states
-                .entry(self.webview_id)
-                .and_modify(|ns| {
-                    ns.current_uri = url.to_string();
-                    ns.navigation_started = true;
-                    ns.navigation_completed = false;
-                });
+            state.nav_states.entry(self.webview_id).and_modify(|ns| {
+                ns.current_uri = url.to_string();
+                ns.navigation_started = true;
+                ns.navigation_completed = false;
+            });
             std::mem::take(&mut state.on_navigation_starting)
         };
 
@@ -1738,7 +1723,7 @@ impl WebView2Controller {
         add_user_script_wkwebview_native(
             self.native_ptr(),
             script,
-            0,  // at document start
+            0,    // at document start
             true, // main frame only
         );
     }
@@ -1812,7 +1797,6 @@ impl Default for WebView2Runtime {
 }
 
 impl WebView2Runtime {
-
     /// Create a new WebView2 environment backed by WKWebView.
     pub fn create_environment(&mut self, _options: u64) -> u64 {
         let id = self.next_id;
@@ -1829,20 +1813,20 @@ impl WebView2Runtime {
         let webview_id = self.create_webview();
 
         // Look up environment for configuration
-        let controller =
-            if let Some(env) = self.environments.get(&env_id).filter(|e| e.is_valid()) {
-                WebView2Controller::create(env, webview_id, 800, 600, parent_hwnd)
-            } else {
-                WebView2Controller {
-                    webview_id,
-                    parent_hwnd,
-                    bounds: (0, 0, 800, 600),
-                    is_visible: true,
-                    zoom_factor: 1.0,
-                    native_webview: None,
-                    nav_delegate_ref: None,
-                }
-            };
+        let controller = if let Some(env) = self.environments.get(&env_id).filter(|e| e.is_valid())
+        {
+            WebView2Controller::create(env, webview_id, 800, 600, parent_hwnd)
+        } else {
+            WebView2Controller {
+                webview_id,
+                parent_hwnd,
+                bounds: (0, 0, 800, 600),
+                is_visible: true,
+                zoom_factor: 1.0,
+                native_webview: None,
+                nav_delegate_ref: None,
+            }
+        };
 
         self.controllers.insert(id, controller);
         // Link the environment to this controller if it exists
@@ -1954,9 +1938,7 @@ impl WebView2Runtime {
         let mut state = delegate_state();
         let id = state.next_callback_id;
         state.next_callback_id += 1;
-        state
-            .on_navigation_starting
-            .push((id, Box::new(callback)));
+        state.on_navigation_starting.push((id, Box::new(callback)));
         id
     }
 
@@ -1968,9 +1950,7 @@ impl WebView2Runtime {
         let mut state = delegate_state();
         let id = state.next_callback_id;
         state.next_callback_id += 1;
-        state
-            .on_navigation_completed
-            .push((id, Box::new(callback)));
+        state.on_navigation_completed.push((id, Box::new(callback)));
         id
     }
 
@@ -2006,21 +1986,29 @@ impl WebView2Runtime {
         let mut state = delegate_state();
         let id = state.next_callback_id;
         state.next_callback_id += 1;
-        state
-            .on_web_message_received
-            .push((id, Box::new(callback)));
+        state.on_web_message_received.push((id, Box::new(callback)));
         id
     }
 
     /// Unregister a callback by its ID.
     pub fn unregister_callback(&mut self, callback_id: u64) {
         let mut state = delegate_state();
-        state.on_navigation_starting.retain(|(id, _)| *id != callback_id);
-        state.on_navigation_completed.retain(|(id, _)| *id != callback_id);
+        state
+            .on_navigation_starting
+            .retain(|(id, _)| *id != callback_id);
+        state
+            .on_navigation_completed
+            .retain(|(id, _)| *id != callback_id);
         state.on_source_changed.retain(|(id, _)| *id != callback_id);
-        state.on_content_loading.retain(|(id, _)| *id != callback_id);
-        state.on_web_message_received.retain(|(id, _)| *id != callback_id);
-        state.on_new_window_requested.retain(|(id, _)| *id != callback_id);
+        state
+            .on_content_loading
+            .retain(|(id, _)| *id != callback_id);
+        state
+            .on_web_message_received
+            .retain(|(id, _)| *id != callback_id);
+        state
+            .on_new_window_requested
+            .retain(|(id, _)| *id != callback_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2810,8 +2798,18 @@ mod tests {
 
         // cb_id must be gone; cb_id2 must remain registered.
         let state = DELEGATE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!state.on_navigation_starting.iter().any(|(id, _)| *id == cb_id));
-        assert!(state.on_navigation_completed.iter().any(|(id, _)| *id == cb_id2));
+        assert!(
+            !state
+                .on_navigation_starting
+                .iter()
+                .any(|(id, _)| *id == cb_id)
+        );
+        assert!(
+            state
+                .on_navigation_completed
+                .iter()
+                .any(|(id, _)| *id == cb_id2)
+        );
     }
 
     /// Test WebView2Controller create/destroy lifecycle.

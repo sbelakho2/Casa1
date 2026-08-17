@@ -838,10 +838,7 @@ impl SteamInput {
         controller: ControllerHandle,
         layer_handle: ActionSetHandle,
     ) {
-        let stack = self
-            .action_set_layer_stacks
-            .entry(controller)
-            .or_default();
+        let stack = self.action_set_layer_stacks.entry(controller).or_default();
         if stack.len() < MAX_ACTION_SET_LAYERS {
             stack.push(layer_handle);
         }
@@ -894,14 +891,12 @@ impl SteamInput {
                 .action_set_layer_stacks
                 .get(&controller)
                 .map(|layers| {
-                    layers
-                        .iter()
-                        .any(|layer| {
-                            self.action_set_members
-                                .get(&Some(*layer))
-                                .map(|members| members.contains(action_name))
-                                .unwrap_or(false)
-                        })
+                    layers.iter().any(|layer| {
+                        self.action_set_members
+                            .get(&Some(*layer))
+                            .map(|members| members.contains(action_name))
+                            .unwrap_or(false)
+                    })
                 })
                 .unwrap_or(false)
             || self
@@ -1081,9 +1076,9 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
     // On macOS, post a lightweight NSUserNotification via script
     #[cfg(target_os = "macos")]
     if duration_ms >= 100 && intensity > 32 {
-        let mut last_notifications = SOFTWARE_HAPTIC_LAST_NOTIFICATIONS.lock().unwrap_or_else(
-            |poisoned| poisoned.into_inner(),
-        );
+        let mut last_notifications = SOFTWARE_HAPTIC_LAST_NOTIFICATIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
         let slot_index = usize::from(slot).min(last_notifications.len() - 1);
         let last = last_notifications[slot_index];
@@ -1096,7 +1091,10 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
         let script = format!(
             r#"display notification "Controller {slot} rumble ({level})" with title "Steam Haptics" subtitle "" sound name "Funk""#
         );
-        match std::process::Command::new("osascript").args(["-e", &script]).spawn() {
+        match std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+        {
             Ok(_) => {}
             Err(error) => {
                 eprintln!(
@@ -1114,9 +1112,8 @@ const SOFTWARE_HAPTIC_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Per-slot timestamp of the last `osascript` haptic notification.
 #[cfg(target_os = "macos")]
-static SOFTWARE_HAPTIC_LAST_NOTIFICATIONS: LazyLock<Mutex<[Instant; 4]>> = LazyLock::new(|| {
-    Mutex::new([Instant::now(); 4])
-});
+static SOFTWARE_HAPTIC_LAST_NOTIFICATIONS: LazyLock<Mutex<[Instant; 4]>> =
+    LazyLock::new(|| Mutex::new([Instant::now(); 4]));
 
 /// Sends a haptic rumble command to the physical controller associated with
 /// the given XInput `slot`.
@@ -1242,12 +1239,7 @@ fn send_rumble_via_iokit(left_motor: u8, right_motor: u8) -> Result<(), String> 
     }
 
     // Pre-create CFString keys for property lookups.
-    let prop_keys = [
-        "VendorID",
-        "ProductID",
-        "PrimaryUsagePage",
-        "PrimaryUsage",
-    ];
+    let prop_keys = ["VendorID", "ProductID", "PrimaryUsagePage", "PrimaryUsage"];
     let mut cf_keys = Vec::with_capacity(prop_keys.len());
     for key in prop_keys {
         let key_cstr = CString::new(key).map_err(|e| e.to_string())?;
@@ -1295,11 +1287,7 @@ fn send_rumble_via_iokit(left_motor: u8, right_motor: u8) -> Result<(), String> 
             )
         } != 0;
         unsafe { CFRelease(cfnum) };
-        if ok {
-            Ok(Some(value))
-        } else {
-            Ok(None)
-        }
+        if ok { Ok(Some(value)) } else { Ok(None) }
     }
 
     // 3. Iterate services.

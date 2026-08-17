@@ -22,7 +22,7 @@ use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -477,7 +477,9 @@ pub fn vk_format_to_metal_format(format: VkFormat) -> metal::MTLPixelFormat {
 /// Map a Vulkan [`VkSamplerCreateInfo`] to a D3D12 static-sampler descriptor
 /// so the shared [`crate::metal_backend::create_static_sampler`] helper can
 /// build the matching `MTLSamplerState`.
-fn vk_sampler_to_d3d12_static_sampler_desc(ci: &VkSamplerCreateInfo) -> crate::gfx::D3D12StaticSamplerDesc {
+fn vk_sampler_to_d3d12_static_sampler_desc(
+    ci: &VkSamplerCreateInfo,
+) -> crate::gfx::D3D12StaticSamplerDesc {
     use crate::gfx::{D3D12ShaderVisibility, D3D12StaticSamplerDesc};
 
     // D3D12_FILTER bit layout: min [0:2], mag [2:4], mip [4:6],
@@ -1926,8 +1928,7 @@ impl SpirvTranslator {
                     // operands: [type_id, result_id, constituent_ids...]
                     if operands.len() >= 3 {
                         let result_id = operands[1];
-                        self.composites
-                            .insert(result_id, operands[2..].to_vec());
+                        self.composites.insert(result_id, operands[2..].to_vec());
                     }
                 }
                 SPIRV_OP_CONSTANT_TRUE => {
@@ -3138,7 +3139,10 @@ impl VulkanState {
         // fresh committed command buffer (same pattern as `metal_renderer`).
         if let Some(backend) = self.metal_backend.as_ref() {
             let sc = backend.swapchain().ok_or_else(|| {
-                AppError::new(ReasonCode::RcInvalidState, "queue_present: no Metal swapchain")
+                AppError::new(
+                    ReasonCode::RcInvalidState,
+                    "queue_present: no Metal swapchain",
+                )
             })?;
             let drawable = sc.next_drawable().map_err(|e| {
                 AppError::new(
@@ -3331,9 +3335,12 @@ impl VulkanState {
         // Reject wrapping offset+size arithmetic before any comparison or
         // pointer arithmetic (a guest-supplied overflow must never bypass the
         // bounds check below).
-        let end = offset
-            .checked_add(size)
-            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "map_memory: offset + size overflows"))?;
+        let end = offset.checked_add(size).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcInvalidState,
+                "map_memory: offset + size overflows",
+            )
+        })?;
         if offset > info.size || end > info.size {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
@@ -3450,7 +3457,10 @@ impl VulkanState {
                 .get(&memory)
                 .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "memory not found"))?;
             let end = offset.checked_add(size).ok_or_else(|| {
-                AppError::new(ReasonCode::RcInvalidState, "invalidate: offset + size overflows")
+                AppError::new(
+                    ReasonCode::RcInvalidState,
+                    "invalidate: offset + size overflows",
+                )
             })?;
             if offset > info.size || end > info.size {
                 return Err(AppError::new(
@@ -3962,11 +3972,7 @@ impl VulkanState {
     /// created from the create info (filters, address modes, LOD clamps,
     /// anisotropy, and compare function) and kept alive for the sampler's
     /// lifetime.
-    pub fn create_sampler(
-        &mut self,
-        device: VkDevice,
-        ci: &VkSamplerCreateInfo,
-    ) -> AppResult<u64> {
+    pub fn create_sampler(&mut self, device: VkDevice, ci: &VkSamplerCreateInfo) -> AppResult<u64> {
         if !self.devices.contains_key(&device) {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
@@ -3977,10 +3983,8 @@ impl VulkanState {
 
         let metal_sampler_id = if let Some(backend) = self.metal_backend.as_ref() {
             let desc = vk_sampler_to_d3d12_static_sampler_desc(ci);
-            let sampler = crate::metal_backend::create_static_sampler(
-                backend.device().metal_device(),
-                &desc,
-            );
+            let sampler =
+                crate::metal_backend::create_static_sampler(backend.device().metal_device(), &desc);
             self.sampler_states.insert(handle, sampler);
             Some(handle)
         } else {
@@ -4421,7 +4425,10 @@ impl VulkanState {
     /// Mutable variant of [`Self::cmd_in_recording`]: returns the command
     /// buffer that is currently being recorded, without any panicking
     /// indexing (an invalid handle is reported as an error instead).
-    fn cmd_in_recording_mut(&mut self, cmd: VkCommandBuffer) -> AppResult<&mut VkCommandBufferInfo> {
+    fn cmd_in_recording_mut(
+        &mut self,
+        cmd: VkCommandBuffer,
+    ) -> AppResult<&mut VkCommandBufferInfo> {
         let info = self
             .command_buffers
             .get_mut(&cmd)
@@ -4601,9 +4608,9 @@ impl VulkanState {
         }
 
         let apply_pipeline = |pipeline: VkPipeline,
-                                  backend: &MetalGpuBackend,
-                                  render_encoder: Option<&metal::RenderCommandEncoderRef>,
-                                  compute_encoder: Option<&metal::ComputeCommandEncoderRef>|
+                              backend: &MetalGpuBackend,
+                              render_encoder: Option<&metal::RenderCommandEncoderRef>,
+                              compute_encoder: Option<&metal::ComputeCommandEncoderRef>|
          -> AppResult<()> {
             let Some(info) = self.pipelines.get(&pipeline) else {
                 return Err(AppError::new(
@@ -4790,9 +4797,7 @@ impl VulkanState {
                             self.resolve_buffer(backend, *src),
                             self.resolve_buffer(backend, *dst),
                         ) {
-                            blit.copy_from_buffer(
-                                src_buf, src_off, dst_buf, dst_off, size,
-                            );
+                            blit.copy_from_buffer(src_buf, src_off, dst_buf, dst_off, size);
                         }
                     }
                     blit.end_encoding();
@@ -4937,7 +4942,10 @@ impl VulkanState {
     }
 
     /// Destroy a descriptor set layout.
-    pub fn destroy_descriptor_set_layout(&mut self, layout: VkDescriptorSetLayout) -> AppResult<()> {
+    pub fn destroy_descriptor_set_layout(
+        &mut self,
+        layout: VkDescriptorSetLayout,
+    ) -> AppResult<()> {
         if self.descriptor_set_layouts.remove(&layout).is_none() {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
@@ -5038,10 +5046,7 @@ impl VulkanState {
     /// Destroy a fence.
     pub fn destroy_fence(&mut self, fence: VkFence) -> AppResult<()> {
         if self.fences.remove(&fence).is_none() {
-            return Err(AppError::new(
-                ReasonCode::RcInvalidState,
-                "fence not found",
-            ));
+            return Err(AppError::new(ReasonCode::RcInvalidState, "fence not found"));
         }
         Ok(())
     }
@@ -6118,7 +6123,10 @@ impl ThreadSafeVulkanState {
 
     /// Destroy a Vulkan instance (thread-safe).
     pub fn destroy_instance(&self, instance: VkInstance) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).destroy_instance(instance)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .destroy_instance(instance)
     }
 
     /// Enumerate physical devices (thread-safe).
@@ -6139,12 +6147,18 @@ impl ThreadSafeVulkanState {
         exts: &[String],
         queues: &[(u32, u32)],
     ) -> AppResult<VkDevice> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_device(phys, exts, queues)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .create_device(phys, exts, queues)
     }
 
     /// Destroy a logical device (thread-safe).
     pub fn destroy_device(&self, device: VkDevice) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).destroy_device(device)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .destroy_device(device)
     }
 
     /// Create a swapchain (thread-safe).
@@ -6186,7 +6200,10 @@ impl ThreadSafeVulkanState {
 
     /// Create a compute pipeline (thread-safe).
     pub fn create_compute_pipeline(&self, layout: VkPipelineLayout) -> AppResult<VkPipeline> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_compute_pipeline(layout)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .create_compute_pipeline(layout)
     }
 
     /// Create a buffer (thread-safe).
@@ -6207,14 +6224,10 @@ impl ThreadSafeVulkanState {
         array_layers: u32,
         usage: VkImageUsageFlags,
     ) -> AppResult<VkImage> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_image(
-            device,
-            format,
-            extent,
-            mip_levels,
-            array_layers,
-            usage,
-        )
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .create_image(device, format, extent, mip_levels, array_layers, usage)
     }
 
     /// Allocate command buffers (thread-safe).
@@ -6232,7 +6245,10 @@ impl ThreadSafeVulkanState {
 
     /// Begin command buffer (thread-safe).
     pub fn begin_command_buffer(&self, cmd: VkCommandBuffer, flags: u32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).begin_command_buffer(cmd, flags)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .begin_command_buffer(cmd, flags)
     }
 
     /// Record draw command (thread-safe).
@@ -6244,27 +6260,39 @@ impl ThreadSafeVulkanState {
         first_vertex: u32,
         first_instance: u32,
     ) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).cmd_draw(
-            cmd,
-            vertex_count,
-            instance_count,
-            first_vertex,
-            first_instance,
-        )
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cmd_draw(
+                cmd,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            )
     }
 
     /// End command buffer (thread-safe).
     pub fn end_command_buffer(&self, cmd: VkCommandBuffer) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).end_command_buffer(cmd)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .end_command_buffer(cmd)
     }
 
     /// Get instance count (thread-safe).
     pub fn instance_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).instance_count()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .instance_count()
     }
     /// Get device count (thread-safe).
     pub fn device_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).device_count()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .device_count()
     }
 }
 
@@ -6491,13 +6519,17 @@ impl GlslToMslTranslator {
         if stage == GlslShaderStage::Vertex && !inputs.is_empty() {
             output.push_str("struct VertexIn {\n");
             for (i, (msl_type, name)) in inputs.iter().enumerate() {
-                output.push_str(&format!("    {} {} [[attribute({})]];\n", msl_type, name, i));
+                output.push_str(&format!(
+                    "    {} {} [[attribute({})]];\n",
+                    msl_type, name, i
+                ));
             }
             output.push_str("};\n\n");
         }
 
         // Generate entry point
-        let return_type = if stage == GlslShaderStage::Vertex || stage == GlslShaderStage::Fragment {
+        let return_type = if stage == GlslShaderStage::Vertex || stage == GlslShaderStage::Fragment
+        {
             "float4"
         } else {
             "void"
@@ -6667,37 +6699,58 @@ impl ThreadSafeGLState {
 
     /// Create a GL context (thread-safe).
     pub fn gl_create_context(&self) -> AppResult<u64> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_create_context()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_create_context()
     }
 
     /// Make a GL context current (thread-safe).
     pub fn gl_make_current(&self, ctx: u64) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_make_current(ctx)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_make_current(ctx)
     }
 
     /// Delete a GL context (thread-safe).
     pub fn gl_delete_context(&self, ctx: u64) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_delete_context(ctx)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_delete_context(ctx)
     }
 
     /// Set clear color (thread-safe).
     pub fn gl_clear_color(&self, r: f32, g: f32, b: f32, a: f32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_clear_color(r, g, b, a)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_clear_color(r, g, b, a)
     }
 
     /// Set viewport (thread-safe).
     pub fn gl_viewport(&self, x: i32, y: i32, w: i32, h: i32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_viewport(x, y, w, h)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_viewport(x, y, w, h)
     }
 
     /// Enable capability (thread-safe).
     pub fn gl_enable(&self, cap: u32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_enable(cap)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_enable(cap)
     }
 
     /// Disable capability (thread-safe).
     pub fn gl_disable(&self, cap: u32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_disable(cap)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_disable(cap)
     }
 
     /// Draw arrays (thread-safe).
@@ -6710,22 +6763,34 @@ impl ThreadSafeGLState {
 
     /// Use program (thread-safe).
     pub fn gl_use_program(&self, program: u32) -> AppResult<()> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_use_program(program)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_use_program(program)
     }
 
     /// Create program (thread-safe).
     pub fn gl_create_program(&self) -> AppResult<u32> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_create_program()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .gl_create_program()
     }
 
     /// Context count (thread-safe).
     pub fn context_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).context_count()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .context_count()
     }
 
     /// Has current context (thread-safe).
     pub fn has_current_context(&self) -> bool {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).has_current_context()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .has_current_context()
     }
 }
 
@@ -6874,7 +6939,9 @@ pub fn register_vulkan_dll() -> Vec<(&'static str, u64)> {
 /// against a cap derived from the guest-supplied counts.
 unsafe fn write_handle(out: *mut u64, handle: u64) {
     if !out.is_null() {
-        unsafe { *out = handle; }
+        unsafe {
+            *out = handle;
+        }
     }
 }
 
@@ -6928,24 +6995,16 @@ fn minimal_spirv_blob() -> Vec<u32> {
         0x00000007, // bound (IDs 0..6)
         0x00000000, // schema
         // OpCapability Shader
-        0x00020011, 0x00000001,
-        // OpMemoryModel Logical GLSL450
-        0x0003000E, 0x00000000, 0x00000001,
-        // OpEntryPoint Vertex %5 "main"
+        0x00020011, 0x00000001, // OpMemoryModel Logical GLSL450
+        0x0003000E, 0x00000000, 0x00000001, // OpEntryPoint Vertex %5 "main"
         0x0005000F, 0x00000000, 0x00000005, 0x6E69616D, 0x00000000,
         // OpName %5 "main"
-        0x00040005, 0x00000005, 0x6E69616D, 0x00000000,
-        // OpTypeVoid %2
-        0x00020013, 0x00000002,
-        // OpTypeFunction %3 %2
-        0x00030021, 0x00000003, 0x00000002,
-        // %5 = OpFunction %2 None %3
-        0x00050036, 0x00000002, 0x00000005, 0x00000000, 0x00000003,
-        // %6 = OpLabel
-        0x000200F8, 0x00000006,
-        // OpReturn
-        0x000100FD,
-        // OpFunctionEnd
+        0x00040005, 0x00000005, 0x6E69616D, 0x00000000, // OpTypeVoid %2
+        0x00020013, 0x00000002, // OpTypeFunction %3 %2
+        0x00030021, 0x00000003, 0x00000002, // %5 = OpFunction %2 None %3
+        0x00050036, 0x00000002, 0x00000005, 0x00000000, 0x00000003, // %6 = OpLabel
+        0x000200F8, 0x00000006, // OpReturn
+        0x000100FD, // OpFunctionEnd
         0x00010038,
     ]
 }
@@ -6960,7 +7019,9 @@ unsafe extern "C" fn vk_thunk_create_instance(p_instance: *mut u64) -> VkResultT
         let layers: Vec<String> = Vec::new();
         match state.create_instance("guest-app", "Casa1", &exts, &layers) {
             Ok(instance) => {
-                unsafe { write_handle(p_instance, instance); }
+                unsafe {
+                    write_handle(p_instance, instance);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -6989,11 +7050,15 @@ unsafe extern "C" fn vk_thunk_enumerate_physical_devices(
     with_vulkan_state(|state| match state.enumerate_physical_devices(instance) {
         Ok(devices) => {
             if !p_count.is_null() {
-                unsafe { *p_count = devices.len() as u32; }
+                unsafe {
+                    *p_count = devices.len() as u32;
+                }
             }
             if !p_devices.is_null() {
                 for (i, d) in devices.iter().enumerate().take(devices.len()) {
-                    unsafe { *p_devices.add(i) = *d; }
+                    unsafe {
+                        *p_devices.add(i) = *d;
+                    }
                 }
             }
             VK_SUCCESS
@@ -7014,7 +7079,9 @@ unsafe extern "C" fn vk_thunk_create_device(
         let exts: Vec<String> = Vec::new();
         match state.create_device(physical_device, &exts, &[(0, 1)]) {
             Ok(device) => {
-                unsafe { write_handle(p_device, device); }
+                unsafe {
+                    write_handle(p_device, device);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7058,10 +7125,17 @@ unsafe extern "C" fn vk_thunk_create_swapchain(
         };
         let ci = VkSwapchainCreateInfo {
             surface,
-            min_image_count: if min_image_count == 0 { 2 } else { min_image_count },
+            min_image_count: if min_image_count == 0 {
+                2
+            } else {
+                min_image_count
+            },
             image_format: VkFormat::B8G8R8A8Unorm,
             image_color_space: VkColorSpaceKHR::SrgbNonlinear,
-            image_extent: (if width == 0 { 800 } else { width }, if height == 0 { 600 } else { height }),
+            image_extent: (
+                if width == 0 { 800 } else { width },
+                if height == 0 { 600 } else { height },
+            ),
             image_array_layers: 1,
             image_usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             pre_transform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
@@ -7071,7 +7145,9 @@ unsafe extern "C" fn vk_thunk_create_swapchain(
         };
         match state.create_swapchain(device, surface, &ci) {
             Ok(sc) => {
-                unsafe { write_handle(p_swapchain, sc); }
+                unsafe {
+                    write_handle(p_swapchain, sc);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7102,11 +7178,15 @@ unsafe extern "C" fn vk_thunk_get_swapchain_images(
         };
         let count = info.metal_drawables.len() as u32;
         if !p_count.is_null() {
-            unsafe { *p_count = count; }
+            unsafe {
+                *p_count = count;
+            }
         }
         if !p_images.is_null() {
             for (i, d) in info.metal_drawables.iter().take(count as usize).enumerate() {
-                unsafe { *p_images.add(i) = *d; }
+                unsafe {
+                    *p_images.add(i) = *d;
+                }
             }
         }
         VK_SUCCESS
@@ -7122,12 +7202,18 @@ unsafe extern "C" fn vk_thunk_acquire_next_image(
     p_image_index: *mut u32,
 ) -> VkResultType {
     with_vulkan_state(|state| {
-        let sem = if semaphore == 0 { None } else { Some(semaphore) };
+        let sem = if semaphore == 0 {
+            None
+        } else {
+            Some(semaphore)
+        };
         let fen = if fence == 0 { None } else { Some(fence) };
         match state.acquire_next_image(swapchain, sem, fen) {
             Ok((index, _)) => {
                 if !p_image_index.is_null() {
-                    unsafe { *p_image_index = index; }
+                    unsafe {
+                        *p_image_index = index;
+                    }
                 }
                 VK_SUCCESS
             }
@@ -7141,10 +7227,12 @@ unsafe extern "C" fn vk_thunk_queue_present(
     swapchain: u64,
     image_index: u32,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.queue_present(queue, swapchain, image_index) {
-        Ok(_) => VK_SUCCESS,
-        Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
-    })
+    with_vulkan_state(
+        |state| match state.queue_present(queue, swapchain, image_index) {
+            Ok(_) => VK_SUCCESS,
+            Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -7168,7 +7256,9 @@ unsafe extern "C" fn vk_thunk_create_shader_module(
         };
         match state.create_shader_module(device, &spirv) {
             Ok(module) => {
-                unsafe { write_handle(p_module, module); }
+                unsafe {
+                    write_handle(p_module, module);
+                }
                 VK_SUCCESS
             }
             Err(e) => {
@@ -7189,7 +7279,9 @@ unsafe extern "C" fn vk_thunk_create_pipeline_layout(
 ) -> VkResultType {
     with_vulkan_state(|state| match state.create_pipeline_layout(vec![], vec![]) {
         Ok(layout) => {
-            unsafe { write_handle(p_layout, layout); }
+            unsafe {
+                write_handle(p_layout, layout);
+            }
             VK_SUCCESS
         }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7212,14 +7304,24 @@ unsafe extern "C" fn vk_thunk_create_graphics_pipelines(
             Some(l) => l,
             None => return VK_ERROR_INITIALIZATION_FAILED,
         };
-        let vertex = if vertex_module == 0 { None } else { Some(vertex_module) };
-        let fragment = if fragment_module == 0 { None } else { Some(fragment_module) };
+        let vertex = if vertex_module == 0 {
+            None
+        } else {
+            Some(vertex_module)
+        };
+        let fragment = if fragment_module == 0 {
+            None
+        } else {
+            Some(fragment_module)
+        };
         let count = count.max(1);
         for i in 0..count {
             match state.create_graphics_pipeline_with_shaders(layout, 2, vertex, fragment) {
                 Ok(pipeline) => {
                     if !p_pipelines.is_null() {
-                        unsafe { *p_pipelines.add(i as usize) = pipeline; }
+                        unsafe {
+                            *p_pipelines.add(i as usize) = pipeline;
+                        }
                     }
                 }
                 Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
@@ -7240,13 +7342,19 @@ unsafe extern "C" fn vk_thunk_create_compute_pipelines(
             Some(l) => l,
             None => return VK_ERROR_INITIALIZATION_FAILED,
         };
-        let module = if compute_module == 0 { None } else { Some(compute_module) };
+        let module = if compute_module == 0 {
+            None
+        } else {
+            Some(compute_module)
+        };
         let count = count.max(1);
         for i in 0..count {
             match state.create_compute_pipeline_with_shader(layout, module) {
                 Ok(pipeline) => {
                     if !p_pipelines.is_null() {
-                        unsafe { *p_pipelines.add(i as usize) = pipeline; }
+                        unsafe {
+                            *p_pipelines.add(i as usize) = pipeline;
+                        }
                     }
                 }
                 Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
@@ -7265,12 +7373,16 @@ unsafe extern "C" fn vk_thunk_create_render_pass(
     color_attachments: u32,
     p_render_pass: *mut u64,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.create_render_pass(color_attachments, false, "clear", "store") {
-        Ok(rp) => {
-            unsafe { write_handle(p_render_pass, rp); }
-            VK_SUCCESS
+    with_vulkan_state(|state| {
+        match state.create_render_pass(color_attachments, false, "clear", "store") {
+            Ok(rp) => {
+                unsafe {
+                    write_handle(p_render_pass, rp);
+                }
+                VK_SUCCESS
+            }
+            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
-        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
@@ -7284,7 +7396,9 @@ unsafe extern "C" fn vk_thunk_create_framebuffer(
     with_vulkan_state(|state| {
         match state.create_framebuffer(render_pass, vec![], width, height, 1) {
             Ok(fb) => {
-                unsafe { write_handle(p_framebuffer, fb); }
+                unsafe {
+                    write_handle(p_framebuffer, fb);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7301,13 +7415,17 @@ unsafe extern "C" fn vk_thunk_create_command_pool(
     queue_family: u32,
     p_pool: *mut u64,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.create_command_pool(device, queue_family) {
-        Ok(pool) => {
-            unsafe { write_handle(p_pool, pool); }
-            VK_SUCCESS
-        }
-        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-    })
+    with_vulkan_state(
+        |state| match state.create_command_pool(device, queue_family) {
+            Ok(pool) => {
+                unsafe {
+                    write_handle(p_pool, pool);
+                }
+                VK_SUCCESS
+            }
+            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+        },
+    )
 }
 
 unsafe extern "C" fn vk_thunk_allocate_command_buffers(
@@ -7322,7 +7440,9 @@ unsafe extern "C" fn vk_thunk_allocate_command_buffers(
             Ok(buffers) => {
                 if !p_buffers.is_null() {
                     for (i, b) in buffers.iter().enumerate() {
-                        unsafe { *p_buffers.add(i) = *b; }
+                        unsafe {
+                            *p_buffers.add(i) = *b;
+                        }
                     }
                 }
                 VK_SUCCESS
@@ -7395,13 +7515,17 @@ unsafe extern "C" fn vk_thunk_allocate_memory(
     memory_type_index: u32,
     p_memory: *mut u64,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.allocate_memory(device, size, memory_type_index) {
-        Ok(memory) => {
-            unsafe { write_handle(p_memory, memory); }
-            VK_SUCCESS
-        }
-        Err(_) => VK_ERROR_OUT_OF_DEVICE_MEMORY,
-    })
+    with_vulkan_state(
+        |state| match state.allocate_memory(device, size, memory_type_index) {
+            Ok(memory) => {
+                unsafe {
+                    write_handle(p_memory, memory);
+                }
+                VK_SUCCESS
+            }
+            Err(_) => VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        },
+    )
 }
 
 unsafe extern "C" fn vk_thunk_free_memory(
@@ -7425,18 +7549,22 @@ unsafe extern "C" fn vk_thunk_map_memory(
     size: u64,
     pp_data: *mut *mut u8,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.map_memory(device, memory, offset, size) {
-        Ok(ptr) => {
-            if !pp_data.is_null() {
-                unsafe { *pp_data = ptr; }
+    with_vulkan_state(
+        |state| match state.map_memory(device, memory, offset, size) {
+            Ok(ptr) => {
+                if !pp_data.is_null() {
+                    unsafe {
+                        *pp_data = ptr;
+                    }
+                }
+                VK_SUCCESS
             }
-            VK_SUCCESS
-        }
-        Err(e) => {
-            eprintln!("[vkgl] map_memory({memory}) failed: {e:?}");
-            VK_ERROR_MEMORY_MAP_FAILED
-        }
-    })
+            Err(e) => {
+                eprintln!("[vkgl] map_memory({memory}) failed: {e:?}");
+                VK_ERROR_MEMORY_MAP_FAILED
+            }
+        },
+    )
 }
 
 unsafe extern "C" fn vk_thunk_unmap_memory(device: u64, memory: u64) -> VkResultType {
@@ -7458,7 +7586,9 @@ unsafe extern "C" fn vk_thunk_create_buffer(
 ) -> VkResultType {
     with_vulkan_state(|state| match state.create_buffer(device, size, usage) {
         Ok(buffer) => {
-            unsafe { write_handle(p_buffer, buffer); }
+            unsafe {
+                write_handle(p_buffer, buffer);
+            }
             VK_SUCCESS
         }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7482,7 +7612,9 @@ unsafe extern "C" fn vk_thunk_create_image(
         };
         match state.create_image(device, fmt, (width, height, 1), 1, 1, usage) {
             Ok(image) => {
-                unsafe { write_handle(p_image, image); }
+                unsafe {
+                    write_handle(p_image, image);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7505,7 +7637,9 @@ unsafe extern "C" fn vk_thunk_create_image_view(
         };
         match state.create_image_view(image, fmt, 1) {
             Ok(view) => {
-                unsafe { write_handle(p_view, view); }
+                unsafe {
+                    write_handle(p_view, view);
+                }
                 VK_SUCCESS
             }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7522,13 +7656,17 @@ unsafe extern "C" fn vk_thunk_create_descriptor_set_layout(
     binding_count: u32,
     p_layout: *mut u64,
 ) -> VkResultType {
-    with_vulkan_state(|state| match state.create_descriptor_set_layout(binding_count) {
-        Ok(layout) => {
-            unsafe { write_handle(p_layout, layout); }
-            VK_SUCCESS
-        }
-        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-    })
+    with_vulkan_state(
+        |state| match state.create_descriptor_set_layout(binding_count) {
+            Ok(layout) => {
+                unsafe {
+                    write_handle(p_layout, layout);
+                }
+                VK_SUCCESS
+            }
+            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+        },
+    )
 }
 
 unsafe extern "C" fn vk_thunk_create_descriptor_pool(
@@ -7538,7 +7676,9 @@ unsafe extern "C" fn vk_thunk_create_descriptor_pool(
 ) -> VkResultType {
     with_vulkan_state(|state| match state.create_descriptor_pool(max_sets) {
         Ok(pool) => {
-            unsafe { write_handle(p_pool, pool); }
+            unsafe {
+                write_handle(p_pool, pool);
+            }
             VK_SUCCESS
         }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7566,7 +7706,9 @@ unsafe extern "C" fn vk_thunk_allocate_descriptor_sets(
             Ok(sets) => {
                 if !p_sets.is_null() {
                     for (i, s) in sets.iter().enumerate() {
-                        unsafe { *p_sets.add(i) = *s; }
+                        unsafe {
+                            *p_sets.add(i) = *s;
+                        }
                     }
                 }
                 VK_SUCCESS
@@ -7587,7 +7729,9 @@ unsafe extern "C" fn vk_thunk_create_fence(
 ) -> VkResultType {
     with_vulkan_state(|state| match state.create_fence(device, signaled != 0) {
         Ok(fence) => {
-            unsafe { write_handle(p_fence, fence); }
+            unsafe {
+                write_handle(p_fence, fence);
+            }
             VK_SUCCESS
         }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7597,7 +7741,9 @@ unsafe extern "C" fn vk_thunk_create_fence(
 unsafe extern "C" fn vk_thunk_create_semaphore(device: u64, p_semaphore: *mut u64) -> VkResultType {
     with_vulkan_state(|state| match state.create_semaphore(device) {
         Ok(semaphore) => {
-            unsafe { write_handle(p_semaphore, semaphore); }
+            unsafe {
+                write_handle(p_semaphore, semaphore);
+            }
             VK_SUCCESS
         }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
@@ -7611,9 +7757,15 @@ unsafe extern "C" fn vk_thunk_create_semaphore(device: u64, p_semaphore: *mut u6
 /// behind a global mutex (see [`with_gl_state`]).
 pub fn register_opengl_dll() -> Vec<(&'static str, u64)> {
     vec![
-        ("wglCreateContext", gl_thunk_create_context as *const () as u64),
+        (
+            "wglCreateContext",
+            gl_thunk_create_context as *const () as u64,
+        ),
         ("wglMakeCurrent", gl_thunk_make_current as *const () as u64),
-        ("wglDeleteContext", gl_thunk_delete_context as *const () as u64),
+        (
+            "wglDeleteContext",
+            gl_thunk_delete_context as *const () as u64,
+        ),
         ("glClear", gl_thunk_clear as *const () as u64),
         ("glDrawArrays", gl_thunk_draw_arrays as *const () as u64),
         ("glDrawElements", gl_thunk_draw_elements as *const () as u64),
@@ -7621,18 +7773,39 @@ pub fn register_opengl_dll() -> Vec<(&'static str, u64)> {
         ("glBindBuffer", gl_thunk_bind_buffer as *const () as u64),
         ("glBufferData", gl_thunk_buffer_data as *const () as u64),
         ("glCreateShader", gl_thunk_create_shader as *const () as u64),
-        ("glCompileShader", gl_thunk_compile_shader as *const () as u64),
+        (
+            "glCompileShader",
+            gl_thunk_compile_shader as *const () as u64,
+        ),
         ("glLinkProgram", gl_thunk_link_program as *const () as u64),
         ("glUseProgram", gl_thunk_use_program as *const () as u64),
         ("glGenTextures", gl_thunk_gen_textures as *const () as u64),
         ("glBindTexture", gl_thunk_bind_texture as *const () as u64),
         ("glTexImage2D", gl_thunk_tex_image_2d as *const () as u64),
-        ("glDeleteBuffers", gl_thunk_delete_buffers as *const () as u64),
-        ("glDeleteTextures", gl_thunk_delete_textures as *const () as u64),
-        ("glDeletePrograms", gl_thunk_delete_programs as *const () as u64),
-        ("glDeleteShaders", gl_thunk_delete_shaders as *const () as u64),
-        ("glDeleteFramebuffers", gl_thunk_delete_framebuffers as *const () as u64),
-        ("glDeleteVertexArrays", gl_thunk_delete_vertex_arrays as *const () as u64),
+        (
+            "glDeleteBuffers",
+            gl_thunk_delete_buffers as *const () as u64,
+        ),
+        (
+            "glDeleteTextures",
+            gl_thunk_delete_textures as *const () as u64,
+        ),
+        (
+            "glDeletePrograms",
+            gl_thunk_delete_programs as *const () as u64,
+        ),
+        (
+            "glDeleteShaders",
+            gl_thunk_delete_shaders as *const () as u64,
+        ),
+        (
+            "glDeleteFramebuffers",
+            gl_thunk_delete_framebuffers as *const () as u64,
+        ),
+        (
+            "glDeleteVertexArrays",
+            gl_thunk_delete_vertex_arrays as *const () as u64,
+        ),
     ]
 }
 
@@ -7695,7 +7868,9 @@ unsafe extern "C" fn gl_thunk_gen_buffers(count: u32, buffers: *mut u32) {
             && !buffers.is_null()
         {
             for (i, id) in ids.iter().enumerate() {
-                unsafe { *buffers.add(i) = *id; }
+                unsafe {
+                    *buffers.add(i) = *id;
+                }
             }
         }
     });
@@ -7709,12 +7884,7 @@ unsafe extern "C" fn gl_thunk_bind_buffer(target: u32, buffer: u32) {
 }
 
 /// `glBufferData(target, size, data, usage)` — uploads (bounded) guest data.
-unsafe extern "C" fn gl_thunk_buffer_data(
-    target: u32,
-    size: i64,
-    data: *const c_void,
-    usage: u32,
-) {
+unsafe extern "C" fn gl_thunk_buffer_data(target: u32, size: i64, data: *const c_void, usage: u32) {
     let bytes: &[u8] = if data.is_null() || size <= 0 {
         &[]
     } else {
@@ -7764,7 +7934,9 @@ unsafe extern "C" fn gl_thunk_gen_textures(count: u32, textures: *mut u32) {
             && !textures.is_null()
         {
             for (i, id) in ids.iter().enumerate() {
-                unsafe { *textures.add(i) = *id; }
+                unsafe {
+                    *textures.add(i) = *id;
+                }
             }
         }
     });
@@ -7877,7 +8049,6 @@ unsafe extern "C" fn gl_thunk_delete_vertex_arrays(count: u32, arrays: *const u3
         let _ = gl.gl_delete_vertex_arrays(names);
     });
 }
-
 
 // ===========================================================================
 // Section 9: Tests

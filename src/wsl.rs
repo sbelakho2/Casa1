@@ -276,17 +276,17 @@ impl WslSupport {
         self.launch_command(&default.name, command, timeout_secs)
     }
 
-/// Check if a specific package/tool is available in a distribution.
-pub fn check_tool_available(&self, distribution: &str, tool: &str) -> Result<bool, String> {
-    // Shell-quote the tool name so guest-supplied input can never inject
-    // additional commands into the launched shell.
-    let result = self.launch_command(
-        distribution,
-        &format!("which {}", shell_quote(tool)),
-        Some(10),
-    )?;
-    Ok(result.exit_code == 0)
-}
+    /// Check if a specific package/tool is available in a distribution.
+    pub fn check_tool_available(&self, distribution: &str, tool: &str) -> Result<bool, String> {
+        // Shell-quote the tool name so guest-supplied input can never inject
+        // additional commands into the launched shell.
+        let result = self.launch_command(
+            distribution,
+            &format!("which {}", shell_quote(tool)),
+            Some(10),
+        )?;
+        Ok(result.exit_code == 0)
+    }
 
     /// Retrieve the Linux kernel version reported by a distribution.
     pub fn kernel_version(&self, distribution: &str) -> Result<Option<String>, String> {

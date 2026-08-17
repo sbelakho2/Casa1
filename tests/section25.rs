@@ -75,7 +75,9 @@ fn t25_01_cm_connect_disconnect() {
         stack.disconnect().expect("disconnect should succeed");
         assert_eq!(stack.state, ConnectionState::Disconnected);
 
-        stack.connect(None).expect("second live connect must succeed");
+        stack
+            .connect(None)
+            .expect("second live connect must succeed");
         stack
             .disconnect()
             .expect("second disconnect should succeed");
@@ -1177,7 +1179,6 @@ fn t25_13_serialize_deserialize_roundtrip_properties() {
 // t25_15 — GNS UDP socket creation and binding
 // ===========================================================================
 
-
 #[test]
 fn t25_15_gns_udp_socket_creation() {
     use std::net::SocketAddr;
@@ -1393,18 +1394,28 @@ fn t25_20_gns_message_encryption_decryption_roundtrip() {
     gns.send_message(h2, plaintext, 0)
         .expect("fallback send must succeed");
     let fallback = gns.poll_incoming_messages().unwrap();
-    assert_eq!(fallback.len(), 1, "fallback must deliver exactly one message");
+    assert_eq!(
+        fallback.len(),
+        1,
+        "fallback must deliver exactly one message"
+    );
     assert_eq!(
         fallback[0].data, plaintext,
         "fallback delivers the plaintext message"
     );
-    assert_eq!(fallback[0].conn, h2, "message must carry its session handle");
+    assert_eq!(
+        fallback[0].conn, h2,
+        "message must carry its session handle"
+    );
 
     // Encryption itself: the wire payload is encrypted with the session key —
     // ciphertext must differ from the plaintext and must decrypt back to it.
     let mut cipher = SessionCipher::new(&[0xAB; 32]);
     let wire_enc = cipher.encrypt(plaintext);
-    assert_ne!(wire_enc, plaintext, "encrypted bytes must differ from plaintext");
+    assert_ne!(
+        wire_enc, plaintext,
+        "encrypted bytes must differ from plaintext"
+    );
     let mut decipher = SessionCipher::new(&[0xAB; 32]);
     assert_eq!(
         decipher.encrypt(&wire_enc),
@@ -1455,9 +1466,15 @@ fn t25_21_gns_session_key_generation() {
         2,
         "both sessions' messages must be delivered exactly once"
     );
-    assert_eq!(messages[0].conn, h1, "message 0 must carry session 1's handle");
+    assert_eq!(
+        messages[0].conn, h1,
+        "message 0 must carry session 1's handle"
+    );
     assert_eq!(messages[0].data, b"data for session 1");
-    assert_eq!(messages[1].conn, h2, "message 1 must carry session 2's handle");
+    assert_eq!(
+        messages[1].conn, h2,
+        "message 1 must carry session 2's handle"
+    );
     assert_eq!(messages[1].data, b"data for session 2");
 
     gns.close_session(h1).unwrap();

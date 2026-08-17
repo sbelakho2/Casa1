@@ -585,7 +585,10 @@ fn create_ge(temp_dir: &TempDir, name: &str) -> GameEnvironment {
 /// (`key=value\0...\0\0`), used to round-trip the engine's block builder.
 fn parse_environment_block_utf16(block: &[u16]) -> BTreeMap<String, String> {
     let mut parsed = BTreeMap::new();
-    for entry in block.split(|word| *word == 0).filter(|entry| !entry.is_empty()) {
+    for entry in block
+        .split(|word| *word == 0)
+        .filter(|entry| !entry.is_empty())
+    {
         let entry = String::from_utf16(entry).expect("UTF-16 environment entry");
         let (key, value) = entry
             .split_once('=')

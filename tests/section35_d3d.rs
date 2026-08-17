@@ -156,11 +156,22 @@ fn t35_05_d3d10_copy_subresource_region() {
         .create_buffer(&desc, None)
         .expect("create dst buffer");
 
-    // Copy from src to dst (whole buffer)
-    let src_box: [u32; 6] = [0, 0, 0, 512, 1, 1];
+    // Whole-buffer copy (no partial source box) is supported.
     device
+        .copy_subresource_region(dst, 0, 0, 0, 0, src, 0, None)
+        .expect("whole-buffer copy_subresource_region should succeed");
+
+    // Partial source boxes are not yet implemented and must be refused
+    // with RcD3dFeatureUnsupported rather than silently mis-copied.
+    let src_box: [u32; 6] = [0, 0, 0, 512, 1, 1];
+    let err = device
         .copy_subresource_region(dst, 0, 0, 0, 0, src, 0, Some(src_box))
-        .expect("copy_subresource_region should succeed");
+        .expect_err("partial-box copy must be refused");
+    assert_eq!(
+        err.code,
+        casa1::reason::ReasonCode::RcD3dFeatureUnsupported,
+        "partial copy must report RcD3dFeatureUnsupported"
+    );
 }
 
 /// D3D10 invalid resource ID returns an error.

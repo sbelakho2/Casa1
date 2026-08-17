@@ -1893,7 +1893,8 @@ impl D3d11Device {
                 };
                 staging.clear();
                 staging.extend_from_slice(bytes);
-                self.backend.overwrite_resource_bytes(backbuffer_id, &staging)?;
+                self.backend
+                    .overwrite_resource_bytes(backbuffer_id, &staging)?;
             }
         }
         let present = self
@@ -2449,8 +2450,8 @@ impl D3d11Device {
             // draws, so the render pass is opened exactly once before the loop
             // and shared by every merged sequence.
             let bindings = &sequences[0].0;
-            let pass_started = !bindings.render_targets.is_empty()
-                || bindings.depth_target.is_some();
+            let pass_started =
+                !bindings.render_targets.is_empty() || bindings.depth_target.is_some();
             if pass_started {
                 let (color_formats, depth_format) = self.render_pass_formats(bindings)?;
                 let (load_action, store_action) = self.render_pass_actions(bindings)?;
@@ -2479,13 +2480,7 @@ impl D3d11Device {
                     self.graphics_pipeline,
                     false,
                 );
-                self.record_sequence_to_command_list(
-                    list,
-                    bindings,
-                    commands,
-                    &mut stats,
-                    false,
-                )?;
+                self.record_sequence_to_command_list(list, bindings, commands, &mut stats, false)?;
                 immutable_streams.push(self.backend.close_command_list(list)?);
             }
         }
@@ -2533,14 +2528,11 @@ impl D3d11Device {
             .map(|resource| {
                 // Only re-hash resources mutated since the last submission;
                 // untouched resources reuse their cached digest.
-                let digest = resource
-                    .digest
-                    .clone()
-                    .unwrap_or_else(|| {
-                        let computed = util::sha256_bytes(&resource.bytes);
-                        resource.digest = Some(computed.clone());
-                        computed
-                    });
+                let digest = resource.digest.clone().unwrap_or_else(|| {
+                    let computed = util::sha256_bytes(&resource.bytes);
+                    resource.digest = Some(computed.clone());
+                    computed
+                });
                 (resource.desc.label.clone(), digest)
             })
             .collect()
@@ -3281,7 +3273,10 @@ impl DeferredContext {
     }
 
     pub fn vs_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Vs);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Vs);
         Ok(())
     }
 
@@ -3294,7 +3289,10 @@ impl DeferredContext {
     }
 
     pub fn ps_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Ps);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Ps);
         Ok(())
     }
 
@@ -3307,7 +3305,10 @@ impl DeferredContext {
     }
 
     pub fn cs_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Cs);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Cs);
         Ok(())
     }
 
@@ -3352,7 +3353,10 @@ impl DeferredContext {
     }
 
     pub fn gs_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Gs);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Gs);
         Ok(())
     }
 
@@ -3365,7 +3369,10 @@ impl DeferredContext {
     }
 
     pub fn hs_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Hs);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Hs);
         Ok(())
     }
 
@@ -3378,7 +3385,10 @@ impl DeferredContext {
     }
 
     pub fn ds_clear_shader(&self) -> AppResult<()> {
-        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Ds);
+        self.lock_recording()?
+            .bindings
+            .shaders
+            .remove(&ShaderStage::Ds);
         Ok(())
     }
 
@@ -3632,18 +3642,22 @@ impl DeferredContext {
     }
 
     pub fn draw_indexed(&self, indices: u32) -> AppResult<()> {
-        self.lock_recording()?.commands.push(RecordedCommand::DrawIndexed {
-            indices,
-            kind: IndexedDrawCallKind::Regular,
-        });
+        self.lock_recording()?
+            .commands
+            .push(RecordedCommand::DrawIndexed {
+                indices,
+                kind: IndexedDrawCallKind::Regular,
+            });
         Ok(())
     }
 
     pub fn draw_indexed_instanced(&self, indices: u32, instances: u32) -> AppResult<()> {
-        self.lock_recording()?.commands.push(RecordedCommand::DrawIndexed {
-            indices,
-            kind: IndexedDrawCallKind::Instanced { instances },
-        });
+        self.lock_recording()?
+            .commands
+            .push(RecordedCommand::DrawIndexed {
+                indices,
+                kind: IndexedDrawCallKind::Instanced { instances },
+            });
         Ok(())
     }
 
@@ -3717,12 +3731,12 @@ impl DeferredContext {
 /// RGBA bytes raw into a B8G8R8A8 backbuffer would swap R and B.
 fn clear_color_bytes_for_format(rgba: [u8; 4], format: DxgiFormat) -> [u8; 4] {
     match format {
-        DxgiFormat::B8G8R8A8Unorm
-        | DxgiFormat::B8G8R8A8UnormSrgb
-        | DxgiFormat::B8G8R8X8Unorm => [rgba[2], rgba[1], rgba[0], rgba[3]],
-        DxgiFormat::R8G8B8A8Unorm
-        | DxgiFormat::R8G8B8A8UnormSrgb
-        | DxgiFormat::R8G8B8A8Uint => rgba,
+        DxgiFormat::B8G8R8A8Unorm | DxgiFormat::B8G8R8A8UnormSrgb | DxgiFormat::B8G8R8X8Unorm => {
+            [rgba[2], rgba[1], rgba[0], rgba[3]]
+        }
+        DxgiFormat::R8G8B8A8Unorm | DxgiFormat::R8G8B8A8UnormSrgb | DxgiFormat::R8G8B8A8Uint => {
+            rgba
+        }
         // Best-effort for every other format: keep the RGBA byte order.
         _ => rgba,
     }
@@ -4330,9 +4344,7 @@ fn create_device_internal_with_backend(
                 ReasonCode::RcD3dFeatureUnsupported,
                 "requested D3D11 feature levels are not supported by the Metal planner",
             )
-            .with_hint(
-                "request feature level 10_1, or 11_0 on mesh-shader-capable GPUs",
-            )
+            .with_hint("request feature level 10_1, or 11_0 on mesh-shader-capable GPUs")
         })?;
     let swapchain = match swapchain_desc {
         Some(desc) => Some(backend.create_swapchain(desc)?),
@@ -5686,8 +5698,15 @@ mod tests {
         );
 
         // Verify the bindings are accessible after finish_command_list.
+        // Both threads set a topology concurrently on the same deferred
+        // context, so the final value is last-writer-wins and either is
+        // valid (4 from thread 1 or 5 from thread 2).
         let bindings = &list.bindings;
-        assert_eq!(bindings.primitive_topology, Some(5));
+        assert!(
+            matches!(bindings.primitive_topology, Some(4) | Some(5)),
+            "topology must be one of the two concurrently recorded values, got {:?}",
+            bindings.primitive_topology
+        );
     }
 
     #[test]
@@ -5950,7 +5969,9 @@ mod tests {
         let predicate = device.create_predicate(PredicateType::Occlusion);
         device.set_predication(predicate);
         device.draw(3);
-        let submission = device.submit_immediate().expect("submit predicated workload");
+        let submission = device
+            .submit_immediate()
+            .expect("submit predicated workload");
         assert_eq!(
             submission.draw_calls, 0,
             "draws under a false predicate must be skipped"
@@ -5958,7 +5979,9 @@ mod tests {
 
         device.clear_predication();
         device.draw(3);
-        let submission = device.submit_immediate().expect("submit unpredicated workload");
+        let submission = device
+            .submit_immediate()
+            .expect("submit unpredicated workload");
         assert_eq!(submission.draw_calls, 1);
     }
 
@@ -6009,7 +6032,10 @@ mod tests {
         )
         .expect("11_0 request on mesh-capable backend");
         assert_eq!(apple11.feature_level(), FeatureLevel::Level11_0);
-        assert!(apple11.caps().hull_shader, "11_0 device may advertise tessellation");
+        assert!(
+            apple11.caps().hull_shader,
+            "11_0 device may advertise tessellation"
+        );
 
         let err = create_device_internal_with_backend(
             DeviceCreationRequest {
@@ -6050,7 +6076,10 @@ mod tests {
             .create_buffer("doomed", 64, ResourceUsageHint::Generic)
             .expect("create buffer");
         device.destroy_resource(buf).expect("destroy resource");
-        assert!(device.resource(buf).is_err(), "destroyed resource must be gone");
+        assert!(
+            device.resource(buf).is_err(),
+            "destroyed resource must be gone"
+        );
         let err = device.destroy_resource(buf).unwrap_err();
         assert!(
             err.to_string().contains("unknown"),

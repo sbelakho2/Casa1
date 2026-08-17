@@ -34,7 +34,7 @@ jobs:
         run: cargo check --all-targets
 
   clippy:
-    name: Clippy
+    name: Clippy (default features)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,23 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Run Clippy
+      - name: Run Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings -A future-incompatible
+
+  clippy-all-features:
+    name: Clippy (all features)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FFmpeg development libraries
+        run: |
+          brew install ffmpeg
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Run Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings -A future-incompatible
 
   test:
@@ -83,9 +99,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
       - name: Build fuzz targets
-        run: cargo +nightly fuzz build --manifest-path fuzz/Cargo.toml
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
 
   warning-count:
     name: Warning Count
@@ -97,11 +114,11 @@ jobs:
       - name: Count compiler warnings
         run: |
           LOG_FILE=$(mktemp)
-          WARNING_COUNT=$(cargo check --all-targets 2>&1 | tee "$LOG_FILE" | grep -c "^warning:" || true)
+          WARNING_COUNT=$(cargo check --all-targets 2>&1 | tee "$LOG_FILE" | grep "^warning:" | grep -v "future version of Rust" | grep -v "generated .* warning" | wc -l | tr -d ' ' || true)
           echo "Compiler warning count: $WARNING_COUNT"
           if [ "$WARNING_COUNT" -gt 0 ]; then
             echo "::error::$WARNING_COUNT compiler warnings detected — fix them before merging"
-            grep "^warning:" "$LOG_FILE" | head -20 || true
+            grep "^warning:" "$LOG_FILE" | grep -v "future version of Rust" | grep -v "generated .* warning" | head -20 || true
             rm -f "$LOG_FILE"
             exit 1
           fi

@@ -33,7 +33,13 @@ fn sysctl_raw(name: &str) -> Option<Vec<u8>> {
     // First call with null oldp to query the required buffer size.
     // SAFETY: sysctlbyname with null oldp never writes, only queries size.
     let rc = unsafe {
-        libc::sysctlbyname(c_name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0)
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if rc != 0 || len == 0 {
         return None;
@@ -64,7 +70,9 @@ fn sysctl_raw(name: &str) -> Option<Vec<u8>> {
 /// `/usr/sbin/sysctl` subprocess.
 fn sysctl_value(name: &str) -> Option<String> {
     let raw = sysctl_raw(name)?;
-    let s = String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string();
+    let s = String::from_utf8_lossy(&raw)
+        .trim_end_matches('\0')
+        .to_string();
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -136,10 +144,7 @@ fn host_name() -> String {
         return "localhost".to_string();
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(
-        &buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>(),
-    )
-    .to_string()
+    String::from_utf8_lossy(&buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>()).to_string()
 }
 
 /// Get macOS version string (e.g., "14.5") via direct sysctl.
@@ -725,11 +730,7 @@ impl Win32VideoControllerProvider {
         // Create a CFString key for "Model" — IORegistryEntryCreateCFProperty
         // requires the key to be a CFStringRef, not a raw C string.
         let model_cfstr = unsafe {
-            CFStringCreateWithCString(
-                std::ptr::null(),
-                c"Model".as_ptr(),
-                CF_STRING_ENCODING_UTF8,
-            )
+            CFStringCreateWithCString(std::ptr::null(), c"Model".as_ptr(), CF_STRING_ENCODING_UTF8)
         };
         if model_cfstr.is_null() {
             // Release the IO service before returning.
@@ -739,9 +740,8 @@ impl Win32VideoControllerProvider {
 
         // SAFETY: IORegistryEntryCreateCFProperty returns a CFString or NULL.
         // Use null() for allocator: CoreFoundation accepts NULL as "use default allocator".
-        let cf_prop = unsafe {
-            IORegistryEntryCreateCFProperty(service, model_cfstr, std::ptr::null(), 0)
-        };
+        let cf_prop =
+            unsafe { IORegistryEntryCreateCFProperty(service, model_cfstr, std::ptr::null(), 0) };
         // SAFETY: Release the IO service object and the CFString key.
         unsafe { IOObjectRelease(service) };
         unsafe { CFRelease(model_cfstr) };
@@ -765,10 +765,9 @@ impl Win32VideoControllerProvider {
 
         if success != 0 {
             let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            let name = String::from_utf8_lossy(
-                &buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>(),
-            )
-            .to_string();
+            let name =
+                String::from_utf8_lossy(&buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>())
+                    .to_string();
             if !name.is_empty() {
                 return name;
             }
@@ -848,9 +847,8 @@ impl Win32VideoControllerProvider {
 
         // SAFETY: IORegistryEntryCreateCFProperty returns a CFNumber or NULL.
         // Use null() for allocator: CoreFoundation accepts NULL as "use default allocator".
-        let cf_num = unsafe {
-            IORegistryEntryCreateCFProperty(service, vram_cfstr, std::ptr::null(), 0)
-        };
+        let cf_num =
+            unsafe { IORegistryEntryCreateCFProperty(service, vram_cfstr, std::ptr::null(), 0) };
         // SAFETY: Release the IO service object and the CFString key.
         unsafe { IOObjectRelease(service) };
         unsafe { CFRelease(vram_cfstr) };
@@ -862,7 +860,11 @@ impl Win32VideoControllerProvider {
         let mut vram_val: i64 = 0;
         // SAFETY: CFNumberGetValue writes the numeric value into vram_val.
         let success = unsafe {
-            CFNumberGetValue(cf_num, KCF_NUMBER_S64_TYPE, &mut vram_val as *mut _ as *mut libc::c_void)
+            CFNumberGetValue(
+                cf_num,
+                KCF_NUMBER_S64_TYPE,
+                &mut vram_val as *mut _ as *mut libc::c_void,
+            )
         };
         // SAFETY: Release the CFNumber.
         unsafe { CFRelease(cf_num) };
@@ -927,7 +929,12 @@ impl Win32DiskDriveProvider {
         let root_path = match std::ffi::CString::new("/") {
             Ok(p) => p,
             Err(_) => {
-                return ("APPLE SSD".to_string(), 256 * 1024 * 1024 * 1024, "NVMe".to_string(), 2);
+                return (
+                    "APPLE SSD".to_string(),
+                    256 * 1024 * 1024 * 1024,
+                    "NVMe".to_string(),
+                    2,
+                );
             }
         };
         // SAFETY: statfs writes filesystem metadata into the provided struct.
@@ -951,7 +958,12 @@ impl Win32DiskDriveProvider {
         }
 
         // Fallback: default values
-        ("APPLE SSD".to_string(), 256 * 1024 * 1024 * 1024, "NVMe".to_string(), 2)
+        (
+            "APPLE SSD".to_string(),
+            256 * 1024 * 1024 * 1024,
+            "NVMe".to_string(),
+            2,
+        )
     }
 }
 
@@ -1043,10 +1055,7 @@ impl Win32NetworkAdapterProvider {
                                             .collect(),
                                     ),
                                 )
-                                .set(
-                                    "NetConnectionStatus",
-                                    if ip_enabled { 2u32 } else { 0u32 },
-                                ) // 2=connected
+                                .set("NetConnectionStatus", if ip_enabled { 2u32 } else { 0u32 }) // 2=connected
                                 .set("AdapterType", "Ethernet 802.3")
                                 .set("Description", name)
                                 .set("Speed", 1000000000u64)
@@ -1196,7 +1205,11 @@ impl Win32LogicalDiskProvider {
         let root_path = match std::ffi::CString::new("/") {
             Ok(p) => p,
             Err(_) => {
-                return (512 * 1024 * 1024 * 1024, 256 * 1024 * 1024 * 1024, "Macintosh HD".to_string());
+                return (
+                    512 * 1024 * 1024 * 1024,
+                    256 * 1024 * 1024 * 1024,
+                    "Macintosh HD".to_string(),
+                );
             }
         };
         // SAFETY: statfs writes filesystem metadata into the provided struct.
@@ -1217,7 +1230,11 @@ impl Win32LogicalDiskProvider {
         if let Ok(_meta) = std::fs::metadata("/") {
             // We can't get accurate free space from std::fs metadata, so use defaults
         }
-        (512 * 1024 * 1024 * 1024, 256 * 1024 * 1024 * 1024, "Macintosh HD".to_string())
+        (
+            512 * 1024 * 1024 * 1024,
+            256 * 1024 * 1024 * 1024,
+            "Macintosh HD".to_string(),
+        )
     }
 }
 
@@ -1388,7 +1405,10 @@ pub fn parse_wql(query: &str) -> AppResult<WqlQuery> {
     let trimmed = query.trim();
 
     // Must start with SELECT (case-insensitive)
-    if !trimmed.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("SELECT")) {
+    if !trimmed
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("SELECT"))
+    {
         return Err(AppError::new(
             ReasonCode::RcWmiParseError,
             format!("WQL query must start with SELECT: {}", query),
@@ -1744,8 +1764,14 @@ impl WbemLocator {
 
         // Log all parameters so authentication context is not silently discarded
         let user_str = user.unwrap_or("<none>");
-        let pass_str = if password.is_some() { "<supplied>" } else { "<none>" };
-        eprintln!("WbemLocator::ConnectServer(server={server:?}, namespace={namespace:?}, user={user_str:?}, password={pass_str})");
+        let pass_str = if password.is_some() {
+            "<supplied>"
+        } else {
+            "<none>"
+        };
+        eprintln!(
+            "WbemLocator::ConnectServer(server={server:?}, namespace={namespace:?}, user={user_str:?}, password={pass_str})"
+        );
 
         // Note: WMI authentication (user/password) is not enforced on macOS;
         // the connection is accepted unconditionally.

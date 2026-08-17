@@ -906,7 +906,9 @@ mod vt_decoder_mft {
 
     /// Lock a `Mutex`, recovering from poisoning instead of panicking.
     fn lock_guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Split H.264 AVCC (avcC) extradata into its parameter sets.
@@ -1064,9 +1066,8 @@ mod vt_decoder_mft {
         fn reclaim_refcon(&mut self) {
             if !self.callback_refcon.is_null() {
                 unsafe {
-                    let _ = Arc::from_raw(
-                        self.callback_refcon as *const Mutex<VecDeque<DecodedFrame>>,
-                    );
+                    let _ =
+                        Arc::from_raw(self.callback_refcon as *const Mutex<VecDeque<DecodedFrame>>);
                 }
                 self.callback_refcon = std::ptr::null_mut();
             }
@@ -1336,7 +1337,7 @@ mod vt_decoder_mft {
                 let decode_status = vt_ffi::VTDecompressionSessionDecodeFrame(
                     session,
                     sample_buffer,
-                    0,                // synchronous
+                    0,                    // synchronous
                     std::ptr::null_mut(), // sourceFrameRefCon
                     std::ptr::null_mut(), // infoFlagsOut (null = don't care)
                 );
@@ -1384,8 +1385,7 @@ mod vt_decoder_mft {
                 if !base_addr.is_null() && data_size > 0 && width > 0 && height > 0 {
                     let w = width;
                     let h = height;
-                    let pixel_format =
-                        vt_ffi::CVPixelBufferGetPixelFormatType(frame.pixel_buffer);
+                    let pixel_format = vt_ffi::CVPixelBufferGetPixelFormatType(frame.pixel_buffer);
                     match pixel_format {
                         vt_ffi::kCVPixelFormatType_32BGRA => {
                             // Validate the layout before copying so no read
@@ -1406,10 +1406,8 @@ mod vt_decoder_mft {
                             } else if needed > 0 && bytes_per_row >= w * 4 {
                                 // Padded rows: copy row by row, bounded by
                                 // the actual buffer size.
-                                let total = bytes_per_row
-                                    .checked_mul(h)
-                                    .unwrap_or(0)
-                                    .min(data_size);
+                                let total =
+                                    bytes_per_row.checked_mul(h).unwrap_or(0).min(data_size);
                                 if total >= needed {
                                     let src =
                                         std::slice::from_raw_parts(base_addr as *const u8, total);
@@ -1434,8 +1432,7 @@ mod vt_decoder_mft {
                             let uv_base =
                                 vt_ffi::CVPixelBufferGetBaseAddressOfPlane(frame.pixel_buffer, 1);
                             if !y_base.is_null() && !uv_base.is_null() {
-                                let Some(needed) =
-                                    w.checked_mul(h).and_then(|n| n.checked_mul(4))
+                                let Some(needed) = w.checked_mul(h).and_then(|n| n.checked_mul(4))
                                 else {
                                     unlock_release_and_finish(frame.pixel_buffer, flags);
                                     return Ok(());
@@ -1537,16 +1534,16 @@ mod vt_decoder_mft {
                     vt_ffi::CFRelease(desc as vt_ffi::CFTypeRef);
                 }
             }
-        self.reclaim_refcon();
-        self.clear_frame_queue();
+            self.reclaim_refcon();
+            self.clear_frame_queue();
+        }
     }
-}
 
-impl Default for H264DecoderMft {
-    fn default() -> Self {
-        Self::new()
+    impl Default for H264DecoderMft {
+        fn default() -> Self {
+            Self::new()
+        }
     }
-}
 }
 
 // Non-macOS stub for H264DecoderMft
@@ -2806,7 +2803,8 @@ impl Mp4Demuxer {
                             self.file[self.position + 14],
                             self.file[self.position + 15],
                         ]) as usize;
-                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(8)) else {
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(8))
+                        else {
                             return Err(self.invalid("stts entry count overflows"));
                         };
                         if child_size >= needed {
@@ -2843,7 +2841,8 @@ impl Mp4Demuxer {
                             self.file[self.position + 14],
                             self.file[self.position + 15],
                         ]) as usize;
-                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(4)) else {
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(4))
+                        else {
                             return Err(self.invalid("stss entry count overflows"));
                         };
                         if child_size >= needed {
@@ -2874,7 +2873,8 @@ impl Mp4Demuxer {
                             self.file[self.position + 14],
                             self.file[self.position + 15],
                         ]) as usize;
-                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(12)) else {
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(12))
+                        else {
                             return Err(self.invalid("stsc entry count overflows"));
                         };
                         if child_size >= needed {
@@ -2955,20 +2955,20 @@ impl Mp4Demuxer {
                         return Err(self.invalid("stco entry count overflows"));
                     };
                     if child_size >= needed {
-                            let mut offsets = Vec::with_capacity(entry_count);
-                            for i in 0..entry_count {
-                                let off = self.position + 16 + i * 4;
-                                offsets.push(u32::from_be_bytes([
-                                    self.file[off],
-                                    self.file[off + 1],
-                                    self.file[off + 2],
-                                    self.file[off + 3],
-                                ]) as u64);
-                            }
-                            raw.stco = offsets;
-                        } else {
-                            return Err(self.invalid("stco table overruns its box"));
+                        let mut offsets = Vec::with_capacity(entry_count);
+                        for i in 0..entry_count {
+                            let off = self.position + 16 + i * 4;
+                            offsets.push(u32::from_be_bytes([
+                                self.file[off],
+                                self.file[off + 1],
+                                self.file[off + 2],
+                                self.file[off + 3],
+                            ]) as u64);
                         }
+                        raw.stco = offsets;
+                    } else {
+                        return Err(self.invalid("stco table overruns its box"));
+                    }
                 }
                 _ => { /* stsd etc. - skip */ }
             }
@@ -3003,8 +3003,7 @@ impl Mp4Demuxer {
 
         for (chunk_idx, &chunk_offset) in raw.stco.iter().enumerate() {
             // Advance to the stsc run covering this 1-based chunk number.
-            while stsc_run + 1 < raw.stsc.len()
-                && chunk_idx as u32 + 1 >= raw.stsc[stsc_run + 1].0
+            while stsc_run + 1 < raw.stsc.len() && chunk_idx as u32 + 1 >= raw.stsc[stsc_run + 1].0
             {
                 stsc_run += 1;
             }
@@ -3800,7 +3799,10 @@ impl MediaShim {
     /// Read a little-endian u32 at `offset` (bounds-checked).
     fn read_le_u32(bytes: &[u8], offset: usize) -> AppResult<u32> {
         let end = offset.checked_add(4).ok_or_else(|| {
-            AppError::new(ReasonCode::RcMediaInvalid, "media container offset overflows")
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "media container offset overflows",
+            )
         })?;
         if end > bytes.len() {
             return Err(AppError::new(

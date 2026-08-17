@@ -115,12 +115,9 @@ fn redact_sensitive_values(kv: BTreeMap<String, Value>) -> BTreeMap<String, Valu
 fn redact_sensitive_value(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(redact_sensitive(&text)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(redact_sensitive_value)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(redact_sensitive_value).collect())
+        }
         Value::Object(fields) => Value::Object(
             fields
                 .into_iter()
@@ -512,7 +509,10 @@ mod tests {
             .expect("open log")
             .read_to_string(&mut contents)
             .expect("read log");
-        assert!(!contents.contains("supersecret123"), "kv value leaked: {contents}");
+        assert!(
+            !contents.contains("supersecret123"),
+            "kv value leaked: {contents}"
+        );
         assert!(!contents.contains("also-secret"), "msg leaked: {contents}");
         assert!(!contents.contains("eyJhbGciOiJIUzI1NiJ9.secret"));
 

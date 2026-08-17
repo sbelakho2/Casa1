@@ -389,14 +389,12 @@ fn t20_6_cache_hit() {
     assert_eq!(
         stats1.hits, 0,
         "first compile must not hit (hits={}, misses={})",
-        stats1.hits,
-        stats1.misses
+        stats1.hits, stats1.misses
     );
     assert_eq!(
         stats1.misses, 1,
         "first compile must miss exactly once (hits={}, misses={})",
-        stats1.hits,
-        stats1.misses
+        stats1.hits, stats1.misses
     );
 
     // Second compile with same input — must hit exactly once and not recompile.
@@ -411,8 +409,7 @@ fn t20_6_cache_hit() {
     assert_eq!(
         stats2.misses, 0,
         "second compile must not miss (hits={}, misses={})",
-        stats2.hits,
-        stats2.misses
+        stats2.hits, stats2.misses
     );
 }
 
@@ -726,19 +723,26 @@ fn t20_dxil_opcode_arithmetic_and_compare_coverage() {
     // a wrong operator mapping that merely contains the right character fails here.
     // A wrong operator mapping that merely contains the right character fails
     // these exact-statement assertions.
-    type OpCase = (u32, &'static str, &'static [&'static str], bool, bool, &'static str);
+    type OpCase = (
+        u32,
+        &'static str,
+        &'static [&'static str],
+        bool,
+        bool,
+        &'static str,
+    );
     let cases: &[OpCase] = &[
-        (0, "_r", &["a", "b"], false, false, "_r = a + b;"),   // add
-        (3, "_r", &["a", "b"], false, true, "_r = a - b;"),    // fsub
-        (5, "_r", &["a", "b"], false, true, "_r = a * b;"),    // fmul
-        (12, "_r", &["a", "b"], false, false, "_r = a | b;"),  // or
-        (13, "_r", &["a", "b"], false, false, "_r = a ^ b;"),  // xor
+        (0, "_r", &["a", "b"], false, false, "_r = a + b;"), // add
+        (3, "_r", &["a", "b"], false, true, "_r = a - b;"),  // fsub
+        (5, "_r", &["a", "b"], false, true, "_r = a * b;"),  // fmul
+        (12, "_r", &["a", "b"], false, false, "_r = a | b;"), // or
+        (13, "_r", &["a", "b"], false, false, "_r = a ^ b;"), // xor
         (14, "_r", &["a", "b"], false, false, "_r = a << b;"), // shl
         (15, "_r", &["a", "b"], false, false, "_r = a >> b;"), // lshr
-        (20, "_r", &["a", "b"], false, false, "_r = a > b;"),  // icmp_ugt
+        (20, "_r", &["a", "b"], false, false, "_r = a > b;"), // icmp_ugt
         (23, "_r", &["a", "b"], false, false, "_r = a <= b;"), // icmp_ule
-        (26, "_r", &["a", "b"], true, false, "_r = a < b;"),   // icmp_slt
-        (28, "_r", &["a", "b"], false, true, "_r = a == b;"),  // fcmp_oeq
+        (26, "_r", &["a", "b"], true, false, "_r = a < b;"), // icmp_slt
+        (28, "_r", &["a", "b"], false, true, "_r = a == b;"), // fcmp_oeq
     ];
     for &(opcode, dst, args, is_signed, is_float, expected) in cases {
         let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();

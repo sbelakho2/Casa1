@@ -20,9 +20,9 @@ use crate::cpu::MemoryImage;
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use crate::security::{AntiDebugState, CodeSection, DenuvoConfig, DenuvoEmulator, DenuvoVersion};
-use aes::cipher::{BlockDecryptMut, KeyIvInit};
 #[cfg(test)]
 use aes::cipher::BlockEncryptMut;
+use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -1036,10 +1036,7 @@ mod tests {
             type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
             let enc = Aes128CbcEnc::new(&aes_key.into(), &iv.into());
             let ct = enc
-                .encrypt_padded_mut::<cipher::block_padding::Pkcs7>(
-                    &mut padded,
-                    plaintext.len(),
-                )
+                .encrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut padded, plaintext.len())
                 .unwrap();
             emulator.base.config.code_sections[idx].decrypted = ct.to_vec();
         }

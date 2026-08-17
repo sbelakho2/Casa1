@@ -418,7 +418,10 @@ fn t18_9_pipe_security_descriptor_argument_accepted() {
         .write_file(client, b"secured data")
         .expect("client write");
     let data = win32.read_file(handle, 64).expect("server read");
-    assert_eq!(data, b"secured data", "pipe with descriptor must carry data");
+    assert_eq!(
+        data, b"secured data",
+        "pipe with descriptor must carry data"
+    );
 }
 
 // ---------------------------------------------------------------------------

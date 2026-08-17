@@ -221,9 +221,7 @@ pub fn export_diagnostics(ge: &GameEnvironment, output_zip: &Path) -> AppResult<
         .map(|entry| entry.into_path())
         .filter(|path| path != &ge.root)
         .filter(|path| {
-            let canonical = path
-                .canonicalize()
-                .unwrap_or_else(|_| path.to_path_buf());
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             canonical != output_zip_canonical
                 && !(path.is_file()
                     && path.extension().is_some_and(|ext| ext == "zip")
@@ -2309,9 +2307,8 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
     let exception_stream_size = std::mem::size_of::<MinidumpExceptionStream>() as u32;
 
     // Stream count depends only on the presence of modules/memory regions.
-    let num_streams = 3u32
-        + (!params.modules.is_empty()) as u32
-        + (!params.memory_regions.is_empty()) as u32;
+    let num_streams =
+        3u32 + (!params.modules.is_empty()) as u32 + (!params.memory_regions.is_empty()) as u32;
 
     // Header: 128 bytes (32-byte MINIDUMP_HEADER + padding), then the
     // directory (12 bytes per stream), then stream data.
@@ -2800,10 +2797,8 @@ mod minidump_tests {
         let buf = build_minidump(&params);
         // The directory starts at 128; the exception stream is the first
         // entry (stream_type 3), 12 bytes per entry.
-        let exc_rva =
-            u32::from_le_bytes(buf[128 + 8..128 + 12].try_into().unwrap()) as usize;
-        let exc_size =
-            u32::from_le_bytes(buf[128 + 4..128 + 8].try_into().unwrap()) as usize;
+        let exc_rva = u32::from_le_bytes(buf[128 + 8..128 + 12].try_into().unwrap()) as usize;
+        let exc_size = u32::from_le_bytes(buf[128 + 4..128 + 8].try_into().unwrap()) as usize;
         assert_eq!(exc_size, 168, "exception stream must match spec size");
 
         // ThreadContext descriptor is the last 8 bytes of the stream.

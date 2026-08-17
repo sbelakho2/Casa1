@@ -565,8 +565,7 @@ impl AddressTranslationCache {
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
         self.translations
             .retain(|_, t| t.guest_address < start || t.guest_address >= end);
-        self.referenced
-            .retain(|key, _| *key < start || *key >= end);
+        self.referenced.retain(|key, _| *key < start || *key >= end);
         // `order` may hold stale keys; the clock eviction skips them.
     }
 }
@@ -986,9 +985,7 @@ impl GpuUploadStreamer {
         if size > capacity {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
-                format!(
-                    "streaming allocation {size} exceeds buffer capacity {capacity}"
-                ),
+                format!("streaming allocation {size} exceeds buffer capacity {capacity}"),
             ));
         }
 
@@ -1430,10 +1427,12 @@ impl FileCache {
     pub fn get(&mut self, path: &str) -> Option<&[u8]> {
         self.access_counter += 1;
         if let Some(entry) = self.entries.get_mut(path) {
-            self.lru_index.remove(&(entry.last_access, path.to_string()));
+            self.lru_index
+                .remove(&(entry.last_access, path.to_string()));
             entry.last_access = self.access_counter;
             entry.access_count += 1;
-            self.lru_index.insert((entry.last_access, path.to_string()), ());
+            self.lru_index
+                .insert((entry.last_access, path.to_string()), ());
             self.hits += 1;
             Some(&entry.data)
         } else {
@@ -2037,7 +2036,8 @@ mod tests {
 
         let mut ids = Vec::new();
         for i in 0..5 {
-            let id = compiler.submit_job(format!("hash{i}"), "vertex".to_string(), "main".to_string());
+            let id =
+                compiler.submit_job(format!("hash{i}"), "vertex".to_string(), "main".to_string());
             compiler.mark_compiling(id).unwrap();
             compiler.mark_completed(id).unwrap();
             ids.push(id);

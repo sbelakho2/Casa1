@@ -345,7 +345,10 @@ impl CrashRecovery {
             .unwrap_or(0);
         static DUMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let counter = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let filename = format!("crash_{}_{}_{}_{}.json", dump.timestamp, dump.pid, nanos, counter);
+        let filename = format!(
+            "crash_{}_{}_{}_{}.json",
+            dump.timestamp, dump.pid, nanos, counter
+        );
         let path = self.dump_dir.join(&filename);
 
         let json = serde_json::to_string_pretty(dump)
@@ -427,9 +430,9 @@ impl CrashRecovery {
                 // Prune stale temporary files left behind by an interrupted
                 // atomic write (`crash_*.json.tmp`).
                 if path.extension().is_some_and(|e| e == "tmp")
-                    && path.file_stem().is_some_and(|s| {
-                        s.to_str().is_some_and(|s| s.starts_with("crash_"))
-                    })
+                    && path
+                        .file_stem()
+                        .is_some_and(|s| s.to_str().is_some_and(|s| s.starts_with("crash_")))
                 {
                     tmp_files.push(path);
                 }

@@ -663,9 +663,7 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
             device.name
         );
         assert_eq!(
-            user32
-                .xinput_get_keystroke(slot)
-                .expect("xinput keystroke"),
+            user32.xinput_get_keystroke(slot).expect("xinput keystroke"),
             expected_buttons.first().cloned(),
             "keystroke must report the first button of the attached spec"
         );
@@ -1044,11 +1042,16 @@ fn t6_9_static_sampler_filter_modes() {
     assert!(!aniso);
     assert!(cmp);
 
-    // Validate address mode mapping
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(1), "clamp_to_edge");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(2), "repeat");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(3), "mirror_repeat");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(4), "clamp_to_zero");
+    // Validate address mode mapping against the real D3D12 enum:
+    // 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE.
+    assert_eq!(D3d12Runtime::map_d3d12_address_mode(0), "repeat");
+    assert_eq!(D3d12Runtime::map_d3d12_address_mode(1), "mirror_repeat");
+    assert_eq!(D3d12Runtime::map_d3d12_address_mode(2), "clamp_to_edge");
+    assert_eq!(D3d12Runtime::map_d3d12_address_mode(3), "clamp_to_border");
+    assert_eq!(
+        D3d12Runtime::map_d3d12_address_mode(4),
+        "mirror_clamp_to_edge"
+    );
 
     // Validate comparison function mapping
     assert_eq!(D3d12Runtime::map_d3d12_comparison_func(1), "never");
@@ -1068,9 +1071,9 @@ fn t6_9_static_sampler_filter_modes() {
         shader_register: 0,
         register_space: 0,
         filter: 0,
-        address_u: 2,
-        address_v: 2,
-        address_w: 2,
+        address_u: 0, // D3D12_TEXTURE_ADDRESS_MODE_WRAP
+        address_v: 0,
+        address_w: 0,
         mip_lod_bias: 0.0,
         max_anisotropy: 1,
         comparison_func: 0,
@@ -1148,7 +1151,9 @@ fn t6_10_root_constants_binding() {
     // The constants must be recorded on the command list verbatim — a
     // round-trip of the root signature desc alone would pass even if the
     // values were dropped.
-    let closed = runtime.close_command_list(list).expect("close command list");
+    let closed = runtime
+        .close_command_list(list)
+        .expect("close command list");
     assert_eq!(
         closed.commands,
         vec![casa1::gfx::Command::SetRootConstants { values }],
@@ -1553,7 +1558,9 @@ fn t6_16_visibility_flags() {
     };
     let mut runtime = make_d3d12_runtime();
     let id = runtime.create_root_signature(desc);
-    let stored = runtime.root_signature_desc(id).expect("stored root signature");
+    let stored = runtime
+        .root_signature_desc(id)
+        .expect("stored root signature");
 
     let pixel_offsets = D3d12Runtime::visibility_offsets(stored, D3D12ShaderVisibility::Pixel);
     assert_eq!(pixel_offsets, &[0]);
@@ -1569,7 +1576,9 @@ fn t6_16_visibility_flags() {
     // pixel-visible table with 2 descriptors, index 1 the vertex table).
     assert_ne!(
         stored.visibility_offsets.get(&D3D12ShaderVisibility::Pixel),
-        stored.visibility_offsets.get(&D3D12ShaderVisibility::Vertex)
+        stored
+            .visibility_offsets
+            .get(&D3D12ShaderVisibility::Vertex)
     );
 }
 
@@ -1665,7 +1674,10 @@ fn t6_17_resource_state_bitmask() {
     assert_eq!(reencoded, combined_bits);
 
     // Zero bits decode to Common.
-    assert_eq!(ResourceState::from_d3d12_bits(0), vec![ResourceState::Common]);
+    assert_eq!(
+        ResourceState::from_d3d12_bits(0),
+        vec![ResourceState::Common]
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -1992,8 +2004,9 @@ fn t6_23_dispatch_rays_shader_table_parsing() {
     // Set a raytracing pipeline state first
     let dxil = vec![0u8; 128];
     runtime
-        .set_pipeline_state1(list, 0xABCD, dxil)
+        .set_pipeline_state1(list, 0xABCD, dxil.clone())
         .expect("set pipeline state1");
+    let dxil = dxil.clone();
 
     let pso = runtime.get_raytracing_pipeline_state(0xABCD);
     assert!(pso.is_some(), "PSO should be stored");
@@ -2066,12 +2079,19 @@ fn t6_23_dispatch_rays_shader_table_parsing() {
         height: 0,
         depth: 0,
     };
-    let recorded_before = stream.commands.len();
+    // A closed list cannot be recorded onto or closed again (D3D12
+    // semantics), so each phase below uses a fresh list.
+    let zero_list = runtime.create_graphics_command_list(allocator, root_sig, false);
+    runtime
+        .set_pipeline_state1(zero_list, 0xABCD, dxil.clone())
+        .expect("set pipeline state1");
+    // A fresh list starts empty (set_pipeline_state1 records nothing).
+    let recorded_before = 0;
     assert!(
-        runtime.dispatch_rays(list, &zero_desc).is_ok(),
+        runtime.dispatch_rays(zero_list, &zero_desc).is_ok(),
         "zero dispatch should be no-op"
     );
-    let after_zero = runtime.close_command_list(list).expect("close list");
+    let after_zero = runtime.close_command_list(zero_list).expect("close list");
     assert_eq!(
         after_zero.commands.len(),
         recorded_before,
@@ -2095,16 +2115,30 @@ fn t6_23_dispatch_rays_shader_table_parsing() {
         height: 16,
         depth: 1,
     };
-    let recorded_before = after_zero.commands.len();
+    let empty_list = runtime.create_graphics_command_list(allocator, root_sig, false);
+    runtime
+        .set_pipeline_state1(empty_list, 0xABCD, dxil)
+        .expect("set pipeline state1");
+    let recorded_before = 0;
     assert!(
-        runtime.dispatch_rays(list, &no_raygen_desc).is_ok(),
+        runtime.dispatch_rays(empty_list, &no_raygen_desc).is_ok(),
         "no raygen shader should be accepted as no-op"
     );
-    let after_no_raygen = runtime.close_command_list(list).expect("close list");
+    let after_no_raygen = runtime.close_command_list(empty_list).expect("close list");
     assert_eq!(
         after_no_raygen.commands.len(),
         recorded_before,
         "dispatch without a raygen shader must not record a command"
+    );
+
+    // Double-close of the same list is refused (D3D12 semantics).
+    let err = runtime
+        .close_command_list(zero_list)
+        .expect_err("closing a closed list must fail");
+    assert_eq!(
+        err.code,
+        casa1::reason::ReasonCode::RcD3dInvalidState,
+        "double close must report RcD3dInvalidState"
     );
 }
 

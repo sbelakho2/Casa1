@@ -1252,8 +1252,12 @@ impl InstallShieldEngine {
         for folder_idx in 0..parsed_folder_count {
             let block_start = folder_blocks_offset[folder_idx];
             let comp_type = folder_comp_type[folder_idx];
-            folder_data[folder_idx] =
-                Some(Self::decompress_cab_folder(cab_bytes, block_start, comp_type, has_checksums)?);
+            folder_data[folder_idx] = Some(Self::decompress_cab_folder(
+                cab_bytes,
+                block_start,
+                comp_type,
+                has_checksums,
+            )?);
         }
 
         // Parse file entries (CFFILE, variable length)
@@ -1348,8 +1352,8 @@ impl InstallShieldEngine {
             if block_pos + 4 > cab_bytes.len() {
                 break;
             }
-            let cb_data = u16::from_le_bytes([cab_bytes[block_pos], cab_bytes[block_pos + 1]])
-                as usize;
+            let cb_data =
+                u16::from_le_bytes([cab_bytes[block_pos], cab_bytes[block_pos + 1]]) as usize;
             let cb_uncomp =
                 u16::from_le_bytes([cab_bytes[block_pos + 2], cab_bytes[block_pos + 3]]) as usize;
             let hdr_size = if has_checksums { 8 } else { 4 };
@@ -1368,14 +1372,12 @@ impl InstallShieldEngine {
             } else {
                 // Compressed – MSZIP blocks are raw deflate with a 4-byte
                 // "CKBB" prefix; everything else is tried as zlib first.
-                let payload = if comp_type == 1
-                    && block_data.len() >= 4
-                    && &block_data[..4] == b"CKBB"
-                {
-                    &block_data[4..]
-                } else {
-                    block_data
-                };
+                let payload =
+                    if comp_type == 1 && block_data.len() >= 4 && &block_data[..4] == b"CKBB" {
+                        &block_data[4..]
+                    } else {
+                        block_data
+                    };
                 match decompress_zlib_block(payload) {
                     Ok(d) => folder_decompressed.extend_from_slice(&d),
                     Err(zlib_err) => match decompress_deflate_block(payload) {
@@ -2061,15 +2063,13 @@ impl ISSetupDllStub {
             let low = path.to_ascii_lowercase();
             if low.ends_with(".dll") || low.ends_with(".ocx") {
                 // Check if this DLL can be serviced by a VC runtime
-                let version = if low.contains("msvc")
-                    || low.contains("vcruntime")
-                    || low.contains("msvcp")
-                {
-                    "vc141"
-                } else {
-                    // Generic COM registration
-                    "com"
-                };
+                let version =
+                    if low.contains("msvc") || low.contains("vcruntime") || low.contains("msvcp") {
+                        "vc141"
+                    } else {
+                        // Generic COM registration
+                        "com"
+                    };
 
                 // Update registry to reflect COM registration
                 let com_key = normalize_registry_key(&format!(
@@ -2521,9 +2521,10 @@ impl InnoSetupEngine {
         }
 
         // Check for "Inno Setup" in version strings
-        let version_match = pe_version_string_from_data(data, "FileDescription").is_some_and(
-            |desc| desc.contains("Inno Setup") || desc.contains("SteamSetup") || desc.contains("Steam"),
-        );
+        let version_match =
+            pe_version_string_from_data(data, "FileDescription").is_some_and(|desc| {
+                desc.contains("Inno Setup") || desc.contains("SteamSetup") || desc.contains("Steam")
+            });
 
         // Check for "Inno" magic in the overlay after sections
         let overlay_match = extract_exe_overlay_bytes(data)
@@ -2643,19 +2644,20 @@ impl InnoSetupEngine {
                     "hklm/software/classes/clsid/{}",
                     util::sha256_bytes(value.as_bytes())
                 );
-                engine
-                    .registry
-                    .insert(
-                        normalize_registry_key(&format!("{com_key}/inprocserver32")),
-                        value.clone(),
-                    );
+                engine.registry.insert(
+                    normalize_registry_key(&format!("{com_key}/inprocserver32")),
+                    value.clone(),
+                );
                 logs.push(format!("ISDone: registered DLL {value}"));
             }
         }
 
         // Simulate ISDone.dll progress: write a marker that extraction is done
         engine.registry.insert(
-            normalize_registry_key(&format!("{}/isdone/extract_complete", normalize_path(setup_dir))),
+            normalize_registry_key(&format!(
+                "{}/isdone/extract_complete",
+                normalize_path(setup_dir)
+            )),
             "true".to_string(),
         );
         logs.push("ISDone: extraction complete marker written".to_string());
@@ -3961,9 +3963,12 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            registry: vec![("HKLM\\Software\\MyApp\\Version".to_string(), "2.0".to_string())]
-                .into_iter()
-                .collect(),
+            registry: vec![(
+                "HKLM\\Software\\MyApp\\Version".to_string(),
+                "2.0".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             logs: vec!["install.log".to_string()],
             gui_windows: vec![GuiWindowPlan {
                 title: "MyApp Installer".to_string(),

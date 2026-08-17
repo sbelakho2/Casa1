@@ -173,13 +173,8 @@ type CGBitmapContextCreateFn = unsafe extern "C" fn(
 ) -> CGContextRef;
 type CGContextReleaseFn = unsafe extern "C" fn(ctx: CGContextRef);
 type CGContextTranslateCTMFn = unsafe extern "C" fn(ctx: CGContextRef, tx: CGFloat, ty: CGFloat);
-type CGContextSetRGBFillColorFn = unsafe extern "C" fn(
-    ctx: CGContextRef,
-    r: CGFloat,
-    g: CGFloat,
-    b: CGFloat,
-    a: CGFloat,
-);
+type CGContextSetRGBFillColorFn =
+    unsafe extern "C" fn(ctx: CGContextRef, r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat);
 type CGColorSpaceReleaseFn = unsafe extern "C" fn(space: CGColorSpaceRef);
 type CTLineDrawFn = unsafe extern "C" fn(line: CTLineRef, ctx: CGContextRef);
 
@@ -601,7 +596,11 @@ impl DWriteFactory {
                 load_sym!(cg_bitmap_context_create, cg_lib, "CGBitmapContextCreate");
                 load_sym!(cg_context_release, cg_lib, "CGContextRelease");
                 load_sym!(cg_context_translate_ctm, cg_lib, "CGContextTranslateCTM");
-                load_sym!(cg_context_set_rgb_fill_color, cg_lib, "CGContextSetRGBFillColor");
+                load_sym!(
+                    cg_context_set_rgb_fill_color,
+                    cg_lib,
+                    "CGContextSetRGBFillColor"
+                );
                 load_sym!(cg_color_space_release, cg_lib, "CGColorSpaceRelease");
                 // CTLineDraw is a CoreText API; it must be resolved against
                 // the CoreText library, not CoreGraphics.
@@ -873,11 +872,7 @@ impl DWriteFactory {
             ) {
                 let cf_name = self.cf_string_create(&format.font_family);
                 if let Some(name) = cf_name {
-                    let font = create_font(
-                        name,
-                        format.font_size as CGFloat,
-                        std::ptr::null(),
-                    );
+                    let font = create_font(name, format.font_size as CGFloat, std::ptr::null());
                     if !font.is_null() {
                         let cf_text = self.cf_string_create(text);
                         if let Some(cf_text_str) = cf_text {
@@ -962,7 +957,11 @@ impl DWriteFactory {
         TextMetrics {
             // Only clamp to max_width when it is a real limit; a non-positive
             // max_width means "no wrap / no width limit".
-            width: if max_width > 0.0 { width.min(max_width) } else { width },
+            width: if max_width > 0.0 {
+                width.min(max_width)
+            } else {
+                width
+            },
             height: height.min(if max_height > 0.0 { max_height } else { height }),
             line_count: line_count as u32,
         }
@@ -1045,12 +1044,13 @@ impl DWriteFactory {
                             if !traits_cf.is_null() {
                                 // Extract the width trait from the traits
                                 // dictionary and map it to DWRITE_FONT_STRETCH.
-                                if let (Some(get_value_fn), Some(get_number_fn)) = (
-                                    self.cf_dictionary_get_value,
-                                    self.cf_number_get_value,
-                                ) {
-                                    let width_trait =
-                                        get_value_fn(traits_cf as CFDictionaryRef, width_key as *const c_void);
+                                if let (Some(get_value_fn), Some(get_number_fn)) =
+                                    (self.cf_dictionary_get_value, self.cf_number_get_value)
+                                {
+                                    let width_trait = get_value_fn(
+                                        traits_cf as CFDictionaryRef,
+                                        width_key as *const c_void,
+                                    );
                                     if !width_trait.is_null() {
                                         let mut ct_width: CGFloat = 0.0;
                                         let got = get_number_fn(
@@ -1224,7 +1224,8 @@ impl DWriteTextLayout {
                 factory.cg_context_set_rgb_fill_color,
                 factory.ct_line_draw,
                 factory.cg_color_space_release,
-            ) else {
+            )
+            else {
                 // Fallback: return empty bitmap
                 return Some(RenderedGlyphs {
                     pixels: vec![0u8; buf_bytes],

@@ -31,7 +31,6 @@ fn create_runtime_with_backend() -> D3d12Runtime {
     D3d12Runtime::from_backend(backend)
 }
 
-
 /// Set up the common command-list scaffolding (allocator, root signature,
 /// compute PSO, graphics command list) used by every raytracing test.
 fn setup_command_list(runtime: &mut D3d12Runtime, label: &str) -> u64 {
@@ -52,7 +51,6 @@ fn setup_command_list(runtime: &mut D3d12Runtime, label: &str) -> u64 {
     );
     runtime.create_graphics_command_list(allocator, pso, false)
 }
-
 
 // ---------------------------------------------------------------------------
 // t28_01: BLAS creation — bottom-level acceleration structure

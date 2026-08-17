@@ -214,8 +214,9 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 .map(String::as_str),
         )?;
         steam_client.materialize_into_ge(&mut ge, job.dtm)?;
-        let launched =
-            steam_result.launch.input_ok && steam_result.launch.audio_ok && steam_result.launch.network_ok;
+        let launched = steam_result.launch.input_ok
+            && steam_result.launch.audio_ok
+            && steam_result.launch.network_ok;
         runner_events.push(log_steam_zero_touch_install(
             &mut logger,
             job,
@@ -437,9 +438,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 )
             })
             .collect::<BTreeMap<String, String>>();
-        host_env.extend(effective_child_environment.iter().map(|(key, value)| {
-            (key.clone(), value.clone())
-        }));
+        host_env.extend(
+            effective_child_environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         host_env
     };
     for (key, value) in &spawn_env {

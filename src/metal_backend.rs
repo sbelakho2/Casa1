@@ -3319,12 +3319,15 @@ pub fn d3d12_filter_to_metal_sampler(filter: u32) -> metal::SamplerDescriptor {
 /// behaviour. BORDER is approximated with `ClampToZero` (transparent black),
 /// which is the closest Metal equivalent for a border colour of 0.
 pub fn map_d3d12_address_mode_to_metal(mode: u32) -> metal::MTLSamplerAddressMode {
+    // D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
+    // 4=MIRROR_ONCE. The previous mapping was shifted by one and never
+    // handled WRAP=0, mis-translating every real D3D12 sampler.
     match mode {
-        1 => metal::MTLSamplerAddressMode::Repeat,
-        2 => metal::MTLSamplerAddressMode::MirrorRepeat,
-        3 => metal::MTLSamplerAddressMode::ClampToEdge,
-        4 => metal::MTLSamplerAddressMode::ClampToZero,
-        5 => metal::MTLSamplerAddressMode::MirrorClampToEdge,
+        0 => metal::MTLSamplerAddressMode::Repeat,
+        1 => metal::MTLSamplerAddressMode::MirrorRepeat,
+        2 => metal::MTLSamplerAddressMode::ClampToEdge,
+        3 => metal::MTLSamplerAddressMode::ClampToBorderColor,
+        4 => metal::MTLSamplerAddressMode::MirrorClampToEdge,
         _ => metal::MTLSamplerAddressMode::ClampToEdge,
     }
 }

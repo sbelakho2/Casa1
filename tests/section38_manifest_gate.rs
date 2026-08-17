@@ -163,8 +163,13 @@ impl Drop for GateCleanup {
 }
 
 fn read_manifest_from_disk() -> Vec<u8> {
-    std::fs::read(repo_ge_root().join("drive_c").join("package").join("steam_client_win32.installed"))
-        .expect("read manifest from the GE on disk")
+    std::fs::read(
+        repo_ge_root()
+            .join("drive_c")
+            .join("package")
+            .join("steam_client_win32.installed"),
+    )
+    .expect("read manifest from the GE on disk")
 }
 
 /// The manifest read cycle exactly as Steam performs it: OPEN_EXISTING with
@@ -293,9 +298,7 @@ fn manifest_file_information_gate() {
         "FileBasicInfo last-write time must be non-zero"
     );
 
-    win32
-        .close_handle(handle)
-        .expect("CloseHandle manifest");
+    win32.close_handle(handle).expect("CloseHandle manifest");
 }
 
 /// Steam's observed failure mode (the manifest open errored at capture)
@@ -464,9 +467,8 @@ fn verbatim_manifest_read_gate() {
         false,
         false,
     );
-    let err = cross_form.expect_err(
-        "plain-path open must conflict with the verbatim handle's share state",
-    );
+    let err = cross_form
+        .expect_err("plain-path open must conflict with the verbatim handle's share state");
     assert_eq!(
         err.code,
         ReasonCode::RcFsSharingViolation,
@@ -618,9 +620,7 @@ fn manifest_share_mode_gate() {
         "share conflict must map to ERROR_SHARING_VIOLATION"
     );
 
-    win32
-        .close_handle(handle)
-        .expect("CloseHandle manifest");
+    win32.close_handle(handle).expect("CloseHandle manifest");
 }
 
 /// The package-directory probe — an EXTENSION of Steam's real writability
@@ -662,7 +662,11 @@ fn package_writability_probe_gate() {
     let written = win32
         .write_file(handle, payload)
         .expect("WriteFile to probe file");
-    assert_eq!(written as usize, payload.len(), "full payload must be written");
+    assert_eq!(
+        written as usize,
+        payload.len(),
+        "full payload must be written"
+    );
 
     // FlushFileBuffers succeeds.
     win32
@@ -693,7 +697,10 @@ fn package_writability_probe_gate() {
     let read_back = win32
         .read_file(handle, payload.len())
         .expect("read probe file back");
-    assert_eq!(read_back, payload, "probe payload must survive close/reopen");
+    assert_eq!(
+        read_back, payload,
+        "probe payload must survive close/reopen"
+    );
 
     // MoveFileEx behavior: rename within the package directory.  The probe
     // handle is closed first: Windows cannot rename a file held open without
@@ -704,7 +711,9 @@ fn package_writability_probe_gate() {
         .expect("MoveFileEx probe file");
 
     // DeleteFile succeeds.
-    win32.delete_file_w(moved_path).expect("DeleteFile probe file");
+    win32
+        .delete_file_w(moved_path)
+        .expect("DeleteFile probe file");
 
     // The original manifest is byte-for-byte unchanged.
     let final_bytes = read_manifest_via_guest(&mut win32, MANIFEST_GUEST_PATH);

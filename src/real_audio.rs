@@ -103,60 +103,59 @@ impl RealAudioBackend {
 
         let default_device = host.default_output_device();
 
-            match host.output_devices() {
-                Ok(device_list) => {
-                    for device in device_list {
-                        let key = cpal_device_key(&device);
-                        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-                        let config = match device.default_output_config() {
-                            Ok(config) => Some(config),
-                            Err(error) => {
-                                eprintln!(
-                                    "[RealAudio] new: failed to get default output config for '{name}': {error}"
-                                );
-                                None
-                            }
-                        };
-                        let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                        let sample_rate =
-                            config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
-                        let is_default = default_device
-                            .as_ref()
-                            .map(|d| d.name().map(|n| n == name).unwrap_or(false))
-                            .unwrap_or(false);
+        match host.output_devices() {
+            Ok(device_list) => {
+                for device in device_list {
+                    let key = cpal_device_key(&device);
+                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                    let config = match device.default_output_config() {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            eprintln!(
+                                "[RealAudio] new: failed to get default output config for '{name}': {error}"
+                            );
+                            None
+                        }
+                    };
+                    let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
+                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                    let is_default = default_device
+                        .as_ref()
+                        .map(|d| d.name().map(|n| n == name).unwrap_or(false))
+                        .unwrap_or(false);
 
-                        devices.insert(
-                            next_device_id,
-                            RealAudioDevice {
-                                id: next_device_id,
-                                key,
-                                name,
-                                channels,
-                                sample_rate,
-                                is_default,
-                            },
-                        );
-                        next_device_id += 1;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("[RealAudio] new: failed to enumerate output devices: {error}");
+                    devices.insert(
+                        next_device_id,
+                        RealAudioDevice {
+                            id: next_device_id,
+                            key,
+                            name,
+                            channels,
+                            sample_rate,
+                            is_default,
+                        },
+                    );
+                    next_device_id += 1;
                 }
             }
+            Err(error) => {
+                eprintln!("[RealAudio] new: failed to enumerate output devices: {error}");
+            }
+        }
 
-            Ok(Self {
-                host,
-                devices,
-                next_device_id,
-                streams: HashMap::new(),
-                stream_queues: HashMap::new(),
-                latency_log: Vec::new(),
-                exclusive_clients: HashMap::new(),
-                exclusive_streams: HashMap::new(),
-                next_audio_client_id: 1,
-                input_stream: None,
-                capture_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            })
+        Ok(Self {
+            host,
+            devices,
+            next_device_id,
+            streams: HashMap::new(),
+            stream_queues: HashMap::new(),
+            latency_log: Vec::new(),
+            exclusive_clients: HashMap::new(),
+            exclusive_streams: HashMap::new(),
+            next_audio_client_id: 1,
+            input_stream: None,
+            capture_buffer: Arc::new(Mutex::new(VecDeque::new())),
+        })
     }
 
     /// Enumerate all real output devices.
@@ -422,10 +421,7 @@ impl RealAudioBackend {
         // The stream was negotiated at exactly `state.format`; queue the
         // samples verbatim so they play back at the correct rate and channel
         // layout (resampling to the device default config would corrupt both).
-        let max_samples = max_output_queue_samples(
-            state.format.sample_rate,
-            state.format.channels,
-        );
+        let max_samples = max_output_queue_samples(state.format.sample_rate, state.format.channels);
         self.enqueue_samples(state.device_id, samples, max_samples)
     }
 
@@ -493,8 +489,7 @@ impl RealAudioBackend {
                         }
                     };
                     let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                    let sample_rate =
-                        config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
                     let is_default = default_device
                         .as_ref()
                         .map(|d| d.name().map(|n| n == name).unwrap_or(false))
@@ -3661,7 +3656,8 @@ impl XapoEffectChain {
                 ) {
                     self.scratch_buffer[..input.len()].fill(0.0);
                 }
-                self.temp_buffer[..input.len()].copy_from_slice(&self.scratch_buffer[..input.len()]);
+                self.temp_buffer[..input.len()]
+                    .copy_from_slice(&self.scratch_buffer[..input.len()]);
             }
         }
 

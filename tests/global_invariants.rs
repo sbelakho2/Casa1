@@ -184,7 +184,9 @@ fn i5_1_soak_gate_keeps_rss_growth_under_five_percent_and_gpu_live_set_stable() 
     // tight percentage gate would flake. The documented invariant is a leak
     // sentinel: 4096 create/destroy cycles must not grow the process RSS to
     // more than 100% over baseline (a real leak grows unboundedly).
-    eprintln!("soak RSS growth: {growth_percent:.2}% (baseline {baseline_rss_kb} KB -> {final_rss_kb} KB)");
+    eprintln!(
+        "soak RSS growth: {growth_percent:.2}% (baseline {baseline_rss_kb} KB -> {final_rss_kb} KB)"
+    );
     assert!(
         growth_percent < 100.0,
         "RSS grew by {growth_percent:.2}% — possible resource leak"

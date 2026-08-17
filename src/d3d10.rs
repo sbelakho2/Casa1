@@ -91,12 +91,16 @@ fn parse_dxbc_bytecode(bytecode: &[u8]) -> AppResult<(ShaderStage, String)> {
         let four_cc = &bytecode[desc_offset..desc_offset + 4];
         // SHDR = shader model 4.0, SHEX = shader model 4.1+
         if four_cc == b"SHDR" || four_cc == b"SHEX" {
-            let chunk_off =
-                u32::from_le_bytes(bytecode[desc_offset + 4..desc_offset + 8].try_into().unwrap())
-                    as usize;
-            let chunk_sz =
-                u32::from_le_bytes(bytecode[desc_offset + 8..desc_offset + 12].try_into().unwrap())
-                    as usize;
+            let chunk_off = u32::from_le_bytes(
+                bytecode[desc_offset + 4..desc_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let chunk_sz = u32::from_le_bytes(
+                bytecode[desc_offset + 8..desc_offset + 12]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             if chunk_off + 4 > bytecode.len() || chunk_sz < 4 {
                 continue;
             }
@@ -115,10 +119,7 @@ fn parse_dxbc_bytecode(bytecode: &[u8]) -> AppResult<(ShaderStage, String)> {
                 _ => {
                     return Err(AppError::new(
                         ReasonCode::RcD3dFeatureUnsupported,
-                        format!(
-                            "D3D10: unsupported shader program type {}",
-                            program_type
-                        ),
+                        format!("D3D10: unsupported shader program type {}", program_type),
                     ));
                 }
             });
@@ -1303,8 +1304,7 @@ impl D3d10Device {
         // and readback; honor the CPU access flags so a read-oriented
         // staging buffer is not given a write-oriented placement.
         let cpu_write_frequent = matches!(usage, D3D10_USAGE_DYNAMIC)
-            || (usage == D3D10_USAGE_STAGING
-                && cpu_access_flags & D3D10_CPU_ACCESS_READ == 0);
+            || (usage == D3D10_USAGE_STAGING && cpu_access_flags & D3D10_CPU_ACCESS_READ == 0);
 
         if is_depth_stencil {
             ResourceUsageHint::DepthStencil
@@ -1449,7 +1449,10 @@ fn validate_creation_flags(flags: u32) -> AppResult<()> {
     if flags & !KNOWN_FLAGS != 0 {
         return Err(AppError::new(
             ReasonCode::RcD3dInvalidState,
-            format!("unknown D3D10 creation flag bits 0x{:x}", flags & !KNOWN_FLAGS),
+            format!(
+                "unknown D3D10 creation flag bits 0x{:x}",
+                flags & !KNOWN_FLAGS
+            ),
         ));
     }
     Ok(())

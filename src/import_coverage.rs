@@ -974,7 +974,6 @@ pub struct ImportCoverageReport {
     pub entries: Vec<ImportCoverageEntry>,
 }
 
-
 /// Generate an import coverage report by cross-referencing known Steam.exe
 /// imports with the PE runtime's registered export tables.
 ///
@@ -1452,16 +1451,16 @@ mod tests {
         for (dll, functions) in &imports {
             let mut seen = std::collections::HashSet::new();
             for func in functions {
-                assert!(
-                    seen.insert(func),
-                    "duplicate import {func} in {dll}"
-                );
+                assert!(seen.insert(func), "duplicate import {func} in {dll}");
             }
         }
 
         let kernel32 = imports.get("kernel32.dll").unwrap();
         assert_eq!(
-            kernel32.iter().filter(|f| *f == "WaitForSingleObject").count(),
+            kernel32
+                .iter()
+                .filter(|f| *f == "WaitForSingleObject")
+                .count(),
             1,
             "WaitForSingleObject must not be duplicated"
         );

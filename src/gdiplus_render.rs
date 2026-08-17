@@ -372,7 +372,14 @@ pub fn draw_line(
                 let blended_color = (color & 0x00FF_FFFF) | (src_alpha << 24);
 
                 put_pixel(
-                    pixels, width, height, stride, px, py, blended_color, compositing_mode,
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    px,
+                    py,
+                    blended_color,
+                    compositing_mode,
                 );
             }
         }
@@ -395,7 +402,14 @@ pub fn draw_line(
             for wy in -(w_int / 2)..=(w_int / 2) {
                 for wx in -(w_int / 2)..=(w_int / 2) {
                     put_pixel(
-                        pixels, width, height, stride, cx + wx, cy + wy, color, compositing_mode,
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        cx + wx,
+                        cy + wy,
+                        color,
+                        compositing_mode,
                     );
                 }
             }
@@ -901,8 +915,18 @@ pub fn draw_pie(
     let pts = arc_to_line_segments(cx, cy, rx, ry, start_angle, sweep_angle, true);
     for i in 1..pts.len() {
         draw_line(
-            pixels, width, height, stride, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y,
-            color, pen_width, compositing_mode, smoothing_mode,
+            pixels,
+            width,
+            height,
+            stride,
+            pts[i - 1].x,
+            pts[i - 1].y,
+            pts[i].x,
+            pts[i].y,
+            color,
+            pen_width,
+            compositing_mode,
+            smoothing_mode,
         );
     }
 }
@@ -954,8 +978,18 @@ pub fn draw_arc(
     let pts = arc_to_line_segments(cx, cy, rx, ry, start_angle, sweep_angle, false);
     for i in 1..pts.len() {
         draw_line(
-            pixels, width, height, stride, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y,
-            color, pen_width, compositing_mode, smoothing_mode,
+            pixels,
+            width,
+            height,
+            stride,
+            pts[i - 1].x,
+            pts[i - 1].y,
+            pts[i].x,
+            pts[i].y,
+            color,
+            pen_width,
+            compositing_mode,
+            smoothing_mode,
         );
     }
 }
@@ -1231,7 +1265,10 @@ pub fn fill_path(
                 figures.push(vec![
                     GdiplusPointF { x: *x, y: *y },
                     GdiplusPointF { x: *x + *w, y: *y },
-                    GdiplusPointF { x: *x + *w, y: *y + *h },
+                    GdiplusPointF {
+                        x: *x + *w,
+                        y: *y + *h,
+                    },
                     GdiplusPointF { x: *x, y: *y + *h },
                 ]);
             }
@@ -1257,7 +1294,13 @@ pub fn fill_path(
                 let rx = w / 2.0;
                 let ry = h / 2.0;
                 figures.push(arc_to_line_segments(
-                    cx, cy, rx, ry, *start_angle, *sweep_angle, true,
+                    cx,
+                    cy,
+                    rx,
+                    ry,
+                    *start_angle,
+                    *sweep_angle,
+                    true,
                 ));
             }
             GdiplusPathElement::Polygon { points } | GdiplusPathElement::Lines { points } => {
@@ -1287,7 +1330,15 @@ pub fn fill_path(
 
     for figure in figures {
         if figure.len() >= 3 {
-            fill_polygon(pixels, width, height, stride, &figure, color, compositing_mode);
+            fill_polygon(
+                pixels,
+                width,
+                height,
+                stride,
+                &figure,
+                color,
+                compositing_mode,
+            );
         }
     }
 }
@@ -1961,8 +2012,14 @@ mod tests {
     fn fill_polygon_extreme_coordinates_do_not_panic() {
         let (mut buf, stride) = make_buffer(32, 32);
         let pts = vec![
-            GdiplusPointF { x: -1.0e9, y: -1.0e9 },
-            GdiplusPointF { x: 1.0e9, y: -1.0e9 },
+            GdiplusPointF {
+                x: -1.0e9,
+                y: -1.0e9,
+            },
+            GdiplusPointF {
+                x: 1.0e9,
+                y: -1.0e9,
+            },
             GdiplusPointF { x: 0.0, y: 1.0e9 },
         ];
         fill_polygon(

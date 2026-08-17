@@ -33,51 +33,45 @@ use url::Url;
 /// Read a `u16` from `data[offset..offset+2]` (big-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u16_be(data: &[u8], offset: usize) -> AppResult<u16> {
-    let s = data
-        .get(offset..offset + 2)
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNetProtocolError,
-                format!(
-                    "SteamProtocol: out-of-bounds read u16 at offset {offset} (len={})",
-                    data.len()
-                ),
-            )
-        })?;
+    let s = data.get(offset..offset + 2).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcNetProtocolError,
+            format!(
+                "SteamProtocol: out-of-bounds read u16 at offset {offset} (len={})",
+                data.len()
+            ),
+        )
+    })?;
     Ok(u16::from_be_bytes([s[0], s[1]]))
 }
 
 /// Read a `u32` from `data[offset..offset+4]` (big-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u32_be(data: &[u8], offset: usize) -> AppResult<u32> {
-    let s = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNetProtocolError,
-                format!(
-                    "SteamProtocol: out-of-bounds read u32 at offset {offset} (len={})",
-                    data.len()
-                ),
-            )
-        })?;
+    let s = data.get(offset..offset + 4).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcNetProtocolError,
+            format!(
+                "SteamProtocol: out-of-bounds read u32 at offset {offset} (len={})",
+                data.len()
+            ),
+        )
+    })?;
     Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Read a `u32` from `data[offset..offset+4]` (little-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u32_le(data: &[u8], offset: usize) -> AppResult<u32> {
-    let s = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNetProtocolError,
-                format!(
-                    "SteamProtocol: out-of-bounds read u32 at offset {offset} (len={})",
-                    data.len()
-                ),
-            )
-        })?;
+    let s = data.get(offset..offset + 4).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcNetProtocolError,
+            format!(
+                "SteamProtocol: out-of-bounds read u32 at offset {offset} (len={})",
+                data.len()
+            ),
+        )
+    })?;
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
@@ -1406,7 +1400,10 @@ impl GameNetworkingSockets {
             if attr_len > u16::MAX as usize {
                 return Err(AppError::new(
                     ReasonCode::RcNetSendFailed,
-                    format!("GNS: TURN attribute {} too large: {attr_len} bytes", attr.attr_type),
+                    format!(
+                        "GNS: TURN attribute {} too large: {attr_len} bytes",
+                        attr.attr_type
+                    ),
                 ));
             }
             let padded_len = if attr.value.len() % 4 == 0 {
@@ -1532,7 +1529,9 @@ impl GameNetworkingSockets {
         if resp_type != TURN_METHOD_ALLOCATE | 0x0100 {
             return Err(AppError::new(
                 ReasonCode::RcNetProtocolError,
-                format!("GNS: TURN Allocate response type {resp_type:#06x} is not a success response"),
+                format!(
+                    "GNS: TURN Allocate response type {resp_type:#06x} is not a success response"
+                ),
             ));
         }
 
@@ -1559,7 +1558,10 @@ impl GameNetworkingSockets {
             }
             if attr_type == TURN_ATTR_LIFETIME && attr_value.len() >= 4 {
                 lifetime = Some(u32::from_be_bytes([
-                    attr_value[0], attr_value[1], attr_value[2], attr_value[3],
+                    attr_value[0],
+                    attr_value[1],
+                    attr_value[2],
+                    attr_value[3],
                 ]));
             }
 
@@ -1611,7 +1613,8 @@ impl GameNetworkingSockets {
             value: peer_value,
         }];
 
-        let request = self.build_stun_request(TURN_METHOD_CREATE_PERMISSION, &tx_id, &attributes)?;
+        let request =
+            self.build_stun_request(TURN_METHOD_CREATE_PERMISSION, &tx_id, &attributes)?;
 
         let socket = if let Some(ref sock) = self.udp_socket {
             sock.try_clone().map_err(|e| {
@@ -1790,8 +1793,7 @@ impl GameNetworkingSockets {
                     let mut data: Option<Vec<u8>> = None;
 
                     while offset + 4 <= packet.len() {
-                        let attr_type =
-                            u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+                        let attr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
                         let attr_len =
                             u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
 
@@ -2949,7 +2951,11 @@ impl SteamProtocolStack {
             if offset + 8 > decrypted.len() {
                 return Err(manifest_truncated(offset, decrypted.len()));
             }
-            let size = u64::from_le_bytes(get_slice(&decrypted, offset, offset + 8)?.try_into().unwrap());
+            let size = u64::from_le_bytes(
+                get_slice(&decrypted, offset, offset + 8)?
+                    .try_into()
+                    .unwrap(),
+            );
             offset += 8;
 
             if offset + 20 > decrypted.len() {
@@ -2988,7 +2994,9 @@ impl SteamProtocolStack {
                     return Err(manifest_truncated(offset, decrypted.len()));
                 }
                 let chunk_offset = u64::from_le_bytes(
-                    get_slice(&decrypted, offset, offset + 8)?.try_into().unwrap(),
+                    get_slice(&decrypted, offset, offset + 8)?
+                        .try_into()
+                        .unwrap(),
                 );
                 offset += 8;
 
@@ -3207,7 +3215,10 @@ impl SteamProtocolStack {
         if !response.status().is_success() {
             return Err(AppError::new(
                 ReasonCode::RcNetProtocolError,
-                format!("SteamProtocol: HTTP error from content server: {}", response.status()),
+                format!(
+                    "SteamProtocol: HTTP error from content server: {}",
+                    response.status()
+                ),
             ));
         }
 
@@ -3476,9 +3487,7 @@ pub fn map_emsg(raw: u32) -> SteamMessageType {
 fn manifest_truncated(offset: usize, len: usize) -> AppError {
     AppError::new(
         ReasonCode::RcNetProtocolError,
-        format!(
-            "SteamProtocol: depot manifest truncated at offset {offset} (len={len})"
-        ),
+        format!("SteamProtocol: depot manifest truncated at offset {offset} (len={len})"),
     )
 }
 
@@ -3847,14 +3856,18 @@ impl SteamProtocolHandler {
             let scheme = match CString::new("steam") {
                 Ok(scheme) => scheme,
                 Err(_) => {
-                    eprintln!("[SteamProtocol] cannot register steam:// URL scheme (invalid scheme)");
+                    eprintln!(
+                        "[SteamProtocol] cannot register steam:// URL scheme (invalid scheme)"
+                    );
                     return;
                 }
             };
             let bundle_id = match CString::new("com.casa1.steam") {
                 Ok(bundle_id) => bundle_id,
                 Err(_) => {
-                    eprintln!("[SteamProtocol] cannot register steam:// URL scheme (invalid bundle ID)");
+                    eprintln!(
+                        "[SteamProtocol] cannot register steam:// URL scheme (invalid bundle ID)"
+                    );
                     return;
                 }
             };
@@ -3866,10 +3879,7 @@ impl SteamProtocolHandler {
                 let pid = libc::fork();
                 if pid == 0 {
                     // Child: perform the registration, then exit.
-                    let _ = LSSetDefaultHandlerForURLScheme(
-                        scheme.as_ptr(),
-                        bundle_id.as_ptr(),
-                    );
+                    let _ = LSSetDefaultHandlerForURLScheme(scheme.as_ptr(), bundle_id.as_ptr());
                     libc::_exit(0);
                 } else if pid > 0 {
                     // Parent: wait up to 5 s for the child to finish.
@@ -4036,7 +4046,9 @@ impl SteamProtocolHandler {
             match arg.as_str() {
                 "-applaunch" => {
                     // -applaunch <app_id> [args...]
-                    if i + 1 < args.len() && let Ok(app_id) = args[i + 1].parse::<u32>() {
+                    if i + 1 < args.len()
+                        && let Ok(app_id) = args[i + 1].parse::<u32>()
+                    {
                         // Collect remaining args as launch arguments
                         let mut launch_args = Vec::new();
                         i += 2;

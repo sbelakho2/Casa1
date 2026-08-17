@@ -329,12 +329,16 @@ impl D3d12Runtime {
     /// D3D12 values: 1=WRAP, 2=MIRROR, 3=CLAMP, 4=BORDER, 5=MIRROR_ONCE.
     /// Metal has no `mirror_once` mode, so MIRROR_ONCE maps to `mirror_repeat`.
     pub fn map_d3d12_address_mode(mode: u32) -> &'static str {
+        // Per D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP,
+        // 3=BORDER, 4=MIRROR_ONCE (the previous mapping was shifted by one
+        // and never handled WRAP=0, which would mis-translate every real
+        // D3D12 sampler).
         match mode {
-            1 => "repeat",          // D3D12_TEXTURE_ADDRESS_MODE_WRAP
-            2 => "mirror_repeat",   // D3D12_TEXTURE_ADDRESS_MODE_MIRROR
-            3 => "clamp_to_edge",   // D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-            4 => "clamp_to_zero",   // D3D12_TEXTURE_ADDRESS_MODE_BORDER
-            5 => "mirror_repeat",   // D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
+            0 => "repeat",               // WRAP
+            1 => "mirror_repeat",        // MIRROR
+            2 => "clamp_to_edge",        // CLAMP
+            3 => "clamp_to_border",      // BORDER
+            4 => "mirror_clamp_to_edge", // MIRROR_ONCE
             _ => "clamp_to_edge",
         }
     }
@@ -368,9 +372,7 @@ impl D3d12Runtime {
     ///
     /// Rejects invalid combinations (anisotropy above the Metal limit of 16,
     /// min_lod > max_lod) before emitting the descriptor.
-    pub fn static_sampler_to_metal_desc(
-        sampler: &D3D12StaticSamplerDesc,
-    ) -> AppResult<String> {
+    pub fn static_sampler_to_metal_desc(sampler: &D3D12StaticSamplerDesc) -> AppResult<String> {
         Self::validate_static_sampler(sampler)?;
         let (min_filter, mag_filter, mip_filter, anisotropic, _) =
             Self::map_d3d12_filter_to_metal(sampler.filter);
@@ -693,11 +695,7 @@ impl D3d12Runtime {
 
     /// Track an aliasing overlap pair, deduplicating so the set does not grow
     /// without bound across repeated barriers on the same pair.
-    fn track_aliasing_overlap(
-        &mut self,
-        before: Option<ResourceId>,
-        after: Option<ResourceId>,
-    ) {
+    fn track_aliasing_overlap(&mut self, before: Option<ResourceId>, after: Option<ResourceId>) {
         if !self
             .aliasing_overlaps
             .iter()
@@ -1050,7 +1048,10 @@ impl D3d12Runtime {
         let start_idx = start as usize;
         let count = count as usize;
         let end_idx = start_idx.checked_add(count).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, "resolve query range overflow")
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "resolve query range overflow",
+            )
         })?;
         if end_idx > qh.count as usize {
             return Err(AppError::new(

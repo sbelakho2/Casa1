@@ -471,10 +471,7 @@ where
                         None
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[cli] icon extraction failed for {}: {e}",
-                            exe.display()
-                        );
+                        eprintln!("[cli] icon extraction failed for {}: {e}", exe.display());
                         None
                     }
                 }
@@ -528,7 +525,10 @@ where
             if !app_path.starts_with(&canonical_dir) {
                 return Err(AppError::new(
                     ReasonCode::RcFsSandboxEscape,
-                    format!("refusing to uninstall app outside {}", canonical_dir.display()),
+                    format!(
+                        "refusing to uninstall app outside {}",
+                        canonical_dir.display()
+                    ),
                 ));
             }
             uninstall_app(&app_path)?;
@@ -937,7 +937,11 @@ fn insert_steam_zero_touch_inputs(
     );
     env.insert(
         "CASA1_STEAM_PAYLOAD_ROOT".to_string(),
-        inputs.payload_root.expect("validated").display().to_string(),
+        inputs
+            .payload_root
+            .expect("validated")
+            .display()
+            .to_string(),
     );
     if let Some(steam_libraryfolders) = inputs.libraryfolders {
         env.insert(

@@ -455,7 +455,7 @@ fn t23_3_import_coverage_matrix() {
     eprintln!("{}", "-".repeat(100));
 
     let mut sorted_dlls: Vec<_> = dll_coverage.iter().collect();
-    sorted_dlls.sort_by_key(|entry| std::cmp::Reverse(entry.1 .1.len()));
+    sorted_dlls.sort_by_key(|entry| std::cmp::Reverse(entry.1.1.len()));
 
     for (dll, (supported, unsupported)) in &sorted_dlls {
         let total_dll = supported.len() + unsupported.len();
@@ -595,7 +595,9 @@ fn t23_4_steam_regression() {
          Parameters: {:#?}",
         table_check[0].parameters,
     );
-    eprintln!("✓ Record table is populated after execution (base {record_base}, first opcode {first_opcode})");
+    eprintln!(
+        "✓ Record table is populated after execution (base {record_base}, first opcode {first_opcode})"
+    );
 
     // 4. Also check the pre-execution SteamInitialGlobals event: it probes the
     // startup globals directly from guest memory before execution. The startup
@@ -700,8 +702,12 @@ fn t23_5_x86_decode_coverage() {
     // Use HashMap<String, usize> because DecodedOpcode does not implement Ord/Hash.
     // We convert opcodes to their debug string representation for map keys.
     #[allow(clippy::type_complexity)]
-    let mut section_results: Vec<(String, usize, HashMap<String, usize>, Vec<(usize, String)>)> =
-        Vec::new();
+    let mut section_results: Vec<(
+        String,
+        usize,
+        HashMap<String, usize>,
+        Vec<(usize, String)>,
+    )> = Vec::new();
 
     let mut total_instructions = 0usize;
     let mut total_decode_errors = 0usize;

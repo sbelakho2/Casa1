@@ -2580,9 +2580,7 @@ fn t01_19_forwarder_chain_too_deep_returns_none() {
                      ({MAX_FORWARDER_DEPTH}) before terminating"
                 );
                 let provider = tables.get(&next_dll).unwrap_or_else(|| {
-                    panic!(
-                        "forwarder '{dll}' -> '{target}' targets missing module '{next_dll}'"
-                    )
+                    panic!("forwarder '{dll}' -> '{target}' targets missing module '{next_dll}'")
                 });
                 let symbol = symbol.strip_prefix('#').unwrap_or(symbol);
                 let resolved = provider

@@ -301,7 +301,10 @@ impl PrintSubsystem {
         // dialog invocations cannot accumulate unbounded temp PDFs.
         let temp_dir = std::env::temp_dir().join(format!("casa1_print_{}", std::process::id()));
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-            eprintln!("[print] failed to create temp dir {}: {e}", temp_dir.display());
+            eprintln!(
+                "[print] failed to create temp dir {}: {e}",
+                temp_dir.display()
+            );
             return false;
         }
         cleanup_stale_temp_pdfs(&temp_dir);
@@ -329,7 +332,10 @@ impl PrintSubsystem {
                 }
             },
             Err(e) => {
-                eprintln!("[print] failed to write temp PDF {}: {e}", temp_path.display());
+                eprintln!(
+                    "[print] failed to write temp PDF {}: {e}",
+                    temp_path.display()
+                );
                 false
             }
         }
@@ -448,8 +454,7 @@ impl PrintSubsystem {
                 format!(
                     "BT /F1 12 Tf 100 700 Td (Printed from Casa1 - {}) Tj ET\n\
                      BT /F1 10 Tf 100 680 Td ({}) Tj ET",
-                    safe_name,
-                    page_label,
+                    safe_name, page_label,
                 )
             };
             objects.push(format!(
@@ -528,7 +533,10 @@ fn cleanup_stale_temp_pdfs(temp_dir: &std::path::Path) {
             let Ok(modified) = metadata.modified() else {
                 continue;
             };
-            if now.duration_since(modified).is_ok_and(|age| age.as_secs() > 3600) {
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age.as_secs() > 3600)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

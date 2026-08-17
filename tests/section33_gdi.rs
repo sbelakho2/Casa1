@@ -1045,7 +1045,10 @@ fn t33_29_image_attributes_color_matrix() {
 
     // The image attributes must be stored and readable back through the
     // public API, with the grayscale color matrix intact.
-    match state.get(handle).expect("image attributes should be stored") {
+    match state
+        .get(handle)
+        .expect("image attributes should be stored")
+    {
         GdiplusObject::ImageAttributes(stored) => {
             let (adjust_type, stored_matrix) = stored
                 .color_matrix
@@ -1145,9 +1148,11 @@ fn t33_31_status_codes() {
     assert_eq!(GdiplusStatus::FontStyleNotFound.to_u32(), 15);
     assert_eq!(GdiplusStatus::NotTrueTypeFont.to_u32(), 16);
     assert_eq!(GdiplusStatus::UnsupportedGdiplusVersion.to_u32(), 17);
-    assert_eq!(GdiplusStatus::PropertyNotFound.to_u32(), 19);
-    assert_eq!(GdiplusStatus::PropertyNotSupported.to_u32(), 20);
-    assert_eq!(GdiplusStatus::ProfileNotFound.to_u32(), 21);
+    // Discriminants per Microsoft GdiplusTypes.h: PropertyNotFound = 18,
+    // PropertyNotSupported = 19, ProfileNotFound = 20.
+    assert_eq!(GdiplusStatus::PropertyNotFound.to_u32(), 18);
+    assert_eq!(GdiplusStatus::PropertyNotSupported.to_u32(), 19);
+    assert_eq!(GdiplusStatus::ProfileNotFound.to_u32(), 20);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1830,8 +1835,7 @@ fn t33_47_renderer_draw_string() {
     }
     let below = 5 * stride as usize + 5 * 4 + char_h * stride as usize;
     assert_eq!(
-        pixels[below],
-        0,
+        pixels[below], 0,
         "pixels below the text blocks must be untouched"
     );
 }

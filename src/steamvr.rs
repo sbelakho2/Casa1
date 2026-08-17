@@ -197,11 +197,7 @@ impl ControllerState {
         // (r_axis[2], r_axis[3]), axis 2 = (r_axis[4], 0.0) etc.
         for axis_index in 0..5 {
             let x = self.r_axis.get(axis_index * 2).copied().unwrap_or(0.0);
-            let y = self
-                .r_axis
-                .get(axis_index * 2 + 1)
-                .copied()
-                .unwrap_or(0.0);
+            let y = self.r_axis.get(axis_index * 2 + 1).copied().unwrap_or(0.0);
             bytes.extend_from_slice(&x.to_le_bytes());
             bytes.extend_from_slice(&y.to_le_bytes());
         }
@@ -1872,12 +1868,12 @@ pub type InputFnTable = [FnTableEntry; 20];
 pub fn controller_fn_tables() -> (ControllerFnTable, InputFnTable) {
     // IVRController_002 vtable (10 methods, offset 0 = Release)
     let controller_vtable: [FnTableEntry; 5] = [
-        ("Release", 4),             // 0: void Release()
-        ("TriggerHapticPulse", 12), // 1: bool TriggerHapticPulse(u32 axis, u16 duration)
+        ("Release", 4),               // 0: void Release()
+        ("TriggerHapticPulse", 12),   // 1: bool TriggerHapticPulse(u32 axis, u16 duration)
         ("TriggerHapticPulseV2", 12), // 2: (unused)
-        ("GetControllerState", 8),  // 3: bool GetControllerState(u32 device, VRControllerState_t*)
+        ("GetControllerState", 8), // 3: bool GetControllerState(u32 device, VRControllerState_t*)
         ("GetControllerStateForNextFrame", 8), // 4: same with predicted
-                                              // Remaining slots = unsupported
+                                   // Remaining slots = unsupported
     ];
     // Pad to 10 entries
     let mut controller_full: ControllerFnTable = [("unsupported", 4); 10];

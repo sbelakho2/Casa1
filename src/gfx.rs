@@ -92,80 +92,80 @@ impl DxgiFormat {
         let format = match value {
             // 0: DXGI_FORMAT_UNKNOWN
             1 | 2 | 5 | 6 => DxgiFormat::R32G32B32A32Float, // R32G32B32A32_TYPELESS/FLOAT, R32G32B32_TYPELESS/FLOAT
-            3 | 7 => DxgiFormat::R32G32B32A32Uint, // R32G32B32A32_UINT, R32G32B32_UINT
+            3 | 7 => DxgiFormat::R32G32B32A32Uint,          // R32G32B32A32_UINT, R32G32B32_UINT
             4 | 8 => DxgiFormat::R32G32B32A32Uint, // R32G32B32A32_SINT, R32G32B32_SINT (closest: Uint)
             9 | 11 | 13 => DxgiFormat::R16G16B16A16Unorm, // R16G16B16A16_TYPELESS/UNORM/SNORM
-            10 => DxgiFormat::R16G16B16A16Float, // R16G16B16A16_FLOAT
-            12 => DxgiFormat::R16G16B16A16Uint, // R16G16B16A16_UINT
-            14 => DxgiFormat::R16G16B16A16Uint, // R16G16B16A16_SINT (closest: Uint)
-            15 | 16 => DxgiFormat::R32G32Float, // R32G32_TYPELESS/FLOAT
-            17 => DxgiFormat::R32G32Uint,       // R32G32_UINT
-            18 => DxgiFormat::R32G32Uint,       // R32G32_SINT (closest: Uint)
-            19 => DxgiFormat::D32FloatS8Uint,   // R32G8X24_TYPELESS (closest: depth-stencil)
-            20 => DxgiFormat::D32FloatS8Uint,   // D32_FLOAT_S8X24_UINT
-            21 => DxgiFormat::D32FloatS8Uint,   // R32_FLOAT_X8X24_TYPELESS
-            22 => DxgiFormat::D32FloatS8Uint,   // X32_TYPELESS_G8X24_UINT
+            10 => DxgiFormat::R16G16B16A16Float,   // R16G16B16A16_FLOAT
+            12 => DxgiFormat::R16G16B16A16Uint,    // R16G16B16A16_UINT
+            14 => DxgiFormat::R16G16B16A16Uint,    // R16G16B16A16_SINT (closest: Uint)
+            15 | 16 => DxgiFormat::R32G32Float,    // R32G32_TYPELESS/FLOAT
+            17 => DxgiFormat::R32G32Uint,          // R32G32_UINT
+            18 => DxgiFormat::R32G32Uint,          // R32G32_SINT (closest: Uint)
+            19 => DxgiFormat::D32FloatS8Uint,      // R32G8X24_TYPELESS (closest: depth-stencil)
+            20 => DxgiFormat::D32FloatS8Uint,      // D32_FLOAT_S8X24_UINT
+            21 => DxgiFormat::D32FloatS8Uint,      // R32_FLOAT_X8X24_TYPELESS
+            22 => DxgiFormat::D32FloatS8Uint,      // X32_TYPELESS_G8X24_UINT
             23 | 24 => DxgiFormat::R10G10B10A2Unorm, // R10G10B10A2_TYPELESS/UNORM
-            25 => DxgiFormat::R10G10B10A2Uint,  // R10G10B10A2_UINT
-            26 => DxgiFormat::R11G11B10Float,   // R11G11B10_FLOAT
-            27 | 28 => DxgiFormat::R8G8B8A8Unorm, // R8G8B8A8_TYPELESS/UNORM
-            29 => DxgiFormat::R8G8B8A8UnormSrgb, // R8G8B8A8_UNORM_SRGB
-            30 => DxgiFormat::R8G8B8A8Uint,     // R8G8B8A8_UINT
-            31 => DxgiFormat::R8G8B8A8Unorm,    // R8G8B8A8_SNORM (closest: Unorm)
-            32 => DxgiFormat::R8G8B8A8Uint,     // R8G8B8A8_SINT (closest: Uint)
-            33 | 35 => DxgiFormat::R16G16Unorm, // R16G16_TYPELESS/UNORM
-            34 => DxgiFormat::R16G16Float,      // R16G16_FLOAT
-            36 => DxgiFormat::R16G16Uint,       // R16G16_UINT
-            37 => DxgiFormat::R16G16Snorm,      // R16G16_SNORM
-            38 => DxgiFormat::R16G16Uint,       // R16G16_SINT (closest: Uint)
-            39 | 41 => DxgiFormat::R32Float,    // R32_TYPELESS/R32_FLOAT
-            40 => DxgiFormat::D32Float,         // D32_FLOAT
-            42 => DxgiFormat::R32Uint,          // R32_UINT
-            43 => DxgiFormat::R32Sint,          // R32_SINT
+            25 => DxgiFormat::R10G10B10A2Uint,     // R10G10B10A2_UINT
+            26 => DxgiFormat::R11G11B10Float,      // R11G11B10_FLOAT
+            27 | 28 => DxgiFormat::R8G8B8A8Unorm,  // R8G8B8A8_TYPELESS/UNORM
+            29 => DxgiFormat::R8G8B8A8UnormSrgb,   // R8G8B8A8_UNORM_SRGB
+            30 => DxgiFormat::R8G8B8A8Uint,        // R8G8B8A8_UINT
+            31 => DxgiFormat::R8G8B8A8Unorm,       // R8G8B8A8_SNORM (closest: Unorm)
+            32 => DxgiFormat::R8G8B8A8Uint,        // R8G8B8A8_SINT (closest: Uint)
+            33 | 35 => DxgiFormat::R16G16Unorm,    // R16G16_TYPELESS/UNORM
+            34 => DxgiFormat::R16G16Float,         // R16G16_FLOAT
+            36 => DxgiFormat::R16G16Uint,          // R16G16_UINT
+            37 => DxgiFormat::R16G16Snorm,         // R16G16_SNORM
+            38 => DxgiFormat::R16G16Uint,          // R16G16_SINT (closest: Uint)
+            39 | 41 => DxgiFormat::R32Float,       // R32_TYPELESS/R32_FLOAT
+            40 => DxgiFormat::D32Float,            // D32_FLOAT
+            42 => DxgiFormat::R32Uint,             // R32_UINT
+            43 => DxgiFormat::R32Sint,             // R32_SINT
             44 | 45 => DxgiFormat::D24UnormS8Uint, // R24G8_TYPELESS/D24_UNORM_S8_UINT
             46 | 47 => DxgiFormat::D24UnormS8Uint, // R24_UNORM_X8_TYPELESS/X24_TYPELESS_G8_UINT
-            48 | 49 => DxgiFormat::R16G16Unorm, // R8G8_TYPELESS/UNORM (closest: 2×16)
-            50 => DxgiFormat::R16G16Uint,       // R8G8_UINT
-            51 => DxgiFormat::R16G16Snorm,      // R8G8_SNORM
-            52 => DxgiFormat::R16G16Uint,       // R8G8_SINT (closest: Uint)
-            53 | 56 => DxgiFormat::R16Unorm,    // R16_TYPELESS/R16_UNORM
-            54 => DxgiFormat::R16Float,         // R16_FLOAT
-            55 => DxgiFormat::R16Unorm,         // D16_UNORM (closest: R16)
-            57 => DxgiFormat::R16Uint,          // R16_UINT
-            58 => DxgiFormat::R16Snorm,         // R16_SNORM
-            59 => DxgiFormat::R16Uint,          // R16_SINT (closest: Uint)
-            60 | 61 => DxgiFormat::R8Unorm,     // R8_TYPELESS/R8_UNORM
-            62 => DxgiFormat::R8Uint,           // R8_UINT
-            63 => DxgiFormat::R8Unorm,          // R8_SNORM (closest: Unorm)
-            64 => DxgiFormat::R8Uint,           // R8_SINT (closest: Uint)
-            65 => DxgiFormat::R8Unorm,          // A8_UNORM
-            66 => DxgiFormat::R8Unorm,          // R1_UNORM (closest: R8)
-            67 => DxgiFormat::R11G11B10Float,   // R9G9B9E5_SHAREDEXP (closest: packed float)
-            68 | 69 => DxgiFormat::R8G8B8A8Unorm, // R8G8_B8G8_UNORM/G8R8_G8B8_UNORM
-            70 | 71 => DxgiFormat::Bc1Unorm,    // BC1_TYPELESS/BC1_UNORM
-            72 => DxgiFormat::Bc1UnormSrgb,     // BC1_UNORM_SRGB
-            73 | 74 => DxgiFormat::Bc2Unorm,    // BC2_TYPELESS/BC2_UNORM
-            75 => DxgiFormat::Bc2UnormSrgb,     // BC2_UNORM_SRGB
-            76 | 77 => DxgiFormat::Bc3Unorm,    // BC3_TYPELESS/BC3_UNORM
-            78 => DxgiFormat::Bc3UnormSrgb,     // BC3_UNORM_SRGB
-            79 | 80 => DxgiFormat::Bc4Unorm,    // BC4_TYPELESS/BC4_UNORM
-            81 => DxgiFormat::Bc4Unorm,         // BC4_SNORM (closest: Unorm)
-            82 | 83 => DxgiFormat::Bc5Unorm,    // BC5_TYPELESS/BC5_UNORM
-            84 => DxgiFormat::Bc5Unorm,         // BC5_SNORM (closest: Unorm)
-            85 => DxgiFormat::B5G6R5Unorm,      // B5G6R5_UNORM
-            86 => DxgiFormat::B5G6R5Unorm,      // B5G5R5A1_UNORM (closest: B5G6R5)
-            87 => DxgiFormat::B8G8R8A8Unorm,    // B8G8R8A8_UNORM
-            88 => DxgiFormat::B8G8R8X8Unorm,    // B8G8R8X8_UNORM
-            89 => DxgiFormat::R10G10B10A2Unorm, // R10G10B10_XR_BIAS_A2_UNORM (closest)
-            90 => DxgiFormat::B8G8R8A8Unorm,    // B8G8R8A8_TYPELESS
-            91 => DxgiFormat::B8G8R8A8UnormSrgb, // B8G8R8A8_UNORM_SRGB
-            92 => DxgiFormat::B8G8R8X8Unorm,    // B8G8R8X8_TYPELESS
-            93 => DxgiFormat::B8G8R8A8UnormSrgb, // B8G8R8X8_UNORM_SRGB (closest: sRGB BGRA)
+            48 | 49 => DxgiFormat::R16G16Unorm,    // R8G8_TYPELESS/UNORM (closest: 2×16)
+            50 => DxgiFormat::R16G16Uint,          // R8G8_UINT
+            51 => DxgiFormat::R16G16Snorm,         // R8G8_SNORM
+            52 => DxgiFormat::R16G16Uint,          // R8G8_SINT (closest: Uint)
+            53 | 56 => DxgiFormat::R16Unorm,       // R16_TYPELESS/R16_UNORM
+            54 => DxgiFormat::R16Float,            // R16_FLOAT
+            55 => DxgiFormat::R16Unorm,            // D16_UNORM (closest: R16)
+            57 => DxgiFormat::R16Uint,             // R16_UINT
+            58 => DxgiFormat::R16Snorm,            // R16_SNORM
+            59 => DxgiFormat::R16Uint,             // R16_SINT (closest: Uint)
+            60 | 61 => DxgiFormat::R8Unorm,        // R8_TYPELESS/R8_UNORM
+            62 => DxgiFormat::R8Uint,              // R8_UINT
+            63 => DxgiFormat::R8Unorm,             // R8_SNORM (closest: Unorm)
+            64 => DxgiFormat::R8Uint,              // R8_SINT (closest: Uint)
+            65 => DxgiFormat::R8Unorm,             // A8_UNORM
+            66 => DxgiFormat::R8Unorm,             // R1_UNORM (closest: R8)
+            67 => DxgiFormat::R11G11B10Float,      // R9G9B9E5_SHAREDEXP (closest: packed float)
+            68 | 69 => DxgiFormat::R8G8B8A8Unorm,  // R8G8_B8G8_UNORM/G8R8_G8B8_UNORM
+            70 | 71 => DxgiFormat::Bc1Unorm,       // BC1_TYPELESS/BC1_UNORM
+            72 => DxgiFormat::Bc1UnormSrgb,        // BC1_UNORM_SRGB
+            73 | 74 => DxgiFormat::Bc2Unorm,       // BC2_TYPELESS/BC2_UNORM
+            75 => DxgiFormat::Bc2UnormSrgb,        // BC2_UNORM_SRGB
+            76 | 77 => DxgiFormat::Bc3Unorm,       // BC3_TYPELESS/BC3_UNORM
+            78 => DxgiFormat::Bc3UnormSrgb,        // BC3_UNORM_SRGB
+            79 | 80 => DxgiFormat::Bc4Unorm,       // BC4_TYPELESS/BC4_UNORM
+            81 => DxgiFormat::Bc4Unorm,            // BC4_SNORM (closest: Unorm)
+            82 | 83 => DxgiFormat::Bc5Unorm,       // BC5_TYPELESS/BC5_UNORM
+            84 => DxgiFormat::Bc5Unorm,            // BC5_SNORM (closest: Unorm)
+            85 => DxgiFormat::B5G6R5Unorm,         // B5G6R5_UNORM
+            86 => DxgiFormat::B5G6R5Unorm,         // B5G5R5A1_UNORM (closest: B5G6R5)
+            87 => DxgiFormat::B8G8R8A8Unorm,       // B8G8R8A8_UNORM
+            88 => DxgiFormat::B8G8R8X8Unorm,       // B8G8R8X8_UNORM
+            89 => DxgiFormat::R10G10B10A2Unorm,    // R10G10B10_XR_BIAS_A2_UNORM (closest)
+            90 => DxgiFormat::B8G8R8A8Unorm,       // B8G8R8A8_TYPELESS
+            91 => DxgiFormat::B8G8R8A8UnormSrgb,   // B8G8R8A8_UNORM_SRGB
+            92 => DxgiFormat::B8G8R8X8Unorm,       // B8G8R8X8_TYPELESS
+            93 => DxgiFormat::B8G8R8A8UnormSrgb,   // B8G8R8X8_UNORM_SRGB (closest: sRGB BGRA)
             94..=96 => DxgiFormat::Bc7Unorm, // BC6H_TYPELESS/UF16/SF16 (closest: same block size)
-            97 | 98 => DxgiFormat::Bc7Unorm,    // BC7_TYPELESS/BC7_UNORM
-            99 => DxgiFormat::Bc7UnormSrgb,     // BC7_UNORM_SRGB
-            100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 | 112
-            | 113 | 114 | 115 | 130 | 131 | 132 => DxgiFormat::R8G8B8A8Unorm, // AYUV/video formats
+            97 | 98 => DxgiFormat::Bc7Unorm, // BC7_TYPELESS/BC7_UNORM
+            99 => DxgiFormat::Bc7UnormSrgb,  // BC7_UNORM_SRGB
+            100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 | 112 | 113
+            | 114 | 115 | 130 | 131 | 132 => DxgiFormat::R8G8B8A8Unorm, // AYUV/video formats
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
@@ -1662,15 +1662,12 @@ impl GraphicsBackend {
 
     /// Destroy a swapchain and its backbuffer resources.
     pub fn destroy_swapchain(&mut self, swapchain: SwapchainId) -> AppResult<()> {
-        let record = self
-            .swapchains
-            .remove(&swapchain)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("unknown swapchain {swapchain}"),
-                )
-            })?;
+        let record = self.swapchains.remove(&swapchain).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown swapchain {swapchain}"),
+            )
+        })?;
         for backbuffer in record.state.backbuffers {
             let _ = self.destroy_resource(backbuffer);
         }
@@ -2494,7 +2491,8 @@ impl GraphicsBackend {
                         pass.merge_store_action(store_action);
                     }
                     Some(_) => {
-                        plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                        plan.render_passes
+                            .push(plan.active_pass.take().expect("active pass"));
                         plan.active_pass = Some(RenderPassPlan {
                             color_formats: mapped_color_formats,
                             depth_format: mapped_depth_format,
@@ -2517,7 +2515,8 @@ impl GraphicsBackend {
             Command::ClearRtv { heap, index } => {
                 let descriptor = self.descriptor_at(*heap, *index)?;
                 let ViewDescriptor::Rtv { format, .. } = descriptor else {
-                    plan.validation_errors.push("invalid RTV attachment".to_string());
+                    plan.validation_errors
+                        .push("invalid RTV attachment".to_string());
                     return Ok(());
                 };
                 let mapping = format_mapping(format)?;
@@ -2531,7 +2530,8 @@ impl GraphicsBackend {
                         if pass.color_formats != vec![mapping.metal]
                             || pass.depth_format != depth_format
                         {
-                            plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                            plan.render_passes
+                                .push(plan.active_pass.take().expect("active pass"));
                             plan.active_pass = Some(RenderPassPlan {
                                 color_formats: vec![mapping.metal],
                                 depth_format,
@@ -2557,7 +2557,8 @@ impl GraphicsBackend {
             Command::ClearDsv { heap, index } => {
                 let descriptor = self.descriptor_at(*heap, *index)?;
                 let ViewDescriptor::Dsv { format, .. } = descriptor else {
-                    plan.validation_errors.push("invalid DSV attachment".to_string());
+                    plan.validation_errors
+                        .push("invalid DSV attachment".to_string());
                     return Ok(());
                 };
                 let mapping = format_mapping(format)?;
@@ -2576,7 +2577,8 @@ impl GraphicsBackend {
                         pass.load_action = "clear".to_string();
                     }
                     Some(_) => {
-                        plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                        plan.render_passes
+                            .push(plan.active_pass.take().expect("active pass"));
                         plan.active_pass = Some(RenderPassPlan {
                             color_formats,
                             depth_format: Some(mapping.metal),
@@ -2600,7 +2602,8 @@ impl GraphicsBackend {
                 if let Some(pass) = &mut plan.active_pass {
                     pass.draw_calls += 1;
                 } else {
-                    plan.validation_errors.push("draw without active render pass".to_string());
+                    plan.validation_errors
+                        .push("draw without active render pass".to_string());
                 }
             }
             Command::Dispatch { .. } => {
@@ -2615,7 +2618,8 @@ impl GraphicsBackend {
                 if let Some(pass) = &mut plan.active_pass {
                     pass.draw_calls += 1;
                 } else {
-                    plan.validation_errors.push("dispatch mesh without active render pass".to_string());
+                    plan.validation_errors
+                        .push("dispatch mesh without active render pass".to_string());
                 }
             }
             Command::CopyResource { src, dst } => {
@@ -2639,10 +2643,16 @@ impl GraphicsBackend {
                 let src_bytes = self.resource(*src)?.bytes.clone();
                 let dst_bytes = self.resource_mut(*dst)?;
                 let src_start = usize::try_from(*src_offset).map_err(|_| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, "copy source offset out of range")
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "copy source offset out of range",
+                    )
                 })?;
                 let dst_start = usize::try_from(*dst_offset).map_err(|_| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, "copy dest offset out of range")
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "copy dest offset out of range",
+                    )
                 })?;
                 let len = usize::try_from(*size).map_err(|_| {
                     AppError::new(ReasonCode::RcD3dInvalidState, "copy size out of range")
@@ -2659,8 +2669,7 @@ impl GraphicsBackend {
                         "copy buffer region out of bounds",
                     ));
                 }
-                dst_bytes.bytes[dst_start..dst_end]
-                    .copy_from_slice(&src_bytes[src_start..src_end]);
+                dst_bytes.bytes[dst_start..dst_end].copy_from_slice(&src_bytes[src_start..src_end]);
             }
             Command::CopyResourceRegion {
                 dst,
@@ -2689,26 +2698,30 @@ impl GraphicsBackend {
                 let dst_bytes = self.resource_mut(*dst)?;
                 let bpp = 4usize;
                 let row_count = *height as usize;
-                let src_stride = (*width as usize)
-                    .checked_mul(bpp)
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow"))?;
-                let dst_stride = (*width as usize)
-                    .checked_mul(bpp)
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow"))?;
-                let src_x_off = (*src_x as usize)
-                    .checked_mul(bpp)
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy src_x overflow"))?;
-                let dst_x_off = (*dst_x as usize)
-                    .checked_mul(bpp)
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy dst_x overflow"))?;
+                let src_stride = (*width as usize).checked_mul(bpp).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow")
+                })?;
+                let dst_stride = (*width as usize).checked_mul(bpp).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow")
+                })?;
+                let src_x_off = (*src_x as usize).checked_mul(bpp).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy src_x overflow")
+                })?;
+                let dst_x_off = (*dst_x as usize).checked_mul(bpp).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy dst_x overflow")
+                })?;
                 let src_row_base = (*src_y as usize)
                     .checked_mul(src_stride)
                     .and_then(|v| v.checked_add(src_x_off))
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy source offset overflow"))?;
+                    .ok_or_else(|| {
+                        AppError::new(ReasonCode::RcD3dInvalidState, "copy source offset overflow")
+                    })?;
                 let dst_row_base = (*dst_y as usize)
                     .checked_mul(dst_stride)
                     .and_then(|v| v.checked_add(dst_x_off))
-                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy dest offset overflow"))?;
+                    .ok_or_else(|| {
+                        AppError::new(ReasonCode::RcD3dInvalidState, "copy dest offset overflow")
+                    })?;
                 for row in 0..row_count {
                     let src_row_start = src_row_base
                         .checked_add(row.checked_mul(src_stride).ok_or_else(|| {
@@ -3034,7 +3047,10 @@ impl GraphicsBackend {
     ) -> AppResult<()> {
         let resource = self.resource_mut(resource)?;
         let end = offset.checked_add(bytes.len()).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, "resource write range overflow")
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "resource write range overflow",
+            )
         })?;
         if end > resource.bytes.len() {
             return Err(AppError::new(

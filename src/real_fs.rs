@@ -329,7 +329,10 @@ impl WindowsPathResolver {
             if !ancestor.pop() {
                 return Err(AppError::new(
                     ReasonCode::RcFsSandboxEscape,
-                    format!("path {} has no existing ancestor inside the GE root", path.display()),
+                    format!(
+                        "path {} has no existing ancestor inside the GE root",
+                        path.display()
+                    ),
                 ));
             }
             // Defense in depth: never walk lexically above the GE root.
@@ -739,8 +742,12 @@ impl RealFilesystem {
         let real_path = self.resolver.resolve(windows_path)?;
 
         // Enforce Windows share-mode semantics before touching the file.
-        let access = (if can_read { ACCESS_READ } else { 0 }) | (if can_write { ACCESS_WRITE } else { 0 });
-        let claim = HandleClaim { access, share: options.share_mode };
+        let access =
+            (if can_read { ACCESS_READ } else { 0 }) | (if can_write { ACCESS_WRITE } else { 0 });
+        let claim = HandleClaim {
+            access,
+            share: options.share_mode,
+        };
         if !self.share_registry.register(&real_path, claim) {
             return Err(AppError::new(
                 ReasonCode::RcFsSharingViolation,
@@ -801,21 +808,16 @@ impl RealFilesystem {
     pub fn delete_file(&self, windows_path: &str) -> AppResult<()> {
         self.authorize_path(windows_path, true)?;
         let real_path = self.resolver.resolve(windows_path)?;
-        fs::remove_file(&real_path).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("cannot delete file: {e}"))
-        })
+        fs::remove_file(&real_path)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot delete file: {e}")))
     }
 
     /// Remove a directory.
     pub fn remove_directory(&self, windows_path: &str) -> AppResult<()> {
         self.authorize_path(windows_path, true)?;
         let real_path = self.resolver.resolve(windows_path)?;
-        fs::remove_dir_all(&real_path).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("cannot remove directory: {e}"),
-            )
-        })
+        fs::remove_dir_all(&real_path)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot remove directory: {e}")))
     }
 
     /// Move/rename a file.
@@ -860,12 +862,8 @@ impl RealFilesystem {
     pub fn metadata(&self, windows_path: &str) -> AppResult<FileMetadata> {
         self.authorize_path(windows_path, false)?;
         let real_path = self.resolver.resolve(windows_path)?;
-        let meta = fs::metadata(&real_path).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("cannot get metadata: {e}"),
-            )
-        })?;
+        let meta = fs::metadata(&real_path)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot get metadata: {e}")))?;
 
         Ok(FileMetadata {
             size: meta.len(),
@@ -883,20 +881,13 @@ impl RealFilesystem {
         let real_path = self.resolver.resolve(windows_path)?;
         let mut entries = Vec::new();
 
-        let dir = fs::read_dir(&real_path).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("cannot read directory: {e}"),
-            )
-        })?;
+        let dir = fs::read_dir(&real_path)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot read directory: {e}")))?;
 
         for entry in dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let meta = entry.metadata().map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcIo,
-                    format!("cannot read entry metadata: {e}"),
-                )
+                AppError::new(ReasonCode::RcIo, format!("cannot read entry metadata: {e}"))
             })?;
 
             entries.push(DirEntry {
@@ -1317,10 +1308,7 @@ impl RealFilesystem {
         let names = parse_xattr_list(&buf[..n]);
         let stream_names: Vec<String> = names
             .into_iter()
-            .filter_map(|name| {
-                name.strip_prefix(XATTR_ADS_PREFIX)
-                    .map(str::to_string)
-            })
+            .filter_map(|name| name.strip_prefix(XATTR_ADS_PREFIX).map(str::to_string))
             .collect();
 
         Ok(stream_names)
@@ -1705,18 +1693,17 @@ pub fn backup_write_file(
     for entry in &backup.entries {
         if entry.stream_name.is_empty() {
             // Write main data stream
-            let mut file =
-                real_fs.open_file_with_options(
-                    windows_path,
-                    false,
-                    true,
-                    true,
-                    true,
-                    OpenFileOptions {
-                        share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        delete_on_close: false,
-                    },
-                )?;
+            let mut file = real_fs.open_file_with_options(
+                windows_path,
+                false,
+                true,
+                true,
+                true,
+                OpenFileOptions {
+                    share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    delete_on_close: false,
+                },
+            )?;
             file.write(&entry.data)?;
             file.flush()?;
         } else {
@@ -2261,19 +2248,31 @@ mod tests {
 
         // open_file through the symlink must fail.
         let result = fs.open_file("C:\\escape\\victim.txt", true, false, false, false);
-        assert!(result.is_err(), "open through symlink must fail, got {result:?}");
+        assert!(
+            result.is_err(),
+            "open through symlink must fail, got {result:?}"
+        );
 
         // delete_file through the symlink must fail (must not delete outside files).
         let result = fs.delete_file("C:\\escape\\victim.txt");
-        assert!(result.is_err(), "delete through symlink must fail, got {result:?}");
+        assert!(
+            result.is_err(),
+            "delete through symlink must fail, got {result:?}"
+        );
         assert!(
             outside_dir.join("victim.txt").exists(),
             "outside file must be untouched"
         );
 
         // copy/move through the symlink must fail.
-        assert!(fs.copy_file("C:\\escape\\victim.txt", "C:\\copied.txt").is_err());
-        assert!(fs.move_file("C:\\escape\\victim.txt", "C:\\moved.txt").is_err());
+        assert!(
+            fs.copy_file("C:\\escape\\victim.txt", "C:\\copied.txt")
+                .is_err()
+        );
+        assert!(
+            fs.move_file("C:\\escape\\victim.txt", "C:\\moved.txt")
+                .is_err()
+        );
         assert!(!fs.exists("C:\\escape\\victim.txt"));
     }
 
@@ -2285,7 +2284,9 @@ mod tests {
         // A symlink that stays inside the GE root is fine.
         fs.create_directory("C:\\real_dir").unwrap();
         {
-            let mut f = fs.open_file("C:\\real_dir\\data.txt", false, true, true, false).unwrap();
+            let mut f = fs
+                .open_file("C:\\real_dir\\data.txt", false, true, true, false)
+                .unwrap();
             f.write(b"data").unwrap();
         }
         let link = tmp.path().join("drive_c").join("alias");
@@ -2293,7 +2294,10 @@ mod tests {
 
         assert!(fs.exists("C:\\alias\\data.txt"));
         let meta = fs.metadata("C:\\alias\\data.txt");
-        assert!(meta.is_ok(), "in-root symlink should be allowed, got {meta:?}");
+        assert!(
+            meta.is_ok(),
+            "in-root symlink should be allowed, got {meta:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -2355,11 +2359,19 @@ mod tests {
         // move/copy into a missing parent also fail without creating it.
         fs.create_directory("C:\\sub").unwrap();
         {
-            let mut f = fs.open_file("C:\\sub\\data.txt", false, true, true, false).unwrap();
+            let mut f = fs
+                .open_file("C:\\sub\\data.txt", false, true, true, false)
+                .unwrap();
             f.write(b"data").unwrap();
         }
-        assert!(fs.move_file("C:\\sub\\data.txt", "C:\\no_move_dir\\out.txt").is_err());
-        assert!(fs.copy_file("C:\\sub\\data.txt", "C:\\no_copy_dir\\out.txt").is_err());
+        assert!(
+            fs.move_file("C:\\sub\\data.txt", "C:\\no_move_dir\\out.txt")
+                .is_err()
+        );
+        assert!(
+            fs.copy_file("C:\\sub\\data.txt", "C:\\no_copy_dir\\out.txt")
+                .is_err()
+        );
         assert!(!tmp.path().join("drive_c").join("no_move_dir").exists());
         assert!(!tmp.path().join("drive_c").join("no_copy_dir").exists());
     }
@@ -2394,8 +2406,8 @@ mod tests {
         drop(handle);
 
         // After close, the file can be opened again.
-        assert!(fs
-            .open_file_with_options(
+        assert!(
+            fs.open_file_with_options(
                 "C:\\shared.txt",
                 true,
                 false,
@@ -2403,7 +2415,8 @@ mod tests {
                 false,
                 OpenFileOptions::default(),
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2489,7 +2502,10 @@ mod tests {
                 "stream name {bad:?} must be rejected, got {result:?}"
             );
             let result = fs.read_alternate_stream("C:\\ads_base.bin", bad);
-            assert!(result.is_err(), "stream name {bad:?} must be rejected on read");
+            assert!(
+                result.is_err(),
+                "stream name {bad:?} must be rejected on read"
+            );
         }
     }
 
@@ -2509,7 +2525,9 @@ mod tests {
             let sidecar = ads_sidecar_path_for(&base.join("file.txt"), evil);
             let parent_dir = sidecar.parent().unwrap();
             assert_eq!(
-                parent_dir.file_name().map(|n| n.to_string_lossy().to_string()),
+                parent_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string()),
                 Some(".casa1_ads".to_string()),
                 "sidecar for {evil:?} must stay inside .casa1_ads"
             );
@@ -2539,11 +2557,17 @@ mod tests {
         });
 
         let result = fs.open_file("C:\\auth.txt", false, true, true, false);
-        assert!(result.is_err(), "authorizer must block open, got {result:?}");
+        assert!(
+            result.is_err(),
+            "authorizer must block open, got {result:?}"
+        );
         assert!(fs.copy_file("C:\\a", "C:\\b").is_err());
 
         *denied.lock().unwrap() = false;
-        assert!(fs.open_file("C:\\auth.txt", false, true, true, false).is_ok());
+        assert!(
+            fs.open_file("C:\\auth.txt", false, true, true, false)
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------

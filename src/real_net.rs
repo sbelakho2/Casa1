@@ -349,21 +349,21 @@ impl RealTlsStream {
         self.stream
             .get_mut()
             .set_nonblocking(nonblocking)
-            .map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcIo,
-                    format!("TLS set_nonblocking error: {e}"),
-                )
-            })
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS set_nonblocking error: {e}")))
     }
 
     /// Set read/write timeout on the underlying TCP stream.
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> AppResult<()> {
         let tcp = self.stream.get_mut();
-        tcp.set_read_timeout(timeout)
-            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS set_read_timeout error: {e}")))?;
-        tcp.set_write_timeout(timeout)
-            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS set_write_timeout error: {e}")))
+        tcp.set_read_timeout(timeout).map_err(|e| {
+            AppError::new(ReasonCode::RcIo, format!("TLS set_read_timeout error: {e}"))
+        })?;
+        tcp.set_write_timeout(timeout).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("TLS set_write_timeout error: {e}"),
+            )
+        })
     }
 }
 
@@ -393,10 +393,7 @@ pub struct RealHttpClient {
 
 /// Composite key identifying a cookie in the jar.
 fn cookie_key(cookie: &crate::network::Cookie) -> String {
-    format!(
-        "{}\u{0}{}\u{0}{}",
-        cookie.name, cookie.domain, cookie.path
-    )
+    format!("{}\u{0}{}\u{0}{}", cookie.name, cookie.domain, cookie.path)
 }
 
 impl RealHttpClient {
@@ -575,9 +572,7 @@ impl RealHttpClient {
                         self.cookie_expiries
                             .get(&cookie_key(cookie))
                             .is_none_or(|expires| *expires > now)
-                            && crate::network::cookie_matches_origin(
-                                cookie, &host, &path, secure,
-                            )
+                            && crate::network::cookie_matches_origin(cookie, &host, &path, secure)
                     })
                     .map(|cookie| format!("{}={}", cookie.name, cookie.value))
                     .collect()
@@ -954,8 +949,10 @@ impl RealNetworkStack {
             let socket_addr: SocketAddr = match format!("{}:{}", addr.ip, addr.port).parse() {
                 Ok(socket_addr) => socket_addr,
                 Err(e) => {
-                    last_error =
-                        Some(AppError::new(ReasonCode::RcIo, format!("invalid address: {e}")));
+                    last_error = Some(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("invalid address: {e}"),
+                    ));
                     continue;
                 }
             };
@@ -980,10 +977,7 @@ impl RealNetworkStack {
         }
         let stream = stream.ok_or_else(|| {
             last_error.unwrap_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcIo,
-                    format!("no address for {host}:{port}"),
-                )
+                AppError::new(ReasonCode::RcIo, format!("no address for {host}:{port}"))
             })
         })?;
 
@@ -1411,10 +1405,7 @@ pub fn poll_sockets(
         if fd < 0 || fd as usize >= libc::FD_SETSIZE {
             return Err(AppError::new(
                 ReasonCode::RcIo,
-                format!(
-                    "socket fd {fd} exceeds FD_SETSIZE ({})",
-                    libc::FD_SETSIZE
-                ),
+                format!("socket fd {fd} exceeds FD_SETSIZE ({})", libc::FD_SETSIZE),
             ));
         }
     }
@@ -1422,10 +1413,7 @@ pub fn poll_sockets(
         if fd < 0 || fd as usize >= libc::FD_SETSIZE {
             return Err(AppError::new(
                 ReasonCode::RcIo,
-                format!(
-                    "socket fd {fd} exceeds FD_SETSIZE ({})",
-                    libc::FD_SETSIZE
-                ),
+                format!("socket fd {fd} exceeds FD_SETSIZE ({})", libc::FD_SETSIZE),
             ));
         }
     }
@@ -1516,10 +1504,10 @@ fn map_connect_error_kind(kind: std::io::ErrorKind) -> i32 {
         std::io::ErrorKind::ConnectionRefused => 10061, // WSAECONNREFUSED
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => 10054, // WSAECONNRESET
         std::io::ErrorKind::NotConnected => 10057, // WSAENOTCONN
-        std::io::ErrorKind::TimedOut => 10060,   // WSAETIMEDOUT
+        std::io::ErrorKind::TimedOut => 10060,     // WSAETIMEDOUT
         std::io::ErrorKind::HostUnreachable => 10065, // WSAEHOSTUNREACH
         std::io::ErrorKind::NetworkUnreachable => 10051, // WSAENETUNREACH
-        _ => 10022, // WSAEINVAL
+        _ => 10022,                                // WSAEINVAL
     }
 }
 
@@ -1682,11 +1670,8 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_basic() {
-        let (cookie, expires_at) = parse_set_cookie(
-            "session=abc123; domain=.example.com; path=/; secure",
-            None,
-        )
-        .unwrap();
+        let (cookie, expires_at) =
+            parse_set_cookie("session=abc123; domain=.example.com; path=/; secure", None).unwrap();
         assert_eq!(cookie.name, "session");
         assert_eq!(cookie.value, "abc123");
         assert_eq!(cookie.domain, "example.com");
@@ -1724,9 +1709,8 @@ mod tests {
 
     #[test]
     fn split_set_cookie_preserves_expires_comma() {
-        let values = split_set_cookie_values(
-            "a=1; Expires=Wed, 09 Jun 2026 12:00:00 GMT, b=2; Path=/",
-        );
+        let values =
+            split_set_cookie_values("a=1; Expires=Wed, 09 Jun 2026 12:00:00 GMT, b=2; Path=/");
         assert_eq!(values.len(), 2);
         assert!(values[0].contains("Expires=Wed, 09 Jun 2026"));
         assert_eq!(values[1], "b=2; Path=/");

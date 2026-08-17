@@ -300,7 +300,10 @@ impl FilesystemSandbox {
         };
         if is_sensitive_path(&before) {
             if within_root(&before, &self.ge_root)
-                || self.allow_list.iter().any(|root| within_root(&before, root))
+                || self
+                    .allow_list
+                    .iter()
+                    .any(|root| within_root(&before, root))
             {
                 return Ok(AuthorizedPath {
                     canonical_path: after,
@@ -312,7 +315,10 @@ impl FilesystemSandbox {
             ));
         }
         if within_root(&before, &self.ge_root)
-            || self.allow_list.iter().any(|root| within_root(&before, root))
+            || self
+                .allow_list
+                .iter()
+                .any(|root| within_root(&before, root))
         {
             Ok(AuthorizedPath {
                 canonical_path: after,
@@ -793,10 +799,7 @@ pub fn resolve_sandbox_path(
     }
 
     // Reject path traversal with ..
-    if requested_path
-        .split(['/', '\\'])
-        .any(|seg| seg == "..")
-    {
+    if requested_path.split(['/', '\\']).any(|seg| seg == "..") {
         return Err(AppError::new(
             ReasonCode::RcFsPathInvalid,
             format!("sandbox: path traversal denied: {requested_path}"),
@@ -4047,8 +4050,7 @@ impl AntiDebugState {
     /// backward mid-session.
     pub fn get_tick_count(&self) -> u32 {
         let prev = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        prev
-            .saturating_add(1)
+        prev.saturating_add(1)
             .saturating_mul(30_000)
             .min(u32::MAX as u64) as u32
     }
@@ -5364,7 +5366,8 @@ pub fn win_verify_trust(policy_guid: WinTrustPolicyGuid, pe_data: &[u8]) -> WinV
             // certificate check observe "trusted", so fail closed instead.
             WinVerifyTrustResult {
                 error: win_trust_error::TRUST_E_PROVIDER_UNKNOWN,
-                description: "HTTPS provider: subject type not supported by this provider.".to_string(),
+                description: "HTTPS provider: subject type not supported by this provider."
+                    .to_string(),
                 verdict: None,
             }
         }
@@ -5470,8 +5473,7 @@ mod tests {
         let pad_len = block_size - (code.len() % block_size);
         let mut padded = code.clone();
         padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
-        let ciphertext =
-            crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
+        let ciphertext = crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
 
         // Replace section.decrypted with the ciphertext so the AES decrypt works
         emulator.config.code_sections[0].decrypted = ciphertext;
@@ -5529,8 +5531,7 @@ mod tests {
         let pad_len = block_size - (code.len() % block_size);
         let mut padded = code.clone();
         padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
-        let ciphertext =
-            crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
+        let ciphertext = crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
         emulator.config.code_sections[0].decrypted = ciphertext;
 
         emulator.decrypt_code_section(&mut memory, 0).unwrap();
@@ -6919,7 +6920,7 @@ impl CertificateStore {
             // `find_by_serial` does not implement. Return no results instead
             // of silently producing wrong matches for an unsupported type.
             5 => vec![],
-            _ => vec![],                             // unsupported search type
+            _ => vec![], // unsupported search type
         }
     }
 
@@ -7655,7 +7656,8 @@ impl BCryptRuntime {
                         use aes::Aes128;
                         use cbc::Encryptor;
                         type Aes128CbcEnc = Encryptor<Aes128>;
-                        let mut encryptor = Aes128CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
+                        let mut encryptor =
+                            Aes128CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
                         for chunk in buf.chunks_exact_mut(16) {
                             encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
@@ -7664,7 +7666,8 @@ impl BCryptRuntime {
                         use aes::Aes256;
                         use cbc::Encryptor;
                         type Aes256CbcEnc = Encryptor<Aes256>;
-                        let mut encryptor = Aes256CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
+                        let mut encryptor =
+                            Aes256CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
                         for chunk in buf.chunks_exact_mut(16) {
                             encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
@@ -7707,7 +7710,8 @@ impl BCryptRuntime {
                         use aes::Aes128;
                         use cbc::Decryptor;
                         type Aes128CbcDec = Decryptor<Aes128>;
-                        let mut decryptor = Aes128CbcDec::new_from_slices(&key.key_data, iv).ok()?;
+                        let mut decryptor =
+                            Aes128CbcDec::new_from_slices(&key.key_data, iv).ok()?;
                         for chunk in buf.chunks_exact_mut(16) {
                             decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
@@ -7716,7 +7720,8 @@ impl BCryptRuntime {
                         use aes::Aes256;
                         use cbc::Decryptor;
                         type Aes256CbcDec = Decryptor<Aes256>;
-                        let mut decryptor = Aes256CbcDec::new_from_slices(&key.key_data, iv).ok()?;
+                        let mut decryptor =
+                            Aes256CbcDec::new_from_slices(&key.key_data, iv).ok()?;
                         for chunk in buf.chunks_exact_mut(16) {
                             decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }

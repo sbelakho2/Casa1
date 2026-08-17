@@ -1357,14 +1357,28 @@ fn t34_41_topology_node_connections() {
 fn t34_42_session_start_without_topology() {
     let mut session = MfMediaSession::new();
 
-    // Starting from Idle without setting a topology
-    // This should still succeed (just transitions to Playing),
-    // but no topology events will be emitted
+    // Real Media Foundation rejects Start from Idle without a topology
+    // (the session never enters Playing and no SessionStarted event is
+    // emitted). The failure must be graceful: an RcInvalidState error and
+    // an unchanged state machine.
     let result = session.start();
-    assert!(result.is_ok(), "Starting without topology should succeed");
-    assert_eq!(session.state(), MfSessionState::Playing);
-    let event = session.get_event().unwrap();
-    assert_eq!(event.event_type, MediaEventType::SessionStarted);
+    assert!(
+        result.is_err(),
+        "Starting without topology must be refused, not faked"
+    );
+    assert_eq!(
+        result.unwrap_err().code,
+        casa1::reason::ReasonCode::RcInvalidState
+    );
+    assert_eq!(
+        session.state(),
+        MfSessionState::Idle,
+        "state must remain Idle after a refused start"
+    );
+    assert!(
+        session.get_event().is_none(),
+        "no session events may be emitted for a refused start"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

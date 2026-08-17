@@ -811,12 +811,14 @@ impl AudioSubsystem {
             self.destroy_voice(child)?;
         }
         // Unlink this voice from its parent's cached child list.
-        let parent_id = self.voices.get(&voice).and_then(|record| match record.kind {
-            VoiceKind::Submix { destination, .. } | VoiceKind::Source { destination, .. } => {
-                Some(destination)
-            }
-            _ => None,
-        });
+        let parent_id =
+            self.voices
+                .get(&voice)
+                .and_then(|record| match record.kind {
+                    VoiceKind::Submix { destination, .. }
+                    | VoiceKind::Source { destination, .. } => Some(destination),
+                    _ => None,
+                });
         if let Some(parent_id) = parent_id
             && let Some(parent) = self.voices.get_mut(&parent_id)
         {
@@ -1429,7 +1431,9 @@ impl AudioSubsystem {
         record.looping = (flags & 0x00000001) != 0; // DSBPLAY_LOOPING
         // Re-arm DSBPN_OFFSETSTOP (u32::MAX) so it fires again on the next
         // stop; ordinary offsets are re-armed on wrap-around.
-        record.fired_notifications.retain(|&offset| offset != u32::MAX);
+        record
+            .fired_notifications
+            .retain(|&offset| offset != u32::MAX);
         Ok(())
     }
 
@@ -1808,7 +1812,17 @@ impl AudioSubsystem {
     ) -> AppResult<RenderOutput> {
         Self::check_render_frames(frames)?;
         // ── Gather immutable state before mutating ──────────────────────
-        let (channels, sample_rate, device_id, direct_sound_id, volume_db, pan_db, frequency, looping, is_lost) = {
+        let (
+            channels,
+            sample_rate,
+            device_id,
+            direct_sound_id,
+            volume_db,
+            pan_db,
+            frequency,
+            looping,
+            is_lost,
+        ) = {
             let record = self.direct_sound_buffers.get(&buffer).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcAudioUnsupported,
@@ -2033,7 +2047,12 @@ impl AudioSubsystem {
                 self.consume_source_frames(voice, frames, callbacks, underflow_frames)?
             }
         };
-        apply_levels(&mut mix, channels, volume, &self.voice(voice)?.channel_volumes);
+        apply_levels(
+            &mut mix,
+            channels,
+            volume,
+            &self.voice(voice)?.channel_volumes,
+        );
         // Apply effects chain (if any effects are registered), borrowing the
         // chain briefly — no recursion happens at this point.
         if !self.voice(voice)?.effects_chain.effect_clsids.is_empty() {

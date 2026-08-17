@@ -860,8 +860,9 @@ impl GameEnvironment {
         self.reject_write_to_read_only_drive(windows_path)?;
         // A missing parent is ERROR_PATH_NOT_FOUND (Windows), not
         // ERROR_FILE_NOT_FOUND: the parent resolution surfaces RcFsNotFound.
-        let (parent, requested_name, normalized_path) =
-            self.resolve_parent_for_create(windows_path, None).map_err(|error| {
+        let (parent, requested_name, normalized_path) = self
+            .resolve_parent_for_create(windows_path, None)
+            .map_err(|error| {
                 if error.code == ReasonCode::RcFsNotFound {
                     AppError::new(
                         ReasonCode::RcFsPathInvalid,
@@ -1023,7 +1024,11 @@ impl GameEnvironment {
             .or(last_access_time_ticks)
             .or(last_write_time_ticks)
             .unwrap_or_else(|| current_windows_ticks(false));
-        let is_new_entry = !self.config.fs_state.entries.contains_key(&resolved.normalized_path);
+        let is_new_entry = !self
+            .config
+            .fs_state
+            .entries
+            .contains_key(&resolved.normalized_path);
         let entry = self
             .config
             .fs_state
@@ -1037,18 +1042,18 @@ impl GameEnvironment {
                         .prune_pending = true;
                 }
                 FsMetadataRecord {
-                kind: kind.clone(),
-                original_case,
-                attributes: if kind == FsEntryKind::Directory {
-                    vec!["directory".to_string()]
-                } else {
-                    Vec::new()
-                },
-                // fallback: use any provided time or current time as default
-                creation_time_ticks: fallback_ticks,
-                last_access_time_ticks: fallback_ticks,
-                last_write_time_ticks: fallback_ticks,
-            }
+                    kind: kind.clone(),
+                    original_case,
+                    attributes: if kind == FsEntryKind::Directory {
+                        vec!["directory".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    // fallback: use any provided time or current time as default
+                    creation_time_ticks: fallback_ticks,
+                    last_access_time_ticks: fallback_ticks,
+                    last_write_time_ticks: fallback_ticks,
+                }
             });
 
         if let Some(value) = creation_time_ticks {
@@ -1636,8 +1641,10 @@ impl GameEnvironment {
                 .join(format!("users/{}/AppData/Roaming", self.config.user_name)),
             self.drive_c()
                 .join(format!("users/{}/AppData/Local", self.config.user_name)),
-            self.drive_c()
-                .join(format!("users/{}/AppData/Local/Temp", self.config.user_name)),
+            self.drive_c().join(format!(
+                "users/{}/AppData/Local/Temp",
+                self.config.user_name
+            )),
             self.drive_c()
                 .join(format!("users/{}/AppData/LocalLow", self.config.user_name)),
             self.root.join("fs"),
@@ -2571,9 +2578,7 @@ fn current_windows_ticks(dtm: bool) -> u64 {
 /// the current time.
 fn system_time_to_filetime_ticks(time: SystemTime) -> u64 {
     match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => {
-            duration.as_nanos().div_euclid(100) as u64 + FILE_TIME_EPOCH_OFFSET_TICKS
-        }
+        Ok(duration) => duration.as_nanos().div_euclid(100) as u64 + FILE_TIME_EPOCH_OFFSET_TICKS,
         Err(_) => current_windows_ticks(false),
     }
 }

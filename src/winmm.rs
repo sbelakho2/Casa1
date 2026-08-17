@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ── Audio subsystem imports ─────────────────────────────────────────────────
 use crate::audio::{SampleFormat, WaveFormat};
 use crate::midi;
-use crate::real_audio::{pcm_bytes_to_float, RealAudioBackend};
+use crate::real_audio::{RealAudioBackend, pcm_bytes_to_float};
 
 // ── Wave message constants ──────────────────────────────────────────────────
 
@@ -1228,11 +1228,7 @@ impl WinMmSubsystem {
     /// semantics.
     ///
     /// Returns `MMSYSERR_INVALHANDLE` if the handle is invalid.
-    pub fn wave_out_get_position(
-        &self,
-        device_handle: u32,
-        time_format: u32,
-    ) -> (u32, u32) {
+    pub fn wave_out_get_position(&self, device_handle: u32, time_format: u32) -> (u32, u32) {
         let device = match self
             .wave_out_devices
             .iter()
@@ -1247,9 +1243,7 @@ impl WinMmSubsystem {
             MmtTime::TIME_SAMPLES => device.total_frames_consumed as u32,
             MmtTime::TIME_MS => {
                 if device.format.n_samples_per_sec > 0 {
-                    (device
-                        .total_frames_consumed
-                        .saturating_mul(1000)
+                    (device.total_frames_consumed.saturating_mul(1000)
                         / device.format.n_samples_per_sec as u64) as u32
                 } else {
                     0
@@ -2012,7 +2006,8 @@ impl WinMmSubsystem {
                 if fmt_data.len() >= 16 {
                     format_tag = u16::from_le_bytes([fmt_data[0], fmt_data[1]]);
                     channels = u16::from_le_bytes([fmt_data[2], fmt_data[3]]);
-                    sample_rate = u32::from_le_bytes([fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7]]);
+                    sample_rate =
+                        u32::from_le_bytes([fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7]]);
                     bits_per_sample = u16::from_le_bytes([fmt_data[14], fmt_data[15]]);
                 }
             } else if ckid == FOURCC_DATA && offset + 8 + cksize <= file_data.len() {
@@ -2532,7 +2527,12 @@ impl WinMmSubsystem {
             }
         }
 
-        mmio.position = chunk.dw_data_offset as u64 + if chunk.ckid == FOURCC_RIFF || chunk.ckid == FOURCC_LIST { 4 } else { 0 };
+        mmio.position = chunk.dw_data_offset as u64
+            + if chunk.ckid == FOURCC_RIFF || chunk.ckid == FOURCC_LIST {
+                4
+            } else {
+                0
+            };
 
         // Push onto stack so mmio_ascend can finalise the size
         mmio.chunk_stack.push(MmioChunkEntry {
@@ -2869,10 +2869,8 @@ mod tests {
     #[test]
     fn test_mmio_create_ascend_patches_chunk_sizes() {
         let mut mm = WinMmSubsystem::new();
-        let path = std::env::temp_dir().join(format!(
-            "casa1-mmio-ascend-{}.wav",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("casa1-mmio-ascend-{}.wav", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
 
         let handle = mm.mmio_open_w(path_str.clone(), MMIO_WRITE | MMIO_CREATE);
@@ -2883,18 +2881,12 @@ mod tests {
             fcc_type: FOURCC_WAVE,
             ..Default::default()
         };
-        assert_eq!(
-            mm.mmio_create_chunk(handle, &mut riff, 0),
-            MMSYSERR_NOERROR
-        );
+        assert_eq!(mm.mmio_create_chunk(handle, &mut riff, 0), MMSYSERR_NOERROR);
         let mut data = MmioChunkInfo {
             ckid: FOURCC_DATA,
             ..Default::default()
         };
-        assert_eq!(
-            mm.mmio_create_chunk(handle, &mut data, 0),
-            MMSYSERR_NOERROR
-        );
+        assert_eq!(mm.mmio_create_chunk(handle, &mut data, 0), MMSYSERR_NOERROR);
 
         let payload = [0xABu8; 32];
         assert_eq!(
@@ -2936,10 +2928,7 @@ mod tests {
     #[test]
     fn test_mmio_seek_positions() {
         let mut mm = WinMmSubsystem::new();
-        let path = std::env::temp_dir().join(format!(
-            "casa1-mmio-seek-{}.bin",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("casa1-mmio-seek-{}.bin", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
         let handle = mm.mmio_open_w(path_str.clone(), MMIO_WRITE | MMIO_CREATE);
         assert_ne!(handle, 0);

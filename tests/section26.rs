@@ -589,7 +589,10 @@ fn t26_10_vulkan_loader_reporting_contract() {
         compute_dispatches: 0,
     };
     assert_eq!(
-        loader.render_sample(&bad_sample).expect_err("must reject").code,
+        loader
+            .render_sample(&bad_sample)
+            .expect_err("must reject")
+            .code,
         casa1::reason::ReasonCode::RcVulkanNotSupported,
         "unadvertised extensions must be rejected with RcVulkanNotSupported"
     );
@@ -646,10 +649,7 @@ fn t26_11_shader_feature_detection() {
     );
 
     // Argument buffers are a documented baseline capability of the backend.
-    assert!(
-        caps.argument_buffers,
-        "argument buffers must be supported"
-    );
+    assert!(caps.argument_buffers, "argument buffers must be supported");
 
     // Verify format support reports mappings for common formats.
     let fmt_rgba = gfx::format_mapping(DxgiFormat::R8G8B8A8Unorm);
@@ -661,8 +661,7 @@ fn t26_11_shader_feature_detection() {
 
     // The mapping must be a real mapping: the Metal pixel format differs from
     // the DXGI format for BC7-sRGB (block-compressed, converted in shaders).
-    let bc7 = gfx::format_mapping(DxgiFormat::Bc7UnormSrgb)
-        .expect("BC7 sRGB must map");
+    let bc7 = gfx::format_mapping(DxgiFormat::Bc7UnormSrgb).expect("BC7 sRGB must map");
     assert_eq!(
         bc7.metal,
         casa1::gfx::MtlPixelFormat::Bc7RgbaUnormSrgb,

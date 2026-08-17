@@ -581,7 +581,8 @@ impl AsyncPipelineCompiler {
             return;
         }
         self.in_flight.retain(|req| !finished.contains(&req.id));
-        self._block_handles.retain(|handle| !finished.contains(&handle.id));
+        self._block_handles
+            .retain(|handle| !finished.contains(&handle.id));
     }
 
     /// Block the calling thread until a specific compilation completes.

@@ -1059,7 +1059,9 @@ pub fn with_global_cef_compositor<F, R>(f: F) -> R
 where
     F: FnOnce(&mut CefMetalCompositor) -> R,
 {
-    let mut guard = GLOBAL_CEF_METAL_COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = GLOBAL_CEF_METAL_COMPOSITOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
