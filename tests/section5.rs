@@ -211,12 +211,38 @@ fn t5_2_overlapped_io_randomized_tests_vs_independent_reference() {
         .get_overlapped_result(pending, false)
         .expect("cancelled overlapped result");
     assert!(cancelled.cancelled);
+    // CallNamedPipe returns whatever the SERVER wrote into the pipe — not a
+    // copy of the request (Windows-compatible IPC).
+    let server = win32
+        .create_named_pipe_w(
+            r"\\.\pipe\call-ipc",
+            0x3,
+            0,
+            1,
+            4096,
+            4096,
+            0,
+            false,
+            None,
+            None,
+        )
+        .expect("create registered server pipe");
     for payload in [b"payload".as_slice(), b"longer-payload".as_slice()] {
-        let echo = win32
-            .call_named_pipe(r"\\.\pipe\steam-ipc", payload)
+        // The server writes its response into the pipe before the call.
+        win32
+            .write_file(server, b"server-response")
+            .expect("server response write");
+        let response = win32
+            .call_named_pipe(r"\\.\pipe\call-ipc", payload)
             .expect("call named pipe");
-        assert_eq!(echo, payload);
+        assert_eq!(
+            response, b"server-response",
+            "the response must be the server's bytes, not a copy of the request"
+        );
     }
+    win32
+        .close_handle(server)
+        .expect("close registered server pipe");
 }
 
 #[test]
