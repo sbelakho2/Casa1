@@ -57,6 +57,9 @@ pub struct FirstFailure {
     pub guest_error: Option<u32>,
     /// The Windows path involved (file failures), when known.
     pub windows_path: Option<String>,
+    /// Compact JSON of the failing call's parameters (CreateFileW's
+    /// path/desired_access/share_mode/disposition/...), when known.
+    pub params: Option<String>,
     /// Short human-readable detail string.
     pub detail: String,
 }
@@ -109,6 +112,7 @@ pub fn record_first_failure_in(
     guest_error: Option<u32>,
     detail: String,
     path_value: Option<String>,
+    params: Option<String>,
 ) -> bool {
     let slot = match category {
         FailureCategory::Fs => &mut milestones.first_failures.fs,
@@ -128,11 +132,13 @@ pub fn record_first_failure_in(
         guest_error,
         detail,
         windows_path: path_value,
+        params,
     });
     true
 }
 
 /// Record the first failure for `category` into the shared static.
+#[allow(clippy::too_many_arguments)]
 pub fn record_first_failure(
     category: FailureCategory,
     guest_pc: u32,
@@ -141,6 +147,7 @@ pub fn record_first_failure(
     guest_error: Option<u32>,
     detail: String,
     path_value: Option<String>,
+    params: Option<String>,
 ) -> bool {
     with_milestones(|milestones| {
         record_first_failure_in(
@@ -152,6 +159,7 @@ pub fn record_first_failure(
             guest_error,
             detail,
             path_value,
+            params,
         )
     })
     .unwrap_or(false)

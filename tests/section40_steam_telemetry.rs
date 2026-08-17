@@ -134,6 +134,7 @@ fn first_failure_records_only_first_per_category() {
         Some(2),
         "first fs failure".to_string(),
         None,
+        None,
     );
     assert!(recorded);
     let first = milestones.first_failures.fs.clone().expect("recorded");
@@ -153,6 +154,7 @@ fn first_failure_records_only_first_per_category() {
         Some(3),
         "second fs failure".to_string(),
         None,
+        None,
     );
     assert!(!recorded);
     let second = milestones.first_failures.fs.clone().expect("still first");
@@ -168,6 +170,7 @@ fn first_failure_records_only_first_per_category() {
         Some("connect".to_string()),
         Some(10061),
         "connection refused".to_string(),
+        None,
         None,
     );
     assert!(recorded);
