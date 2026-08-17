@@ -152,6 +152,31 @@
     }
   ],
   "fs_state": {
-    "entries": {}
+    "entries": {
+      "C:\\steam\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 134314260480000000,
+        "last_access_time_ticks": 134314260480000000,
+        "last_write_time_ticks": 134314306900000000
+      },
+      "C:\\steam\\.writable": {
+        "kind": "File",
+        "original_case": ".writable",
+        "attributes": [],
+        "creation_time_ticks": 134314307816339260,
+        "last_access_time_ticks": 134314307816339260,
+        "last_write_time_ticks": 134314307816339260
+      },
+      "C:\\steam\\package\\.writable": {
+        "kind": "File",
+        "original_case": ".writable",
+        "attributes": [],
+        "creation_time_ticks": 134314307816387690,
+        "last_access_time_ticks": 134314307816387690,
+        "last_write_time_ticks": 134314307816387690
+      }
+    }
   }
 }
