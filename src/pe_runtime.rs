@@ -6590,7 +6590,27 @@ pub fn execute_with_options(
                 }
             };
 
-            // JIT is disabled — skip adaptive tiered compilation entirely.
+            // --- Adaptive tiered compilation ---
+            // Hot blocks (>= 50 dispatches) are compiled to MAP_JIT native
+            // code and executed through execute_with_jit.  The tiered
+            // compiler only promotes when the JIT runtime exists
+            // (jit_mode=Enabled); otherwise this stays a cheap counter.
+            if let Some(jit) = runtime.jit_runtime.as_mut() {
+                let block_start = cached_block.start_rip;
+                if let Some(_tier) = runtime.tiered_compiler.record_execution(block_start) {
+                    let ir = &cached_block.translated.ir;
+                    if jit
+                        .get_or_compile(ir, block_start, engine.config.arch, None)
+                        .is_ok()
+                    {
+                        // Sync updated unwind info to the SEH subsystem so that
+                        // RtlVirtualUnwind can find newly compiled JIT blocks.
+                        if jit.is_unwind_dirty() {
+                            jit.unwind_table.register_with_seh(&mut runtime.seh);
+                        }
+                    }
+                }
+            }
 
             if runtime.enable_steam_tracing {
                 if let Some(block_label) = steam_convar_precise_watch {
@@ -9228,13 +9248,16 @@ impl PeHostRuntime {
         //     MAP_JIT execution for ad-hoc-signed binaries, and compiling
         //     blocks that can't execute wastes ~1ms per hot block on
         //     mmap+memcpy+icache syscalls, making the emulator 1000x slower).
-        //   - Enabled: attempt to enable — construct the JIT runtime so the
-        //     machinery is active; on macOS 26 it stays dormant (the
-        //     requested/active distinction is reported in jit_telemetry).
+        //   - Enabled: construct the JIT runtime AND use the real tier
+        //     thresholds ([50, 500]) so hot blocks actually compile and
+        //     execute natively; the requested/active distinction is reported
+        //     in jit_telemetry (on macOS 26 without the allow-jit entitlement
+        //     execution faults and the run fails honestly).
         if matches!(self.jit_mode, crate::runner::JitMode::Enabled) {
             let mut jit_runtime = crate::jit::JitRuntime::new(guest_arch);
             jit_runtime.unwind_table.register_with_seh(&mut self.seh);
             self.jit_runtime = Some(jit_runtime);
+            self.tiered_compiler = crate::jit::TieredCompiler::new();
             eprintln!("[pe_runtime] JIT runtime constructed (jit_mode=enabled)");
         }
     }
@@ -40422,6 +40445,7 @@ impl PeHostRuntime {
                     ("session".to_string(), json!(format!("{session_handle:#x}"))),
                     ("server".to_string(), json!(&server_name)),
                     ("port".to_string(), json!(server_port)),
+                    ("secure".to_string(), json!(server_port == 443)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::WinHttpOpenRequest => {
@@ -40479,6 +40503,8 @@ impl PeHostRuntime {
                 }
                 self.push_trace("winhttp", "WinHttpSendRequest", BTreeMap::from([
                     ("request".to_string(), json!(format!("{request_handle:#x}"))),
+                    ("status".to_string(), json!(self.winhttp.request_status_code(request_handle))),
+                    ("bytes_out".to_string(), json!(optional_length)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::WinHttpReceiveResponse => {
@@ -40495,17 +40521,20 @@ impl PeHostRuntime {
                 }
                 self.push_trace("winhttp", "WinHttpReceiveResponse", BTreeMap::from([
                     ("request".to_string(), json!(format!("{request_handle:#x}"))),
+                    ("status".to_string(), json!(self.winhttp.request_status_code(request_handle))),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::WinHttpReadData => {
                 let request_handle = guest_call_arg(state, memory, 0)?;
                 let buffer_ptr = guest_call_arg(state, memory, 1)?;
                 let bytes_to_read = guest_call_arg_u32(state, memory, 2)?;
+                let mut bytes_read: u32 = 0;
                 if buffer_ptr != 0 && bytes_to_read > 0 {
                     let mut buf = vec![0_u8; bytes_to_read as usize];
                     match self.winhttp.win_http_read_data(request_handle, &mut buf) {
-                        Ok(bytes_read) => {
-                            for (i, &byte) in buf[..bytes_read as usize].iter().enumerate() {
+                        Ok(read) => {
+                            bytes_read = read;
+                            for (i, &byte) in buf[..read as usize].iter().enumerate() {
                                 memory.write_u8(buffer_ptr + i as u64, byte);
                             }
                             state.set(Register::Rax, 1);
@@ -40522,6 +40551,7 @@ impl PeHostRuntime {
                 }
                 self.push_trace("winhttp", "WinHttpReadData", BTreeMap::from([
                     ("request".to_string(), json!(format!("{request_handle:#x}"))),
+                    ("bytes_read".to_string(), json!(bytes_read)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::WinHttpQueryDataAvailable => {
@@ -40775,6 +40805,7 @@ impl PeHostRuntime {
                     ("session".to_string(), json!(format!("{session_handle:#x}"))),
                     ("server".to_string(), json!(&server_name)),
                     ("port".to_string(), json!(server_port)),
+                    ("secure".to_string(), json!(server_port == 443)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::HttpOpenRequestW => {
@@ -40832,18 +40863,22 @@ impl PeHostRuntime {
                 }
                 self.push_trace("wininet", "HttpSendRequestW", BTreeMap::from([
                     ("request".to_string(), json!(format!("{request_handle:#x}"))),
+                    ("status".to_string(), json!(self.winhttp.request_status_code(request_handle))),
+                    ("bytes_out".to_string(), json!(optional_length)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::InternetReadFile => {
                 let request_handle = guest_call_arg(state, memory, 0)?;
                 let buffer_ptr = guest_call_arg(state, memory, 1)?;
                 let bytes_to_read = guest_call_arg_u32(state, memory, 2)?;
+                let mut bytes_read: u32 = 0;
                 if buffer_ptr != 0 && bytes_to_read > 0 {
                     let mut buf = vec![0_u8; bytes_to_read as usize];
                     match self.winhttp.win_http_read_data(request_handle, &mut buf) {
-                        Ok(bytes_read) => {
-                            if bytes_read > 0 {
-                                for (i, &byte) in buf[..bytes_read as usize].iter().enumerate() {
+                        Ok(read) => {
+                            bytes_read = read;
+                            if read > 0 {
+                                for (i, &byte) in buf[..read as usize].iter().enumerate() {
                                     memory.write_u8(buffer_ptr + i as u64, byte);
                                 }
                             }
@@ -40861,6 +40896,7 @@ impl PeHostRuntime {
                 }
                 self.push_trace("wininet", "InternetReadFile", BTreeMap::from([
                     ("request".to_string(), json!(format!("{request_handle:#x}"))),
+                    ("bytes_read".to_string(), json!(bytes_read)),
                 ]), json!(state.get(Register::Rax)));
             }
             HostThunk::InternetCloseHandle => {

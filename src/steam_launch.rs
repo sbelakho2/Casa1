@@ -620,10 +620,10 @@ pub fn create_steam_job(
             .as_millis()
     );
 
-    // The Steam profile's jit_enabled = true means the caller REQUIRES JIT
-    // execution for the supported Apple-Silicon configuration — map it to
-    // JitMode::Enabled (never Auto, which can stay dormant).  Auto is
-    // reserved for generic applications.
+    // jit_enabled maps to JitMode::Enabled (never Auto): a steam:launch job
+    // explicitly requests the JIT machinery, and the run's jit telemetry
+    // reports the requested/active distinction honestly.  Auto keeps the
+    // historical dormant behavior for non-Steam jobs only.
     let jit_mode = if profile.jit_enabled {
         crate::runner::JitMode::Enabled
     } else {
@@ -662,6 +662,20 @@ pub fn create_steam_job(
     };
 
     Ok(job)
+}
+
+/// The production Steam job constructor used by BOTH the CLI's `steam:launch`
+/// pipeline and the Steam E2E gate (`section41`): opens/creates the GE named
+/// by the profile, registers the Steam override profile, prepares the Steam
+/// environment, and builds the runner job via [`create_steam_job`] — the exact
+/// job `steam:launch` dispatches.  This is the single source of truth for
+/// "the production Steam job"; the E2E gate must never hand-construct a
+/// `RunnerJob`.
+pub fn prepare_steam_job(profile: &SteamLaunchProfile) -> AppResult<RunnerJob> {
+    let (mut ge, _ge_created) = prepare_steam_ge(profile)?;
+    register_steam_override(&mut ge, profile)?;
+    prepare_steam_environment(&ge.root, profile)?;
+    create_steam_job(profile, &ge)
 }
 
 /// Full Steam launch pipeline.
@@ -709,7 +723,10 @@ pub fn prepare_steam_launch(
     // Step 4: Prepare the Steam directory structure.
     prepare_steam_environment(&ge.root, profile)?;
 
-    // Step 5: Create the runner job.
+    // Step 5: Create the runner job.  This is the single production job
+    // constructor shared with the Steam E2E gate (prepare_steam_job performs
+    // steps 1-4 and delegates here), so `steam:launch` and `section41` always
+    // dispatch the identical job for the same profile.
     let job = create_steam_job(profile, &ge)?;
 
     let steam_exe = profile.steam_exe_path(&ge.root);
@@ -866,6 +883,40 @@ mod tests {
             exe_path,
             PathBuf::from("/tmp/test_ge/drive_c/Steam/Steam.exe")
         );
+    }
+
+    #[test]
+    fn create_steam_job_requests_jit_enabled_from_profile() {
+        // The production Steam job must request JIT Enabled (never Auto): the
+        // run's jit telemetry then reports the requested/active distinction
+        // honestly instead of silently keeping the dormant behavior.
+        let profile = SteamLaunchProfile::default();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = crate::ge::GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam",
+            crate::ge::GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let steam_dir = ge.root.join("drive_c").join("Steam");
+        std::fs::create_dir_all(&steam_dir).expect("create steam dir");
+        std::fs::write(steam_dir.join("Steam.exe"), b"MZ fake steam")
+            .expect("write fixture steam.exe");
+        let job = create_steam_job(&profile, &ge).expect("create steam job");
+        assert_eq!(job.intent, RunIntent::Play);
+        assert_eq!(job.jit_mode, crate::runner::JitMode::Enabled);
+        assert_eq!(job.steam_ipc, profile.steam_ipc);
+        assert_eq!(job.window_width, None);
+        assert_eq!(job.window_height, None);
+        assert!(job.env.contains_key("CASA1_METAL_RENDERING"));
+
+        let disabled = SteamLaunchProfile {
+            jit_enabled: false,
+            ..SteamLaunchProfile::default()
+        };
+        let job = create_steam_job(&disabled, &ge).expect("create steam job");
+        assert_eq!(job.jit_mode, crate::runner::JitMode::Disabled);
     }
 
     #[test]

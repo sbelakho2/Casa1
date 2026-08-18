@@ -333,22 +333,36 @@ fi
 info ""
 info "5. JIT self-test ..."
 
-# Preferred: a dedicated self-test flag on the packaged runner. No such CLI
-# exists today (src/cli.rs and src/runner.rs expose no self-test command),
-# so we fall back to the JIT unit tests. In release mode we must not build
-# anything, so JIT execution is validated by the packaged-runner PE
-# execution in step 6 (guest code runs through the real JIT on Apple
-# Silicon when the allow-jit-signed runner carries the entitlement).
-if "$RELEASE_DIR/casa1-runner" --jit-self-test >/dev/null 2>&1; then
-  info "  ✅ casa1-runner --jit-self-test passed"
+# The packaged runner implements a real --jit-self-test: it allocates
+# MAP_JIT memory, flips W/X, compiles a translated block via the
+# JitCompiler machinery, executes it, verifies the guest result, triggers
+# the safepoint flag (EXIT_SAFEPOINT), re-patches the code page and
+# re-executes the changed code.  It reports a JSON JitSelfTestReport;
+# active == true only when the full test executed in a real process.
+# On macOS 26 without the allow-jit entitlement MAP_JIT execution is
+# blocked: the report says active:false and the self-test is a FAIL (a
+# self-test that cannot execute is not pass).
+JIT_SELF_TEST_OUT="$("$RELEASE_DIR/casa1-runner" --jit-self-test 2>/dev/null || true)"
+JIT_SELF_TEST_ACTIVE="$(printf '%s' "$JIT_SELF_TEST_OUT" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("active", False))
+except Exception:
+    print(False)
+' 2>/dev/null || echo False)"
+
+if [[ "$JIT_SELF_TEST_ACTIVE" == "True" ]]; then
+  info "  ✅ casa1-runner --jit-self-test: active=true ($(printf '%s' "$JIT_SELF_TEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"compiled={d.get(\"compiled_blocks\")} executed={d.get(\"executed_blocks\")} safepoint={d.get(\"safepoint_observed\")}")' 2>/dev/null || echo "json"))"
   PASS=$((PASS + 1))
 elif [[ $RELEASE_MODE -eq 1 ]]; then
-  info "  --jit-self-test is not implemented on the packaged runner yet;"
-  info "  release mode refuses rebuilds, so JIT is covered by step 6"
-  info "  (packaged-runner PE execution through the real JIT)."
+  fail "  ❌ JIT self-test is not active in release mode:"
+  fail "  $(printf '%s' "$JIT_SELF_TEST_OUT" | head -c 400)"
+  fail "  (MAP_JIT execution is blocked for this signing configuration — the signed"
+  fail "  runner must carry the allow-jit entitlement, or the JIT self-test must pass)"
+  FAIL=$((FAIL + 1))
 else
-  info "  --jit-self-test not implemented; running the JIT unit tests as the"
-  info "  self-test: cargo test --lib jit::"
+  info "  JIT self-test not active in dev mode ($(printf '%s' "$JIT_SELF_TEST_OUT" | head -c 200));"
+  info "  running the JIT unit tests as the dev-mode self-test: cargo test --lib jit::"
   if cargo test --lib jit:: >/dev/null 2>&1; then
     info "  ✅ JIT unit self-test passed (cargo test --lib jit::)"
     PASS=$((PASS + 1))
@@ -382,6 +396,59 @@ else
   else
     fail "  ❌ Packaged runner failed on $TETRIS_PE"
     fail "$(head -5 "$TEMP_DIR/ge-run.json")"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
+# ── 6b. JIT-enabled PE execution (release mode: real JIT evidence) ───────────
+# In release mode the minimal PE is ALSO run through the packaged runner
+# with JitMode::Enabled, and the outcome's jit telemetry must prove real
+# JIT activity: jit.active == true && blocks_compiled > 0.  This is the
+# signed configuration's ground truth — a run that compiles but never
+# executes (or never compiles) is not a JIT-enabled run.
+if [[ $RELEASE_MODE -eq 1 && -f "$TETRIS_PE" && -d "$CASA1_GES_ROOT/$GE_NAME" ]]; then
+  JIT_JOB_FILE="$TEMP_DIR/jit-enabled-job.json"
+  cat > "$JIT_JOB_FILE" <<EOF
+{
+  "ge_name": "$GE_NAME",
+  "ge_root": "$CASA1_GES_ROOT/$GE_NAME",
+  "program": "$TETRIS_PE",
+  "args": [],
+  "cwd": "$CASA1_GES_ROOT/$GE_NAME",
+  "env": {},
+  "dtm": false,
+  "intent": "run",
+  "trace_categories": [],
+  "test_id": "smoke-jit-enabled",
+  "jit_mode": "Enabled",
+  "steam_ipc": false,
+  "window_width": null,
+  "window_height": null
+}
+EOF
+  if "$RELEASE_DIR/casa1-runner" --job "$JIT_JOB_FILE" \
+      > "$TEMP_DIR/jit-run.json" 2>"$TEMP_DIR/jit-run.err"; then
+    JIT_ACTIVE="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open("'"$TEMP_DIR"'/jit-run.json"))
+    j = d.get("jit", {})
+    print("true" if j.get("active") and j.get("blocks_compiled", 0) > 0 else "false")
+except Exception:
+    print("false")
+' 2>/dev/null || echo false)"
+    if [[ "$JIT_ACTIVE" == "true" ]]; then
+      info "  ✅ JIT-enabled run: jit.active=true blocks_compiled>0"
+      PASS=$((PASS + 1))
+    else
+      fail "  ❌ JIT-enabled run reported inactive JIT telemetry:"
+      fail "  $(python3 -c 'import json; print(json.load(open("'"$TEMP_DIR"'/jit-run.json")).get("jit", {}))' 2>/dev/null || cat "$TEMP_DIR/jit-run.err" | head -3)"
+      fail "  (the signed runner must actually compile AND execute guest blocks with JitMode::Enabled)"
+      FAIL=$((FAIL + 1))
+    fi
+  else
+    fail "  ❌ JIT-enabled run failed:"
+    fail "$(head -5 "$TEMP_DIR/jit-run.err")"
     FAIL=$((FAIL + 1))
   fi
 fi
