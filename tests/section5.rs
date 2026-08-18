@@ -381,6 +381,7 @@ fn memory_time_locale_baseline_is_consistent() {
     let previous = win32
         .virtual_protect(
             reserved,
+            0x2000,
             MemoryProtection {
                 read: true,
                 write: false,
@@ -389,6 +390,14 @@ fn memory_time_locale_baseline_is_consistent() {
         )
         .expect("protect region");
     assert!(previous.write);
+    // Page-granular query: the committed 0x2000 run reports the protected
+    // protection; the reserved tail (0x2000..0x3000) is Reserved.
+    let committed_query = win32.virtual_query(reserved);
+    assert_eq!(committed_query.state, MemoryState::Committed);
+    assert!(committed_query.protection.execute);
+    assert_eq!(committed_query.region_size, 0x2000);
+    let reserved_tail = win32.virtual_query(reserved + 0x2000);
+    assert_eq!(reserved_tail.state, MemoryState::Reserved);
     let section = win32
         .create_section(
             0x1000,
@@ -426,11 +435,18 @@ fn memory_time_locale_baseline_is_consistent() {
     win32.heap_free(heap, resized).expect("heap free");
     win32.heap_destroy(heap).expect("heap destroy");
     win32
-        .virtual_free(reserved, FreeType::Decommit)
+        .virtual_free(reserved, 0x1000, FreeType::Decommit)
         .expect("decommit region");
     assert_eq!(win32.virtual_query(reserved).state, MemoryState::Reserved);
+    // Partial decommit: the second page is still committed.
+    let second_page = win32.virtual_query(reserved + 0x1000);
+    assert_eq!(second_page.state, MemoryState::Committed);
     win32
-        .virtual_free(reserved, FreeType::Release)
+        .virtual_free(reserved, 0x2000, FreeType::Decommit)
+        .expect("decommit remainder");
+    assert_eq!(win32.virtual_query(reserved).state, MemoryState::Reserved);
+    win32
+        .virtual_free(reserved, 0, FreeType::Release)
         .expect("release region");
 }
 

@@ -171,12 +171,43 @@ const X86_CONTEXT_OFFSET_ESP: u64 = 0xc4;
 const X86_CONTEXT_OFFSET_SEG_SS: u64 = 0xc8;
 const X86_EXCEPTION_CONTINUE_EXECUTION: u32 = 0;
 const X86_EXCEPTION_CONTINUE_SEARCH: u32 = 1;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_GUARD: u32 = 0x100;
+
+/// Translate Windows page-protection flags to the win32 protection model.
+fn protection_from_page_flags(flags: u32) -> crate::win32::MemoryProtection {
+    let flags = flags & !PAGE_GUARD;
+    crate::win32::MemoryProtection {
+        read: flags & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)
+            != 0,
+        write: flags & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0,
+        execute: flags & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE) != 0,
+    }
+}
+
+/// Translate the win32 protection model back to Windows page flags.
+fn page_flags_from_protection(protection: &crate::win32::MemoryProtection) -> u32 {
+    match (protection.read, protection.write, protection.execute) {
+        (false, false, false) => PAGE_NOACCESS,
+        (true, false, false) => PAGE_READONLY,
+        (true, true, false) => PAGE_READWRITE,
+        (false, false, true) => PAGE_EXECUTE,
+        (true, false, true) => PAGE_EXECUTE_READ,
+        (true, true, true) => PAGE_EXECUTE_READWRITE,
+        _ => PAGE_NOACCESS,
+    }
+}
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
 const MEM_PRIVATE: u32 = 0x0002_0000;
+const MEM_FREE: u32 = 0x0001_0000;
 const MEM_IMAGE: u32 = 0x0100_0000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const STARTF_USESHOWWINDOW: u32 = 0x0001;
@@ -3742,7 +3773,13 @@ struct PeHostRuntime {
     crt_alloc_fail_next: bool,
     /// Tracks private page allocations (VirtualAlloc / MEM_RESERVE|MEM_COMMIT)
     /// so `VirtualFree` / `MEM_RELEASE` can validate and free them.
-    private_pages: BTreeMap<u64, usize>,
+    /// Committed private pages (VirtualAlloc), keyed by page base; the value
+    /// is the page's protection.  Page-granular so MEM_DECOMMIT /
+    /// VirtualProtect / VirtualQuery handle partial ranges correctly.
+    private_pages: BTreeMap<u64, crate::win32::MemoryProtection>,
+    /// Reserved ranges (VirtualAlloc(MEM_RESERVE)), keyed by base with the
+    /// size.  Commits inside an existing reservation commit its pages.
+    private_reservations: BTreeMap<u64, usize>,
     critical_sections: BTreeMap<u64, usize>,
     condition_variables: BTreeMap<u64, GuestConditionVariable>,
     srw_locks: BTreeMap<u64, Arc<GuestSRWLock>>,
@@ -8602,6 +8639,7 @@ impl PeHostRuntime {
             heap_allocations: BTreeMap::new(),
             crt_alloc_fail_next: false,
             private_pages: BTreeMap::new(),
+            private_reservations: BTreeMap::new(),
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),
@@ -36352,7 +36390,52 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    let address = self.alloc_private_pages(memory, requested_address, bytes)?;
+                    let commits = allocation_type & MEM_COMMIT != 0;
+                    let _reserves = allocation_type & MEM_RESERVE != 0;
+                    let aligned = align_up_u64(bytes as u64, 0x1000);
+                    let address = if !commits {
+                        // MEM_RESERVE only: record the reservation; the pages
+                        // stay unmapped and VirtualQuery reports Reserved.
+                        let base = if requested_address == 0 {
+                            let current = self.next_private_address;
+                            self.next_private_address = current.checked_add(aligned).ok_or_else(|| {
+                                AppError::new(ReasonCode::RcUnimplInsn, "virtual address space exhausted")
+                            })?;
+                            current
+                        } else {
+                            requested_address & !0xfff
+                        };
+                        self.private_reservations.insert(base, aligned as usize);
+                        base
+                    } else if requested_address != 0 {
+                        // MEM_COMMIT at a specific address: commit the pages
+                        // INSIDE an existing reservation (interior commit).
+                        let base = requested_address & !0xfff;
+                        let range_end = base.checked_add(aligned).ok_or_else(|| {
+                            AppError::new(ReasonCode::RcUnimplInsn, "commit range overflow")
+                        })?;
+                        let containing = self.private_reservation_containing(base);
+                        let fits = containing.is_some_and(|(rbase, rsize)| {
+                            rbase.checked_add(rsize as u64).is_some_and(|rend| range_end <= rend)
+                        });
+                        if !fits {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                            return Ok(None);
+                        }
+                        memory.map_bytes(base, &vec![0; aligned as usize]);
+                        for page in (0..aligned / 0x1000).map(|i| base + i * 0x1000) {
+                            self.private_pages.insert(
+                                page,
+                                protection_from_page_flags(protect),
+                            );
+                        }
+                        base
+                    } else {
+                        // MEM_COMMIT (or RESERVE|COMMIT) without a base:
+                        // reserve + commit a fresh region.
+                        self.alloc_private_pages(memory, 0, bytes)?
+                    };
                     state.set(Register::Rax, address);
                     self.last_error = 0;
                     self.push_trace(
@@ -36389,9 +36472,12 @@ impl PeHostRuntime {
                             ]),
                             json!(0),
                         );
-                    } else if let Some(&size) = self.private_pages.get(&address) {
+                    } else if let Some(&size) = self.private_reservations.get(&address) {
                         memory.unmap_range(address, size);
-                        self.private_pages.remove(&address);
+                        self.private_reservations.remove(&address);
+                        for page in (0..size / 0x1000).map(|i| address + i as u64 * 0x1000) {
+                            self.private_pages.remove(&page);
+                        }
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -36420,12 +36506,16 @@ impl PeHostRuntime {
                         );
                     }
                 } else if free_type & MEM_DECOMMIT != 0 {
-                    // MEM_DECOMMIT: decommit pages (release physical storage, keep reservation).
-                    // Zero the pages and keep them in the page table so subsequent reads return
-                    // zero rather than failing with "unmapped guest memory". This matches the
-                    // practical behavior expected by guest code (e.g., reading from a decommitted
-                    // CRT heap region after an SEH fixup).
-                    memory.zero_range(address, bytes.max(0x1000));
+                    // MEM_DECOMMIT: decommit ONLY the requested page range
+                    // (Windows: the size parameter selects the range).  The
+                    // pages are unmapped so VirtualQuery reports Reserved,
+                    // and reads fault like a decommitted page; the
+                    // reservation itself is kept.
+                    let aligned = align_up_u64(bytes.max(1) as u64, 0x1000) as usize;
+                    memory.unmap_range(address, aligned);
+                    for page in (0..aligned / 0x1000).map(|i| address + i as u64 * 0x1000) {
+                        self.private_pages.remove(&page);
+                    }
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
                     self.push_trace(
@@ -36459,8 +36549,28 @@ impl PeHostRuntime {
                 let bytes = guest_call_arg(state, memory, 1)?;
                 let new_protect = guest_call_arg_u32(state, memory, 2)?;
                 let old_protect_ptr = guest_call_arg(state, memory, 3)?;
+                // Real page-granular protection change: apply the new
+                // protection to the range's committed pages and report the
+                // previous protection of the first page in the range.
+                let new_protection = protection_from_page_flags(new_protect);
+                let aligned = align_up_u64(bytes.max(1) as u64, 0x1000);
+                let first_page = address & !0xfff;
+                let old_protection = self
+                    .private_pages
+                    .get(&first_page)
+                    .cloned()
+                    .unwrap_or(crate::win32::MemoryProtection {
+                        read: false,
+                        write: false,
+                        execute: false,
+                    });
+                for page in (0..aligned / 0x1000).map(|i| first_page + i * 0x1000) {
+                    if let Some(protection) = self.private_pages.get_mut(&page) {
+                        *protection = new_protection.clone();
+                    }
+                }
                 if old_protect_ptr != 0 {
-                    write_u32(memory, old_protect_ptr, PAGE_EXECUTE_READWRITE);
+                    write_u32(memory, old_protect_ptr, page_flags_from_protection(&old_protection));
                 }
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
@@ -36590,13 +36700,15 @@ impl PeHostRuntime {
                         json!(0),
                     );
                 } else {
-                    let (base_address, allocation_base, region_size, ty) = if address >= self.mapped_image_base
+                    let (base_address, allocation_base, region_size, mem_state, protection, ty) = if address >= self.mapped_image_base
                         && address < self.mapped_image_base + self.mapped_image_size
                     {
                         (
                             self.mapped_image_base,
                             self.mapped_image_base,
                             self.mapped_image_size - (address - self.mapped_image_base),
+                            MEM_COMMIT,
+                            PAGE_EXECUTE_READWRITE,
                             MEM_IMAGE,
                         )
                     } else if (address >= STACK_BASE && address < STACK_BASE + STACK_SIZE as u64)
@@ -36611,49 +36723,83 @@ impl PeHostRuntime {
                             sb,
                             sb,
                             sb + STACK_SIZE as u64 - address,
+                            MEM_COMMIT,
+                            PAGE_READWRITE,
                             MEM_PRIVATE,
                         )
                     } else {
-                        // Check private_pages first (VirtualAlloc allocations), fall back to heap_allocations.
-                        let allocation_base = self
-                            .private_pages
-                            .range(..=address)
-                            .next_back()
-                            .map(|(base, _)| *base)
-                            .or_else(|| {
-                                self.heap_allocations
-                                    .range(..=address)
-                                    .next_back()
-                                    .map(|(base, _)| *base)
-                            })
-                            .unwrap_or(address);
-                        let allocation_size = self
-                            .private_pages
-                            .get(&allocation_base)
-                            .copied()
-                            .or_else(|| self.heap_allocations.get(&allocation_base).copied())
-                            .unwrap_or(0x1000) as u64;
-                        (allocation_base, allocation_base, allocation_size, MEM_PRIVATE)
+                        // Page-granular private allocation query with
+                        // coalescing: report the run of adjacent pages with
+                        // identical state (committed/reserved) and, for
+                        // committed pages, identical protection.
+                        let page = address & !0xfff;
+                        let (allocation_base, allocation_size, mem_state, protection, _ty) =
+                            if let Some(&protection) = self.private_pages.get(&page) {
+                                // Committed page: coalesce forward over
+                                // committed pages with the same protection.
+                                let mut run_end = page + 0x1000;
+                                loop {
+                                    match self.private_pages.get(&run_end) {
+                                        Some(next) if next == &protection => {
+                                            run_end += 0x1000;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                (
+                                    page,
+                                    run_end - page,
+                                    MEM_COMMIT,
+                                    page_flags_from_protection(&protection),
+                                    MEM_PRIVATE,
+                                )
+                            } else if let Some((rbase, rsize)) =
+                                self.private_reservation_containing(address)
+                            {
+                                // Reserved (uncommitted) page inside a
+                                // reservation: coalesce forward over
+                                // non-committed pages.
+                                let mut run_end = page + 0x1000;
+                                let rend = rbase + rsize as u64;
+                                while run_end < rend
+                                    && !self.private_pages.contains_key(&run_end)
+                                {
+                                    run_end += 0x1000;
+                                }
+                                (rbase, run_end - page, MEM_RESERVE, PAGE_NOACCESS, MEM_PRIVATE)
+                            } else if let Some((&hbase, &hsize)) =
+                                self.heap_allocations.range(..=address).next_back()
+                            {
+                                let hend = hbase.checked_add(hsize as u64).unwrap_or(u64::MAX);
+                                if address < hend {
+                                    (hbase, hend - address, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE)
+                                } else {
+                                    (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
+                                }
+                            } else {
+                                (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
+                            };
+                        (allocation_base, allocation_base, allocation_size, mem_state, protection, MEM_PRIVATE)
                     };
                     let region_size = region_size.max(0x1000);
                     match self.guest_arch {
                         GuestArch::X86 => {
                             write_u32(memory, buffer, base_address as u32);
                             write_u32(memory, buffer + 4, allocation_base as u32);
-                            write_u32(memory, buffer + 8, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 8, protection);
                             write_u32(memory, buffer + 12, region_size as u32);
-                            write_u32(memory, buffer + 16, MEM_COMMIT);
-                            write_u32(memory, buffer + 20, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 16, mem_state);
+                            write_u32(memory, buffer + 20, protection);
                             write_u32(memory, buffer + 24, ty);
                         }
                         GuestArch::X64 => {
                             write_u64(memory, buffer, base_address);
                             write_u64(memory, buffer + 8, allocation_base);
-                            write_u32(memory, buffer + 16, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 16, protection);
                             write_u32(memory, buffer + 20, 0);
                             write_u64(memory, buffer + 24, region_size);
-                            write_u32(memory, buffer + 32, MEM_COMMIT);
-                            write_u32(memory, buffer + 36, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 32, mem_state);
+                            write_u32(memory, buffer + 36, protection);
                             write_u32(memory, buffer + 40, ty);
                             write_u32(memory, buffer + 44, 0);
                         }
@@ -52847,7 +52993,7 @@ impl PeHostRuntime {
                     "PE runtime virtual allocation overflow",
                 )
             })?;
-            for (&existing_base, &existing_size) in &self.private_pages {
+            for (&existing_base, &existing_size) in &self.private_reservations {
                 let existing_end =
                     existing_base
                         .checked_add(existing_size as u64)
@@ -52876,8 +53022,30 @@ impl PeHostRuntime {
         })?;
         self.next_private_address = self.next_private_address.max(end);
         memory.map_bytes(address, &vec![0; size]);
-        self.private_pages.insert(address, size);
+        for page in (0..size / 0x1000).map(|i| address + i as u64 * 0x1000) {
+            self.private_pages.insert(
+                page,
+                crate::win32::MemoryProtection {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            );
+        }
+        self.private_reservations.insert(address, size);
         Ok(address)
+    }
+
+    /// Find the private reservation containing `address` (or None).
+    fn private_reservation_containing(&self, address: u64) -> Option<(u64, u64)> {
+        self.private_reservations
+            .range(..=address)
+            .next_back()
+            .filter(|(base, size)| {
+                base.checked_add(**size as u64)
+                    .is_some_and(|end| address < end)
+            })
+            .map(|(&base, &size)| (base, size as u64))
     }
 
     /// Register a fast-thunk for the given host thunk address.
@@ -76833,6 +77001,198 @@ mod tests {
         );
         assert_eq!(read_u32(&memory, buffer + 24).expect("type"), MEM_PRIVATE);
         assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn virtual_memory_page_granular_semantics() {
+        // Page-granular VM: interior commits, partial decommit, range
+        // protect, and coalescing VirtualQuery.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "vm-pages", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime
+                .seed_process_state(&mut memory, "C:\\vm-probe.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let virtual_alloc = runtime.alloc_host_thunk(HostThunk::VirtualAlloc);
+            let virtual_free = runtime.alloc_host_thunk(HostThunk::VirtualFree);
+            let virtual_protect = runtime.alloc_host_thunk(HostThunk::VirtualProtect);
+            let virtual_query = runtime.alloc_host_thunk(HostThunk::VirtualQuery);
+            let buffer = 0x41_000;
+            memory.map_bytes(buffer, &[0; MEMORY_BASIC_INFORMATION32_SIZE as usize]);
+
+            // 1. Reserve 0x4000, then commit ONLY the interior 0x1000..0x3000.
+            let reservation = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_alloc,
+                &[0, 0x4000, MEM_RESERVE, PAGE_NOACCESS],
+            );
+            assert_ne!(reservation, 0);
+            let committed = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_alloc,
+                &[
+                    reservation as u32 + 0x1000,
+                    0x2000,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                ],
+            );
+            assert_eq!(committed, reservation + 0x1000, "interior commit");
+
+            // 2. VirtualQuery at the committed range: MEM_COMMIT + PAGE_READWRITE.
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    committed as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 8).expect("protect"),
+                PAGE_READWRITE
+            );
+            assert_eq!(read_u32(&memory, buffer + 16).expect("state"), MEM_COMMIT);
+            assert_eq!(read_u32(&memory, buffer + 12).expect("region size"), 0x2000);
+
+            // 3. VirtualQuery at the uncommitted tail: MEM_RESERVE + PAGE_NOACCESS.
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    (reservation + 0x3000) as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(read_u32(&memory, buffer + 16).expect("state"), MEM_RESERVE);
+            assert_eq!(
+                read_u32(&memory, buffer + 8).expect("protect"),
+                PAGE_NOACCESS
+            );
+
+            // 4. VirtualProtect a sub-range: only the first 0x1000 changes.
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_protect,
+                &[
+                    committed as u32,
+                    0x1000,
+                    PAGE_READONLY,
+                    (buffer + 0x100) as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 0x100).expect("old protect"),
+                PAGE_READWRITE
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    committed as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 8).expect("protect"),
+                PAGE_READONLY
+            );
+            assert_eq!(read_u32(&memory, buffer + 12).expect("region size"), 0x1000);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    (committed + 0x1000) as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 8).expect("protect"),
+                PAGE_READWRITE,
+                "the second page keeps its protection"
+            );
+
+            // 5. Partial MEM_DECOMMIT: only the requested range is released.
+            let decommit_result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_free,
+                &[committed as u32, 0x1000, MEM_DECOMMIT],
+            );
+            assert_eq!(decommit_result, 1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    committed as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 16).expect("state"),
+                MEM_RESERVE,
+                "decommitted page reports Reserved"
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    (committed + 0x1000) as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 16).expect("state"),
+                MEM_COMMIT,
+                "the untouched page stays committed"
+            );
+
+            // 6. MEM_RELEASE frees the whole reservation.
+            let release_result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_free,
+                &[reservation as u32, 0, MEM_RELEASE],
+            );
+            assert_eq!(release_result, 1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                virtual_query,
+                &[
+                    reservation as u32,
+                    buffer as u32,
+                    MEMORY_BASIC_INFORMATION32_SIZE as u32,
+                ],
+            );
+            assert_eq!(
+                read_u32(&memory, buffer + 16).expect("state"),
+                MEM_FREE,
+                "released range reports Free"
+            );
+        })
     }
 
     #[test]

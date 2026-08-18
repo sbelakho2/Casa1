@@ -823,12 +823,26 @@ struct OverlappedRequest {
     state: OverlappedState,
 }
 
+/// State of a single committed 4 KiB page.
+#[derive(Debug, Clone)]
+struct CommittedPage {
+    protection: MemoryProtection,
+}
+
+/// Page-granular virtual memory region: a reservation (base + size) whose
+/// pages are individually Reserved / Committed(protection).  This gives
+/// correct partial-range semantics: VirtualFree(MEM_DECOMMIT) decommits
+/// only the requested pages, VirtualProtect changes only the requested
+/// range, VirtualAlloc(MEM_COMMIT) commits an interior range of an existing
+/// reservation, and VirtualQuery reports the coalesced run of pages with
+/// identical state/protection.
 #[derive(Debug, Clone)]
 struct VirtualRegion {
     base_address: u64,
     size: usize,
-    committed: BTreeSet<u64>,
-    protection: MemoryProtection,
+    /// Committed pages, keyed by page base address (0x1000-aligned).
+    /// Pages absent from this map are Reserved within the reservation.
+    pages: BTreeMap<u64, CommittedPage>,
     /// Shared section backing for regions created by `map_view_of_file`
     /// (`None` for plain `VirtualAlloc` regions).
     backing: Option<Arc<Mutex<Vec<u8>>>>,
@@ -3866,9 +3880,28 @@ impl Win32Subsystem {
         protection: MemoryProtection,
     ) -> AppResult<u64> {
         let aligned = align_up(size as u64, 0x1000);
+        let page_count = aligned / 0x1000;
+        if page_count > MAX_COMMIT_PAGES {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("commit of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"),
+            ));
+        }
+        let reserves = matches!(
+            allocation_type,
+            AllocationType::Reserve | AllocationType::ReserveCommit
+        );
+        let commits = matches!(
+            allocation_type,
+            AllocationType::Commit | AllocationType::ReserveCommit
+        );
         let base = match base_address {
-            Some(base) => base,
+            Some(base) => base & !0xfff,
             None => {
+                if !reserves {
+                    // MEM_COMMIT without a base: reserve + commit a fresh
+                    // region (Windows treats it as reserve-commit).
+                }
                 let current = self.next_virtual_address;
                 self.next_virtual_address = current.checked_add(aligned).ok_or_else(|| {
                     AppError::new(
@@ -3879,56 +3912,113 @@ impl Win32Subsystem {
                 current
             }
         };
-        // Reject ranges that would overflow u64 page arithmetic.
         base.checked_add(aligned).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcCliInvalid,
                 format!("region {base:#x} + {aligned:#x} overflows the address space"),
             )
         })?;
-        let region = self
-            .memory_regions
-            .entry(base)
-            .or_insert_with(|| VirtualRegion {
-                base_address: base,
-                size: aligned as usize,
-                committed: BTreeSet::new(),
-                protection,
-                backing: None,
-                backing_offset: 0,
-            });
-        // A second call at the same base (e.g. committing a reservation) must
-        // extend the region instead of reporting free pages beyond its size.
-        if region.size < aligned as usize {
-            region.size = aligned as usize;
-        }
-        match allocation_type {
-            AllocationType::Reserve => {}
-            AllocationType::Commit | AllocationType::ReserveCommit => {
-                let page_count = aligned / 0x1000;
-                if page_count > MAX_COMMIT_PAGES {
+
+        if commits && base_address.is_some() {
+            // MEM_COMMIT at an interior address of an existing reservation:
+            // commit only the requested pages of the containing region.
+            if let Some(containing_base) = self
+                .region_containing(base)
+                .map(|region| region.base_address)
+            {
+                let range_end = base.checked_add(aligned).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcCliInvalid, "commit range overflow")
+                })?;
+                let containing_size = self
+                    .memory_regions
+                    .get(&containing_base)
+                    .map(|region| region.size)
+                    .unwrap_or(0);
+                if range_end > containing_base + containing_size as u64 {
                     return Err(AppError::new(
                         ReasonCode::RcCliInvalid,
                         format!(
-                            "commit of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"
+                            "commit range {base:#x}..{range_end:#x} exceeds the reservation at {containing_base:#x} size {containing_size:#x}"
                         ),
                     ));
                 }
-                // Windows VirtualAlloc(MEM_COMMIT) sets the protection of the
-                // committed range; with a single per-region protection the
-                // commit's protection wins.  Plain reserves leave it alone.
-                region.protection = protection;
-                for page in 0..page_count {
-                    region.committed.insert(base + page * 0x1000);
+                let region = self.memory_regions.get_mut(&containing_base).unwrap();
+                for page in (0..page_count).map(|i| base + i * 0x1000) {
+                    region.pages.insert(page, CommittedPage { protection });
+                }
+                return Ok(base);
+            }
+            // No containing reservation: an explicit-base commit of an
+            // unreserved range fails on Windows (VirtualAlloc(MEM_COMMIT)
+            // requires the range to be reserved).
+            return Err(AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("commit at {base:#x} has no containing reservation"),
+            ));
+        }
+
+        // Fresh reservation (Reserve / ReserveCommit / implicit commit).
+        if let Some(region) = self.memory_regions.get_mut(&base) {
+            // Extending an existing reservation at the same base.
+            if region.size < aligned as usize {
+                region.size = aligned as usize;
+            }
+            if commits {
+                for page in (0..page_count).map(|i| base + i * 0x1000) {
+                    region.pages.insert(page, CommittedPage { protection });
                 }
             }
+            return Ok(base);
         }
+        let mut region = VirtualRegion {
+            base_address: base,
+            size: aligned as usize,
+            pages: BTreeMap::new(),
+            backing: None,
+            backing_offset: 0,
+        };
+        if commits {
+            for page in (0..page_count).map(|i| base + i * 0x1000) {
+                region.pages.insert(page, CommittedPage { protection });
+            }
+        }
+        self.memory_regions.insert(base, region);
         Ok(base)
     }
 
-    pub fn virtual_free(&mut self, base_address: u64, free_type: FreeType) -> AppResult<()> {
+    /// Find the region containing `address` (address inside base..base+size).
+    fn region_containing(&self, address: u64) -> Option<&VirtualRegion> {
+        self.memory_regions
+            .range(..=address)
+            .next_back()
+            .filter(|(_, region)| {
+                region
+                    .base_address
+                    .checked_add(region.size as u64)
+                    .is_some_and(|end| address < end)
+            })
+            .map(|(_, region)| region)
+    }
+
+    fn region_containing_mut(&mut self, address: u64) -> Option<&mut VirtualRegion> {
+        let base = self.region_containing(address).map(|r| r.base_address)?;
+        self.memory_regions.get_mut(&base)
+    }
+
+    pub fn virtual_free(
+        &mut self,
+        base_address: u64,
+        size: usize,
+        free_type: FreeType,
+    ) -> AppResult<()> {
         match free_type {
             FreeType::Release => {
+                if size != 0 {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "MEM_RELEASE requires size=0",
+                    ));
+                }
                 if self.memory_regions.remove(&base_address).is_none() {
                     return Err(AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
@@ -3937,13 +4027,30 @@ impl Win32Subsystem {
                 }
             }
             FreeType::Decommit => {
-                let region = self.memory_regions.get_mut(&base_address).ok_or_else(|| {
+                // Decommit ONLY the requested page range, not the whole
+                // region (Windows: the size parameter selects the range).
+                let aligned = align_up(size.max(1) as u64, 0x1000);
+                let range_end = base_address.checked_add(aligned).ok_or_else(|| {
                     AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
-                        format!("unknown region {base_address:#x}"),
+                        "decommit range overflow",
                     )
                 })?;
-                region.committed.clear();
+                let region = self.region_containing_mut(base_address).ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcMemoryAccessViolation,
+                        format!("no reservation containing {base_address:#x}"),
+                    )
+                })?;
+                let pages = (0..aligned / 0x1000)
+                    .map(|i| base_address + i * 0x1000)
+                    .filter(|page| *page < region.base_address + region.size as u64)
+                    .collect::<Vec<_>>();
+                for page in pages {
+                    region.pages.remove(&page);
+                }
+                // Keep the reservation: decommitted pages become Reserved.
+                let _ = range_end;
             }
         }
         Ok(())
@@ -3952,46 +4059,92 @@ impl Win32Subsystem {
     pub fn virtual_protect(
         &mut self,
         base_address: u64,
+        size: usize,
         protection: MemoryProtection,
     ) -> AppResult<MemoryProtection> {
-        let region = self.memory_regions.get_mut(&base_address).ok_or_else(|| {
+        // Protect only the requested range's committed pages; return the
+        // previous protection of the first page in the range.
+        let aligned = align_up(size.max(1) as u64, 0x1000);
+        let region = self.region_containing_mut(base_address).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcMemoryAccessViolation,
-                format!("unknown region {base_address:#x}"),
+                format!("no reservation containing {base_address:#x}"),
             )
         })?;
-        let previous = region.protection;
-        region.protection = protection;
+        let range_end = base_address.checked_add(aligned).unwrap_or(u64::MAX);
+        let mut previous = MemoryProtection {
+            read: false,
+            write: false,
+            execute: false,
+        };
+        let mut found = false;
+        for page in region.pages.range_mut(base_address..range_end) {
+            if !found {
+                previous = page.1.protection.clone();
+                found = true;
+            }
+            page.1.protection = protection.clone();
+        }
         Ok(previous)
     }
 
     pub fn virtual_query(&self, address: u64) -> MemoryBasicInformation {
-        // BTreeMap keys are sorted by base address: binary-search the
-        // containing region instead of scanning every region per query.
-        if let Some((_, region)) = self.memory_regions.range(..=address).next_back()
-            && let Some(end) = region.base_address.checked_add(region.size as u64)
-            && address < end
-        {
+        // Page-granular query: report the coalesced run of adjacent pages
+        // with identical state/protection (Windows VirtualQuery semantics —
+        // a query against an uncommitted page inside a partially committed
+        // reservation reports a Reserved region, not the whole region).
+        let Some(region) = self.region_containing(address) else {
             return MemoryBasicInformation {
-                base_address: region.base_address,
-                region_size: region.size,
-                state: if region.committed.is_empty() {
-                    MemoryState::Reserved
-                } else {
-                    MemoryState::Committed
+                base_address: 0,
+                region_size: 0,
+                state: MemoryState::Free,
+                protection: MemoryProtection {
+                    read: false,
+                    write: false,
+                    execute: false,
                 },
-                protection: region.protection,
             };
-        }
-        MemoryBasicInformation {
-            base_address: 0,
-            region_size: 0,
-            state: MemoryState::Free,
-            protection: MemoryProtection {
+        };
+        let page = address & !0xfff;
+        let region_end = region.base_address + region.size as u64;
+        let committed = region.pages.contains_key(&page);
+        let protection = region
+            .pages
+            .get(&page)
+            .map(|committed_page| committed_page.protection.clone())
+            .unwrap_or(MemoryProtection {
                 read: false,
                 write: false,
                 execute: false,
+            });
+        // Coalesce: extend the reported region while adjacent pages share
+        // the same state and protection.
+        let mut run_end = page + 0x1000;
+        loop {
+            if run_end >= region_end {
+                break;
+            }
+            let next_committed = region.pages.contains_key(&run_end);
+            if next_committed != committed {
+                break;
+            }
+            if committed {
+                let next_protection = &region.pages.get(&run_end).unwrap().protection;
+                if next_protection != &protection {
+                    break;
+                }
+            }
+            run_end += 0x1000;
+        }
+        MemoryBasicInformation {
+            base_address: page,
+            region_size: (run_end - page) as usize,
+            state: if committed {
+                MemoryState::Committed
+            } else {
+                MemoryState::Reserved
             },
+            protection,
         }
     }
 
@@ -4794,17 +4947,21 @@ impl Win32Subsystem {
                     "virtual address space exhausted",
                 )
             })?;
-        let mut committed = BTreeSet::new();
+        let mut pages = BTreeMap::new();
         for page in 0..page_count {
-            committed.insert(base + page * 0x1000);
+            pages.insert(
+                base + page * 0x1000,
+                CommittedPage {
+                    protection: protection.clone(),
+                },
+            );
         }
         self.memory_regions.insert(
             base,
             VirtualRegion {
                 base_address: base,
                 size,
-                committed,
-                protection,
+                pages,
                 backing,
                 backing_offset: offset,
             },
