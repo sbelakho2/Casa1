@@ -50,7 +50,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --lib --bins
+        run: cargo test --tests
 
   check-no-insecure-tls:
     name: Check No Insecure TLS in Defaults
@@ -65,64 +65,62 @@ jobs:
           fi
           echo "✅ dev-insecure-tls is not in default features"
 
-  release-gate:
-    name: Release Gate
+  # Steam E2E evidence (the steam-e2e workflow's artifact for this exact
+  # SHA) is REQUIRED. actions/download-artifact fails the job when the
+  # artifact does not exist, so the gate fails closed when no Steam E2E
+  # evidence was produced for this commit.
+  steam-e2e-evidence:
+    name: Steam E2E Evidence
     runs-on: macos-latest
-    needs:
-      - check-compile
-      - check-format
-      - check-clippy
-      - check-tests
-      - check-no-insecure-tls
-      - check-dependency-audit
-      - check-licenses
-      - check-reproducible
-      - release-smoke-tests
-      - check-checklist-gate
-      - audit-release-entitlements
-    if: always()
     steps:
-      - name: Evaluate checklist results
+      - uses: actions/checkout@v4
+      - name: Download Steam E2E evidence artifact (fails closed if absent)
+        uses: actions/download-artifact@v4
+        with:
+          name: steam-e2e-${{ github.sha }}
+          path: e2e-evidence
+      - name: Verify evidence bundle
         run: |
-          RESULTS=""
-          FAIL=0
+          set -euo pipefail
+          test -f e2e-evidence/release-evidence.json
+          test -f e2e-evidence/acceptance.json
+          test -f e2e-evidence/milestones.json
+          test -f e2e-evidence/commit.txt
+          grep -qx "${{ github.sha }}" e2e-evidence/commit.txt
+          echo "✅ Steam E2E evidence present for ${{ github.sha }}"
 
-          for job in check-compile check-format check-clippy check-tests \
-                     check-no-insecure-tls check-dependency-audit \
-                     check-licenses check-reproducible release-smoke-tests \
-                     check-checklist-gate audit-release-entitlements; do
-            STATUS=""
-            case "$job" in
-              check-compile)           STATUS="${{ needs.check-compile.result }}" ;;
-              check-format)            STATUS="${{ needs.check-format.result }}" ;;
-              check-clippy)            STATUS="${{ needs.check-clippy.result }}" ;;
-              check-tests)             STATUS="${{ needs.check-tests.result }}" ;;
-              check-no-insecure-tls)   STATUS="${{ needs.check-no-insecure-tls.result }}" ;;
-              check-dependency-audit)  STATUS="${{ needs.check-dependency-audit.result }}" ;;
-              check-licenses)          STATUS="${{ needs.check-licenses.result }}" ;;
-              check-reproducible)      STATUS="${{ needs.check-reproducible.result }}" ;;
-              release-smoke-tests)     STATUS="${{ needs.release-smoke-tests.result }}" ;;
-              check-checklist-gate)    STATUS="${{ needs.check-checklist-gate.result }}" ;;
-              audit-release-entitlements) STATUS="${{ needs.audit-release-entitlements.result }}" ;;
-            esac
+  release-smoke-tests:
+    name: Release Smoke Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # CI_RELEASE=1: missing binaries fail (never silently rebuilt) and the
+      # smoke suite runs the signed JIT self-test plus packaged-runner PE
+      # execution and the steam:launch profile surface test.
+      - name: Run release smoke tests (signed JIT self-test, packaged-runner PE execution)
+        run: CI_RELEASE=1 ./ci/check_release_smoke.sh
 
-            if [ "$STATUS" = "success" ]; then
-              RESULTS="$RESULTS\n✅ $job: PASSED"
-            else
-              RESULTS="$RESULTS\n❌ $job: FAILED ($STATUS)"
-              FAIL=1
-            fi
-          done
-
-          echo -e "$RESULTS"
-          echo ""
-
-          if [ "$FAIL" -eq 1 ]; then
-            echo "::error::Release checklist FAILED — one or more checks did not pass"
-            exit 1
-          else
-            echo "🎉 All release checklist checks PASSED"
-          fi
+  check-release-gate:
+    name: Release Evidence Gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Steam E2E evidence artifact (fails closed if absent)
+        uses: actions/download-artifact@v4
+        with:
+          name: steam-e2e-${{ github.sha }}
+          path: e2e-evidence
+      # Evidence model: the gate verifies release-evidence.json (commit ==
+      # HEAD, all required fields "pass", Steam E2E artifact digest ties to
+      # this commit, signed candidate hash matches the artifact tested).
+      # checklist.md is a human tracking document, not executable evidence.
+      - name: Verify release evidence
+        run: |
+          RELEASE_EVIDENCE_FILE="$GITHUB_WORKSPACE/e2e-evidence/release-evidence.json" \
+          RELEASE_EVIDENCE_DIR="$GITHUB_WORKSPACE/e2e-evidence" \
+          ./ci/check_release_gate.sh
 
   check-dependency-audit:
     name: Dependency Audit
@@ -158,24 +156,11 @@ jobs:
       - name: Run reproducibility check
         run: ./ci/check_reproducible.sh
 
-  release-smoke-tests:
-    name: Release Smoke Tests
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run release smoke tests
-        run: ./ci/check_release_smoke.sh
-
-  check-checklist-gate:
-    name: Release Gate Checklist
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify all checklist items are checked
-        run: ./ci/check_release_gate.sh
-
+  # Verifies the EXISTING Developer ID signatures and entitlements and
+  # never re-signs anything. Requires the release-signed artifacts (built
+  # and signed on the self-hosted Apple Silicon runner by the Steam E2E
+  # workflow); on hosted runners without signed artifacts this job fails,
+  # failing the gate closed by design.
   audit-release-entitlements:
     name: Audit Release Entitlements
     runs-on: macos-latest
@@ -183,5 +168,69 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build, sign, and audit release binaries
-        run: ./ci/audit_release_entitlements.sh
+      - name: Verify existing signatures and entitlements (never re-signs)
+        run: ./ci/audit_release_entitlements.sh --verify-existing-signatures
+
+  release-gate:
+    name: Release Gate
+    runs-on: macos-latest
+    needs:
+      - check-compile
+      - check-format
+      - check-clippy
+      - check-tests
+      - check-no-insecure-tls
+      - check-dependency-audit
+      - check-licenses
+      - check-reproducible
+      - release-smoke-tests
+      - steam-e2e-evidence
+      - check-release-gate
+      - audit-release-entitlements
+    if: always()
+    steps:
+      - name: Evaluate release gate results
+        run: |
+          RESULTS=""
+          FAIL=0
+
+          for job in check-compile check-format check-clippy check-tests \
+                     check-no-insecure-tls check-dependency-audit \
+                     check-licenses check-reproducible release-smoke-tests \
+                     steam-e2e-evidence check-release-gate \
+                     audit-release-entitlements; do
+            STATUS=""
+            case "$job" in
+              check-compile)           STATUS="${{ needs.check-compile.result }}" ;;
+              check-format)            STATUS="${{ needs.check-format.result }}" ;;
+              check-clippy)            STATUS="${{ needs.check-clippy.result }}" ;;
+              check-tests)             STATUS="${{ needs.check-tests.result }}" ;;
+              check-no-insecure-tls)   STATUS="${{ needs.check-no-insecure-tls.result }}" ;;
+              check-dependency-audit)  STATUS="${{ needs.check-dependency-audit.result }}" ;;
+              check-licenses)          STATUS="${{ needs.check-licenses.result }}" ;;
+              check-reproducible)      STATUS="${{ needs.check-reproducible.result }}" ;;
+              release-smoke-tests)     STATUS="${{ needs.release-smoke-tests.result }}" ;;
+              steam-e2e-evidence)      STATUS="${{ needs.steam-e2e-evidence.result }}" ;;
+              check-release-gate)      STATUS="${{ needs.check-release-gate.result }}" ;;
+              audit-release-entitlements) STATUS="${{ needs.audit-release-entitlements.result }}" ;;
+            esac
+
+            if [ "$STATUS" = "success" ]; then
+              RESULTS="$RESULTS\n✅ $job: PASSED"
+            else
+              RESULTS="$RESULTS\n❌ $job: FAILED ($STATUS)"
+              FAIL=1
+            fi
+          done
+
+          echo -e "$RESULTS"
+          echo ""
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "::error::Release gate FAILED — evidence is missing or a check did not pass"
+            echo "::error::The gate fails closed: Steam E2E evidence for this exact SHA,"
+            echo "::error::the signed JIT self-test, and the evidence checks are all required."
+            exit 1
+          else
+            echo "🎉 All release gate checks PASSED"
+          fi

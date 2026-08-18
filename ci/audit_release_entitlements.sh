@@ -1,7 +1,26 @@
 #!/usr/bin/env bash
+# ci/audit_release_entitlements.sh — Release entitlement audit for Casa1
+#
+# Default mode: builds the release binaries, ad-hoc signs them (with the
+# JIT entitlement on casa1-runner), and audits the entitlement structure.
+# This validates entitlement policy but manufactures its own signatures.
+#
+# --verify-existing-signatures mode: refuses to build and refuses to sign
+# anything. It only VERIFIES the signatures already present on the release
+# binaries: each binary must carry a valid Developer ID signature, and the
+# entitlement audit (including com.apple.security.cs.allow-jit on
+# casa1-runner) is run against the existing signed binaries. Any unsigned,
+# ad-hoc-signed, or missing binary fails the audit — the gate fails closed.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+verify_only=0
+case "${1:-}" in
+  --verify-existing-signatures) verify_only=1 ;;
+  "") ;;
+  *) echo "usage: $0 [--verify-existing-signatures]" >&2; exit 2 ;;
+esac
 
 # Detect the default target if configured in .cargo/config.toml
 default_target=""
@@ -15,7 +34,12 @@ else
 fi
 
 cd "$repo_root"
-cargo build --release --bins
+
+if [[ $verify_only -eq 1 ]]; then
+  echo "Mode: --verify-existing-signatures (verify only; nothing will be built or re-signed)"
+else
+  cargo build --release --bins
+fi
 
 # IMPORTANT: This list must stay in sync with [[bin]] entries in Cargo.toml.
 # The verification step below will catch mismatches.
@@ -44,16 +68,49 @@ for binary in "${binaries[@]}"; do
   fi
 done
 
-for binary in casa1 macwin casa1-helper casa1-test-guest casa1-oracle; do
-  /usr/bin/codesign --force --sign - "$release_dir/$binary" &>/dev/null
-done
+if [[ $verify_only -eq 1 ]]; then
+  # -------------------------------------------------------------------------
+  # Verify-only mode: never sign, never rebuild. Every binary must already
+  # carry a valid Developer ID signature with the expected entitlements.
+  # -------------------------------------------------------------------------
+  SIGN_FAILED=false
+  for binary in "${binaries[@]}"; do
+    path="$release_dir/$binary"
+    if ! /usr/bin/codesign --verify --strict "$path" &>/dev/null; then
+      echo "ERROR: $binary: signature invalid or missing (expected an existing Developer ID signature)" >&2
+      SIGN_FAILED=true
+      continue
+    fi
+    if ! /usr/bin/codesign -dv "$path" 2>&1 | grep -q "Developer ID Application"; then
+      echo "ERROR: $binary: signature is not a Developer ID Application signature" >&2
+      echo "  (ad-hoc or unknown identity found — the release gate requires Developer ID)" >&2
+      SIGN_FAILED=true
+      continue
+    fi
+    echo "OK: $binary: valid Developer ID signature"
+  done
+  if [[ "$SIGN_FAILED" == true ]]; then
+    echo "ERROR: one or more binaries failed signature verification." >&2
+    echo "  The release process must sign every binary with the Developer ID identity;" >&2
+    echo "  this audit never re-signs." >&2
+    exit 1
+  fi
+else
+  for binary in casa1 macwin casa1-helper casa1-test-guest casa1-oracle; do
+    /usr/bin/codesign --force --sign - "$release_dir/$binary" &>/dev/null
+  done
 
-/usr/bin/codesign \
-  --force \
-  --sign - \
-  --entitlements "$repo_root/ci/entitlements/casa1-runner.plist" \
-  "$release_dir/casa1-runner" &>/dev/null
+  /usr/bin/codesign \
+    --force \
+    --sign - \
+    --entitlements "$repo_root/ci/entitlements/casa1-runner.plist" \
+    "$release_dir/casa1-runner" &>/dev/null
+fi
 
+# The entitlement audit reads the embedded entitlements of the binaries as
+# they are signed right now (ad-hoc in default mode, pre-existing Developer
+# ID signatures in verify-only mode) and fails when the expected set,
+# including com.apple.security.cs.allow-jit on casa1-runner, is missing.
 "$release_dir/macwin" security:audit-entitlements \
   --jit-owner casa1-runner \
   --require-approved \

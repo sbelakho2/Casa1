@@ -1,4 +1,32 @@
-# Casa1 100% Completion Checklist
+# Casa1 Engineering Remediation Checklist
+
+> **Note**: This checklist is a human tracking document, not executable
+> evidence. Release decisions are gated by machine-verifiable evidence only:
+> `ci/check_release_gate.sh` + `release-evidence.json` (commit tie, Steam E2E
+> artifact digest, signed candidate hash) and the fail-closed release CI
+> checks. An `[x]` here records intent and review, never proof.
+
+## Steam V1 Acceptance
+
+Real Steam E2E milestones (S0-S13). Evaluated by the `steam-e2e` workflow
+(`tests/section41.rs` with `CASA1_STEAM_E2E=1`) on a self-hosted Apple
+Silicon runner with the signed runner; evidence uploaded as
+`steam-e2e-<sha>`.
+
+- [ ] S0 — Steam bootstrap starts (first block dispatch of the PE main loop)
+- [ ] S1 — Steam manifest opened
+- [ ] S2 — Steam manifest verified (opened and fully read)
+- [ ] S3 — Package writability probe observed
+- [ ] S4 — Steam client main started (first CreateThread after bootstrap)
+- [ ] S5 — First steamwebhelper process created
+- [ ] S6 — CEF browser created
+- [ ] S7 — First CEF paint observed
+- [ ] S8 — Software CEF paints observed
+- [ ] S9 — Accelerated CEF paints observed
+- [ ] S10 — DXGI presents observed
+- [ ] S11 — First Metal-presented frame
+- [ ] S12 — Login screen visible (frame-capture acceptance)
+- [ ] S13 — Steam V1 accepted: S0-S12 all green in the real Steam E2E run
 
 ## Definition Of 100%
 
@@ -27,13 +55,13 @@
 ## Working Tree Hygiene
 
 - [x] Review every modified tracked file and decide whether it belongs in the current project state.
-- [x] Remove generated logs and run artifacts from version control unless they are intentional fixtures.
+- [ ] Remove generated logs and run artifacts from version control unless they are intentional fixtures.
 - [x] Decide whether generated PDFs belong in the repo, and move them to fixtures only if tests require them.
 - [x] Restore or replace deleted planning/output files only if they are still part of the project workflow.
 - [x] Add ignore rules for generated logs, temporary Steam runtime files, build outputs, and local run artifacts.
 - [x] Make `Cargo.toml`, `Cargo.lock`, and `fuzz/Cargo.toml` consistent and intentionally updated.
 - [x] Document which newly added source modules are part of the supported architecture.
-- [x] Ensure no local machine paths or user-specific paths are committed.
+- [ ] Ensure no local machine paths or user-specific paths are committed.
 - [x] Ensure binary fixtures are documented with origin, purpose, and update process.
 
 ## Rust Quality Gates
@@ -81,6 +109,7 @@
 - [x] Replace silent `FAST_THUNK_MAP.lock().ok()` misses with explicit poison handling or a lock-free/read-mostly structure.
 - [x] Benchmark global fast-thunk map contention under multi-threaded guest workloads.
 - [x] Add tests for executable memory exhaustion and graceful fallback to interpreter.
+- [ ] Production JIT execution through the signed release runner (allow-jit + MAP_JIT path end to end, not just unit tests).
 
 ## CPU Interpreter And IR Correctness
 
@@ -99,7 +128,7 @@
 
 ## PE Loader And Runtime Dispatch
 
-- [x] Split `src/pe_runtime.rs` into smaller host thunk modules by subsystem.
+- [ ] Split `src/pe_runtime.rs` into smaller host thunk modules by subsystem.
 - [x] Generate or centralize host thunk metadata so argument counts, names, and last-error behavior stay consistent.
 - [x] Replace guest-controlled enum transmutes in WinHTTP WebSocket thunks with validated conversions.
 - [x] Replace guest-controlled close-status transmutes with validated conversions.
@@ -278,7 +307,7 @@
 - [x] Add fuzz targets for WinHTTP/WinINet header and URL parsing.
 - [x] Add fuzz targets for registry paths and filesystem canonicalization.
 - [x] Add fuzz targets for media containers and video packet parsing.
-- [x] Add a minimal fuzz smoke run to CI.
+- [ ] Add a minimal fuzz smoke run to CI.
 - [x] Store minimized crash reproducers as fixtures.
 - [x] Add regression tests for every accepted fuzz crash.
 
@@ -317,4 +346,6 @@
 - [x] Add license and supply-chain checks for dependencies.
 - [x] Add release artifact reproducibility checks where feasible.
 - [x] Add release smoke tests for generated app bundles and command-line tools.
-- [x] Add a final release gate that requires all checklist release blockers to be checked.
+- [ ] Real Steam E2E evidence tied to an exact commit (steam-e2e workflow artifact, section41, CASA1_STEAM_E2E=1).
+- [ ] Release evidence tied to the exact candidate hash (release-evidence.json + ci/check_release_gate.sh).
+- [x] Add a final release gate that requires all release blockers to pass with machine-verifiable evidence.

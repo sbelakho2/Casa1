@@ -3,6 +3,44 @@
 This directory contains tracked Guest Environment snapshots used as test fixtures
 for Casa1's Steam and Windows compatibility layers.
 
+## Two Kinds of Environment
+
+### Bootstrap fixture (deterministic, checked in)
+
+The `steam/`, `steam-live-run/`, `steam-live-run-x86/`, and `replay/`
+snapshots are **bootstrap fixtures**: deterministic, reproducible inputs for
+CI and local tests. They pin down:
+
+- PE imports of the Steam binaries (Steam.exe, SteamService.exe, NSIS
+  installer plugins)
+- The filesystem layout of `drive_c` (manifest, package markers,
+  steambootstrapper localization files)
+- The installer/bootstrap semantics (NSIS behavior during SteamSetup.exe)
+- The `ge.json` configuration and `fs/reparse.db.json` state
+
+They are NOT a running Steam client: no updater/network traffic, no full
+client, no webhelper/CEF, no login. They are updated deliberately by
+re-running the installer (see below), and runtime churn is never committed
+(see "Runtime Artifacts").
+
+### Hydrated E2E environment (disposable, generated)
+
+The **hydrated E2E environment** is the real Steam V1 acceptance target:
+a running Steam client with updater/network access, steamwebhelper, CEF
+UI, Metal output, and a login screen. It is:
+
+- **Generated**, not checked in: created by the `steam-e2e` workflow
+  (`.github/workflows/steam-e2e.yml`) on the self-hosted Apple Silicon
+  runner by bootstrapping from the fixture and letting Steam update itself.
+- **Disposable**: torn down after the run; never committed.
+- **Evidenced**: the S0-S13 milestone results and hashes are uploaded as
+  the `steam-e2e-<sha>` artifact consumed by the release gate.
+
+The distinction matters: a green fixture-based test proves deterministic
+bootstrap behavior; only a hydrated E2E run proves the Steam client
+actually reaches the login screen, and only its evidence can unlock a
+release.
+
 ## Directory Layout
 
 | Directory | Purpose |

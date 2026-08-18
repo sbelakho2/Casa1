@@ -1,2 +1,0 @@
-{"event_id":1,"ts_ticks":11,"pid":109237,"tid":1,"module":"runner","severity":"info","reason_code":0,"win32_err":null,"ntstatus":null,"msg":"spawned guest process 109237","kv":{"args":[],"cwd":"/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris","exe":"/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/dist/casa1-tetris.exe","intent":"play"}}
-{"event_id":2,"ts_ticks":9649769,"pid":109237,"tid":1,"module":"runner","severity":"info","reason_code":0,"win32_err":null,"ntstatus":null,"msg":"guest process exited with 0","kv":{"exit_code":0}}
