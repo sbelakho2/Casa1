@@ -16,6 +16,7 @@ pub enum ReasonCode {
     RcHelperPermissionDenied = 1009,
     RcEntitlementAuditFailed = 1010,
     RcEntitlementValidationError = 1011,
+    RcRunnerVersionMismatch = 1012,
     RcFsPathInvalid = 1100,
     RcFsAlreadyExists = 1101,
     RcFsNotFound = 1102,
@@ -131,6 +132,7 @@ impl ReasonCode {
             1009 => Some(Self::RcHelperPermissionDenied),
             1010 => Some(Self::RcEntitlementAuditFailed),
             1011 => Some(Self::RcEntitlementValidationError),
+            1012 => Some(Self::RcRunnerVersionMismatch),
             1100 => Some(Self::RcFsPathInvalid),
             1101 => Some(Self::RcFsAlreadyExists),
             1102 => Some(Self::RcFsNotFound),
@@ -243,6 +245,7 @@ impl ReasonCode {
             Self::RcHelperPermissionDenied => "RC_HELPER_PERMISSION_DENIED",
             Self::RcEntitlementAuditFailed => "RC_ENTITLEMENT_AUDIT_FAILED",
             Self::RcEntitlementValidationError => "RC_ENTITLEMENT_VALIDATION_ERROR",
+            Self::RcRunnerVersionMismatch => "RC_RUNNER_VERSION_MISMATCH",
             Self::RcFsPathInvalid => "RC_FS_PATH_INVALID",
             Self::RcFsAlreadyExists => "RC_FS_ALREADY_EXISTS",
             Self::RcFsNotFound => "RC_FS_NOT_FOUND",
@@ -373,6 +376,7 @@ mod tests {
         assert_eq!(ReasonCode::RcHandleStaleOrInvalid as u32, 1306);
         assert_eq!(ReasonCode::RcSandboxPathViolation as u32, 1108);
         assert_eq!(ReasonCode::RcEntitlementValidationError as u32, 1011);
+        assert_eq!(ReasonCode::RcRunnerVersionMismatch as u32, 1012);
         assert_eq!(ReasonCode::RcCrashRecoveryError as u32, 3002);
     }
 
@@ -393,6 +397,7 @@ mod tests {
             (ReasonCode::RcHelperPermissionDenied, 1009),
             (ReasonCode::RcEntitlementAuditFailed, 1010),
             (ReasonCode::RcEntitlementValidationError, 1011),
+            (ReasonCode::RcRunnerVersionMismatch, 1012),
             (ReasonCode::RcFsPathInvalid, 1100),
             (ReasonCode::RcFsAlreadyExists, 1101),
             (ReasonCode::RcFsNotFound, 1102),

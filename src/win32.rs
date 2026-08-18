@@ -4899,6 +4899,40 @@ impl Win32Subsystem {
         Ok(handle)
     }
 
+    /// SteamService named-pipe listener for launch-time IPC wiring.
+    ///
+    /// When a Steam launch enables `steam_ipc`, the runner pre-creates the
+    /// `\\.\pipe\steam_service` server endpoint (the NamedPipeState
+    /// server-created hook) before the guest runs, so a guest Steam client
+    /// connecting via `CreateFileW`/`CallNamedPipe` finds a live listener
+    /// even though SteamService.exe is not being executed.  Idempotent: if
+    /// the pipe already exists (guest created it, or a prior call), it is
+    /// left untouched.
+    pub fn ensure_steam_service_pipe_listener(&mut self) -> AppResult<()> {
+        const STEAM_SERVICE_PIPE: &str = r"\\.\pipe\steam_service";
+        let normalized = normalize_pipe_name(STEAM_SERVICE_PIPE);
+        if self.named_pipes.contains_key(&normalized) {
+            return Ok(());
+        }
+        let handle = self.create_named_pipe_w(
+            STEAM_SERVICE_PIPE,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_READMODE_MESSAGE,
+            1,         // nMaxInstances
+            64 * 1024, // out buffer
+            64 * 1024, // in buffer
+            0,         // default timeout
+            false,     // inheritable
+            None,      // security descriptor
+            None,      // uds path (derived)
+        )?;
+        eprintln!(
+            "[win32] SteamService pipe listener created: {} (server handle {handle:#x})",
+            STEAM_SERVICE_PIPE
+        );
+        Ok(())
+    }
+
     /// `ConnectNamedPipe` — wait for a client to connect to the named pipe.
     pub fn connect_named_pipe(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;

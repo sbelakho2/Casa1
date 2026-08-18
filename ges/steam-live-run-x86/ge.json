@@ -42,7 +42,6 @@
           "CASA1_METAL_RENDERING": "1",
           "CASA1_OPENGL_METAL": "1",
           "CASA1_REAL_AUDIO": "1",
-          "CASA1_STEAM_CRASH_WORKAROUND": "1",
           "CASA1_STEAM_INPUT": "1",
           "CASA1_VULKAN_METAL": "1",
           "CASA1_WEBVIEW2": "1",
@@ -802,6 +801,196 @@
         "creation_time_ticks": 133607156180000000,
         "last_access_time_ticks": 0,
         "last_write_time_ticks": 133607156180000000
+      },
+      "C:\\users": {
+        "kind": "Directory",
+        "original_case": "users",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1": {
+        "kind": "Directory",
+        "original_case": "casa1",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata": {
+        "kind": "Directory",
+        "original_case": "AppData",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp": {
+        "kind": "Directory",
+        "original_case": "Temp",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 133105159660000000,
+        "last_access_time_ticks": 133105159660000000,
+        "last_write_time_ticks": 133105159660000000
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\logs": {
+        "kind": "Directory",
+        "original_case": "logs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\steam.exe": {
+        "kind": "File",
+        "original_case": "Steam.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\steamsetup.exe": {
+        "kind": "File",
+        "original_case": "SteamSetup.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming": {
+        "kind": "Directory",
+        "original_case": "Roaming",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft": {
+        "kind": "Directory",
+        "original_case": "Microsoft",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows": {
+        "kind": "Directory",
+        "original_case": "Windows",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows\\start menu": {
+        "kind": "Directory",
+        "original_case": "Start Menu",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows\\start menu\\programs": {
+        "kind": "Directory",
+        "original_case": "Programs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\desktop": {
+        "kind": "Directory",
+        "original_case": "Desktop",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 134237419486415600,
+        "last_access_time_ticks": 134237419486415600,
+        "last_write_time_ticks": 134237419486415600
+      },
+      "\\\\?\\C:\\Steam\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\Steam\\logs\\%s.txt": {
+        "kind": "File",
+        "original_case": "%s.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\Steam\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
+        "attributes": [],
+        "creation_time_ticks": 134236866690913950,
+        "last_access_time_ticks": 134236866690913950,
+        "last_write_time_ticks": 134236866690913950
+      },
+      "\\\\?\\C:\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
+        "attributes": [],
+        "creation_time_ticks": 134237439965011330,
+        "last_access_time_ticks": 134237439965011330,
+        "last_write_time_ticks": 134237439965011330
+      },
+      "\\\\?\\C:\\steam\\logs\\%s.txt": {
+        "kind": "File",
+        "original_case": "%s.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\users\\casa1\\AppData\\Local\\Temp\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\users\\casa1\\AppData\\Local\\Temp\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
       }
     }
   }

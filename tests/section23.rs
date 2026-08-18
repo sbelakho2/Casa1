@@ -81,7 +81,11 @@ fn t23_1_steam_bootstrap_diagnostic() {
 
     // 3. Build execution options.
     let env = trace_env();
-    let options = PeExecutionOptions { live_session: None };
+    let options = PeExecutionOptions {
+        live_session: None,
+        jit_mode: None,
+        steam_ipc: false,
+    };
 
     // 4. Execute Steam.exe with tracing.
     let result = pe_runtime::execute_with_options(

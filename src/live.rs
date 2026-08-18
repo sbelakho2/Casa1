@@ -135,8 +135,9 @@ pub fn run_live_host_session<T>(
     title: &str,
     session: LiveHostSession,
     worker: JoinHandle<AppResult<T>>,
+    requested_window_size: Option<(u32, u32)>,
 ) -> AppResult<T> {
-    let loop_result = run_live_host_loop(title, session, &worker);
+    let loop_result = run_live_host_loop(title, session, &worker, requested_window_size);
     live_trace("[live] run_live_host_session exiting — joining worker thread");
     // The worker is always joined, even when the host loop returns early
     // (window creation, export, or decode failure), so it never keeps
@@ -156,15 +157,25 @@ fn run_live_host_loop<T>(
     title: &str,
     session: LiveHostSession,
     worker: &JoinHandle<AppResult<T>>,
+    requested_window_size: Option<(u32, u32)>,
 ) -> AppResult<()> {
     let audio = LiveAudioOutput::new()?;
     let export_live_frame_path = std::env::var(EXPORT_LIVE_FRAME_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty());
     // No window is created at startup: the live window only exists once a
-    // real guest frame arrives, and is sized to that frame's validated
-    // dimensions.  If the worker finishes without ever producing a frame,
-    // the loop exits cleanly below without creating any window.
+    // real guest frame arrives.  When the launch requested an explicit
+    // window size (profile resolution), the window is created at that size;
+    // otherwise it is sized to the first frame's validated dimensions.  If
+    // the worker finishes without ever producing a frame, the loop exits
+    // cleanly below without creating any window.
+    let requested_window_size = requested_window_size
+        .map(|(width, height)| {
+            let width = width as usize;
+            let height = height as usize;
+            validate_presentable_dims(width, height).map(|_| (width, height))
+        })
+        .transpose()?;
     let mut window: Option<Window> = None;
     let mut frame_buffer = Vec::new();
     let mut frame_width = 0usize;
@@ -227,6 +238,7 @@ fn run_live_host_loop<T>(
             &mut frame_height,
             title,
             export_live_frame_path.as_deref().map(Path::new),
+            requested_window_size,
         )?;
 
         if let Some(window) = window.as_mut() {
@@ -333,6 +345,7 @@ fn run_live_host_loop<T>(
                 &mut frame_height,
                 title,
                 export_live_frame_path.as_deref().map(Path::new),
+                requested_window_size,
             )?;
             if final_changed && let Some(window) = window.as_mut() {
                 window
@@ -367,7 +380,9 @@ fn drain_frames(rx: &Receiver<LiveFrame>, latest_frame: &mut Option<LiveFrame>) 
 /// Consume the latest frame, (re)creating the window and decoding the pixel
 /// buffer as needed.  Returns true when the window should present the new
 /// buffer.  Frame dimensions come from the guest pipeline and are untrusted,
-/// so they are validated before reaching minifb.
+/// so they are validated before reaching minifb.  When a launch requested an
+/// explicit window size, the window is created at that size and frames are
+/// scaled (nearest neighbour) to fit it.
 #[allow(clippy::too_many_arguments)]
 fn process_latest_frame(
     latest_frame: &mut Option<LiveFrame>,
@@ -377,26 +392,53 @@ fn process_latest_frame(
     frame_height: &mut usize,
     title: &str,
     export_live_frame_path: Option<&Path>,
+    requested_window_size: Option<(usize, usize)>,
 ) -> AppResult<bool> {
     let Some(frame) = latest_frame.take() else {
         return Ok(false);
     };
-    if window.is_none()
-        || frame.width as usize != *frame_width
-        || frame.height as usize != *frame_height
-    {
-        let width = frame.width as usize;
-        let height = frame.height as usize;
-        validate_presentable_dims(width, height)?;
-        *window = Some(create_window(title, width, height)?);
-        *frame_width = width;
-        *frame_height = height;
+    let frame_w = frame.width as usize;
+    let frame_h = frame.height as usize;
+    // Guest frame dimensions are untrusted regardless of the window size:
+    // validate them before they reach decode or scaling arithmetic.
+    validate_presentable_dims(frame_w, frame_h)?;
+    let (window_w, window_h) = requested_window_size.unwrap_or((frame_w, frame_h));
+    if window.is_none() || window_w != *frame_width || window_h != *frame_height {
+        validate_presentable_dims(window_w, window_h)?;
+        *window = Some(create_window(title, window_w, window_h)?);
+        *frame_width = window_w;
+        *frame_height = window_h;
     }
     if let Some(path) = export_live_frame_path {
         export_live_frame(&frame, path)?;
     }
     decode_frame_buffer_into(&frame, frame_buffer)?;
+    if frame_w != *frame_width || frame_h != *frame_height {
+        *frame_buffer =
+            scale_frame_nearest(frame_buffer, frame_w, frame_h, *frame_width, *frame_height);
+    }
     Ok(true)
+}
+
+/// Nearest-neighbour scale of a decoded ARGB buffer from `src_w x src_h`
+/// to `dst_w x dst_h`.  Used when a launch requested an explicit window
+/// size that differs from the guest frame size.
+fn scale_frame_nearest(
+    src: &[u32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u32> {
+    let mut dst = Vec::with_capacity(dst_w.saturating_mul(dst_h));
+    for y in 0..dst_h {
+        let src_y = (y * src_h / dst_h).min(src_h.saturating_sub(1));
+        for x in 0..dst_w {
+            let src_x = (x * src_w / dst_w).min(src_w.saturating_sub(1));
+            dst.push(src[src_y * src_w + src_x]);
+        }
+    }
+    dst
 }
 
 fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> {

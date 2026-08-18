@@ -76,14 +76,13 @@ pub struct SteamLaunchProfile {
     pub steam_overlay: bool,
     /// Whether to enable Steam IPC (named pipes).
     pub steam_ipc: bool,
-    /// Whether to auto-login to Steam.
+    /// Whether to auto-login to Steam.  Not supported in this version:
+    /// `create_steam_job` rejects profiles that set it with a clear error.
     pub auto_login: bool,
     /// Whether to start Steam in offline mode.
     pub offline_mode: bool,
     /// Whether to enable debug logging for Steam.
     pub debug_logging: bool,
-    /// Whether to enable Steam crash workaround instrumentation.
-    pub steam_crash_workaround: bool,
     /// Whether to enable JIT compilation for the PE runtime.
     pub jit_enabled: bool,
     /// Custom PE runtime instruction budget (0 = unlimited).
@@ -120,7 +119,6 @@ impl Default for SteamLaunchProfile {
             auto_login: false,
             offline_mode: false,
             debug_logging: false,
-            steam_crash_workaround: true,
             jit_enabled: true,
             instruction_budget: 0, // unlimited
             extra_args: Vec::new(),
@@ -138,12 +136,11 @@ impl Default for SteamLaunchProfile {
 impl SteamLaunchProfile {
     /// Create a profile optimized for maximum performance.
     ///
-    /// Disables debug logging, crash workarounds, and enables JIT with
-    /// unlimited instruction budget.
+    /// Disables debug logging and enables JIT with unlimited instruction
+    /// budget.
     pub fn performance() -> Self {
         Self {
             debug_logging: false,
-            steam_crash_workaround: false,
             jit_enabled: true,
             instruction_budget: 0,
             ..Self::default()
@@ -152,12 +149,11 @@ impl SteamLaunchProfile {
 
     /// Create a profile optimized for debugging Steam issues.
     ///
-    /// Enables debug logging, crash workarounds, Steam tracing, and
-    /// limits the instruction budget for reproducible behavior.
+    /// Enables debug logging, Steam tracing, and limits the instruction
+    /// budget for reproducible behavior.
     pub fn debug() -> Self {
         Self {
             debug_logging: true,
-            steam_crash_workaround: true,
             jit_enabled: true,
             instruction_budget: 50_000_000,
             extra_args: vec!["-dev".to_string(), "-console".to_string()],
@@ -250,10 +246,13 @@ pub fn prepare_steam_ge(
     }
 }
 
-/// The `CASA1_*` environment variables derived from a launch profile.
+/// The `CASA1_*` launch-specific environment variables derived from a launch
+/// profile.
 ///
-/// Shared by [`build_steam_override_profile`] and
-/// [`build_steam_environment`] so the two sets cannot drift apart.
+/// This set contains ONLY launch-specific Casa1 settings (graphics, audio,
+/// CEF, Vulkan/OpenGL, Steam Input, budget).  The runner itself supplies the
+/// GE root, registry files, trace file, run intent, and test id via
+/// `runner::child_environment` — they are never duplicated here.
 fn steam_env_vars(profile: &SteamLaunchProfile) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
@@ -305,14 +304,8 @@ fn steam_env_vars(profile: &SteamLaunchProfile) -> BTreeMap<String, String> {
     }
 
     // ── Steam-specific configuration ────────────────────────────────────────
-    if profile.steam_crash_workaround {
-        env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
-    }
     if profile.debug_logging {
         env.insert("CASA1_STEAM_TRACE".to_string(), "1".to_string());
-    }
-    if !profile.jit_enabled {
-        env.insert("CASA1_JIT".to_string(), "0".to_string());
     }
     if profile.instruction_budget > 0 {
         env.insert(
@@ -515,76 +508,24 @@ pub fn prepare_steam_environment(ge_root: &Path, profile: &SteamLaunchProfile) -
     Ok(())
 }
 
-/// Builds the complete environment variable map for Steam execution.
+/// Builds the launch-specific job environment map for Steam execution.
 ///
-/// This combines the runner's base environment variables with Steam-specific
-/// configuration for optimal rendering, audio, and networking.
-pub fn build_steam_environment(
-    profile: &SteamLaunchProfile,
-    ge_root: &Path,
-    trace_file: &Path,
-    test_id: &str,
-) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-
-    // ── Base GE environment variables (set by runner::child_environment) ─────
-    env.insert("CASA1_GE_ROOT".to_string(), ge_root.display().to_string());
-    env.insert(
-        "CASA1_REGISTRY_HKCU".to_string(),
-        ge_root
-            .join("registry")
-            .join("HKCU.db")
-            .display()
-            .to_string(),
-    );
-    env.insert(
-        "CASA1_REGISTRY_HKLM".to_string(),
-        ge_root
-            .join("registry")
-            .join("HKLM.db")
-            .display()
-            .to_string(),
-    );
-    env.insert(
-        "CASA1_REGISTRY_HKCR".to_string(),
-        ge_root
-            .join("registry")
-            .join("HKCR.db")
-            .display()
-            .to_string(),
-    );
-    env.insert(
-        "CASA1_TRACE_FILE".to_string(),
-        trace_file.display().to_string(),
-    );
-    env.insert("CASA1_DTM".to_string(), "0".to_string());
-    env.insert("CASA1_RUN_INTENT".to_string(), "play".to_string());
-    env.insert("CASA1_TEST_ID".to_string(), test_id.to_string());
-
-    // ── Steam-specific environment variables (shared with the override
-    // profile so the two cannot drift) ─────────────────────────────────────
-    env.extend(steam_env_vars(profile));
-
-    // Steam install directory hint.
-    let steam_dir = profile.steam_dir(ge_root);
-    env.insert(
-        "CASA1_STEAM_DIR".to_string(),
-        steam_dir.display().to_string(),
-    );
-
-    env
+/// Contains ONLY launch-specific Casa1 settings derived from the profile
+/// (graphics, audio, CEF, Vulkan/OpenGL, Steam Input, budget).  The runner
+/// supplies the GE root, registry files, trace file, run intent and test id
+/// via `runner::child_environment` — those are never duplicated here.
+pub fn build_steam_job_env(profile: &SteamLaunchProfile) -> BTreeMap<String, String> {
+    steam_env_vars(profile)
 }
 
 /// Builds the Steam.exe command-line arguments from the launch profile.
 pub fn build_steam_args(profile: &SteamLaunchProfile) -> Vec<String> {
     let mut args = Vec::new();
 
-    if profile.steam_overlay {
-        args.push("-overlay".to_string());
-    }
-    if profile.auto_login {
-        args.push("-login".to_string());
-    }
+    // NOTE: `steam_overlay` represents *support only* — no forced `-overlay`
+    // startup flag is emitted (the overlay must be enabled from within Steam
+    // itself, and a forced flag changes Steam's startup behavior).
+    // NOTE: `auto_login` is not supported in v1 (see create_steam_job).
     if profile.offline_mode {
         args.push("-offline".to_string());
     }
@@ -601,25 +542,38 @@ pub fn build_steam_args(profile: &SteamLaunchProfile) -> Vec<String> {
 ///
 /// This persists the override configuration in the GE's `ge.json` so that
 /// it is automatically applied whenever Steam.exe is executed within this GE.
+///
+/// Upsert semantics: a `steam-optimal` override that already exists is
+/// REPLACED by the freshly built profile (the new invocation wins — a
+/// `steam:launch` followed by `steam:launch --no-metal` applies the second
+/// invocation's configuration).  `save_config()` is only invoked when the
+/// effective contents actually changed.
 pub fn register_steam_override(
     ge: &mut crate::ge::GameEnvironment,
     profile: &SteamLaunchProfile,
 ) -> AppResult<()> {
     let override_profile = build_steam_override_profile(profile);
 
-    // Check if the override profile is already registered.
-    let already_registered = ge
+    match ge
         .config
         .override_profiles
         .iter()
-        .any(|p| p.id == "steam-optimal");
-
-    if !already_registered {
-        ge.config.override_profiles.push(override_profile);
-        ge.save_config()?;
-        eprintln!("[steam_launch] registered Steam override profile 'steam-optimal'");
-    } else {
-        eprintln!("[steam_launch] Steam override profile already registered");
+        .position(|p| p.id == "steam-optimal")
+    {
+        Some(index) => {
+            if ge.config.override_profiles[index] != override_profile {
+                ge.config.override_profiles[index] = override_profile;
+                ge.save_config()?;
+                eprintln!("[steam_launch] updated Steam override profile 'steam-optimal'");
+            } else {
+                eprintln!("[steam_launch] Steam override profile 'steam-optimal' unchanged");
+            }
+        }
+        None => {
+            ge.config.override_profiles.push(override_profile);
+            ge.save_config()?;
+            eprintln!("[steam_launch] registered Steam override profile 'steam-optimal'");
+        }
     }
 
     Ok(())
@@ -628,7 +582,8 @@ pub fn register_steam_override(
 /// Creates a `RunnerJob` for launching Steam through the Casa1 runner.
 ///
 /// This constructs the complete job specification including the Steam.exe
-/// path, command-line arguments, environment variables, and execution mode.
+/// path, command-line arguments, launch-specific environment variables,
+/// JIT mode, Steam IPC listener, and requested window size.
 pub fn create_steam_job(
     profile: &SteamLaunchProfile,
     ge: &crate::ge::GameEnvironment,
@@ -646,6 +601,16 @@ pub fn create_steam_job(
         ));
     }
 
+    // Auto-login is not supported in this version: `-login` requires
+    // interactive credentials handling that v1 does not implement.
+    if profile.auto_login {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "Steam auto-login is not supported in this version",
+        )
+        .with_hint("log in interactively from Steam's UI instead"));
+    }
+
     let args = build_steam_args(profile);
     let test_id = format!(
         "play-Steam-{}",
@@ -655,14 +620,23 @@ pub fn create_steam_job(
             .as_millis()
     );
 
+    let jit_mode = if profile.jit_enabled {
+        crate::runner::JitMode::Auto
+    } else {
+        crate::runner::JitMode::Disabled
+    };
+    let window_width = (profile.resolution_width > 0).then_some(profile.resolution_width);
+    let window_height = (profile.resolution_height > 0).then_some(profile.resolution_height);
+
     let job = RunnerJob {
         ge_name: ge.config.name.clone(),
         ge_root: ge.root.clone(),
         program: steam_exe,
         args,
         cwd: ge.root.clone(),
-        env: BTreeMap::new(), // Will be populated by child_environment() in runner
-        dtm: false,           // Never use DTM for live Steam execution
+        env: build_steam_job_env(profile), // launch-specific settings only; the
+        // runner supplies GE/registry/trace/test-id
+        dtm: false, // Never use DTM for live Steam execution
         intent: RunIntent::Play,
         trace_categories: if profile.debug_logging {
             vec![
@@ -677,6 +651,10 @@ pub fn create_steam_job(
             vec![TraceCategory::Process]
         },
         test_id: test_id.clone(),
+        jit_mode,
+        steam_ipc: profile.steam_ipc,
+        window_width,
+        window_height,
     };
 
     Ok(job)
@@ -711,10 +689,23 @@ pub fn prepare_steam_launch(
     // Step 2: Register the Steam override profile.
     register_steam_override(&mut ge, profile)?;
 
-    // Step 3: Prepare the Steam directory structure.
+    // Step 3: Register the steam:// protocol handler when the profile asks
+    // for it (LaunchServices, so the app bundle Info.plist / launch-time
+    // registration claim the scheme).  When register_protocol is false the
+    // scheme is NOT registered.
+    if profile.register_protocol {
+        crate::steam_integration::SteamProtocolIntegration::new_registered();
+        eprintln!("[steam_launch] steam:// protocol handler registered (register_protocol=true)");
+    } else {
+        eprintln!(
+            "[steam_launch] steam:// protocol registration skipped (register_protocol=false)"
+        );
+    }
+
+    // Step 4: Prepare the Steam directory structure.
     prepare_steam_environment(&ge.root, profile)?;
 
-    // Step 4: Create the runner job.
+    // Step 5: Create the runner job.
     let job = create_steam_job(profile, &ge)?;
 
     let steam_exe = profile.steam_exe_path(&ge.root);
@@ -764,7 +755,6 @@ mod tests {
         assert!(profile.cef_bridge);
         assert!(profile.vulkan_opengl);
         assert!(profile.jit_enabled);
-        assert!(profile.steam_crash_workaround);
         assert!(!profile.debug_logging);
         assert!(!profile.auto_login);
         assert!(!profile.offline_mode);
@@ -774,7 +764,6 @@ mod tests {
     fn performance_profile_disables_debug() {
         let profile = SteamLaunchProfile::performance();
         assert!(!profile.debug_logging);
-        assert!(!profile.steam_crash_workaround);
         assert!(profile.jit_enabled);
         assert_eq!(profile.instruction_budget, 0);
     }
@@ -783,7 +772,6 @@ mod tests {
     fn debug_profile_enables_tracing() {
         let profile = SteamLaunchProfile::debug();
         assert!(profile.debug_logging);
-        assert!(profile.steam_crash_workaround);
         assert!(profile.extra_args.contains(&"-dev".to_string()));
         assert!(profile.extra_args.contains(&"-console".to_string()));
     }
@@ -853,7 +841,8 @@ mod tests {
     fn steam_args_build_correctly() {
         let profile = SteamLaunchProfile::default();
         let args = build_steam_args(&profile);
-        assert!(args.contains(&"-overlay".to_string()));
+        assert!(!args.contains(&"-overlay".to_string()));
+        assert!(!args.contains(&"-login".to_string()));
         assert!(!args.contains(&"-offline".to_string()));
     }
 
@@ -876,16 +865,55 @@ mod tests {
     }
 
     #[test]
-    fn build_environment_has_required_vars() {
+    fn build_job_env_has_only_launch_specific_vars() {
         let profile = SteamLaunchProfile::default();
-        let ge_root = PathBuf::from("/tmp/test_ge");
-        let trace_file = ge_root.join("trace.json");
-        let env = build_steam_environment(&profile, &ge_root, &trace_file, "test-123");
-        assert!(env.contains_key("CASA1_GE_ROOT"));
+        let env = build_steam_job_env(&profile);
         assert!(env.contains_key("CASA1_METAL_RENDERING"));
         assert!(env.contains_key("CASA1_REAL_AUDIO"));
         assert!(env.contains_key("CASA1_CEF_BRIDGE"));
-        assert!(env.contains_key("CASA1_STEAM_DIR"));
+        // Launch-specific env must never duplicate runner-supplied settings.
+        assert!(!env.contains_key("CASA1_GE_ROOT"));
+        assert!(!env.contains_key("CASA1_REGISTRY_HKCU"));
+        assert!(!env.contains_key("CASA1_TEST_ID"));
+        assert!(!env.contains_key("CASA1_RUN_INTENT"));
+        // Dead knobs: no crash-workaround and no CASA1_JIT emission.
+        assert!(!env.contains_key("CASA1_STEAM_CRASH_WORKAROUND"));
+        assert!(!env.contains_key("CASA1_JIT"));
+    }
+
+    #[test]
+    fn override_profile_omits_dead_knob_env() {
+        let profile = SteamLaunchProfile::default();
+        let override_profile = build_steam_override_profile(&profile);
+        assert!(
+            !override_profile
+                .payload
+                .env_add
+                .contains_key("CASA1_STEAM_CRASH_WORKAROUND")
+        );
+        assert!(!override_profile.payload.env_add.contains_key("CASA1_JIT"));
+    }
+
+    #[test]
+    fn checked_in_ge_fixture_matches_default_override_profile() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture_path = manifest.join("ges/steam-live-run-x86/ge.json");
+        if !fixture_path.is_file() {
+            return;
+        }
+        let contents = std::fs::read_to_string(&fixture_path).expect("read ge.json fixture");
+        let config: crate::ge::GeConfig = serde_json::from_str(&contents).expect("parse ge.json");
+        let fixture_override = config
+            .override_profiles
+            .iter()
+            .find(|p| p.id == "steam-optimal")
+            .expect("fixture must contain the steam-optimal override");
+        let current = build_steam_override_profile(&SteamLaunchProfile::default());
+        assert_eq!(
+            fixture_override, &current,
+            "ges/steam-live-run-x86/ge.json steam-optimal payload drifted from \
+             build_steam_override_profile(SteamLaunchProfile::default()) — regenerate it"
+        );
     }
 
     #[test]

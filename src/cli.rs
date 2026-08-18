@@ -192,9 +192,6 @@ enum HostCommand {
         /// Steam install directory name within drive_c (default: "Steam").
         #[arg(long, default_value = "Steam")]
         steam_dir: String,
-        /// Enable auto-login.
-        #[arg(long)]
-        auto_login: bool,
         /// Disable HiDPI/Retina rendering.
         #[arg(long)]
         no_hidpi: bool,
@@ -302,6 +299,10 @@ where
                     RunIntent::Run,
                 )?,
                 test_id: format!("run-{}", executable_stem(&exe)),
+                jit_mode: crate::runner::JitMode::Auto,
+                steam_ipc: false,
+                window_width: None,
+                window_height: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()
@@ -335,6 +336,10 @@ where
                     RunIntent::Play,
                 )?,
                 test_id: format!("play-{}", executable_stem(&exe)),
+                jit_mode: crate::runner::JitMode::Auto,
+                steam_ipc: false,
+                window_width: None,
+                window_height: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()
@@ -390,6 +395,10 @@ where
                     RunIntent::Install,
                 )?,
                 test_id: format!("install-{}", executable_stem(&installer)),
+                jit_mode: crate::runner::JitMode::Auto,
+                steam_ipc: false,
+                window_width: None,
+                window_height: None,
             };
             let outcome = dispatch_runner(&ge, &job)?;
             outcome.canonical_output.stable_json()
@@ -550,7 +559,6 @@ where
             budget,
             steam_args,
             steam_dir,
-            auto_login,
             no_hidpi,
             no_steam_input,
             no_network,
@@ -594,9 +602,6 @@ where
             if budget > 0 {
                 profile.instruction_budget = budget;
             }
-            if auto_login {
-                profile.auto_login = true;
-            }
             if no_hidpi {
                 profile.hidpi = false;
             }
@@ -622,13 +627,25 @@ where
             let ge = GameEnvironment::open(&launch_result.ge_name)?;
             let outcome = dispatch_runner(&ge, &job)?;
 
-            // Merge launch result with runner outcome.
+            // Merge launch result with runner outcome: the effective (resolved)
+            // profile, run id, authoritative termination, steam-bootstrap
+            // artifact paths, milestone snapshot, JIT block, and first-failure
+            // records all come from what the runner actually returned.
             util::stable_json(&serde_json::json!({
                 "launch": launch_result,
+                "effective_profile": &profile,
+                "run_id": &outcome.run_id,
+                "termination": &outcome.termination,
+                "termination_detail": &outcome.termination_detail,
+                "steam_artifact_json": &outcome.steam_artifact_json,
+                "steam_artifact_log": &outcome.steam_artifact_log,
+                "milestones": &outcome.milestones,
+                "jit": &outcome.jit,
+                "first_failures": &outcome.milestones.first_failures,
                 "outcome": {
-                    "report_path": outcome.report_path,
-                    "trace_path": outcome.trace_path,
-                    "log_path": outcome.log_path,
+                    "report_path": &outcome.report_path,
+                    "trace_path": &outcome.trace_path,
+                    "log_path": &outcome.log_path,
                     "exit_code": outcome.canonical_output.exit_code,
                 },
             }))
@@ -707,7 +724,52 @@ fn ensure_runner_binary_is_current(runner_binary: &Path) -> AppResult<()> {
         )
     })?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if !manifest_dir.join("Cargo.toml").is_file() {
+    // A development tree is detected by the presence of Cargo.toml AND the
+    // absence of the product-bundle marker.  Outside a development tree the
+    // runner is NEVER rebuilt: a product bundle must ship a matching
+    // casa1-runner, and any staleness is a version mismatch.
+    let is_dev_tree = manifest_dir.join("Cargo.toml").is_file()
+        && std::env::var_os("CASA1_PRODUCT_BUNDLE").is_none();
+    if !is_dev_tree {
+        if std::env::var_os("CASA1_PRODUCT_BUNDLE").is_some() {
+            // Product bundle: never rebuild — a missing or stale runner is a
+            // version mismatch, reported with a dedicated reason code.
+            let runner_modified =
+                match fs::metadata(runner_binary).and_then(|metadata| metadata.modified()) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("[cli] failed to get runner binary modified time: {e}");
+                        None
+                    }
+                };
+            let current_modified =
+                match fs::metadata(&current_executable).and_then(|metadata| metadata.modified()) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("[cli] failed to get current binary modified time: {e}");
+                        None
+                    }
+                };
+            let runner_fresh = match (runner_modified, current_modified) {
+                (Some(runner_modified), Some(current_modified)) => {
+                    runner_modified >= current_modified
+                }
+                _ => false,
+            };
+            if !runner_fresh {
+                return Err(AppError::new(
+                    ReasonCode::RcRunnerVersionMismatch,
+                    format!(
+                        "casa1-runner at {} is missing or older than the product-bundle \
+                         macwin binary; the product bundle cannot rebuild it",
+                        runner_binary.display()
+                    ),
+                )
+                .with_hint(
+                    "reinstall or update the Casa1 product bundle so both binaries ship together",
+                ));
+            }
+        }
         return Ok(());
     }
     let runner_modified = match fs::metadata(runner_binary).and_then(|metadata| metadata.modified())
