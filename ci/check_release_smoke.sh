@@ -4,7 +4,21 @@
 # Verifies:
 #   1. All CLI binaries print usage and exit with expected status.
 #   2. App bundle structure can be created and validated.
-#   3. Release binaries are signed (if codesign available).
+#   3. Release binaries are signed (if codesign available), including the
+#      allow-jit entitlement on casa1-runner.
+#   4. JIT self-test: a dedicated --jit-self-test CLI on the packaged runner
+#      when one exists; otherwise the JIT unit tests (cargo test --lib jit::).
+#      In release mode the packaged-runner PE execution covers JIT instead,
+#      because release mode refuses to build anything.
+#   5. Minimal PE execution through the packaged runner (the bounded
+#      casa1-tetris-smoke.exe fixture runs to a clean exit via macwin ->
+#      casa1-runner, exercising the real JIT on Apple Silicon).
+#   6. Effective steam:launch profile surface (steam:launch --help exposes
+#      the performance/profile flags; there is no dry-run mode yet).
+#
+# Release mode (CASA1_PRODUCT_BUNDLE=1 or CI_RELEASE=1): missing binaries
+# FAIL the smoke test — the script never silently rebuilds release artifacts,
+# because a rebuilt binary would not be the one that was signed and tested.
 #
 # Usage:
 #   ./ci/check_release_smoke.sh
@@ -43,10 +57,21 @@ BINARIES=(
 info "=== Release Smoke Tests ==="
 info "Release directory: $RELEASE_DIR"
 
+RELEASE_MODE=0
+if [[ -n "${CASA1_PRODUCT_BUNDLE:-}" || -n "${CI_RELEASE:-}" ]]; then
+  RELEASE_MODE=1
+  info "Release mode: ON (missing binaries will FAIL, never silently rebuilt)"
+fi
+
 # ── 1. Ensure release binaries are built ─────────────────────────────────────
 info ""
 info "1. Checking release binaries exist ..."
 if [[ ! -d "$RELEASE_DIR" ]]; then
+  if [[ $RELEASE_MODE -eq 1 ]]; then
+    fail "Release directory $RELEASE_DIR does not exist"
+    fail "Release mode refuses to rebuild — build and sign the release artifacts first"
+    exit 1
+  fi
   info "Release directory does not exist — building release binaries ..."
   cargo build --release --bins 2>&1
 fi
@@ -54,7 +79,11 @@ fi
 MISSING=0
 for binary in "${BINARIES[@]}"; do
   if [[ ! -x "$RELEASE_DIR/$binary" ]]; then
-    fail "Missing release binary: $binary"
+    if [[ $RELEASE_MODE -eq 1 ]]; then
+      fail "Missing release binary: $binary — release mode fails closed (no rebuild)"
+    else
+      fail "Missing release binary: $binary"
+    fi
     MISSING=$((MISSING + 1))
   else
     info "  ✅ $binary found ($(stat -f%z "$RELEASE_DIR/$binary" 2>/dev/null || stat -c%s "$RELEASE_DIR/$binary" 2>/dev/null) bytes)"
@@ -62,7 +91,11 @@ for binary in "${BINARIES[@]}"; do
 done
 
 if [[ $MISSING -gt 0 ]]; then
-  fail "$MISSING binaries missing — build release first"
+  if [[ $RELEASE_MODE -eq 1 ]]; then
+    fail "$MISSING binaries missing — build and sign the release artifacts first (release mode never rebuilds)"
+  else
+    fail "$MISSING binaries missing — build release first"
+  fi
   exit 1
 fi
 PASS=$((PASS + 1))
@@ -294,6 +327,85 @@ if command -v codesign &>/dev/null; then
 else
   info "  codesign not available — skipping signing check"
   PASS=$((PASS + 1))
+fi
+
+# ── 5. JIT self-test ─────────────────────────────────────────────────────────
+info ""
+info "5. JIT self-test ..."
+
+# Preferred: a dedicated self-test flag on the packaged runner. No such CLI
+# exists today (src/cli.rs and src/runner.rs expose no self-test command),
+# so we fall back to the JIT unit tests. In release mode we must not build
+# anything, so JIT execution is validated by the packaged-runner PE
+# execution in step 6 (guest code runs through the real JIT on Apple
+# Silicon when the allow-jit-signed runner carries the entitlement).
+if "$RELEASE_DIR/casa1-runner" --jit-self-test >/dev/null 2>&1; then
+  info "  ✅ casa1-runner --jit-self-test passed"
+  PASS=$((PASS + 1))
+elif [[ $RELEASE_MODE -eq 1 ]]; then
+  info "  --jit-self-test is not implemented on the packaged runner yet;"
+  info "  release mode refuses rebuilds, so JIT is covered by step 6"
+  info "  (packaged-runner PE execution through the real JIT)."
+else
+  info "  --jit-self-test not implemented; running the JIT unit tests as the"
+  info "  self-test: cargo test --lib jit::"
+  if cargo test --lib jit:: >/dev/null 2>&1; then
+    info "  ✅ JIT unit self-test passed (cargo test --lib jit::)"
+    PASS=$((PASS + 1))
+  else
+    fail "  ❌ JIT unit self-test failed (cargo test --lib jit::)"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
+# ── 6. Minimal PE execution through the packaged runner ──────────────────────
+info ""
+info "6. Minimal PE execution through the packaged runner ..."
+
+# The bounded casa1-tetris-smoke.exe fixture (TETRIS_SMOKE build) renders a
+# frame and exits on its own; running it through macwin -> casa1-runner
+# exercises the packaged runner end to end, including JIT execution on
+# Apple Silicon. The throwaway GE from step 3 is reused, so no real
+# environment is touched.
+TETRIS_PE="$REPO_ROOT/games/windows_tetris/dist/casa1-tetris-smoke.exe"
+if [[ ! -f "$TETRIS_PE" ]]; then
+  fail "  ❌ Missing PE fixture: $TETRIS_PE"
+  FAIL=$((FAIL + 1))
+elif [[ ! -d "$CASA1_GES_ROOT/$GE_NAME" ]]; then
+  fail "  ❌ Throwaway GE '$GE_NAME' missing (ge:create failed earlier) — cannot run PE fixture"
+  FAIL=$((FAIL + 1))
+else
+  if "$RELEASE_DIR/macwin" ge:run --ge "$GE_NAME" --exe "$TETRIS_PE" --dtm \
+      > "$TEMP_DIR/ge-run.json" 2>&1; then
+    info "  ✅ Packaged runner executed $TETRIS_PE to a clean exit (exit 0)"
+    PASS=$((PASS + 1))
+  else
+    fail "  ❌ Packaged runner failed on $TETRIS_PE"
+    fail "$(head -5 "$TEMP_DIR/ge-run.json")"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
+# ── 7. Effective steam:launch profile test ───────────────────────────────────
+info ""
+info "7. steam:launch profile surface test ..."
+
+# No profile dry-run/print mode exists on steam:launch yet, so the
+# effective-profile smoke is: the subcommand parses and --help exposes the
+# profile/performance flags that construct the launch profile (--performance,
+# --no-jit, --offline, --debug, --ge). Once a dry-run is added, replace this
+# with an actual profile dry-run invocation.
+STEAM_HELP="$("$RELEASE_DIR/macwin" steam:launch --help 2>&1 || true)"
+if echo "$STEAM_HELP" | grep -q -- "--performance" \
+  && echo "$STEAM_HELP" | grep -q -- "--no-jit" \
+  && echo "$STEAM_HELP" | grep -q -- "--ge" \
+  && echo "$STEAM_HELP" | grep -q "Usage"; then
+  info "  ✅ steam:launch --help exposes the launch/profile flags"
+  PASS=$((PASS + 1))
+else
+  fail "  ❌ steam:launch --help did not expose the expected profile flags"
+  fail "$(echo "$STEAM_HELP" | head -5)"
+  FAIL=$((FAIL + 1))
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -4,6 +4,28 @@ This document lists known limitations of Casa1, separated from inline code
 comments for easy reference. These are architectural or implementation
 constraints that are unlikely to be resolved in the near term.
 
+## Supported
+
+- Windows Steam client
+- Apple Silicon
+- Supported macOS versions
+- Steam bootstrap/update
+- Steam login/store/library UI once proven
+- CEF UI
+- Metal output
+- Basic input/audio/network
+- Supported Windows games meeting documented requirements
+
+## Not Automatically Guaranteed
+
+- Anti-cheat drivers
+- Kernel-mode DRM
+- SteamVR
+- All Steam Overlay paths
+- .NET Framework games
+- Every Vulkan/OpenGL extension
+- Every Windows application
+
 ### block v0.1.6 Future Compatibility
 
 **Limitation**: The `block` crate v0.1.6 (a transitive dependency) produces a

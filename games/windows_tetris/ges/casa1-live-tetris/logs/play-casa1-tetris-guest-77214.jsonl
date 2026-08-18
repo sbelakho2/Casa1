@@ -1,1 +1,0 @@
-{"event_id":1,"ts_ticks":18,"pid":77214,"tid":1,"module":"runner","severity":"info","reason_code":0,"win32_err":null,"ntstatus":null,"msg":"spawned guest process 77214","kv":{"args":[],"cwd":"/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris","exe":"/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/dist/casa1-tetris.exe","intent":"play"}}

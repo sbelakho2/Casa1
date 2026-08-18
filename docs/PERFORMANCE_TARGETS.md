@@ -89,3 +89,21 @@ must be met before additional optimisation work is undertaken.
 | Adaptive JIT (T0→T1→T2) | ≤3 ms | Tier progression |
 | PE load and prepare | ≤50 μs | Minimal PE |
 | Perf subsystems init | ≤50 μs | All caching structures |
+
+## 9. End-User Steam Experience
+
+Measured on the release build on Apple Silicon with the signed runner, from
+the moment the user launches Steam in the GE. Cold-start (first run after
+boot) and warm-start (subsequent launches) are recorded separately.
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Steam bootstrap → updater start | ≤10 s | Bootstrapper dispatch to updater entry |
+| Steam bootstrap → webhelper | ≤20 s | First steamwebhelper process |
+| Steam bootstrap → first CEF paint | ≤30 s | First CEF paint (software or accelerated) |
+| Steam bootstrap → first Metal frame | ≤30 s | First Metal-presented frame |
+| Steady-state guest instructions/sec | ≥50 M insn/s | Post-login idle Steam UI |
+| JIT hit ratio | ≥95 % | Compiled-block execution share |
+| Host CPU at idle Steam UI | ≤15 % | One core, post-login idle |
+| Memory at login screen | ≤2 GB | Casa1 + Steam resident set |
+| Frame latency | ≤100 ms | Input → presented frame (UI interactions) |

@@ -104,6 +104,38 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly fuzz build
 
+  fuzz-smoke:
+    name: Fuzz Smoke
+    runs-on: macos-latest
+    needs: [fuzz-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Run short bounded fuzz smoke runs
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          # Targets mirror fuzz/fuzz_targets/*.rs exactly. Each gets a short
+          # bounded libFuzzer run (-runs=1000, capped by -max_total_time).
+          TARGETS="dxil_parser filesystem_path http_headers http_response \
+                   media_container msi_parser pe_parser registry_path \
+                   spirv_parser steam_protocol url_handling video_packet \
+                   winhttp_url"
+          FAIL=0
+          for target in $TARGETS; do
+            echo ":: fuzz smoke: $target"
+            if cargo +nightly fuzz run "$target" -- -runs=1000 -max_total_time=180; then
+              echo "  OK: $target"
+            else
+              echo "::error::fuzz smoke failed for target $target"
+              FAIL=1
+            fi
+          done
+          exit "$FAIL"
+
   warning-count:
     name: Warning Count
     runs-on: macos-latest
