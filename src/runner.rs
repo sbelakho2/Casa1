@@ -317,9 +317,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     }
 
     // Parse Steam command-line flags from job arguments when running Steam.exe.
-    if job.program.to_string_lossy().contains("Steam.exe")
-        || job.program.to_string_lossy().contains("steam.exe")
-    {
+    if is_steam_executable(&job.program) {
         let steam_flags = pe_runtime::process_steam_command_line(&job.args);
         if steam_flags.has_launch_command() {
             eprintln!(
@@ -340,6 +338,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             log_override_application(&mut logger, applied_override)?;
         }
         runner_events.extend(log_process_start(&mut logger, job, child_pid)?);
+        // Every execution now finalizes into a PeExecutionResult with an
+        // authoritative ExecutionTermination (guest exit, harness deadline,
+        // instruction budget, unsupported instruction, guest exception,
+        // host error) — nothing is reconstructed here, and no error-message
+        // sniffing is needed.  Only genuine setup errors can reach this arm.
         let pe_output = match if job.intent == RunIntent::Play && !job.dtm {
             execute_live_pe_job(job, &ge, &effective_child_environment)
         } else {
@@ -355,26 +358,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         } {
             Ok(pe_output) => pe_output,
             Err(error) => {
-                if is_wall_clock_deadline(&error) {
-                    // The wall-clock run deadline (CASA1_PE_RUNTIME_DEADLINE_SECS)
-                    // ended a guest that never exits (Steam's wait-bound main
-                    // loop).  Convert it into a completed result with exit
-                    // code -2 so the telemetry artifacts are produced; the
-                    // milestone counters and provenance live in shared
-                    // statics, so nothing is lost.
-                    crate::pe_runtime::PeExecutionResult {
-                        synthetic_pid: 0,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: -2,
-                        guest_exceptions: Vec::new(),
-                        gfx_frames: Vec::new(),
-                        perf: Vec::new(),
-                        trace_events: Vec::new(),
-                        milestones: crate::steam_milestones::snapshot_milestones(),
-                        provenance: crate::steam_milestones::RunProvenance::from_env(),
-                    }
-                } else if let Some(recovered) = try_recover_budget_exhausted_steam_install(
+                if let Some(recovered) = try_recover_budget_exhausted_steam_install(
                     &mut logger,
                     &mut runner_events,
                     &mut ge,
@@ -391,14 +375,24 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         runner_events.push(log_process_end_code(&mut logger, pe_output.exit_code)?);
 
         // Steam run instrumentation: write the self-identifying run artifact
-        // for Steam.exe jobs.  Instrumentation only — a failed artifact write
+        // ONLY for actual Steam.exe executions (the basename helper, never
+        // substring matching — a `foo-Steam.exe.backup` must not produce a
+        // Steam artifact).  Instrumentation only — a failed artifact write
         // is reported but never fails the run.
-        if let Err(error) = write_steam_bootstrap_artifacts(&ge, &pe_output, job) {
-            eprintln!(
-                "[runner] steam bootstrap artifact write failed: {}",
-                error.message
-            );
-        }
+        let _steam_artifact_paths = if is_steam_executable(&job.program) {
+            match write_steam_bootstrap_artifacts(&ge, &pe_output, job) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    eprintln!(
+                        "[runner] steam bootstrap artifact write failed: {}",
+                        error.message
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let after_files = ge.snapshot_files(job.dtm, started)?;
         let after_registry = ge.snapshot_registry()?;
@@ -960,6 +954,10 @@ fn try_recover_budget_exhausted_steam_install(
     runner_events.push(log_native_steam_install_recovery(
         logger, job, &install, error,
     )?);
+    // The budget-exhausted install recovery is a MODEL run (the synthetic
+    // install model, never real Steam execution); its termination is a
+    // normal GuestExit so the acceptance evaluator can distinguish
+    // model artifacts from real-PE artifacts via provenance.execution_mode.
     Ok(Some(pe_runtime::PeExecutionResult {
         synthetic_pid: pe_runtime::synthetic_pid(job.dtm), // real implementation: generates PID based on dtm mode
         stdout: String::new(),
@@ -971,6 +969,8 @@ fn try_recover_budget_exhausted_steam_install(
         trace_events: Vec::new(),
         milestones: crate::steam_milestones::SteamMilestones::default(),
         provenance: crate::steam_milestones::RunProvenance::default(),
+        termination: pe_runtime::ExecutionTermination::GuestExit { code: 0 },
+        termination_detail: None,
     }))
 }
 

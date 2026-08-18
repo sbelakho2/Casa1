@@ -635,7 +635,25 @@ const DRIVE_FIXED: u32 = 3;
 const WIN32_FIND_DATAW_FILE_NAME_CHARS: usize = 260;
 const WIN32_FIND_DATAW_ALT_FILE_NAME_CHARS: usize = 14;
 
-#[derive(Debug, Clone)]
+/// How a PE execution ended.  The structured termination is authoritative;
+/// `exit_code` keeps its legacy meaning (-2 for harness cancellation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecutionTermination {
+    /// The guest exited normally (ExitProcess / main-thread return).
+    GuestExit { code: i32 },
+    /// The host run deadline (CASA1_PE_RUNTIME_DEADLINE_SECS) cancelled the
+    /// run: harness cancellation, never a fake guest result.
+    HarnessDeadline,
+    /// The instruction budget was exhausted.
+    InstructionBudget,
+    /// An unsupported/unimplemented guest instruction was reached.
+    UnsupportedInstruction,
+    /// An unhandled guest exception (fault) terminated the run.
+    GuestException,
+    /// Any other host-side error.
+    HostError,
+}
+
 pub struct PeExecutionResult {
     pub synthetic_pid: u32,
     pub stdout: String,
@@ -651,6 +669,23 @@ pub struct PeExecutionResult {
     /// Steam run instrumentation: self-identifying run provenance (env-side
     /// fields; content hashes are filled in by the runner for Steam jobs).
     pub provenance: crate::steam_milestones::RunProvenance,
+    /// Authoritative termination reason.
+    pub termination: ExecutionTermination,
+    /// Error detail for non-guest terminations (message of the underlying
+    /// error when one exists).
+    pub termination_detail: Option<String>,
+}
+
+/// Legacy exit code for a termination (kept for compatibility: harness
+/// cancellation and budget exhaustion both map to -2).
+pub fn legacy_exit_code(termination: ExecutionTermination) -> i32 {
+    match termination {
+        ExecutionTermination::GuestExit { code } => code,
+        ExecutionTermination::HarnessDeadline | ExecutionTermination::InstructionBudget => -2,
+        ExecutionTermination::UnsupportedInstruction
+        | ExecutionTermination::GuestException
+        | ExecutionTermination::HostError => -2,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4914,109 +4949,133 @@ pub fn execute_with_options(
     ));
     diag("3:before main loop");
 
-    let mut exit_code = 0_i32;
-    let mut steps = 0_u64;
-    let mut block_count: u64 = 0;
-    let mut thunk_count: u64 = 0;
-    let mut last_progress_log = std::time::Instant::now();
-    let mut last_safepoint = std::time::Instant::now();
-    let mut last_rip_for_loop_detect = 0u64;
-    let mut same_rip_consecutive_count = 0u32;
-    // RIP seen two iterations ago, for detecting tight A↔B cycles.
-    let mut two_rip_prev_rip: u64 = 0;
-    // Count of consecutive A↔B alternations (resets on any other RIP).
-    let mut two_rip_cycle_count: u32 = 0;
-    crate::live::live_trace("[pe] entering main execution loop");
+    // The run body is a closure so every `?` error (instruction budget,
+    // wall-clock deadline, unsupported instruction, guest fault, host
+    // error) is CAUGHT here and finalized into a PeExecutionResult with a
+    // structured ExecutionTermination — the runner never reconstructs a
+    // synthetic result and never has to sniff error-message strings.
+    let run_body = |runtime: &mut PeHostRuntime,
+                    memory: &mut MemoryImage,
+                    state: &mut CpuState,
+                    engine: &mut CpuExecutionEngine,
+                    instruction_budget: u64|
+     -> AppResult<(i32, u64, u64)> {
+        let mut exit_code = 0_i32;
+        let mut steps = 0_u64;
+        let mut block_count: u64 = 0;
+        let mut thunk_count: u64 = 0;
+        let mut last_progress_log = std::time::Instant::now();
+        let mut last_safepoint = std::time::Instant::now();
+        let mut last_rip_for_loop_detect = 0u64;
+        let mut same_rip_consecutive_count = 0u32;
+        // RIP seen two iterations ago, for detecting tight A↔B cycles.
+        let mut two_rip_prev_rip: u64 = 0;
+        // Count of consecutive A↔B alternations (resets on any other RIP).
+        let mut two_rip_cycle_count: u32 = 0;
+        crate::live::live_trace("[pe] entering main execution loop");
 
-    // Register the JIT runtime so the live-session watchdog can
-    // forcibly break JIT block chains across threads.
-    if let Some(jit) = &mut runtime.jit_runtime {
-        crate::jit::register_jit_runtime(jit);
-    }
-
-    loop {
-        block_count += 1;
-        // Steam run instrumentation (no behavior change): the first block
-        // dispatch marks bootstrap as started.
-        crate::steam_milestones::note_bootstrap_started();
-        // ── Host-side block-dispatch safepoint ───────────────────────────
-        // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
-        // guest scheduler between dispatched blocks: pump a pending guest
-        // thread, drain timer callbacks, deliver APCs to the main thread,
-        // poll due SetTimer timers, and advance the guest clock by the
-        // measured wall elapsed.  The GUI scheduler requires this — an
-        // order of magnitude faster than Steam's own 250 ms polls — so a
-        // guest spin loop (which never reaches a wait site) cannot freeze
-        // the clock or starve pending threads, timers, APCs and the live
-        // frame pipeline.
-        //
-        // The safepoint must NOT run while a pumped guest thread is active
-        // (nested execution): the pump services scheduling for the pumped
-        // thread's own lifetime, and running the safepoint inside it would
-        // recurse into another pump.
-        //
-        // The live watchdog's `JIT_CHAIN_BREAK_REQUESTED` path remains
-        // intact as a fallback for when JIT block chains are re-enabled;
-        // the old 50 ms main-loop chain-break timer is replaced by this
-        // safepoint.
-        if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
-            // Wall-clock run deadline (instrumentation): end the run with
-            // exit code -2 so artifacts are produced even though Steam's
-            // main loop never exits on its own.
-            exit_code = -2;
-            crate::live::live_trace("[pe] run deadline reached — ending run with exit -2");
-            break;
+        // Register the JIT runtime so the live-session watchdog can
+        // forcibly break JIT block chains across threads.
+        if let Some(jit) = runtime.jit_runtime.as_mut() {
+            crate::jit::register_jit_runtime(jit);
         }
 
-        if runtime.active_pumped_guest_thread.is_none()
-            && last_safepoint.elapsed().as_millis() as u64 >= SAFEPOINT_INTERVAL_MS
-        {
-            // Measure the wall elapsed since the previous safepoint BEFORE
-            // running the body so a pumped thread's execution time lands in
-            // the NEXT interval (the pump advances the clock itself via the
-            // guest's own wait/sleep APIs).
-            let elapsed_ms = last_safepoint.elapsed().as_millis() as u64;
-            last_safepoint = std::time::Instant::now();
-            if let Some(code) =
-                runtime.run_block_dispatch_safepoint(&mut state, &mut memory, elapsed_ms)?
-            {
-                // A pumped thread or timer callback requested process exit.
-                exit_code = code;
+        loop {
+            block_count += 1;
+            // Steam run instrumentation (no behavior change): the first block
+            // dispatch marks bootstrap as started.
+            crate::steam_milestones::note_bootstrap_started();
+            // ── Host-side block-dispatch safepoint ───────────────────────────
+            // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
+            // guest scheduler between dispatched blocks: pump a pending guest
+            // thread, drain timer callbacks, deliver APCs to the main thread,
+            // poll due SetTimer timers, and advance the guest clock by the
+            // measured wall elapsed.  The GUI scheduler requires this — an
+            // order of magnitude faster than Steam's own 250 ms polls — so a
+            // guest spin loop (which never reaches a wait site) cannot freeze
+            // the clock or starve pending threads, timers, APCs and the live
+            // frame pipeline.
+            //
+            // The safepoint must NOT run while a pumped guest thread is active
+            // (nested execution): the pump services scheduling for the pumped
+            // thread's own lifetime, and running the safepoint inside it would
+            // recurse into another pump.
+            //
+            // The live watchdog's `JIT_CHAIN_BREAK_REQUESTED` path remains
+            // intact as a fallback for when JIT block chains are re-enabled;
+            // the old 50 ms main-loop chain-break timer is replaced by this
+            // safepoint.
+            if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
+                // Wall-clock run deadline (instrumentation): end the run with
+                // exit code -2 so artifacts are produced even though Steam's
+                // main loop never exits on its own.
+                exit_code = -2;
+                crate::live::live_trace("[pe] run deadline reached — ending run with exit -2");
                 break;
             }
-        }
 
-        // Infinite loop detection: track consecutive same-RIP iterations.
-        // Also catch tight 2-RIP cycles (A↔B) by treating the previous RIP as
-        // part of the same spin window — many real busy-loops alternate
-        // between exactly two addresses, which the strict same-RIP check
-        // alone would never flag.
-        let prev_rip_for_detect = last_rip_for_loop_detect;
-        if state.rip == last_rip_for_loop_detect
-            || (two_rip_cycle_count < u32::MAX && state.rip == two_rip_prev_rip)
-        {
-            same_rip_consecutive_count += 1;
-            if state.rip == two_rip_prev_rip && state.rip != last_rip_for_loop_detect {
-                two_rip_cycle_count += 1;
+            if runtime.active_pumped_guest_thread.is_none()
+                && last_safepoint.elapsed().as_millis() as u64 >= SAFEPOINT_INTERVAL_MS
+            {
+                // Measure the wall elapsed since the previous safepoint BEFORE
+                // running the body so a pumped thread's execution time lands in
+                // the NEXT interval (the pump advances the clock itself via the
+                // guest's own wait/sleep APIs).
+                let elapsed_ms = last_safepoint.elapsed().as_millis() as u64;
+                last_safepoint = std::time::Instant::now();
+                if let Some(code) =
+                    runtime.run_block_dispatch_safepoint(state, memory, elapsed_ms)?
+                {
+                    // A pumped thread or timer callback requested process exit.
+                    exit_code = code;
+                    break;
+                }
             }
-        } else {
-            // Log transition when leaving a previously-same-RIP pattern
-            if same_rip_consecutive_count >= 10 {
-                diag(&format!(
-                    "LOOP_EXIT after {} same-rip iterations, new rip={:#x}",
-                    same_rip_consecutive_count, state.rip
-                ));
+
+            // Infinite loop detection: track consecutive same-RIP iterations.
+            // Also catch tight 2-RIP cycles (A↔B) by treating the previous RIP as
+            // part of the same spin window — many real busy-loops alternate
+            // between exactly two addresses, which the strict same-RIP check
+            // alone would never flag.
+            let prev_rip_for_detect = last_rip_for_loop_detect;
+            if state.rip == last_rip_for_loop_detect
+                || (two_rip_cycle_count < u32::MAX && state.rip == two_rip_prev_rip)
+            {
+                same_rip_consecutive_count += 1;
+                if state.rip == two_rip_prev_rip && state.rip != last_rip_for_loop_detect {
+                    two_rip_cycle_count += 1;
+                }
+            } else {
+                // Log transition when leaving a previously-same-RIP pattern
+                if same_rip_consecutive_count >= 10 {
+                    diag(&format!(
+                        "LOOP_EXIT after {} same-rip iterations, new rip={:#x}",
+                        same_rip_consecutive_count, state.rip
+                    ));
+                }
+                two_rip_prev_rip = prev_rip_for_detect;
+                last_rip_for_loop_detect = state.rip;
+                same_rip_consecutive_count = 1;
+                two_rip_cycle_count = 0;
+                // Log first encounter of the infinite loop address
+                if last_rip_for_loop_detect == runtime.mapped_image_base + 0x1714ea {
+                    diag(&format!(
+                        "ENTERED_INFINITE_LOOP_RIP iter={} rip={:#x} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x}",
+                        block_count,
+                        state.rip,
+                        state.get(Register::Rax),
+                        state.get(Register::Rcx),
+                        state.get(Register::Rdx),
+                        state.get(Register::Rsi),
+                        state.get(Register::Rdi)
+                    ));
+                }
             }
-            two_rip_prev_rip = prev_rip_for_detect;
-            last_rip_for_loop_detect = state.rip;
-            same_rip_consecutive_count = 1;
-            two_rip_cycle_count = 0;
-            // Log first encounter of the infinite loop address
-            if last_rip_for_loop_detect == runtime.mapped_image_base + 0x1714ea {
+            if same_rip_consecutive_count >= 10 && same_rip_consecutive_count.is_multiple_of(5) {
                 diag(&format!(
-                    "ENTERED_INFINITE_LOOP_RIP iter={} rip={:#x} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x}",
-                    block_count,
+                    "SAME_RIP_WARN rip={:#x} consecutive={} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x}",
                     state.rip,
+                    same_rip_consecutive_count,
                     state.get(Register::Rax),
                     state.get(Register::Rcx),
                     state.get(Register::Rdx),
@@ -5024,517 +5083,29 @@ pub fn execute_with_options(
                     state.get(Register::Rdi)
                 ));
             }
-        }
-        if same_rip_consecutive_count >= 10 && same_rip_consecutive_count.is_multiple_of(5) {
-            diag(&format!(
-                "SAME_RIP_WARN rip={:#x} consecutive={} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x}",
-                state.rip,
-                same_rip_consecutive_count,
-                state.get(Register::Rax),
-                state.get(Register::Rcx),
-                state.get(Register::Rdx),
-                state.get(Register::Rsi),
-                state.get(Register::Rdi)
-            ));
-        }
-        // Yield CPU when stuck in a tight spin loop (same RIP for 1000+
-        // consecutive iterations).  This prevents 99% CPU usage when the
-        // guest is polling a memory flag or waiting in a non-message API.
-        // Use sleep(1ms) instead of yield_now() because on macOS
-        // yield_now() is effectively a no-op — the thread immediately
-        // resumes and CPU stays at 99%.
-        // No per-iteration sleep.  The time-based yield (every 1s) handles
-        // CPU backpressure.  Per-iteration sleeps of 1ms on tight loops
-        // (memset, memcpy, heap init during CRT startup) would accumulate
-        // to hundreds of milliseconds, making the emulator unusably slow.
-        if same_rip_consecutive_count == 25 {
-            let rva = if state.rip >= runtime.mapped_image_base
-                && state.rip < runtime.mapped_image_base + runtime.mapped_image_size
-            {
-                format!("{:#x}", state.rip.saturating_sub(runtime.mapped_image_base))
-            } else {
-                format!("<outside:{:#x}>", state.rip)
-            };
-            diag(&format!(
-                "INFINITE_LOOP_DETECTED rip={:#x} rva={} consecutive={} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
-                state.rip,
-                rva,
-                same_rip_consecutive_count,
-                state.get(Register::Rax),
-                state.get(Register::Rcx),
-                state.get(Register::Rdx),
-                state.get(Register::Rsi),
-                state.get(Register::Rdi),
-                state.get(Register::Rsp),
-                state.get(Register::Rbp),
-                state.get(Register::R8),
-                state.get(Register::R9),
-                state.get(Register::R10),
-                state.get(Register::R11)
-            ));
-            // Decode and log the block to understand the loop
-            if let Ok(window) = read_window(&memory, state.rip, 32) {
-                let hex: String = window
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            // Yield CPU when stuck in a tight spin loop (same RIP for 1000+
+            // consecutive iterations).  This prevents 99% CPU usage when the
+            // guest is polling a memory flag or waiting in a non-message API.
+            // Use sleep(1ms) instead of yield_now() because on macOS
+            // yield_now() is effectively a no-op — the thread immediately
+            // resumes and CPU stays at 99%.
+            // No per-iteration sleep.  The time-based yield (every 1s) handles
+            // CPU backpressure.  Per-iteration sleeps of 1ms on tight loops
+            // (memset, memcpy, heap init during CRT startup) would accumulate
+            // to hundreds of milliseconds, making the emulator unusably slow.
+            if same_rip_consecutive_count == 25 {
+                let rva = if state.rip >= runtime.mapped_image_base
+                    && state.rip < runtime.mapped_image_base + runtime.mapped_image_size
+                {
+                    format!("{:#x}", state.rip.saturating_sub(runtime.mapped_image_base))
+                } else {
+                    format!("<outside:{:#x}>", state.rip)
+                };
                 diag(&format!(
-                    "INFINITE_LOOP_BYTES at rip={:#x}: {}",
-                    state.rip, hex
-                ));
-            }
-        }
-        // Progress via stderr — every 5 seconds
-        if runtime.live_session.is_some() && last_progress_log.elapsed().as_secs() >= 5 {
-            last_progress_log = std::time::Instant::now();
-            let msg = format!(
-                "[pe] live blocks={} steps={} thunks={} elapsed_ms={}",
-                block_count,
-                steps,
-                thunk_count,
-                start_time.elapsed().as_millis()
-            );
-            let _ = std::fs::write("/tmp/casa1_progress.txt", &msg);
-        }
-
-        if let Some(result) =
-            runtime.dispatch_import_if_present(state.rip, &mut state, &mut memory)?
-        {
-            thunk_count += 1;
-            advance_runtime_steps(
-                &mut runtime,
-                &mut steps,
-                instruction_budget,
-                1,
-                &memory,
-                &state,
-                test_id,
-            )?;
-            if let Some(code) = result {
-                exit_code = code;
-                break;
-            }
-            if runtime.main_thread_parked {
-                // A wait thunk parked the main thread in the scheduler wait
-                // queue: switch to pump-driven execution until the run ends.
-                // The parked thread resumes (and runs) inside the pump, so
-                // `state` here is stale and must not be used again.
-                exit_code = runtime.run_pump_driven(&mut memory, &mut steps, instruction_budget)?;
-                break;
-            }
-            runtime.drain_pending_dll_main_calls(&mut state, &mut memory)?;
-            continue;
-        }
-
-        let opcode = memory
-            .read_u8(state.rip)
-            .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
-        if opcode == 0xFF {
-            match memory.read_u8(state.rip + 1)? {
-                0x15 | 0x25 => {
-                    advance_runtime_steps(
-                        &mut runtime,
-                        &mut steps,
-                        instruction_budget,
-                        1,
-                        &memory,
-                        &state,
-                        test_id,
-                    )?;
-                    let next_rip = state.rip + 6;
-                    let slot_address = if guest_arch == GuestArch::X64 {
-                        let displacement = read_i32_from_memory(&memory, state.rip + 2)?;
-                        (next_rip as i128 + displacement as i128) as u64
-                    } else {
-                        read_u32(&memory, state.rip + 2)? as u64
-                    };
-                    let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
-                    let is_call = memory.read_u8(state.rip + 1)? == 0x15;
-
-                    if is_call {
-                        let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
-                        write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
-                        state.set(Register::Rsp, call_rsp);
-                    }
-
-                    if let Some(result) =
-                        runtime.dispatch_import_if_present(target, &mut state, &mut memory)?
-                    {
-                        thunk_count += 1;
-                        if let Some(code) = result {
-                            exit_code = code;
-                            break;
-                        }
-                        // Host thunk was dispatched successfully. For a CALL, advance
-                        // RIP past the call instruction so the subsequent block decode
-                        // (line 4807) starts from the instruction AFTER the call.
-                        // Without this, the decoded block will contain the same call
-                        // instruction, causing a second dispatch through the IR
-                        // interpreter — a double-dispatch bug.
-                        if is_call {
-                            state.rip = next_rip;
-                        }
-                        // For a JMP (ModRM 0x25), the thunk handles control flow
-                        // internally.  Just continue the loop — dispatch_import
-                        // will have updated state.rip as needed.
-                    } else {
-                        state.rip = target;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // --- Steam.exe crash point: zero-filled record at 0x401389/0x401390 ---
-        // Steam's main loop iterates over a table of 0x1c-byte records whose base
-        // pointer lives at global 0x42a270.  Each record starts with an opcode
-        // field; opcode == 0 marks the sentinel end of the table.  If the table
-        // was never populated (because an earlier initialisation API returned an
-        // unexpected value), the very first record is zero and we trap here
-        // instead of silently dereferencing a null/invalid pointer later.
-        // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-        if guest_arch == GuestArch::X86
-            && state.rip == runtime.mapped_image_base + 0x1390
-            && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-        {
-            let record_base =
-                read_guest_u32(&memory, runtime.mapped_image_base + 0x2a270).unwrap_or(0) as u64;
-            let current_index = state.get(Register::Rsi) as u32;
-            let record_address = record_base + u64::from(current_index) * 0x1c;
-            let record_opcode = read_guest_u32(&memory, record_address).unwrap_or(u32::MAX);
-            if record_opcode == 0 {
-                let previous_index = current_index.saturating_sub(1);
-                let previous_record = if record_base != 0 {
-                    let previous_address = record_base + u64::from(previous_index) * 0x1c;
-                    let fields = (0..7)
-                        .map(|slot| {
-                            let value = read_guest_u32(&memory, previous_address + slot * 4)
-                                .unwrap_or(0) as u64;
-                            format!("{slot}:{value:#x}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    format!("addr={previous_address:#x} fields=[{fields}]")
-                } else {
-                    "<unavailable>".to_string()
-                };
-                runtime.push_trace(
-                    "process",
-                    "SteamZeroRecord",
-                    BTreeMap::from([
-                        (
-                            "current_index".to_string(),
-                            json!(format!("{current_index:#x}")),
-                        ),
-                        (
-                            "record_address".to_string(),
-                            json!(format!("{record_address:#x}")),
-                        ),
-                        (
-                            "record_base".to_string(),
-                            json!(format!("{record_base:#x}")),
-                        ),
-                        (
-                            "previous_index".to_string(),
-                            json!(format!("{previous_index:#x}")),
-                        ),
-                        ("previous_record".to_string(), json!(previous_record)),
-                    ]),
-                    json!(current_index),
-                );
-            }
-        }
-
-        // --- Steam.exe crash point: ESI tracking at 0x401389/0x4013a8 ---
-        // The loop body at 0x401389 uses ESI as the record index.  It calls a
-        // helper at 0x401434 which must preserve ESI (callee-saved in cdecl).
-        // When RIP reaches 0x401389 the loop is re-entering, so we reset the
-        // expected-ESI tracker.  When RIP reaches 0x4013a8 the helper has
-        // returned; we verify that ESI was not clobbered.
-        // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-        if guest_arch == GuestArch::X86
-            && state.rip == runtime.mapped_image_base + 0x1389
-            && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-        {
-            runtime.steam_401389_expected_esi_after_401434 = None;
-            runtime.steam_401389_saved_esi_slot_addr = None;
-        }
-        // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-        if guest_arch == GuestArch::X86
-            && state.rip == runtime.mapped_image_base + 0x13a8
-            && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-            && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take()
-        {
-            runtime.steam_401389_saved_esi_slot_addr = None;
-            let actual_esi = state.get(Register::Rsi) as u32;
-            if actual_esi != expected_esi {
-                runtime.push_trace(
-                    "process",
-                    "SteamEsiClobber",
-                    BTreeMap::from([
-                        (
-                            "expected_esi".to_string(),
-                            json!(format!("{expected_esi:#x}")),
-                        ),
-                        ("actual_esi".to_string(), json!(format!("{actual_esi:#x}"))),
-                    ]),
-                    json!(actual_esi),
-                );
-            }
-        }
-        // Per-block diagnostic writes removed.
-        let cached_block = decode_basic_block_cached(
-            &mut engine,
-            &memory,
-            &mut runtime.instruction_cache,
-            &mut runtime.instruction_cache_lru,
-            &mut runtime.instruction_cache_generation,
-            INSTRUCTION_CACHE_LIMIT,
-            &mut runtime.basic_block_cache,
-            &mut runtime.basic_block_cache_lru,
-            &mut runtime.basic_block_cache_generation,
-            BASIC_BLOCK_CACHE_LIMIT,
-            state.rip,
-        )
-        .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
-        if block_count <= 10 {
-            let start_rip = state.rip;
-            let rva = if start_rip >= runtime.mapped_image_base
-                && start_rip < runtime.mapped_image_base + runtime.mapped_image_size
-            {
-                format!("{:#x}", start_rip.saturating_sub(runtime.mapped_image_base))
-            } else {
-                format!("<outside:{:#x}>", start_rip)
-            };
-            diag(&format!(
-                "iter:{} decoded block at rva={}, {} insns",
-                block_count,
-                rva,
-                cached_block.translated.decoded.len()
-            ));
-        }
-        let block_start_rip = state.rip;
-        let block_rva = if block_start_rip >= runtime.mapped_image_base
-            && block_start_rip < runtime.mapped_image_base + runtime.mapped_image_size
-        {
-            let block_rva = block_start_rip.saturating_sub(runtime.mapped_image_base) as u32;
-            // Steam diagnostic tracking of block RVAs (only when tracing is active).
-            if runtime.enable_steam_tracing {
-                if runtime.recent_main_block_rvas.len() == 32
-                    && runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400)
-                {
-                    runtime.recent_main_cc400_count =
-                        runtime.recent_main_cc400_count.saturating_sub(1);
-                }
-                runtime.recent_main_block_rvas.push_back(block_rva);
-                if block_rva == 0x000c_c400 {
-                    runtime.recent_main_cc400_count += 1;
-                }
-            }
-            Some(block_rva)
-        } else {
-            if runtime.enable_steam_tracing && !runtime.steam_reported_image_exit {
-                runtime.steam_reported_image_exit = true;
-                let last_rvas: Vec<String> = runtime
-                    .recent_main_block_rvas
-                    .iter()
-                    .map(|rva| format!("{rva:#x}"))
-                    .collect();
-                let last_rvas_str = last_rvas.join(" ");
-                emit_live_ui_debug(format!(
-                    "ImageExit: rip={:#x} mapped_base={:#x} mapped_size={:#x} last_32_block_rvas=[{}]",
-                    state.rip, runtime.mapped_image_base, runtime.mapped_image_size, last_rvas_str,
-                ));
-                runtime.push_trace(
-                    "process",
-                    "ImageExit",
-                    BTreeMap::from([
-                        ("rip".to_string(), json!(format!("{:#x}", state.rip))),
-                        (
-                            "mapped_base".to_string(),
-                            json!(format!("{:#x}", runtime.mapped_image_base)),
-                        ),
-                        (
-                            "mapped_size".to_string(),
-                            json!(format!("{:#x}", runtime.mapped_image_size)),
-                        ),
-                        ("last_32_block_rvas".to_string(), json!(last_rvas_str)),
-                    ]),
-                    json!(null),
-                );
-            }
-            None
-        };
-        if runtime.enable_steam_tracing
-            && let Some(block_rva) = block_rva
-        {
-            if guest_arch == GuestArch::X86 {
-                let cookie_watch_site = match block_rva {
-                    0x0017_5f4e => Some("after_get_module_file_name_w"),
-                    0x0017_5f94 => Some("after_175f8f_call"),
-                    0x0017_5faf => Some("after_175faa_call"),
-                    0x0017_5fb8 => Some("before_security_check"),
-                    _ => None,
-                };
-                if let Some(site) = cookie_watch_site {
-                    let ebp = state.get(Register::Rbp) as u32;
-                    let frame_cookie_addr = ebp.wrapping_sub(4) as u64;
-                    let frame_cookie = match read_guest_u32(&memory, frame_cookie_addr) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            eprintln!(
-                                "[pe_runtime] SteamCookieWatch: failed to read frame cookie at {:#x}: {}",
-                                frame_cookie_addr, error
-                            );
-                            None
-                        }
-                    };
-                    let global_cookie_addr = runtime.mapped_image_base + 0x003c_bfd4;
-                    let global_cookie = match read_guest_u32(&memory, global_cookie_addr) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            eprintln!(
-                                "[pe_runtime] SteamCookieWatch: failed to read global cookie at {:#x}: {}",
-                                global_cookie_addr, error
-                            );
-                            None
-                        }
-                    };
-                    let decoded_cookie = frame_cookie.map(|value| value ^ ebp);
-                    runtime.push_trace(
-                        "process",
-                        "SteamCookieWatch",
-                        BTreeMap::from([
-                            ("site".to_string(), json!(site)),
-                            ("ebp".to_string(), json!(format!("{ebp:#x}"))),
-                            (
-                                "esp".to_string(),
-                                json!(format!("{:#x}", state.get(Register::Rsp))),
-                            ),
-                            (
-                                "frame_cookie_addr".to_string(),
-                                json!(format!("{frame_cookie_addr:#x}")),
-                            ),
-                            (
-                                "frame_cookie".to_string(),
-                                json!(
-                                    frame_cookie
-                                        .map(|value| format!("{value:#x}"))
-                                        .unwrap_or_else(|| "<unavailable>".to_string())
-                                ),
-                            ),
-                            (
-                                "decoded_cookie".to_string(),
-                                json!(
-                                    decoded_cookie
-                                        .map(|value| format!("{value:#x}"))
-                                        .unwrap_or_else(|| "<unavailable>".to_string())
-                                ),
-                            ),
-                            (
-                                "global_cookie".to_string(),
-                                json!(
-                                    global_cookie
-                                        .map(|value| format!("{value:#x}"))
-                                        .unwrap_or_else(|| "<unavailable>".to_string())
-                                ),
-                            ),
-                        ]),
-                        json!(site),
-                    );
-                }
-            }
-            let in_final_assert_window = (0x0013_6400..=0x0013_6f00).contains(&block_rva)
-                || (0x0013_d180..=0x0013_d1b0).contains(&block_rva)
-                || (0x0013_ea00..=0x0013_f800).contains(&block_rva)
-                || (0x0014_ca80..=0x0014_cd50).contains(&block_rva);
-            let in_pre_report_window = (0x0014_dee0..=0x0014_df40).contains(&block_rva)
-                || (0x0015_e6d0..=0x0015_e720).contains(&block_rva)
-                || (0x0016_c040..=0x0016_c0c0).contains(&block_rva)
-                || (0x0016_ddf0..=0x0016_e120).contains(&block_rva);
-            runtime.trace_steam_pre_report_pointer_state(&memory, &state, block_rva);
-            if in_final_assert_window || in_pre_report_window {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let return_addr = read_guest_u32(&memory, state.get(Register::Rsp))
-                    .ok()
-                    .map(u64::from)
-                    .map(|value| format!("{:#x}", value.saturating_sub(runtime.mapped_image_base)))
-                    .unwrap_or_else(|| "<unavailable>".to_string());
-                let final_assert_tls_state = if guest_arch == GuestArch::X86
-                    && block_rva == 0x0013_ea80
-                {
-                    let format_opt = |value: Option<u64>| {
-                        value
-                            .map(|value| format!("{value:#x}"))
-                            .unwrap_or_else(|| "<unavailable>".to_string())
-                    };
-                    let tls_index_address = runtime.mapped_image_base + 0x0045_71a8;
-                    let compare_left_address = runtime.mapped_image_base + 0x0042_6400;
-                    let tls_vector = match read_guest_pointer(
-                        &memory,
-                        runtime.teb_base + 0x2c,
-                        guest_arch,
-                    ) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            eprintln!(
-                                "[pe_runtime] SteamTLSWatch: failed to read TLS vector at {:#x}: {}",
-                                runtime.teb_base + 0x2c,
-                                error
-                            );
-                            None
-                        }
-                    };
-                    let tls_index = read_guest_u32(&memory, tls_index_address)
-                        .ok()
-                        .map(u64::from);
-                    let tls_slot = match (tls_vector, tls_index) {
-                        (Some(vector), Some(index)) if vector != 0 => read_guest_pointer(
-                            &memory,
-                            vector + index * guest_arch.pointer_bytes() as u64,
-                            guest_arch,
-                        )
-                        .ok(),
-                        _ => None,
-                    };
-                    let compare_left = read_guest_u32(&memory, compare_left_address)
-                        .ok()
-                        .map(u64::from);
-                    let compare_right = match tls_slot {
-                        Some(slot) if slot != 0 => {
-                            read_guest_u32(&memory, slot + 0x480).ok().map(u64::from)
-                        }
-                        _ => None,
-                    };
-                    format!(
-                        " tls_index={} tls_vector={} tls_slot={} compare_lhs={} compare_rhs={}",
-                        format_opt(tls_index),
-                        format_opt(tls_vector),
-                        format_opt(tls_slot),
-                        format_opt(compare_left),
-                        format_opt(compare_right),
-                    )
-                } else {
-                    String::new()
-                };
-                let block_summary = format!(
-                    "block_start={block_rva:#x} ret_rva={return_addr} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x}{final_assert_tls_state} decoded=[{decoded_instructions}]",
+                    "INFINITE_LOOP_DETECTED rip={:#x} rva={} consecutive={} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
+                    state.rip,
+                    rva,
+                    same_rip_consecutive_count,
                     state.get(Register::Rax),
                     state.get(Register::Rcx),
                     state.get(Register::Rdx),
@@ -5542,612 +5113,1105 @@ pub fn execute_with_options(
                     state.get(Register::Rdi),
                     state.get(Register::Rsp),
                     state.get(Register::Rbp),
+                    state.get(Register::R8),
+                    state.get(Register::R9),
+                    state.get(Register::R10),
+                    state.get(Register::R11)
+                ));
+                // Decode and log the block to understand the loop
+                if let Ok(window) = read_window(memory, state.rip, 32) {
+                    let hex: String = window
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    diag(&format!(
+                        "INFINITE_LOOP_BYTES at rip={:#x}: {}",
+                        state.rip, hex
+                    ));
+                }
+            }
+            // Progress via stderr — every 5 seconds
+            if runtime.live_session.is_some() && last_progress_log.elapsed().as_secs() >= 5 {
+                last_progress_log = std::time::Instant::now();
+                let msg = format!(
+                    "[pe] live blocks={} steps={} thunks={} elapsed_ms={}",
+                    block_count,
+                    steps,
+                    thunk_count,
+                    start_time.elapsed().as_millis()
                 );
-                if in_final_assert_window {
-                    if runtime.steam_final_assert_recent_blocks.len() == 32 {
-                        runtime.steam_final_assert_recent_blocks.pop_front();
+                let _ = std::fs::write("/tmp/casa1_progress.txt", &msg);
+            }
+
+            if let Some(result) = runtime.dispatch_import_if_present(state.rip, state, memory)? {
+                thunk_count += 1;
+                advance_runtime_steps(
+                    runtime,
+                    &mut steps,
+                    instruction_budget,
+                    1,
+                    memory,
+                    state,
+                    test_id,
+                )?;
+                if let Some(code) = result {
+                    exit_code = code;
+                    break;
+                }
+                if runtime.main_thread_parked {
+                    // A wait thunk parked the main thread in the scheduler wait
+                    // queue: switch to pump-driven execution until the run ends.
+                    // The parked thread resumes (and runs) inside the pump, so
+                    // `state` here is stale and must not be used again.
+                    exit_code = runtime.run_pump_driven(memory, &mut steps, instruction_budget)?;
+                    break;
+                }
+                runtime.drain_pending_dll_main_calls(state, memory)?;
+                continue;
+            }
+
+            let opcode = memory
+                .read_u8(state.rip)
+                .map_err(|error| annotate_guest_fault(error, memory, state))?;
+            if opcode == 0xFF {
+                match memory.read_u8(state.rip + 1)? {
+                    0x15 | 0x25 => {
+                        advance_runtime_steps(
+                            runtime,
+                            &mut steps,
+                            instruction_budget,
+                            1,
+                            memory,
+                            state,
+                            test_id,
+                        )?;
+                        let next_rip = state.rip + 6;
+                        let slot_address = if guest_arch == GuestArch::X64 {
+                            let displacement = read_i32_from_memory(memory, state.rip + 2)?;
+                            (next_rip as i128 + displacement as i128) as u64
+                        } else {
+                            read_u32(memory, state.rip + 2)? as u64
+                        };
+                        let target = read_guest_pointer(memory, slot_address, guest_arch)?;
+                        let is_call = memory.read_u8(state.rip + 1)? == 0x15;
+
+                        if is_call {
+                            let call_rsp =
+                                state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
+                            write_guest_pointer(memory, call_rsp, next_rip, guest_arch)?;
+                            state.set(Register::Rsp, call_rsp);
+                        }
+
+                        if let Some(result) =
+                            runtime.dispatch_import_if_present(target, state, memory)?
+                        {
+                            thunk_count += 1;
+                            if let Some(code) = result {
+                                exit_code = code;
+                                break;
+                            }
+                            // Host thunk was dispatched successfully. For a CALL, advance
+                            // RIP past the call instruction so the subsequent block decode
+                            // (line 4807) starts from the instruction AFTER the call.
+                            // Without this, the decoded block will contain the same call
+                            // instruction, causing a second dispatch through the IR
+                            // interpreter — a double-dispatch bug.
+                            if is_call {
+                                state.rip = next_rip;
+                            }
+                            // For a JMP (ModRM 0x25), the thunk handles control flow
+                            // internally.  Just continue the loop — dispatch_import
+                            // will have updated state.rip as needed.
+                        } else {
+                            state.rip = target;
+                        }
                     }
-                    runtime
-                        .steam_final_assert_recent_blocks
-                        .push_back(block_summary.clone());
-                    if (0x0013_eaf0..=0x0013_eb10).contains(&block_rva)
-                        || (0x0014_ca80..=0x0014_cd80).contains(&block_rva)
+                    _ => {}
+                }
+            }
+
+            // --- Steam.exe crash point: zero-filled record at 0x401389/0x401390 ---
+            // Steam's main loop iterates over a table of 0x1c-byte records whose base
+            // pointer lives at global 0x42a270.  Each record starts with an opcode
+            // field; opcode == 0 marks the sentinel end of the table.  If the table
+            // was never populated (because an earlier initialisation API returned an
+            // unexpected value), the very first record is zero and we trap here
+            // instead of silently dereferencing a null/invalid pointer later.
+            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
+            if guest_arch == GuestArch::X86
+                && state.rip == runtime.mapped_image_base + 0x1390
+                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
+            {
+                let record_base =
+                    read_guest_u32(memory, runtime.mapped_image_base + 0x2a270).unwrap_or(0) as u64;
+                let current_index = state.get(Register::Rsi) as u32;
+                let record_address = record_base + u64::from(current_index) * 0x1c;
+                let record_opcode = read_guest_u32(memory, record_address).unwrap_or(u32::MAX);
+                if record_opcode == 0 {
+                    let previous_index = current_index.saturating_sub(1);
+                    let previous_record = if record_base != 0 {
+                        let previous_address = record_base + u64::from(previous_index) * 0x1c;
+                        let fields = (0..7)
+                            .map(|slot| {
+                                let value = read_guest_u32(memory, previous_address + slot * 4)
+                                    .unwrap_or(0)
+                                    as u64;
+                                format!("{slot}:{value:#x}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("addr={previous_address:#x} fields=[{fields}]")
+                    } else {
+                        "<unavailable>".to_string()
+                    };
+                    runtime.push_trace(
+                        "process",
+                        "SteamZeroRecord",
+                        BTreeMap::from([
+                            (
+                                "current_index".to_string(),
+                                json!(format!("{current_index:#x}")),
+                            ),
+                            (
+                                "record_address".to_string(),
+                                json!(format!("{record_address:#x}")),
+                            ),
+                            (
+                                "record_base".to_string(),
+                                json!(format!("{record_base:#x}")),
+                            ),
+                            (
+                                "previous_index".to_string(),
+                                json!(format!("{previous_index:#x}")),
+                            ),
+                            ("previous_record".to_string(), json!(previous_record)),
+                        ]),
+                        json!(current_index),
+                    );
+                }
+            }
+
+            // --- Steam.exe crash point: ESI tracking at 0x401389/0x4013a8 ---
+            // The loop body at 0x401389 uses ESI as the record index.  It calls a
+            // helper at 0x401434 which must preserve ESI (callee-saved in cdecl).
+            // When RIP reaches 0x401389 the loop is re-entering, so we reset the
+            // expected-ESI tracker.  When RIP reaches 0x4013a8 the helper has
+            // returned; we verify that ESI was not clobbered.
+            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
+            if guest_arch == GuestArch::X86
+                && state.rip == runtime.mapped_image_base + 0x1389
+                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
+            {
+                runtime.steam_401389_expected_esi_after_401434 = None;
+                runtime.steam_401389_saved_esi_slot_addr = None;
+            }
+            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
+            if guest_arch == GuestArch::X86
+                && state.rip == runtime.mapped_image_base + 0x13a8
+                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
+                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take()
+            {
+                runtime.steam_401389_saved_esi_slot_addr = None;
+                let actual_esi = state.get(Register::Rsi) as u32;
+                if actual_esi != expected_esi {
+                    runtime.push_trace(
+                        "process",
+                        "SteamEsiClobber",
+                        BTreeMap::from([
+                            (
+                                "expected_esi".to_string(),
+                                json!(format!("{expected_esi:#x}")),
+                            ),
+                            ("actual_esi".to_string(), json!(format!("{actual_esi:#x}"))),
+                        ]),
+                        json!(actual_esi),
+                    );
+                }
+            }
+            // Per-block diagnostic writes removed.
+            let cached_block = decode_basic_block_cached(
+                engine,
+                memory,
+                &mut runtime.instruction_cache,
+                &mut runtime.instruction_cache_lru,
+                &mut runtime.instruction_cache_generation,
+                INSTRUCTION_CACHE_LIMIT,
+                &mut runtime.basic_block_cache,
+                &mut runtime.basic_block_cache_lru,
+                &mut runtime.basic_block_cache_generation,
+                BASIC_BLOCK_CACHE_LIMIT,
+                state.rip,
+            )
+            .map_err(|error| annotate_guest_fault(error, memory, state))?;
+            if block_count <= 10 {
+                let start_rip = state.rip;
+                let rva = if start_rip >= runtime.mapped_image_base
+                    && start_rip < runtime.mapped_image_base + runtime.mapped_image_size
+                {
+                    format!("{:#x}", start_rip.saturating_sub(runtime.mapped_image_base))
+                } else {
+                    format!("<outside:{:#x}>", start_rip)
+                };
+                diag(&format!(
+                    "iter:{} decoded block at rva={}, {} insns",
+                    block_count,
+                    rva,
+                    cached_block.translated.decoded.len()
+                ));
+            }
+            let block_start_rip = state.rip;
+            let block_rva = if block_start_rip >= runtime.mapped_image_base
+                && block_start_rip < runtime.mapped_image_base + runtime.mapped_image_size
+            {
+                let block_rva = block_start_rip.saturating_sub(runtime.mapped_image_base) as u32;
+                // Steam diagnostic tracking of block RVAs (only when tracing is active).
+                if runtime.enable_steam_tracing {
+                    if runtime.recent_main_block_rvas.len() == 32
+                        && runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400)
                     {
-                        if runtime.steam_final_status_writer_blocks.len() == 40 {
-                            runtime.steam_final_status_writer_blocks.pop_front();
-                        }
-                        runtime
-                            .steam_final_status_writer_blocks
-                            .push_back(block_summary.clone());
-                    } else if (0x0013_c3d0..=0x0013_c410).contains(&block_rva)
-                        || (0x0013_d190..=0x0013_d197).contains(&block_rva)
-                        || (0x0013_f0a0..=0x0013_f0d0).contains(&block_rva)
-                        || (0x0013_f560..=0x0013_f790).contains(&block_rva)
-                    {
-                        if runtime.steam_final_lock_blocks.len() == 64 {
-                            runtime.steam_final_lock_blocks.pop_front();
-                        }
-                        runtime
-                            .steam_final_lock_blocks
-                            .push_back(block_summary.clone());
+                        runtime.recent_main_cc400_count =
+                            runtime.recent_main_cc400_count.saturating_sub(1);
+                    }
+                    runtime.recent_main_block_rvas.push_back(block_rva);
+                    if block_rva == 0x000c_c400 {
+                        runtime.recent_main_cc400_count += 1;
                     }
                 }
-                if in_pre_report_window {
-                    if runtime.steam_pre_report_blocks.len() == 64 {
-                        runtime.steam_pre_report_blocks.pop_front();
-                    }
-                    runtime.steam_pre_report_blocks.push_back(block_summary);
-                }
-            }
-        }
-        // --- Steam tracing pre-execution state captures ---
-        // These variable declarations capture guest state before block execution so
-        // that tracing emission blocks (C, D, E below) can compare before/after values.
-        // They are always computed (guards are cheap) but must remain in scope for the
-        // later tracing emission blocks after execute_ir_with_guest_exception_delivery.
-        let esi_before = state.get(Register::Rsi) as u32;
-        let steam_565af0_range_start = runtime.mapped_image_base + 0x0016_5ab5;
-        let steam_565af0_range_end = runtime.mapped_image_base + 0x0016_5d10;
-        let steam_565ac1 = runtime.mapped_image_base + 0x0016_5ac1;
-        let steam_565af0 = runtime.mapped_image_base + 0x0016_5af0;
-        let steam_565c46 = runtime.mapped_image_base + 0x0016_5c46;
-        let trace_steam_final_assert_globals = guest_arch == GuestArch::X86
-            && matches!(
-                block_rva,
-                Some(rva)
-                    if (0x0013_6400..=0x0013_6f00).contains(&rva)
-                        || (0x0013_d180..=0x0013_d1b0).contains(&rva)
-                        || (0x0013_ea00..=0x0013_f800).contains(&rva)
-                        || (0x0014_ca80..=0x0014_cd50).contains(&rva)
-                        || (0x0014_dee0..=0x0014_df40).contains(&rva)
-                        || (0x0015_e6d0..=0x0015_e720).contains(&rva)
-                        || (0x0016_c040..=0x0016_c0c0).contains(&rva)
-                        || (0x0016_ddf0..=0x0016_e120).contains(&rva)
-            );
-        let final_assert_globals_before = if trace_steam_final_assert_globals {
-            Some([
-                (
-                    runtime.mapped_image_base + 0x003c_bfc4,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_bfc4),
-                ),
-                (
-                    runtime.mapped_image_base + 0x003c_bfd4,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_bfd4),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_3a34,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a34),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_3a38,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a38),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_3fbc,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fbc),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_6130,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6130),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_63e8,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_63e8),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_6400,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6400),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0042_6404,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6404),
-                ),
-            ])
-        } else {
-            None
-        };
-        let steam_trace = runtime.enable_steam_tracing && guest_arch == GuestArch::X86;
-        let trace_steam_136b50_entry = steam_trace && block_rva == Some(0x0013_6b50);
-        let steam_136b50_esp_before = trace_steam_136b50_entry.then_some(state.get(Register::Rsp));
-        let steam_136b50_arg0_before = steam_136b50_esp_before
-            .and_then(|esp| probe_read_guest_u32(&memory, esp + 4).map(u64::from));
-        let steam_136b50_arg1_before = steam_136b50_esp_before
-            .and_then(|esp| probe_read_guest_u32(&memory, esp + 8).map(u64::from));
-        let steam_136b50_global_423fbc_before = trace_steam_136b50_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fbc)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136b50_global_423fb8_before = trace_steam_136b50_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fb8)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136b50_global_423a30_before = trace_steam_136b50_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a30)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136b50_global_423a38_before = trace_steam_136b50_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a38)
-                    .map(u64::from)
-            })
-            .flatten();
-        let trace_steam_136e80_entry = steam_trace && block_rva == Some(0x0013_6e80);
-        let steam_136e80_esp_before = trace_steam_136e80_entry.then_some(state.get(Register::Rsp));
-        let steam_136e80_args_before = steam_136e80_esp_before.map(|esp| {
-            [
-                probe_read_guest_u32(&memory, esp + 4).map(u64::from),
-                probe_read_guest_u32(&memory, esp + 8).map(u64::from),
-                probe_read_guest_u32(&memory, esp + 12).map(u64::from),
-                probe_read_guest_u32(&memory, esp + 16).map(u64::from),
-                probe_read_guest_u32(&memory, esp + 20).map(u64::from),
-            ]
-        });
-        let steam_136e80_global_423e4c_before = trace_steam_136e80_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3e4c)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136e80_global_423e6c_before = trace_steam_136e80_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3e6c)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136e80_tls_index_before = trace_steam_136e80_entry
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_71a8)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_136e80_tls_vector_before = trace_steam_136e80_entry
-            .then(|| probe_read_guest_pointer(&memory, runtime.teb_base + 0x2c, guest_arch))
-            .flatten();
-        let steam_136e80_tls_slot_before = match (
-            steam_136e80_tls_vector_before,
-            steam_136e80_tls_index_before,
-        ) {
-            (Some(vector), Some(index)) if vector != 0 => probe_read_guest_pointer(
-                &memory,
-                vector + index * guest_arch.pointer_bytes() as u64,
-                guest_arch,
-            ),
-            _ => None,
-        };
-        let steam_136e80_tls_slot_480_before = steam_136e80_tls_slot_before
-            .and_then(|slot| {
-                (slot != 0).then(|| probe_read_guest_u32(&memory, slot + 0x480).map(u64::from))
-            })
-            .flatten();
-        let trace_steam_memstd_oom_entry = steam_trace && block_rva == Some(0x0013_4bd0);
-        let steam_memstd_oom_esp_before =
-            trace_steam_memstd_oom_entry.then_some(state.get(Register::Rsp));
-        let steam_memstd_oom_size_before = steam_memstd_oom_esp_before
-            .and_then(|esp| probe_read_guest_u32(&memory, esp + 4).map(u64::from));
-        let steam_memstd_oom_return_rva_before = steam_memstd_oom_esp_before
-            .and_then(|esp| probe_read_guest_u32(&memory, esp).map(u64::from))
-            .map(|value| value.saturating_sub(runtime.mapped_image_base));
-        let steam_memstd_oom_this_before =
-            trace_steam_memstd_oom_entry.then_some(state.get(Register::Rcx));
-        let trace_steam_memstd_oom_caller = steam_trace && block_rva == Some(0x0013_4b56);
-        let steam_memstd_caller_this_before =
-            trace_steam_memstd_oom_caller.then_some(state.get(Register::Rdi));
-        let steam_memstd_caller_old_address_before =
-            trace_steam_memstd_oom_caller.then_some(state.get(Register::Rsi));
-        let steam_memstd_caller_requested_size_before =
-            trace_steam_memstd_oom_caller.then_some(state.get(Register::Rbx));
-        let steam_memstd_caller_mode_before = steam_memstd_caller_this_before
-            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x5918).map(u64::from));
-        let steam_memstd_caller_range1_table_before = steam_memstd_caller_this_before
-            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x0c58).map(u64::from));
-        let steam_memstd_caller_range2_table_before = steam_memstd_caller_this_before
-            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x5910).map(u64::from));
-        let steam_global_array_watch = steam_trace
-            && matches!(
-                block_rva,
-                Some(
-                    0x0015_e9b1
-                        | 0x0015_e9c5
-                        | 0x0015_e9d0
-                        | 0x0015_e9f0
-                        | 0x0015_ea1b
-                        | 0x0015_ea89
-                        | 0x0015_ea98
-                        | 0x0015_eac0
-                        | 0x0017_21d1
-                        | 0x0017_21f0
-                )
-            );
-        let steam_global_array_count_before = steam_global_array_watch
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_global_array_ptr_before = steam_global_array_watch
-            .then(|| {
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628)
-                    .map(u64::from)
-            })
-            .flatten();
-        let steam_global_array_return_before = steam_global_array_watch
-            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
-            .flatten()
-            .map(|value| value.saturating_sub(runtime.mapped_image_base));
-        let steam_early_termination_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0015_e740..=0x0015_e7a5).contains(&rva));
-        let steam_early_termination_return_before = steam_early_termination_watch
-            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
-            .flatten()
-            .map(|value| value.saturating_sub(runtime.mapped_image_base));
-        let steam_global_state_watch = steam_trace && block_rva.is_some();
-        let steam_global_state_before = steam_global_state_watch.then(|| {
-            [
-                (
-                    runtime.mapped_image_base + 0x0045_715c,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_715c),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0045_7624,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624),
-                ),
-                (
-                    runtime.mapped_image_base + 0x0045_7628,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628),
-                ),
-                (
-                    runtime.mapped_image_base + 0x003c_873c,
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_873c),
-                ),
-            ]
-        });
-        let steam_initterm_e_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0016_e34b..=0x0016_e371).contains(&rva));
-        let steam_initterm_e_start_before = steam_initterm_e_watch
-            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4).map(u64::from))
-            .flatten();
-        let steam_initterm_e_end_before = steam_initterm_e_watch
-            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8).map(u64::from))
-            .flatten();
-        let steam_startup_init_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0014_d105..=0x0014_d17b).contains(&rva));
-        let steam_startup_failure_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0014_d257..=0x0014_d264).contains(&rva));
-        let steam_callback_walk_watch = steam_trace && block_rva == Some(0x0017_7827);
-        let steam_callback_walk_entry_before = steam_callback_walk_watch.then(|| {
-            let entry = state.get(Register::Rsi);
-            (
-                entry,
-                probe_read_guest_u32(&memory, entry).map(u64::from),
-                probe_read_guest_u32(&memory, entry + 4).map(u64::from),
-            )
-        });
-        let steam_post_577113_watch =
-            steam_trace && matches!(block_rva, Some(0x0017_6f61 | 0x0017_6f84));
-        let steam_post_56ee10_watch = steam_trace && block_rva == Some(0x0017_6f3c);
-        let steam_post_576ca8_watch = steam_trace && block_rva == Some(0x0017_7133);
-        let steam_post_576d7e_watch = steam_trace && block_rva == Some(0x0017_71a9);
-        let steam_577113_epilogue_watch = steam_trace && block_rva == Some(0x0017_72f4);
-        let steam_577113_epilogue_before = steam_577113_epilogue_watch.then(|| {
-            let rsp = state.get(Register::Rsp);
-            (
-                rsp,
-                probe_read_guest_u32(&memory, rsp).map(u64::from),
-                probe_read_guest_u32(&memory, rsp + 4).map(u64::from),
-                probe_read_guest_u32(&memory, rsp + 8).map(u64::from),
-                probe_read_guest_u32(&memory, rsp + 12).map(u64::from),
-                state.get(Register::Rdi),
-                state.get(Register::Rsi),
-            )
-        });
-        let steam_saved_edi_slot_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0001_6ca8..=0x0001_7304).contains(&rva));
-        let steam_saved_edi_slot_before = steam_saved_edi_slot_watch
-            .then(|| probe_read_guest_u32(&memory, 0x7000_ff1c).map(u64::from))
-            .flatten();
-        let trace_steam_convar_create = steam_trace && block_rva == Some(0x000c_c542);
-        let trace_steam_convar_create_start = steam_trace && block_rva == Some(0x000c_c400);
-        let steam_convar_trace_active =
-            trace_steam_convar_create || trace_steam_convar_create_start;
-        let steam_convar_this_before = if trace_steam_convar_create_start {
-            Some(state.get(Register::Rcx))
-        } else if trace_steam_convar_create {
-            Some(state.get(Register::Rsi))
-        } else {
-            None
-        };
-        let steam_convar_frame_before =
-            steam_convar_trace_active.then_some(state.get(Register::Rbp));
-        let steam_convar_name_ptr_before = steam_convar_frame_before
-            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x08).map(u64::from));
-        let steam_convar_flags_before = steam_convar_frame_before
-            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x10).map(u64::from));
-        let steam_convar_help_ptr_before = steam_convar_frame_before
-            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x14).map(u64::from));
-        let steam_convar_parent_ptr_before = steam_convar_frame_before
-            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x18).map(u64::from));
-        let steam_convar_callback_ptr_before = steam_convar_frame_before
-            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x2c).map(u64::from));
-        let steam_convar_vector_ptr_before =
-            steam_convar_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
-        let steam_convar_vector_bytes_before = steam_convar_vector_ptr_before
-            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
-        let recent_main_has_cc400 = steam_trace && runtime.recent_main_cc400_count != 0;
-        let steam_convar_helper_watch = if recent_main_has_cc400 {
-            match block_rva {
-                Some(0x0014_c88e) => Some("0x14c88e"),
-                Some(0x0014_e980) => Some("0x14e980"),
-                Some(0x0014_6200) => Some("0x146200"),
-                Some(0x0016_00aa) => Some("0x1600aa"),
-                Some(0x0016_0033) => Some("0x160033"),
-                Some(0x0014_6570) => Some("0x146570"),
-                Some(0x0016_6127) => Some("0x166127"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let steam_convar_helper_this_before = if steam_convar_helper_watch.is_some() {
-            Some(state.get(Register::Rsi))
-        } else {
-            None
-        };
-        let steam_convar_helper_vector_ptr_before =
-            steam_convar_helper_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
-        let steam_convar_helper_vector_bytes_before = steam_convar_helper_vector_ptr_before
-            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
-        let steam_convar_helper_arg0_before = steam_convar_helper_watch.and_then(|_| {
-            probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4).map(u64::from)
-        });
-        let steam_convar_helper_arg1_before = steam_convar_helper_watch.and_then(|_| {
-            probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8).map(u64::from)
-        });
-        let steam_convar_helper_arg2_before = steam_convar_helper_watch.and_then(|_| {
-            probe_read_guest_u32(&memory, state.get(Register::Rsp) + 12).map(u64::from)
-        });
-        let steam_convar_helper_return_before = steam_convar_helper_watch
-            .and_then(|_| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
-            .map(|value| value.saturating_sub(runtime.mapped_image_base));
-        if matches!(steam_convar_helper_watch, Some("0x14e980")) {
-            runtime.steam_convar_memcpy_watch_this = steam_convar_helper_this_before;
-        }
-        let steam_convar_memcpy_byte_watch = if recent_main_has_cc400 {
-            match block_rva {
-                Some(0x0014_ee9d) => Some("0x14ee9d"),
-                Some(0x0014_eea6) => Some("0x14eea6"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let steam_convar_memcpy_byte_this_before =
-            steam_convar_memcpy_byte_watch.and(runtime.steam_convar_memcpy_watch_this);
-        let steam_convar_memcpy_byte_vector_ptr_before =
-            steam_convar_memcpy_byte_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
-        let steam_convar_memcpy_byte_vector_bytes_before =
-            steam_convar_memcpy_byte_vector_ptr_before
-                .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
-        let steam_convar_memcpy_return_watch = if recent_main_has_cc400 {
-            match block_rva {
-                Some(0x0014_eeb0) => Some("0x14eeb0"),
-                Some(0x000c_c474) => Some("0xcc474"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let steam_convar_memcpy_return_this_before =
-            steam_convar_memcpy_return_watch.and(runtime.steam_convar_memcpy_watch_this);
-        let steam_convar_memcpy_return_vector_ptr_before =
-            steam_convar_memcpy_return_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
-        let steam_convar_memcpy_return_vector_bytes_before =
-            steam_convar_memcpy_return_vector_ptr_before
-                .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
-        let trace_steam_vector_grow_request = steam_trace && block_rva == Some(0x0009_968b);
-        let steam_vector_this_before =
-            trace_steam_vector_grow_request.then_some(state.get(Register::Rdi));
-        let steam_vector_element_size_before = steam_vector_this_before
-            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr).map(u64::from));
-        let steam_vector_old_address_before = steam_vector_this_before
-            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x4).map(u64::from));
-        let steam_vector_capacity_before = steam_vector_this_before
-            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x8).map(u64::from));
-        let steam_vector_grow_size_before = steam_vector_this_before
-            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x0c).map(u64::from));
-        let steam_vector_count_before = steam_vector_this_before
-            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x10).map(u64::from));
-        let decode_steam_convar_vector_fields = |bytes: &[u8]| -> BTreeMap<String, Value> {
-            let read_u32_at = |offset: usize| -> u64 {
-                u64::from(u32::from_le_bytes(
-                    bytes[offset..offset + 4].try_into().unwrap(),
-                ))
-            };
-            BTreeMap::from([
-                (
-                    "element_size".to_string(),
-                    json!(format!("{:#x}", read_u32_at(0))),
-                ),
-                (
-                    "memory_ptr".to_string(),
-                    json!(format!("{:#x}", read_u32_at(4))),
-                ),
-                (
-                    "allocation_count".to_string(),
-                    json!(format!("{:#x}", read_u32_at(8))),
-                ),
-                (
-                    "grow_size".to_string(),
-                    json!(format!("{:#x}", read_u32_at(12))),
-                ),
-                (
-                    "count".to_string(),
-                    json!(format!("{:#x}", read_u32_at(16))),
-                ),
-            ])
-        };
-        let steam_convar_precise_watch = if steam_trace {
-            match block_rva {
-                Some(0x000c_c400) => Some("0xcc400"),
-                Some(0x000c_c447) => Some("0xcc447"),
-                Some(0x000c_c457) => Some("0xcc457"),
-                Some(0x000c_c465) => Some("0xcc465"),
-                Some(0x000c_c474) => Some("0xcc474"),
-                Some(0x000c_c4ac) => Some("0xcc4ac"),
-                Some(0x000c_c514) => Some("0xcc514"),
-                Some(0x000c_c542) => Some("0xcc542"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let steam_convar_precise_this_before = steam_convar_precise_watch.and_then(|_| {
-            let this_ptr = if block_rva == Some(0x000c_c400) {
-                state.get(Register::Rcx)
+                Some(block_rva)
             } else {
-                state.get(Register::Rsi)
+                if runtime.enable_steam_tracing && !runtime.steam_reported_image_exit {
+                    runtime.steam_reported_image_exit = true;
+                    let last_rvas: Vec<String> = runtime
+                        .recent_main_block_rvas
+                        .iter()
+                        .map(|rva| format!("{rva:#x}"))
+                        .collect();
+                    let last_rvas_str = last_rvas.join(" ");
+                    emit_live_ui_debug(format!(
+                        "ImageExit: rip={:#x} mapped_base={:#x} mapped_size={:#x} last_32_block_rvas=[{}]",
+                        state.rip,
+                        runtime.mapped_image_base,
+                        runtime.mapped_image_size,
+                        last_rvas_str,
+                    ));
+                    runtime.push_trace(
+                        "process",
+                        "ImageExit",
+                        BTreeMap::from([
+                            ("rip".to_string(), json!(format!("{:#x}", state.rip))),
+                            (
+                                "mapped_base".to_string(),
+                                json!(format!("{:#x}", runtime.mapped_image_base)),
+                            ),
+                            (
+                                "mapped_size".to_string(),
+                                json!(format!("{:#x}", runtime.mapped_image_size)),
+                            ),
+                            ("last_32_block_rvas".to_string(), json!(last_rvas_str)),
+                        ]),
+                        json!(null),
+                    );
+                }
+                None
             };
-            (this_ptr != 0).then_some(this_ptr)
-        });
-        let steam_convar_precise_vector_before = steam_convar_precise_this_before
-            .and_then(|this_ptr| this_ptr.checked_add(0x84))
-            .and_then(|vector_ptr| read_window(&memory, vector_ptr, 0x14).ok())
-            .map(|bytes| decode_steam_convar_vector_fields(&bytes));
-        let steam_convar_precise_field_94_before = steam_convar_precise_this_before
-            .and_then(|this_ptr| read_guest_u32(&memory, this_ptr + 0x94).ok().map(u64::from));
-        let contains_steam_4013c0 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == 0x4013c0);
-        let contains_steam_4013ba = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == 0x4013ba);
-        let contains_steam_4013a3 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == 0x4013a3);
-        let contains_steam_402a57 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == 0x402a57);
-        let touches_steam_565af0_helper = steam_trace
-            && cached_block.translated.decoded.iter().any(|instruction| {
-                (steam_565af0_range_start..=steam_565af0_range_end).contains(&instruction.address)
+            if runtime.enable_steam_tracing
+                && let Some(block_rva) = block_rva
+            {
+                if guest_arch == GuestArch::X86 {
+                    let cookie_watch_site = match block_rva {
+                        0x0017_5f4e => Some("after_get_module_file_name_w"),
+                        0x0017_5f94 => Some("after_175f8f_call"),
+                        0x0017_5faf => Some("after_175faa_call"),
+                        0x0017_5fb8 => Some("before_security_check"),
+                        _ => None,
+                    };
+                    if let Some(site) = cookie_watch_site {
+                        let ebp = state.get(Register::Rbp) as u32;
+                        let frame_cookie_addr = ebp.wrapping_sub(4) as u64;
+                        let frame_cookie = match read_guest_u32(memory, frame_cookie_addr) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                eprintln!(
+                                    "[pe_runtime] SteamCookieWatch: failed to read frame cookie at {:#x}: {}",
+                                    frame_cookie_addr, error
+                                );
+                                None
+                            }
+                        };
+                        let global_cookie_addr = runtime.mapped_image_base + 0x003c_bfd4;
+                        let global_cookie = match read_guest_u32(memory, global_cookie_addr) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                eprintln!(
+                                    "[pe_runtime] SteamCookieWatch: failed to read global cookie at {:#x}: {}",
+                                    global_cookie_addr, error
+                                );
+                                None
+                            }
+                        };
+                        let decoded_cookie = frame_cookie.map(|value| value ^ ebp);
+                        runtime.push_trace(
+                            "process",
+                            "SteamCookieWatch",
+                            BTreeMap::from([
+                                ("site".to_string(), json!(site)),
+                                ("ebp".to_string(), json!(format!("{ebp:#x}"))),
+                                (
+                                    "esp".to_string(),
+                                    json!(format!("{:#x}", state.get(Register::Rsp))),
+                                ),
+                                (
+                                    "frame_cookie_addr".to_string(),
+                                    json!(format!("{frame_cookie_addr:#x}")),
+                                ),
+                                (
+                                    "frame_cookie".to_string(),
+                                    json!(
+                                        frame_cookie
+                                            .map(|value| format!("{value:#x}"))
+                                            .unwrap_or_else(|| "<unavailable>".to_string())
+                                    ),
+                                ),
+                                (
+                                    "decoded_cookie".to_string(),
+                                    json!(
+                                        decoded_cookie
+                                            .map(|value| format!("{value:#x}"))
+                                            .unwrap_or_else(|| "<unavailable>".to_string())
+                                    ),
+                                ),
+                                (
+                                    "global_cookie".to_string(),
+                                    json!(
+                                        global_cookie
+                                            .map(|value| format!("{value:#x}"))
+                                            .unwrap_or_else(|| "<unavailable>".to_string())
+                                    ),
+                                ),
+                            ]),
+                            json!(site),
+                        );
+                    }
+                }
+                let in_final_assert_window = (0x0013_6400..=0x0013_6f00).contains(&block_rva)
+                    || (0x0013_d180..=0x0013_d1b0).contains(&block_rva)
+                    || (0x0013_ea00..=0x0013_f800).contains(&block_rva)
+                    || (0x0014_ca80..=0x0014_cd50).contains(&block_rva);
+                let in_pre_report_window = (0x0014_dee0..=0x0014_df40).contains(&block_rva)
+                    || (0x0015_e6d0..=0x0015_e720).contains(&block_rva)
+                    || (0x0016_c040..=0x0016_c0c0).contains(&block_rva)
+                    || (0x0016_ddf0..=0x0016_e120).contains(&block_rva);
+                runtime.trace_steam_pre_report_pointer_state(memory, state, block_rva);
+                if in_final_assert_window || in_pre_report_window {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let return_addr = read_guest_u32(memory, state.get(Register::Rsp))
+                        .ok()
+                        .map(u64::from)
+                        .map(|value| {
+                            format!("{:#x}", value.saturating_sub(runtime.mapped_image_base))
+                        })
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    let final_assert_tls_state = if guest_arch == GuestArch::X86
+                        && block_rva == 0x0013_ea80
+                    {
+                        let format_opt = |value: Option<u64>| {
+                            value
+                                .map(|value| format!("{value:#x}"))
+                                .unwrap_or_else(|| "<unavailable>".to_string())
+                        };
+                        let tls_index_address = runtime.mapped_image_base + 0x0045_71a8;
+                        let compare_left_address = runtime.mapped_image_base + 0x0042_6400;
+                        let tls_vector = match read_guest_pointer(
+                            memory,
+                            runtime.teb_base + 0x2c,
+                            guest_arch,
+                        ) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                eprintln!(
+                                    "[pe_runtime] SteamTLSWatch: failed to read TLS vector at {:#x}: {}",
+                                    runtime.teb_base + 0x2c,
+                                    error
+                                );
+                                None
+                            }
+                        };
+                        let tls_index = read_guest_u32(memory, tls_index_address)
+                            .ok()
+                            .map(u64::from);
+                        let tls_slot = match (tls_vector, tls_index) {
+                            (Some(vector), Some(index)) if vector != 0 => read_guest_pointer(
+                                memory,
+                                vector + index * guest_arch.pointer_bytes() as u64,
+                                guest_arch,
+                            )
+                            .ok(),
+                            _ => None,
+                        };
+                        let compare_left = read_guest_u32(memory, compare_left_address)
+                            .ok()
+                            .map(u64::from);
+                        let compare_right = match tls_slot {
+                            Some(slot) if slot != 0 => {
+                                read_guest_u32(memory, slot + 0x480).ok().map(u64::from)
+                            }
+                            _ => None,
+                        };
+                        format!(
+                            " tls_index={} tls_vector={} tls_slot={} compare_lhs={} compare_rhs={}",
+                            format_opt(tls_index),
+                            format_opt(tls_vector),
+                            format_opt(tls_slot),
+                            format_opt(compare_left),
+                            format_opt(compare_right),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let block_summary = format!(
+                        "block_start={block_rva:#x} ret_rva={return_addr} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x}{final_assert_tls_state} decoded=[{decoded_instructions}]",
+                        state.get(Register::Rax),
+                        state.get(Register::Rcx),
+                        state.get(Register::Rdx),
+                        state.get(Register::Rsi),
+                        state.get(Register::Rdi),
+                        state.get(Register::Rsp),
+                        state.get(Register::Rbp),
+                    );
+                    if in_final_assert_window {
+                        if runtime.steam_final_assert_recent_blocks.len() == 32 {
+                            runtime.steam_final_assert_recent_blocks.pop_front();
+                        }
+                        runtime
+                            .steam_final_assert_recent_blocks
+                            .push_back(block_summary.clone());
+                        if (0x0013_eaf0..=0x0013_eb10).contains(&block_rva)
+                            || (0x0014_ca80..=0x0014_cd80).contains(&block_rva)
+                        {
+                            if runtime.steam_final_status_writer_blocks.len() == 40 {
+                                runtime.steam_final_status_writer_blocks.pop_front();
+                            }
+                            runtime
+                                .steam_final_status_writer_blocks
+                                .push_back(block_summary.clone());
+                        } else if (0x0013_c3d0..=0x0013_c410).contains(&block_rva)
+                            || (0x0013_d190..=0x0013_d197).contains(&block_rva)
+                            || (0x0013_f0a0..=0x0013_f0d0).contains(&block_rva)
+                            || (0x0013_f560..=0x0013_f790).contains(&block_rva)
+                        {
+                            if runtime.steam_final_lock_blocks.len() == 64 {
+                                runtime.steam_final_lock_blocks.pop_front();
+                            }
+                            runtime
+                                .steam_final_lock_blocks
+                                .push_back(block_summary.clone());
+                        }
+                    }
+                    if in_pre_report_window {
+                        if runtime.steam_pre_report_blocks.len() == 64 {
+                            runtime.steam_pre_report_blocks.pop_front();
+                        }
+                        runtime.steam_pre_report_blocks.push_back(block_summary);
+                    }
+                }
+            }
+            // --- Steam tracing pre-execution state captures ---
+            // These variable declarations capture guest state before block execution so
+            // that tracing emission blocks (C, D, E below) can compare before/after values.
+            // They are always computed (guards are cheap) but must remain in scope for the
+            // later tracing emission blocks after execute_ir_with_guest_exception_delivery.
+            let esi_before = state.get(Register::Rsi) as u32;
+            let steam_565af0_range_start = runtime.mapped_image_base + 0x0016_5ab5;
+            let steam_565af0_range_end = runtime.mapped_image_base + 0x0016_5d10;
+            let steam_565ac1 = runtime.mapped_image_base + 0x0016_5ac1;
+            let steam_565af0 = runtime.mapped_image_base + 0x0016_5af0;
+            let steam_565c46 = runtime.mapped_image_base + 0x0016_5c46;
+            let trace_steam_final_assert_globals = guest_arch == GuestArch::X86
+                && matches!(
+                    block_rva,
+                    Some(rva)
+                        if (0x0013_6400..=0x0013_6f00).contains(&rva)
+                            || (0x0013_d180..=0x0013_d1b0).contains(&rva)
+                            || (0x0013_ea00..=0x0013_f800).contains(&rva)
+                            || (0x0014_ca80..=0x0014_cd50).contains(&rva)
+                            || (0x0014_dee0..=0x0014_df40).contains(&rva)
+                            || (0x0015_e6d0..=0x0015_e720).contains(&rva)
+                            || (0x0016_c040..=0x0016_c0c0).contains(&rva)
+                            || (0x0016_ddf0..=0x0016_e120).contains(&rva)
+                );
+            let final_assert_globals_before = if trace_steam_final_assert_globals {
+                Some([
+                    (
+                        runtime.mapped_image_base + 0x003c_bfc4,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x003c_bfc4),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x003c_bfd4,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x003c_bfd4),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_3a34,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3a34),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_3a38,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3a38),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_3fbc,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3fbc),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_6130,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_6130),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_63e8,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_63e8),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_6400,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_6400),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0042_6404,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_6404),
+                    ),
+                ])
+            } else {
+                None
+            };
+            let steam_trace = runtime.enable_steam_tracing && guest_arch == GuestArch::X86;
+            let trace_steam_136b50_entry = steam_trace && block_rva == Some(0x0013_6b50);
+            let steam_136b50_esp_before =
+                trace_steam_136b50_entry.then_some(state.get(Register::Rsp));
+            let steam_136b50_arg0_before = steam_136b50_esp_before
+                .and_then(|esp| probe_read_guest_u32(memory, esp + 4).map(u64::from));
+            let steam_136b50_arg1_before = steam_136b50_esp_before
+                .and_then(|esp| probe_read_guest_u32(memory, esp + 8).map(u64::from));
+            let steam_136b50_global_423fbc_before = trace_steam_136b50_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3fbc)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136b50_global_423fb8_before = trace_steam_136b50_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3fb8)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136b50_global_423a30_before = trace_steam_136b50_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3a30)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136b50_global_423a38_before = trace_steam_136b50_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3a38)
+                        .map(u64::from)
+                })
+                .flatten();
+            let trace_steam_136e80_entry = steam_trace && block_rva == Some(0x0013_6e80);
+            let steam_136e80_esp_before =
+                trace_steam_136e80_entry.then_some(state.get(Register::Rsp));
+            let steam_136e80_args_before = steam_136e80_esp_before.map(|esp| {
+                [
+                    probe_read_guest_u32(memory, esp + 4).map(u64::from),
+                    probe_read_guest_u32(memory, esp + 8).map(u64::from),
+                    probe_read_guest_u32(memory, esp + 12).map(u64::from),
+                    probe_read_guest_u32(memory, esp + 16).map(u64::from),
+                    probe_read_guest_u32(memory, esp + 20).map(u64::from),
+                ]
             });
-        let contains_steam_565ac1 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == steam_565ac1);
-        let contains_steam_565af0 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == steam_565af0);
-        let contains_steam_565c46 = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| instruction.address == steam_565c46);
-        let watch_steam_adf60_edi_preservation = steam_trace
-            && matches!(block_rva, Some(rva) if (0x000a_df67..=0x000a_e239).contains(&rva));
-        let enter_steam_4dea00 = steam_trace && block_rva == Some(0x000a_ea00);
-        let watch_steam_4dea00_edi_preservation = steam_trace
-            && matches!(block_rva, Some(rva) if (0x000a_ea09..=0x000a_ec80).contains(&rva));
-        let steam_hash_insert_probe_before = (steam_trace
-            && runtime.steam_4ae970_probe_count < 16
-            && cached_block.translated.decoded.iter().any(|instruction| {
-                let instruction_rva = instruction
-                    .address
-                    .saturating_sub(runtime.mapped_image_base);
-                (0x000a_e970..=0x000a_ea10).contains(&instruction_rva)
-            }))
-        .then(|| {
-            (
-                probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from),
-                probe_read_guest_u32(&memory, state.get(Register::Rbp) + 8).map(u64::from),
-                state.get(Register::Rbx),
-                state.get(Register::Rdi),
-                state.get(Register::Rbp),
-                state.get(Register::Rsp),
-                block_rva,
-            )
-        });
-        let steam_owner_allocator_probe_before = (steam_trace
-            && runtime.steam_owner_allocator_probe_count < 16
-            && cached_block.translated.decoded.iter().any(|instruction| {
-                let instruction_rva = instruction
-                    .address
-                    .saturating_sub(runtime.mapped_image_base);
-                (0x000a_bfd7..=0x000a_c04b).contains(&instruction_rva)
-            }))
-        .then(|| {
-            (
-                block_rva,
-                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_873c),
-                state.get(Register::Rsp),
-                state.get(Register::Rax),
-                state.get(Register::Rcx),
-            )
-        });
-        let steam_install_dir_set_edi =
-            steam_trace
+            let steam_136e80_global_423e4c_before = trace_steam_136e80_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3e4c)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136e80_global_423e6c_before = trace_steam_136e80_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0042_3e6c)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136e80_tls_index_before = trace_steam_136e80_entry
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_71a8)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_136e80_tls_vector_before = trace_steam_136e80_entry
+                .then(|| probe_read_guest_pointer(memory, runtime.teb_base + 0x2c, guest_arch))
+                .flatten();
+            let steam_136e80_tls_slot_before = match (
+                steam_136e80_tls_vector_before,
+                steam_136e80_tls_index_before,
+            ) {
+                (Some(vector), Some(index)) if vector != 0 => probe_read_guest_pointer(
+                    memory,
+                    vector + index * guest_arch.pointer_bytes() as u64,
+                    guest_arch,
+                ),
+                _ => None,
+            };
+            let steam_136e80_tls_slot_480_before = steam_136e80_tls_slot_before
+                .and_then(|slot| {
+                    (slot != 0).then(|| probe_read_guest_u32(memory, slot + 0x480).map(u64::from))
+                })
+                .flatten();
+            let trace_steam_memstd_oom_entry = steam_trace && block_rva == Some(0x0013_4bd0);
+            let steam_memstd_oom_esp_before =
+                trace_steam_memstd_oom_entry.then_some(state.get(Register::Rsp));
+            let steam_memstd_oom_size_before = steam_memstd_oom_esp_before
+                .and_then(|esp| probe_read_guest_u32(memory, esp + 4).map(u64::from));
+            let steam_memstd_oom_return_rva_before = steam_memstd_oom_esp_before
+                .and_then(|esp| probe_read_guest_u32(memory, esp).map(u64::from))
+                .map(|value| value.saturating_sub(runtime.mapped_image_base));
+            let steam_memstd_oom_this_before =
+                trace_steam_memstd_oom_entry.then_some(state.get(Register::Rcx));
+            let trace_steam_memstd_oom_caller = steam_trace && block_rva == Some(0x0013_4b56);
+            let steam_memstd_caller_this_before =
+                trace_steam_memstd_oom_caller.then_some(state.get(Register::Rdi));
+            let steam_memstd_caller_old_address_before =
+                trace_steam_memstd_oom_caller.then_some(state.get(Register::Rsi));
+            let steam_memstd_caller_requested_size_before =
+                trace_steam_memstd_oom_caller.then_some(state.get(Register::Rbx));
+            let steam_memstd_caller_mode_before =
+                steam_memstd_caller_this_before.and_then(|this_ptr| {
+                    probe_read_guest_u32(memory, this_ptr + 0x5918).map(u64::from)
+                });
+            let steam_memstd_caller_range1_table_before =
+                steam_memstd_caller_this_before.and_then(|this_ptr| {
+                    probe_read_guest_u32(memory, this_ptr + 0x0c58).map(u64::from)
+                });
+            let steam_memstd_caller_range2_table_before =
+                steam_memstd_caller_this_before.and_then(|this_ptr| {
+                    probe_read_guest_u32(memory, this_ptr + 0x5910).map(u64::from)
+                });
+            let steam_global_array_watch = steam_trace
+                && matches!(
+                    block_rva,
+                    Some(
+                        0x0015_e9b1
+                            | 0x0015_e9c5
+                            | 0x0015_e9d0
+                            | 0x0015_e9f0
+                            | 0x0015_ea1b
+                            | 0x0015_ea89
+                            | 0x0015_ea98
+                            | 0x0015_eac0
+                            | 0x0017_21d1
+                            | 0x0017_21f0
+                    )
+                );
+            let steam_global_array_count_before = steam_global_array_watch
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7624)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_global_array_ptr_before = steam_global_array_watch
+                .then(|| {
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7628)
+                        .map(u64::from)
+                })
+                .flatten();
+            let steam_global_array_return_before = steam_global_array_watch
+                .then(|| probe_read_guest_u32(memory, state.get(Register::Rsp)).map(u64::from))
+                .flatten()
+                .map(|value| value.saturating_sub(runtime.mapped_image_base));
+            let steam_early_termination_watch = steam_trace
+                && matches!(block_rva, Some(rva) if (0x0015_e740..=0x0015_e7a5).contains(&rva));
+            let steam_early_termination_return_before = steam_early_termination_watch
+                .then(|| probe_read_guest_u32(memory, state.get(Register::Rsp)).map(u64::from))
+                .flatten()
+                .map(|value| value.saturating_sub(runtime.mapped_image_base));
+            let steam_global_state_watch = steam_trace && block_rva.is_some();
+            let steam_global_state_before = steam_global_state_watch.then(|| {
+                [
+                    (
+                        runtime.mapped_image_base + 0x0045_715c,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_715c),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0045_7624,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7624),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x0045_7628,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7628),
+                    ),
+                    (
+                        runtime.mapped_image_base + 0x003c_873c,
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x003c_873c),
+                    ),
+                ]
+            });
+            let steam_initterm_e_watch = steam_trace
+                && matches!(block_rva, Some(rva) if (0x0016_e34b..=0x0016_e371).contains(&rva));
+            let steam_initterm_e_start_before = steam_initterm_e_watch
+                .then(|| probe_read_guest_u32(memory, state.get(Register::Rsp) + 4).map(u64::from))
+                .flatten();
+            let steam_initterm_e_end_before = steam_initterm_e_watch
+                .then(|| probe_read_guest_u32(memory, state.get(Register::Rsp) + 8).map(u64::from))
+                .flatten();
+            let steam_startup_init_watch = steam_trace
+                && matches!(block_rva, Some(rva) if (0x0014_d105..=0x0014_d17b).contains(&rva));
+            let steam_startup_failure_watch = steam_trace
+                && matches!(block_rva, Some(rva) if (0x0014_d257..=0x0014_d264).contains(&rva));
+            let steam_callback_walk_watch = steam_trace && block_rva == Some(0x0017_7827);
+            let steam_callback_walk_entry_before = steam_callback_walk_watch.then(|| {
+                let entry = state.get(Register::Rsi);
+                (
+                    entry,
+                    probe_read_guest_u32(memory, entry).map(u64::from),
+                    probe_read_guest_u32(memory, entry + 4).map(u64::from),
+                )
+            });
+            let steam_post_577113_watch =
+                steam_trace && matches!(block_rva, Some(0x0017_6f61 | 0x0017_6f84));
+            let steam_post_56ee10_watch = steam_trace && block_rva == Some(0x0017_6f3c);
+            let steam_post_576ca8_watch = steam_trace && block_rva == Some(0x0017_7133);
+            let steam_post_576d7e_watch = steam_trace && block_rva == Some(0x0017_71a9);
+            let steam_577113_epilogue_watch = steam_trace && block_rva == Some(0x0017_72f4);
+            let steam_577113_epilogue_before = steam_577113_epilogue_watch.then(|| {
+                let rsp = state.get(Register::Rsp);
+                (
+                    rsp,
+                    probe_read_guest_u32(memory, rsp).map(u64::from),
+                    probe_read_guest_u32(memory, rsp + 4).map(u64::from),
+                    probe_read_guest_u32(memory, rsp + 8).map(u64::from),
+                    probe_read_guest_u32(memory, rsp + 12).map(u64::from),
+                    state.get(Register::Rdi),
+                    state.get(Register::Rsi),
+                )
+            });
+            let steam_saved_edi_slot_watch = steam_trace
+                && matches!(block_rva, Some(rva) if (0x0001_6ca8..=0x0001_7304).contains(&rva));
+            let steam_saved_edi_slot_before = steam_saved_edi_slot_watch
+                .then(|| probe_read_guest_u32(memory, 0x7000_ff1c).map(u64::from))
+                .flatten();
+            let trace_steam_convar_create = steam_trace && block_rva == Some(0x000c_c542);
+            let trace_steam_convar_create_start = steam_trace && block_rva == Some(0x000c_c400);
+            let steam_convar_trace_active =
+                trace_steam_convar_create || trace_steam_convar_create_start;
+            let steam_convar_this_before = if trace_steam_convar_create_start {
+                Some(state.get(Register::Rcx))
+            } else if trace_steam_convar_create {
+                Some(state.get(Register::Rsi))
+            } else {
+                None
+            };
+            let steam_convar_frame_before =
+                steam_convar_trace_active.then_some(state.get(Register::Rbp));
+            let steam_convar_name_ptr_before = steam_convar_frame_before
+                .and_then(|frame| probe_read_guest_u32(memory, frame + 0x08).map(u64::from));
+            let steam_convar_flags_before = steam_convar_frame_before
+                .and_then(|frame| probe_read_guest_u32(memory, frame + 0x10).map(u64::from));
+            let steam_convar_help_ptr_before = steam_convar_frame_before
+                .and_then(|frame| probe_read_guest_u32(memory, frame + 0x14).map(u64::from));
+            let steam_convar_parent_ptr_before = steam_convar_frame_before
+                .and_then(|frame| probe_read_guest_u32(memory, frame + 0x18).map(u64::from));
+            let steam_convar_callback_ptr_before = steam_convar_frame_before
+                .and_then(|frame| probe_read_guest_u32(memory, frame + 0x2c).map(u64::from));
+            let steam_convar_vector_ptr_before =
+                steam_convar_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
+            let steam_convar_vector_bytes_before = steam_convar_vector_ptr_before
+                .and_then(|vector_ptr| probe_read_window(memory, vector_ptr, 0x14));
+            let recent_main_has_cc400 = steam_trace && runtime.recent_main_cc400_count != 0;
+            let steam_convar_helper_watch = if recent_main_has_cc400 {
+                match block_rva {
+                    Some(0x0014_c88e) => Some("0x14c88e"),
+                    Some(0x0014_e980) => Some("0x14e980"),
+                    Some(0x0014_6200) => Some("0x146200"),
+                    Some(0x0016_00aa) => Some("0x1600aa"),
+                    Some(0x0016_0033) => Some("0x160033"),
+                    Some(0x0014_6570) => Some("0x146570"),
+                    Some(0x0016_6127) => Some("0x166127"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let steam_convar_helper_this_before = if steam_convar_helper_watch.is_some() {
+                Some(state.get(Register::Rsi))
+            } else {
+                None
+            };
+            let steam_convar_helper_vector_ptr_before =
+                steam_convar_helper_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
+            let steam_convar_helper_vector_bytes_before = steam_convar_helper_vector_ptr_before
+                .and_then(|vector_ptr| probe_read_window(memory, vector_ptr, 0x14));
+            let steam_convar_helper_arg0_before = steam_convar_helper_watch.and_then(|_| {
+                probe_read_guest_u32(memory, state.get(Register::Rsp) + 4).map(u64::from)
+            });
+            let steam_convar_helper_arg1_before = steam_convar_helper_watch.and_then(|_| {
+                probe_read_guest_u32(memory, state.get(Register::Rsp) + 8).map(u64::from)
+            });
+            let steam_convar_helper_arg2_before = steam_convar_helper_watch.and_then(|_| {
+                probe_read_guest_u32(memory, state.get(Register::Rsp) + 12).map(u64::from)
+            });
+            let steam_convar_helper_return_before = steam_convar_helper_watch
+                .and_then(|_| probe_read_guest_u32(memory, state.get(Register::Rsp)).map(u64::from))
+                .map(|value| value.saturating_sub(runtime.mapped_image_base));
+            if matches!(steam_convar_helper_watch, Some("0x14e980")) {
+                runtime.steam_convar_memcpy_watch_this = steam_convar_helper_this_before;
+            }
+            let steam_convar_memcpy_byte_watch = if recent_main_has_cc400 {
+                match block_rva {
+                    Some(0x0014_ee9d) => Some("0x14ee9d"),
+                    Some(0x0014_eea6) => Some("0x14eea6"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let steam_convar_memcpy_byte_this_before =
+                steam_convar_memcpy_byte_watch.and(runtime.steam_convar_memcpy_watch_this);
+            let steam_convar_memcpy_byte_vector_ptr_before = steam_convar_memcpy_byte_this_before
+                .and_then(|this_ptr| this_ptr.checked_add(0x84));
+            let steam_convar_memcpy_byte_vector_bytes_before =
+                steam_convar_memcpy_byte_vector_ptr_before
+                    .and_then(|vector_ptr| probe_read_window(memory, vector_ptr, 0x14));
+            let steam_convar_memcpy_return_watch = if recent_main_has_cc400 {
+                match block_rva {
+                    Some(0x0014_eeb0) => Some("0x14eeb0"),
+                    Some(0x000c_c474) => Some("0xcc474"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let steam_convar_memcpy_return_this_before =
+                steam_convar_memcpy_return_watch.and(runtime.steam_convar_memcpy_watch_this);
+            let steam_convar_memcpy_return_vector_ptr_before =
+                steam_convar_memcpy_return_this_before
+                    .and_then(|this_ptr| this_ptr.checked_add(0x84));
+            let steam_convar_memcpy_return_vector_bytes_before =
+                steam_convar_memcpy_return_vector_ptr_before
+                    .and_then(|vector_ptr| probe_read_window(memory, vector_ptr, 0x14));
+            let trace_steam_vector_grow_request = steam_trace && block_rva == Some(0x0009_968b);
+            let steam_vector_this_before =
+                trace_steam_vector_grow_request.then_some(state.get(Register::Rdi));
+            let steam_vector_element_size_before = steam_vector_this_before
+                .and_then(|vector_ptr| probe_read_guest_u32(memory, vector_ptr).map(u64::from));
+            let steam_vector_old_address_before = steam_vector_this_before.and_then(|vector_ptr| {
+                probe_read_guest_u32(memory, vector_ptr + 0x4).map(u64::from)
+            });
+            let steam_vector_capacity_before = steam_vector_this_before.and_then(|vector_ptr| {
+                probe_read_guest_u32(memory, vector_ptr + 0x8).map(u64::from)
+            });
+            let steam_vector_grow_size_before = steam_vector_this_before.and_then(|vector_ptr| {
+                probe_read_guest_u32(memory, vector_ptr + 0x0c).map(u64::from)
+            });
+            let steam_vector_count_before = steam_vector_this_before.and_then(|vector_ptr| {
+                probe_read_guest_u32(memory, vector_ptr + 0x10).map(u64::from)
+            });
+            let decode_steam_convar_vector_fields = |bytes: &[u8]| -> BTreeMap<String, Value> {
+                let read_u32_at = |offset: usize| -> u64 {
+                    u64::from(u32::from_le_bytes(
+                        bytes[offset..offset + 4].try_into().unwrap(),
+                    ))
+                };
+                BTreeMap::from([
+                    (
+                        "element_size".to_string(),
+                        json!(format!("{:#x}", read_u32_at(0))),
+                    ),
+                    (
+                        "memory_ptr".to_string(),
+                        json!(format!("{:#x}", read_u32_at(4))),
+                    ),
+                    (
+                        "allocation_count".to_string(),
+                        json!(format!("{:#x}", read_u32_at(8))),
+                    ),
+                    (
+                        "grow_size".to_string(),
+                        json!(format!("{:#x}", read_u32_at(12))),
+                    ),
+                    (
+                        "count".to_string(),
+                        json!(format!("{:#x}", read_u32_at(16))),
+                    ),
+                ])
+            };
+            let steam_convar_precise_watch = if steam_trace {
+                match block_rva {
+                    Some(0x000c_c400) => Some("0xcc400"),
+                    Some(0x000c_c447) => Some("0xcc447"),
+                    Some(0x000c_c457) => Some("0xcc457"),
+                    Some(0x000c_c465) => Some("0xcc465"),
+                    Some(0x000c_c474) => Some("0xcc474"),
+                    Some(0x000c_c4ac) => Some("0xcc4ac"),
+                    Some(0x000c_c514) => Some("0xcc514"),
+                    Some(0x000c_c542) => Some("0xcc542"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let steam_convar_precise_this_before = steam_convar_precise_watch.and_then(|_| {
+                let this_ptr = if block_rva == Some(0x000c_c400) {
+                    state.get(Register::Rcx)
+                } else {
+                    state.get(Register::Rsi)
+                };
+                (this_ptr != 0).then_some(this_ptr)
+            });
+            let steam_convar_precise_vector_before = steam_convar_precise_this_before
+                .and_then(|this_ptr| this_ptr.checked_add(0x84))
+                .and_then(|vector_ptr| read_window(memory, vector_ptr, 0x14).ok())
+                .map(|bytes| decode_steam_convar_vector_fields(&bytes));
+            let steam_convar_precise_field_94_before = steam_convar_precise_this_before
+                .and_then(|this_ptr| read_guest_u32(memory, this_ptr + 0x94).ok().map(u64::from));
+            let contains_steam_4013c0 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == 0x4013c0);
+            let contains_steam_4013ba = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == 0x4013ba);
+            let contains_steam_4013a3 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == 0x4013a3);
+            let contains_steam_402a57 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == 0x402a57);
+            let touches_steam_565af0_helper = steam_trace
+                && cached_block.translated.decoded.iter().any(|instruction| {
+                    (steam_565af0_range_start..=steam_565af0_range_end)
+                        .contains(&instruction.address)
+                });
+            let contains_steam_565ac1 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == steam_565ac1);
+            let contains_steam_565af0 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == steam_565af0);
+            let contains_steam_565c46 = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| instruction.address == steam_565c46);
+            let watch_steam_adf60_edi_preservation = steam_trace
+                && matches!(block_rva, Some(rva) if (0x000a_df67..=0x000a_e239).contains(&rva));
+            let enter_steam_4dea00 = steam_trace && block_rva == Some(0x000a_ea00);
+            let watch_steam_4dea00_edi_preservation = steam_trace
+                && matches!(block_rva, Some(rva) if (0x000a_ea09..=0x000a_ec80).contains(&rva));
+            let steam_hash_insert_probe_before = (steam_trace
+                && runtime.steam_4ae970_probe_count < 16
+                && cached_block.translated.decoded.iter().any(|instruction| {
+                    let instruction_rva = instruction
+                        .address
+                        .saturating_sub(runtime.mapped_image_base);
+                    (0x000a_e970..=0x000a_ea10).contains(&instruction_rva)
+                }))
+            .then(|| {
+                (
+                    probe_read_guest_u32(memory, state.get(Register::Rsp)).map(u64::from),
+                    probe_read_guest_u32(memory, state.get(Register::Rbp) + 8).map(u64::from),
+                    state.get(Register::Rbx),
+                    state.get(Register::Rdi),
+                    state.get(Register::Rbp),
+                    state.get(Register::Rsp),
+                    block_rva,
+                )
+            });
+            let steam_owner_allocator_probe_before = (steam_trace
+                && runtime.steam_owner_allocator_probe_count < 16
+                && cached_block.translated.decoded.iter().any(|instruction| {
+                    let instruction_rva = instruction
+                        .address
+                        .saturating_sub(runtime.mapped_image_base);
+                    (0x000a_bfd7..=0x000a_c04b).contains(&instruction_rva)
+                }))
+            .then(|| {
+                (
+                    block_rva,
+                    probe_read_guest_u32(memory, runtime.mapped_image_base + 0x003c_873c),
+                    state.get(Register::Rsp),
+                    state.get(Register::Rax),
+                    state.get(Register::Rcx),
+                )
+            });
+            let steam_install_dir_set_edi = steam_trace
                 && cached_block.translated.decoded.iter().any(|instruction| {
                     instruction.address == runtime.mapped_image_base + 0x0005_47c4
                 });
-        let watch_steam_install_dir_edi_preservation = steam_trace
-            && cached_block.translated.decoded.iter().any(|instruction| {
-                let instruction_rva = instruction
-                    .address
-                    .saturating_sub(runtime.mapped_image_base);
-                (0x0005_47c6..=0x0005_4a33).contains(&instruction_rva)
-            });
-        let watched_esi_slot_before =
-            runtime
-                .steam_401389_saved_esi_slot_addr
-                .and_then(|address| {
-                    read_guest_u32(&memory, address)
-                        .ok()
-                        .map(|value| (address, value))
+            let watch_steam_install_dir_edi_preservation = steam_trace
+                && cached_block.translated.decoded.iter().any(|instruction| {
+                    let instruction_rva = instruction
+                        .address
+                        .saturating_sub(runtime.mapped_image_base);
+                    (0x0005_47c6..=0x0005_4a33).contains(&instruction_rva)
                 });
-        let touches_steam_401389_helper = steam_trace
-            && cached_block
-                .translated
-                .decoded
-                .iter()
-                .any(|instruction| (0x401389..=0x4013fc).contains(&instruction.address));
-        if runtime.enable_steam_tracing {
-            if guest_arch == GuestArch::X86 && contains_steam_565af0 {
-                runtime.steam_565af0_recent_blocks.clear();
-            }
-            if enter_steam_4dea00 {
-                runtime.steam_4dea00_expected_edi = Some(state.get(Register::Rdi));
-            } else if guest_arch == GuestArch::X86 && !watch_steam_4dea00_edi_preservation {
-                runtime.steam_4dea00_expected_edi = None;
-            }
-            if watch_steam_4dea00_edi_preservation
-                && let Some(expected_edi) = runtime.steam_4dea00_expected_edi
-            {
-                let actual_edi = state.get(Register::Rdi);
-                if actual_edi != expected_edi {
-                    return Err(AppError::new(
+            let watched_esi_slot_before =
+                runtime
+                    .steam_401389_saved_esi_slot_addr
+                    .and_then(|address| {
+                        read_guest_u32(memory, address)
+                            .ok()
+                            .map(|value| (address, value))
+                    });
+            let touches_steam_401389_helper = steam_trace
+                && cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .any(|instruction| (0x401389..=0x4013fc).contains(&instruction.address));
+            if runtime.enable_steam_tracing {
+                if guest_arch == GuestArch::X86 && contains_steam_565af0 {
+                    runtime.steam_565af0_recent_blocks.clear();
+                }
+                if enter_steam_4dea00 {
+                    runtime.steam_4dea00_expected_edi = Some(state.get(Register::Rdi));
+                } else if guest_arch == GuestArch::X86 && !watch_steam_4dea00_edi_preservation {
+                    runtime.steam_4dea00_expected_edi = None;
+                }
+                if watch_steam_4dea00_edi_preservation
+                    && let Some(expected_edi) = runtime.steam_4dea00_expected_edi
+                {
+                    let actual_edi = state.get(Register::Rdi);
+                    if actual_edi != expected_edi {
+                        return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!(
                                 "steam 0x4dea00 callee lost edi inside block={block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}, ebp={:#x}",
@@ -6157,7 +6221,7 @@ pub fn execute_with_options(
                         .with_hint(format!(
                             "steam-0x4dea00 esp={:#x} return={} eax={:#x} ecx={:#x} edx={:#x}",
                             state.get(Register::Rsp),
-                            read_guest_u32(&memory, state.get(Register::Rsp))
+                            read_guest_u32(memory, state.get(Register::Rsp))
                                 .ok()
                                 .map(|value| format!("{:#x}", u64::from(value)))
                                 .unwrap_or_else(|| "<unavailable>".to_string()),
@@ -6165,21 +6229,21 @@ pub fn execute_with_options(
                             state.get(Register::Rcx),
                             state.get(Register::Rdx),
                         )));
+                    }
                 }
-            }
-            if watch_steam_install_dir_edi_preservation
-                && let Some(expected_edi) = runtime.steam_install_dir_expected_edi
-            {
-                let actual_edi = state.get(Register::Rdi);
-                if actual_edi != expected_edi {
-                    let decoded_addresses = cached_block
-                        .translated
-                        .decoded
-                        .iter()
-                        .map(|instruction| format!("{:#x}", instruction.address))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    return Err(AppError::new(
+                if watch_steam_install_dir_edi_preservation
+                    && let Some(expected_edi) = runtime.steam_install_dir_expected_edi
+                {
+                    let actual_edi = state.get(Register::Rdi);
+                    if actual_edi != expected_edi {
+                        let decoded_addresses = cached_block
+                            .translated
+                            .decoded
+                            .iter()
+                            .map(|instruction| format!("{:#x}", instruction.address))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!(
                                 "steam install-dir callee lost edi before block {block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}"
@@ -6196,17 +6260,17 @@ pub fn execute_with_options(
                             state.get(Register::Rbp),
                             state.get(Register::Rsp),
                         )));
+                    }
                 }
-            }
-            if watch_steam_adf60_edi_preservation {
-                let expected_edi =
-                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
-                        .ok()
-                        .map(u64::from)
-                        .unwrap_or(0);
-                let actual_edi = state.get(Register::Rdi);
-                if expected_edi != 0 && actual_edi != expected_edi {
-                    return Err(AppError::new(
+                if watch_steam_adf60_edi_preservation {
+                    let expected_edi =
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_add(12))
+                            .ok()
+                            .map(u64::from)
+                            .unwrap_or(0);
+                    let actual_edi = state.get(Register::Rdi);
+                    if expected_edi != 0 && actual_edi != expected_edi {
+                        return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!(
                             "steam 0xadf60 wrapper lost edi before call block={block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}, ebp={:#x}",
@@ -6215,118 +6279,118 @@ pub fn execute_with_options(
                     )
                     .with_hint(format!(
                         "steam-0xadf60 frame return={} arg0={} arg1={} arg2={} ecx={:#x} esi={:#x}",
-                        read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(4))
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_add(4))
                             .ok()
                             .map(|value| format!("{:#x}", u64::from(value)))
                             .unwrap_or_else(|| "<unavailable>".to_string()),
-                        read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(8))
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_add(8))
                             .ok()
                             .map(|value| format!("{:#x}", u64::from(value)))
                             .unwrap_or_else(|| "<unavailable>".to_string()),
-                        read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_add(12))
                             .ok()
                             .map(|value| format!("{:#x}", u64::from(value)))
                             .unwrap_or_else(|| "<unavailable>".to_string()),
-                        read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(16))
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_add(16))
                             .ok()
                             .map(|value| format!("{:#x}", u64::from(value)))
                             .unwrap_or_else(|| "<unavailable>".to_string()),
                         state.get(Register::Rcx),
                         state.get(Register::Rsi),
                     )));
-                }
-            }
-            if touches_steam_565af0_helper {
-                let decoded_addresses = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| format!("{:#x}", instruction.address))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let esp = state.get(Register::Rsp);
-                let ebp = state.get(Register::Rbp);
-                let return_addr = read_guest_u32(&memory, esp).ok().map(u64::from);
-                let arg_from_esp = read_guest_u32(&memory, esp + 4).ok().map(u64::from);
-                let arg_from_ebp = read_guest_u32(&memory, ebp.wrapping_add(8))
-                    .ok()
-                    .map(u64::from);
-                let preview_ascii = |pointer: Option<u64>| -> String {
-                    let Some(pointer) = pointer else {
-                        return "<unavailable>".to_string();
-                    };
-                    if pointer == 0 {
-                        return "<null>".to_string();
                     }
-                    let mut bytes = Vec::new();
-                    for offset in 0..32_u64 {
-                        match memory.read_u8(pointer + offset) {
-                            Ok(0) => break,
-                            Ok(byte) => bytes.push(byte),
-                            Err(_) if bytes.is_empty() => return "<unreadable>".to_string(),
-                            Err(_) => break,
-                        }
-                    }
-                    bytes
-                        .iter()
-                        .map(|byte| {
-                            if byte.is_ascii_graphic() || *byte == b' ' {
-                                char::from(*byte)
-                            } else {
-                                '.'
-                            }
-                        })
-                        .collect::<String>()
-                };
-                let eax_ascii = preview_ascii(Some(state.get(Register::Rax)));
-                let esp_arg0_ascii = preview_ascii(arg_from_esp);
-                let esi_deref_ascii = preview_ascii(
-                    read_guest_u32(&memory, state.get(Register::Rsi))
-                        .ok()
-                        .map(u64::from),
-                );
-                let block_summary = format!(
-                    "block_start={block_start_rip:#x} addrs=[{decoded_addresses}] esp={esp:#x} ebp={ebp:#x} eax={:#x} eax_ascii={} ecx={:#x} edx={:#x} esi_deref_ascii={} return_addr={} esp_arg0={} esp_arg0_ascii={} ebp_arg0={} pre_call_eax={}",
-                    state.get(Register::Rax),
-                    eax_ascii,
-                    state.get(Register::Rcx),
-                    state.get(Register::Rdx),
-                    esi_deref_ascii,
-                    return_addr
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    arg_from_esp
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    esp_arg0_ascii,
-                    arg_from_ebp
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    if contains_steam_565ac1 {
-                        format!("{:#x}", state.get(Register::Rax))
-                    } else {
-                        "<n/a>".to_string()
-                    },
-                );
-                if runtime.steam_565af0_recent_blocks.len() == 20 {
-                    runtime.steam_565af0_recent_blocks.pop_front();
                 }
-                runtime.steam_565af0_recent_blocks.push_back(block_summary);
-            }
-            if guest_arch == GuestArch::X86 && contains_steam_565c46 {
-                let frame_ebp = state.get(Register::Rbp);
-                let frame_arg0 = read_guest_u32(&memory, frame_ebp.wrapping_add(8))
-                    .ok()
-                    .map(u64::from)
-                    .unwrap_or(0);
-                if frame_arg0 == 0 || read_guest_u32(&memory, frame_arg0).is_err() {
-                    let recent_blocks = runtime
-                        .steam_565af0_recent_blocks
+                if touches_steam_565af0_helper {
+                    let decoded_addresses = cached_block
+                        .translated
+                        .decoded
                         .iter()
-                        .cloned()
+                        .map(|instruction| format!("{:#x}", instruction.address))
                         .collect::<Vec<_>>()
-                        .join(" || ");
-                    return Err(
+                        .join(",");
+                    let esp = state.get(Register::Rsp);
+                    let ebp = state.get(Register::Rbp);
+                    let return_addr = read_guest_u32(memory, esp).ok().map(u64::from);
+                    let arg_from_esp = read_guest_u32(memory, esp + 4).ok().map(u64::from);
+                    let arg_from_ebp = read_guest_u32(memory, ebp.wrapping_add(8))
+                        .ok()
+                        .map(u64::from);
+                    let preview_ascii = |pointer: Option<u64>| -> String {
+                        let Some(pointer) = pointer else {
+                            return "<unavailable>".to_string();
+                        };
+                        if pointer == 0 {
+                            return "<null>".to_string();
+                        }
+                        let mut bytes = Vec::new();
+                        for offset in 0..32_u64 {
+                            match memory.read_u8(pointer + offset) {
+                                Ok(0) => break,
+                                Ok(byte) => bytes.push(byte),
+                                Err(_) if bytes.is_empty() => return "<unreadable>".to_string(),
+                                Err(_) => break,
+                            }
+                        }
+                        bytes
+                            .iter()
+                            .map(|byte| {
+                                if byte.is_ascii_graphic() || *byte == b' ' {
+                                    char::from(*byte)
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect::<String>()
+                    };
+                    let eax_ascii = preview_ascii(Some(state.get(Register::Rax)));
+                    let esp_arg0_ascii = preview_ascii(arg_from_esp);
+                    let esi_deref_ascii = preview_ascii(
+                        read_guest_u32(memory, state.get(Register::Rsi))
+                            .ok()
+                            .map(u64::from),
+                    );
+                    let block_summary = format!(
+                        "block_start={block_start_rip:#x} addrs=[{decoded_addresses}] esp={esp:#x} ebp={ebp:#x} eax={:#x} eax_ascii={} ecx={:#x} edx={:#x} esi_deref_ascii={} return_addr={} esp_arg0={} esp_arg0_ascii={} ebp_arg0={} pre_call_eax={}",
+                        state.get(Register::Rax),
+                        eax_ascii,
+                        state.get(Register::Rcx),
+                        state.get(Register::Rdx),
+                        esi_deref_ascii,
+                        return_addr
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        arg_from_esp
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        esp_arg0_ascii,
+                        arg_from_ebp
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        if contains_steam_565ac1 {
+                            format!("{:#x}", state.get(Register::Rax))
+                        } else {
+                            "<n/a>".to_string()
+                        },
+                    );
+                    if runtime.steam_565af0_recent_blocks.len() == 20 {
+                        runtime.steam_565af0_recent_blocks.pop_front();
+                    }
+                    runtime.steam_565af0_recent_blocks.push_back(block_summary);
+                }
+                if guest_arch == GuestArch::X86 && contains_steam_565c46 {
+                    let frame_ebp = state.get(Register::Rbp);
+                    let frame_arg0 = read_guest_u32(memory, frame_ebp.wrapping_add(8))
+                        .ok()
+                        .map(u64::from)
+                        .unwrap_or(0);
+                    if frame_arg0 == 0 || read_guest_u32(memory, frame_arg0).is_err() {
+                        let recent_blocks = runtime
+                            .steam_565af0_recent_blocks
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" || ");
+                        return Err(
                         AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!(
@@ -6336,134 +6400,134 @@ pub fn execute_with_options(
                         )
                         .with_hint(format!("steam-565af0 recent-blocks {recent_blocks}")),
                     );
+                    }
                 }
-            }
-            if guest_arch == GuestArch::X86
-                && contains_steam_402a57
-                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
-            {
-                let saved_esi =
-                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
-                        .unwrap_or(0);
-                if saved_esi != expected_esi {
-                    return Err(AppError::new(
-                        ReasonCode::RcUnimplInsn,
-                        format!(
-                            "steam 401434 corrupted its saved ESI slot before epilogue: expected {expected_esi:#x}, saved slot holds {saved_esi:#x}"
-                        ),
-                    ));
-                }
-            }
-        }
-        if state.rip <= 0x19026bf1 && cached_block.end_rip > 0x19026bf1 {
-            let this_ptr = state.get(Register::Rcx) & state.arch.register_mask();
-            let first = read_guest_pointer(&memory, this_ptr, guest_arch).unwrap_or(0);
-            let second = read_guest_pointer(&memory, first, guest_arch).unwrap_or(0);
-            if second != 0 {
-                let field_4c = read_u32(&memory, second + 0x4c).unwrap_or(0) as u64;
-                if read_u32(&memory, second + 0x48).unwrap_or(0) as u64
-                    == u64::from(DEFAULT_ANSI_CODE_PAGE)
-                    && field_4c >= 0x1_0000
+                if guest_arch == GuestArch::X86
+                    && contains_steam_402a57
+                    && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
                 {
-                    write_u32(&mut memory, second + 0x48, field_4c as u32);
+                    let saved_esi =
+                        read_guest_u32(memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
+                            .unwrap_or(0);
+                    if saved_esi != expected_esi {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!(
+                                "steam 401434 corrupted its saved ESI slot before epilogue: expected {expected_esi:#x}, saved slot holds {saved_esi:#x}"
+                            ),
+                        ));
+                    }
                 }
             }
-        }
-        if runtime.enable_steam_tracing {
-            // Trace hash-table insertion probes (capped at 16 emissions).
-            if let Some((
-                return_addr,
-                key_arg,
-                map_this,
-                edi_before,
-                ebp_before,
-                rsp_before,
-                block_rva_before,
-            )) = steam_hash_insert_probe_before
-            {
-                runtime.push_trace(
-                    "process",
-                    "SteamHashInsert",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva_before
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "return_rva".to_string(),
-                            json!(
-                                return_addr
-                                    .map(|v| format!(
-                                        "{:#x}",
-                                        v.saturating_sub(runtime.mapped_image_base)
-                                    ))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "frame_key".to_string(),
-                            json!(
-                                key_arg
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        ("map_this".to_string(), json!(format!("{map_this:#x}"))),
-                        ("edi_before".to_string(), json!(format!("{edi_before:#x}"))),
-                        ("ebp_before".to_string(), json!(format!("{ebp_before:#x}"))),
-                        ("esp_before".to_string(), json!(format!("{rsp_before:#x}"))),
-                    ]),
-                    json!(format!("{map_this:#x}")),
-                );
-                runtime.steam_4ae970_probe_count += 1;
+            if state.rip <= 0x19026bf1 && cached_block.end_rip > 0x19026bf1 {
+                let this_ptr = state.get(Register::Rcx) & state.arch.register_mask();
+                let first = read_guest_pointer(memory, this_ptr, guest_arch).unwrap_or(0);
+                let second = read_guest_pointer(memory, first, guest_arch).unwrap_or(0);
+                if second != 0 {
+                    let field_4c = read_u32(memory, second + 0x4c).unwrap_or(0) as u64;
+                    if read_u32(memory, second + 0x48).unwrap_or(0) as u64
+                        == u64::from(DEFAULT_ANSI_CODE_PAGE)
+                        && field_4c >= 0x1_0000
+                    {
+                        write_u32(memory, second + 0x48, field_4c as u32);
+                    }
+                }
             }
-        }
-        // All per-block diagnostic writes removed for performance.
-        let consumed_instructions = cached_block.translated.decoded.len().max(1) as u64;
-        advance_runtime_steps(
-            &mut runtime,
-            &mut steps,
-            instruction_budget,
-            consumed_instructions,
-            &memory,
-            &state,
-            test_id,
-        )?;
-        let _rip_before = state.rip;
-        let block_start_rip = cached_block.start_rip;
-        let _block_end_rip = cached_block.end_rip;
-        let continue_after_execute = match runtime.execute_ir_with_guest_exception_delivery(
-            // Note: execute already timed via t2/t3 below
-            &engine,
-            &mut state,
-            &mut memory,
-            &cached_block.translated.ir,
-            test_id,
-        ) {
-            Ok(should_continue) => should_continue,
-            Err(error) => {
-                let mut wrapped = annotate_guest_fault(error, &memory, &state);
-                let current_block_detail = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                wrapped = wrapped.with_hint(format!(
+            if runtime.enable_steam_tracing {
+                // Trace hash-table insertion probes (capped at 16 emissions).
+                if let Some((
+                    return_addr,
+                    key_arg,
+                    map_this,
+                    edi_before,
+                    ebp_before,
+                    rsp_before,
+                    block_rva_before,
+                )) = steam_hash_insert_probe_before
+                {
+                    runtime.push_trace(
+                        "process",
+                        "SteamHashInsert",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva_before
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            (
+                                "return_rva".to_string(),
+                                json!(
+                                    return_addr
+                                        .map(|v| format!(
+                                            "{:#x}",
+                                            v.saturating_sub(runtime.mapped_image_base)
+                                        ))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "frame_key".to_string(),
+                                json!(
+                                    key_arg
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            ("map_this".to_string(), json!(format!("{map_this:#x}"))),
+                            ("edi_before".to_string(), json!(format!("{edi_before:#x}"))),
+                            ("ebp_before".to_string(), json!(format!("{ebp_before:#x}"))),
+                            ("esp_before".to_string(), json!(format!("{rsp_before:#x}"))),
+                        ]),
+                        json!(format!("{map_this:#x}")),
+                    );
+                    runtime.steam_4ae970_probe_count += 1;
+                }
+            }
+            // All per-block diagnostic writes removed for performance.
+            let consumed_instructions = cached_block.translated.decoded.len().max(1) as u64;
+            advance_runtime_steps(
+                runtime,
+                &mut steps,
+                instruction_budget,
+                consumed_instructions,
+                memory,
+                state,
+                test_id,
+            )?;
+            let _rip_before = state.rip;
+            let block_start_rip = cached_block.start_rip;
+            let _block_end_rip = cached_block.end_rip;
+            let continue_after_execute = match runtime.execute_ir_with_guest_exception_delivery(
+                // Note: execute already timed via t2/t3 below
+                engine,
+                state,
+                memory,
+                &cached_block.translated.ir,
+                test_id,
+            ) {
+                Ok(should_continue) => should_continue,
+                Err(error) => {
+                    let mut wrapped = annotate_guest_fault(error, memory, state);
+                    let current_block_detail = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    wrapped = wrapped.with_hint(format!(
                     "guest-crash-context mapped_base={:#x} rip={:#x} block_start_rva={:#x} block_end_rva={:#x} decoded {}",
                     runtime.mapped_image_base,
                     state.rip,
@@ -6471,282 +6535,235 @@ pub fn execute_with_options(
                     cached_block.end_rip.saturating_sub(runtime.mapped_image_base),
                     current_block_detail,
                 ));
-                if !runtime.steam_401389_recent_blocks.is_empty() {
-                    wrapped = wrapped.with_hint(format!(
-                        "steam-401389 recent-blocks {}",
-                        runtime
-                            .steam_401389_recent_blocks
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" || ")
-                    ));
+                    if !runtime.steam_401389_recent_blocks.is_empty() {
+                        wrapped = wrapped.with_hint(format!(
+                            "steam-401389 recent-blocks {}",
+                            runtime
+                                .steam_401389_recent_blocks
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" || ")
+                        ));
+                    }
+                    if let Some(block) = runtime.steam_401389_first_over_0x1000.as_deref() {
+                        wrapped =
+                            wrapped.with_hint(format!("steam-401389 first-over-0x1000 {block}"));
+                    }
+                    if let Some(mode) = runtime.configured_narrow_argv_mode {
+                        wrapped =
+                            wrapped.with_hint(format!("crt-configure-narrow-argv mode={mode:#x}"));
+                    }
+                    if !runtime.module_paths_by_handle.is_empty() {
+                        wrapped = wrapped.with_hint(format!(
+                            "loaded-modules {}",
+                            runtime
+                                .module_paths_by_handle
+                                .iter()
+                                .map(|(handle, path)| format!("{handle:#x}={path}"))
+                                .collect::<Vec<_>>()
+                                .join(" || ")
+                        ));
+                    }
+                    if !runtime.steam_565af0_recent_blocks.is_empty() {
+                        wrapped = wrapped.with_hint(format!(
+                            "steam-565af0 recent-blocks {}",
+                            runtime
+                                .steam_565af0_recent_blocks
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" || ")
+                        ));
+                    }
+                    return Err(wrapped);
                 }
-                if let Some(block) = runtime.steam_401389_first_over_0x1000.as_deref() {
-                    wrapped = wrapped.with_hint(format!("steam-401389 first-over-0x1000 {block}"));
-                }
-                if let Some(mode) = runtime.configured_narrow_argv_mode {
-                    wrapped =
-                        wrapped.with_hint(format!("crt-configure-narrow-argv mode={mode:#x}"));
-                }
-                if !runtime.module_paths_by_handle.is_empty() {
-                    wrapped = wrapped.with_hint(format!(
-                        "loaded-modules {}",
-                        runtime
-                            .module_paths_by_handle
-                            .iter()
-                            .map(|(handle, path)| format!("{handle:#x}={path}"))
-                            .collect::<Vec<_>>()
-                            .join(" || ")
-                    ));
-                }
-                if !runtime.steam_565af0_recent_blocks.is_empty() {
-                    wrapped = wrapped.with_hint(format!(
-                        "steam-565af0 recent-blocks {}",
-                        runtime
-                            .steam_565af0_recent_blocks
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" || ")
-                    ));
-                }
-                return Err(wrapped);
-            }
-        };
+            };
 
-        // JIT is disabled — skip adaptive tiered compilation entirely.
+            // JIT is disabled — skip adaptive tiered compilation entirely.
 
-        if runtime.enable_steam_tracing {
-            if let Some(block_label) = steam_convar_precise_watch {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let steam_convar_precise_vector_after = steam_convar_precise_this_before
-                    .and_then(|this_ptr| this_ptr.checked_add(0x84))
-                    .and_then(|vector_ptr| read_window(&memory, vector_ptr, 0x14).ok())
-                    .map(|bytes| decode_steam_convar_vector_fields(&bytes));
-                let steam_convar_precise_field_94_after = steam_convar_precise_this_before
-                    .and_then(|this_ptr| {
-                        read_guest_u32(&memory, this_ptr + 0x94).ok().map(u64::from)
-                    });
-                runtime.push_trace(
-                    "process",
-                    "SteamConVarVectorState",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!(block_label)),
-                        (
-                            "this_ptr".to_string(),
-                            json!(
-                                steam_convar_precise_this_before.map(|value| format!("{value:#x}"))
+            if runtime.enable_steam_tracing {
+                if let Some(block_label) = steam_convar_precise_watch {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let steam_convar_precise_vector_after = steam_convar_precise_this_before
+                        .and_then(|this_ptr| this_ptr.checked_add(0x84))
+                        .and_then(|vector_ptr| read_window(memory, vector_ptr, 0x14).ok())
+                        .map(|bytes| decode_steam_convar_vector_fields(&bytes));
+                    let steam_convar_precise_field_94_after = steam_convar_precise_this_before
+                        .and_then(|this_ptr| {
+                            read_guest_u32(memory, this_ptr + 0x94).ok().map(u64::from)
+                        });
+                    runtime.push_trace(
+                        "process",
+                        "SteamConVarVectorState",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!(block_label)),
+                            (
+                                "this_ptr".to_string(),
+                                json!(
+                                    steam_convar_precise_this_before
+                                        .map(|value| format!("{value:#x}"))
+                                ),
                             ),
-                        ),
-                        (
-                            "field_0x94_before".to_string(),
-                            json!(
-                                steam_convar_precise_field_94_before
-                                    .map(|value| format!("{value:#x}"))
+                            (
+                                "field_0x94_before".to_string(),
+                                json!(
+                                    steam_convar_precise_field_94_before
+                                        .map(|value| format!("{value:#x}"))
+                                ),
                             ),
-                        ),
-                        (
-                            "field_0x94_after".to_string(),
-                            json!(
-                                steam_convar_precise_field_94_after
-                                    .map(|value| format!("{value:#x}"))
+                            (
+                                "field_0x94_after".to_string(),
+                                json!(
+                                    steam_convar_precise_field_94_after
+                                        .map(|value| format!("{value:#x}"))
+                                ),
                             ),
-                        ),
-                        (
-                            "vector_before".to_string(),
-                            json!(steam_convar_precise_vector_before),
-                        ),
-                        (
-                            "vector_after".to_string(),
-                            json!(steam_convar_precise_vector_after),
-                        ),
-                        (
-                            "recent_main_block_rvas".to_string(),
-                            json!(
-                                runtime
-                                    .recent_main_block_rvas
-                                    .iter()
-                                    .map(|value| format!("{value:#x}"))
-                                    .collect::<Vec<_>>()
+                            (
+                                "vector_before".to_string(),
+                                json!(steam_convar_precise_vector_before),
                             ),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            // Track writes to Steam's global state variables (0x45715c, 0x457620,
-            // 0x457624, 0x457628, 0x42a270).  Emit a trace event when a value changes.
-            if let Some(steam_global_state_before) = steam_global_state_before {
-                for (address, before_value) in steam_global_state_before {
-                    let after_value = probe_read_guest_u32(&memory, address);
-                    if after_value != before_value {
-                        runtime.push_trace(
-                            "process",
-                            "SteamGlobalWrite",
-                            BTreeMap::from([
-                                (
-                                    "block_rva".to_string(),
-                                    json!(
-                                        block_rva
-                                            .map(|v| format!("{v:#x}"))
-                                            .unwrap_or_else(|| "<non-main>".to_string())
+                            (
+                                "vector_after".to_string(),
+                                json!(steam_convar_precise_vector_after),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                // Track writes to Steam's global state variables (0x45715c, 0x457620,
+                // 0x457624, 0x457628, 0x42a270).  Emit a trace event when a value changes.
+                if let Some(steam_global_state_before) = steam_global_state_before {
+                    for (address, before_value) in steam_global_state_before {
+                        let after_value = probe_read_guest_u32(memory, address);
+                        if after_value != before_value {
+                            runtime.push_trace(
+                                "process",
+                                "SteamGlobalWrite",
+                                BTreeMap::from([
+                                    (
+                                        "block_rva".to_string(),
+                                        json!(
+                                            block_rva
+                                                .map(|v| format!("{v:#x}"))
+                                                .unwrap_or_else(|| "<non-main>".to_string())
+                                        ),
                                     ),
-                                ),
-                                (
-                                    "address_rva".to_string(),
-                                    json!(format!(
-                                        "{:#x}",
-                                        address.saturating_sub(runtime.mapped_image_base)
-                                    )),
-                                ),
-                                (
-                                    "before".to_string(),
-                                    json!(
-                                        before_value
-                                            .map(|v| format!("{v:#x}"))
-                                            .unwrap_or_else(|| "<unmapped>".to_string())
+                                    (
+                                        "address_rva".to_string(),
+                                        json!(format!(
+                                            "{:#x}",
+                                            address.saturating_sub(runtime.mapped_image_base)
+                                        )),
                                     ),
-                                ),
-                                (
-                                    "after".to_string(),
-                                    json!(
-                                        after_value
-                                            .map(|v| format!("{v:#x}"))
-                                            .unwrap_or_else(|| "<unmapped>".to_string())
+                                    (
+                                        "before".to_string(),
+                                        json!(
+                                            before_value
+                                                .map(|v| format!("{v:#x}"))
+                                                .unwrap_or_else(|| "<unmapped>".to_string())
+                                        ),
                                     ),
-                                ),
-                                (
-                                    "rip_after_rva".to_string(),
-                                    json!(format!(
-                                        "{:#x}",
-                                        state.rip.saturating_sub(runtime.mapped_image_base)
-                                    )),
-                                ),
-                            ]),
-                            json!(after_value.unwrap_or(0)),
-                        );
+                                    (
+                                        "after".to_string(),
+                                        json!(
+                                            after_value
+                                                .map(|v| format!("{v:#x}"))
+                                                .unwrap_or_else(|| "<unmapped>".to_string())
+                                        ),
+                                    ),
+                                    (
+                                        "rip_after_rva".to_string(),
+                                        json!(format!(
+                                            "{:#x}",
+                                            state.rip.saturating_sub(runtime.mapped_image_base)
+                                        )),
+                                    ),
+                                ]),
+                                json!(after_value.unwrap_or(0)),
+                            );
+                        }
                     }
                 }
             }
-        }
-        if continue_after_execute {
-            continue;
-        }
-        if runtime.enable_steam_tracing {
-            if let Some(final_assert_globals_before) = final_assert_globals_before {
-                for (address, before_value) in final_assert_globals_before {
-                    let after_value = probe_read_guest_u32(&memory, address);
-                    if after_value != before_value {
-                        let stack_return_addr =
-                            probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from);
-                        let decoded_instructions = cached_block
-                            .translated
-                            .decoded
-                            .iter()
-                            .map(|instruction| {
-                                format!(
-                                    "{:#x}:{:?} {:?}",
-                                    instruction
-                                        .address
-                                        .saturating_sub(runtime.mapped_image_base),
-                                    instruction.opcode,
-                                    instruction.operands
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" | ");
-                        let history_entry = format!(
-                            "addr={:#x} block_rva={} return_rva={} before={} after={} decoded=[{}]",
-                            address.saturating_sub(runtime.mapped_image_base),
-                            block_rva
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<non-main>".to_string()),
-                            stack_return_addr
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<unavailable>".to_string()),
-                            before_value
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<unmapped>".to_string()),
-                            after_value
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<unmapped>".to_string()),
-                            decoded_instructions,
-                        );
-                        if runtime.steam_final_assert_global_history.len() == 20 {
-                            runtime.steam_final_assert_global_history.pop_front();
-                        }
-                        runtime
-                            .steam_final_assert_global_history
-                            .push_back(history_entry);
-                        runtime.push_trace(
-                            "process",
-                            "SteamFinalAssertGlobalWrite",
-                            BTreeMap::from([
-                                (
-                                    "address".to_string(),
-                                    json!(format!(
-                                        "{:#x}",
-                                        address.saturating_sub(runtime.mapped_image_base)
-                                    )),
-                                ),
-                                (
-                                    "block_rva".to_string(),
-                                    json!(
-                                        block_rva
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<non-main>".to_string())
-                                    ),
-                                ),
-                                ("return_rva".to_string(), json!(stack_return_addr)),
-                                (
-                                    "before".to_string(),
-                                    json!(
-                                        before_value
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<unmapped>".to_string())
-                                    ),
-                                ),
-                                (
-                                    "after".to_string(),
-                                    json!(
-                                        after_value
-                                            .map(|value| format!("{value:#x}"))
-                                            .unwrap_or_else(|| "<unmapped>".to_string())
-                                    ),
-                                ),
-                                (
-                                    "recent_main_block_rvas".to_string(),
-                                    json!(
-                                        runtime
-                                            .recent_main_block_rvas
-                                            .iter()
-                                            .map(|value| format!("{value:#x}"))
-                                            .collect::<Vec<_>>()
-                                    ),
-                                ),
-                            ]),
-                            json!(decoded_instructions),
-                        );
-                        if after_value == Some(0x8000_000d) {
+            if continue_after_execute {
+                continue;
+            }
+            if runtime.enable_steam_tracing {
+                if let Some(final_assert_globals_before) = final_assert_globals_before {
+                    for (address, before_value) in final_assert_globals_before {
+                        let after_value = probe_read_guest_u32(memory, address);
+                        if after_value != before_value {
+                            let stack_return_addr =
+                                probe_read_guest_u32(memory, state.get(Register::Rsp))
+                                    .map(u64::from);
+                            let decoded_instructions = cached_block
+                                .translated
+                                .decoded
+                                .iter()
+                                .map(|instruction| {
+                                    format!(
+                                        "{:#x}:{:?} {:?}",
+                                        instruction
+                                            .address
+                                            .saturating_sub(runtime.mapped_image_base),
+                                        instruction.opcode,
+                                        instruction.operands
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            let history_entry = format!(
+                                "addr={:#x} block_rva={} return_rva={} before={} after={} decoded=[{}]",
+                                address.saturating_sub(runtime.mapped_image_base),
+                                block_rva
+                                    .map(|value| format!("{value:#x}"))
+                                    .unwrap_or_else(|| "<non-main>".to_string()),
+                                stack_return_addr
+                                    .map(|value| format!("{value:#x}"))
+                                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                                before_value
+                                    .map(|value| format!("{value:#x}"))
+                                    .unwrap_or_else(|| "<unmapped>".to_string()),
+                                after_value
+                                    .map(|value| format!("{value:#x}"))
+                                    .unwrap_or_else(|| "<unmapped>".to_string()),
+                                decoded_instructions,
+                            );
+                            if runtime.steam_final_assert_global_history.len() == 20 {
+                                runtime.steam_final_assert_global_history.pop_front();
+                            }
+                            runtime
+                                .steam_final_assert_global_history
+                                .push_back(history_entry);
                             runtime.push_trace(
                                 "process",
-                                "SteamFinalStatusCode",
+                                "SteamFinalAssertGlobalWrite",
                                 BTreeMap::from([
                                     (
                                         "address".to_string(),
@@ -6793,782 +6810,441 @@ pub fn execute_with_options(
                                 ]),
                                 json!(decoded_instructions),
                             );
+                            if after_value == Some(0x8000_000d) {
+                                runtime.push_trace(
+                                    "process",
+                                    "SteamFinalStatusCode",
+                                    BTreeMap::from([
+                                        (
+                                            "address".to_string(),
+                                            json!(format!(
+                                                "{:#x}",
+                                                address.saturating_sub(runtime.mapped_image_base)
+                                            )),
+                                        ),
+                                        (
+                                            "block_rva".to_string(),
+                                            json!(
+                                                block_rva
+                                                    .map(|value| format!("{value:#x}"))
+                                                    .unwrap_or_else(|| "<non-main>".to_string())
+                                            ),
+                                        ),
+                                        ("return_rva".to_string(), json!(stack_return_addr)),
+                                        (
+                                            "before".to_string(),
+                                            json!(
+                                                before_value
+                                                    .map(|value| format!("{value:#x}"))
+                                                    .unwrap_or_else(|| "<unmapped>".to_string())
+                                            ),
+                                        ),
+                                        (
+                                            "after".to_string(),
+                                            json!(
+                                                after_value
+                                                    .map(|value| format!("{value:#x}"))
+                                                    .unwrap_or_else(|| "<unmapped>".to_string())
+                                            ),
+                                        ),
+                                        (
+                                            "recent_main_block_rvas".to_string(),
+                                            json!(
+                                                runtime
+                                                    .recent_main_block_rvas
+                                                    .iter()
+                                                    .map(|value| format!("{value:#x}"))
+                                                    .collect::<Vec<_>>()
+                                            ),
+                                        ),
+                                    ]),
+                                    json!(decoded_instructions),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            if trace_steam_136b50_entry {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                runtime.push_trace(
-                    "process",
-                    "SteamLateGate136b50Entry",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!("0x136b50")),
-                        (
-                            "arg0".to_string(),
-                            json!(format_opt(steam_136b50_arg0_before)),
-                        ),
-                        (
-                            "arg1".to_string(),
-                            json!(format_opt(steam_136b50_arg1_before)),
-                        ),
-                        (
-                            "global_0x423fbc_before".to_string(),
-                            json!(format_opt(steam_136b50_global_423fbc_before)),
-                        ),
-                        (
-                            "global_0x423fb8_before".to_string(),
-                            json!(format_opt(steam_136b50_global_423fb8_before)),
-                        ),
-                        (
-                            "global_0x423a30_before".to_string(),
-                            json!(format_opt(steam_136b50_global_423a30_before)),
-                        ),
-                        (
-                            "global_0x423a38_before".to_string(),
-                            json!(format_opt(steam_136b50_global_423a38_before)),
-                        ),
-                        (
-                            "eax_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "rip_after".to_string(),
-                            json!(format!(
-                                "{:#x}",
-                                state.rip.saturating_sub(runtime.mapped_image_base)
-                            )),
-                        ),
-                        (
-                            "recent_main_block_rvas".to_string(),
-                            json!(
-                                runtime
-                                    .recent_main_block_rvas
-                                    .iter()
-                                    .map(|value| format!("{value:#x}"))
-                                    .collect::<Vec<_>>()
-                            ),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if trace_steam_136e80_entry {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let args_before =
-                    steam_136e80_args_before.unwrap_or([None, None, None, None, None]);
-                runtime.push_trace(
-                    "process",
-                    "SteamLateGate136e80Entry",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!("0x136e80")),
-                        ("arg0".to_string(), json!(format_opt(args_before[0]))),
-                        ("arg1".to_string(), json!(format_opt(args_before[1]))),
-                        ("arg2".to_string(), json!(format_opt(args_before[2]))),
-                        ("arg3".to_string(), json!(format_opt(args_before[3]))),
-                        ("arg4".to_string(), json!(format_opt(args_before[4]))),
-                        (
-                            "global_0x423e4c_before".to_string(),
-                            json!(format_opt(steam_136e80_global_423e4c_before)),
-                        ),
-                        (
-                            "global_0x423e6c_before".to_string(),
-                            json!(format_opt(steam_136e80_global_423e6c_before)),
-                        ),
-                        (
-                            "tls_index_before".to_string(),
-                            json!(format_opt(steam_136e80_tls_index_before)),
-                        ),
-                        (
-                            "tls_vector_before".to_string(),
-                            json!(format_opt(steam_136e80_tls_vector_before)),
-                        ),
-                        (
-                            "tls_slot_before".to_string(),
-                            json!(format_opt(steam_136e80_tls_slot_before)),
-                        ),
-                        (
-                            "tls_slot_plus_0x480_before".to_string(),
-                            json!(format_opt(steam_136e80_tls_slot_480_before)),
-                        ),
-                        (
-                            "eax_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "rip_after".to_string(),
-                            json!(format!(
-                                "{:#x}",
-                                state.rip.saturating_sub(runtime.mapped_image_base)
-                            )),
-                        ),
-                        (
-                            "recent_main_block_rvas".to_string(),
-                            json!(
-                                runtime
-                                    .recent_main_block_rvas
-                                    .iter()
-                                    .map(|value| format!("{value:#x}"))
-                                    .collect::<Vec<_>>()
-                            ),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if trace_steam_memstd_oom_entry {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                runtime.push_trace(
-                    "process",
-                    "SteamMemstdOomEntry",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!("0x134bd0")),
-                        (
-                            "caller_rva".to_string(),
-                            json!(
-                                steam_memstd_oom_return_rva_before
-                                    .map(|value| format!("{value:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "requested_size".to_string(),
-                            json!(format_opt(steam_memstd_oom_size_before)),
-                        ),
-                        (
-                            "this_ptr".to_string(),
-                            json!(format_opt(steam_memstd_oom_this_before)),
-                        ),
-                        (
-                            "eax_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "rip_after".to_string(),
-                            json!(format!(
-                                "{:#x}",
-                                state.rip.saturating_sub(runtime.mapped_image_base)
-                            )),
-                        ),
-                        (
-                            "recent_main_block_rvas".to_string(),
-                            json!(
-                                runtime
-                                    .recent_main_block_rvas
-                                    .iter()
-                                    .map(|value| format!("{value:#x}"))
-                                    .collect::<Vec<_>>()
-                            ),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if trace_steam_memstd_oom_caller {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                runtime.push_trace(
-                    "process",
-                    "SteamMemstdOomCaller",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!("0x134b56")),
-                        (
-                            "this_ptr".to_string(),
-                            json!(format_opt(steam_memstd_caller_this_before)),
-                        ),
-                        (
-                            "old_address".to_string(),
-                            json!(format_opt(steam_memstd_caller_old_address_before)),
-                        ),
-                        (
-                            "requested_size".to_string(),
-                            json!(format_opt(steam_memstd_caller_requested_size_before)),
-                        ),
-                        (
-                            "mode".to_string(),
-                            json!(format_opt(steam_memstd_caller_mode_before)),
-                        ),
-                        (
-                            "range1_table".to_string(),
-                            json!(format_opt(steam_memstd_caller_range1_table_before)),
-                        ),
-                        (
-                            "range2_table".to_string(),
-                            json!(format_opt(steam_memstd_caller_range2_table_before)),
-                        ),
-                        (
-                            "recent_main_block_rvas".to_string(),
-                            json!(
-                                runtime
-                                    .recent_main_block_rvas
-                                    .iter()
-                                    .map(|value| format!("{value:#x}"))
-                                    .collect::<Vec<_>>()
-                            ),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if steam_global_array_watch {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let steam_global_array_count_after =
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624)
-                        .map(u64::from);
-                let steam_global_array_ptr_after =
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628)
-                        .map(u64::from);
-                // The push_trace below already captures the full lifecycle data.
-                runtime.push_trace(
-                    "process",
-                    "SteamGlobalArrayLifecycle",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva
-                                    .map(|value| format!("{value:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "return_rva".to_string(),
-                            json!(
-                                steam_global_array_return_before
-                                    .map(|value| format!("{value:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "count_before".to_string(),
-                            json!(format_opt(steam_global_array_count_before)),
-                        ),
-                        (
-                            "ptr_before".to_string(),
-                            json!(format_opt(steam_global_array_ptr_before)),
-                        ),
-                        (
-                            "count_after".to_string(),
-                            json!(format_opt(steam_global_array_count_after)),
-                        ),
-                        (
-                            "ptr_after".to_string(),
-                            json!(format_opt(steam_global_array_ptr_after)),
-                        ),
-                        (
-                            "eax_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "esi_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsi))),
-                        ),
-                        (
-                            "edi_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rdi))),
-                        ),
-                        (
-                            "esp_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsp))),
-                        ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if steam_early_termination_watch {
-                runtime.push_trace(
-                    "process",
-                    "SteamEarlyTermination",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "return_rva".to_string(),
-                            json!(
-                                steam_early_termination_return_before
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "eax".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "ebx".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rbx))),
-                        ),
-                        (
-                            "esi".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsi))),
-                        ),
-                        (
-                            "edi".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rdi))),
-                        ),
-                        (
-                            "esp".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsp))),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax)),
-                );
-            }
-            if steam_initterm_e_watch {
-                runtime.push_trace(
-                    "process",
-                    "SteamInittermE",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "start".to_string(),
-                            json!(
-                                steam_initterm_e_start_before
-                                    .map(|v| format!(
-                                        "{:#x}",
-                                        v.saturating_sub(runtime.mapped_image_base)
-                                    ))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "end".to_string(),
-                            json!(
-                                steam_initterm_e_end_before
-                                    .map(|v| format!(
-                                        "{:#x}",
-                                        v.saturating_sub(runtime.mapped_image_base)
-                                    ))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "esi".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsi))),
-                        ),
-                        (
-                            "edi".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rdi))),
-                        ),
-                        (
-                            "eax".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax)),
-                );
-            }
-            if steam_startup_init_watch {
-                runtime.push_trace(
-                    "process",
-                    "SteamStartupInit",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "eax".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "ecx".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rcx))),
-                        ),
-                        (
-                            "state_0x45715c".to_string(),
-                            json!(
-                                probe_read_guest_u32(
-                                    &memory,
-                                    runtime.mapped_image_base + 0x0045_715c
-                                )
-                                .map(|v| format!("{v:#x}"))
-                                .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "esp".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsp))),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax)),
-                );
-            }
-            if steam_startup_failure_watch {
-                runtime.push_trace(
-                    "process",
-                    "SteamStartupFailure",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        (
-                            "eax".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        (
-                            "esi".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsi))),
-                        ),
-                        (
-                            "state_0x45715c".to_string(),
-                            json!(
-                                probe_read_guest_u32(
-                                    &memory,
-                                    runtime.mapped_image_base + 0x0045_715c
-                                )
-                                .map(|v| format!("{v:#x}"))
-                                .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "esp".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsp))),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax)),
-                );
-            }
-            if let Some((block_rva_before, counter_before, rsp_before, eax_before, ecx_before)) =
-                steam_owner_allocator_probe_before
-            {
-                let counter_before_str = counter_before
-                    .map(|value| format!("{value:#x}"))
-                    .unwrap_or_else(|| "<unavailable>".to_string());
-                let counter_after_str =
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_873c)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string());
-                runtime.push_trace(
-                    "process",
-                    "SteamOwnerAllocator",
-                    BTreeMap::from([
-                        (
-                            "block_rva".to_string(),
-                            json!(
-                                block_rva_before
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<non-main>".to_string())
-                            ),
-                        ),
-                        ("counter_before".to_string(), json!(counter_before_str)),
-                        ("counter_after".to_string(), json!(counter_after_str)),
-                        ("eax_before".to_string(), json!(format!("{eax_before:#x}"))),
-                        (
-                            "eax_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax))),
-                        ),
-                        ("ecx_before".to_string(), json!(format!("{ecx_before:#x}"))),
-                        (
-                            "ecx_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rcx))),
-                        ),
-                        ("esp_before".to_string(), json!(format!("{rsp_before:#x}"))),
-                        (
-                            "esp_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rsp))),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax)),
-                );
-                runtime.steam_owner_allocator_probe_count += 1;
-            }
-            if let Some((entry, callback, unwind)) = steam_callback_walk_entry_before {
-                let get_process_heap_slot = runtime.mapped_image_base + 0x002e_230c;
-                let get_process_heap_target =
-                    if callback == Some(runtime.mapped_image_base + 0x0016_b18c) {
-                        read_guest_pointer(&memory, get_process_heap_slot, runtime.guest_arch).ok()
-                    } else {
-                        None
+                if trace_steam_136b50_entry {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
                     };
-                let get_process_heap_binding = get_process_heap_target.and_then(|target| {
-                    runtime
-                        .host_thunks
-                        .get(&target)
-                        .map(|thunk| format!("{thunk:?}"))
-                });
-                runtime.push_trace(
-                    "process",
-                    "SteamCallbackWalk",
-                    BTreeMap::from([
-                        ("entry".to_string(), json!(format!("{entry:#x}"))),
-                        (
-                            "callback".to_string(),
-                            json!(
-                                callback
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "unwind".to_string(),
-                            json!(
-                                unwind
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            ),
-                        ),
-                        (
-                            "al_after".to_string(),
-                            json!(format!("{:#x}", state.get(Register::Rax) & 0xff)),
-                        ),
-                        (
-                            "next_rva".to_string(),
-                            json!(format!(
-                                "{:#x}",
-                                state.rip.saturating_sub(runtime.mapped_image_base)
-                            )),
-                        ),
-                        (
-                            "get_process_heap_target".to_string(),
-                            json!(
-                                get_process_heap_target
-                                    .map(|v| format!("{v:#x}"))
-                                    .unwrap_or_else(|| "<n/a>".to_string())
-                            ),
-                        ),
-                        (
-                            "get_process_heap_binding".to_string(),
-                            json!(get_process_heap_binding.unwrap_or_else(|| "<n/a>".to_string())),
-                        ),
-                    ]),
-                    json!(state.get(Register::Rax) & 0xff),
-                );
-            }
-            if steam_post_577113_watch {
-                let decoded_detail: Vec<String> = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|inst| {
-                        let rva = inst.address.saturating_sub(runtime.mapped_image_base);
-                        format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
-                    })
-                    .collect();
-                emit_live_ui_debug(format!(
-                    "steam-post-577113 block_rva={} eax={:#x} esi={:#x} edi={:#x} arg_obj={} heap_handle={} rsp={:#x} decoded=[{}]",
-                    block_rva
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<non-main>".to_string()),
-                    state.get(Register::Rax),
-                    state.get(Register::Rsi),
-                    state.get(Register::Rdi),
-                    probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7664)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    state.get(Register::Rsp),
-                    decoded_detail.join(" | "),
-                ));
-            }
-            if steam_post_56ee10_watch {
-                let decoded_detail: Vec<String> = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|inst| {
-                        let rva = inst.address.saturating_sub(runtime.mapped_image_base);
-                        format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
-                    })
-                    .collect();
-                emit_live_ui_debug(format!(
-                    "steam-post-56ee10 eax={:#x} edi={:#x} esi={:#x} ebx={:#x} heap_handle={} rsp={:#x} decoded=[{}]",
-                    state.get(Register::Rax),
-                    state.get(Register::Rdi),
-                    state.get(Register::Rsi),
-                    state.get(Register::Rbx),
-                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7664)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    state.get(Register::Rsp),
-                    decoded_detail.join(" | "),
-                ));
-            }
-            if steam_post_576ca8_watch || steam_post_576d7e_watch {
-                let decoded_detail: Vec<String> = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|inst| {
-                        let rva = inst.address.saturating_sub(runtime.mapped_image_base);
-                        format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
-                    })
-                    .collect();
-                emit_live_ui_debug(format!(
-                    "steam-post-helper block_rva={} rsp={:#x} stack0={} stack1={} stack2={} edi={:#x} esi={:#x} ebx={:#x} decoded=[{}]",
-                    block_rva
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<non-main>".to_string()),
-                    state.get(Register::Rsp),
-                    probe_read_guest_u32(&memory, state.get(Register::Rsp))
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8)
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    state.get(Register::Rdi),
-                    state.get(Register::Rsi),
-                    state.get(Register::Rbx),
-                    decoded_detail.join(" | "),
-                ));
-            }
-            if let Some((rsp_before, stack0, stack1, stack2, stack3, edi_before, esi_before)) =
-                steam_577113_epilogue_before
-            {
-                emit_live_ui_debug(format!(
-                    "steam-577113-epilogue rsp_before={:#x} stack0={} stack1={} stack2={} stack3={} edi_before={:#x} esi_before={:#x} rsp_after={:#x} edi_after={:#x} esi_after={:#x}",
-                    rsp_before,
-                    stack0
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    stack1
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    stack2
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    stack3
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string()),
-                    edi_before,
-                    esi_before,
-                    state.get(Register::Rsp),
-                    state.get(Register::Rdi),
-                    state.get(Register::Rsi),
-                ));
-            }
-            if let Some(saved_edi_before) = steam_saved_edi_slot_before {
-                let saved_edi_after = probe_read_guest_u32(&memory, 0x7000_ff1c).map(u64::from);
-                if saved_edi_after != Some(saved_edi_before) {
                     runtime.push_trace(
                         "process",
-                        "SteamSavedEdiSlotWrite",
+                        "SteamLateGate136b50Entry",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!("0x136b50")),
+                            (
+                                "arg0".to_string(),
+                                json!(format_opt(steam_136b50_arg0_before)),
+                            ),
+                            (
+                                "arg1".to_string(),
+                                json!(format_opt(steam_136b50_arg1_before)),
+                            ),
+                            (
+                                "global_0x423fbc_before".to_string(),
+                                json!(format_opt(steam_136b50_global_423fbc_before)),
+                            ),
+                            (
+                                "global_0x423fb8_before".to_string(),
+                                json!(format_opt(steam_136b50_global_423fb8_before)),
+                            ),
+                            (
+                                "global_0x423a30_before".to_string(),
+                                json!(format_opt(steam_136b50_global_423a30_before)),
+                            ),
+                            (
+                                "global_0x423a38_before".to_string(),
+                                json!(format_opt(steam_136b50_global_423a38_before)),
+                            ),
+                            (
+                                "eax_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "rip_after".to_string(),
+                                json!(format!(
+                                    "{:#x}",
+                                    state.rip.saturating_sub(runtime.mapped_image_base)
+                                )),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if trace_steam_136e80_entry {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let args_before =
+                        steam_136e80_args_before.unwrap_or([None, None, None, None, None]);
+                    runtime.push_trace(
+                        "process",
+                        "SteamLateGate136e80Entry",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!("0x136e80")),
+                            ("arg0".to_string(), json!(format_opt(args_before[0]))),
+                            ("arg1".to_string(), json!(format_opt(args_before[1]))),
+                            ("arg2".to_string(), json!(format_opt(args_before[2]))),
+                            ("arg3".to_string(), json!(format_opt(args_before[3]))),
+                            ("arg4".to_string(), json!(format_opt(args_before[4]))),
+                            (
+                                "global_0x423e4c_before".to_string(),
+                                json!(format_opt(steam_136e80_global_423e4c_before)),
+                            ),
+                            (
+                                "global_0x423e6c_before".to_string(),
+                                json!(format_opt(steam_136e80_global_423e6c_before)),
+                            ),
+                            (
+                                "tls_index_before".to_string(),
+                                json!(format_opt(steam_136e80_tls_index_before)),
+                            ),
+                            (
+                                "tls_vector_before".to_string(),
+                                json!(format_opt(steam_136e80_tls_vector_before)),
+                            ),
+                            (
+                                "tls_slot_before".to_string(),
+                                json!(format_opt(steam_136e80_tls_slot_before)),
+                            ),
+                            (
+                                "tls_slot_plus_0x480_before".to_string(),
+                                json!(format_opt(steam_136e80_tls_slot_480_before)),
+                            ),
+                            (
+                                "eax_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "rip_after".to_string(),
+                                json!(format!(
+                                    "{:#x}",
+                                    state.rip.saturating_sub(runtime.mapped_image_base)
+                                )),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if trace_steam_memstd_oom_entry {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    runtime.push_trace(
+                        "process",
+                        "SteamMemstdOomEntry",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!("0x134bd0")),
+                            (
+                                "caller_rva".to_string(),
+                                json!(
+                                    steam_memstd_oom_return_rva_before
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "requested_size".to_string(),
+                                json!(format_opt(steam_memstd_oom_size_before)),
+                            ),
+                            (
+                                "this_ptr".to_string(),
+                                json!(format_opt(steam_memstd_oom_this_before)),
+                            ),
+                            (
+                                "eax_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "rip_after".to_string(),
+                                json!(format!(
+                                    "{:#x}",
+                                    state.rip.saturating_sub(runtime.mapped_image_base)
+                                )),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if trace_steam_memstd_oom_caller {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    runtime.push_trace(
+                        "process",
+                        "SteamMemstdOomCaller",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!("0x134b56")),
+                            (
+                                "this_ptr".to_string(),
+                                json!(format_opt(steam_memstd_caller_this_before)),
+                            ),
+                            (
+                                "old_address".to_string(),
+                                json!(format_opt(steam_memstd_caller_old_address_before)),
+                            ),
+                            (
+                                "requested_size".to_string(),
+                                json!(format_opt(steam_memstd_caller_requested_size_before)),
+                            ),
+                            (
+                                "mode".to_string(),
+                                json!(format_opt(steam_memstd_caller_mode_before)),
+                            ),
+                            (
+                                "range1_table".to_string(),
+                                json!(format_opt(steam_memstd_caller_range1_table_before)),
+                            ),
+                            (
+                                "range2_table".to_string(),
+                                json!(format_opt(steam_memstd_caller_range2_table_before)),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if steam_global_array_watch {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let steam_global_array_count_after =
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7624)
+                            .map(u64::from);
+                    let steam_global_array_ptr_after =
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7628)
+                            .map(u64::from);
+                    // The push_trace below already captures the full lifecycle data.
+                    runtime.push_trace(
+                        "process",
+                        "SteamGlobalArrayLifecycle",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            (
+                                "return_rva".to_string(),
+                                json!(
+                                    steam_global_array_return_before
+                                        .map(|value| format!("{value:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "count_before".to_string(),
+                                json!(format_opt(steam_global_array_count_before)),
+                            ),
+                            (
+                                "ptr_before".to_string(),
+                                json!(format_opt(steam_global_array_ptr_before)),
+                            ),
+                            (
+                                "count_after".to_string(),
+                                json!(format_opt(steam_global_array_count_after)),
+                            ),
+                            (
+                                "ptr_after".to_string(),
+                                json!(format_opt(steam_global_array_ptr_after)),
+                            ),
+                            (
+                                "eax_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "esi_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsi))),
+                            ),
+                            (
+                                "edi_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rdi))),
+                            ),
+                            (
+                                "esp_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if steam_early_termination_watch {
+                    runtime.push_trace(
+                        "process",
+                        "SteamEarlyTermination",
                         BTreeMap::from([
                             (
                                 "block_rva".to_string(),
@@ -7579,534 +7255,538 @@ pub fn execute_with_options(
                                 ),
                             ),
                             (
-                                "before".to_string(),
-                                json!(format!("{saved_edi_before:#x}")),
-                            ),
-                            (
-                                "after".to_string(),
+                                "return_rva".to_string(),
                                 json!(
-                                    saved_edi_after
+                                    steam_early_termination_return_before
                                         .map(|v| format!("{v:#x}"))
                                         .unwrap_or_else(|| "<unavailable>".to_string())
                                 ),
                             ),
                             (
-                                "rsp".to_string(),
-                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                                "eax".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
                             ),
                             (
-                                "rbp".to_string(),
-                                json!(format!("{:#x}", state.get(Register::Rbp))),
+                                "ebx".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rbx))),
+                            ),
+                            (
+                                "esi".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsi))),
+                            ),
+                            (
+                                "edi".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rdi))),
+                            ),
+                            (
+                                "esp".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
                             ),
                         ]),
-                        json!(saved_edi_before),
+                        json!(state.get(Register::Rax)),
                     );
                 }
-            }
-            if trace_steam_convar_create || trace_steam_convar_create_start {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let read_c_string_opt = |ptr: Option<u64>| {
-                    ptr.and_then(|ptr| {
-                        if ptr == 0 {
-                            Some(String::new())
-                        } else {
-                            read_c_string(&memory, ptr).ok()
-                        }
-                    })
-                    .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let vector_fields = steam_convar_vector_bytes_before.map(|bytes| {
-                    let read_u32_at = |offset: usize| -> u64 {
-                        u64::from(u32::from_le_bytes(
-                            bytes[offset..offset + 4].try_into().unwrap(),
-                        ))
-                    };
-                    BTreeMap::from([
-                        (
-                            "element_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(0))),
-                        ),
-                        (
-                            "memory_ptr".to_string(),
-                            json!(format!("{:#x}", read_u32_at(4))),
-                        ),
-                        (
-                            "allocation_count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(8))),
-                        ),
-                        (
-                            "grow_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(12))),
-                        ),
-                        (
-                            "count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(16))),
-                        ),
-                    ])
-                });
-                let mut parameters = BTreeMap::from([
-                    (
-                        "block_rva".to_string(),
-                        json!(if trace_steam_convar_create_start {
-                            "0xcc400"
-                        } else {
-                            "0xcc542"
-                        }),
-                    ),
-                    (
-                        "this_ptr".to_string(),
-                        json!(format_opt(steam_convar_this_before)),
-                    ),
-                    (
-                        "frame_ptr".to_string(),
-                        json!(format_opt(steam_convar_frame_before)),
-                    ),
-                    (
-                        "name_ptr".to_string(),
-                        json!(format_opt(steam_convar_name_ptr_before)),
-                    ),
-                    (
-                        "name".to_string(),
-                        json!(read_c_string_opt(steam_convar_name_ptr_before)),
-                    ),
-                    (
-                        "flags".to_string(),
-                        json!(format_opt(steam_convar_flags_before)),
-                    ),
-                    (
-                        "help_ptr".to_string(),
-                        json!(format_opt(steam_convar_help_ptr_before)),
-                    ),
-                    (
-                        "help".to_string(),
-                        json!(read_c_string_opt(steam_convar_help_ptr_before)),
-                    ),
-                    (
-                        "parent_ptr".to_string(),
-                        json!(format_opt(steam_convar_parent_ptr_before)),
-                    ),
-                    (
-                        "callback_ptr".to_string(),
-                        json!(format_opt(steam_convar_callback_ptr_before)),
-                    ),
-                    (
-                        "vector_ptr".to_string(),
-                        json!(format_opt(steam_convar_vector_ptr_before)),
-                    ),
-                    (
-                        "recent_main_block_rvas".to_string(),
-                        json!(
-                            runtime
-                                .recent_main_block_rvas
-                                .iter()
-                                .map(|value| format!("{value:#x}"))
-                                .collect::<Vec<_>>()
-                        ),
-                    ),
-                ]);
-                if let Some(vector_fields) = vector_fields {
-                    parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                if steam_initterm_e_watch {
+                    runtime.push_trace(
+                        "process",
+                        "SteamInittermE",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            (
+                                "start".to_string(),
+                                json!(
+                                    steam_initterm_e_start_before
+                                        .map(|v| format!(
+                                            "{:#x}",
+                                            v.saturating_sub(runtime.mapped_image_base)
+                                        ))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "end".to_string(),
+                                json!(
+                                    steam_initterm_e_end_before
+                                        .map(|v| format!(
+                                            "{:#x}",
+                                            v.saturating_sub(runtime.mapped_image_base)
+                                        ))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "esi".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsi))),
+                            ),
+                            (
+                                "edi".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rdi))),
+                            ),
+                            (
+                                "eax".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                        ]),
+                        json!(state.get(Register::Rax)),
+                    );
                 }
-                runtime.push_trace(
-                    "process",
-                    if trace_steam_convar_create_start {
-                        "SteamConVarCreateStart"
+                if steam_startup_init_watch {
+                    runtime.push_trace(
+                        "process",
+                        "SteamStartupInit",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            (
+                                "eax".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "ecx".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rcx))),
+                            ),
+                            (
+                                "state_0x45715c".to_string(),
+                                json!(
+                                    probe_read_guest_u32(
+                                        memory,
+                                        runtime.mapped_image_base + 0x0045_715c
+                                    )
+                                    .map(|v| format!("{v:#x}"))
+                                    .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "esp".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                            ),
+                        ]),
+                        json!(state.get(Register::Rax)),
+                    );
+                }
+                if steam_startup_failure_watch {
+                    runtime.push_trace(
+                        "process",
+                        "SteamStartupFailure",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            (
+                                "eax".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            (
+                                "esi".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsi))),
+                            ),
+                            (
+                                "state_0x45715c".to_string(),
+                                json!(
+                                    probe_read_guest_u32(
+                                        memory,
+                                        runtime.mapped_image_base + 0x0045_715c
+                                    )
+                                    .map(|v| format!("{v:#x}"))
+                                    .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "esp".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                            ),
+                        ]),
+                        json!(state.get(Register::Rax)),
+                    );
+                }
+                if let Some((
+                    block_rva_before,
+                    counter_before,
+                    rsp_before,
+                    eax_before,
+                    ecx_before,
+                )) = steam_owner_allocator_probe_before
+                {
+                    let counter_before_str = counter_before
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    let counter_after_str =
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x003c_873c)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string());
+                    runtime.push_trace(
+                        "process",
+                        "SteamOwnerAllocator",
+                        BTreeMap::from([
+                            (
+                                "block_rva".to_string(),
+                                json!(
+                                    block_rva_before
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<non-main>".to_string())
+                                ),
+                            ),
+                            ("counter_before".to_string(), json!(counter_before_str)),
+                            ("counter_after".to_string(), json!(counter_after_str)),
+                            ("eax_before".to_string(), json!(format!("{eax_before:#x}"))),
+                            (
+                                "eax_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax))),
+                            ),
+                            ("ecx_before".to_string(), json!(format!("{ecx_before:#x}"))),
+                            (
+                                "ecx_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rcx))),
+                            ),
+                            ("esp_before".to_string(), json!(format!("{rsp_before:#x}"))),
+                            (
+                                "esp_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rsp))),
+                            ),
+                        ]),
+                        json!(state.get(Register::Rax)),
+                    );
+                    runtime.steam_owner_allocator_probe_count += 1;
+                }
+                if let Some((entry, callback, unwind)) = steam_callback_walk_entry_before {
+                    let get_process_heap_slot = runtime.mapped_image_base + 0x002e_230c;
+                    let get_process_heap_target = if callback
+                        == Some(runtime.mapped_image_base + 0x0016_b18c)
+                    {
+                        read_guest_pointer(memory, get_process_heap_slot, runtime.guest_arch).ok()
                     } else {
-                        "SteamConVarCreateEntry"
-                    },
-                    parameters,
-                    json!(decoded_instructions),
-                );
-            }
-            if let Some(helper_rva) = steam_convar_helper_watch {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let vector_fields = steam_convar_helper_vector_bytes_before.map(|bytes| {
-                    let read_u32_at = |offset: usize| -> u64 {
-                        u64::from(u32::from_le_bytes(
-                            bytes[offset..offset + 4].try_into().unwrap(),
-                        ))
+                        None
                     };
-                    BTreeMap::from([
-                        (
-                            "element_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(0))),
-                        ),
-                        (
-                            "memory_ptr".to_string(),
-                            json!(format!("{:#x}", read_u32_at(4))),
-                        ),
-                        (
-                            "allocation_count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(8))),
-                        ),
-                        (
-                            "grow_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(12))),
-                        ),
-                        (
-                            "count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(16))),
-                        ),
-                    ])
-                });
-                let mut parameters = BTreeMap::from([
-                    ("helper_rva".to_string(), json!(helper_rva)),
-                    (
-                        "this_ptr".to_string(),
-                        json!(format_opt(steam_convar_helper_this_before)),
-                    ),
-                    (
-                        "vector_ptr".to_string(),
-                        json!(format_opt(steam_convar_helper_vector_ptr_before)),
-                    ),
-                    (
-                        "arg0".to_string(),
-                        json!(format_opt(steam_convar_helper_arg0_before)),
-                    ),
-                    (
-                        "arg1".to_string(),
-                        json!(format_opt(steam_convar_helper_arg1_before)),
-                    ),
-                    (
-                        "arg2".to_string(),
-                        json!(format_opt(steam_convar_helper_arg2_before)),
-                    ),
-                    (
-                        "return_rva".to_string(),
-                        json!(
-                            steam_convar_helper_return_before
-                                .map(|value| format!("{value:#x}"))
-                                .unwrap_or_else(|| "<unavailable>".to_string())
-                        ),
-                    ),
-                    (
-                        "recent_main_block_rvas".to_string(),
-                        json!(
-                            runtime
-                                .recent_main_block_rvas
-                                .iter()
-                                .map(|value| format!("{value:#x}"))
-                                .collect::<Vec<_>>()
-                        ),
-                    ),
-                ]);
-                if let Some(vector_fields) = vector_fields {
-                    parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                    let get_process_heap_binding = get_process_heap_target.and_then(|target| {
+                        runtime
+                            .host_thunks
+                            .get(&target)
+                            .map(|thunk| format!("{thunk:?}"))
+                    });
+                    runtime.push_trace(
+                        "process",
+                        "SteamCallbackWalk",
+                        BTreeMap::from([
+                            ("entry".to_string(), json!(format!("{entry:#x}"))),
+                            (
+                                "callback".to_string(),
+                                json!(
+                                    callback
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "unwind".to_string(),
+                                json!(
+                                    unwind
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<unavailable>".to_string())
+                                ),
+                            ),
+                            (
+                                "al_after".to_string(),
+                                json!(format!("{:#x}", state.get(Register::Rax) & 0xff)),
+                            ),
+                            (
+                                "next_rva".to_string(),
+                                json!(format!(
+                                    "{:#x}",
+                                    state.rip.saturating_sub(runtime.mapped_image_base)
+                                )),
+                            ),
+                            (
+                                "get_process_heap_target".to_string(),
+                                json!(
+                                    get_process_heap_target
+                                        .map(|v| format!("{v:#x}"))
+                                        .unwrap_or_else(|| "<n/a>".to_string())
+                                ),
+                            ),
+                            (
+                                "get_process_heap_binding".to_string(),
+                                json!(
+                                    get_process_heap_binding.unwrap_or_else(|| "<n/a>".to_string())
+                                ),
+                            ),
+                        ]),
+                        json!(state.get(Register::Rax) & 0xff),
+                    );
                 }
-                runtime.push_trace(
-                    "process",
-                    "SteamConVarHelperEntry",
-                    parameters,
-                    json!(decoded_instructions),
-                );
-            }
-            if let Some(block_label) = steam_convar_memcpy_byte_watch {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let vector_fields = steam_convar_memcpy_byte_vector_bytes_before.map(|bytes| {
-                    let read_u32_at = |offset: usize| -> u64 {
-                        u64::from(u32::from_le_bytes(
-                            bytes[offset..offset + 4].try_into().unwrap(),
-                        ))
+                if steam_post_577113_watch {
+                    let decoded_detail: Vec<String> = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|inst| {
+                            let rva = inst.address.saturating_sub(runtime.mapped_image_base);
+                            format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
+                        })
+                        .collect();
+                    emit_live_ui_debug(format!(
+                        "steam-post-577113 block_rva={} eax={:#x} esi={:#x} edi={:#x} arg_obj={} heap_handle={} rsp={:#x} decoded=[{}]",
+                        block_rva
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<non-main>".to_string()),
+                        state.get(Register::Rax),
+                        state.get(Register::Rsi),
+                        state.get(Register::Rdi),
+                        probe_read_guest_u32(memory, state.get(Register::Rsp) + 4)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7664)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        state.get(Register::Rsp),
+                        decoded_detail.join(" | "),
+                    ));
+                }
+                if steam_post_56ee10_watch {
+                    let decoded_detail: Vec<String> = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|inst| {
+                            let rva = inst.address.saturating_sub(runtime.mapped_image_base);
+                            format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
+                        })
+                        .collect();
+                    emit_live_ui_debug(format!(
+                        "steam-post-56ee10 eax={:#x} edi={:#x} esi={:#x} ebx={:#x} heap_handle={} rsp={:#x} decoded=[{}]",
+                        state.get(Register::Rax),
+                        state.get(Register::Rdi),
+                        state.get(Register::Rsi),
+                        state.get(Register::Rbx),
+                        probe_read_guest_u32(memory, runtime.mapped_image_base + 0x0045_7664)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        state.get(Register::Rsp),
+                        decoded_detail.join(" | "),
+                    ));
+                }
+                if steam_post_576ca8_watch || steam_post_576d7e_watch {
+                    let decoded_detail: Vec<String> = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|inst| {
+                            let rva = inst.address.saturating_sub(runtime.mapped_image_base);
+                            format!("{rva:#x}:{:?} {:?}", inst.opcode, inst.operands)
+                        })
+                        .collect();
+                    emit_live_ui_debug(format!(
+                        "steam-post-helper block_rva={} rsp={:#x} stack0={} stack1={} stack2={} edi={:#x} esi={:#x} ebx={:#x} decoded=[{}]",
+                        block_rva
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<non-main>".to_string()),
+                        state.get(Register::Rsp),
+                        probe_read_guest_u32(memory, state.get(Register::Rsp))
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        probe_read_guest_u32(memory, state.get(Register::Rsp) + 4)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        probe_read_guest_u32(memory, state.get(Register::Rsp) + 8)
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        state.get(Register::Rdi),
+                        state.get(Register::Rsi),
+                        state.get(Register::Rbx),
+                        decoded_detail.join(" | "),
+                    ));
+                }
+                if let Some((rsp_before, stack0, stack1, stack2, stack3, edi_before, esi_before)) =
+                    steam_577113_epilogue_before
+                {
+                    emit_live_ui_debug(format!(
+                        "steam-577113-epilogue rsp_before={:#x} stack0={} stack1={} stack2={} stack3={} edi_before={:#x} esi_before={:#x} rsp_after={:#x} edi_after={:#x} esi_after={:#x}",
+                        rsp_before,
+                        stack0
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        stack1
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        stack2
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        stack3
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        edi_before,
+                        esi_before,
+                        state.get(Register::Rsp),
+                        state.get(Register::Rdi),
+                        state.get(Register::Rsi),
+                    ));
+                }
+                if let Some(saved_edi_before) = steam_saved_edi_slot_before {
+                    let saved_edi_after = probe_read_guest_u32(memory, 0x7000_ff1c).map(u64::from);
+                    if saved_edi_after != Some(saved_edi_before) {
+                        runtime.push_trace(
+                            "process",
+                            "SteamSavedEdiSlotWrite",
+                            BTreeMap::from([
+                                (
+                                    "block_rva".to_string(),
+                                    json!(
+                                        block_rva
+                                            .map(|v| format!("{v:#x}"))
+                                            .unwrap_or_else(|| "<non-main>".to_string())
+                                    ),
+                                ),
+                                (
+                                    "before".to_string(),
+                                    json!(format!("{saved_edi_before:#x}")),
+                                ),
+                                (
+                                    "after".to_string(),
+                                    json!(
+                                        saved_edi_after
+                                            .map(|v| format!("{v:#x}"))
+                                            .unwrap_or_else(|| "<unavailable>".to_string())
+                                    ),
+                                ),
+                                (
+                                    "rsp".to_string(),
+                                    json!(format!("{:#x}", state.get(Register::Rsp))),
+                                ),
+                                (
+                                    "rbp".to_string(),
+                                    json!(format!("{:#x}", state.get(Register::Rbp))),
+                                ),
+                            ]),
+                            json!(saved_edi_before),
+                        );
+                    }
+                }
+                if trace_steam_convar_create || trace_steam_convar_create_start {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
                     };
-                    BTreeMap::from([
-                        (
-                            "element_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(0))),
-                        ),
-                        (
-                            "memory_ptr".to_string(),
-                            json!(format!("{:#x}", read_u32_at(4))),
-                        ),
-                        (
-                            "allocation_count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(8))),
-                        ),
-                        (
-                            "grow_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(12))),
-                        ),
-                        (
-                            "count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(16))),
-                        ),
-                    ])
-                });
-                let mut parameters = BTreeMap::from([
-                    ("block_rva".to_string(), json!(block_label)),
-                    (
-                        "this_ptr".to_string(),
-                        json!(format_opt(steam_convar_memcpy_byte_this_before)),
-                    ),
-                    (
-                        "vector_ptr".to_string(),
-                        json!(format_opt(steam_convar_memcpy_byte_vector_ptr_before)),
-                    ),
-                    (
-                        "eax".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rax))),
-                    ),
-                    (
-                        "ecx".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rcx))),
-                    ),
-                    (
-                        "edx".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rdx))),
-                    ),
-                    (
-                        "edi".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rdi))),
-                    ),
-                    (
-                        "recent_main_block_rvas".to_string(),
-                        json!(
-                            runtime
-                                .recent_main_block_rvas
-                                .iter()
-                                .map(|value| format!("{value:#x}"))
-                                .collect::<Vec<_>>()
-                        ),
-                    ),
-                ]);
-                if let Some(vector_fields) = vector_fields {
-                    parameters.insert("vector_fields".to_string(), json!(vector_fields));
-                }
-                runtime.push_trace(
-                    "process",
-                    "SteamConVarMemcpyByteBlock",
-                    parameters,
-                    json!(decoded_instructions),
-                );
-            }
-            if let Some(block_label) = steam_convar_memcpy_return_watch {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
+                    let read_c_string_opt = |ptr: Option<u64>| {
+                        ptr.and_then(|ptr| {
+                            if ptr == 0 {
+                                Some(String::new())
+                            } else {
+                                read_c_string(memory, ptr).ok()
+                            }
+                        })
                         .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let vector_fields = steam_convar_memcpy_return_vector_bytes_before.map(|bytes| {
-                    let read_u32_at = |offset: usize| -> u64 {
-                        u64::from(u32::from_le_bytes(
-                            bytes[offset..offset + 4].try_into().unwrap(),
-                        ))
                     };
-                    BTreeMap::from([
+                    let vector_fields = steam_convar_vector_bytes_before.map(|bytes| {
+                        let read_u32_at = |offset: usize| -> u64 {
+                            u64::from(u32::from_le_bytes(
+                                bytes[offset..offset + 4].try_into().unwrap(),
+                            ))
+                        };
+                        BTreeMap::from([
+                            (
+                                "element_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(0))),
+                            ),
+                            (
+                                "memory_ptr".to_string(),
+                                json!(format!("{:#x}", read_u32_at(4))),
+                            ),
+                            (
+                                "allocation_count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(8))),
+                            ),
+                            (
+                                "grow_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(12))),
+                            ),
+                            (
+                                "count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(16))),
+                            ),
+                        ])
+                    });
+                    let mut parameters = BTreeMap::from([
                         (
-                            "element_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(0))),
+                            "block_rva".to_string(),
+                            json!(if trace_steam_convar_create_start {
+                                "0xcc400"
+                            } else {
+                                "0xcc542"
+                            }),
                         ),
                         (
-                            "memory_ptr".to_string(),
-                            json!(format!("{:#x}", read_u32_at(4))),
+                            "this_ptr".to_string(),
+                            json!(format_opt(steam_convar_this_before)),
                         ),
                         (
-                            "allocation_count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(8))),
+                            "frame_ptr".to_string(),
+                            json!(format_opt(steam_convar_frame_before)),
                         ),
                         (
-                            "grow_size".to_string(),
-                            json!(format!("{:#x}", read_u32_at(12))),
+                            "name_ptr".to_string(),
+                            json!(format_opt(steam_convar_name_ptr_before)),
                         ),
                         (
-                            "count".to_string(),
-                            json!(format!("{:#x}", read_u32_at(16))),
+                            "name".to_string(),
+                            json!(read_c_string_opt(steam_convar_name_ptr_before)),
                         ),
-                    ])
-                });
-                let mut parameters = BTreeMap::from([
-                    ("block_rva".to_string(), json!(block_label)),
-                    (
-                        "this_ptr".to_string(),
-                        json!(format_opt(steam_convar_memcpy_return_this_before)),
-                    ),
-                    (
-                        "vector_ptr".to_string(),
-                        json!(format_opt(steam_convar_memcpy_return_vector_ptr_before)),
-                    ),
-                    (
-                        "eax".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rax))),
-                    ),
-                    (
-                        "ecx".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rcx))),
-                    ),
-                    (
-                        "edx".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rdx))),
-                    ),
-                    (
-                        "esi".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rsi))),
-                    ),
-                    (
-                        "edi".to_string(),
-                        json!(format!("{:#x}", state.get(Register::Rdi))),
-                    ),
-                    (
-                        "recent_main_block_rvas".to_string(),
-                        json!(
-                            runtime
-                                .recent_main_block_rvas
-                                .iter()
-                                .map(|value| format!("{value:#x}"))
-                                .collect::<Vec<_>>()
+                        (
+                            "flags".to_string(),
+                            json!(format_opt(steam_convar_flags_before)),
                         ),
-                    ),
-                ]);
-                if let Some(vector_fields) = vector_fields {
-                    parameters.insert("vector_fields".to_string(), json!(vector_fields));
-                }
-                runtime.push_trace(
-                    "process",
-                    "SteamConVarMemcpyReturnBlock",
-                    parameters,
-                    json!(decoded_instructions),
-                );
-            }
-            if trace_steam_vector_grow_request {
-                let decoded_instructions = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| {
-                        format!(
-                            "{:#x}:{:?} {:?}",
-                            instruction
-                                .address
-                                .saturating_sub(runtime.mapped_image_base),
-                            instruction.opcode,
-                            instruction.operands
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let format_opt = |value: Option<u64>| {
-                    value
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let requested_bytes = match (
-                    steam_vector_element_size_before,
-                    steam_vector_capacity_before,
-                ) {
-                    (Some(element_size), Some(capacity)) => element_size.checked_mul(capacity),
-                    _ => None,
-                };
-                let owner_ptr_candidate =
-                    steam_vector_this_before.and_then(|vector_ptr| vector_ptr.checked_sub(0x84));
-                runtime.push_trace(
-                    "process",
-                    "SteamVectorGrowRequest",
-                    BTreeMap::from([
-                        ("block_rva".to_string(), json!("0x9968b")),
+                        (
+                            "help_ptr".to_string(),
+                            json!(format_opt(steam_convar_help_ptr_before)),
+                        ),
+                        (
+                            "help".to_string(),
+                            json!(read_c_string_opt(steam_convar_help_ptr_before)),
+                        ),
+                        (
+                            "parent_ptr".to_string(),
+                            json!(format_opt(steam_convar_parent_ptr_before)),
+                        ),
+                        (
+                            "callback_ptr".to_string(),
+                            json!(format_opt(steam_convar_callback_ptr_before)),
+                        ),
                         (
                             "vector_ptr".to_string(),
-                            json!(format_opt(steam_vector_this_before)),
-                        ),
-                        (
-                            "owner_ptr_candidate".to_string(),
-                            json!(format_opt(owner_ptr_candidate)),
-                        ),
-                        (
-                            "old_address".to_string(),
-                            json!(format_opt(steam_vector_old_address_before)),
-                        ),
-                        (
-                            "element_size".to_string(),
-                            json!(format_opt(steam_vector_element_size_before)),
-                        ),
-                        (
-                            "capacity".to_string(),
-                            json!(format_opt(steam_vector_capacity_before)),
-                        ),
-                        (
-                            "grow_size".to_string(),
-                            json!(format_opt(steam_vector_grow_size_before)),
-                        ),
-                        (
-                            "count".to_string(),
-                            json!(format_opt(steam_vector_count_before)),
-                        ),
-                        (
-                            "requested_bytes".to_string(),
-                            json!(format_opt(requested_bytes)),
+                            json!(format_opt(steam_convar_vector_ptr_before)),
                         ),
                         (
                             "recent_main_block_rvas".to_string(),
@@ -8118,43 +7798,420 @@ pub fn execute_with_options(
                                     .collect::<Vec<_>>()
                             ),
                         ),
-                    ]),
-                    json!(decoded_instructions),
-                );
-            }
-            if guest_arch == GuestArch::X86
-                && runtime.steam_401389_expected_esi_after_401434.is_some()
-                && runtime.steam_401389_saved_esi_slot_addr.is_none()
-                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
-            {
-                let candidate = state.get(Register::Rbp).wrapping_sub(0x2b8);
-                if read_guest_u32(&memory, candidate).ok() == Some(expected_esi) {
-                    runtime.steam_401389_saved_esi_slot_addr = Some(candidate);
+                    ]);
+                    if let Some(vector_fields) = vector_fields {
+                        parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                    }
+                    runtime.push_trace(
+                        "process",
+                        if trace_steam_convar_create_start {
+                            "SteamConVarCreateStart"
+                        } else {
+                            "SteamConVarCreateEntry"
+                        },
+                        parameters,
+                        json!(decoded_instructions),
+                    );
                 }
-            }
-            if let Some((watched_address, before_value)) = watched_esi_slot_before
-                && let Ok(after_value) = read_guest_u32(&memory, watched_address)
-                && after_value != before_value
-            {
-                let decoded_addresses = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| format!("{:#x}", instruction.address))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                return Err(AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!(
-                        "steam 401434 overwrote saved ESI slot at {watched_address:#x} from {before_value:#x} to {after_value:#x} while executing block {block_start_rip:#x} addrs=[{decoded_addresses}]"
-                    ),
-                ));
-            }
-            if steam_install_dir_set_edi {
-                let expected_edi = runtime.mapped_image_base + 0x003d_6168;
-                let actual_edi = state.get(Register::Rdi);
-                runtime.steam_install_dir_expected_edi = Some(expected_edi);
-                if actual_edi != expected_edi {
+                if let Some(helper_rva) = steam_convar_helper_watch {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let vector_fields = steam_convar_helper_vector_bytes_before.map(|bytes| {
+                        let read_u32_at = |offset: usize| -> u64 {
+                            u64::from(u32::from_le_bytes(
+                                bytes[offset..offset + 4].try_into().unwrap(),
+                            ))
+                        };
+                        BTreeMap::from([
+                            (
+                                "element_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(0))),
+                            ),
+                            (
+                                "memory_ptr".to_string(),
+                                json!(format!("{:#x}", read_u32_at(4))),
+                            ),
+                            (
+                                "allocation_count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(8))),
+                            ),
+                            (
+                                "grow_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(12))),
+                            ),
+                            (
+                                "count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(16))),
+                            ),
+                        ])
+                    });
+                    let mut parameters = BTreeMap::from([
+                        ("helper_rva".to_string(), json!(helper_rva)),
+                        (
+                            "this_ptr".to_string(),
+                            json!(format_opt(steam_convar_helper_this_before)),
+                        ),
+                        (
+                            "vector_ptr".to_string(),
+                            json!(format_opt(steam_convar_helper_vector_ptr_before)),
+                        ),
+                        (
+                            "arg0".to_string(),
+                            json!(format_opt(steam_convar_helper_arg0_before)),
+                        ),
+                        (
+                            "arg1".to_string(),
+                            json!(format_opt(steam_convar_helper_arg1_before)),
+                        ),
+                        (
+                            "arg2".to_string(),
+                            json!(format_opt(steam_convar_helper_arg2_before)),
+                        ),
+                        (
+                            "return_rva".to_string(),
+                            json!(
+                                steam_convar_helper_return_before
+                                    .map(|value| format!("{value:#x}"))
+                                    .unwrap_or_else(|| "<unavailable>".to_string())
+                            ),
+                        ),
+                        (
+                            "recent_main_block_rvas".to_string(),
+                            json!(
+                                runtime
+                                    .recent_main_block_rvas
+                                    .iter()
+                                    .map(|value| format!("{value:#x}"))
+                                    .collect::<Vec<_>>()
+                            ),
+                        ),
+                    ]);
+                    if let Some(vector_fields) = vector_fields {
+                        parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                    }
+                    runtime.push_trace(
+                        "process",
+                        "SteamConVarHelperEntry",
+                        parameters,
+                        json!(decoded_instructions),
+                    );
+                }
+                if let Some(block_label) = steam_convar_memcpy_byte_watch {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let vector_fields = steam_convar_memcpy_byte_vector_bytes_before.map(|bytes| {
+                        let read_u32_at = |offset: usize| -> u64 {
+                            u64::from(u32::from_le_bytes(
+                                bytes[offset..offset + 4].try_into().unwrap(),
+                            ))
+                        };
+                        BTreeMap::from([
+                            (
+                                "element_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(0))),
+                            ),
+                            (
+                                "memory_ptr".to_string(),
+                                json!(format!("{:#x}", read_u32_at(4))),
+                            ),
+                            (
+                                "allocation_count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(8))),
+                            ),
+                            (
+                                "grow_size".to_string(),
+                                json!(format!("{:#x}", read_u32_at(12))),
+                            ),
+                            (
+                                "count".to_string(),
+                                json!(format!("{:#x}", read_u32_at(16))),
+                            ),
+                        ])
+                    });
+                    let mut parameters = BTreeMap::from([
+                        ("block_rva".to_string(), json!(block_label)),
+                        (
+                            "this_ptr".to_string(),
+                            json!(format_opt(steam_convar_memcpy_byte_this_before)),
+                        ),
+                        (
+                            "vector_ptr".to_string(),
+                            json!(format_opt(steam_convar_memcpy_byte_vector_ptr_before)),
+                        ),
+                        (
+                            "eax".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rax))),
+                        ),
+                        (
+                            "ecx".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rcx))),
+                        ),
+                        (
+                            "edx".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rdx))),
+                        ),
+                        (
+                            "edi".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rdi))),
+                        ),
+                        (
+                            "recent_main_block_rvas".to_string(),
+                            json!(
+                                runtime
+                                    .recent_main_block_rvas
+                                    .iter()
+                                    .map(|value| format!("{value:#x}"))
+                                    .collect::<Vec<_>>()
+                            ),
+                        ),
+                    ]);
+                    if let Some(vector_fields) = vector_fields {
+                        parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                    }
+                    runtime.push_trace(
+                        "process",
+                        "SteamConVarMemcpyByteBlock",
+                        parameters,
+                        json!(decoded_instructions),
+                    );
+                }
+                if let Some(block_label) = steam_convar_memcpy_return_watch {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let vector_fields =
+                        steam_convar_memcpy_return_vector_bytes_before.map(|bytes| {
+                            let read_u32_at = |offset: usize| -> u64 {
+                                u64::from(u32::from_le_bytes(
+                                    bytes[offset..offset + 4].try_into().unwrap(),
+                                ))
+                            };
+                            BTreeMap::from([
+                                (
+                                    "element_size".to_string(),
+                                    json!(format!("{:#x}", read_u32_at(0))),
+                                ),
+                                (
+                                    "memory_ptr".to_string(),
+                                    json!(format!("{:#x}", read_u32_at(4))),
+                                ),
+                                (
+                                    "allocation_count".to_string(),
+                                    json!(format!("{:#x}", read_u32_at(8))),
+                                ),
+                                (
+                                    "grow_size".to_string(),
+                                    json!(format!("{:#x}", read_u32_at(12))),
+                                ),
+                                (
+                                    "count".to_string(),
+                                    json!(format!("{:#x}", read_u32_at(16))),
+                                ),
+                            ])
+                        });
+                    let mut parameters = BTreeMap::from([
+                        ("block_rva".to_string(), json!(block_label)),
+                        (
+                            "this_ptr".to_string(),
+                            json!(format_opt(steam_convar_memcpy_return_this_before)),
+                        ),
+                        (
+                            "vector_ptr".to_string(),
+                            json!(format_opt(steam_convar_memcpy_return_vector_ptr_before)),
+                        ),
+                        (
+                            "eax".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rax))),
+                        ),
+                        (
+                            "ecx".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rcx))),
+                        ),
+                        (
+                            "edx".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rdx))),
+                        ),
+                        (
+                            "esi".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rsi))),
+                        ),
+                        (
+                            "edi".to_string(),
+                            json!(format!("{:#x}", state.get(Register::Rdi))),
+                        ),
+                        (
+                            "recent_main_block_rvas".to_string(),
+                            json!(
+                                runtime
+                                    .recent_main_block_rvas
+                                    .iter()
+                                    .map(|value| format!("{value:#x}"))
+                                    .collect::<Vec<_>>()
+                            ),
+                        ),
+                    ]);
+                    if let Some(vector_fields) = vector_fields {
+                        parameters.insert("vector_fields".to_string(), json!(vector_fields));
+                    }
+                    runtime.push_trace(
+                        "process",
+                        "SteamConVarMemcpyReturnBlock",
+                        parameters,
+                        json!(decoded_instructions),
+                    );
+                }
+                if trace_steam_vector_grow_request {
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction
+                                    .address
+                                    .saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let requested_bytes = match (
+                        steam_vector_element_size_before,
+                        steam_vector_capacity_before,
+                    ) {
+                        (Some(element_size), Some(capacity)) => element_size.checked_mul(capacity),
+                        _ => None,
+                    };
+                    let owner_ptr_candidate = steam_vector_this_before
+                        .and_then(|vector_ptr| vector_ptr.checked_sub(0x84));
+                    runtime.push_trace(
+                        "process",
+                        "SteamVectorGrowRequest",
+                        BTreeMap::from([
+                            ("block_rva".to_string(), json!("0x9968b")),
+                            (
+                                "vector_ptr".to_string(),
+                                json!(format_opt(steam_vector_this_before)),
+                            ),
+                            (
+                                "owner_ptr_candidate".to_string(),
+                                json!(format_opt(owner_ptr_candidate)),
+                            ),
+                            (
+                                "old_address".to_string(),
+                                json!(format_opt(steam_vector_old_address_before)),
+                            ),
+                            (
+                                "element_size".to_string(),
+                                json!(format_opt(steam_vector_element_size_before)),
+                            ),
+                            (
+                                "capacity".to_string(),
+                                json!(format_opt(steam_vector_capacity_before)),
+                            ),
+                            (
+                                "grow_size".to_string(),
+                                json!(format_opt(steam_vector_grow_size_before)),
+                            ),
+                            (
+                                "count".to_string(),
+                                json!(format_opt(steam_vector_count_before)),
+                            ),
+                            (
+                                "requested_bytes".to_string(),
+                                json!(format_opt(requested_bytes)),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(
+                                    runtime
+                                        .recent_main_block_rvas
+                                        .iter()
+                                        .map(|value| format!("{value:#x}"))
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                }
+                if guest_arch == GuestArch::X86
+                    && runtime.steam_401389_expected_esi_after_401434.is_some()
+                    && runtime.steam_401389_saved_esi_slot_addr.is_none()
+                    && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434
+                {
+                    let candidate = state.get(Register::Rbp).wrapping_sub(0x2b8);
+                    if read_guest_u32(memory, candidate).ok() == Some(expected_esi) {
+                        runtime.steam_401389_saved_esi_slot_addr = Some(candidate);
+                    }
+                }
+                if let Some((watched_address, before_value)) = watched_esi_slot_before
+                    && let Ok(after_value) = read_guest_u32(memory, watched_address)
+                    && after_value != before_value
+                {
                     let decoded_addresses = cached_block
                         .translated
                         .decoded
@@ -8165,100 +8222,120 @@ pub fn execute_with_options(
                     return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!(
+                            "steam 401434 overwrote saved ESI slot at {watched_address:#x} from {before_value:#x} to {after_value:#x} while executing block {block_start_rip:#x} addrs=[{decoded_addresses}]"
+                        ),
+                    ));
+                }
+                if steam_install_dir_set_edi {
+                    let expected_edi = runtime.mapped_image_base + 0x003d_6168;
+                    let actual_edi = state.get(Register::Rdi);
+                    runtime.steam_install_dir_expected_edi = Some(expected_edi);
+                    if actual_edi != expected_edi {
+                        let decoded_addresses = cached_block
+                            .translated
+                            .decoded
+                            .iter()
+                            .map(|instruction| format!("{:#x}", instruction.address))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
                             "steam install-dir setup block failed to leave edi on the relocated install-dir buffer: expected {expected_edi:#x}, actual {actual_edi:#x}"
                         ),
                     )
                     .with_hint(format!(
                         "steam-install-dir set-block={block_start_rip:#x} addrs=[{decoded_addresses}]"
                     )));
+                    }
                 }
-            }
-            if touches_steam_401389_helper {
-                let record_base = read_guest_u32(&memory, 0x42a270).ok().map(u64::from);
-                let summarize_record = |index: u32| {
-                    record_base
-                        .map(|base| {
-                            let record_address = base + u64::from(index) * 0x1c;
+                if touches_steam_401389_helper {
+                    let record_base = read_guest_u32(memory, 0x42a270).ok().map(u64::from);
+                    let summarize_record = |index: u32| {
+                        record_base
+                            .map(|base| {
+                                let record_address = base + u64::from(index) * 0x1c;
+                                let fields = (0..7)
+                                    .map(|slot| {
+                                        let value =
+                                            read_guest_u32(memory, record_address + slot * 4)
+                                                .ok()
+                                                .map(u64::from)
+                                                .unwrap_or(0);
+                                        format!("{slot}:{value:#x}")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("addr={record_address:#x} fields=[{fields}]")
+                            })
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let decoded_addresses = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| format!("{:#x}", instruction.address))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let esi_after = state.get(Register::Rsi) as u32;
+                    let helper_arg = read_guest_u32(memory, state.get(Register::Rsp) + 8)
+                        .ok()
+                        .map(u64::from)
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    let block_summary = format!(
+                        "block_start={block_start_rip:#x} addrs=[{decoded_addresses}] esi_before={esi_before:#x} esi_after={esi_after:#x} eax_after={:#x} helper_arg={} before_record={} after_record={}",
+                        state.get(Register::Rax),
+                        helper_arg,
+                        summarize_record(esi_before),
+                        summarize_record(esi_after),
+                    );
+                    if runtime.steam_401389_first_over_0x1000.is_none() && esi_after >= 0x1000 {
+                        runtime.steam_401389_first_over_0x1000 = Some(block_summary.clone());
+                    }
+                    if runtime.steam_401389_recent_blocks.len() == 4 {
+                        runtime.steam_401389_recent_blocks.pop_front();
+                    }
+                    runtime.steam_401389_recent_blocks.push_back(block_summary);
+                }
+                if guest_arch == GuestArch::X86 && contains_steam_4013a3 {
+                    runtime.steam_401389_expected_esi_after_401434 = Some(esi_before);
+                }
+                if guest_arch == GuestArch::X86 && contains_steam_4013c0 {
+                    let esi_after = state.get(Register::Rsi) as u32;
+                    if esi_before < 0x1000 && esi_after >= 0x1000 {
+                        let record_base = read_guest_u32(memory, 0x42a270).unwrap_or(0) as u64;
+                        let previous_record = if record_base != 0 {
+                            let record_address = record_base + u64::from(esi_before) * 0x1c;
                             let fields = (0..7)
                                 .map(|slot| {
-                                    let value = read_guest_u32(&memory, record_address + slot * 4)
-                                        .ok()
-                                        .map(u64::from)
-                                        .unwrap_or(0);
+                                    let value = read_guest_u32(memory, record_address + slot * 4)
+                                        .unwrap_or(0)
+                                        as u64;
                                     format!("{slot}:{value:#x}")
                                 })
                                 .collect::<Vec<_>>()
                                 .join(",");
                             format!("addr={record_address:#x} fields=[{fields}]")
-                        })
-                        .unwrap_or_else(|| "<unavailable>".to_string())
-                };
-                let decoded_addresses = cached_block
-                    .translated
-                    .decoded
-                    .iter()
-                    .map(|instruction| format!("{:#x}", instruction.address))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let esi_after = state.get(Register::Rsi) as u32;
-                let helper_arg = read_guest_u32(&memory, state.get(Register::Rsp) + 8)
-                    .ok()
-                    .map(u64::from)
-                    .map(|value| format!("{value:#x}"))
-                    .unwrap_or_else(|| "<unavailable>".to_string());
-                let block_summary = format!(
-                    "block_start={block_start_rip:#x} addrs=[{decoded_addresses}] esi_before={esi_before:#x} esi_after={esi_after:#x} eax_after={:#x} helper_arg={} before_record={} after_record={}",
-                    state.get(Register::Rax),
-                    helper_arg,
-                    summarize_record(esi_before),
-                    summarize_record(esi_after),
-                );
-                if runtime.steam_401389_first_over_0x1000.is_none() && esi_after >= 0x1000 {
-                    runtime.steam_401389_first_over_0x1000 = Some(block_summary.clone());
-                }
-                if runtime.steam_401389_recent_blocks.len() == 4 {
-                    runtime.steam_401389_recent_blocks.pop_front();
-                }
-                runtime.steam_401389_recent_blocks.push_back(block_summary);
-            }
-            if guest_arch == GuestArch::X86 && contains_steam_4013a3 {
-                runtime.steam_401389_expected_esi_after_401434 = Some(esi_before);
-            }
-            if guest_arch == GuestArch::X86 && contains_steam_4013c0 {
-                let esi_after = state.get(Register::Rsi) as u32;
-                if esi_before < 0x1000 && esi_after >= 0x1000 {
-                    let record_base = read_guest_u32(&memory, 0x42a270).unwrap_or(0) as u64;
-                    let previous_record = if record_base != 0 {
-                        let record_address = record_base + u64::from(esi_before) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(&memory, record_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={record_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    let current_record = if record_base != 0 {
-                        let record_address = record_base + u64::from(esi_after) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(&memory, record_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={record_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    return Err(AppError::new(
+                        } else {
+                            "<unavailable>".to_string()
+                        };
+                        let current_record = if record_base != 0 {
+                            let record_address = record_base + u64::from(esi_after) * 0x1c;
+                            let fields = (0..7)
+                                .map(|slot| {
+                                    let value = read_guest_u32(memory, record_address + slot * 4)
+                                        .unwrap_or(0)
+                                        as u64;
+                                    format!("{slot}:{value:#x}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("addr={record_address:#x} fields=[{fields}]")
+                        } else {
+                            "<unavailable>".to_string()
+                        };
+                        return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!(
                             "steam 401389 transition block {block_start_rip:#x} jumped across 0x1000 from {esi_before:#x} to {esi_after:#x}"
@@ -8267,25 +8344,25 @@ pub fn execute_with_options(
                     .with_hint(format!(
                         "steam-401389 threshold-jump record_base={record_base:#x} previous_record={previous_record} current_record={current_record}"
                     )));
-                }
-                if esi_after > 0x10000 {
-                    let record_base = read_guest_u32(&memory, 0x42a270).unwrap_or(0) as u64;
-                    let previous_record = if record_base != 0 {
-                        let record_address = record_base + u64::from(esi_before) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(&memory, record_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={record_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    return Err(AppError::new(
+                    }
+                    if esi_after > 0x10000 {
+                        let record_base = read_guest_u32(memory, 0x42a270).unwrap_or(0) as u64;
+                        let previous_record = if record_base != 0 {
+                            let record_address = record_base + u64::from(esi_before) * 0x1c;
+                            let fields = (0..7)
+                                .map(|slot| {
+                                    let value = read_guest_u32(memory, record_address + slot * 4)
+                                        .unwrap_or(0)
+                                        as u64;
+                                    format!("{slot}:{value:#x}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("addr={record_address:#x} fields=[{fields}]")
+                        } else {
+                            "<unavailable>".to_string()
+                        };
+                        return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!(
                             "steam 401389 transition block {block_start_rip:#x} jumped from {esi_before:#x} to large index {esi_after:#x}"
@@ -8294,43 +8371,43 @@ pub fn execute_with_options(
                     .with_hint(format!(
                         "steam-401389 transition record_base={record_base:#x} previous_record={previous_record}"
                     )));
+                    }
                 }
-            }
-            if guest_arch == GuestArch::X86 && contains_steam_4013ba {
-                let esi_after = state.get(Register::Rsi) as u32;
-                if esi_before < 0x1000 && esi_after >= 0x1000 {
-                    let record_base = read_guest_u32(&memory, 0x42a270).unwrap_or(0) as u64;
-                    let current_record = if record_base != 0 {
-                        let record_address = record_base + u64::from(esi_after) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(&memory, record_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={record_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    let previous_record = if record_base != 0 {
-                        let record_address = record_base + u64::from(esi_before) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(&memory, record_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={record_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    return Err(AppError::new(
+                if guest_arch == GuestArch::X86 && contains_steam_4013ba {
+                    let esi_after = state.get(Register::Rsi) as u32;
+                    if esi_before < 0x1000 && esi_after >= 0x1000 {
+                        let record_base = read_guest_u32(memory, 0x42a270).unwrap_or(0) as u64;
+                        let current_record = if record_base != 0 {
+                            let record_address = record_base + u64::from(esi_after) * 0x1c;
+                            let fields = (0..7)
+                                .map(|slot| {
+                                    let value = read_guest_u32(memory, record_address + slot * 4)
+                                        .unwrap_or(0)
+                                        as u64;
+                                    format!("{slot}:{value:#x}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("addr={record_address:#x} fields=[{fields}]")
+                        } else {
+                            "<unavailable>".to_string()
+                        };
+                        let previous_record = if record_base != 0 {
+                            let record_address = record_base + u64::from(esi_before) * 0x1c;
+                            let fields = (0..7)
+                                .map(|slot| {
+                                    let value = read_guest_u32(memory, record_address + slot * 4)
+                                        .unwrap_or(0)
+                                        as u64;
+                                    format!("{slot}:{value:#x}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("addr={record_address:#x} fields=[{fields}]")
+                        } else {
+                            "<unavailable>".to_string()
+                        };
+                        return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!(
                             "steam 401389 linear scan crossed 0x1000 via inc esi from {esi_before:#x} to {esi_after:#x}"
@@ -8339,34 +8416,125 @@ pub fn execute_with_options(
                     .with_hint(format!(
                         "steam-401389 inc-esi record_base={record_base:#x} previous_record={previous_record} current_record={current_record}"
                     )));
+                    }
                 }
             }
-        }
-        let last_instruction = cached_block.translated.decoded.last().ok_or_else(|| {
-            AppError::new(ReasonCode::RcUnimplInsn, "translated basic block was empty")
-        })?;
-        if last_instruction.opcode == DecodedOpcode::Ret {
-            if state.rip == 0 {
-                break;
+            let last_instruction = cached_block.translated.decoded.last().ok_or_else(|| {
+                AppError::new(ReasonCode::RcUnimplInsn, "translated basic block was empty")
+            })?;
+            if last_instruction.opcode == DecodedOpcode::Ret {
+                if state.rip == 0 {
+                    break;
+                }
+            } else if !instruction_controls_rip(last_instruction.opcode) {
+                state.rip = cached_block.end_rip;
             }
-        } else if !instruction_controls_rip(last_instruction.opcode) {
-            state.rip = cached_block.end_rip;
         }
-    }
 
-    // ── Thread-drain phase after a main-thread exit ─────────────────────
-    // `ExitThread`/`_endthreadex`/`_endthread` on the main thread ends only
-    // the MAIN thread; Windows ends the process when its LAST thread exits.
-    // If guest workers are still pending, keep pumping them to completion
-    // (unless a process-exit API was called, which abandons every thread).
-    if runtime.main_thread_exit_code.is_some() && !runtime.pending_guest_threads.is_empty() {
-        exit_code = runtime.drain_pending_guest_threads_after_main_exit(&mut memory)?;
-    }
+        // ── Thread-drain phase after a main-thread exit ─────────────────────
+        // `ExitThread`/`_endthreadex`/`_endthread` on the main thread ends only
+        // the MAIN thread; Windows ends the process when its LAST thread exits.
+        // If guest workers are still pending, keep pumping them to completion
+        // (unless a process-exit API was called, which abandons every thread).
+        if runtime.main_thread_exit_code.is_some() && !runtime.pending_guest_threads.is_empty() {
+            exit_code = runtime.drain_pending_guest_threads_after_main_exit(memory)?;
+        }
 
-    // JIT runtime is no longer needed — unregister so the live-session
-    // watchdog no longer holds a reference to it.
-    crate::jit::unregister_jit_runtime();
+        // JIT runtime is no longer needed — unregister so the live-session
+        // watchdog no longer holds a reference to it.
+        crate::jit::unregister_jit_runtime();
 
+        eprintln!(
+            "CASA1_LOOP_EXIT: iter={} exit_code={} elapsed_ms={}",
+            block_count,
+            exit_code,
+            start_time.elapsed().as_millis()
+        );
+
+        Ok((exit_code, steps, block_count))
+    };
+
+    // Run the body; every error is classified into an authoritative
+    // ExecutionTermination and finalized — nothing is lost.
+    let (exit_code, steps, block_count) = match run_body(
+        &mut runtime,
+        &mut memory,
+        &mut state,
+        &mut engine,
+        instruction_budget,
+    ) {
+        Ok((code, steps, block_count)) => (code, steps, block_count),
+        Err(error) => {
+            let termination = classify_execution_error(&error);
+            let detail = Some(error.to_string());
+            let exit_code = legacy_exit_code(termination);
+            // The error path has no completed step accounting (the budget /
+            // deadline errors carry the step count in their message); the
+            // rest of the diagnostic state is preserved by the finalizer.
+            return finalize_execution(
+                runtime,
+                &mut memory,
+                &image,
+                &mapped,
+                env,
+                dtm,
+                image_hash,
+                0,
+                0,
+                start_time,
+                exit_code,
+                termination,
+                detail,
+            );
+        }
+    };
+    let termination =
+        if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) && exit_code == -2 {
+            ExecutionTermination::HarnessDeadline
+        } else {
+            ExecutionTermination::GuestExit { code: exit_code }
+        };
+    let termination_detail = None;
+
+    finalize_execution(
+        runtime,
+        &mut memory,
+        &image,
+        &mapped,
+        env,
+        dtm,
+        image_hash,
+        steps,
+        block_count,
+        start_time,
+        exit_code,
+        termination,
+        termination_detail,
+    )
+}
+
+/// Build the final PeExecutionResult, preserving EVERY piece of diagnostic
+/// state: stdout/stderr, guest exceptions, trace events, graphics frames,
+/// perf counters, milestones, provenance and the authoritative termination.
+/// Every exit path (guest exit, harness deadline, instruction budget,
+/// unsupported instruction, guest exception, host error) funnels through
+/// here — the runner never reconstructs a synthetic result.
+#[allow(clippy::too_many_arguments)]
+fn finalize_execution(
+    runtime: PeHostRuntime,
+    _memory: &mut MemoryImage,
+    image: &pe::ParsedPe,
+    mapped: &pe::MappedImage,
+    env: &std::collections::BTreeMap<String, String>,
+    dtm: bool,
+    image_hash: String,
+    steps: u64,
+    block_count: u64,
+    start_time: std::time::Instant,
+    exit_code: i32,
+    termination: ExecutionTermination,
+    termination_detail: Option<String>,
+) -> AppResult<PeExecutionResult> {
     eprintln!(
         "CASA1_LOOP_EXIT: iter={} exit_code={} elapsed_ms={}",
         block_count,
@@ -8400,37 +8568,6 @@ pub fn execute_with_options(
     )];
     trace_events.extend(runtime.trace_events);
 
-    // Post-execution record table check (only when workaround is active).
-    if guest_arch == GuestArch::X86 && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok() {
-        let record_base = read_guest_u32(&memory, runtime.mapped_image_base + 0x2a270).unwrap_or(0);
-        let first_opcode = if record_base != 0 {
-            read_guest_u32(&memory, record_base as u64).ok()
-        } else {
-            None
-        };
-        trace_events.push(trace_event(
-            runtime.next_trace_index,
-            "process",
-            "SteamRecordTablePostExec",
-            BTreeMap::from([
-                (
-                    "record_base".to_string(),
-                    json!(format!("{record_base:#x}")),
-                ),
-                (
-                    "first_opcode".to_string(),
-                    json!(first_opcode.map(|v| format!("{v:#x}"))),
-                ),
-                (
-                    "table_populated".to_string(),
-                    json!(first_opcode.is_some() && first_opcode != Some(0)),
-                ),
-            ]),
-            json!(first_opcode.unwrap_or(0)),
-            Vec::new(),
-        ));
-    }
-
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),
         stdout: runtime.stdout,
@@ -8442,7 +8579,24 @@ pub fn execute_with_options(
         trace_events,
         milestones: crate::steam_milestones::snapshot_milestones(),
         provenance: crate::steam_milestones::RunProvenance::from_env(),
+        termination,
+        termination_detail,
     })
+}
+
+/// Classify an execution error into the authoritative termination reason.
+fn classify_execution_error(error: &AppError) -> ExecutionTermination {
+    if error.message.contains("wall-clock deadline") {
+        ExecutionTermination::HarnessDeadline
+    } else if error.message.contains("instruction budget") {
+        ExecutionTermination::InstructionBudget
+    } else if error.code == ReasonCode::RcUnimplInsn {
+        ExecutionTermination::UnsupportedInstruction
+    } else if error.code == ReasonCode::RcMemoryAccessViolation {
+        ExecutionTermination::GuestException
+    } else {
+        ExecutionTermination::HostError
+    }
 }
 
 // ---------------------------------------------------------------------------
