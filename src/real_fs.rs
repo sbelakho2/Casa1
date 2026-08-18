@@ -64,98 +64,205 @@ const BACKUP_READ_CHUNK_SIZE: usize = 1 << 20;
 /// Maximum total size [`backup_read_file`] will buffer for one file.
 const MAX_BACKUP_READ_SIZE: u64 = 256 << 20;
 
-/// Parse a path that may contain NTFS Alternate Data Stream syntax
+/// First-class parsed Windows path: every path is classified at parse time
+/// so downstream layers never re-derive the syntax with ad hoc prefix
+/// exceptions.  The verbatim forms are especially important: `\\?\`
+/// disables normalization (no dot/underscore collapsing, no device-path
+/// translation), so it cannot be treated as an ordinary DOS path with four
+/// characters stripped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsPathKind {
+    /// `C:\\x` — drive absolute.
+    DriveAbsolute { drive: char, path: String },
+    /// `C:x` — drive relative (relative to the drive's current directory).
+    DriveRelative { drive: char, path: String },
+    /// `\\x` — rooted at the current drive's root.
+    RootedCurrentDrive { path: String },
+    /// `x` — relative to the current directory.
+    Relative { path: String },
+    /// `\\\\server\\share\\x` — UNC.
+    Unc {
+        server: String,
+        share: String,
+        path: String,
+    },
+    /// `\\\\?\\C:\\x` — verbatim drive path (no normalization).
+    VerbatimDrive { drive: char, path: String },
+    /// `\\\\?\\UNC\\server\\share\\x` — verbatim UNC (no normalization).
+    VerbatimUnc {
+        server: String,
+        share: String,
+        path: String,
+    },
+    /// `\\.\\...` — device namespace (no normalization, no translation).
+    Device { path: String },
+}
+
+/// A parsed Windows path: its syntactic kind plus an optional ADS suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsPath {
+    pub kind: WindowsPathKind,
+    /// ADS stream name (e.g. `Zone.Identifier`) when the path carries one.
+    pub ads_stream: Option<String>,
+}
+
+impl WindowsPath {
+    /// Reconstruct a canonical text form of the path WITHOUT the ADS suffix.
+    pub fn to_base_string(&self) -> String {
+        match &self.kind {
+            WindowsPathKind::DriveAbsolute { drive, path } => format!("{drive}:\\{path}"),
+            WindowsPathKind::DriveRelative { drive, path } => format!("{drive}:{path}"),
+            WindowsPathKind::RootedCurrentDrive { path } => format!("\\{path}"),
+            WindowsPathKind::Relative { path } => path.clone(),
+            WindowsPathKind::Unc {
+                server,
+                share,
+                path,
+            } => {
+                format!("\\\\{server}\\{share}\\{path}")
+            }
+            WindowsPathKind::VerbatimDrive { drive, path } => format!("\\\\?\\{drive}:\\{path}"),
+            WindowsPathKind::VerbatimUnc {
+                server,
+                share,
+                path,
+            } => {
+                format!("\\\\?\\UNC\\{server}\\{share}\\{path}")
+            }
+            WindowsPathKind::Device { path } => format!("\\.\\{path}"),
+        }
+    }
+}
+
+/// Split a `name:stream` ADS suffix off a path body.  Returns
+/// `(body, Some(stream))` when the LAST colon-separated component is a
+/// valid stream name (not a drive letter colon, not part of a verbatim
+/// prefix, and not a URL scheme / IPv6 form).
+fn split_ads_suffix(path: &str) -> (String, Option<String>) {
+    // The drive-letter colon (C:) and verbatim-prefix colons must not be
+    // treated as ADS separators.  The ADS separator is the FIRST colon that
+    // is not a drive/prefix colon; anything after it (including `:$DATA`)
+    // belongs to the stream specification.
+    let colon_positions: Vec<usize> = path.match_indices(':').map(|(i, _)| i).collect();
+    for &pos in &colon_positions {
+        if is_drive_letter_colon(path, pos) {
+            continue;
+        }
+        // Found the ADS separator: base = path[..pos], stream = the rest.
+        let stream = path[pos + 1..].to_string();
+        let name = stream.split(':').next().unwrap_or(&stream).to_string();
+        if name.is_empty() {
+            return (path.to_string(), None);
+        }
+        return (path[..pos].to_string(), Some(name));
+    }
+    (path.to_string(), None)
+}
+
+/// Parse a Windows path into its syntactic kind plus an optional ADS suffix.
+/// This is the single classification point: every path form (drive absolute,
+/// drive relative, rooted-current-drive, relative, UNC, verbatim drive,
+/// verbatim UNC, device namespace) is distinguished here, BEFORE any
+/// translation into the host filesystem.
+pub fn parse_windows_path(path: &str) -> WindowsPath {
+    let trimmed = path.trim();
+    let (body, ads_stream) = split_ads_suffix(trimmed);
+    let kind = if let Some(rest) = body.strip_prefix("\\\\?\\") {
+        // Verbatim: no normalization, no translation.  `\\?\\C:\\x`
+        // vs `\\?\\UNC\\server\\share\\x` vs `\\?\x`.
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            let mut parts = unc.splitn(3, '\\');
+            let server = parts.next().unwrap_or_default().to_string();
+            let share = parts.next().unwrap_or_default().to_string();
+            let tail = parts.next().unwrap_or_default().to_string();
+            WindowsPathKind::VerbatimUnc {
+                server,
+                share,
+                path: tail,
+            }
+        } else if let Some(drive) = rest.chars().next()
+            && rest.len() >= 2
+            && rest.as_bytes()[1] == b':'
+        {
+            let path = rest[2..].trim_start_matches('\\').to_string();
+            WindowsPathKind::VerbatimDrive { drive, path }
+        } else {
+            WindowsPathKind::Device {
+                path: rest.to_string(),
+            }
+        }
+    } else if let Some(rest) = body.strip_prefix("\\.\\") {
+        // Device namespace: no normalization, no translation.
+        WindowsPathKind::Device {
+            path: rest.to_string(),
+        }
+    } else if let Some(rest) = body.strip_prefix("\\\\") {
+        // UNC: \\server\\share\\...
+        let mut parts = rest.splitn(3, '\\');
+        let server = parts.next().unwrap_or_default().to_string();
+        let share = parts.next().unwrap_or_default().to_string();
+        let tail = parts.next().unwrap_or_default().to_string();
+        WindowsPathKind::Unc {
+            server,
+            share,
+            path: tail,
+        }
+    } else if let Some(drive) = body.chars().next()
+        && body.len() >= 2
+        && body.as_bytes()[1] == b':'
+    {
+        let rest = &body[2..];
+        if let Some(tail) = rest.strip_prefix('\\') {
+            // Strip the single root backslash (the reconstruction adds it
+            // back): C:\\x -> path "x".
+            WindowsPathKind::DriveAbsolute {
+                drive,
+                path: tail.to_string(),
+            }
+        } else {
+            WindowsPathKind::DriveRelative {
+                drive,
+                path: rest.to_string(),
+            }
+        }
+    } else if let Some(tail) = body.strip_prefix('\\') {
+        WindowsPathKind::RootedCurrentDrive {
+            path: tail.to_string(),
+        }
+    } else {
+        WindowsPathKind::Relative {
+            path: body.to_string(),
+        }
+    };
+    WindowsPath { kind, ads_stream }
+}
+
+/// Parse a path that may contain NTFS Alternate Data Stream syntax/// Parse a path that may contain NTFS Alternate Data Stream syntax
 /// (e.g., `file.exe:Zone.Identifier:$DATA` or `C:\path\file.exe:Zone.Identifier`)
 /// into the base file path and an optional stream descriptor.
 ///
 /// Returns `(file_path, Some(stream))` if an ADS component is found,
 /// or `(original_path, None)` if there is no stream.
 pub fn parse_ntfs_path(path: &str) -> (String, Option<AlternateStreamName>) {
-    let path = path.trim();
-
-    // Handle empty paths
-    if path.is_empty() {
-        return (String::new(), None);
-    }
-
-    // Find the first colon that could be a stream separator.
-    // A colon after a drive letter (e.g., "C:\...") is NOT a stream separator.
-    // We need to find a colon that appears after the drive letter/prefix portion.
-    //
-    // Strategy: find the position of the last colon, then work backwards.
-    // If there's a ":" that is part of a drive spec (index 1 like "C:"),
-    // it's not a stream separator.
-
-    let _bytes = path.as_bytes();
-
-    // Find all colon positions
-    let colon_positions: Vec<usize> = path.match_indices(':').map(|(i, _)| i).collect();
-
-    if colon_positions.is_empty() {
-        return (path.to_string(), None);
-    }
-
-    // Determine which colons are drive letters (position 1, like "C:" or "D:")
-    // and which could be stream separators.
-    //
-    // For ADS paths like:
-    //   "file.exe:Zone.Identifier"          → colon at index 8
-    //   "file.exe:Zone.Identifier:$DATA"    → colons at 8 and 24
-    //   "C:\path\file.exe:Zone.Identifier"  → colons at 1 and 21
-    //   "C:\path\file.exe:Zone.Identifier:$DATA" → colons at 1, 21, 37
-
-    // The stream separator is the colon after the file path.
-    // Work backwards from the end to find the stream separator.
-
-    // Case 1: No drive letter, single colon: "file.exe:Zone.Identifier"
-    if colon_positions.len() == 1 {
-        let pos = colon_positions[0];
-        if is_drive_letter_colon(path, pos) {
-            return (path.to_string(), None);
+    // Classify the path once (drive/UNC/verbatim/device/relative + ADS
+    // suffix); the base is the path WITHOUT the stream, so verbatim drive
+    // colons and drive-letter colons are never mis-split.
+    let parsed = parse_windows_path(path);
+    let base = parsed.to_base_string();
+    match parsed.ads_stream {
+        Some(stream_name) => {
+            let (name, stream_type) = parse_stream_spec(&stream_name);
+            (
+                base.clone(),
+                Some(AlternateStreamName {
+                    file_path: base,
+                    stream_name: name,
+                    stream_type,
+                }),
+            )
         }
-        let file_path = path[..pos].to_string();
-        let stream_spec = path[pos + 1..].trim();
-        let (stream_name, stream_type) = parse_stream_spec(stream_spec);
-        return (
-            file_path.clone(),
-            Some(AlternateStreamName {
-                file_path,
-                stream_name,
-                stream_type,
-            }),
-        );
+        None => (base, None),
     }
-
-    // Case 2: Multiple colons
-    // The leftmost non-drive colon is the stream separator (between file and stream).
-    // Any subsequent colons separate stream name from stream type (e.g., `Zone.Identifier:$DATA`).
-    //
-    // Examples:
-    //   "file.exe:Zone.Identifier:$DATA"       → colons at 7, 22; stream sep = 7
-    //   "C:\path\file.exe:Zone.Identifier:$DATA" → colons at 1, 23, 38; stream sep = 23 (1 is drive)
-    //   "D:\save.dat:backup:$DATA"              → colons at 1, 14, 21; stream sep = 14 (1 is drive)
-
-    // Find the first non-drive colon scanning left-to-right.
-    for &pos in &colon_positions {
-        if is_drive_letter_colon(path, pos) {
-            continue;
-        }
-        // This colon is the stream separator
-        let file_path = path[..pos].to_string();
-        let stream_spec = path[pos + 1..].trim();
-        let (stream_name, stream_type) = parse_stream_spec(stream_spec);
-        return (
-            file_path.clone(),
-            Some(AlternateStreamName {
-                file_path,
-                stream_name,
-                stream_type,
-            }),
-        );
-    }
-
-    // No suitable stream separator found — all colons are drive letters
-    (path.to_string(), None)
 }
 
 /// Check if a colon at a given position is part of a Windows drive letter (e.g., `C:`).
@@ -1985,6 +2092,98 @@ mod tests {
         let (base, ads) = parse_ntfs_path("C:\\Steam\\file.txt");
         assert_eq!(base, "C:\\Steam\\file.txt");
         assert!(ads.is_none());
+    }
+
+    #[test]
+    fn windows_path_classifier_distinguishes_all_forms() {
+        use WindowsPathKind::*;
+        // Drive absolute.
+        let p = parse_windows_path("C:\\Users\\x");
+        assert_eq!(
+            p.kind,
+            DriveAbsolute {
+                drive: 'C',
+                path: "Users\\x".into()
+            }
+        );
+        assert_eq!(p.to_base_string(), "C:\\Users\\x");
+        assert_eq!(p.ads_stream, None);
+        // Drive relative.
+        let p = parse_windows_path("C:foo");
+        assert_eq!(
+            p.kind,
+            DriveRelative {
+                drive: 'C',
+                path: "foo".into()
+            }
+        );
+        assert_eq!(p.to_base_string(), "C:foo");
+        // Rooted current drive.
+        let p = parse_windows_path("\\foo");
+        assert_eq!(p.kind, RootedCurrentDrive { path: "foo".into() });
+        // Relative.
+        let p = parse_windows_path("a\\b.txt");
+        assert_eq!(
+            p.kind,
+            Relative {
+                path: "a\\b.txt".into()
+            }
+        );
+        // UNC.
+        let p = parse_windows_path("\\\\server\\share\\dir\\f");
+        assert_eq!(
+            p.kind,
+            Unc {
+                server: "server".into(),
+                share: "share".into(),
+                path: "dir\\f".into()
+            }
+        );
+        assert_eq!(p.to_base_string(), "\\\\server\\share\\dir\\f");
+        // Verbatim drive: the drive colon must not split, and the base must
+        // round-trip exactly.
+        let p = parse_windows_path("\\\\?\\C:\\Steam\\x.txt");
+        assert_eq!(
+            p.kind,
+            VerbatimDrive {
+                drive: 'C',
+                path: "Steam\\x.txt".into()
+            }
+        );
+        assert_eq!(p.to_base_string(), "\\\\?\\C:\\Steam\\x.txt");
+        assert_eq!(p.ads_stream, None);
+        // Verbatim UNC.
+        let p = parse_windows_path("\\\\?\\UNC\\s\\sh\\p");
+        assert_eq!(
+            p.kind,
+            VerbatimUnc {
+                server: "s".into(),
+                share: "sh".into(),
+                path: "p".into()
+            }
+        );
+        // Device namespace.
+        let p = parse_windows_path("\\.\\pipe\\steam_service");
+        assert_eq!(
+            p.kind,
+            Device {
+                path: "pipe\\steam_service".into()
+            }
+        );
+        // ADS on the classified forms.
+        let p = parse_windows_path("C:\\dir\\f.exe:Zone.Identifier");
+        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
+        assert_eq!(p.to_base_string(), "C:\\dir\\f.exe");
+        let p = parse_windows_path("\\\\?\\C:\\f.txt:Zone.Identifier");
+        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
+        assert_eq!(p.to_base_string(), "\\\\?\\C:\\f.txt");
+        let p = parse_windows_path("\\\\server\\share\\f:Zone.Identifier");
+        assert_eq!(p.ads_stream.as_deref(), Some("Zone.Identifier"));
+        assert_eq!(p.to_base_string(), "\\\\server\\share\\f");
+        // The drive-relative form has no ADS even with a colon after C:.
+        let p = parse_windows_path("C:file.txt");
+        assert_eq!(p.ads_stream, None);
+        assert_eq!(p.to_base_string(), "C:file.txt");
     }
 
     fn parse_ntfs_path_simple() {
