@@ -1,22 +1,39 @@
 //! Import coverage report system (Gap 7.1).
 //!
-//! Scans all registered DLL exports in the PE runtime, cross-references
-//! with known Steam.exe imports, and produces a JSON report showing
-//! total imports, covered imports, missing imports, and coverage
-//! percentage per DLL.
+//! Two paths live here:
+//!
+//! 1. **Regression snapshot** — the legacy hand-curated Steam.exe import list
+//!    ([`steam_exe_imports_regression_snapshot`]) and the report generators
+//!    built on it (`generate_import_coverage_report*`).  These are kept ONLY
+//!    as a regression snapshot of the historical report format.
+//! 2. **Canonical fixture-derived coverage** —
+//!    [`coverage_for_steam_fixture`] parses the ACTUAL Steam executable's
+//!    import tables (via [`crate::pe::parse_from_file`]), classifies every
+//!    import against the canonical [`ThunkMetadata`]
+//!    ([`crate::host_thunks::THUNK_METADATA`]), and emits a structured
+//!    report (JSON-serializable) with the implementation quality and
+//!    Steam-criticality of each import.
 
+use crate::host_thunks::ImplementationLevel;
 use crate::pe::{ExportSymbol, ImportSymbol, ParsedPe};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// Known Steam.exe imports (representative set from real Steam client)
+// Known Steam.exe imports — REGRESSION SNAPSHOT ONLY
 // ---------------------------------------------------------------------------
 
-/// Returns the canonical list of DLLs that Steam.exe imports from,
-/// along with the function names it requires from each DLL.
-pub fn steam_exe_imports() -> BTreeMap<String, Vec<String>> {
+/// **Regression snapshot.**  Hand-curated representative list of DLLs that
+/// Steam.exe imports from, along with the function names it requires from
+/// each DLL.
+///
+/// This list is kept ONLY as a regression snapshot of the legacy report
+/// format (`generate_import_coverage_report*`).  The canonical, authoritative
+/// coverage path is [`coverage_for_steam_fixture`], which derives imports
+/// from the real Steam.exe binary instead of a hand-maintained copy.
+pub fn steam_exe_imports_regression_snapshot() -> BTreeMap<String, Vec<String>> {
     let mut m = BTreeMap::new();
 
     // kernel32.dll
@@ -974,14 +991,18 @@ pub struct ImportCoverageReport {
     pub entries: Vec<ImportCoverageEntry>,
 }
 
-/// Generate an import coverage report by cross-referencing known Steam.exe
-/// imports with the PE runtime's registered export tables.
+/// Generate an import coverage report by cross-referencing the regression
+/// snapshot of known Steam.exe imports with the PE runtime's registered
+/// export tables.
 ///
 /// "Covered" is derived from the authoritative runtime export registry
 /// ([`crate::pe_runtime::export_tables`]), so the report reflects the actual
 /// state of the implemented API surface instead of a hand-maintained copy.
+///
+/// Kept as a regression snapshot: the canonical fixture-derived coverage is
+/// [`coverage_for_steam_fixture`].
 pub fn generate_import_coverage_report() -> ImportCoverageReport {
-    let steam_imports = steam_exe_imports();
+    let steam_imports = steam_exe_imports_regression_snapshot();
 
     // Pre-index the runtime's registered export names (lowercased) per DLL
     // so each import lookup is O(1) instead of a linear scan.
@@ -1394,9 +1415,247 @@ impl DllCoverageReportBuilder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical fixture-derived Steam import coverage
+// ---------------------------------------------------------------------------
+
+/// A single Steam.exe import classified against the canonical thunk metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteamImportEntry {
+    /// SHA-256 of the Steam executable the import was parsed from.
+    pub steam_sha256: String,
+    /// Version info of the Steam executable (PE `FileVersion`), if present.
+    pub image_version: Option<String>,
+    /// DLL the import comes from (lowercase, e.g. `"kernel32.dll"`).
+    pub dll: String,
+    /// Import name as resolved from the import table (ordinal-only imports
+    /// are resolved to their canonical name where the runtime maps them,
+    /// otherwise `ordinal#N`).
+    pub import: String,
+    /// Implementation quality of the host thunk for this import
+    /// ([`ImplementationLevel`]).
+    pub implementation: ImplementationLevel,
+    /// Whether this import is Steam-bootstrap-critical.
+    pub steam_critical: bool,
+    /// Whether this import was actually invoked in the E2E run (false unless
+    /// the invoked-set flag/parameter was supplied).
+    pub invoked_in_e2e: bool,
+}
+
+/// Fixture-derived Steam import coverage report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SteamCoverageReport {
+    /// Path of the Steam executable the report was derived from.
+    pub steam_exe_path: String,
+    /// SHA-256 of the Steam executable.
+    pub steam_sha256: String,
+    /// PE version info of the Steam executable, if present.
+    pub image_version: Option<String>,
+    /// Total number of imports in the executable.
+    pub total_imports: usize,
+    /// Per-implementation-level import counts (Implemented/Partial/Stub/Unsupported).
+    pub by_implementation: BTreeMap<String, usize>,
+    /// All classified imports.
+    pub entries: Vec<SteamImportEntry>,
+    /// Steam-critical imports whose implementation is `Stub` or `Unsupported`.
+    ///
+    /// The release requirement is that no *runtime-reached* Steam-critical
+    /// API is `Stub` or `Unsupported`; this field lists the candidates that
+    /// would fail the gate if they are ever invoked.
+    pub critical_not_working: Vec<SteamImportEntry>,
+    /// Whether the invoked-in-E2E flag was supplied for this report.
+    pub invoked_in_e2e: bool,
+}
+
+impl SteamCoverageReport {
+    /// Steam-critical imports that were actually invoked in the E2E run and
+    /// whose implementation is `Stub` or `Unsupported` — the exact set the
+    /// release gate asserts to be empty.
+    pub fn invoked_critical_violations(&self) -> Vec<&SteamImportEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.invoked_in_e2e
+                    && entry.steam_critical
+                    && !entry.implementation.has_working_implementation()
+            })
+            .collect()
+    }
+}
+
+/// Generate the fixture-derived Steam import coverage report.
+///
+/// Parses the ACTUAL Steam executable's import tables via
+/// [`crate::pe::parse_from_file`], classifies every import against the
+/// canonical [`ThunkMetadata`] table
+/// ([`crate::host_thunks::THUNK_METADATA`]), and emits a structured report.
+///
+/// Every entry carries `invoked_in_e2e: false` unless an invoked set is
+/// supplied via [`coverage_for_steam_fixture_with_invoked`].
+pub fn coverage_for_steam_fixture(
+    steam_exe_path: &Path,
+) -> crate::error::AppResult<SteamCoverageReport> {
+    coverage_for_steam_fixture_with_invoked(steam_exe_path, &[])
+}
+
+/// Generate the fixture-derived Steam import coverage report with an invoked
+/// set.
+///
+/// `invoked` lists the API names that were actually dispatched during an E2E
+/// run (e.g. from [`crate::pe_runtime::PeExecutionResult::trace_events`] via
+/// [`invoked_api_names_from_trace`]); matching entries get
+/// `invoked_in_e2e: true`.
+pub fn coverage_for_steam_fixture_with_invoked(
+    steam_exe_path: &Path,
+    invoked: &[String],
+) -> crate::error::AppResult<SteamCoverageReport> {
+    use crate::pe::ImportSymbol;
+
+    let parsed = crate::pe::parse_from_file(steam_exe_path)?;
+    let steam_sha256 = crate::util::sha256_file(steam_exe_path)?;
+    let image_version = parsed.version_info.file_version.clone();
+    let invoked_set: std::collections::HashSet<String> = invoked
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+
+    let mut entries = Vec::new();
+    for descriptor in parsed.imports.iter().chain(parsed.delay_imports.iter()) {
+        let dll = descriptor.dll_name.to_ascii_lowercase();
+        for import in &descriptor.imports {
+            let name = match &import.symbol {
+                ImportSymbol::ByName { name, .. } => name.clone(),
+                ImportSymbol::ByOrdinal { ordinal } => {
+                    crate::host_thunks::ordinal_import_name(&dll, *ordinal)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("ordinal#{ordinal}"))
+                }
+            };
+            let (implementation, steam_critical) =
+                crate::pe_runtime::import_implementation_quality(&dll, &import.symbol);
+            let invoked_in_e2e = invoked_set.contains(&name.to_ascii_lowercase());
+            entries.push(SteamImportEntry {
+                steam_sha256: steam_sha256.clone(),
+                image_version: image_version.clone(),
+                dll: dll.clone(),
+                import: name,
+                implementation,
+                steam_critical,
+                invoked_in_e2e,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.dll.cmp(&b.dll).then_with(|| a.import.cmp(&b.import)));
+
+    let mut by_implementation = BTreeMap::new();
+    for entry in &entries {
+        let label = match entry.implementation {
+            ImplementationLevel::Implemented => "Implemented",
+            ImplementationLevel::Partial => "Partial",
+            ImplementationLevel::Stub => "Stub",
+            ImplementationLevel::Unsupported => "Unsupported",
+        };
+        *by_implementation.entry(label.to_string()).or_insert(0) += 1;
+    }
+
+    let critical_not_working = entries
+        .iter()
+        .filter(|entry| entry.steam_critical && !entry.implementation.has_working_implementation())
+        .cloned()
+        .collect();
+
+    Ok(SteamCoverageReport {
+        steam_exe_path: steam_exe_path.display().to_string(),
+        steam_sha256,
+        image_version,
+        total_imports: entries.len(),
+        by_implementation,
+        entries,
+        critical_not_working,
+        invoked_in_e2e: !invoked_set.is_empty(),
+    })
+}
+
+/// Extract the set of invoked API names from a PE runtime trace.
+///
+/// Each trace event's `call_id` is the dispatched API name (e.g.
+/// `"CreateFileW"`); duplicate calls collapse into a single name so the set
+/// can be fed to [`coverage_for_steam_fixture_with_invoked`].
+pub fn invoked_api_names_from_trace(trace_events: &[crate::trace::TraceEvent]) -> Vec<String> {
+    let mut names: Vec<String> = trace_events
+        .iter()
+        .map(|event| event.call_id.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Generate the fixture-derived coverage report as pretty JSON.
+pub fn coverage_for_steam_fixture_json(steam_exe_path: &Path) -> crate::error::AppResult<Value> {
+    let report = coverage_for_steam_fixture(steam_exe_path)?;
+    serde_json::to_value(&report).map_err(|error| {
+        crate::error::AppError::new(
+            crate::reason::ReasonCode::RcDiagnosticsExportFailed,
+            format!("failed to serialize Steam coverage report: {error}"),
+        )
+    })
+}
+
+/// Generate a structured human-readable rendering of the fixture-derived
+/// coverage report (the section40-style telemetry view).
+pub fn coverage_for_steam_fixture_text(steam_exe_path: &Path) -> crate::error::AppResult<String> {
+    let report = coverage_for_steam_fixture(steam_exe_path)?;
+    let mut lines = Vec::new();
+    lines.push("═══════════════════════════════════════════════════════════════".to_string());
+    lines.push("      Steam.exe Import Coverage (fixture-derived)              ".to_string());
+    lines.push("═══════════════════════════════════════════════════════════════".to_string());
+    lines.push(format!("exe:     {}", report.steam_exe_path));
+    lines.push(format!("sha256:  {}", report.steam_sha256));
+    lines.push(format!(
+        "version: {}",
+        report.image_version.as_deref().unwrap_or("<none>")
+    ));
+    lines.push(format!("imports: {}", report.total_imports));
+    lines.push(format!(
+        "invoked-in-e2e flag: {}",
+        if report.invoked_in_e2e { "yes" } else { "no" }
+    ));
+    lines.push(String::new());
+    lines.push(format!("{:<14} {:>6}", "Implementation", "Count"));
+    lines.push("─".repeat(24));
+    for label in ["Implemented", "Partial", "Stub", "Unsupported"] {
+        lines.push(format!(
+            "{:<14} {:>6}",
+            label,
+            report.by_implementation.get(label).copied().unwrap_or(0)
+        ));
+    }
+    lines.push(String::new());
+    if report.critical_not_working.is_empty() {
+        lines.push(
+            "No Steam-critical import is Stub/Unsupported on the static surface.".to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "Steam-critical imports NOT working ({}):",
+            report.critical_not_working.len()
+        ));
+        for entry in &report.critical_not_working {
+            lines.push(format!(
+                "  - {}!{} [{:?}]",
+                entry.dll, entry.import, entry.implementation
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_coverage_report_is_not_empty() {
@@ -1435,7 +1694,7 @@ mod tests {
 
     #[test]
     fn test_steam_exe_imports_contains_known_dlls() {
-        let imports = steam_exe_imports();
+        let imports = steam_exe_imports_regression_snapshot();
         assert!(imports.contains_key("kernel32.dll"));
         assert!(imports.contains_key("user32.dll"));
         assert!(imports.contains_key("gdi32.dll"));
@@ -1447,7 +1706,7 @@ mod tests {
 
     #[test]
     fn test_steam_exe_imports_are_unique_and_attributed() {
-        let imports = steam_exe_imports();
+        let imports = steam_exe_imports_regression_snapshot();
         for (dll, functions) in &imports {
             let mut seen = std::collections::HashSet::new();
             for func in functions {
@@ -1504,7 +1763,7 @@ mod tests {
 
         let mut expected_total = 0usize;
         let mut expected_covered = 0usize;
-        for (dll, functions) in steam_exe_imports() {
+        for (dll, functions) in steam_exe_imports_regression_snapshot() {
             expected_total += functions.len();
             let exports = registry.get(&dll);
             for func in &functions {
@@ -1526,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_kernel32_has_core_functions() {
-        let imports = steam_exe_imports();
+        let imports = steam_exe_imports_regression_snapshot();
         let kernel32 = imports.get("kernel32.dll").unwrap();
         assert!(kernel32.contains(&"GetProcAddress".to_string()));
         assert!(kernel32.contains(&"LoadLibraryA".to_string()));
@@ -1584,5 +1843,192 @@ mod tests {
         assert_eq!(report.covered, 2);
         assert_eq!(report.missing, 1);
         assert!((report.coverage_percent - 66.66666666666667).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------
+    // Canonical fixture-derived coverage tests
+    // -----------------------------------------------------------------
+
+    /// Path to the tracked Steam.exe fixture (committed to the repo).
+    fn tracked_steam_fixture() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("ges")
+            .join("steam")
+            .join("drive_c")
+            .join("Steam")
+            .join("Steam.exe")
+    }
+
+    #[test]
+    fn test_tracked_steam_fixture_parses() {
+        let path = tracked_steam_fixture();
+        assert!(
+            path.is_file(),
+            "tracked Steam fixture missing at {}",
+            path.display()
+        );
+        let pe = crate::pe::parse_from_file(&path).expect("parse Steam.exe");
+        assert!(pe.machine != 0, "PE machine field must be set");
+        assert!(
+            !pe.imports.is_empty(),
+            "Steam.exe must import from at least one DLL"
+        );
+    }
+
+    #[test]
+    fn test_coverage_for_steam_fixture_covers_all_imports() {
+        let report = coverage_for_steam_fixture(&tracked_steam_fixture()).expect("coverage report");
+        assert!(
+            report.total_imports > 300,
+            "unexpectedly small import surface"
+        );
+        assert!(!report.steam_sha256.is_empty());
+        assert!(
+            report.by_implementation.values().sum::<usize>() == report.total_imports,
+            "by_implementation must account for every import"
+        );
+        // The fixture's imports must all be classified (no import may fall
+        // through to an unclassified default).
+        assert!(
+            report.entries.iter().all(|e| !e.import.is_empty()),
+            "every entry must carry an import name"
+        );
+        // No entry may be marked invoked without the flag.
+        assert!(
+            report.entries.iter().all(|e| !e.invoked_in_e2e),
+            "invoked_in_e2e must be false without an invoked set"
+        );
+    }
+
+    #[test]
+    fn test_coverage_for_steam_fixture_json_roundtrip() {
+        let json = coverage_for_steam_fixture_json(&tracked_steam_fixture()).expect("json report");
+        let obj = json.as_object().expect("object");
+        for key in [
+            "steam_exe_path",
+            "steam_sha256",
+            "image_version",
+            "total_imports",
+            "by_implementation",
+            "entries",
+            "critical_not_working",
+            "invoked_in_e2e",
+        ] {
+            assert!(obj.contains_key(key), "missing report field {key}");
+        }
+        let entries = obj["entries"].as_array().expect("entries array");
+        let first = entries.first().expect("at least one entry");
+        for key in [
+            "steam_sha256",
+            "image_version",
+            "dll",
+            "import",
+            "implementation",
+            "steam_critical",
+            "invoked_in_e2e",
+        ] {
+            assert!(
+                first.as_object().unwrap().contains_key(key),
+                "missing entry field {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coverage_for_steam_fixture_with_invoked_marks_entries() {
+        let invoked = vec!["CreateFileW".to_string(), "GetProcAddress".to_string()];
+        let report = coverage_for_steam_fixture_with_invoked(&tracked_steam_fixture(), &invoked)
+            .expect("coverage report");
+        assert!(report.invoked_in_e2e);
+        let marked: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|entry| entry.invoked_in_e2e)
+            .map(|entry| entry.import.as_str())
+            .collect();
+        assert_eq!(marked, vec!["CreateFileW", "GetProcAddress"]);
+        // No violation may be reported for these two implemented APIs.
+        assert!(
+            report.invoked_critical_violations().is_empty(),
+            "implemented APIs must not violate the release gate"
+        );
+    }
+
+    #[test]
+    fn test_invoked_api_names_from_trace_dedups() {
+        let events = vec![
+            crate::trace::TraceEvent {
+                event_index: 1,
+                category: "process".to_string(),
+                call_id: "GetModuleHandleW".to_string(),
+                parameters: BTreeMap::new(),
+                return_value: json!(0),
+                get_last_error: None,
+                side_effect_hashes: vec![],
+            },
+            crate::trace::TraceEvent {
+                event_index: 2,
+                category: "process".to_string(),
+                call_id: "GetModuleHandleW".to_string(),
+                parameters: BTreeMap::new(),
+                return_value: json!(0),
+                get_last_error: None,
+                side_effect_hashes: vec![],
+            },
+            crate::trace::TraceEvent {
+                event_index: 3,
+                category: "file".to_string(),
+                call_id: "CreateFileW".to_string(),
+                parameters: BTreeMap::new(),
+                return_value: json!(1),
+                get_last_error: None,
+                side_effect_hashes: vec![],
+            },
+        ];
+        let names = invoked_api_names_from_trace(&events);
+        assert_eq!(
+            names,
+            vec!["CreateFileW".to_string(), "GetModuleHandleW".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_coverage_for_steam_fixture_text_is_structured() {
+        let text = coverage_for_steam_fixture_text(&tracked_steam_fixture()).expect("text report");
+        assert!(text.contains("Steam.exe Import Coverage (fixture-derived)"));
+        assert!(text.contains("sha256:"));
+        assert!(text.contains("Implemented"));
+        assert!(text.contains("Unsupported"));
+    }
+
+    #[test]
+    fn test_critical_not_working_invariant_and_release_gate() {
+        let report = coverage_for_steam_fixture(&tracked_steam_fixture()).expect("coverage report");
+        // Every entry in critical_not_working must be steam-critical with a
+        // non-working implementation.
+        assert!(report.critical_not_working.iter().all(
+            |entry| entry.steam_critical && !entry.implementation.has_working_implementation()
+        ));
+        // The tracked fixture's bootstrap-critical surface is fully working:
+        // the bootstrapper does not import any steam-critical API that lacks
+        // a host thunk, so the static surface has no violations and the
+        // release gate (over the empty invoked set) is trivially satisfied.
+        assert!(
+            report.critical_not_working.is_empty(),
+            "unexpected static violations: {:#?}",
+            report.critical_not_working
+        );
+        assert!(
+            report.invoked_critical_violations().is_empty(),
+            "invoked critical violations must be empty"
+        );
+        // Sanity: steam-critical entries ARE present and marked.
+        let create_file = report
+            .entries
+            .iter()
+            .find(|entry| entry.import == "CreateFileW")
+            .expect("CreateFileW import");
+        assert!(create_file.steam_critical);
+        assert_eq!(create_file.implementation, ImplementationLevel::Implemented);
     }
 }

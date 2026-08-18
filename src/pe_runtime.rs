@@ -29,6 +29,7 @@ use crate::gfx::{
     BufferRole, DescriptorHeapType, DxgiFormat, ResourceState, ResourceUsageHint, SwapchainDesc,
     ViewDescriptor,
 };
+use crate::host_thunks::{ImplementationLevel, lookup_thunk_metadata, ordinal_import_name};
 #[cfg(test)]
 use crate::host_thunks::{LastErrorBehavior, Subsystem, ThunkMetadata};
 use crate::host_thunks::{
@@ -71625,6 +71626,34 @@ pub fn is_import_supported(dll: &str, symbol: &ImportSymbol) -> bool {
     !matches!(thunk, HostThunk::Unsupported { .. })
 }
 
+/// Diagnostics: classify a (dll, symbol) import against the canonical thunk
+/// implementation-quality metadata ([`ThunkMetadata`] /
+/// [`crate::host_thunks::THUNK_METADATA`]).
+///
+/// Returns the [`ImplementationLevel`] and the Steam-bootstrap-critical flag
+/// for the import.  Ordinal-only imports are resolved through
+/// [`ordinal_import_name`]; imports with no metadata entry are classified
+/// [`ImplementationLevel::Unsupported`] (no host thunk / no metadata).
+///
+/// This is the metadata-consuming diagnostic used by the fixture-derived
+/// import coverage ([`crate::import_coverage::coverage_for_steam_fixture`])
+/// and by the section24 integration model.
+pub fn import_implementation_quality(
+    dll: &str,
+    symbol: &ImportSymbol,
+) -> (ImplementationLevel, bool) {
+    let api = match symbol {
+        ImportSymbol::ByName { name, .. } => name.clone(),
+        ImportSymbol::ByOrdinal { ordinal } => ordinal_import_name(dll, *ordinal)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ordinal#{ordinal}")),
+    };
+    match lookup_thunk_metadata(dll, &api) {
+        Some(metadata) => (metadata.implementation, metadata.steam_critical),
+        None => (ImplementationLevel::Unsupported, false),
+    }
+}
+
 fn resolve_imports_for_runtime(
     image: &pe::ParsedPe,
     resolver: &ApiSetResolver,
@@ -86791,10 +86820,13 @@ mod tests {
         // Verify that every HostThunk variant has a well-defined subsystem
         // via the metadata module
         let _meta = ThunkMetadata {
+            dll: "kernel32.dll",
             name: "GetVersion",
             subsystem: Subsystem::Kernel,
             x86_arg_bytes: 0,
             last_error: LastErrorBehavior::Preserves,
+            implementation: ImplementationLevel::Implemented,
+            steam_critical: true,
         };
         assert_eq!(_meta.name, "GetVersion");
         assert_eq!(_meta.subsystem, Subsystem::Kernel);
