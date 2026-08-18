@@ -86,6 +86,10 @@ pub struct RunnerOutcome {
     pub trace_path: PathBuf,
     pub log_path: PathBuf,
     pub canonical_output: CanonicalTestOutput,
+    /// Steam bootstrap JSON artifact for this run (Steam.exe jobs only).
+    pub steam_artifact_json: Option<PathBuf>,
+    /// Steam bootstrap log artifact for this run (Steam.exe jobs only).
+    pub steam_artifact_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -114,6 +118,10 @@ where
 }
 
 pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
+    // Run identity: generated ONCE at job start and carried through the whole
+    // run, so every artifact of this run shares one id and two concurrent
+    // workers can never collide on filenames.
+    let run_id = generate_run_id(job);
     let mut ge = match GameEnvironment::from_root(job.ge_root.clone()) {
         Ok(ge) => ge,
         Err(e) => {
@@ -292,6 +300,8 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             trace_path,
             log_path,
             canonical_output,
+            steam_artifact_json: None,
+            steam_artifact_log: None,
         });
     }
 
@@ -378,9 +388,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         // ONLY for actual Steam.exe executions (the basename helper, never
         // substring matching — a `foo-Steam.exe.backup` must not produce a
         // Steam artifact).  Instrumentation only — a failed artifact write
-        // is reported but never fails the run.
-        let _steam_artifact_paths = if is_steam_executable(&job.program) {
-            match write_steam_bootstrap_artifacts(&ge, &pe_output, job) {
+        // is reported but never fails the run.  The paths are exposed on the
+        // outcome so steam:launch and CI can point at the exact evidence of
+        // this run.
+        let steam_artifact_paths = if is_steam_executable(&job.program) {
+            match write_steam_bootstrap_artifacts(&ge, &pe_output, job, &run_id) {
                 Ok(paths) => Some(paths),
                 Err(error) => {
                     eprintln!(
@@ -448,6 +460,12 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             trace_path,
             log_path,
             canonical_output,
+            steam_artifact_json: steam_artifact_paths
+                .as_ref()
+                .map(|paths| paths.json_path.clone()),
+            steam_artifact_log: steam_artifact_paths
+                .as_ref()
+                .map(|paths| paths.log_path.clone()),
         });
     }
 
@@ -571,6 +589,8 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         trace_path,
         log_path,
         canonical_output,
+        steam_artifact_json: None,
+        steam_artifact_log: None,
     })
 }
 
@@ -1180,23 +1200,80 @@ fn guest_exceptions(status: &std::process::ExitStatus, program: &Path) -> Vec<Gu
 
 /// True when the job program basename is `steam.exe` (case-insensitive) —
 /// the only jobs that get the steam-bootstrap artifact.
-fn is_steam_executable(program: &Path) -> bool {
+pub fn is_steam_executable(program: &Path) -> bool {
     program
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case("steam.exe"))
 }
 
-/// The full JSON artifact payload: provenance, milestones, and the run
-/// summary lines.
+/// Run identity: UUID v4 for live (`!dtm`) runs; a DETERMINISTIC id for DTM
+/// runs (`sha256(short-sha + test-id)[..12]`) so parallel DTM workers never
+/// collide while staying reproducible.  Never timestamp-only.
+pub fn generate_run_id(job: &RunnerJob) -> String {
+    if job.dtm {
+        deterministic_run_id(&short_commit_sha(), &job.test_id)
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
+/// Deterministic DTM run id: `sha256(short-sha + test-id)[..12]`.
+pub fn deterministic_run_id(short_sha: &str, test_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(short_sha.as_bytes());
+    hasher.update(test_id.as_bytes());
+    hex::encode(hasher.finalize())[..12].to_string()
+}
+
+/// Build-time commit short sha (`unknown` when git is unavailable).
+fn short_commit_sha() -> String {
+    let provenance = crate::steam_milestones::RunProvenance::from_env();
+    if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
+        "unknown".to_string()
+    } else {
+        provenance.commit_sha.chars().take(8).collect()
+    }
+}
+
+/// Steam bootstrap artifact stem: `<short-sha>-<test-id>-<run-id>-steam-bootstrap`.
+/// The run id distinguishes concurrent runs at the same commit; the test id
+/// distinguishes jobs within a worker.
+pub fn steam_artifact_stem(short_sha: &str, test_id: &str, run_id: &str) -> String {
+    format!("{short_sha}-{test_id}-{run_id}-steam-bootstrap")
+}
+
+/// The full JSON artifact payload: identity, provenance, milestones,
+/// termination, and the run summary lines.
 #[derive(Debug, Clone, Serialize)]
-struct SteamBootstrapArtifact {
-    provenance: crate::steam_milestones::RunProvenance,
-    milestones: crate::steam_milestones::SteamMilestones,
-    last_thunk: Option<crate::steam_milestones::LastThunk>,
-    exit_code: i32,
-    instruction_count: Option<u64>,
-    network_summary: Vec<String>,
+pub struct SteamBootstrapArtifact {
+    pub provenance: crate::steam_milestones::RunProvenance,
+    /// The run id generated once at `execute_job` start (UUID v4 for live
+    /// runs, deterministic for DTM runs).
+    pub run_id: String,
+    /// The runner job's test id.
+    pub test_id: String,
+    /// The Steam executable path that was run.
+    pub program_path: String,
+    /// SHA-256 of the Steam executable that was run.
+    pub program_sha256: String,
+    pub milestones: crate::steam_milestones::SteamMilestones,
+    pub last_thunk: Option<crate::steam_milestones::LastThunk>,
+    pub exit_code: i32,
+    /// Authoritative termination reason (guest exit / harness deadline /
+    /// instruction budget / unsupported instruction / guest exception /
+    /// host error).
+    pub termination: pe_runtime::ExecutionTermination,
+    pub instruction_count: Option<u64>,
+    pub network_summary: Vec<String>,
+}
+
+/// Where the steam-bootstrap JSON and log artifacts were written.
+#[derive(Debug, Clone)]
+pub struct SteamArtifactPaths {
+    pub json_path: PathBuf,
+    pub log_path: PathBuf,
 }
 
 /// Instruction count from the run's `pe_runtime_steps` perf metric, if the
@@ -1221,44 +1298,63 @@ fn network_summary_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<
 
 /// Human-readable milestone block for the log artifact.
 fn milestones_log_lines(milestones: &crate::steam_milestones::SteamMilestones) -> Vec<String> {
+    use crate::steam_milestones::MilestoneEvidence;
     let steam = &milestones.steam;
     let graphics = &milestones.graphics;
     let threads = &milestones.threads;
     let failures = &milestones.first_failures;
     let mut lines = Vec::new();
     lines.push("milestones:".to_string());
-    lines.push(format!(
-        "  steam.bootstrap_started: {}",
-        steam.bootstrap_started
+    let evidence = |name: &str, value: &Option<MilestoneEvidence>| -> String {
+        match value {
+            Some(value) => {
+                let api = value.api.as_deref().unwrap_or("<none>");
+                let path = value.path.as_deref().unwrap_or("<none>");
+                let detail = value.detail.as_deref().unwrap_or("");
+                format!(
+                    "  steam.{name}: observed (api={api}, path={path}, guest_pc={:#x}, detail={detail})",
+                    value.guest_pc
+                )
+            }
+            None => format!("  steam.{name}: not observed"),
+        }
+    };
+    lines.push(evidence("bootstrap_started", &steam.bootstrap_started));
+    lines.push(evidence("manifest_opened", &steam.manifest_opened));
+    lines.push(evidence("manifest_full_read", &steam.manifest_full_read));
+    lines.push(evidence(
+        "package_writability_probe",
+        &steam.package_writability_probe,
+    ));
+    lines.push(evidence("client_main_started", &steam.client_main_started));
+    lines.push(evidence(
+        "webhelper_spawn_requested",
+        &steam.webhelper_spawn_requested,
+    ));
+    lines.push(evidence(
+        "webhelper_process_started",
+        &steam.webhelper_process_started,
     ));
     lines.push(format!(
-        "  steam.manifest_opened: {}",
-        steam.manifest_opened
+        "  steam.webhelper_spawn_requests: {}",
+        steam.webhelper_spawn_requests
     ));
     lines.push(format!(
-        "  steam.manifest_verified: {}",
-        steam.manifest_verified
+        "  steam.webhelper_processes_started: {}",
+        steam.webhelper_processes_started
     ));
-    lines.push(format!(
-        "  steam.package_writability_probe: {}",
-        steam.package_writability_probe
+    lines.push(evidence("cef_browser_created", &steam.cef_browser_created));
+    lines.push(evidence("cef_first_paint", &steam.cef_first_paint));
+    lines.push(evidence(
+        "first_software_paint",
+        &steam.first_software_paint,
     ));
-    lines.push(format!(
-        "  steam.client_main_started: {}",
-        steam.client_main_started
+    lines.push(evidence(
+        "first_accelerated_paint",
+        &steam.first_accelerated_paint,
     ));
-    lines.push(format!(
-        "  steam.webhelper_processes: {}",
-        steam.webhelper_processes
-    ));
-    lines.push(format!(
-        "  steam.cef_browser_created: {}",
-        steam.cef_browser_created
-    ));
-    lines.push(format!(
-        "  steam.cef_first_paint: {}",
-        steam.cef_first_paint
-    ));
+    lines.push(evidence("first_dxgi_present", &steam.first_dxgi_present));
+    lines.push(evidence("first_metal_present", &steam.first_metal_present));
     lines.push(format!(
         "  steam.cef_software_paints: {}",
         steam.cef_software_paints
@@ -1328,14 +1424,16 @@ fn milestones_log_lines(milestones: &crate::steam_milestones::SteamMilestones) -
     lines
 }
 
-/// Write `<short-sha>-steam-bootstrap.json` and `.log` under the GE's
-/// diagnostics directory.  Only called for Steam.exe jobs; any failure is
-/// reported to the caller, which logs it without failing the run.
-fn write_steam_bootstrap_artifacts(
+/// Write `<short-sha>-<test-id>-<run-id>-steam-bootstrap.json` and `.log`
+/// under the GE's diagnostics directory.  Only called for Steam.exe jobs;
+/// any failure is reported to the caller, which logs it without failing the
+/// run.  Returns the written paths so the caller can expose the evidence.
+pub fn write_steam_bootstrap_artifacts(
     ge: &GameEnvironment,
     pe_output: &pe_runtime::PeExecutionResult,
     job: &RunnerJob,
-) -> AppResult<()> {
+    run_id: &str,
+) -> AppResult<SteamArtifactPaths> {
     let provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
     let short_sha = if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
         "unknown".to_string()
@@ -1344,9 +1442,14 @@ fn write_steam_bootstrap_artifacts(
     };
     let artifact = SteamBootstrapArtifact {
         provenance: provenance.clone(),
+        run_id: run_id.to_string(),
+        test_id: job.test_id.clone(),
+        program_path: job.program.display().to_string(),
+        program_sha256: crate::steam_milestones::file_content_hash(&job.program),
         milestones: pe_output.milestones.clone(),
         last_thunk: crate::steam_milestones::snapshot_last_thunk(),
         exit_code: pe_output.exit_code,
+        termination: pe_output.termination,
         instruction_count: instruction_count_from_perf(pe_output),
         network_summary: network_summary_from_trace(pe_output),
     };
@@ -1362,8 +1465,9 @@ fn write_steam_bootstrap_artifacts(
             &error,
         )
     })?;
-    let json_path = diagnostics_dir.join(format!("{short_sha}-steam-bootstrap.json"));
-    let log_path = diagnostics_dir.join(format!("{short_sha}-steam-bootstrap.log"));
+    let stem = steam_artifact_stem(&short_sha, &job.test_id, run_id);
+    let json_path = diagnostics_dir.join(format!("{stem}.json"));
+    let log_path = diagnostics_dir.join(format!("{stem}.log"));
 
     let json_body = util::stable_json(&artifact)?;
     util::write_string(&json_path, &json_body)?;
@@ -1371,6 +1475,10 @@ fn write_steam_bootstrap_artifacts(
     let mut log_lines = Vec::new();
     log_lines.push(format!("Casa1 commit: {}", provenance.commit_sha));
     log_lines.push(format!("dirty tree: {}", provenance.dirty_tree));
+    log_lines.push(format!("run_id: {}", artifact.run_id));
+    log_lines.push(format!("test_id: {}", artifact.test_id));
+    log_lines.push(format!("program_path: {}", artifact.program_path));
+    log_lines.push(format!("program_sha256: {}", artifact.program_sha256));
     log_lines.push(format!("fixture hash: {}", provenance.fixture_hash));
     log_lines.push(format!("GE hash: {}", provenance.ge_hash));
     log_lines.push(format!(
@@ -1382,6 +1490,7 @@ fn write_steam_bootstrap_artifacts(
     log_lines.push(format!("host architecture: {}", provenance.host_arch));
     log_lines.extend(milestones_log_lines(&pe_output.milestones));
     log_lines.push(format!("exit_code: {}", pe_output.exit_code));
+    log_lines.push(format!("termination: {:?}", pe_output.termination));
     log_lines.push(format!(
         "instruction_count: {}",
         artifact
@@ -1400,5 +1509,8 @@ fn write_steam_bootstrap_artifacts(
         log_lines.push(format!("  {line}"));
     }
     util::write_string(&log_path, &format!("{}\n", log_lines.join("\n")))?;
-    Ok(())
+    Ok(SteamArtifactPaths {
+        json_path,
+        log_path,
+    })
 }

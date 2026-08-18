@@ -203,31 +203,99 @@ pub fn record_first_failure(
 }
 
 // ---------------------------------------------------------------------------
+// Milestone evidence
+// ---------------------------------------------------------------------------
+
+/// Evidence attached to a milestone: the guest context in which the
+/// milestone was FIRST observed.  Zero `guest_pc` / `thread_id` /
+/// `process_id` / `guest_tick` mean the record was made host-side (the Win32
+/// file layer has no guest context); the API/path/detail fields are always
+/// populated when known.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MilestoneEvidence {
+    /// Guest program counter at the observation site (`0` when host-side).
+    pub guest_pc: u64,
+    /// Guest thread id at the observation site (`0` when host-side).
+    pub thread_id: u32,
+    /// Guest process id (`0` when host-side).
+    pub process_id: u32,
+    /// Guest tick at the observation site (`0` when host-side).
+    pub guest_tick: u64,
+    /// API name, e.g. `CreateFileW` / `ReadFile` / `DXGISwapChainPresent`.
+    pub api: Option<String>,
+    /// The Windows path involved (file milestones), when known.
+    pub path: Option<String>,
+    /// Short human-readable detail string.
+    pub detail: Option<String>,
+}
+
+impl MilestoneEvidence {
+    /// Evidence for a record made outside the guest context (e.g. the Win32
+    /// file layer): the guest-context fields stay zero and the record names
+    /// the API, path and detail that were observable at the call site.
+    pub fn context_free(api: &str, path: Option<&str>, detail: &str) -> Self {
+        Self {
+            guest_pc: 0,
+            thread_id: 0,
+            process_id: 0,
+            guest_tick: 0,
+            api: Some(api.to_string()),
+            path: path.map(str::to_string),
+            detail: Some(detail.to_string()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Milestone groups
 // ---------------------------------------------------------------------------
 
-/// Steam bootstrap milestones (steam group).
+/// Steam bootstrap milestones (steam group).  The `Option<MilestoneEvidence>`
+/// fields record the FIRST observation of each milestone with the guest
+/// context available at the time (first-wins); the `u32` counters stay
+/// cumulative across the run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SteamMilestoneGroup {
     /// Set at the first block dispatch of the PE main loop.
-    pub bootstrap_started: bool,
-    /// A file open of the manifest (`...\package\steam_client_win32.installed`).
-    pub manifest_opened: bool,
-    /// Approximation: the manifest was opened AND at least one full read of
-    /// the manifest file completed.
-    pub manifest_verified: bool,
+    pub bootstrap_started: Option<MilestoneEvidence>,
+    /// A file open of the manifest (`C:\package\steam_client_win32.installed`).
+    pub manifest_opened: Option<MilestoneEvidence>,
+    /// A full read of the manifest file completed (proves the manifest is
+    /// both opened and readable, unlike a mere open).
+    pub manifest_full_read: Option<MilestoneEvidence>,
     /// An open-for-write of `C:\package` or a `C:\*.crash` path.
-    pub package_writability_probe: bool,
+    pub package_writability_probe: Option<MilestoneEvidence>,
     /// First `CreateThread` from the initial synthetic process after
     /// bootstrap started.
-    pub client_main_started: bool,
-    /// `CreateProcess` calls whose application/command line contains
+    pub client_main_started: Option<MilestoneEvidence>,
+    /// First `CreateProcessW/A` call whose image/command line named
+    /// `steamwebhelper` (the spawn REQUEST, not the started child).
+    pub webhelper_spawn_requested: Option<MilestoneEvidence>,
+    /// A spawned steamwebhelper child PE was actually loaded and had at
+    /// least one block dispatched (the child truly started).  Child PEs
+    /// currently execute in a separate casa1-runner process, so this stays
+    /// unset in the parent's artifact; the spawn-request hook is the only
+    /// producer today.
+    pub webhelper_process_started: Option<MilestoneEvidence>,
+    /// `CreateProcessW/A` calls whose image/command line contains
     /// `steamwebhelper` (case-insensitive).
-    pub webhelper_processes: u32,
+    pub webhelper_spawn_requests: u32,
+    /// Spawned steamwebhelper child PEs that actually began dispatching
+    /// blocks (distinct from spawn requests above).
+    pub webhelper_processes_started: u32,
     /// A CEF browser has been created (set on the first successful paint).
-    pub cef_browser_created: bool,
+    pub cef_browser_created: Option<MilestoneEvidence>,
     /// The first CEF paint (software or accelerated) was observed.
-    pub cef_first_paint: bool,
+    pub cef_first_paint: Option<MilestoneEvidence>,
+    /// The first CEF software paint (`CefRenderHandler::OnPaint`).
+    pub first_software_paint: Option<MilestoneEvidence>,
+    /// The first CEF accelerated paint
+    /// (`CefRenderHandler::OnAcceleratedPaint`).
+    pub first_accelerated_paint: Option<MilestoneEvidence>,
+    /// The first DXGI `Present` call.
+    pub first_dxgi_present: Option<MilestoneEvidence>,
+    /// The first Metal `present_drawable` observed (folded in at snapshot).
+    pub first_metal_present: Option<MilestoneEvidence>,
     /// `CefRenderHandler::OnPaint` calls.
     pub cef_software_paints: u32,
     /// `CefRenderHandler::OnAcceleratedPaint` calls.
@@ -281,11 +349,42 @@ pub struct SteamMilestones {
 // Pure milestone transitions
 // ---------------------------------------------------------------------------
 
-/// Case-insensitive manifest-path test: the normalized path contains
-/// `package` and ends with `steam_client_win32.installed`.
+/// Exact manifest-path test via the Windows-path machinery: the path must
+/// parse as a drive-absolute `C:` path (plain or `\\?\` verbatim/extended
+/// form) whose components are EXACTLY `package` then
+/// `steam_client_win32.installed`.  Anything else — a different drive, a
+/// different directory (`C:\notpackage\steam_client_win32.installed`), a
+/// different file (`C:\package\steam_client_win32.installed.bak`), extra
+/// components, UNC/device/relative forms, or an ADS stream suffix — is
+/// rejected.
 pub fn is_manifest_path(normalized_path: &str) -> bool {
-    let lower = normalized_path.to_ascii_lowercase();
-    lower.contains("package") && lower.ends_with("steam_client_win32.installed")
+    use crate::real_fs::{WindowsPathKind, parse_windows_path};
+    let parsed = parse_windows_path(normalized_path);
+    if parsed.ads_stream.is_some() {
+        return false;
+    }
+    let (drive, path) = match parsed.kind {
+        WindowsPathKind::DriveAbsolute { drive, path }
+        | WindowsPathKind::VerbatimDrive { drive, path } => (drive, path),
+        _ => return false,
+    };
+    if !drive.eq_ignore_ascii_case(&'c') {
+        return false;
+    }
+    let mut components = path.split(['\\', '/']).filter(|c| !c.is_empty());
+    let Some(directory) = components.next() else {
+        return false;
+    };
+    if !directory.eq_ignore_ascii_case("package") {
+        return false;
+    }
+    let Some(file) = components.next() else {
+        return false;
+    };
+    if !file.eq_ignore_ascii_case("steam_client_win32.installed") {
+        return false;
+    }
+    components.next().is_none()
 }
 
 /// The Steam package-writability probe paths: `C:\package` itself or any
@@ -296,19 +395,31 @@ pub fn is_package_writability_probe_path(normalized_path: &str) -> bool {
     lower == "c:\\package" || (lower.starts_with("c:\\") && lower.ends_with(".crash"))
 }
 
-/// Record a successful manifest open into `milestones`.
-pub fn note_manifest_path_in(milestones: &mut SteamMilestones, normalized_path: &str) {
-    if is_manifest_path(normalized_path) {
-        milestones.steam.manifest_opened = true;
+/// Record the first successful manifest open into `milestones`.
+pub fn note_manifest_path_in(
+    milestones: &mut SteamMilestones,
+    normalized_path: &str,
+    evidence: MilestoneEvidence,
+) {
+    if is_manifest_path(normalized_path) && milestones.steam.manifest_opened.is_none() {
+        milestones.steam.manifest_opened = Some(evidence);
     }
 }
 
-/// Record a successful full read of the manifest into `milestones`; the read
-/// proves the manifest was opened, so both flags are set.
-pub fn note_manifest_read_in(milestones: &mut SteamMilestones, normalized_path: &str) {
+/// Record the first full read of the manifest into `milestones`; the read
+/// proves the manifest was opened, so both milestones are set.
+pub fn note_manifest_read_in(
+    milestones: &mut SteamMilestones,
+    normalized_path: &str,
+    evidence: MilestoneEvidence,
+) {
     if is_manifest_path(normalized_path) {
-        milestones.steam.manifest_opened = true;
-        milestones.steam.manifest_verified = true;
+        if milestones.steam.manifest_opened.is_none() {
+            milestones.steam.manifest_opened = Some(evidence.clone());
+        }
+        if milestones.steam.manifest_full_read.is_none() {
+            milestones.steam.manifest_full_read = Some(evidence);
+        }
     }
 }
 
@@ -318,27 +429,37 @@ pub fn note_package_writability_probe_in(
     milestones: &mut SteamMilestones,
     normalized_path: &str,
     write_requested: bool,
+    evidence: MilestoneEvidence,
 ) {
-    if write_requested && is_package_writability_probe_path(normalized_path) {
-        milestones.steam.package_writability_probe = true;
+    if write_requested
+        && is_package_writability_probe_path(normalized_path)
+        && milestones.steam.package_writability_probe.is_none()
+    {
+        milestones.steam.package_writability_probe = Some(evidence);
     }
 }
 
 /// Record the first block dispatch (bootstrap started).
-pub fn note_bootstrap_started_in(milestones: &mut SteamMilestones) {
-    milestones.steam.bootstrap_started = true;
+pub fn note_bootstrap_started_in(milestones: &mut SteamMilestones, evidence: MilestoneEvidence) {
+    if milestones.steam.bootstrap_started.is_none() {
+        milestones.steam.bootstrap_started = Some(evidence);
+    }
 }
 
 /// Record a guest thread creation.  `is_initial_process` marks a
 /// `CreateThread` issued by the initial synthetic main process (main thread);
 /// the first such call after bootstrap sets `client_main_started`.
-pub fn note_thread_created_in(milestones: &mut SteamMilestones, is_initial_process: bool) {
+pub fn note_thread_created_in(
+    milestones: &mut SteamMilestones,
+    is_initial_process: bool,
+    evidence: MilestoneEvidence,
+) {
     milestones.threads.created = milestones.threads.created.saturating_add(1);
     if is_initial_process
-        && milestones.steam.bootstrap_started
-        && !milestones.steam.client_main_started
+        && milestones.steam.bootstrap_started.is_some()
+        && milestones.steam.client_main_started.is_none()
     {
-        milestones.steam.client_main_started = true;
+        milestones.steam.client_main_started = Some(evidence);
     }
 }
 
@@ -361,10 +482,36 @@ pub fn note_illegal_host_termination_in(milestones: &mut SteamMilestones) {
         .saturating_add(1);
 }
 
-/// Record a `CreateProcess` whose application/command line names
-/// `steamwebhelper` (case-insensitive).
-pub fn note_webhelper_process_in(milestones: &mut SteamMilestones) {
-    milestones.steam.webhelper_processes = milestones.steam.webhelper_processes.saturating_add(1);
+/// Record a `CreateProcessW/A` whose image/command line named
+/// `steamwebhelper` (case-insensitive): a spawn REQUEST.
+pub fn note_webhelper_spawn_request_in(
+    milestones: &mut SteamMilestones,
+    evidence: MilestoneEvidence,
+) {
+    milestones.steam.webhelper_spawn_requests =
+        milestones.steam.webhelper_spawn_requests.saturating_add(1);
+    if milestones.steam.webhelper_spawn_requested.is_none() {
+        milestones.steam.webhelper_spawn_requested = Some(evidence);
+    }
+}
+
+/// Record that a spawned steamwebhelper child PE actually loaded and began
+/// dispatching blocks — distinct from the spawn REQUEST above.  Child PEs
+/// currently execute in a separate casa1-runner process, so this hook has no
+/// in-process producer yet; the distinction is modeled so the moment a child
+/// PE executes in-process, `webhelper_processes_started` starts reflecting
+/// reality instead of conflating requests with started processes.
+pub fn note_webhelper_process_started_in(
+    milestones: &mut SteamMilestones,
+    evidence: MilestoneEvidence,
+) {
+    milestones.steam.webhelper_processes_started = milestones
+        .steam
+        .webhelper_processes_started
+        .saturating_add(1);
+    if milestones.steam.webhelper_process_started.is_none() {
+        milestones.steam.webhelper_process_started = Some(evidence);
+    }
 }
 
 /// Pure test of whether a CreateProcess application/command line targets
@@ -400,17 +547,31 @@ pub fn note_gfx_frame_in(milestones: &mut SteamMilestones, metadata: &BTreeMap<S
 }
 
 /// Count a CEF paint (software or accelerated) and set the browser-created /
-/// first-paint flags (a paint proves a browser existed).
-pub fn note_cef_paint_in(milestones: &mut SteamMilestones, accelerated: bool) {
+/// first-paint milestones (a paint proves a browser existed).
+pub fn note_cef_paint_in(
+    milestones: &mut SteamMilestones,
+    accelerated: bool,
+    evidence: MilestoneEvidence,
+) {
     if accelerated {
         milestones.steam.cef_accelerated_paints =
             milestones.steam.cef_accelerated_paints.saturating_add(1);
+        if milestones.steam.first_accelerated_paint.is_none() {
+            milestones.steam.first_accelerated_paint = Some(evidence.clone());
+        }
     } else {
         milestones.steam.cef_software_paints =
             milestones.steam.cef_software_paints.saturating_add(1);
+        if milestones.steam.first_software_paint.is_none() {
+            milestones.steam.first_software_paint = Some(evidence.clone());
+        }
     }
-    milestones.steam.cef_first_paint = true;
-    milestones.steam.cef_browser_created = true;
+    if milestones.steam.cef_first_paint.is_none() {
+        milestones.steam.cef_first_paint = Some(evidence.clone());
+    }
+    if milestones.steam.cef_browser_created.is_none() {
+        milestones.steam.cef_browser_created = Some(evidence);
+    }
 }
 
 /// Frame categories counted from GfxFrame metadata sources.
@@ -459,11 +620,14 @@ where
         .map(|mut milestones| f(&mut milestones))
 }
 
+/// Snapshot the shared milestone state for the run artifact, folding in the
+/// atomic graphics/CEF counters and deriving `live_at_process_exit`.
 pub fn snapshot_milestones() -> SteamMilestones {
     let mut milestones = MILESTONES.lock().map(|m| m.clone()).unwrap_or_default();
     milestones.graphics.dxgi_presents = DXGI_PRESENTS.load(Ordering::Relaxed) as u32;
-    milestones.graphics.metal_presented_frames =
+    let metal_presented =
         crate::metal_backend::METAL_PRESENTED_FRAMES.load(Ordering::Relaxed) as u32;
+    milestones.graphics.metal_presented_frames = metal_presented;
     milestones.steam.cef_software_paints = CEF_SOFTWARE_PAINTS.load(Ordering::Relaxed) as u32;
     milestones.steam.cef_accelerated_paints = CEF_ACCELERATED_PAINTS.load(Ordering::Relaxed) as u32;
     milestones.threads.live_at_process_exit = milestones
@@ -471,40 +635,83 @@ pub fn snapshot_milestones() -> SteamMilestones {
         .created
         .saturating_sub(milestones.threads.normal_exits)
         .saturating_sub(milestones.threads.terminated);
+    // The Metal present counter is incremented by the Metal backend, which
+    // has no milestone access; the first-present evidence is derived at the
+    // snapshot (the artifact boundary) when the counter is non-zero.
+    if metal_presented > 0 && milestones.steam.first_metal_present.is_none() {
+        milestones.steam.first_metal_present = Some(MilestoneEvidence::context_free(
+            "MTLCommandBuffer presentDrawable",
+            None,
+            "first Metal present observed",
+        ));
+    }
     milestones
 }
 
-/// Reset the shared static (tests and between jobs in a long-lived process).
-pub fn reset_milestones() {
-    if let Ok(mut milestones) = MILESTONES.lock() {
-        *milestones = SteamMilestones::default();
-    }
+/// Reset the per-run atomic graphics/CEF counters and the milestones'
+/// graphics fields.  `METAL_ENCODERS` is process-lifetime (encoder
+/// balancing) and must NOT be reset here.
+pub fn reset_run_counters() {
     DXGI_PRESENTS.store(0, Ordering::Relaxed);
     CEF_SOFTWARE_PAINTS.store(0, Ordering::Relaxed);
     CEF_ACCELERATED_PAINTS.store(0, Ordering::Relaxed);
     crate::metal_backend::METAL_PRESENTED_FRAMES.store(0, Ordering::Relaxed);
+    if let Ok(mut milestones) = MILESTONES.lock() {
+        milestones.graphics = GraphicsMilestoneGroup::default();
+        milestones.steam.first_software_paint = None;
+        milestones.steam.first_accelerated_paint = None;
+        milestones.steam.first_dxgi_present = None;
+        milestones.steam.first_metal_present = None;
+        milestones.steam.cef_software_paints = 0;
+        milestones.steam.cef_accelerated_paints = 0;
+    }
+}
+
+/// Reset the shared static (tests and between jobs in a long-lived process):
+/// clears the milestone state, the last-thunk recorder, the run-start marker,
+/// and the per-run atomic counters.  Process-lifetime counters (Metal encoder
+/// balancing) are NOT reset.
+pub fn reset_milestones() {
+    if let Ok(mut milestones) = MILESTONES.lock() {
+        *milestones = SteamMilestones::default();
+    }
+    *LAST_THUNK.lock().unwrap() = None;
+    *RUN_START_WALL.lock().unwrap() = None;
+    reset_run_counters();
 }
 
 pub fn note_manifest_path(normalized_path: &str) {
-    with_milestones(|milestones| note_manifest_path_in(milestones, normalized_path));
+    let evidence =
+        MilestoneEvidence::context_free("CreateFileW", Some(normalized_path), "manifest opened");
+    with_milestones(|milestones| note_manifest_path_in(milestones, normalized_path, evidence));
 }
 
 pub fn note_manifest_read(normalized_path: &str) {
-    with_milestones(|milestones| note_manifest_read_in(milestones, normalized_path));
+    let evidence = MilestoneEvidence::context_free(
+        "ReadFile",
+        Some(normalized_path),
+        "manifest full read completed",
+    );
+    with_milestones(|milestones| note_manifest_read_in(milestones, normalized_path, evidence));
 }
 
 pub fn note_package_writability_probe(normalized_path: &str, write_requested: bool) {
+    let evidence = MilestoneEvidence::context_free(
+        "CreateFileW",
+        Some(normalized_path),
+        "package writability probe",
+    );
     with_milestones(|milestones| {
-        note_package_writability_probe_in(milestones, normalized_path, write_requested);
+        note_package_writability_probe_in(milestones, normalized_path, write_requested, evidence);
     });
 }
 
-pub fn note_bootstrap_started() {
-    with_milestones(note_bootstrap_started_in);
+pub fn note_bootstrap_started(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_bootstrap_started_in(milestones, evidence));
 }
 
-pub fn note_thread_created(is_initial_process: bool) {
-    with_milestones(|milestones| note_thread_created_in(milestones, is_initial_process));
+pub fn note_thread_created(is_initial_process: bool, evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_thread_created_in(milestones, is_initial_process, evidence));
 }
 
 pub fn note_thread_normal_exit() {
@@ -519,28 +726,68 @@ pub fn note_illegal_host_termination() {
     with_milestones(note_illegal_host_termination_in);
 }
 
-pub fn note_webhelper_process(application: &str, command_line: &str) {
+/// Count a `CreateProcessW/A` call naming `steamwebhelper` (case-insensitive)
+/// as a spawn REQUEST, with first-request evidence.
+pub fn note_webhelper_spawn_request(
+    application: &str,
+    command_line: &str,
+    evidence: MilestoneEvidence,
+) {
     if command_line_is_webhelper(application, command_line) {
-        with_milestones(note_webhelper_process_in);
+        with_milestones(|milestones| {
+            note_webhelper_spawn_request_in(milestones, evidence);
+        });
     }
+}
+
+/// Record a steamwebhelper child PE that actually began dispatching blocks.
+/// No in-process producer exists yet (child PEs run in a separate runner
+/// process); the hook is the single producer of `webhelper_processes_started`
+/// once the child-execution path lands in-process.
+pub fn note_webhelper_process_started(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_webhelper_process_started_in(milestones, evidence));
 }
 
 pub fn note_gfx_frame(metadata: &BTreeMap<String, String>) {
     with_milestones(|milestones| note_gfx_frame_in(milestones, metadata));
 }
 
-/// Count one DXGI `Present` (atomic; folded into the snapshot).
+/// Count one DXGI `Present` (atomic; folded into the snapshot) with
+/// context-free evidence.
 pub fn note_dxgi_present() {
+    note_dxgi_present_with(MilestoneEvidence::context_free(
+        "DXGISwapChainPresent",
+        None,
+        "DXGI Present call",
+    ));
+}
+
+/// Count one DXGI `Present` and record first-present evidence.
+pub fn note_dxgi_present_with(evidence: MilestoneEvidence) {
     DXGI_PRESENTS.fetch_add(1, Ordering::Relaxed);
+    with_milestones(|milestones| {
+        if milestones.steam.first_dxgi_present.is_none() {
+            milestones.steam.first_dxgi_present = Some(evidence);
+        }
+    });
 }
 
 pub fn note_cef_paint(accelerated: bool) {
+    let (api, detail) = if accelerated {
+        (
+            "CefRenderHandler::OnAcceleratedPaint",
+            "accelerated CEF paint",
+        )
+    } else {
+        ("CefRenderHandler::OnPaint", "software CEF paint")
+    };
+    let evidence = MilestoneEvidence::context_free(api, None, detail);
     if accelerated {
         CEF_ACCELERATED_PAINTS.fetch_add(1, Ordering::Relaxed);
     } else {
         CEF_SOFTWARE_PAINTS.fetch_add(1, Ordering::Relaxed);
     }
-    with_milestones(|milestones| note_cef_paint_in(milestones, accelerated));
+    with_milestones(|milestones| note_cef_paint_in(milestones, accelerated, evidence));
 }
 
 // ---------------------------------------------------------------------------
