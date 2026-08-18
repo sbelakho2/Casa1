@@ -674,6 +674,8 @@ pub struct PeExecutionResult {
     /// Error detail for non-guest terminations (message of the underlying
     /// error when one exists).
     pub termination_detail: Option<String>,
+    /// JIT telemetry: requested mode, activity, and block counters.
+    pub jit_telemetry: JitTelemetry,
 }
 
 /// Legacy exit code for a termination (kept for compatibility: harness
@@ -688,9 +690,83 @@ pub fn legacy_exit_code(termination: ExecutionTermination) -> i32 {
     }
 }
 
+impl ExecutionTermination {
+    /// Stable machine-readable variant name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GuestExit { .. } => "GuestExit",
+            Self::HarnessDeadline => "HarnessDeadline",
+            Self::InstructionBudget => "InstructionBudget",
+            Self::UnsupportedInstruction => "UnsupportedInstruction",
+            Self::GuestException => "GuestException",
+            Self::HostError => "HostError",
+        }
+    }
+}
+
+/// JIT telemetry block reported with every PE execution result and Steam
+/// bootstrap artifact: what the caller requested, whether the JIT machinery
+/// actually ran, and why it fell back to the AOT interpreter when it did not.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct JitTelemetry {
+    /// Requested mode: "auto" | "enabled" | "disabled".
+    pub requested: String,
+    /// True when JIT-compiled blocks actually executed during the run.
+    pub active: bool,
+    pub blocks_compiled: u64,
+    pub blocks_executed: u64,
+    /// Reason the JIT stayed inactive despite being requested (e.g. the
+    /// macOS 26 MAP_JIT restriction for ad-hoc-signed binaries).
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for JitTelemetry {
+    fn default() -> Self {
+        Self {
+            requested: "auto".to_string(),
+            active: false,
+            blocks_compiled: 0,
+            blocks_executed: 0,
+            fallback_reason: None,
+        }
+    }
+}
+
+impl JitTelemetry {
+    pub(crate) fn from_mode(
+        mode: crate::runner::JitMode,
+        blocks_compiled: u64,
+        blocks_executed: u64,
+    ) -> Self {
+        let requested = mode.as_str().to_string();
+        let active = blocks_compiled > 0 || blocks_executed > 0;
+        let fallback_reason = if matches!(mode, crate::runner::JitMode::Enabled) && !active {
+            Some(
+                "macos-26-map-jit-dormant: MAP_JIT execution is blocked for \
+                 ad-hoc-signed binaries — JIT stays inactive, the AOT interpreter executes"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        Self {
+            requested,
+            active,
+            blocks_compiled,
+            blocks_executed,
+            fallback_reason,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PeExecutionOptions {
     pub live_session: Option<LivePeSession>,
+    /// JIT policy requested by the caller (None = Auto).
+    pub jit_mode: Option<crate::runner::JitMode>,
+    /// When true, the SteamService named-pipe listener is created before the
+    /// guest runs so a Steam client can connect to it.
+    pub steam_ipc: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4103,6 +4179,9 @@ struct PeHostRuntime {
     /// failures.
     enable_steam_tracing: bool,
     jit_runtime: Option<crate::jit::JitRuntime>,
+    /// JIT policy requested by the caller (RunnerJob protocol; Auto keeps
+    /// the historical dormant behavior).
+    jit_mode: crate::runner::JitMode,
     /// Tiered compilation manager that tracks execution counts and promotes
     /// hot blocks to higher optimization tiers.
     tiered_compiler: crate::jit::TieredCompiler,
@@ -4647,8 +4726,16 @@ pub fn execute_with_options(
         options.live_session,
         load_trace_categories(env),
     );
+    runtime.jit_mode = options.jit_mode.unwrap_or(crate::runner::JitMode::Auto);
     runtime.set_guest_arch(guest_arch);
     runtime.process_environment = env.clone();
+    if options.steam_ipc {
+        // The SteamService named-pipe listener is part of the launch job:
+        // pre-create the server endpoint so a guest Steam client can connect
+        // to `\\.\pipe\steam_service` without SteamService.exe running.
+        runtime.win32.ensure_steam_service_pipe_listener()?;
+        eprintln!("[pe_runtime] steam_ipc enabled — SteamService pipe listener created");
+    }
     let staged_program_path = runtime.stage_main_module(program)?;
     runtime.current_directory =
         initial_guest_current_directory(runtime.win32.ge(), _cwd, &staged_program_path);
@@ -5231,104 +5318,6 @@ pub fn execute_with_options(
                 }
             }
 
-            // --- Steam.exe crash point: zero-filled record at 0x401389/0x401390 ---
-            // Steam's main loop iterates over a table of 0x1c-byte records whose base
-            // pointer lives at global 0x42a270.  Each record starts with an opcode
-            // field; opcode == 0 marks the sentinel end of the table.  If the table
-            // was never populated (because an earlier initialisation API returned an
-            // unexpected value), the very first record is zero and we trap here
-            // instead of silently dereferencing a null/invalid pointer later.
-            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-            if guest_arch == GuestArch::X86
-                && state.rip == runtime.mapped_image_base + 0x1390
-                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-            {
-                let record_base =
-                    read_guest_u32(memory, runtime.mapped_image_base + 0x2a270).unwrap_or(0) as u64;
-                let current_index = state.get(Register::Rsi) as u32;
-                let record_address = record_base + u64::from(current_index) * 0x1c;
-                let record_opcode = read_guest_u32(memory, record_address).unwrap_or(u32::MAX);
-                if record_opcode == 0 {
-                    let previous_index = current_index.saturating_sub(1);
-                    let previous_record = if record_base != 0 {
-                        let previous_address = record_base + u64::from(previous_index) * 0x1c;
-                        let fields = (0..7)
-                            .map(|slot| {
-                                let value = read_guest_u32(memory, previous_address + slot * 4)
-                                    .unwrap_or(0)
-                                    as u64;
-                                format!("{slot}:{value:#x}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("addr={previous_address:#x} fields=[{fields}]")
-                    } else {
-                        "<unavailable>".to_string()
-                    };
-                    runtime.push_trace(
-                        "process",
-                        "SteamZeroRecord",
-                        BTreeMap::from([
-                            (
-                                "current_index".to_string(),
-                                json!(format!("{current_index:#x}")),
-                            ),
-                            (
-                                "record_address".to_string(),
-                                json!(format!("{record_address:#x}")),
-                            ),
-                            (
-                                "record_base".to_string(),
-                                json!(format!("{record_base:#x}")),
-                            ),
-                            (
-                                "previous_index".to_string(),
-                                json!(format!("{previous_index:#x}")),
-                            ),
-                            ("previous_record".to_string(), json!(previous_record)),
-                        ]),
-                        json!(current_index),
-                    );
-                }
-            }
-
-            // --- Steam.exe crash point: ESI tracking at 0x401389/0x4013a8 ---
-            // The loop body at 0x401389 uses ESI as the record index.  It calls a
-            // helper at 0x401434 which must preserve ESI (callee-saved in cdecl).
-            // When RIP reaches 0x401389 the loop is re-entering, so we reset the
-            // expected-ESI tracker.  When RIP reaches 0x4013a8 the helper has
-            // returned; we verify that ESI was not clobbered.
-            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-            if guest_arch == GuestArch::X86
-                && state.rip == runtime.mapped_image_base + 0x1389
-                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-            {
-                runtime.steam_401389_expected_esi_after_401434 = None;
-                runtime.steam_401389_saved_esi_slot_addr = None;
-            }
-            // Guarded by CASA1_STEAM_CRASH_WORKAROUND env var — opt-in for diagnostics only.
-            if guest_arch == GuestArch::X86
-                && state.rip == runtime.mapped_image_base + 0x13a8
-                && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take()
-            {
-                runtime.steam_401389_saved_esi_slot_addr = None;
-                let actual_esi = state.get(Register::Rsi) as u32;
-                if actual_esi != expected_esi {
-                    runtime.push_trace(
-                        "process",
-                        "SteamEsiClobber",
-                        BTreeMap::from([
-                            (
-                                "expected_esi".to_string(),
-                                json!(format!("{expected_esi:#x}")),
-                            ),
-                            ("actual_esi".to_string(), json!(format!("{actual_esi:#x}"))),
-                        ]),
-                        json!(actual_esi),
-                    );
-                }
-            }
             // Per-block diagnostic writes removed.
             let cached_block = decode_basic_block_cached(
                 engine,
@@ -8568,6 +8557,13 @@ fn finalize_execution(
     )];
     trace_events.extend(runtime.trace_events);
 
+    let (jit_blocks_compiled, jit_blocks_executed) = match &runtime.jit_runtime {
+        Some(jit) => (jit.blocks_compiled, jit.blocks_executed),
+        None => (0, 0),
+    };
+    let jit_telemetry =
+        JitTelemetry::from_mode(runtime.jit_mode, jit_blocks_compiled, jit_blocks_executed);
+
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),
         stdout: runtime.stdout,
@@ -8581,6 +8577,7 @@ fn finalize_execution(
         provenance: crate::steam_milestones::RunProvenance::from_env(),
         termination,
         termination_detail,
+        jit_telemetry,
     })
 }
 
@@ -8604,9 +8601,7 @@ fn classify_execution_error(error: &AppError) -> ExecutionTermination {
 // ---------------------------------------------------------------------------
 
 /// Execute Steam.exe from the `steam-live-run-x86` GE with deterministic mode
-/// and a configurable instruction budget, enabling the workaround instrumentation
-/// so that trace events (SteamZeroRecord, SteamRecordTablePostExec, etc.) are
-/// emitted for diagnostic and regression-test assertions.
+/// and a configurable instruction budget.
 ///
 /// This function opens the GE, resolves the Steam.exe host path, builds the
 /// environment map, and calls [`execute_with_options`].  The caller receives
@@ -8634,8 +8629,6 @@ pub fn regression_test_steam_bootstrap(
 
     let mut env = BTreeMap::new();
     env.insert("CASA1_PE_RUNTIME_BUDGET".to_string(), budget.to_string());
-    // Enable the crash workaround instrumentation so trace events are emitted.
-    env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
     if let Some(categories) = trace_categories {
         env.insert("CASA1_TRACE_CATEGORIES".to_string(), categories.join(","));
     }
@@ -8982,6 +8975,7 @@ impl PeHostRuntime {
             // Only enable when debugging Steam.exe startup failures.
             enable_steam_tracing: std::env::var("CASA1_STEAM_TRACE").is_ok(),
             jit_runtime: None,
+            jit_mode: crate::runner::JitMode::Auto,
             tiered_compiler: crate::jit::TieredCompiler::with_thresholds(u32::MAX, u32::MAX),
             xinput_manager: crate::real_win32::XInputManager::new(),
             steam_input: crate::steam_input::SteamInput::new(),
@@ -9064,16 +9058,20 @@ impl PeHostRuntime {
         self.next_heap_address = heap_base_for_arch(guest_arch);
         self.next_private_address = private_pages_base_for_arch(guest_arch);
         self.x86_heap_region = 0;
-        // JIT is DISABLED — macOS 26 blocks MAP_JIT execution for ad-hoc
-        // signed binaries, and compiling blocks that can't execute wastes
-        // ~1ms per hot block on mmap+memcpy+icache syscalls, making the
-        // emulator 1000x slower.  The AOT match executor runs at 191M
-        // insns/sec standalone — fast enough when JIT compilation overhead
-        // is removed.
-        if false {
+        // JIT enablement is part of the runner protocol (RunnerJob.jit_mode):
+        //   - Disabled: never construct the JIT runtime.
+        //   - Auto: keep the historical dormant behavior (macOS 26 blocks
+        //     MAP_JIT execution for ad-hoc-signed binaries, and compiling
+        //     blocks that can't execute wastes ~1ms per hot block on
+        //     mmap+memcpy+icache syscalls, making the emulator 1000x slower).
+        //   - Enabled: attempt to enable — construct the JIT runtime so the
+        //     machinery is active; on macOS 26 it stays dormant (the
+        //     requested/active distinction is reported in jit_telemetry).
+        if matches!(self.jit_mode, crate::runner::JitMode::Enabled) {
             let mut jit_runtime = crate::jit::JitRuntime::new(guest_arch);
             jit_runtime.unwind_table.register_with_seh(&mut self.seh);
             self.jit_runtime = Some(jit_runtime);
+            eprintln!("[pe_runtime] JIT runtime constructed (jit_mode=enabled)");
         }
     }
 
@@ -10121,6 +10119,10 @@ impl PeHostRuntime {
                 intent: crate::runner::RunIntent::Run,
                 trace_categories: Vec::new(),
                 test_id: child_test_id,
+                jit_mode: crate::runner::JitMode::Auto,
+                steam_ipc: false,
+                window_width: None,
+                window_height: None,
             };
 
             // Serialise the job to a temporary JSON file.

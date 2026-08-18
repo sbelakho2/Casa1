@@ -66,6 +66,28 @@ impl RunIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JitMode {
+    /// Runtime decides (current behavior: JIT stays dormant).
+    #[default]
+    Auto,
+    /// The caller explicitly requests JIT compilation to be enabled.
+    Enabled,
+    /// The caller explicitly requests JIT compilation to be disabled.
+    Disabled,
+}
+
+impl JitMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerJob {
     pub ge_name: String,
@@ -78,6 +100,19 @@ pub struct RunnerJob {
     pub intent: RunIntent,
     pub trace_categories: Vec<TraceCategory>,
     pub test_id: String,
+    /// JIT policy for the PE runtime (Auto/Enabled/Disabled).
+    #[serde(default)]
+    pub jit_mode: JitMode,
+    /// When true, the runner pre-creates the SteamService named-pipe
+    /// listener so a guest Steam client can connect to it.
+    #[serde(default)]
+    pub steam_ipc: bool,
+    /// Requested live-window width (None = size from the guest frames).
+    #[serde(default)]
+    pub window_width: Option<u32>,
+    /// Requested live-window height (None = size from the guest frames).
+    #[serde(default)]
+    pub window_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +121,26 @@ pub struct RunnerOutcome {
     pub trace_path: PathBuf,
     pub log_path: PathBuf,
     pub canonical_output: CanonicalTestOutput,
+    /// The run identifier (job test id).
+    #[serde(default)]
+    pub run_id: String,
+    /// ExecutionTermination variant name (e.g. "GuestExit").
+    #[serde(default)]
+    pub termination: String,
+    /// Termination detail (error message for non-guest terminations).
+    #[serde(default)]
+    pub termination_detail: Option<String>,
+    /// Paths of the steam-bootstrap artifacts, when this was a Steam.exe run.
+    #[serde(default)]
+    pub steam_artifact_json: Option<PathBuf>,
+    #[serde(default)]
+    pub steam_artifact_log: Option<PathBuf>,
+    /// Steam run milestone snapshot.
+    #[serde(default)]
+    pub milestones: crate::steam_milestones::SteamMilestones,
+    /// JIT telemetry for the run.
+    #[serde(default)]
+    pub jit: pe_runtime::JitTelemetry,
 }
 
 #[derive(Debug, Parser)]
@@ -287,11 +342,19 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         let trace_path = ge.trace_path(&job.test_id);
         util::write_string(&trace_path, &trace_record.stable_json()?)?;
 
+        let termination = pe_runtime::ExecutionTermination::GuestExit { code: exit_code };
         return Ok(RunnerOutcome {
             report_path,
             trace_path,
             log_path,
             canonical_output,
+            run_id: job.test_id.clone(),
+            termination: termination.name().to_string(),
+            termination_detail: None,
+            steam_artifact_json: None,
+            steam_artifact_log: None,
+            milestones: crate::steam_milestones::snapshot_milestones(),
+            jit: pe_runtime::JitTelemetry::default(),
         });
     }
 
@@ -346,7 +409,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         let pe_output = match if job.intent == RunIntent::Play && !job.dtm {
             execute_live_pe_job(job, &ge, &effective_child_environment)
         } else {
-            pe_runtime::execute(
+            pe_runtime::execute_with_options(
                 &job.program,
                 &job.args,
                 &ge,
@@ -354,6 +417,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 &effective_child_environment,
                 job.dtm,
                 &job.test_id,
+                pe_runtime::PeExecutionOptions {
+                    live_session: None,
+                    jit_mode: Some(job.jit_mode),
+                    steam_ipc: job.steam_ipc,
+                },
             )
         } {
             Ok(pe_output) => pe_output,
@@ -379,7 +447,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         // substring matching — a `foo-Steam.exe.backup` must not produce a
         // Steam artifact).  Instrumentation only — a failed artifact write
         // is reported but never fails the run.
-        let _steam_artifact_paths = if is_steam_executable(&job.program) {
+        let steam_artifact_paths = if is_steam_executable(&job.program) {
             match write_steam_bootstrap_artifacts(&ge, &pe_output, job) {
                 Ok(paths) => Some(paths),
                 Err(error) => {
@@ -443,11 +511,21 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         let trace_path = ge.trace_path(&job.test_id);
         util::write_string(&trace_path, &trace_record.stable_json()?)?;
 
+        let (steam_artifact_json, steam_artifact_log) = steam_artifact_paths
+            .map(|(json_path, log_path)| (Some(json_path), Some(log_path)))
+            .unwrap_or((None, None));
         return Ok(RunnerOutcome {
             report_path,
             trace_path,
             log_path,
             canonical_output,
+            run_id: job.test_id.clone(),
+            termination: pe_output.termination.name().to_string(),
+            termination_detail: pe_output.termination_detail.clone(),
+            steam_artifact_json,
+            steam_artifact_log,
+            milestones: pe_output.milestones.clone(),
+            jit: pe_output.jit_telemetry.clone(),
         });
     }
 
@@ -566,11 +644,19 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     let trace_path = ge.trace_path(&job.test_id);
     util::write_string(&trace_path, &trace_record.stable_json()?)?;
 
+    let termination = pe_runtime::ExecutionTermination::GuestExit { code: exit_code };
     Ok(RunnerOutcome {
         report_path,
         trace_path,
         log_path,
         canonical_output,
+        run_id: job.test_id.clone(),
+        termination: termination.name().to_string(),
+        termination_detail: None,
+        steam_artifact_json: None,
+        steam_artifact_log: None,
+        milestones: crate::steam_milestones::snapshot_milestones(),
+        jit: pe_runtime::JitTelemetry::default(),
     })
 }
 
@@ -588,6 +674,10 @@ pub fn replay_trace(trace_path: &Path, ge: &GameEnvironment) -> AppResult<Canoni
         intent: RunIntent::from_str(&record.command.intent)?,
         trace_categories: trace::parse_categories(Some(&record.categories.join(",")))?,
         test_id: record.test_id.clone(),
+        jit_mode: JitMode::Auto,
+        steam_ipc: false,
+        window_width: None,
+        window_height: None,
     };
     let actual = execute_job(&job)?.canonical_output;
     compare_outputs(
@@ -717,6 +807,12 @@ fn execute_live_pe_job(
     let env = effective_child_environment.clone();
     let dtm = job.dtm;
     let test_id = job.test_id.clone();
+    let jit_mode = job.jit_mode;
+    let steam_ipc = job.steam_ipc;
+    let window_size = match (job.window_width, job.window_height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => None,
+    };
     let worker = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
@@ -739,6 +835,8 @@ fn execute_live_pe_job(
                 &test_id,
                 pe_runtime::PeExecutionOptions {
                     live_session: Some(live_session),
+                    jit_mode: Some(jit_mode),
+                    steam_ipc,
                 },
             )
         })
@@ -753,6 +851,7 @@ fn execute_live_pe_job(
         &live_window_title(&job.ge_name, &job.program, &job.intent),
         host_session,
         worker,
+        window_size,
     )
 }
 
@@ -971,6 +1070,7 @@ fn try_recover_budget_exhausted_steam_install(
         provenance: crate::steam_milestones::RunProvenance::default(),
         termination: pe_runtime::ExecutionTermination::GuestExit { code: 0 },
         termination_detail: None,
+        jit_telemetry: pe_runtime::JitTelemetry::default(),
     }))
 }
 
@@ -1187,8 +1287,8 @@ fn is_steam_executable(program: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("steam.exe"))
 }
 
-/// The full JSON artifact payload: provenance, milestones, and the run
-/// summary lines.
+/// The full JSON artifact payload: provenance, milestones, JIT telemetry, and
+/// the run summary lines.
 #[derive(Debug, Clone, Serialize)]
 struct SteamBootstrapArtifact {
     provenance: crate::steam_milestones::RunProvenance,
@@ -1197,6 +1297,7 @@ struct SteamBootstrapArtifact {
     exit_code: i32,
     instruction_count: Option<u64>,
     network_summary: Vec<String>,
+    jit: pe_runtime::JitTelemetry,
 }
 
 /// Instruction count from the run's `pe_runtime_steps` perf metric, if the
@@ -1331,11 +1432,13 @@ fn milestones_log_lines(milestones: &crate::steam_milestones::SteamMilestones) -
 /// Write `<short-sha>-steam-bootstrap.json` and `.log` under the GE's
 /// diagnostics directory.  Only called for Steam.exe jobs; any failure is
 /// reported to the caller, which logs it without failing the run.
+///
+/// Returns the (json, log) artifact paths on success.
 fn write_steam_bootstrap_artifacts(
     ge: &GameEnvironment,
     pe_output: &pe_runtime::PeExecutionResult,
     job: &RunnerJob,
-) -> AppResult<()> {
+) -> AppResult<(PathBuf, PathBuf)> {
     let provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
     let short_sha = if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
         "unknown".to_string()
@@ -1349,6 +1452,7 @@ fn write_steam_bootstrap_artifacts(
         exit_code: pe_output.exit_code,
         instruction_count: instruction_count_from_perf(pe_output),
         network_summary: network_summary_from_trace(pe_output),
+        jit: pe_output.jit_telemetry.clone(),
     };
 
     let diagnostics_dir = ge.diagnostics_dir();
@@ -1395,10 +1499,25 @@ fn write_steam_bootstrap_artifacts(
             last.name, last.guest_pc, last.wall_secs_since_start
         ));
     }
+    log_lines.push("jit:".to_string());
+    log_lines.push(format!("  requested: {}", artifact.jit.requested));
+    log_lines.push(format!("  active: {}", artifact.jit.active));
+    log_lines.push(format!(
+        "  blocks_compiled: {}",
+        artifact.jit.blocks_compiled
+    ));
+    log_lines.push(format!(
+        "  blocks_executed: {}",
+        artifact.jit.blocks_executed
+    ));
+    log_lines.push(format!(
+        "  fallback_reason: {}",
+        artifact.jit.fallback_reason.as_deref().unwrap_or("<none>")
+    ));
     log_lines.push("network_summary:".to_string());
     for line in &artifact.network_summary {
         log_lines.push(format!("  {line}"));
     }
     util::write_string(&log_path, &format!("{}\n", log_lines.join("\n")))?;
-    Ok(())
+    Ok((json_path, log_path))
 }
