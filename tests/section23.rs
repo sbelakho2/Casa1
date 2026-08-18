@@ -16,7 +16,6 @@
 //! Usage:
 //!   CASA1_STEAM_E2E=1 cargo test --test section23 -- --ignored --nocapture
 
-use casa1::ge::GameEnvironment;
 use casa1::runner::{self, RunIntent, RunnerJob};
 use std::collections::BTreeMap;
 
@@ -38,11 +37,6 @@ fn steam_first_divergence_diagnostic() {
         "Steam executable missing at {}",
         steam_exe.display()
     );
-
-    let deadline_secs: u64 = std::env::var("CASA1_STEAM_E2E_DEADLINE_SECS")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .unwrap_or(120);
 
     let job = RunnerJob {
         ge_name: STEAM_GE.to_string(),
