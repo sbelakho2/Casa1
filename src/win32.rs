@@ -432,6 +432,28 @@ pub struct OverlappedResult {
     pub cancelled: bool,
 }
 
+/// Result of issuing an overlapped pipe read/write: either completed
+/// synchronously (data already queued) or pending (the caller parks the
+/// guest thread on the scheduler's `PipeIo` wait).
+#[derive(Debug, Clone)]
+pub struct PipeIoOutcome {
+    pub id: u64,
+    /// Bytes consumed from the pipe queue (only when `completed`).
+    pub bytes: Vec<u8>,
+    pub completed: bool,
+}
+
+/// A pending pipe I/O request completed by the scheduler: the guest buffer
+/// pointers captured at issue time plus the consumed bytes (or a
+/// broken-pipe marker when the peer disconnected).
+#[derive(Debug, Clone)]
+pub struct PendingPipeIoCompletion {
+    pub buffer_ptr: u64,
+    pub bytes_read_ptr: u64,
+    pub bytes: Vec<u8>,
+    pub broken_pipe: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateProcessResult {
     pub process_handle: Handle,
@@ -743,26 +765,34 @@ pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
 }
 
 /// State tracking for a Windows named pipe.
-/// Named pipes are backed by in-memory ring buffers with condvar-based
-/// synchronisation so that readers block when the buffer is empty and
-/// writers wake them.
+///
+/// A pipe has two real ends with independent direction queues:
+/// server-to-client (bytes written by the server, read by the client) and
+/// client-to-server (bytes written by the client, read by the server).
+/// Reads consume from the peer's write queue; writes append to the
+/// opposite direction's queue and notify the condvar.
 #[derive(Debug, Clone)]
 struct NamedPipeState {
     /// The pipe name (e.g. `\\.\pipe\steam_service`).
     name: String,
     /// Whether a server endpoint has been created via CreateNamedPipeW.
     server_created: bool,
-    /// Whether a client has connected via ConnectNamedPipe / CreateFileW.
-    connected: bool,
-    /// Data buffer shared between server and client ends.
-    buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Server writes append here; client-side reads consume it.
+    server_to_client: Arc<Mutex<VecDeque<u8>>>,
+    /// Client writes append here; server-side reads consume it.
+    client_to_server: Arc<Mutex<VecDeque<u8>>>,
     /// Condition variable signalled when new data arrives or the pipe is
     /// disconnected.
     data_ready: Arc<Condvar>,
     /// Maximum pipe size (from nMaxInstances / nOutBufferSize).
     max_buffer_size: usize,
-    /// Whether the server end has been disconnected.
+    /// Whether the server end has been disconnected (DisconnectNamedPipe).
     server_disconnected: bool,
+    /// Whether the client end has been disconnected (the server called
+    /// DisconnectNamedPipe, or the server handle was closed while a client
+    /// was connected).  A waiting CallNamedPipe / pipe reader observes this
+    /// as ERROR_BROKEN_PIPE.
+    client_disconnected: bool,
     /// Optional security descriptor pointer (guest virtual address of the
     /// `SECURITY_DESCRIPTOR` passed via `lpSecurityAttributes`). Stored for
     /// future ACL enforcement; currently unused beyond record-keeping.
@@ -782,6 +812,16 @@ struct NamedPipeState {
     out_buffer_size: u32,
     /// Inbound buffer size as requested at creation time.
     in_buffer_size: u32,
+    /// The server-end handle (from CreateNamedPipeW), when open.
+    server_handle: Option<Handle>,
+    /// The client-end handle (from CreateFileW on `\\.\pipe\NAME`), when
+    /// connected.
+    client_handle: Option<Handle>,
+    /// PIPE_READMODE_MESSAGE: writes append a [u32 length][bytes...] frame
+    /// and reads return exactly one message.
+    message_mode: bool,
+    /// Whether a client has connected (ConnectNamedPipe completes).
+    client_connected: bool,
 }
 
 /// Backing store for a shared-memory section created via CreateFileMappingW.
@@ -811,6 +851,17 @@ enum OverlappedState {
     Cancelled,
 }
 
+/// The kind of operation behind an overlapped request.  The scheduler uses
+/// the kind to complete pipe requests from the right direction queue and to
+/// recover the request id from the guest OVERLAPPED struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverlappedKind {
+    Read,
+    Write,
+    Connection,
+    DeviceControl,
+}
+
 #[derive(Debug, Clone)]
 struct OverlappedRequest {
     handle: Handle,
@@ -821,6 +872,19 @@ struct OverlappedRequest {
     generation: u32,
     event_handle: Option<Handle>,
     state: OverlappedState,
+    /// Typed operation behind the request (Read / Write / Connection /
+    /// DeviceControl).  Pending pipe Read requests complete from the pipe's
+    /// direction queue; everything else completes through explicit state
+    /// transitions.
+    kind: OverlappedKind,
+    /// Guest pointer to the I/O buffer (pipe Read/Write requests only; 0
+    /// for everything else).
+    buffer_ptr: u64,
+    /// Requested transfer length (pipe Read requests).
+    length: u32,
+    /// Guest pointer to the bytes-transferred out-parameter (pipe I/O
+    /// requests only; 0 when the caller passed NULL).
+    bytes_read_ptr: u64,
 }
 
 /// State of a single committed 4 KiB page.
@@ -1818,7 +1882,47 @@ impl Win32Subsystem {
             .is_some_and(|request| !matches!(request.state, OverlappedState::Pending))
     }
 
-    /// Non-consuming check: is the pipe connected (server side)?
+    /// Non-consuming satisfiability of an overlapped request: completed
+    /// requests are ready; PENDING pipe Read requests become ready when
+    /// their direction queue has data (or the peer disconnected).
+    pub fn overlapped_satisfiable(&self, id: u64) -> bool {
+        let Some(request) = self.overlapped.get(&id) else {
+            return false;
+        };
+        if !matches!(request.state, OverlappedState::Pending) {
+            return true;
+        }
+        if request.kind != OverlappedKind::Read {
+            return false;
+        }
+        let Some(state) =
+            self.handle_entry(request.handle)
+                .ok()
+                .and_then(|entry| match &entry.object {
+                    KernelObject::Pipe(pipe) => self
+                        .named_pipes
+                        .get(&normalize_pipe_name(&pipe.name))
+                        .cloned(),
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        let is_server = state.server_handle == Some(request.handle);
+        let queue = if is_server {
+            &state.client_to_server
+        } else {
+            &state.server_to_client
+        };
+        if state.client_disconnected || state.server_disconnected {
+            return true;
+        }
+        pipe_queue_peek_len(queue, state.message_mode) > 0
+    }
+
+    /// Non-consuming check: is the pipe connected (server side)?  True once
+    /// a client has connected (via CreateFileW on `\\.\pipe\NAME` or
+    /// CallNamedPipe).
     pub fn pipe_is_connected(&self, handle: Handle) -> bool {
         self.handle_entry(handle)
             .ok()
@@ -1827,6 +1931,17 @@ impl Win32Subsystem {
                 _ => None,
             })
             .unwrap_or(false)
+            || self
+                .handle_entry(handle)
+                .ok()
+                .and_then(|entry| match &entry.object {
+                    KernelObject::Pipe(pipe) => self
+                        .named_pipes
+                        .get(&normalize_pipe_name(&pipe.name))
+                        .map(|state| state.client_connected),
+                    _ => None,
+                })
+                .unwrap_or(false)
     }
 
     pub fn mark_owned_mutexes_abandoned(&mut self, thread_id: u32) {
@@ -2588,6 +2703,35 @@ impl Win32Subsystem {
                 });
                 if !still_open {
                     self.named_pipes.remove(&name);
+                } else {
+                    // The peer end survives: forget the closed end so a
+                    // recycled handle value can never be misclassified as
+                    // it, and mark the surviving end's direction broken so
+                    // parked pipe waiters wake with ERROR_BROKEN_PIPE.
+                    let surviving = {
+                        let state = self.named_pipes.get_mut(&name);
+                        if let Some(state) = state {
+                            if state.server_handle == Some(handle) {
+                                state.server_handle = None;
+                                state.client_disconnected = true;
+                                state.client_handle
+                            } else if state.client_handle == Some(handle) {
+                                state.client_handle = None;
+                                state.server_disconnected = true;
+                                state.server_handle
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    // Signal pending pipe I/O events on the surviving end so
+                    // event waiters wake; the requests stay Pending and
+                    // complete as broken pipe through the scheduler.
+                    if let Some(surviving) = surviving {
+                        self.signal_pending_pipe_io_events(surviving)?;
+                    }
                 }
             }
             KernelObject::Section(section) => {
@@ -2805,23 +2949,13 @@ impl Win32Subsystem {
                     _ => return invalid_handle("handle is not a pipe"),
                 };
                 if let Some(state) = self.named_pipes.get(&normalized) {
-                    if state.server_disconnected {
+                    if state.server_disconnected && !state.client_connected {
                         return Err(AppError::new(
                             ReasonCode::RcIo,
                             format!("pipe {normalized} is disconnected"),
                         ));
                     }
-                    let buffer = state.buffer.lock().unwrap();
-                    let available = buffer.len().min(length);
-                    let data: Vec<u8> = buffer.iter().take(available).copied().collect();
-                    drop(buffer);
-                    if let Some(state_mut) = self.named_pipes.get_mut(&normalized) {
-                        let mut buf = state_mut.buffer.lock().unwrap();
-                        if available > 0 {
-                            buf.drain(..available);
-                        }
-                    }
-                    Ok(data)
+                    Ok(self.pipe_read_sync(handle, length))
                 } else {
                     // Legacy pipe without shared state: read from the
                     // per-object buffer.
@@ -2955,9 +3089,23 @@ impl Win32Subsystem {
                     ));
                 }
                 if let Some(state) = self.named_pipes.get_mut(&normalized) {
-                    let mut buffer = state.buffer.lock().unwrap();
-                    buffer.extend(bytes);
-                    state.data_ready.notify_all();
+                    // Server writes append to server-to-client; client writes
+                    // append to client-to-server.
+                    let is_server = state.server_handle == Some(handle);
+                    let (queue, data_ready, message_mode) = if is_server {
+                        (
+                            state.server_to_client.clone(),
+                            state.data_ready.clone(),
+                            state.message_mode,
+                        )
+                    } else {
+                        (
+                            state.client_to_server.clone(),
+                            state.data_ready.clone(),
+                            state.message_mode,
+                        )
+                    };
+                    pipe_queue_append(&queue, &data_ready, bytes, message_mode);
                 } else {
                     // Legacy pipe without shared state: buffer on the object.
                     let entry = self.handle_entry_mut(handle)?;
@@ -3546,6 +3694,7 @@ impl Win32Subsystem {
         let id = self.insert_overlapped(
             handle,
             event_handle,
+            OverlappedKind::Read,
             OverlappedState::Completed(transferred),
         );
         self.signal_event_if_needed(event_handle)?;
@@ -3555,6 +3704,47 @@ impl Win32Subsystem {
             completed: true,
             cancelled: false,
         })
+    }
+
+    /// Like [`Self::read_file_overlapped`] but also returns the bytes read so
+    /// the ReadFile thunk can copy them into the guest buffer.
+    pub fn read_file_overlapped_full(
+        &mut self,
+        handle: Handle,
+        length: usize,
+        offset: u64,
+        event_handle: Option<Handle>,
+    ) -> AppResult<(OverlappedResult, Vec<u8>)> {
+        let file = self.file_object(handle)?;
+        let file = file.borrow();
+        let bytes = fs::read(&file.host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to read {}", file.host_path.display()),
+                &error,
+            )
+        })?;
+        // Clamp before adding: a near-u64::MAX offset must not overflow.
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(length).min(bytes.len());
+        let data = bytes[start..end].to_vec();
+        let transferred = data.len() as u32;
+        let id = self.insert_overlapped(
+            handle,
+            event_handle,
+            OverlappedKind::Read,
+            OverlappedState::Completed(transferred),
+        );
+        self.signal_event_if_needed(event_handle)?;
+        Ok((
+            OverlappedResult {
+                id,
+                bytes_transferred: transferred,
+                completed: true,
+                cancelled: false,
+            },
+            data,
+        ))
     }
 
     pub fn write_file_overlapped(
@@ -3615,6 +3805,7 @@ impl Win32Subsystem {
         let id = self.insert_overlapped(
             handle,
             event_handle,
+            OverlappedKind::Write,
             OverlappedState::Completed(bytes.len() as u32),
         );
         self.signal_event_if_needed(event_handle)?;
@@ -3763,6 +3954,12 @@ impl Win32Subsystem {
         )
     }
 
+    /// `ConnectNamedPipe` inner helper.  Non-blocking: returns `Ok(None)`
+    /// when the client is already connected (signalling `event_handle`), an
+    /// overlapped request id when `overlapped` (the caller reports
+    /// ERROR_IO_PENDING), or `Some(0)` as a pending marker when a
+    /// non-overlapped call must wait (the caller parks the guest thread on
+    /// [`Self::pipe_is_connected`]).
     pub fn connect_named_pipe_internal(
         &mut self,
         handle: Handle,
@@ -3782,33 +3979,113 @@ impl Win32Subsystem {
                 _ => return invalid_handle("handle is not a pipe"),
             }
         };
+        let normalized = normalize_pipe_name(&pipe_name);
+        // Mark ourselves as ready to connect – the client side (CreateFileW
+        // with `\\.\pipe\...`) performs the connection.  A new connect
+        // cycle clears the previous disconnect.
+        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+            state.server_created = true;
+            state.server_handle = Some(handle);
+            state.server_disconnected = false;
+        }
+        if self
+            .named_pipes
+            .get(&normalized)
+            .is_some_and(|state| state.client_connected)
+        {
+            self.signal_event_if_needed(event_handle)?;
+            return Ok(None);
+        }
         if overlapped {
-            let id = self.insert_overlapped(handle, event_handle, OverlappedState::Pending);
+            let id = self.insert_overlapped(
+                handle,
+                event_handle,
+                OverlappedKind::Connection,
+                OverlappedState::Pending,
+            );
             return Ok(Some(id));
         }
-        // Non-overlapped ConnectNamedPipe blocks until a client connects.
-        // Poll the shared state for a bounded period — guest threads are
-        // scheduled cooperatively, so an unbounded block would deadlock the
-        // emulator when the client lives in another guest thread.
-        let normalized = normalize_pipe_name(&pipe_name);
-        for _ in 0..BLOCKING_POLL_ITERATIONS {
-            if self
-                .named_pipes
-                .get(&normalized)
-                .is_some_and(|state| state.connected)
-            {
-                self.signal_event_if_needed(event_handle)?;
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-            self.record_sleep_observation(1, 1);
-        }
-        Err(AppError::new(
-            ReasonCode::RcPipeBusy,
-            format!("{} is not connected", pipe_name),
-        ))
+        // Non-overlapped ConnectNamedPipe on a not-yet-connected pipe: the
+        // caller must park the guest thread on the pipe-connection condition
+        // (guest threads are scheduled cooperatively — a host poll loop
+        // would deadlock the emulator when the client lives in another
+        // guest thread).
+        Ok(Some(0))
     }
 
+    /// Client-connection step shared by `CreateFileW` on `\\.\pipe\NAME`,
+    /// `CallNamedPipeW` and the legacy `call_named_pipe` helper: mark the
+    /// pipe connected and complete the server's pending ConnectNamedPipe
+    /// overlapped requests (staleness-checked — a completion whose handle
+    /// was closed and recycled must be dropped, never applied to the wrong
+    /// object).
+    fn pipe_complete_connect(&mut self, normalized: &str) -> AppResult<()> {
+        let server_handle = if let Some(state) = self.named_pipes.get_mut(normalized) {
+            state.client_connected = true;
+            state.client_disconnected = false;
+            state.server_disconnected = false;
+            state.server_handle
+        } else {
+            None
+        };
+        if let Some(server_handle) = server_handle
+            && let Some(HandleEntry {
+                object: KernelObject::Pipe(pipe),
+                ..
+            }) = self.handles.get_mut(&server_handle)
+        {
+            pipe.connected = true;
+        }
+        // Complete pending ConnectNamedPipe overlapped requests on the
+        // server end.
+        if let Some(server_handle) = server_handle {
+            self.complete_pending_connection_requests(server_handle)?;
+        }
+        Ok(())
+    }
+
+    /// Complete every pending Connection overlapped request queued on
+    /// `server_handle`, dropping completions whose handle was closed (and
+    /// possibly its value recycled to a different object) since the request
+    /// was queued — never signal an event owned by the wrong object.
+    fn complete_pending_connection_requests(&mut self, server_handle: Handle) -> AppResult<()> {
+        let pending_ids = self
+            .overlapped
+            .iter()
+            .filter(|(_, request)| {
+                request.handle == server_handle
+                    && request.kind == OverlappedKind::Connection
+                    && matches!(request.state, OverlappedState::Pending)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for id in pending_ids {
+            let stale = self
+                .overlapped
+                .get(&id)
+                .is_none_or(|request| self.overlapped_request_is_stale(request));
+            if stale {
+                self.overlapped.remove(&id);
+                continue;
+            }
+            if let Some(overlapped) = self.overlapped.get_mut(&id) {
+                overlapped.state = OverlappedState::Completed(0);
+                events.push(overlapped.event_handle);
+            }
+        }
+        for event_handle in events {
+            self.signal_event_if_needed(event_handle)?;
+        }
+        Ok(())
+    }
+
+    /// `CallNamedPipe` legacy helper — open (client connect), write the
+    /// request, read the server's response, close.  The returned bytes are
+    /// whatever the server wrote into the pipe (the response queue), NOT a
+    /// copy of the request.  The helper is synchronous: when the server has
+    /// not queued a response yet it returns empty and the thunk layer parks
+    /// the guest thread on the scheduler's `PipeCall` wait instead.
     pub fn call_named_pipe(&mut self, name: &str, request: &[u8]) -> AppResult<Vec<u8>> {
         let normalized = normalize_pipe_name(name);
         let pipe_handle = self
@@ -3824,52 +4101,43 @@ impl Win32Subsystem {
                     format!("{} is not registered", normalized),
                 )
             })?;
-        // Mirror `call_named_pipe_w`: the request goes into the shared
-        // named-pipe buffer so server-side `read_file` calls observe it
-        // (the per-object `PipeObject.buffer` is never read anywhere).
+        // Client connection: this call is a client; complete the server's
+        // pending ConnectNamedPipe overlapped requests.
+        self.pipe_complete_connect(&normalized)?;
         if let Some(state) = self.named_pipes.get_mut(&normalized) {
-            let mut buffer = state.buffer.lock().unwrap();
-            buffer.extend(request);
-            state.data_ready.notify_all();
-        }
-        if let Some(HandleEntry {
-            object: KernelObject::Pipe(pipe),
-            ..
-        }) = self.handles.get_mut(&pipe_handle)
-        {
-            pipe.connected = true;
-            pipe.buffer.extend_from_slice(request);
-        }
-        let pending_ids = self
-            .overlapped
-            .iter()
-            .filter(|(_, request)| request.handle == pipe_handle)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        let mut events = Vec::new();
-        for id in pending_ids {
-            // Drop completions whose handle was closed (and possibly its
-            // value recycled to a different object) since the request was
-            // queued — never signal an event owned by the wrong object.
-            let stale = self
-                .overlapped
-                .get(&id)
-                .is_none_or(|request| self.overlapped_request_is_stale(request));
-            if stale {
-                self.overlapped.remove(&id);
-                continue;
-            }
-            if let Some(overlapped) = self.overlapped.get_mut(&id) {
-                // Complete pending connect requests with the actual byte
-                // count written by this call.
-                overlapped.state = OverlappedState::Completed(request.len() as u32);
-                events.push(overlapped.event_handle);
+            // The request goes into client-to-server so server-side
+            // `read_file` calls observe it.
+            pipe_queue_append(
+                &state.client_to_server,
+                &state.data_ready,
+                request,
+                state.message_mode,
+            );
+        } else {
+            // Legacy pipe without shared state: buffer on the object.
+            if let Some(HandleEntry {
+                object: KernelObject::Pipe(pipe),
+                ..
+            }) = self.handles.get_mut(&pipe_handle)
+            {
+                pipe.connected = true;
+                pipe.buffer.extend_from_slice(request);
             }
         }
-        for event_handle in events {
-            self.signal_event_if_needed(event_handle)?;
+        self.complete_pending_connection_requests(pipe_handle)?;
+        // The response is whatever the server wrote into the pipe; when the
+        // server has not responded yet there is nothing to return (the thunk
+        // layer parks the caller on the scheduler wait).
+        if let Some(state) = self.named_pipes.get(&normalized) {
+            Ok(pipe_queue_read(
+                &state.server_to_client,
+                &state.data_ready,
+                usize::MAX,
+                state.message_mode,
+            ))
+        } else {
+            Ok(Vec::new())
         }
-        Ok(request.to_vec())
     }
 
     pub fn virtual_alloc(
@@ -4592,14 +4860,27 @@ impl Win32Subsystem {
             );
         }
 
+        // Create the server handle first so the state can record it as the
+        // server end.
+        let handle = self.insert_object(
+            ObjectType::Pipe,
+            0x1F0FFF,
+            inheritable,
+            KernelObject::Pipe(PipeObject {
+                name: normalized.clone(),
+                connected: false,
+                buffer: Vec::new(),
+            }),
+        );
         let state = NamedPipeState {
             name: normalized.clone(),
             server_created: true,
-            connected: false,
-            buffer: Arc::new(Mutex::new(VecDeque::with_capacity(buf_size))),
+            server_to_client: Arc::new(Mutex::new(VecDeque::with_capacity(buf_size))),
+            client_to_server: Arc::new(Mutex::new(VecDeque::with_capacity(buf_size))),
             data_ready: Arc::new(Condvar::new()),
             max_buffer_size: buf_size,
             server_disconnected: false,
+            client_disconnected: false,
             security_descriptor,
             uds_socket_path: Some(uds_path),
             open_mode,
@@ -4608,19 +4889,14 @@ impl Win32Subsystem {
             default_timeout,
             out_buffer_size,
             in_buffer_size,
+            server_handle: Some(handle),
+            client_handle: None,
+            message_mode: pipe_mode & PIPE_READMODE_MESSAGE != 0,
+            client_connected: false,
         };
-        self.named_pipes.insert(normalized.clone(), state.clone());
+        self.named_pipes.insert(normalized, state.clone());
 
-        Ok(self.insert_object(
-            ObjectType::Pipe,
-            0x1F0FFF,
-            inheritable,
-            KernelObject::Pipe(PipeObject {
-                name: normalized,
-                connected: false,
-                buffer: Vec::new(),
-            }),
-        ))
+        Ok(handle)
     }
 
     /// `ConnectNamedPipe` — wait for a client to connect to the named pipe.
@@ -4632,9 +4908,10 @@ impl Win32Subsystem {
         };
         let normalized = normalize_pipe_name(&pipe_name);
         // Mark ourselves as ready to connect – the client side (CreateFileW
-        // with `\\.\pipe\...`) will set `connected`.
+        // with `\\.\pipe\...`) performs the connection.
         if let Some(state) = self.named_pipes.get_mut(&normalized) {
             state.server_created = true;
+            state.server_handle = Some(handle);
             // A new connect cycle clears the previous disconnect.
             state.server_disconnected = false;
         }
@@ -4686,6 +4963,9 @@ impl Win32Subsystem {
             // Apply the same PIPE_WAIT/NOWAIT + READMODE mask used at
             // creation so wait/info semantics see consistent bits.
             state.pipe_mode = mode & 0x0000_0003;
+            // PIPE_READMODE_MESSAGE: writes append a [u32 len][bytes]
+            // frame and reads return exactly one message.
+            state.message_mode = mode & PIPE_READMODE_MESSAGE != 0;
             // max_collect_count and collect_data_timeout unused in current impl
         }
         Ok(())
@@ -4713,14 +4993,22 @@ impl Win32Subsystem {
                         format!("pipe {} is disconnected", pipe.name),
                     ));
                 }
-                let buf = state.buffer.lock().unwrap();
-                let available = buf.len() as u32;
-                let to_copy = buffer.len().min(available as usize);
-                for (i, b) in buf.iter().take(to_copy).enumerate() {
+                // Peek the handle's read direction: the server end reads
+                // client-to-server, the client end reads server-to-client.
+                let is_server = state.server_handle == Some(handle);
+                let queue = if is_server {
+                    &state.client_to_server
+                } else {
+                    &state.server_to_client
+                };
+                let available = pipe_queue_peek_len(queue, state.message_mode);
+                let to_copy = buffer.len().min(available);
+                let queue = queue.lock().unwrap();
+                for (i, b) in queue.iter().take(to_copy).enumerate() {
                     buffer[i] = *b;
                 }
                 // Return (bytes_read, total_bytes_avail, bytes_left_this_message)
-                Ok((to_copy as u32, available, available))
+                Ok((to_copy as u32, available as u32, available as u32))
             }
             _ => invalid_handle("handle is not a pipe"),
         }
@@ -4734,50 +5022,98 @@ impl Win32Subsystem {
             _ => return invalid_handle("handle is not a pipe"),
         };
         let normalized = normalize_pipe_name(&pipe_name);
+        let mut pipe_handles = Vec::new();
         if let Some(state) = self.named_pipes.get_mut(&normalized) {
-            state.connected = false;
+            state.client_connected = false;
             state.server_disconnected = true;
+            state.client_disconnected = true;
+            state.client_handle = None;
+            pipe_handles.push(state.server_handle);
             // Windows discards queued data on disconnect.
-            state.buffer.lock().unwrap().clear();
+            state.server_to_client.lock().unwrap().clear();
+            state.client_to_server.lock().unwrap().clear();
             state.data_ready.notify_all();
+        }
+        // Mark every pipe handle's `connected` flag false so blocking
+        // ConnectNamedPipe/read paths observe the new cycle.
+        for pipe_handle in pipe_handles.into_iter().flatten() {
+            if let Some(HandleEntry {
+                object: KernelObject::Pipe(pipe),
+                ..
+            }) = self.handles.get_mut(&pipe_handle)
+            {
+                pipe.connected = false;
+            }
+        }
+        if let Some(HandleEntry {
+            object: KernelObject::Pipe(pipe),
+            ..
+        }) = self.handles.get_mut(&handle)
+        {
+            pipe.connected = false;
         }
         Ok(())
     }
 
-    /// `CallNamedPipeW` — convenience: connect, write, read, disconnect.
+    /// `CallNamedPipeW` — open (client connect), write the request, read the
+    /// server's response, close.  The returned bytes are whatever the server
+    /// wrote into the pipe (the response queue), NOT a copy of the request.
     ///
-    /// Writes the request data into the shared pipe buffer and returns
-    /// immediately.  In a shared-buffer model we cannot block for a
-    /// server response in a single-threaded context, so the request is
-    /// left in the buffer for the server to process.  The returned
-    /// `Vec<u8>` is always empty; callers should use separate
-    /// `read_file` / `write_file` calls for the response.
+    /// The helper is synchronous: when the server has not queued a response
+    /// yet it returns empty and the thunk layer parks the guest thread on
+    /// the scheduler's `PipeCall` wait (the request stays in the pipe for
+    /// the server to process via its own `ReadFile`).
     pub fn call_named_pipe_w(
         &mut self,
         pipe_name: &str,
         write_data: &[u8],
-        _read_buffer_size: u32,
+        read_buffer_size: u32,
         _timeout_ms: u32,
     ) -> AppResult<Vec<u8>> {
         let normalized = normalize_pipe_name(pipe_name);
-        // Find the pipe state
+        let server_handle = {
+            let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcFsNotFound,
+                    format!("named pipe not found: {pipe_name}"),
+                )
+            })?;
+            state.server_handle
+        };
+        // Client connection: this call is a client; complete the server's
+        // pending ConnectNamedPipe overlapped requests.
+        self.pipe_complete_connect(&normalized)?;
+        let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("named pipe not found: {pipe_name}"),
+            )
+        })?;
+        // Write data (client → server direction) and notify the server.
+        pipe_queue_append(
+            &state.client_to_server,
+            &state.data_ready,
+            write_data,
+            state.message_mode,
+        );
+        if let Some(server_handle) = server_handle {
+            self.complete_pending_connection_requests(server_handle)?;
+        }
+        // The response is whatever the server already wrote; when the
+        // server has not responded yet the thunk layer parks the caller on
+        // the scheduler wait.
         let state = self.named_pipes.get(&normalized).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcFsNotFound,
                 format!("named pipe not found: {pipe_name}"),
             )
         })?;
-        let buf = state.buffer.clone();
-        let ready = state.data_ready.clone();
-        // Write data (client → server direction) and notify the server.
-        {
-            let mut buffer = buf.lock().unwrap();
-            buffer.extend(write_data);
-            ready.notify_all();
-        }
-        // Do NOT drain the buffer — the request data stays for the
-        // server to read via `read_file`.  Return empty to the caller.
-        Ok(Vec::new())
+        Ok(pipe_queue_read(
+            &state.server_to_client,
+            &state.data_ready,
+            read_buffer_size as usize,
+            state.message_mode,
+        ))
     }
 
     /// `WaitNamedPipeW` — wait for a named pipe to become available.
@@ -4793,38 +5129,385 @@ impl Win32Subsystem {
         }
     }
 
+    /// Whether a named-pipe server instance is registered for `pipe_name`
+    /// (used by the WaitNamedPipeW / CallNamedPipeW thunks and the pump's
+    /// pipe-availability evaluator).
+    pub fn named_pipe_server_exists(&self, pipe_name: &str) -> bool {
+        self.named_pipes
+            .contains_key(&normalize_pipe_name(pipe_name))
+    }
+
+    /// The default timeout recorded at CreateNamedPipeW time (used by
+    /// CallNamedPipeW when the caller passes nTimeOut == 0).
+    pub fn named_pipe_default_timeout(&self, pipe_name: &str) -> Option<u32> {
+        self.named_pipes
+            .get(&normalize_pipe_name(pipe_name))
+            .map(|state| state.default_timeout)
+    }
+
     /// Open a pipe client endpoint: called from `CreateFileW` when the path
-    /// starts with `\\.\pipe\`.
+    /// starts with `\\.\pipe\`.  Performs the CLIENT connection: records the
+    /// client end, marks the pipe connected, and signals the server's
+    /// pending ConnectNamedPipe.
     pub fn open_named_pipe_client(
         &mut self,
         pipe_name: &str,
         inheritable: bool,
     ) -> AppResult<Handle> {
         let normalized = normalize_pipe_name(pipe_name);
-        let name = {
-            let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+        let name = self
+            .named_pipes
+            .get_mut(&normalized)
+            .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!("named pipe not found: {pipe_name}"),
                 )
-            })?;
-            // Mark as connected
-            state.connected = true;
-            state.server_disconnected = false;
-            state.name.clone()
-        };
-        // The pipe object shares the same buffer by name; `read_file` and
-        // `write_file` look the state up through the normalized name.
-        Ok(self.insert_object(
+            })?
+            .name
+            .clone();
+        let handle = self.insert_object(
             ObjectType::Pipe,
             0x1F0FFF,
             inheritable,
             KernelObject::Pipe(PipeObject {
-                name,
+                name: name.clone(),
                 connected: true,
                 buffer: Vec::new(),
             }),
-        ))
+        );
+        // Record the client end and complete the server's pending
+        // ConnectNamedPipe overlapped requests.
+        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+            state.client_handle = Some(handle);
+        }
+        self.pipe_complete_connect(&normalized)?;
+        Ok(handle)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler-facing pipe I/O (used by the pe_runtime pump evaluator and
+    // the ReadFile/WriteFile/GetOverlappedResult thunks)
+    // -----------------------------------------------------------------------
+
+    /// The pipe state behind a pipe handle, cloned for lock-free use.
+    fn pipe_state_for_handle(&self, handle: Handle) -> Option<NamedPipeState> {
+        self.handle_entry(handle)
+            .ok()
+            .and_then(|entry| match &entry.object {
+                KernelObject::Pipe(pipe) => self
+                    .named_pipes
+                    .get(&normalize_pipe_name(&pipe.name))
+                    .cloned(),
+                _ => None,
+            })
+    }
+
+    /// Non-consuming: has the server queued a response for a CallNamedPipe
+    /// waiter (server-to-client non-empty)?
+    pub fn pipe_response_available(&self, name: &str) -> bool {
+        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+            return false;
+        };
+        pipe_queue_peek_len(&state.server_to_client, state.message_mode) > 0
+    }
+
+    /// Non-consuming: would a CallNamedPipe waiter wake with
+    /// ERROR_BROKEN_PIPE (server disconnected / pipe state gone)?
+    pub fn pipe_call_broken(&self, name: &str) -> bool {
+        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+            return true;
+        };
+        state.client_disconnected || state.server_disconnected
+    }
+
+    /// Consume the server's queued response (up to `capacity` bytes) for a
+    /// CallNamedPipe waiter.
+    pub fn take_pipe_response(&self, name: &str, capacity: u32) -> Vec<u8> {
+        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+            return Vec::new();
+        };
+        pipe_queue_read(
+            &state.server_to_client,
+            &state.data_ready,
+            capacity as usize,
+            state.message_mode,
+        )
+    }
+
+    /// Non-consuming: has the pipe handle's read direction queue got data?
+    pub fn pipe_read_available(&self, handle: Handle) -> bool {
+        let Some(state) = self.pipe_state_for_handle(handle) else {
+            return false;
+        };
+        let is_server = state.server_handle == Some(handle);
+        let queue = if is_server {
+            &state.client_to_server
+        } else {
+            &state.server_to_client
+        };
+        pipe_queue_peek_len(queue, state.message_mode) > 0
+    }
+
+    /// Non-consuming: did the pipe's peer end disconnect?
+    pub fn pipe_peer_disconnected(&self, handle: Handle) -> bool {
+        self.pipe_state_for_handle(handle)
+            .is_some_and(|state| state.client_disconnected || state.server_disconnected)
+    }
+
+    /// Synchronously consume queued bytes from a pipe handle's read
+    /// direction (message-aware).
+    pub fn pipe_read_sync(&self, handle: Handle, length: usize) -> Vec<u8> {
+        let Some(state) = self.pipe_state_for_handle(handle) else {
+            return Vec::new();
+        };
+        let is_server = state.server_handle == Some(handle);
+        let (queue, data_ready, message_mode) = if is_server {
+            (
+                state.client_to_server.clone(),
+                state.data_ready.clone(),
+                state.message_mode,
+            )
+        } else {
+            (
+                state.server_to_client.clone(),
+                state.data_ready.clone(),
+                state.message_mode,
+            )
+        };
+        pipe_queue_read(&queue, &data_ready, length, message_mode)
+    }
+
+    /// Issue an overlapped pipe read.  When data is already queued the
+    /// request completes synchronously and the bytes are returned; otherwise
+    /// a typed Pending Read request is queued and the caller parks the guest
+    /// thread on the `PipeIo` scheduler wait (which completes it when the
+    /// queue fills).
+    pub fn pipe_read_begin(
+        &mut self,
+        handle: Handle,
+        length: usize,
+        event_handle: Option<Handle>,
+        buffer_ptr: u64,
+        bytes_read_ptr: u64,
+    ) -> AppResult<PipeIoOutcome> {
+        let data = self.pipe_read_sync(handle, length);
+        if !data.is_empty() || length == 0 {
+            let id = self.insert_pipe_io_overlapped(
+                handle,
+                event_handle,
+                OverlappedKind::Read,
+                OverlappedState::Completed(data.len() as u32),
+                buffer_ptr,
+                length as u32,
+                bytes_read_ptr,
+            );
+            self.signal_event_if_needed(event_handle)?;
+            return Ok(PipeIoOutcome {
+                id,
+                bytes: data,
+                completed: true,
+            });
+        }
+        let id = self.insert_pipe_io_overlapped(
+            handle,
+            event_handle,
+            OverlappedKind::Read,
+            OverlappedState::Pending,
+            buffer_ptr,
+            length as u32,
+            bytes_read_ptr,
+        );
+        Ok(PipeIoOutcome {
+            id,
+            bytes: Vec::new(),
+            completed: false,
+        })
+    }
+
+    /// Issue an overlapped pipe write: appends to the opposite direction's
+    /// queue (unbounded, so writes always complete immediately) and records
+    /// a typed Completed Write request.
+    pub fn pipe_write_begin(
+        &mut self,
+        handle: Handle,
+        bytes: &[u8],
+        event_handle: Option<Handle>,
+    ) -> AppResult<OverlappedResult> {
+        let written = self.write_file(handle, bytes)?;
+        let id = self.insert_pipe_io_overlapped(
+            handle,
+            event_handle,
+            OverlappedKind::Write,
+            OverlappedState::Completed(written),
+            0,
+            0,
+            0,
+        );
+        self.signal_event_if_needed(event_handle)?;
+        Ok(OverlappedResult {
+            id,
+            bytes_transferred: written,
+            completed: true,
+            cancelled: false,
+        })
+    }
+
+    /// Complete exactly one pending pipe I/O request (typed Read/Write) with
+    /// `bytes_transferred`, signalling its event (staleness-checked).
+    /// Scoping completion to the request id keeps sibling requests on the
+    /// same handle pending — each waiter's GetOverlappedResult resumes only
+    /// with its own result.
+    pub fn complete_pipe_io_request_id(
+        &mut self,
+        id: u64,
+        bytes_transferred: u32,
+    ) -> AppResult<()> {
+        let Some(request) = self.overlapped.get(&id) else {
+            return Ok(());
+        };
+        if !matches!(request.kind, OverlappedKind::Read | OverlappedKind::Write)
+            || !matches!(request.state, OverlappedState::Pending)
+        {
+            return Ok(());
+        }
+        if self.overlapped_request_is_stale(request) {
+            self.overlapped.remove(&id);
+            return Ok(());
+        }
+        let event_handle = request.event_handle;
+        if let Some(overlapped) = self.overlapped.get_mut(&id) {
+            overlapped.state = OverlappedState::Completed(bytes_transferred);
+        }
+        self.signal_event_if_needed(event_handle)
+    }
+
+    /// Mark every pending pipe I/O request on `pipe_handle` as completed
+    /// with zero bytes (the peer disconnected) and signal their events, so
+    /// parked Overlapped/event waiters wake instead of hanging.  The
+    /// requests stay in the table until consumed by GetOverlappedResult.
+    pub fn try_complete_pending_pipe_io_for_handle(
+        &mut self,
+        pipe_handle: Handle,
+    ) -> AppResult<()> {
+        let pending_ids = self
+            .overlapped
+            .iter()
+            .filter(|(_, request)| {
+                request.handle == pipe_handle
+                    && matches!(request.kind, OverlappedKind::Read | OverlappedKind::Write)
+                    && matches!(request.state, OverlappedState::Pending)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for id in pending_ids {
+            let stale = self
+                .overlapped
+                .get(&id)
+                .is_none_or(|request| self.overlapped_request_is_stale(request));
+            if stale {
+                self.overlapped.remove(&id);
+                continue;
+            }
+            if let Some(overlapped) = self.overlapped.get_mut(&id) {
+                overlapped.state = OverlappedState::Completed(0);
+                events.push(overlapped.event_handle);
+            }
+        }
+        for event_handle in events {
+            self.signal_event_if_needed(event_handle)?;
+        }
+        Ok(())
+    }
+
+    /// Signal the completion events of every pending pipe I/O request on
+    /// `pipe_handle` without completing the requests (staleness-checked).
+    /// Used when the peer end closes: event waiters wake, and the requests
+    /// complete as broken pipe when the scheduler next evaluates them.
+    fn signal_pending_pipe_io_events(&mut self, pipe_handle: Handle) -> AppResult<()> {
+        let pending_ids = self
+            .overlapped
+            .iter()
+            .filter(|(_, request)| {
+                request.handle == pipe_handle
+                    && matches!(request.kind, OverlappedKind::Read | OverlappedKind::Write)
+                    && matches!(request.state, OverlappedState::Pending)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for id in pending_ids {
+            let stale = self
+                .overlapped
+                .get(&id)
+                .is_none_or(|request| self.overlapped_request_is_stale(request));
+            if stale {
+                self.overlapped.remove(&id);
+                continue;
+            }
+            if let Some(overlapped) = self.overlapped.get_mut(&id) {
+                events.push(overlapped.event_handle);
+            }
+        }
+        for event_handle in events {
+            self.signal_event_if_needed(event_handle)?;
+        }
+        Ok(())
+    }
+
+    /// Try to complete a PENDING typed pipe Read request from its direction
+    /// queue (or with a broken-pipe marker when the peer disconnected).
+    /// Returns `None` while the request is still pending.
+    pub fn try_complete_pending_pipe_io(&mut self, id: u64) -> Option<PendingPipeIoCompletion> {
+        let request = self.overlapped.get(&id)?.clone();
+        if request.kind != OverlappedKind::Read
+            || !matches!(request.state, OverlappedState::Pending)
+            || self.overlapped_request_is_stale(&request)
+        {
+            return None;
+        }
+        let handle = request.handle;
+        let state = self.pipe_state_for_handle(handle)?;
+        if state.client_disconnected || state.server_disconnected {
+            // The peer end is gone: the waiter resumes with
+            // ERROR_BROKEN_PIPE; the request itself is dropped so a later
+            // GetOverlappedResult poll does not hang on it.
+            let _ = self.complete_pipe_io_request_id(id, 0);
+            self.overlapped.remove(&id);
+            return Some(PendingPipeIoCompletion {
+                buffer_ptr: request.buffer_ptr,
+                bytes_read_ptr: request.bytes_read_ptr,
+                bytes: Vec::new(),
+                broken_pipe: true,
+            });
+        }
+        let is_server = state.server_handle == Some(handle);
+        let (queue, data_ready, message_mode) = if is_server {
+            (
+                state.client_to_server.clone(),
+                state.data_ready.clone(),
+                state.message_mode,
+            )
+        } else {
+            (
+                state.server_to_client.clone(),
+                state.data_ready.clone(),
+                state.message_mode,
+            )
+        };
+        let data = pipe_queue_read(&queue, &data_ready, request.length as usize, message_mode);
+        if data.is_empty() {
+            // Still pending: no data arrived (or an incomplete message).
+            return None;
+        }
+        let _ = self.complete_pipe_io_request_id(id, data.len() as u32);
+        Some(PendingPipeIoCompletion {
+            buffer_ptr: request.buffer_ptr,
+            bytes_read_ptr: request.bytes_read_ptr,
+            bytes: data,
+            broken_pipe: false,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -5824,6 +6507,7 @@ impl Win32Subsystem {
         &mut self,
         handle: Handle,
         event_handle: Option<Handle>,
+        kind: OverlappedKind,
         state: OverlappedState,
     ) -> u64 {
         let id = self.next_overlapped_id;
@@ -5836,6 +6520,43 @@ impl Win32Subsystem {
                 generation,
                 event_handle,
                 state,
+                kind,
+                buffer_ptr: 0,
+                length: 0,
+                bytes_read_ptr: 0,
+            },
+        );
+        id
+    }
+
+    /// Queue an overlapped pipe I/O request carrying the guest-side buffers so
+    /// the scheduler can complete it (write the data + byte count) when the
+    /// pipe queue satisfies it.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_pipe_io_overlapped(
+        &mut self,
+        handle: Handle,
+        event_handle: Option<Handle>,
+        kind: OverlappedKind,
+        state: OverlappedState,
+        buffer_ptr: u64,
+        length: u32,
+        bytes_read_ptr: u64,
+    ) -> u64 {
+        let id = self.next_overlapped_id;
+        self.next_overlapped_id += 1;
+        let generation = self.handle_generations.get(&handle).copied().unwrap_or(0);
+        self.overlapped.insert(
+            id,
+            OverlappedRequest {
+                handle,
+                generation,
+                event_handle,
+                state,
+                kind,
+                buffer_ptr,
+                length,
+                bytes_read_ptr,
             },
         );
         id
@@ -5973,6 +6694,107 @@ fn invalid_handle<T>(message: &str) -> AppResult<T> {
 
 fn normalize_pipe_name(name: &str) -> String {
     name.replace('/', "\\").to_ascii_lowercase()
+}
+
+// ── Pipe queue layer ─────────────────────────────────────────────────────────
+//
+// Each direction queue is a raw byte stream in byte mode.  In message mode
+// every WriteFile appends a [u32 LE length][payload...] frame and every
+// ReadFile returns exactly one message, so message boundaries survive the
+// queue.
+
+/// Append `bytes` to a pipe direction queue, framing the write as one
+/// message when `message_mode`, and wake condvar waiters.
+fn pipe_queue_append(
+    queue: &Arc<Mutex<VecDeque<u8>>>,
+    data_ready: &Arc<Condvar>,
+    bytes: &[u8],
+    message_mode: bool,
+) {
+    let mut queue = queue.lock().unwrap();
+    if message_mode {
+        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        queue.extend(len.to_le_bytes());
+    }
+    queue.extend(bytes);
+    drop(queue);
+    data_ready.notify_all();
+}
+
+/// Non-consuming length of the data a read would return from `queue` in the
+/// current mode (raw bytes available, or the full payload of the head
+/// message when `message_mode` — an incomplete message reads as empty).
+fn pipe_queue_peek_len(queue: &Mutex<VecDeque<u8>>, message_mode: bool) -> usize {
+    let queue = queue.lock().unwrap();
+    if !message_mode {
+        return queue.len();
+    }
+    let len_bytes: [u8; 4] = match queue.iter().take(4).copied().collect::<Vec<_>>()[..] {
+        [a, b, c, d] => [a, b, c, d],
+        _ => return 0,
+    };
+    let payload_len = u32::from_le_bytes(len_bytes) as usize;
+    if queue.len() >= 4 + payload_len {
+        payload_len
+    } else {
+        0
+    }
+}
+
+/// Consume up to `length` bytes from a pipe direction queue and return them.
+/// In byte mode the raw stream is drained up to `length`.  In message mode
+/// exactly one message is returned, but never more than `length` bytes of
+/// payload: when the caller's buffer is too small for the message, the
+/// consumed prefix is returned and the remainder is re-framed at the queue
+/// head so the next read continues the message (Windows ERROR_MORE_DATA
+/// semantics) — the caller's buffer can never be overrun.
+fn pipe_queue_read(
+    queue: &Arc<Mutex<VecDeque<u8>>>,
+    data_ready: &Arc<Condvar>,
+    length: usize,
+    message_mode: bool,
+) -> Vec<u8> {
+    let mut queue = queue.lock().unwrap();
+    if message_mode {
+        if queue.len() < 4 {
+            return Vec::new();
+        }
+        let len_bytes: [u8; 4] = match queue.iter().take(4).copied().collect::<Vec<_>>()[..] {
+            [a, b, c, d] => [a, b, c, d],
+            _ => return Vec::new(),
+        };
+        let payload_len = u32::from_le_bytes(len_bytes) as usize;
+        if queue.len() < 4 + payload_len {
+            // Incomplete message: leave the queue untouched (Windows blocks
+            // a message-mode read until the full message arrives).
+            return Vec::new();
+        }
+        queue.drain(..4);
+        let take = payload_len.min(length);
+        let data: Vec<u8> = queue.drain(..take).collect();
+        if take < payload_len {
+            // The caller's buffer was too small for the whole message:
+            // re-frame the unconsumed remainder at the queue head (ahead of
+            // any subsequent messages) so the next read continues it.
+            let mut remainder: Vec<u8> = queue.drain(..(payload_len - take)).collect();
+            let mut rest: Vec<u8> = queue.drain(..).collect();
+            let mut framed = Vec::with_capacity(4 + remainder.len() + rest.len());
+            framed.extend_from_slice(&((payload_len - take) as u32).to_le_bytes());
+            framed.append(&mut remainder);
+            framed.append(&mut rest);
+            queue.clear();
+            queue.extend(framed);
+        }
+        drop(queue);
+        data_ready.notify_all();
+        data
+    } else {
+        let available = queue.len().min(length);
+        let data: Vec<u8> = queue.drain(..available).collect();
+        drop(queue);
+        data_ready.notify_all();
+        data
+    }
 }
 
 fn current_ticks(dtm: bool, ticks_ms: u64) -> u64 {
@@ -6200,9 +7022,9 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 mod tests {
     use super::{
         CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, KernelObject,
-        MemoryProtection, MutexObject, ObjectType, SeekOrigin, SemaphoreObject, ShareMode,
-        ThreadPlan, WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms,
-        split_find_search_pattern, windows_pattern_matches,
+        MemoryProtection, MutexObject, ObjectType, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE,
+        SeekOrigin, SemaphoreObject, ShareMode, ThreadPlan, WaitStatus, Win32Subsystem, iconv_ffi,
+        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches,
     };
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use crate::reason::ReasonCode;
@@ -8365,6 +9187,189 @@ mod tests {
             )
             .expect("recreate pipe after close");
         win32.close_handle(h2).expect("close recreated pipe");
+    }
+
+    #[test]
+    fn named_pipe_message_mode_reads_exactly_one_message_per_read() {
+        // PIPE_READMODE_MESSAGE: each WriteFile appends a [u32 len][bytes]
+        // frame and a message-mode ReadFile returns exactly one message.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "msgpipe", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let server = win32
+            .create_named_pipe_w(
+                r"\\.\pipe\msg-test",
+                0x3,
+                PIPE_READMODE_MESSAGE,
+                1,
+                4096,
+                4096,
+                0,
+                false,
+                None,
+                None,
+            )
+            .expect("create server");
+        let client = win32
+            .open_named_pipe_client(r"\\.\pipe\msg-test", false)
+            .expect("open client");
+
+        // The client writes two messages; the server reads them back one
+        // message per read, in order, with no framing leakage.
+        win32
+            .write_file(client, b"first")
+            .expect("write first message");
+        win32
+            .write_file(client, b"second-message")
+            .expect("write second message");
+        assert_eq!(
+            win32.read_file(server, 4096).expect("server read #1"),
+            b"first",
+            "message-mode read returns exactly the first message"
+        );
+        assert_eq!(
+            win32.read_file(server, 4096).expect("server read #2"),
+            b"second-message",
+            "message-mode read returns exactly the second message"
+        );
+
+        // A byte-mode read on the client side returns the raw byte stream.
+        win32
+            .set_named_pipe_handle_state(client, Some(PIPE_READMODE_BYTE), None, None)
+            .expect("set byte read mode");
+        win32.write_file(server, b"response").expect("server write");
+        assert_eq!(
+            win32.read_file(client, 4096).expect("client byte read"),
+            b"response",
+            "byte-mode read returns the raw stream"
+        );
+
+        // A buffer smaller than the message never overruns: the read
+        // returns exactly the requested bytes and the remainder stays
+        // queued (re-framed) for the next read.
+        win32
+            .set_named_pipe_handle_state(server, Some(PIPE_READMODE_MESSAGE), None, None)
+            .expect("set message read mode");
+        win32
+            .write_file(client, b"oversized-message-payload")
+            .expect("write oversized message");
+        assert_eq!(
+            win32.read_file(server, 4).expect("short message read"),
+            b"over",
+            "message-mode read must never return more than the requested length"
+        );
+        assert_eq!(
+            win32.read_file(server, 4096).expect("remainder read"),
+            b"sized-message-payload",
+            "the message remainder stays queued for the next read"
+        );
+        win32.close_handle(client).expect("close client");
+        win32.close_handle(server).expect("close server");
+    }
+
+    #[test]
+    fn pipe_read_begin_completion_is_scoped_to_request_id() {
+        // Completing one pending overlapped read must not complete its
+        // sibling on the same handle: each waiter resumes only with its own
+        // result.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "ovl-scope", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let server = win32
+            .create_named_pipe_w(
+                r"\\.\pipe\ovl-scope",
+                0x3,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                false,
+                None,
+                None,
+            )
+            .expect("create server");
+        let client = win32
+            .open_named_pipe_client(r"\\.\pipe\ovl-scope", false)
+            .expect("open client");
+
+        // Two pending reads on the server end (the pipe is empty).
+        let first = win32
+            .pipe_read_begin(server, 16, None, 0x1000, 0x2000)
+            .expect("first pending read");
+        assert!(!first.completed);
+        let second = win32
+            .pipe_read_begin(server, 16, None, 0x3000, 0x4000)
+            .expect("second pending read");
+        assert!(!second.completed);
+        assert_ne!(first.id, second.id);
+
+        // Data arrives; completing the FIRST request leaves the second one
+        // pending — its GetOverlappedResult must not report success.
+        win32.write_file(client, b"payload").expect("client write");
+        let completion = win32
+            .try_complete_pending_pipe_io(first.id)
+            .expect("first completion");
+        assert!(!completion.broken_pipe);
+        assert_eq!(completion.bytes, b"payload");
+        let first_result = win32
+            .get_overlapped_result(first.id, false)
+            .expect("first result");
+        assert!(first_result.completed);
+        assert_eq!(first_result.bytes_transferred, 7);
+        let second_result = win32
+            .get_overlapped_result(second.id, false)
+            .expect("second result");
+        assert!(
+            !second_result.completed,
+            "sibling request must stay pending after the first completes"
+        );
+        win32.close_handle(client).expect("close client");
+        win32.close_handle(server).expect("close server");
+    }
+
+    #[test]
+    fn call_named_pipe_w_returns_server_response_not_request() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cnpw", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let server = win32
+            .create_named_pipe_w(
+                r"\\.\pipe\cnpw-test",
+                0x3,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                false,
+                None,
+                None,
+            )
+            .expect("create server");
+        // The server writes its response into the pipe; CallNamedPipeW
+        // returns whatever the server wrote, NOT a copy of the request.
+        win32
+            .write_file(server, b"server-answer")
+            .expect("server response write");
+        let response = win32
+            .call_named_pipe_w(r"\\.\pipe\cnpw-test", b"request-data", 4096, 0)
+            .expect("call named pipe");
+        assert_eq!(
+            response, b"server-answer",
+            "CallNamedPipeW must return the server's bytes, not the request"
+        );
+        // With no queued response the helper returns empty (the thunk layer
+        // parks the guest thread on the scheduler wait instead).
+        let empty = win32
+            .call_named_pipe_w(r"\\.\pipe\cnpw-test", b"another-request", 4096, 0)
+            .expect("call named pipe with no response");
+        assert!(empty.is_empty());
+        win32.close_handle(server).expect("close server");
     }
 
     #[test]

@@ -374,6 +374,11 @@ const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_OPERATION_ABORTED: u32 = 995;
+const ERROR_IO_PENDING: u32 = 997;
+const ERROR_IO_INCOMPLETE: u32 = 996;
+const ERROR_BROKEN_PIPE: u32 = 109;
+const ERROR_PIPE_NOT_AVAILABLE: u32 = 231;
+const ERROR_SEM_TIMEOUT: u32 = 121;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -1724,6 +1729,10 @@ pub enum HostThunk {
     SetFilePointer,
     ReadFile,
     WriteFile,
+    /// `GetOverlappedResult` — reports the result of an overlapped
+    /// operation; with bWait=TRUE the thread parks on the scheduler's
+    /// `Overlapped` wait until the request completes.
+    GetOverlappedResult,
     LocalAlloc,
     LocalLock,
     LocalUnlock,
@@ -4321,6 +4330,37 @@ enum WaitOperation {
     },
     /// Blocking ConnectNamedPipe: resume when a client connects.
     PipeConnect { pipe_handle: u32 },
+    /// CallNamedPipeW: resume when the server's response is queued in the
+    /// pipe's server-to-client direction (or the server disconnected).
+    PipeCall {
+        /// Normalized pipe name (state-table key).
+        name: String,
+        /// Guest pointer to the response buffer (`lpOutBuffer`).
+        out_ptr: u64,
+        /// Capacity of the response buffer (`nOutBufferSize`).
+        out_capacity: u32,
+        /// Guest pointer to the bytes-read out-parameter.
+        bytes_read_ptr: u64,
+    },
+    /// Blocking overlapped pipe ReadFile/WriteFile: resume when the pipe's
+    /// read-direction queue has data (Read) or immediately (Write).
+    PipeIo {
+        pipe_handle: u32,
+        kind: crate::win32::OverlappedKind,
+        /// The typed overlapped request issued for this I/O (0 when the
+        /// thunk parked without issuing one); completion is scoped to this
+        /// request so sibling requests on the same handle stay pending.
+        overlapped_id: u64,
+        /// Guest pointer to the I/O buffer.
+        buffer_ptr: u64,
+        /// Requested transfer length.
+        length: u32,
+        /// Guest pointer to the bytes-read out-parameter.
+        bytes_read_ptr: u64,
+    },
+    /// WaitNamedPipeW: resume when a server instance becomes available (or
+    /// the deadline expires).
+    PipeAvailable { name: String },
 }
 
 /// A parked guest wait: the thread, the objects, the policy, the deadline
@@ -30386,6 +30426,29 @@ impl PeHostRuntime {
                 let length = guest_call_arg(state, memory, 2)? as usize;
                 let bytes_read_ptr = guest_call_arg(state, memory, 3)?;
                 let overlapped = guest_call_arg(state, memory, 4)?;
+                // Event handle recorded in the guest OVERLAPPED struct
+                // (hEvent at offset 16 on x86, 24 on x64).
+                let overlapped_event = if overlapped != 0 {
+                    let h_event = if self.guest_arch == GuestArch::X64 {
+                        read_u64(memory, overlapped + 24)? as u32
+                    } else {
+                        read_u32(memory, overlapped + 16)?
+                    };
+                    (h_event != 0
+                        && self
+                            .win32
+                            .handle_object_type(h_event)
+                            .is_ok_and(|object_type| {
+                                object_type == crate::win32::ObjectType::Event
+                            }))
+                    .then_some(h_event)
+                } else {
+                    None
+                };
+                let is_pipe = self
+                    .win32
+                    .handle_object_type(handle)
+                    .is_ok_and(|object_type| object_type == crate::win32::ObjectType::Pipe);
 
                 if handle == STD_INPUT_HANDLE {
                     if bytes_read_ptr != 0 {
@@ -30393,12 +30456,158 @@ impl PeHostRuntime {
                     }
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
-                } else if overlapped != 0 || (buffer_ptr == 0 && length != 0) {
+                } else if buffer_ptr == 0 && length != 0 {
                     if bytes_read_ptr != 0 {
                         write_u32(memory, bytes_read_ptr, 0);
                     }
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                } else if overlapped != 0 && !is_pipe {
+                    // Overlapped read on a FILE (or ADS) handle: issue a
+                    // typed Read request (files complete synchronously) and
+                    // record the request id in OVERLAPPED.Internal.
+                    if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
+                        let ge_root = self.win32.ge().root.clone();
+                        let resolver = WindowsPathResolver::new(ge_root);
+                        let fs = RealFilesystem::new(resolver);
+                        match fs.read_alternate_stream(&base_path, &stream_name) {
+                            Ok(data) => {
+                                let len = data.len().min(length);
+                                if len > 0 {
+                                    memory.map_bytes(buffer_ptr, &data[..len]);
+                                }
+                                if bytes_read_ptr != 0 {
+                                    write_u32(memory, bytes_read_ptr, len as u32);
+                                }
+                                state.set(Register::Rax, 1);
+                                self.last_error = 0;
+                            }
+                            Err(error) => {
+                                if bytes_read_ptr != 0 {
+                                    write_u32(memory, bytes_read_ptr, 0);
+                                }
+                                state.set(Register::Rax, 0);
+                                self.last_error = last_error_from_app_error(&error);
+                            }
+                        }
+                    } else {
+                        // The Offset field carries the read position
+                        // (offset 8 on x86, 16 on x64).
+                        let offset = if self.guest_arch == GuestArch::X64 {
+                            read_u64(memory, overlapped + 16)?
+                        } else {
+                            u64::from(read_u32(memory, overlapped + 8)?)
+                        };
+                        match self.win32.read_file_overlapped_full(
+                            handle,
+                            length,
+                            offset,
+                            overlapped_event,
+                        ) {
+                            Ok((result, data)) => {
+                                if self.guest_arch == GuestArch::X64 {
+                                    write_u64(memory, overlapped, result.id);
+                                } else {
+                                    write_u32(memory, overlapped, result.id as u32);
+                                }
+                                if !data.is_empty() {
+                                    memory.map_bytes(buffer_ptr, &data);
+                                }
+                                if bytes_read_ptr != 0 {
+                                    write_u32(memory, bytes_read_ptr, data.len() as u32);
+                                }
+                                state.set(Register::Rax, 1);
+                                self.last_error = 0;
+                                self.push_trace(
+                                    "file",
+                                    "ReadFile",
+                                    BTreeMap::from([
+                                        ("handle".to_string(), json!(handle)),
+                                        ("requested_bytes".to_string(), json!(length as u32)),
+                                        ("overlapped".to_string(), json!(true)),
+                                    ]),
+                                    json!(data.len() as u32),
+                                );
+                            }
+                            Err(error) => {
+                                if bytes_read_ptr != 0 {
+                                    write_u32(memory, bytes_read_ptr, 0);
+                                }
+                                state.set(Register::Rax, 0);
+                                self.last_error = last_error_from_app_error(&error);
+                            }
+                        }
+                    }
+                } else if overlapped != 0 && is_pipe {
+                    // Overlapped read on a PIPE: complete synchronously when
+                    // data is already queued; otherwise park the thread on
+                    // the scheduler's PipeIo wait (the pump completes it the
+                    // moment the peer writes).
+                    match self.win32.pipe_read_begin(
+                        handle,
+                        length,
+                        overlapped_event,
+                        buffer_ptr,
+                        bytes_read_ptr,
+                    ) {
+                        Ok(outcome) if outcome.completed => {
+                            if self.guest_arch == GuestArch::X64 {
+                                write_u64(memory, overlapped, outcome.id);
+                            } else {
+                                write_u32(memory, overlapped, outcome.id as u32);
+                            }
+                            let transferred = outcome.bytes.len().min(length);
+                            if transferred > 0 {
+                                memory.map_bytes(buffer_ptr, &outcome.bytes[..transferred]);
+                            }
+                            if bytes_read_ptr != 0 {
+                                write_u32(memory, bytes_read_ptr, transferred as u32);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "ReadFile",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(handle)),
+                                    ("requested_bytes".to_string(), json!(length as u32)),
+                                    ("overlapped".to_string(), json!(true)),
+                                ]),
+                                json!(outcome.bytes.len() as u32),
+                            );
+                        }
+                        Ok(outcome) => {
+                            if self.guest_arch == GuestArch::X64 {
+                                write_u64(memory, overlapped, outcome.id);
+                            } else {
+                                write_u32(memory, overlapped, outcome.id as u32);
+                            }
+                            // Not queued yet: park the guest thread; the
+                            // pump's complete_wait fills the buffer and the
+                            // byte count, then resumes with RAX=TRUE.
+                            self.parked_wait = Some(GuestWait {
+                                objects: Vec::new(),
+                                wait_all: false,
+                                deadline_ticks: None,
+                                alertable: false,
+                                operation: WaitOperation::PipeIo {
+                                    pipe_handle: handle,
+                                    kind: crate::win32::OverlappedKind::Read,
+                                    overlapped_id: outcome.id,
+                                    buffer_ptr,
+                                    length: length as u32,
+                                    bytes_read_ptr,
+                                },
+                            });
+                        }
+                        Err(error) => {
+                            if bytes_read_ptr != 0 {
+                                write_u32(memory, bytes_read_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
                 } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
                     // Read from an NTFS Alternate Data Stream handle.  The
                     // ADS handle is backed by the base file handle, so it must
@@ -30451,11 +30660,12 @@ impl PeHostRuntime {
                 } else {
                     match self.win32.read_file(handle, length) {
                         Ok(bytes) => {
-                            if !bytes.is_empty() {
-                                memory.map_bytes(buffer_ptr, &bytes);
+                            let transferred = bytes.len().min(length);
+                            if transferred > 0 {
+                                memory.map_bytes(buffer_ptr, &bytes[..transferred]);
                             }
                             if bytes_read_ptr != 0 {
-                                write_u32(memory, bytes_read_ptr, bytes.len() as u32);
+                                write_u32(memory, bytes_read_ptr, transferred as u32);
                             }
                             state.set(Register::Rax, 1);
                             self.last_error = 0;
@@ -30466,7 +30676,7 @@ impl PeHostRuntime {
                                     ("handle".to_string(), json!(handle)),
                                     ("requested_bytes".to_string(), json!(length as u32)),
                                 ]),
-                                json!(bytes.len() as u32),
+                                json!(transferred as u32),
                             );
                         }
                         Err(error) => {
@@ -30490,6 +30700,29 @@ impl PeHostRuntime {
                 let length = guest_call_arg(state, memory, 2)? as usize;
                 let bytes_written_ptr = guest_call_arg(state, memory, 3)?;
                 let overlapped = guest_call_arg(state, memory, 4)?;
+                // Event handle recorded in the guest OVERLAPPED struct
+                // (hEvent at offset 16 on x86, 24 on x64).
+                let overlapped_event = if overlapped != 0 {
+                    let h_event = if self.guest_arch == GuestArch::X64 {
+                        read_u64(memory, overlapped + 24)? as u32
+                    } else {
+                        read_u32(memory, overlapped + 16)?
+                    };
+                    (h_event != 0
+                        && self
+                            .win32
+                            .handle_object_type(h_event)
+                            .is_ok_and(|object_type| {
+                                object_type == crate::win32::ObjectType::Event
+                            }))
+                    .then_some(h_event)
+                } else {
+                    None
+                };
+                let is_pipe = self
+                    .win32
+                    .handle_object_type(handle)
+                    .is_ok_and(|object_type| object_type == crate::win32::ObjectType::Pipe);
 
                 if handle == STD_OUTPUT_HANDLE || handle == STD_ERROR_HANDLE {
                     let bytes = read_window(memory, buffer_ptr, length)?;
@@ -30513,12 +30746,93 @@ impl PeHostRuntime {
                         ]),
                         json!(1),
                     );
-                } else if overlapped != 0 || (buffer_ptr == 0 && length != 0) {
+                } else if buffer_ptr == 0 && length != 0 {
                     if bytes_written_ptr != 0 {
                         write_u32(memory, bytes_written_ptr, 0);
                     }
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                } else if overlapped != 0 && is_pipe {
+                    // Overlapped write on a PIPE: appends to the opposite
+                    // direction's queue immediately (unbounded) and records
+                    // a typed Completed Write request in OVERLAPPED.Internal.
+                    let bytes = read_window(memory, buffer_ptr, length)?;
+                    match self.win32.pipe_write_begin(handle, &bytes, overlapped_event) {
+                        Ok(result) => {
+                            if self.guest_arch == GuestArch::X64 {
+                                write_u64(memory, overlapped, result.id);
+                            } else {
+                                write_u32(memory, overlapped, result.id as u32);
+                            }
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, result.bytes_transferred);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "WriteFile",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(handle)),
+                                    ("bytes".to_string(), json!(result.bytes_transferred)),
+                                    ("overlapped".to_string(), json!(true)),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
+                } else if overlapped != 0 && !is_pipe {
+                    // Overlapped write on a FILE handle: issue a typed Write
+                    // request (files complete synchronously) and record the
+                    // request id in OVERLAPPED.Internal.  The Offset field
+                    // carries the write position (offset 8 on x86, 16 on x64).
+                    let bytes = read_window(memory, buffer_ptr, length)?;
+                    let offset = if self.guest_arch == GuestArch::X64 {
+                        read_u64(memory, overlapped + 16)?
+                    } else {
+                        u64::from(read_u32(memory, overlapped + 8)?)
+                    };
+                    match self
+                        .win32
+                        .write_file_overlapped(handle, &bytes, offset, overlapped_event)
+                    {
+                        Ok(result) => {
+                            if self.guest_arch == GuestArch::X64 {
+                                write_u64(memory, overlapped, result.id);
+                            } else {
+                                write_u32(memory, overlapped, result.id as u32);
+                            }
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, result.bytes_transferred);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "WriteFile",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(handle)),
+                                    ("bytes".to_string(), json!(result.bytes_transferred)),
+                                    ("overlapped".to_string(), json!(true)),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
                 } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
                     // Write to an NTFS Alternate Data Stream handle.  The ADS
                     // handle is backed by the base file handle, so it must
@@ -30594,6 +30908,90 @@ impl PeHostRuntime {
                             state.set(Register::Rax, 0);
                             self.last_error = last_error_from_app_error(&error);
                         }
+                    }
+                }
+            }
+            HostThunk::GetOverlappedResult => {
+                let _h_file = guest_call_arg_u32(state, memory, 0)?;
+                let overlapped_ptr = guest_call_arg(state, memory, 1)?;
+                let bytes_ptr = guest_call_arg(state, memory, 2)?;
+                let b_wait = guest_call_arg_u32(state, memory, 3)?;
+                if overlapped_ptr == 0 || bytes_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                // The request id is recovered from OVERLAPPED.Internal
+                // (offset 0), written there when the operation was issued.
+                let id = if self.guest_arch == GuestArch::X64 {
+                    read_u64(memory, overlapped_ptr)?
+                } else {
+                    u64::from(read_u32(memory, overlapped_ptr)?)
+                };
+                match self.win32.get_overlapped_result(id, false) {
+                    Ok(result) if result.completed => {
+                        write_u32(memory, bytes_ptr, result.bytes_transferred);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "GetOverlappedResult",
+                            BTreeMap::from([("overlapped".to_string(), json!(overlapped_ptr))]),
+                            json!(result.bytes_transferred),
+                        );
+                    }
+                    Ok(result) if result.cancelled => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_OPERATION_ABORTED;
+                        self.push_trace(
+                            "file",
+                            "GetOverlappedResult",
+                            BTreeMap::from([("overlapped".to_string(), json!(overlapped_ptr))]),
+                            json!(0),
+                        );
+                    }
+                    Ok(_) if b_wait != 0 => {
+                        // Pending + bWait=TRUE: park on the overlapped
+                        // completion; the pump's complete_wait writes the
+                        // byte count into `bytes_ptr` and resumes with
+                        // RAX=TRUE (or ERROR_BROKEN_PIPE for pipe I/O whose
+                        // peer disconnected).
+                        self.parked_wait = Some(GuestWait {
+                            objects: Vec::new(),
+                            wait_all: false,
+                            deadline_ticks: None,
+                            alertable: false,
+                            operation: WaitOperation::Overlapped {
+                                overlapped_id: id,
+                                bytes_ptr,
+                            },
+                        });
+                        // Fall through: the dispatch epilogue parks the
+                        // thread.
+                    }
+                    Ok(_) => {
+                        // Pending + bWait=FALSE: report ERROR_IO_INCOMPLETE.
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_IO_INCOMPLETE;
+                        self.push_trace(
+                            "file",
+                            "GetOverlappedResult",
+                            BTreeMap::from([("overlapped".to_string(), json!(overlapped_ptr))]),
+                            json!(0),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                        self.push_trace(
+                            "file",
+                            "GetOverlappedResult",
+                            BTreeMap::from([
+                                ("overlapped".to_string(), json!(overlapped_ptr)),
+                                ("error".to_string(), json!(format!("{error:?}"))),
+                            ]),
+                            json!(0),
+                        );
                     }
                 }
             }
@@ -39110,21 +39508,96 @@ impl PeHostRuntime {
             }
             HostThunk::ConnectNamedPipe => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
-                let _overlapped = guest_call_arg(state, memory, 1)?;
-                match self.win32.connect_named_pipe(handle) {
-                    Ok(()) => {
-                        state.set(Register::Rax, 1);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "kernel32",
-                            "ConnectNamedPipe",
-                            BTreeMap::from([("handle".to_string(), json!(format!("{handle:#x}")))]),
-                            json!(1),
-                        );
+                let overlapped_ptr = guest_call_arg(state, memory, 1)?;
+                let overlapped_event = if overlapped_ptr != 0 {
+                    let h_event = if self.guest_arch == GuestArch::X64 {
+                        read_u64(memory, overlapped_ptr + 24)? as u32
+                    } else {
+                        read_u32(memory, overlapped_ptr + 16)?
+                    };
+                    (h_event != 0
+                        && self
+                            .win32
+                            .handle_object_type(h_event)
+                            .is_ok_and(|object_type| {
+                                object_type == crate::win32::ObjectType::Event
+                            }))
+                    .then_some(h_event)
+                } else {
+                    None
+                };
+                if overlapped_ptr != 0 {
+                    // Overlapped ConnectNamedPipe: issue a typed Connection
+                    // request and return immediately (FALSE + ERROR_IO_PENDING
+                    // when the client has not connected yet; TRUE when it
+                    // already has).
+                    match self.win32.connect_named_pipe_internal(handle, overlapped_event, true) {
+                        Ok(Some(id)) => {
+                            if self.guest_arch == GuestArch::X64 {
+                                write_u64(memory, overlapped_ptr, id);
+                            } else {
+                                write_u32(memory, overlapped_ptr, id as u32);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_IO_PENDING;
+                            self.push_trace(
+                                "kernel32",
+                                "ConnectNamedPipe",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                    ("overlapped".to_string(), json!(true)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Ok(None) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "kernel32",
+                                "ConnectNamedPipe",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                    ("overlapped".to_string(), json!(true)),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
-                    Err(error) => {
-                        state.set(Register::Rax, 0);
-                        self.last_error = last_error_from_app_error(&error);
+                } else {
+                    // Blocking ConnectNamedPipe: park the thread until a
+                    // client connects (the pump's PipeConnect evaluator).
+                    match self.win32.connect_named_pipe_internal(handle, None, false) {
+                        Ok(None) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "kernel32",
+                                "ConnectNamedPipe",
+                                BTreeMap::from([("handle".to_string(), json!(format!("{handle:#x}")))]),
+                                json!(1),
+                            );
+                        }
+                        Ok(Some(_)) => {
+                            // Pending marker: park on the pipe-connection
+                            // condition; the pump resumes with RAX=TRUE when
+                            // the client connects.
+                            self.parked_wait = Some(GuestWait {
+                                objects: Vec::new(),
+                                wait_all: false,
+                                deadline_ticks: None,
+                                alertable: false,
+                                operation: WaitOperation::PipeConnect { pipe_handle: handle },
+                            });
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
                     }
                 }
             }
@@ -39154,15 +39627,47 @@ impl PeHostRuntime {
                 let out_buffer_ptr = guest_call_arg(state, memory, 3)?;
                 let out_buffer_size = guest_call_arg_u32(state, memory, 4)?;
                 let bytes_read_ptr = guest_call_arg(state, memory, 5)?;
-                let default_timeout = guest_call_arg_u32(state, memory, 6)?;
+                let timeout_arg = guest_call_arg_u32(state, memory, 6)?;
                 let pipe_name = read_utf16_string(memory, name_ptr)?;
                 let write_data = if in_buffer_ptr != 0 && in_buffer_size > 0 {
                     read_window(memory, in_buffer_ptr, in_buffer_size as usize)?
                 } else {
                     Vec::new()
                 };
-                match self.win32.call_named_pipe_w(&pipe_name, &write_data, out_buffer_size, default_timeout) {
-                    Ok(response) => {
+                // No server registered: fail immediately with
+                // ERROR_PIPE_NOT_AVAILABLE (Windows does not wait for an
+                // instance that will never appear).
+                if !self.win32.named_pipe_server_exists(&pipe_name) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PIPE_NOT_AVAILABLE;
+                    self.push_trace(
+                        "kernel32",
+                        "CallNamedPipeW",
+                        BTreeMap::from([
+                            ("pipe_name".to_string(), json!(pipe_name)),
+                            ("error".to_string(), json!("pipe not available")),
+                        ]),
+                        json!(0),
+                    );
+                    return Ok(None);
+                }
+                // nTimeOut == 0 falls back to the default timeout recorded
+                // at CreateNamedPipeW; INFINITE waits forever.
+                let timeout = if timeout_arg == 0 {
+                    self.win32
+                        .named_pipe_default_timeout(&pipe_name)
+                        .unwrap_or(0)
+                } else {
+                    timeout_arg
+                };
+                match self.win32.call_named_pipe_w(
+                    &pipe_name,
+                    &write_data,
+                    out_buffer_size,
+                    timeout,
+                ) {
+                    Ok(response) if !response.is_empty() => {
+                        // The server already wrote its response: deliver it.
                         if out_buffer_ptr != 0 {
                             let to_write = response.len().min(out_buffer_size as usize);
                             memory.map_bytes(out_buffer_ptr, &response[..to_write]);
@@ -39183,6 +39688,30 @@ impl PeHostRuntime {
                             json!(1),
                         );
                     }
+                    Ok(_) => {
+                        // The request is in the pipe; the response has not
+                        // arrived yet.  Park the thread on the scheduler's
+                        // PipeCall wait: the pump consumes the server's
+                        // response into `out_ptr`/`bytes_read_ptr` and
+                        // resumes with RAX=TRUE (or ERROR_BROKEN_PIPE /
+                        // ERROR_SEM_TIMEOUT).
+                        let now = self.win32.get_tick_count64();
+                        self.parked_wait = Some(GuestWait {
+                            objects: Vec::new(),
+                            wait_all: false,
+                            deadline_ticks: (timeout != u32::MAX)
+                                .then(|| now.saturating_add(timeout as u64)),
+                            alertable: false,
+                            operation: WaitOperation::PipeCall {
+                                name: pipe_name.clone(),
+                                out_ptr: out_buffer_ptr,
+                                out_capacity: out_buffer_size,
+                                bytes_read_ptr,
+                            },
+                        });
+                        // Fall through: the dispatch epilogue parks the
+                        // thread.
+                    }
                     Err(error) => {
                         state.set(Register::Rax, 0);
                         self.last_error = last_error_from_app_error(&error);
@@ -39202,21 +39731,40 @@ impl PeHostRuntime {
                 let name_ptr = guest_call_arg(state, memory, 0)?;
                 let timeout = guest_call_arg_u32(state, memory, 1)?;
                 let pipe_name = read_utf16_string(memory, name_ptr)?;
-                match self.win32.wait_named_pipe_w(&pipe_name, timeout) {
-                    Ok(()) => {
-                        state.set(Register::Rax, 1);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "kernel32",
-                            "WaitNamedPipeW",
-                            BTreeMap::from([("pipe_name".to_string(), json!(pipe_name))]),
-                            json!(1),
-                        );
-                    }
-                    Err(error) => {
-                        state.set(Register::Rax, 0);
-                        self.last_error = last_error_from_app_error(&error);
-                    }
+                if self.win32.named_pipe_server_exists(&pipe_name) {
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "kernel32",
+                        "WaitNamedPipeW",
+                        BTreeMap::from([("pipe_name".to_string(), json!(pipe_name))]),
+                        json!(1),
+                    );
+                } else if timeout == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_SEM_TIMEOUT;
+                    self.push_trace(
+                        "kernel32",
+                        "WaitNamedPipeW",
+                        BTreeMap::from([("pipe_name".to_string(), json!(pipe_name))]),
+                        json!(0),
+                    );
+                } else {
+                    // Wait-any semantics: park until a server instance
+                    // becomes available or the deadline expires (the pump
+                    // resumes with RAX=TRUE or FALSE + ERROR_SEM_TIMEOUT).
+                    let now = self.win32.get_tick_count64();
+                    self.parked_wait = Some(GuestWait {
+                        objects: Vec::new(),
+                        wait_all: false,
+                        deadline_ticks: (timeout != u32::MAX)
+                            .then(|| now.saturating_add(timeout as u64)),
+                        alertable: false,
+                        operation: WaitOperation::PipeAvailable {
+                            name: pipe_name.clone(),
+                        },
+                    });
+                    // Fall through: the dispatch epilogue parks the thread.
                 }
             }
             HostThunk::GetNamedPipeInfo => {
@@ -51431,18 +51979,47 @@ impl PeHostRuntime {
                 }
             }
             WaitOperation::Overlapped { overlapped_id, .. } => {
-                self.win32.overlapped_completed(*overlapped_id)
+                self.win32.overlapped_satisfiable(*overlapped_id)
             }
             WaitOperation::PipeConnect { pipe_handle } => {
                 self.win32.pipe_is_connected(*pipe_handle)
             }
+            WaitOperation::PipeCall { name, .. } => {
+                self.win32.pipe_response_available(name) || self.win32.pipe_call_broken(name)
+            }
+            WaitOperation::PipeIo {
+                pipe_handle,
+                kind: crate::win32::OverlappedKind::Read,
+                ..
+            } => {
+                self.win32.pipe_read_available(*pipe_handle)
+                    || self.win32.pipe_peer_disconnected(*pipe_handle)
+            }
+            WaitOperation::PipeIo {
+                kind: crate::win32::OverlappedKind::Write,
+                ..
+            } => true,
+            WaitOperation::PipeIo {
+                kind:
+                    crate::win32::OverlappedKind::Connection
+                    | crate::win32::OverlappedKind::DeviceControl,
+                ..
+            } => false,
+            WaitOperation::PipeAvailable { name } => self.win32.named_pipe_server_exists(name),
         }
     }
 
     /// Consume the wait atomically and produce the resume result.  Runs in
     /// the pump's run step (no guest code runs between the readiness pass
-    /// and this call, so wait-all consumption is atomic).
-    fn complete_wait(&mut self, wait: &GuestWait, tid: u32) -> AppResult<WaitResume> {
+    /// and this call, so wait-all consumption is atomic).  `memory` lets
+    /// pipe completions write their results into the guest buffers the
+    /// parking thunk captured.
+    fn complete_wait(
+        &mut self,
+        wait: &GuestWait,
+        tid: u32,
+        memory: &mut MemoryImage,
+    ) -> AppResult<WaitResume> {
         // Alertable waits complete through APC delivery (WAIT_IO_COMPLETION):
         // the readiness pass detected a queued APC; the resume reports it.
         // The APC procs are delivered by the pump's run step before the
@@ -51462,6 +52039,28 @@ impl PeHostRuntime {
         if let Some(deadline) = wait.deadline_ticks
             && self.win32.get_tick_count64() >= deadline
         {
+            // Pipe waits report their timeout as FALSE + ERROR_SEM_TIMEOUT
+            // (CallNamedPipeW / WaitNamedPipeW), everything else as
+            // WAIT_TIMEOUT.
+            if matches!(
+                wait.operation,
+                WaitOperation::PipeCall { .. } | WaitOperation::PipeAvailable { .. }
+            ) {
+                // A timed-out CallNamedPipeW abandons its instance: consume
+                // any response that arrived before the deadline so the next
+                // call on the same pipe never reads stale bytes.
+                if let WaitOperation::PipeCall {
+                    name, out_capacity, ..
+                } = &wait.operation
+                {
+                    let _ = self.win32.take_pipe_response(name, *out_capacity);
+                }
+                return Ok(WaitResume {
+                    code: 0,
+                    bytes: None,
+                    last_error: Some(ERROR_SEM_TIMEOUT),
+                });
+            }
             return Ok(WaitResume {
                 code: crate::win32::WAIT_TIMEOUT,
                 bytes: None,
@@ -51509,9 +52108,45 @@ impl PeHostRuntime {
                     })
                 }
             }
-            WaitOperation::Overlapped { overlapped_id, .. } => {
+            WaitOperation::Overlapped {
+                overlapped_id,
+                bytes_ptr,
+            } => {
+                // A PENDING typed pipe Read completes from its direction
+                // queue (the readiness pass woke us because data arrived or
+                // the peer disconnected).
+                if let Some(completion) = self.win32.try_complete_pending_pipe_io(*overlapped_id) {
+                    if !completion.bytes.is_empty() && completion.buffer_ptr != 0 {
+                        memory.map_bytes(completion.buffer_ptr, &completion.bytes);
+                    }
+                    if completion.bytes_read_ptr != 0 {
+                        write_u32(
+                            memory,
+                            completion.bytes_read_ptr,
+                            completion.bytes.len() as u32,
+                        );
+                    }
+                    if *bytes_ptr != 0 {
+                        write_u32(memory, *bytes_ptr, completion.bytes.len() as u32);
+                    }
+                    if completion.broken_pipe {
+                        return Ok(WaitResume {
+                            code: 0,
+                            bytes: None,
+                            last_error: Some(ERROR_BROKEN_PIPE),
+                        });
+                    }
+                    return Ok(WaitResume {
+                        code: 1, // TRUE
+                        bytes: Some(completion.bytes.len() as u32),
+                        last_error: None,
+                    });
+                }
                 let result = self.win32.get_overlapped_result(*overlapped_id, false)?;
                 if result.completed {
+                    if *bytes_ptr != 0 {
+                        write_u32(memory, *bytes_ptr, result.bytes_transferred);
+                    }
                     Ok(WaitResume {
                         code: 1, // TRUE
                         bytes: Some(result.bytes_transferred),
@@ -51532,6 +52167,102 @@ impl PeHostRuntime {
                 }
             }
             WaitOperation::PipeConnect { .. } => Ok(WaitResume {
+                code: 1, // TRUE
+                bytes: None,
+                last_error: None,
+            }),
+            WaitOperation::PipeCall {
+                name,
+                out_ptr,
+                out_capacity,
+                bytes_read_ptr,
+            } => {
+                // The server disconnected while the caller waited: the call
+                // fails with ERROR_BROKEN_PIPE.
+                if self.win32.pipe_call_broken(name) {
+                    return Ok(WaitResume {
+                        code: 0,
+                        bytes: None,
+                        last_error: Some(ERROR_BROKEN_PIPE),
+                    });
+                }
+                let response = self.win32.take_pipe_response(name, *out_capacity);
+                let transferred = response.len().min(*out_capacity as usize);
+                if transferred > 0 && *out_ptr != 0 {
+                    memory.map_bytes(*out_ptr, &response[..transferred]);
+                }
+                if *bytes_read_ptr != 0 {
+                    write_u32(memory, *bytes_read_ptr, transferred as u32);
+                }
+                Ok(WaitResume {
+                    code: 1, // TRUE
+                    bytes: Some(transferred as u32),
+                    last_error: None,
+                })
+            }
+            WaitOperation::PipeIo {
+                pipe_handle,
+                kind: crate::win32::OverlappedKind::Read,
+                overlapped_id,
+                buffer_ptr,
+                length,
+                bytes_read_ptr,
+            } => {
+                if self.win32.pipe_peer_disconnected(*pipe_handle) {
+                    // Complete the pending request so a later
+                    // GetOverlappedResult does not hang, then report the
+                    // broken pipe.
+                    let _ = self
+                        .win32
+                        .try_complete_pending_pipe_io_for_handle(*pipe_handle);
+                    return Ok(WaitResume {
+                        code: 0,
+                        bytes: None,
+                        last_error: Some(ERROR_BROKEN_PIPE),
+                    });
+                }
+                let data = self.win32.pipe_read_sync(*pipe_handle, *length as usize);
+                let transferred = data.len().min(*length as usize);
+                if transferred > 0 && *buffer_ptr != 0 {
+                    memory.map_bytes(*buffer_ptr, &data[..transferred]);
+                }
+                if *bytes_read_ptr != 0 {
+                    write_u32(memory, *bytes_read_ptr, transferred as u32);
+                }
+                self.win32
+                    .complete_pipe_io_request_id(*overlapped_id, transferred as u32)?;
+                Ok(WaitResume {
+                    code: 1, // TRUE
+                    bytes: Some(transferred as u32),
+                    last_error: None,
+                })
+            }
+            WaitOperation::PipeIo {
+                kind: crate::win32::OverlappedKind::Write,
+                overlapped_id,
+                ..
+            } => {
+                // The write already appended to the queue at issue time;
+                // complete the matching pending request (usually already
+                // completed synchronously).
+                self.win32.complete_pipe_io_request_id(*overlapped_id, 0)?;
+                Ok(WaitResume {
+                    code: 1, // TRUE
+                    bytes: None,
+                    last_error: None,
+                })
+            }
+            WaitOperation::PipeIo {
+                kind:
+                    crate::win32::OverlappedKind::Connection
+                    | crate::win32::OverlappedKind::DeviceControl,
+                ..
+            } => Ok(WaitResume {
+                code: crate::win32::WAIT_TIMEOUT,
+                bytes: None,
+                last_error: None,
+            }),
+            WaitOperation::PipeAvailable { .. } => Ok(WaitResume {
                 code: 1, // TRUE
                 bytes: None,
                 last_error: None,
@@ -51727,7 +52458,7 @@ impl PeHostRuntime {
             // result (RAX + last_error), then run the thread.
             let _resumed_from_wait = if let Some(wait) = pending_thread.wait.take() {
                 let tid = pending_thread.thread_id;
-                let resume = self.complete_wait(&wait, tid)?;
+                let resume = self.complete_wait(&wait, tid, memory)?;
                 // Alertable waits complete via APC delivery: deliver queued
                 // APCs in the thread's context before the wait result is
                 // published (Windows runs the APC, then the wait reports
@@ -65726,6 +66457,11 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "WriteFile" => {
                 Self::WriteFile
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetOverlappedResult" =>
+            {
+                Self::GetOverlappedResult
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlushFileBuffers" => {
                 Self::FlushFileBuffers
             }
@@ -66125,6 +66861,11 @@ impl HostThunk {
                 if name == "WriteProcessMemory" =>
             {
                 Self::WriteProcessMemory
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetOverlappedResult" =>
+            {
+                Self::GetOverlappedResult
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentThread" => {
                 Self::GetCurrentThread
@@ -70326,6 +71067,7 @@ impl HostThunk {
             | Self::RegOpenKeyExW
             | Self::ReadFile
             | Self::WriteFile
+            | Self::GetOverlappedResult
             | Self::SHGetFileInfoW
             | Self::SHGetFolderPathW
             | Self::CoCreateInstance
@@ -77785,6 +78527,562 @@ mod tests {
                     .expect("thread exit code after wait"),
                 Some(7)
             );
+        })
+    }
+
+    #[test]
+    fn call_named_pipe_w_parks_until_server_response() {
+        // CallNamedPipeW with no queued response parks the guest thread on
+        // the scheduler's PipeCall wait; the response the server writes into
+        // the pipe is delivered when the pump resumes the caller.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "call-named-pipe-pump",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let server = runtime
+                .win32
+                .create_named_pipe_w(
+                    r"\\.\pipe\call-pump",
+                    0x3,
+                    0,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .expect("create server pipe");
+
+            let call_named_pipe = runtime.alloc_host_thunk(HostThunk::CallNamedPipeW);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let import_slot = 0x41_000_u64;
+            let entry = 0x41_100_u64;
+            let name_ptr = 0x41_200_u64;
+            let in_ptr = 0x41_300_u64;
+            let out_ptr = 0x41_400_u64;
+            let bytes_read_ptr = 0x41_500_u64;
+            let result_ptr = 0x41_600_u64;
+            let thread_id_ptr = 0x41_604_u64;
+            write_u32(&mut memory, import_slot, call_named_pipe as u32);
+            let mut pipe_name_utf16 = r"\\.\pipe\call-pump"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<_>>();
+            pipe_name_utf16.extend_from_slice(&[0_u8, 0_u8]);
+            memory.map_bytes(name_ptr, &pipe_name_utf16);
+            memory.map_bytes(in_ptr, b"request-data");
+            memory.map_bytes(out_ptr, &[0_u8; 32]);
+            memory.map_bytes(bytes_read_ptr, &[0_u8; 4]);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+
+            // push nTimeOut(INFINITE); push lpBytesRead; push nOutBufferSize;
+            // push lpOutBuffer; push nInBufferSize; push lpInBuffer;
+            // push lpName; call [CallNamedPipeW]; mov [result], eax; ret
+            let mut bytes = vec![0x90; 0x80];
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x68, 0xFF, 0xFF, 0xFF, 0xFF]);
+            for arg in [
+                bytes_read_ptr as u32,
+                32,
+                out_ptr as u32,
+                12,
+                in_ptr as u32,
+                name_ptr as u32,
+            ] {
+                code.extend_from_slice(&[0x68]);
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(import_slot as u32).to_le_bytes());
+            code.extend_from_slice(&[0xA3]);
+            code.extend_from_slice(&(result_ptr as u32).to_le_bytes());
+            code.push(0xC3);
+            bytes[..code.len()].copy_from_slice(&code);
+            memory.map_bytes(entry, &bytes);
+
+            let _caller = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+
+            // Pump until the caller parks on the PipeCall wait.
+            let mut parked = false;
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| thread.wait.is_some())
+                {
+                    parked = true;
+                    break;
+                }
+            }
+            assert!(parked, "caller must park waiting for the response");
+
+            // The server writes its response into the pipe; the pump then
+            // delivers it to the parked caller.
+            runtime
+                .win32
+                .write_file(server, b"server-response")
+                .expect("server response write");
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "caller must complete after the response arrives"
+            );
+            assert_eq!(
+                read_u32(&memory, result_ptr).expect("call result"),
+                1,
+                "CallNamedPipeW must return TRUE with the server's response"
+            );
+            assert_eq!(
+                read_u32(&memory, bytes_read_ptr).expect("bytes read"),
+                15,
+                "response byte count"
+            );
+            let response = memory
+                .read_bytes(out_ptr, 15)
+                .expect("read response buffer");
+            assert_eq!(&response[..], b"server-response");
+            let _ = runtime.win32.close_handle(server);
+        })
+    }
+
+    #[test]
+    fn read_file_overlapped_pipe_parks_until_data_arrives() {
+        // ReadFile with an OVERLAPPED struct on an empty pipe parks the
+        // thread on the scheduler's PipeIo wait; when the peer writes, the
+        // pump fills the guest buffer + byte count, records the request id
+        // in OVERLAPPED.Internal and resumes with TRUE.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "pipe-overlapped-read-pump",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let server = runtime
+                .win32
+                .create_named_pipe_w(
+                    r"\\.\pipe\ovl-read",
+                    0x3,
+                    0,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .expect("create server pipe");
+            let client = runtime
+                .win32
+                .open_named_pipe_client(r"\\.\pipe\ovl-read", false)
+                .expect("open client");
+
+            let read_file = runtime.alloc_host_thunk(HostThunk::ReadFile);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let import_slot = 0x41_000_u64;
+            let entry = 0x41_100_u64;
+            let buffer_ptr = 0x41_200_u64;
+            let bytes_read_ptr = 0x41_300_u64;
+            let overlapped_ptr = 0x41_400_u64;
+            let result_ptr = 0x41_500_u64;
+            let thread_id_ptr = 0x41_504_u64;
+            write_u32(&mut memory, import_slot, read_file as u32);
+            memory.map_bytes(buffer_ptr, &[0_u8; 32]);
+            memory.map_bytes(bytes_read_ptr, &[0_u8; 4]);
+            // x86 OVERLAPPED: Internal=0, InternalHigh=0, Offset=0,
+            // OffsetHigh=0, hEvent=0.
+            memory.map_bytes(overlapped_ptr, &[0_u8; 20]);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+
+            // push lpOverlapped; push lpNumberOfBytesRead; push n(8);
+            // push lpBuffer; push hFile; call [ReadFile];
+            // mov [result], eax; ret
+            let mut code = Vec::new();
+            for arg in [
+                overlapped_ptr as u32,
+                bytes_read_ptr as u32,
+                8,
+                buffer_ptr as u32,
+                server,
+            ] {
+                code.extend_from_slice(&[0x68]);
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(import_slot as u32).to_le_bytes());
+            code.extend_from_slice(&[0xA3]);
+            code.extend_from_slice(&(result_ptr as u32).to_le_bytes());
+            code.push(0xC3);
+            memory.map_bytes(entry, &code);
+
+            let _reader = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+
+            // The pipe is empty: the reader must park on the PipeIo wait.
+            let mut parked = false;
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| thread.wait.is_some())
+                {
+                    parked = true;
+                    break;
+                }
+            }
+            assert!(parked, "reader must park while the pipe is empty");
+
+            // The client (peer) writes; the pump completes the overlapped
+            // read into the guest buffer.
+            runtime
+                .win32
+                .write_file(client, b"payload")
+                .expect("client write");
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "reader must complete after the write"
+            );
+            assert_eq!(
+                read_u32(&memory, result_ptr).expect("read result"),
+                1,
+                "overlapped ReadFile must return TRUE"
+            );
+            assert_eq!(
+                read_u32(&memory, bytes_read_ptr).expect("bytes read"),
+                7,
+                "payload length"
+            );
+            assert_eq!(
+                &memory.read_bytes(buffer_ptr, 7).expect("read buffer")[..],
+                b"payload"
+            );
+            let internal = read_u32(&memory, overlapped_ptr).expect("overlapped internal");
+            assert!(
+                internal != 0,
+                "the overlapped request id must be recorded in Internal"
+            );
+            // GetOverlappedResult on the recorded id reports the byte count.
+            let overlapped_result = runtime
+                .win32
+                .get_overlapped_result(u64::from(internal), false)
+                .expect("overlapped result");
+            assert!(overlapped_result.completed);
+            assert_eq!(overlapped_result.bytes_transferred, 7);
+            let _ = runtime.win32.close_handle(client);
+            let _ = runtime.win32.close_handle(server);
+        })
+    }
+
+    #[test]
+    fn connect_named_pipe_overlapped_parks_get_overlapped_result_until_client_connects() {
+        // Overlapped ConnectNamedPipe issues a typed Connection request and
+        // returns FALSE + ERROR_IO_PENDING; GetOverlappedResult(TRUE) parks
+        // on the scheduler's Overlapped wait; the client connect completes
+        // the request and the caller resumes with TRUE.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "pipe-connect-overlapped-pump",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let server = runtime
+                .win32
+                .create_named_pipe_w(
+                    r"\\.\pipe\ovl-connect",
+                    0x3,
+                    0,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .expect("create server pipe");
+
+            let connect_named_pipe = runtime.alloc_host_thunk(HostThunk::ConnectNamedPipe);
+            let get_overlapped_result = runtime.alloc_host_thunk(HostThunk::GetOverlappedResult);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let connect_slot = 0x41_000_u64;
+            let get_result_slot = 0x41_008_u64;
+            let entry = 0x41_100_u64;
+            let overlapped_ptr = 0x41_200_u64;
+            let bytes_ptr = 0x41_300_u64;
+            let connect_result_ptr = 0x41_400_u64;
+            let get_result_ptr = 0x41_404_u64;
+            let thread_id_ptr = 0x41_408_u64;
+            write_u32(&mut memory, connect_slot, connect_named_pipe as u32);
+            write_u32(&mut memory, get_result_slot, get_overlapped_result as u32);
+            memory.map_bytes(overlapped_ptr, &[0_u8; 20]);
+            memory.map_bytes(bytes_ptr, &[0_u8; 4]);
+            memory.map_bytes(connect_result_ptr, &[0_u8; 4]);
+            memory.map_bytes(get_result_ptr, &[0_u8; 4]);
+
+            // push lpOverlapped; push hPipe; call [ConnectNamedPipe];
+            // mov [connect_result], eax; push 1; push lpBytes;
+            // push lpOverlapped; push hPipe; call [GetOverlappedResult];
+            // mov [get_result], eax; ret
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x68]);
+            code.extend_from_slice(&(overlapped_ptr as u32).to_le_bytes());
+            code.extend_from_slice(&[0x68]);
+            code.extend_from_slice(&server.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(connect_slot as u32).to_le_bytes());
+            code.extend_from_slice(&[0xA3]);
+            code.extend_from_slice(&(connect_result_ptr as u32).to_le_bytes());
+            for arg in [1_u32, bytes_ptr as u32, overlapped_ptr as u32, server] {
+                code.extend_from_slice(&[0x68]);
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(get_result_slot as u32).to_le_bytes());
+            code.extend_from_slice(&[0xA3]);
+            code.extend_from_slice(&(get_result_ptr as u32).to_le_bytes());
+            code.push(0xC3);
+            memory.map_bytes(entry, &code);
+
+            let _caller = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+
+            // First pump: ConnectNamedPipe returns FALSE + ERROR_IO_PENDING
+            // (the request id lands in OVERLAPPED.Internal), then the thread
+            // parks inside GetOverlappedResult(TRUE).
+            let mut parked = false;
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| thread.wait.is_some())
+                {
+                    parked = true;
+                    break;
+                }
+            }
+            assert!(parked, "caller must park inside GetOverlappedResult");
+            assert_eq!(
+                read_u32(&memory, connect_result_ptr).expect("connect result"),
+                0,
+                "overlapped ConnectNamedPipe returns FALSE"
+            );
+            assert_eq!(
+                runtime.last_error, ERROR_IO_PENDING,
+                "overlapped ConnectNamedPipe reports ERROR_IO_PENDING"
+            );
+            let id = read_u32(&memory, overlapped_ptr).expect("overlapped internal");
+            assert!(id != 0, "request id must be recorded in Internal");
+
+            // The client connects; the pump completes the Connection request.
+            let client = runtime
+                .win32
+                .open_named_pipe_client(r"\\.\pipe\ovl-connect", false)
+                .expect("open client");
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "caller must complete after the client connects"
+            );
+            assert_eq!(
+                read_u32(&memory, get_result_ptr).expect("get result"),
+                1,
+                "GetOverlappedResult must return TRUE after the connect"
+            );
+            assert_eq!(
+                read_u32(&memory, bytes_ptr).expect("bytes transferred"),
+                0,
+                "ConnectNamedPipe transfers zero bytes"
+            );
+            let _ = runtime.win32.close_handle(client);
+            let _ = runtime.win32.close_handle(server);
+        })
+    }
+
+    #[test]
+    fn blocking_connect_named_pipe_parks_until_client_connects() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "pipe-connect-blocking-pump",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let server = runtime
+                .win32
+                .create_named_pipe_w(
+                    r"\\.\pipe\block-connect",
+                    0x3,
+                    0,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    false,
+                    None,
+                    None,
+                )
+                .expect("create server pipe");
+
+            let connect_named_pipe = runtime.alloc_host_thunk(HostThunk::ConnectNamedPipe);
+            let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+            let import_slot = 0x41_000_u64;
+            let entry = 0x41_100_u64;
+            let result_ptr = 0x41_200_u64;
+            let thread_id_ptr = 0x41_204_u64;
+            write_u32(&mut memory, import_slot, connect_named_pipe as u32);
+            memory.map_bytes(result_ptr, &[0_u8; 4]);
+
+            // push NULL (lpOverlapped); push hPipe; call [ConnectNamedPipe];
+            // mov [result], eax; ret
+            let mut code = Vec::new();
+            for arg in [0_u32, server] {
+                code.extend_from_slice(&[0x68]);
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(import_slot as u32).to_le_bytes());
+            code.extend_from_slice(&[0xA3]);
+            code.extend_from_slice(&(result_ptr as u32).to_le_bytes());
+            code.push(0xC3);
+            memory.map_bytes(entry, &code);
+
+            let _caller = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_thread,
+                &[0, 0, entry as u32, 0, 0, thread_id_ptr as u32],
+            );
+
+            // No client yet: ConnectNamedPipe parks on the PipeConnect wait.
+            let mut parked = false;
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| thread.wait.is_some())
+                {
+                    parked = true;
+                    break;
+                }
+            }
+            assert!(
+                parked,
+                "ConnectNamedPipe must park before a client connects"
+            );
+
+            let client = runtime
+                .win32
+                .open_named_pipe_client(r"\\.\pipe\block-connect", false)
+                .expect("open client");
+            for _ in 0..100 {
+                let _ = runtime
+                    .pump_pending_guest_thread(&mut memory)
+                    .expect("pump pending thread");
+                if runtime.pending_guest_threads.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                runtime.pending_guest_threads.is_empty(),
+                "caller must complete after the client connects"
+            );
+            assert_eq!(
+                read_u32(&memory, result_ptr).expect("connect result"),
+                1,
+                "blocking ConnectNamedPipe must return TRUE once connected"
+            );
+            let _ = runtime.win32.close_handle(client);
+            let _ = runtime.win32.close_handle(server);
         })
     }
 
@@ -90169,6 +91467,12 @@ fn read_u32(memory: &MemoryImage, address: u64) -> AppResult<u32> {
         memory.read_u8(address + 2)?,
         memory.read_u8(address + 3)?,
     ]))
+}
+
+fn read_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
+    let low = read_u32(memory, address)?;
+    let high = read_u32(memory, address + 4)?;
+    Ok((u64::from(high) << 32) | u64::from(low))
 }
 
 fn read_u16(memory: &MemoryImage, address: u64) -> AppResult<u16> {

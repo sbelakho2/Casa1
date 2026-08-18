@@ -8566,9 +8566,12 @@ mod tests {
         // Wait for other threads' encoder traffic (from parallel tests) to
         // settle, then require the invariant: every encoder created in this
         // window (ours, plus any interleaved test's) must be ended.
-        for _ in 0..200 {
+        // 8 s settle window (600 x 5 ms): other metal tests create encoders
+        // concurrently under full-suite parallelism, so the counters keep
+        // moving; wait for a quiescent read before asserting the invariant.
+        for _ in 0..600 {
             let a = encoder_balance();
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
             let b = encoder_balance();
             if a == b && (a.0 - before.0) == (a.1 - before.1) {
                 return;
