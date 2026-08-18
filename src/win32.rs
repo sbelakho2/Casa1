@@ -4071,7 +4071,7 @@ impl Win32Subsystem {
                 format!("no reservation containing {base_address:#x}"),
             )
         })?;
-        let range_end = base_address.checked_add(aligned).unwrap_or(u64::MAX);
+        let range_end = base_address.saturating_add(aligned);
         let mut previous = MemoryProtection {
             read: false,
             write: false,
@@ -4080,10 +4080,10 @@ impl Win32Subsystem {
         let mut found = false;
         for page in region.pages.range_mut(base_address..range_end) {
             if !found {
-                previous = page.1.protection.clone();
+                previous = page.1.protection;
                 found = true;
             }
-            page.1.protection = protection.clone();
+            page.1.protection = protection;
         }
         Ok(previous)
     }
@@ -4111,7 +4111,7 @@ impl Win32Subsystem {
         let protection = region
             .pages
             .get(&page)
-            .map(|committed_page| committed_page.protection.clone())
+            .map(|committed_page| committed_page.protection)
             .unwrap_or(MemoryProtection {
                 read: false,
                 write: false,
@@ -4949,12 +4949,7 @@ impl Win32Subsystem {
             })?;
         let mut pages = BTreeMap::new();
         for page in 0..page_count {
-            pages.insert(
-                base + page * 0x1000,
-                CommittedPage {
-                    protection: protection.clone(),
-                },
-            );
+            pages.insert(base + page * 0x1000, CommittedPage { protection });
         }
         self.memory_regions.insert(
             base,

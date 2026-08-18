@@ -36416,7 +36416,7 @@ impl PeHostRuntime {
                         })?;
                         let containing = self.private_reservation_containing(base);
                         let fits = containing.is_some_and(|(rbase, rsize)| {
-                            rbase.checked_add(rsize as u64).is_some_and(|rend| range_end <= rend)
+                            rbase.checked_add(rsize).is_some_and(|rend| range_end <= rend)
                         });
                         if !fits {
                             state.set(Register::Rax, 0);
@@ -36566,7 +36566,7 @@ impl PeHostRuntime {
                     });
                 for page in (0..aligned / 0x1000).map(|i| first_page + i * 0x1000) {
                     if let Some(protection) = self.private_pages.get_mut(&page) {
-                        *protection = new_protection.clone();
+                        *protection = new_protection;
                     }
                 }
                 if old_protect_ptr != 0 {
@@ -36760,7 +36760,7 @@ impl PeHostRuntime {
                                 // reservation: coalesce forward over
                                 // non-committed pages.
                                 let mut run_end = page + 0x1000;
-                                let rend = rbase + rsize as u64;
+                                let rend = rbase + rsize;
                                 while run_end < rend
                                     && !self.private_pages.contains_key(&run_end)
                                 {
@@ -36770,7 +36770,7 @@ impl PeHostRuntime {
                             } else if let Some((&hbase, &hsize)) =
                                 self.heap_allocations.range(..=address).next_back()
                             {
-                                let hend = hbase.checked_add(hsize as u64).unwrap_or(u64::MAX);
+                                let hend = hbase.saturating_add(hsize as u64);
                                 if address < hend {
                                     (hbase, hend - address, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE)
                                 } else {
