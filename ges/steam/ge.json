@@ -159,23 +159,23 @@
         "attributes": [],
         "creation_time_ticks": 134314260480000000,
         "last_access_time_ticks": 134314260480000000,
-        "last_write_time_ticks": 134314798020000000
+        "last_write_time_ticks": 134314907040000000
       },
       "C:\\steam\\.writable": {
         "kind": "File",
         "original_case": ".writable",
         "attributes": [],
-        "creation_time_ticks": 134314798035604650,
-        "last_access_time_ticks": 134314798035604650,
-        "last_write_time_ticks": 134314798035604650
+        "creation_time_ticks": 134314907059639310,
+        "last_access_time_ticks": 134314907059639310,
+        "last_write_time_ticks": 134314907059639310
       },
       "C:\\steam\\package\\.writable": {
         "kind": "File",
         "original_case": ".writable",
         "attributes": [],
-        "creation_time_ticks": 134314798035670080,
-        "last_access_time_ticks": 134314798035670080,
-        "last_write_time_ticks": 134314798035670080
+        "creation_time_ticks": 134314907059696150,
+        "last_access_time_ticks": 134314907059696150,
+        "last_write_time_ticks": 134314907059696150
       }
     }
   }
