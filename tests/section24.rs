@@ -7,6 +7,16 @@
 //! Smoke tests execute Steam.exe with a small instruction budget to verify that
 //! basic imports work end-to-end through the full PE runtime.
 //!
+//! Phase 24.2 extends the model with implementation-quality coverage: every
+//! Steam import is classified against the canonical [`ThunkMetadata`] table
+//! ([`crate::host_thunks::THUNK_METADATA`]) as Implemented / Partial / Stub /
+//! Unsupported, and the release requirement *"no runtime-reached
+//! Steam-critical API is Stub or Unsupported"* is encoded as an assertion over
+//! the INVOKED set only (an empty invoked set is trivially satisfied but
+//! reported).  The tracked fixture
+//! ([`Steam.exe`](ges/steam/drive_c/Steam/Steam.exe)) drives the always-on
+//! model; trace-derived invoked sets come from the GE smoke runs.
+//!
 //! These tests require the Steam GE at `ges/steam-live-run-x86/` with
 //! `Steam.exe`.  If the GE is not present, tests are skipped at runtime with a
 //! clear message.
@@ -17,10 +27,14 @@
 //! ```
 
 use casa1::ge::GameEnvironment;
+use casa1::host_thunks::ImplementationLevel;
+use casa1::import_coverage::{
+    SteamCoverageReport, coverage_for_steam_fixture_with_invoked, invoked_api_names_from_trace,
+};
 use casa1::pe::{self, ApiSetResolver, ImportSymbol};
 use casa1::pe_runtime::{self, PeExecutionOptions, PeExecutionResult, is_import_supported};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -686,4 +700,248 @@ fn t24_16_kernel32_key_functions() {
          kernel32 thunk dispatch never happened"
     );
     eprintln!("  ✓ kernel32 key functions dispatched successfully");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// t24_17/t24_18 — fixture-derived implementation-quality model (Phase 24.2)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The exact-import scanning above stays untouched.  This model additionally
+// classifies EVERY Steam import against the canonical ThunkMetadata table
+// (host_thunks::THUNK_METADATA) and reports:
+//   (a) all imported APIs,
+//   (b) all actually invoked APIs (from an E2E trace when available, else
+//       empty),
+//   (c) all actually invoked APIs whose implementation is Partial/Stub/
+//       Unsupported.
+// The release requirement — "no runtime-reached Steam-critical API is Stub
+// or Unsupported" — is encoded as an assertion over the INVOKED set ONLY
+// (an empty invoked set is trivially satisfied, but still reported).
+
+/// Path to the tracked Steam.exe fixture (committed to the repo, always
+/// available — no GE setup required).
+fn tracked_steam_exe() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("ges")
+        .join("steam")
+        .join("drive_c")
+        .join("Steam")
+        .join("Steam.exe")
+}
+
+/// Print the section40-style structured telemetry for a coverage report.
+///
+/// The report is printed twice: a compact per-entry listing (all imported
+/// APIs, (a)) and the JSON serialization, so the full structured report is
+/// visible under `--nocapture`.
+fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
+    eprintln!("\n═══════════════════════════════════════════════════════════════");
+    eprintln!("  Steam import quality telemetry [{label}]");
+    eprintln!("═══════════════════════════════════════════════════════════════");
+    eprintln!("exe:     {}", report.steam_exe_path);
+    eprintln!("sha256:  {}", report.steam_sha256);
+    eprintln!(
+        "version: {}",
+        report.image_version.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("imports: {}", report.total_imports);
+    eprintln!(
+        "levels:  Implemented={}  Partial={}  Stub={}  Unsupported={}",
+        report
+            .by_implementation
+            .get("Implemented")
+            .copied()
+            .unwrap_or(0),
+        report
+            .by_implementation
+            .get("Partial")
+            .copied()
+            .unwrap_or(0),
+        report.by_implementation.get("Stub").copied().unwrap_or(0),
+        report
+            .by_implementation
+            .get("Unsupported")
+            .copied()
+            .unwrap_or(0),
+    );
+    eprintln!(
+        "invoked-in-e2e flag: {}",
+        if report.invoked_in_e2e { "yes" } else { "no" }
+    );
+
+    // (a) All imported APIs, grouped per DLL, with quality + criticality.
+    eprintln!("\n--- (a) all imported APIs ({}):", report.entries.len());
+    let mut current_dll = String::new();
+    for entry in &report.entries {
+        if entry.dll != current_dll {
+            current_dll = entry.dll.clone();
+            eprintln!("  [{current_dll}]");
+        }
+        eprintln!(
+            "    {:40} {:12} critical={:<5} invoked={}",
+            entry.import,
+            format!("{:?}", entry.implementation),
+            entry.steam_critical,
+            entry.invoked_in_e2e,
+        );
+    }
+
+    // (b) All actually invoked APIs.
+    let invoked: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.invoked_in_e2e)
+        .collect();
+    eprintln!("\n--- (b) actually invoked APIs ({}):", invoked.len());
+    for entry in &invoked {
+        eprintln!(
+            "    {:40} {:12} critical={}",
+            entry.import,
+            format!("{:?}", entry.implementation),
+            entry.steam_critical,
+        );
+    }
+
+    // (c) Invoked APIs with non-Implemented quality.
+    let flagged: Vec<_> = invoked
+        .iter()
+        .filter(|entry| !matches!(entry.implementation, ImplementationLevel::Implemented))
+        .collect();
+    eprintln!(
+        "\n--- (c) invoked APIs that are Partial/Stub/Unsupported ({}):",
+        flagged.len()
+    );
+    for entry in &flagged {
+        eprintln!(
+            "    {}!{} [{:?}]",
+            entry.dll, entry.import, entry.implementation
+        );
+    }
+
+    // Release gate (over the invoked set only).
+    let violations = report.invoked_critical_violations();
+    eprintln!(
+        "\n--- release gate: no invoked Steam-critical API is Stub/Unsupported — violations: {}",
+        violations.len()
+    );
+    if violations.is_empty() && invoked.is_empty() {
+        eprintln!("    (invoked set is empty — gate trivially satisfied but reported)");
+    }
+
+    eprintln!("\n--- JSON report:");
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(report).expect("serialize coverage report")
+    );
+    eprintln!("═══════════════════════════════════════════════════════════════\n");
+}
+
+#[test]
+fn t24_17_tracked_fixture_import_quality() {
+    let path = tracked_steam_exe();
+    assert!(
+        path.is_file(),
+        "tracked Steam fixture missing at {}",
+        path.display()
+    );
+
+    // No E2E trace is available in CI for the tracked fixture, so the
+    // invoked set is empty; t24_18 (ignored, GE smoke) supplies a real one.
+    let report = coverage_for_steam_fixture_with_invoked(&path, &[]).expect("coverage report");
+
+    print_quality_telemetry("tracked-fixture (invoked set: empty)", &report);
+
+    // (a) Every import of the fixture is present and classified.
+    assert!(
+        report.total_imports > 300,
+        "unexpectedly small import surface: {}",
+        report.total_imports
+    );
+    assert_eq!(
+        report.by_implementation.values().sum::<usize>(),
+        report.total_imports,
+        "every import must be classified"
+    );
+
+    // (b) Invoked set: empty (no trace) — reported, not asserted.
+    assert!(
+        report.entries.iter().all(|entry| !entry.invoked_in_e2e),
+        "invoked_in_e2e must be false without a trace"
+    );
+
+    // (c) Invoked Partial/Stub/Unsupported: empty (nothing invoked).
+    // Release requirement: encoded ONLY over the invoked set.
+    let violations = report.invoked_critical_violations();
+    assert!(
+        violations.is_empty(),
+        "invoked Steam-critical API is Stub/Unsupported: {:#?}",
+        violations
+    );
+    eprintln!(
+        "  ✓ t24_17: release gate over invoked set PASSES ({} violation(s); invoked set empty => trivially satisfied but reported)",
+        violations.len()
+    );
+}
+
+#[test]
+#[ignore]
+// slow: re-executes the full Steam.exe PE emulation (shared 1M-budget smoke
+// run, many minutes); the runtime also returns an Err when the budget is
+// exhausted, so this cannot pass in CI. Run manually on a GE machine with
+// -- --ignored.  Supplies the trace-derived invoked set for (b)/(c).
+fn t24_18_tracked_fixture_import_quality_with_trace() {
+    if !require_steam_ge() {
+        return;
+    }
+    let result = steam_smoke_result();
+    let invoked = invoked_api_names_from_trace(&result.trace_events);
+    eprintln!(
+        "[t24_18] trace-derived invoked API names: {}",
+        invoked.len()
+    );
+
+    let path = tracked_steam_exe();
+    let report = coverage_for_steam_fixture_with_invoked(&path, &invoked)
+        .expect("coverage report with invoked set");
+
+    print_quality_telemetry("tracked-fixture (invoked set: smoke trace)", &report);
+
+    // (b) The invoked set is non-empty and reflected in the report.
+    let invoked_entries: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.invoked_in_e2e)
+        .collect();
+    assert!(
+        !invoked_entries.is_empty(),
+        "smoke trace produced no invoked imports"
+    );
+
+    // (c) Report the invoked APIs whose quality is not Implemented.
+    let flagged: Vec<_> = invoked_entries
+        .iter()
+        .filter(|entry| !matches!(entry.implementation, ImplementationLevel::Implemented))
+        .collect();
+    eprintln!(
+        "[t24_18] invoked APIs with Partial/Stub/Unsupported quality: {}",
+        flagged.len()
+    );
+    for entry in &flagged {
+        eprintln!(
+            "  - {}!{} [{:?}] critical={}",
+            entry.dll, entry.import, entry.implementation, entry.steam_critical
+        );
+    }
+
+    // Release requirement: over the INVOKED set only.
+    let violations = report.invoked_critical_violations();
+    assert!(
+        violations.is_empty(),
+        "a runtime-reached Steam-critical API is Stub or Unsupported: {:#?}",
+        violations
+    );
+    eprintln!(
+        "  ✓ t24_18: release gate over the real invoked set PASSES ({} violation(s))",
+        violations.len()
+    );
 }
