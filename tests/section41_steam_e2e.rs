@@ -3,15 +3,27 @@
 //! Runs the REAL Steam client from `ges/steam/drive_c/Steam/Steam.exe`
 //! through the runner's `execute_job` path with a bounded wall-clock
 //! deadline (`CASA1_PE_RUNTIME_DEADLINE_SECS`, default 300 s), loads the
-//! steam-bootstrap artifact the runner writes into the GE diagnostics
-//! directory, and evaluates it with [`casa1::steam_acceptance::evaluate`]
+//! steam-bootstrap artifact the runner wrote for THIS run (via
+//! `outcome.steam_artifact_json` — never an mtime scan of the diagnostics
+//! directory), and evaluates it with [`casa1::steam_acceptance::evaluate`]
 //! under a policy that requires stages S0-S12 and allows the harness
 //! deadline.
 //!
-//! The test PASSES only when the acceptance result passes, or when every
-//! recorded failure is a documented stage-missing (`StageNotReached`) and
-//! the full evidence (artifact identity, completed/missing stages,
-//! failures) has been printed.
+//! The job is the PRODUCTION Steam job: it is built by
+//! [`casa1::steam_launch::prepare_steam_job`] from a
+//! `SteamLaunchProfile::default()` — the exact construction `steam:launch`
+//! dispatches — so the gate exercises the live PE host path (intent
+//! `Play`), the profile's Steam IPC, JIT mode (Enabled), window dimensions
+//! and launch environment.
+//!
+//! The gate is TRUTHFUL: the test PASSES only when the acceptance result
+//! passes.  Missing stages are diagnostics, never success — the gate ends
+//! with `assert!(result.passed, ...)`.
+//!
+//! A single machine-readable verdict line is emitted on stdout:
+//! `STEAM_ACCEPTANCE=<JSON>` where the JSON is the serialized
+//! [`SteamAcceptanceResult`] plus run identity — the CI workflow consumes
+//! this line; it never re-derives S0-S13 by regex over stdout.
 //!
 //! Gated twice: `#[ignore]` keeps it out of the default suite, and the
 //! `CASA1_STEAM_E2E=1` environment gate skips it (with a message) even
@@ -23,13 +35,10 @@
 //!   cargo test --release --test section41_steam_e2e -- --ignored --nocapture
 //! ```
 
-use casa1::ge::GameEnvironment;
-use casa1::runner::{RunIntent, RunnerJob, SteamBootstrapArtifact, execute_job};
-use casa1::steam_acceptance::{
-    MANDATORY_STAGES, SteamAcceptanceFailure, SteamAcceptancePolicy, evaluate,
-};
+use casa1::runner::{SteamBootstrapArtifact, execute_job};
+use casa1::steam_acceptance::{MANDATORY_STAGES, SteamAcceptancePolicy, evaluate};
+use casa1::steam_launch::{SteamLaunchProfile, prepare_steam_job};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The Steam GE whose `drive_c/Steam/Steam.exe` is the real client.
@@ -51,34 +60,20 @@ fn steam_e2e_gate() -> bool {
     true
 }
 
-/// Resolve the tracked Steam GE root via the workspace manifest dir.
-fn steam_ge_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("ges")
-        .join(STEAM_GE)
+/// Resolve the Steam GE root: the CI hydration stage points
+/// `CASA1_STEAM_E2E_GE_ROOT` at the hydrated fixture it produced; locally the
+/// tracked `ges/<name>` fixture is used.
+fn e2e_ge_name() -> String {
+    std::env::var("CASA1_STEAM_E2E_GE_NAME").unwrap_or_else(|_| STEAM_GE.to_string())
 }
 
-/// The newest `*-steam-bootstrap.json` artifact in `dir`, if any.
-fn latest_steam_artifact(dir: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.path().is_file() && {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                name.ends_with("-steam-bootstrap.json")
-            }
-        })
-        .filter_map(|entry| {
-            entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .map(|modified| (modified, entry.path()))
-        })
-        .collect();
-    candidates.sort_by_key(|(modified, _)| *modified);
-    candidates.pop().map(|(_, path)| path)
+fn e2e_ge_root() -> PathBuf {
+    match std::env::var_os("CASA1_STEAM_E2E_GE_ROOT") {
+        Some(root) => PathBuf::from(root),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("ges")
+            .join(e2e_ge_name()),
+    }
 }
 
 #[test]
@@ -89,11 +84,13 @@ fn t41_steam_e2e_acceptance() {
     }
 
     // ── Resolve the real client ──────────────────────────────────────────
-    let ge_root = steam_ge_root();
+    let ge_root = e2e_ge_root();
+    let ge_name = e2e_ge_name();
     let steam_exe = ge_root.join("drive_c").join("Steam").join("Steam.exe");
     assert!(
         steam_exe.is_file(),
-        "real Steam client missing at {} — the E2E test needs ges/{STEAM_GE}/drive_c/Steam/Steam.exe",
+        "real Steam client missing at {} — the E2E test needs a hydrated GE with \
+         drive_c/Steam/Steam.exe (default: ges/{STEAM_GE}/drive_c/Steam/Steam.exe)",
         steam_exe.display(),
     );
 
@@ -109,25 +106,59 @@ fn t41_steam_e2e_acceptance() {
     // required for the bounded Steam execution.
     unsafe {
         std::env::set_var("CASA1_PE_RUNTIME_DEADLINE_SECS", deadline_secs.to_string());
+        // Pin the GE root so the production job constructor resolves the
+        // hydrated/tracked fixture (never a stray environment of the same
+        // name).  The root is the fixture itself; open() looks one level up.
+        std::env::set_var(
+            "CASA1_GES_ROOT",
+            ge_root.parent().expect("GE root has a parent"),
+        );
     }
 
-    // ── Run the real client through the runner's execute_job path ────────
-    let job = RunnerJob {
-        ge_name: STEAM_GE.to_string(),
-        ge_root: ge_root.clone(),
-        program: steam_exe.clone(),
-        args: Vec::new(),
-        cwd: ge_root.join("drive_c").join("Steam"),
-        env: BTreeMap::new(),
-        dtm: false,
-        intent: RunIntent::Run,
-        trace_categories: Vec::new(),
-        test_id: "section41_steam_e2e".to_string(),
-        jit_mode: Default::default(),
-        steam_ipc: false,
-        window_width: None,
-        window_height: None,
+    // ── Build the PRODUCTION Steam job ────────────────────────────────────
+    // prepare_steam_job is the exact job construction steam:launch uses:
+    // intent Play (live PE host path), steam_ipc from the profile, JIT mode
+    // from the profile (Enabled), window dimensions from the profile, and
+    // the steam launch environment.  The gate never hand-constructs a
+    // RunnerJob.
+    let profile = SteamLaunchProfile {
+        ge_name: ge_name.clone(),
+        ..SteamLaunchProfile::default()
     };
+    let job = match prepare_steam_job(&profile) {
+        Ok(job) => job,
+        Err(error) => {
+            panic!(
+                "[section41] prepare_steam_job failed (production Steam job construction): {}",
+                error.message,
+            );
+        }
+    };
+    assert_eq!(
+        job.program,
+        steam_exe,
+        "the production Steam job must run the real client at {}",
+        steam_exe.display(),
+    );
+    assert!(
+        job.intent == casa1::runner::RunIntent::Play,
+        "the production Steam job must use intent Play (live PE host path), got {:?}",
+        job.intent,
+    );
+    assert_eq!(
+        job.jit_mode,
+        casa1::runner::JitMode::Enabled,
+        "the production Steam job must request JIT Enabled from the profile",
+    );
+    assert_eq!(job.steam_ipc, profile.steam_ipc);
+    assert_eq!(
+        job.window_width,
+        (profile.resolution_width > 0).then_some(profile.resolution_width),
+    );
+    assert_eq!(
+        job.window_height,
+        (profile.resolution_height > 0).then_some(profile.resolution_height),
+    );
     eprintln!(
         "[section41] executing real Steam client (deadline {deadline_secs}s): {}",
         steam_exe.display(),
@@ -147,32 +178,55 @@ fn t41_steam_e2e_acceptance() {
         outcome.report_path.display(),
     );
 
-    // ── Load the artifact the runner wrote ────────────────────────────────
-    let ge = GameEnvironment::from_root(ge_root).expect("open steam GE");
-    let diagnostics_dir = ge.diagnostics_dir();
-    let artifact_path = latest_steam_artifact(&diagnostics_dir).unwrap_or_else(|| {
+    // ── Load the artifact the runner wrote FOR THIS RUN ───────────────────
+    // The outcome carries the authoritative artifact paths of this run —
+    // never an mtime scan of the diagnostics directory.
+    let artifact_path = outcome.steam_artifact_json.clone().unwrap_or_else(|| {
         panic!(
-            "no steam-bootstrap artifact found in {} (listing): {:#?}",
-            diagnostics_dir.display(),
-            std::fs::read_dir(&diagnostics_dir).map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            }),
-        )
+            "[section41] execute_job returned no steam_artifact_json — the run did not \
+             produce the steam-bootstrap artifact (run_id={}, test_id={})",
+            outcome.run_id, job.test_id,
+        );
     });
+    let artifact_log_path = outcome.steam_artifact_log.clone().unwrap_or_else(|| {
+        panic!("[section41] execute_job returned no steam_artifact_log",);
+    });
+    assert!(
+        artifact_path.is_file(),
+        "[section41] steam artifact {} does not exist",
+        artifact_path.display(),
+    );
+    assert!(
+        artifact_log_path.is_file(),
+        "[section41] steam artifact log {} does not exist",
+        artifact_log_path.display(),
+    );
     eprintln!("[section41] artifact: {}", artifact_path.display());
     let artifact_bytes = std::fs::read(&artifact_path).expect("read steam-bootstrap artifact");
     let artifact: SteamBootstrapArtifact =
         serde_json::from_slice(&artifact_bytes).expect("parse steam-bootstrap artifact JSON");
 
-    // ── Self-consistency assertions ───────────────────────────────────────
+    // ── Authoritative artifact identity ────────────────────────────────────
     assert!(
         !artifact.run_id.is_empty(),
         "artifact must carry a non-empty run_id",
     );
+    assert_eq!(
+        artifact.run_id, outcome.run_id,
+        "artifact.run_id must equal the outcome's run id (the artifact was read by \
+         path, so a mismatch means the artifact does not belong to this run)",
+    );
+    assert_eq!(
+        artifact.test_id, job.test_id,
+        "artifact.test_id must equal the job's test id",
+    );
+    // The artifact must carry the sha256 of the exact binary that ran —
+    // computed in the test, never trusted from the artifact itself.
     let program_sha = casa1::steam_milestones::file_content_hash(&steam_exe);
+    assert_eq!(
+        artifact.program_sha256, program_sha,
+        "artifact program_sha256 must match the sha256 of the real binary that ran",
+    );
     assert_eq!(
         artifact.provenance.steam_executable_hash, program_sha,
         "artifact steam_executable_hash must match the sha256 of the real binary \
@@ -212,29 +266,30 @@ fn t41_steam_e2e_acceptance() {
         serde_json::to_string_pretty(&report).expect("serialize acceptance report"),
     );
 
-    if result.passed {
-        eprintln!("[section41] PASS: acceptance passed (all stages S0-S13)");
-        return;
-    }
+    // ── Machine-readable verdict line (single line, stdout) ───────────────
+    // The CI workflow consumes ONLY this line; it must not re-implement
+    // S0-S13 by regex over stdout.
+    let verdict = json!({
+        "result": result,
+        "run_id": artifact.run_id,
+        "test_id": job.test_id,
+        "program_sha256": artifact.program_sha256,
+        "exit_code": artifact.exit_code,
+        "termination": artifact.termination,
+    });
+    println!(
+        "STEAM_ACCEPTANCE={}",
+        serde_json::to_string(&verdict).expect("serialize verdict")
+    );
 
-    // Documented stage-missing only: the run stopped short of later stages
-    // (missing + StageNotReached), which is the expected scaffolding
-    // outcome while milestone instrumentation is still landing.  Any
-    // run-level failure (network unproven, guest exception, illegal host
-    // termination, encoder imbalance, placeholder-only rendering, model
-    // provenance, unsanctioned deadline) fails the gate.
-    let only_documented_stage_missing = result
-        .failures
-        .iter()
-        .all(|failure| matches!(failure, SteamAcceptanceFailure::StageNotReached(_)));
+    // ── The gate ──────────────────────────────────────────────────────────
+    // Missing stages are diagnostics, NEVER success: there is no
+    // documented-stage-missing pass branch.  The gate ends with the
+    // acceptance result.
     assert!(
-        only_documented_stage_missing,
-        "[section41] FAIL: acceptance recorded run-level failures beyond \
-         documented stage-missing: {:#?}",
-        result.failures,
+        result.passed,
+        "Steam E2E acceptance failed: completed={:?}, missing={:?}, failures={:?}",
+        result.completed_stages, result.missing, result.failures,
     );
-    eprintln!(
-        "[section41] PASS (documented stage-missing): completed={:?} missing={:?}",
-        result.completed_stages, result.missing,
-    );
+    eprintln!("[section41] PASS: acceptance passed (all stages S0-S13)");
 }

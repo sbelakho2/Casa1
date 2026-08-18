@@ -10,7 +10,19 @@ name: Steam E2E
 # permits when the signed casa1-runner carries
 # com.apple.security.cs.allow-jit in its signature. Without a Developer ID
 # identity the runner is signed ad-hoc, signed_jit_selftest is recorded as
-# "ad-hoc" (not "pass"), and the release gate fails closed.
+# "fail" (the JIT self-test reports active:false — a self-test that cannot
+# execute is not pass), and the release gate fails closed.
+#
+# The pipeline is FAIL-CLOSED end to end:
+#   - ci/prepare_steam_e2e_fixture.sh hydrates the fixture (real Steam
+#     updater, sha256-validated) and fails the run on any missing piece;
+#   - the section41 test emits a single machine-readable verdict line
+#     (STEAM_ACCEPTANCE=<JSON SteamAcceptanceResult>) that this workflow
+#     parses — S0-S13 are NEVER re-derived by regex over stdout;
+#   - signed_jit_selftest is "pass" only when the signed runner's
+#     --jit-self-test actually ran and reported jit.active == true;
+#   - signed_candidate / signed_candidate_sha256 come from the signing
+#     step (sha256 of the signed binary, never empty).
 #
 # The schedule keeps evidence fresh; workflow_dispatch is used to re-run
 # acceptance for a specific candidate commit.
@@ -74,133 +86,164 @@ jobs:
       - name: Release smoke on signed artifacts (fail closed)
         run: CI_RELEASE=1 ./ci/check_release_smoke.sh
 
+      # The signed JIT self-test verdict: the smoke script requires
+      # active==true in release mode; this step persists the machine-
+      # readable report so the evidence step can record signed_jit_selftest
+      # ("pass" ONLY when the self-test actually ran and reported
+      # jit.active == true).
+      - name: Record JIT self-test report
+        run: |
+          set -euo pipefail
+          target/release/casa1-runner --jit-self-test > /tmp/jit-selftest.json
+          python3 -c 'import json; d = json.load(open("/tmp/jit-selftest.json")); assert "active" in d'
+
+      # Hydrate the Steam E2E fixture: the tracked baseline is copied to a
+      # fresh work dir, the real Steam updater runs (sha256-validated), and
+      # the required components (client, steamwebhelper.exe, CEF payload)
+      # are verified.  FAIL-CLOSED: the script exits non-zero on any missing
+      # piece and its printed hydrated path is the GE the test runs.
+      - name: Hydrate Steam E2E fixture (real updater, fail-closed)
+        run: |
+          set -euo pipefail
+          STEAM_BOOTSTRAPPER_SHA256="$(shasum -a 256 ges/steam-live-run-x86/drive_c/Steam.exe | awk '{print $1}')"
+          FIXTURE_ROOT="$(ci/prepare_steam_e2e_fixture.sh "$STEAM_BOOTSTRAPPER_SHA256")"
+          echo "CASA1_STEAM_E2E_GE_ROOT=$FIXTURE_ROOT" >> "$GITHUB_ENV"
+          echo "CASA1_STEAM_E2E_GE_NAME=steam-live-run-x86" >> "$GITHUB_ENV"
+
       # Steam V1 acceptance suite. section41 implements the S0-S13
       # acceptance criteria; it runs only when CASA1_STEAM_E2E=1 is set
       # (real Steam client, updater/network, CEF UI, Metal, login screen).
+      # The test prints exactly one machine-readable verdict line
+      # (STEAM_ACCEPTANCE=<JSON>) which the evidence step parses.
       - name: Run Steam V1 acceptance (section41)
         id: acceptance
         env:
           CASA1_STEAM_E2E: "1"
+          CASA1_PE_RUNTIME_DEADLINE_SECS: "600"
         continue-on-error: true
         run: |
-          cargo test --test section41 -- --ignored --nocapture \
+          cargo test --release --test section41_steam_e2e -- --ignored --nocapture \
             2>&1 | tee /tmp/section41-out.txt
           echo "TEST_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
-      - name: Evaluate acceptance and write evidence
+      - name: Evaluate acceptance verdict and write evidence
         id: evidence
         run: |
           set -euo pipefail
-          mkdir -p e2e-evidence
-          git rev-parse HEAD > e2e-evidence/commit.txt
+          # Layout consumed by ci/check_release_gate.sh: the evidence bundle
+          # lives in e2e-evidence/steam-e2e-evidence/ (the "artifact" whose
+          # content digest ties to this commit) while the top-level
+          # release-evidence.json is the file the gate validates.
+          mkdir -p e2e-evidence/steam-e2e-evidence
+          git rev-parse HEAD > e2e-evidence/steam-e2e-evidence/commit.txt
           cp /tmp/section41-out.txt e2e-evidence/section41.txt
 
-          # Derive the S0-S13 milestone verdicts from the section41 output
-          # (mirrors src/steam_milestones.rs SteamMilestoneGroup fields).
+          # The verdict is the section41 test's STEAM_ACCEPTANCE= line — the
+          # serialized SteamAcceptanceResult.  Nothing here re-implements
+          # S0-S13; missing verdict = not accepted (fail closed).
           python3 - <<'PY'
-          import json, os, re, sys
+          import json, os, sys
 
-          out = ""
           out_path = "e2e-evidence/section41.txt"
+          out = ""
           if os.path.exists(out_path):
               out = open(out_path, errors="replace").read()
 
+          verdict = None
+          for line in out.splitlines():
+              if line.startswith("STEAM_ACCEPTANCE="):
+                  try:
+                      verdict = json.loads(line[len("STEAM_ACCEPTANCE="):])
+                  except Exception as e:
+                      print(f"STEAM_ACCEPTANCE line unparseable: {e}", file=sys.stderr)
+                  break
+
           test_exit = int(os.environ.get("TEST_EXIT", "1"))
+          if verdict is None:
+              result = {"passed": False, "completed_stages": [],
+                        "missing": [], "failures": [{"StageNotReached": "verdict_missing"}]}
+              verdict = {"result": result, "run_id": "", "test_id": "",
+                         "program_sha256": "", "exit_code": None, "termination": None}
+              print("::warning::No STEAM_ACCEPTANCE verdict line — acceptance did not pass", file=sys.stderr)
+          else:
+              print("verdict parsed:", json.dumps(verdict["result"].get("passed")))
 
-          def flag(key):
-              # Accept "key": true / key:true / key = true forms.
-              m = re.search(r'"' + key + r'"\s*:\s*(true|false)', out)
-              if not m:
-                  m = re.search(key + r'\s*[=:]\s*(true|false)', out)
-              return m is not None and m.group(1) == "true"
-
-          def count(key):
-              m = re.search(r'"' + key + r'"\s*:\s*(\d+)', out)
-              if not m:
-                  m = re.search(key + r'\s*[=:]\s*(\d+)', out)
-              return int(m.group(1)) if m else 0
-
-          mil = {
-              "bootstrap_started": flag("bootstrap_started"),
-              "manifest_opened": flag("manifest_opened"),
-              "manifest_verified": flag("manifest_verified"),
-              "package_writability_probe": flag("package_writability_probe"),
-              "client_main_started": flag("client_main_started"),
-              "webhelper_processes": count("webhelper_processes"),
-              "cef_browser_created": flag("cef_browser_created"),
-              "cef_first_paint": flag("cef_first_paint"),
-              "cef_software_paints": count("cef_software_paints"),
-              "cef_accelerated_paints": count("cef_accelerated_paints"),
-              "dxgi_presents": count("dxgi_presents"),
-              "metal_presented_frames": count("metal_presented_frames"),
-              "login_screen_visible": flag("login_screen_visible"),
-          }
-
-          # S0-S13 acceptance mapping.
-          milestones = {
-              "S0": mil["bootstrap_started"],
-              "S1": mil["manifest_opened"],
-              "S2": mil["manifest_verified"],
-              "S3": mil["package_writability_probe"],
-              "S4": mil["client_main_started"],
-              "S5": mil["webhelper_processes"] >= 1,
-              "S6": mil["cef_browser_created"],
-              "S7": mil["cef_first_paint"],
-              "S8": mil["cef_software_paints"] > 0,
-              "S9": mil["cef_accelerated_paints"] > 0,
-              "S10": mil["dxgi_presents"] > 0,
-              "S11": mil["metal_presented_frames"] > 0,
-              "S12": mil["login_screen_visible"],
-          }
-          milestones["S13"] = test_exit == 0 and all(milestones[s] for s in
-                                                       ["S0","S1","S2","S3","S4","S5","S6","S7","S8","S9","S10","S11","S12"])
-          accepted = milestones["S13"]
+          accepted = bool(verdict["result"].get("passed"))
+          verdict["test_exit"] = test_exit
+          verdict["accepted"] = accepted
 
           json.dump({"accepted": accepted, "test_exit": test_exit,
-                     "milestones": milestones, "milestone_flags": mil},
-                    open("e2e-evidence/acceptance.json", "w"), indent=2)
-          json.dump(mil, open("e2e-evidence/milestones.json", "w"), indent=2)
-          print("accepted:", accepted, "| test_exit:", test_exit)
-          if not accepted:
-              print("::warning::Steam V1 acceptance did not pass (S0-S13 not all green)")
+                     "verdict": verdict,
+                     "result": verdict["result"]},
+                    open("e2e-evidence/steam-e2e-evidence/acceptance.json", "w"), indent=2)
+          json.dump({"passed": accepted,
+                     "completed_stages": verdict["result"].get("completed_stages", []),
+                     "missing": verdict["result"].get("missing", []),
+                     "failures": verdict["result"].get("failures", [])},
+                    open("e2e-evidence/steam-e2e-evidence/milestones.json", "w"), indent=2)
           PY
+
+          # The signed candidate: the exact signed binary that was smoke-
+          # tested and E2E'd, with its sha256 — never empty.
+          if [[ ! -f target/release/casa1-runner ]]; then
+            echo "::error::signed candidate target/release/casa1-runner missing"
+            exit 1
+          fi
+          cp target/release/casa1-runner e2e-evidence/signed-casa1-runner
+          SIGNED_CANDIDATE_SHA256="$(shasum -a 256 e2e-evidence/signed-casa1-runner | awk '{print $1}')"
+          echo "signed candidate sha256: $SIGNED_CANDIDATE_SHA256"
 
           # Deterministic content digest of the evidence bundle (over
           # commit.txt + acceptance.json + milestones.json; never over the
           # zip container, whose bytes vary between downloads). This value
           # becomes steam_e2e_artifact_sha256 in release-evidence.json.
           DIGEST="$(printf '%s' \
-            "$(shasum -a 256 e2e-evidence/commit.txt | awk '{print $1}')$(shasum -a 256 e2e-evidence/acceptance.json | awk '{print $1}')$(shasum -a 256 e2e-evidence/milestones.json | awk '{print $1}')" \
+            "$(shasum -a 256 e2e-evidence/steam-e2e-evidence/commit.txt | awk '{print $1}')$(shasum -a 256 e2e-evidence/steam-e2e-evidence/acceptance.json | awk '{print $1}')$(shasum -a 256 e2e-evidence/steam-e2e-evidence/milestones.json | awk '{print $1}')" \
             | shasum -a 256 | awk '{print $1}')"
           echo "$DIGEST" > e2e-evidence/evidence.sha256
 
-          ACCEPTED="$(python3 -c 'import json;print(json.load(open("e2e-evidence/acceptance.json"))["accepted"])')"
+          ACCEPTED="$(python3 -c 'import json;print(json.load(open("e2e-evidence/steam-e2e-evidence/acceptance.json"))["accepted"])')"
           if [[ "$ACCEPTED" == "True" ]]; then STEAM_PASS="pass"; else STEAM_PASS="fail"; fi
+          export STEAM_PASS
+          export SIGNED_CANDIDATE_SHA256
 
           python3 - <<'PY'
           import json, os
+
           digest = open("e2e-evidence/evidence.sha256").read().strip()
           signing = os.environ.get("SIGNING_MODE", "ad-hoc")
-          # signed_jit_selftest is only "pass" when the runner was signed
-          # with the Developer ID identity (hardened runtime + allow-jit);
-          # ad-hoc signing means the real signed-JIT path was not exercised.
+
+          # signed_jit_selftest is "pass" ONLY when the signed runner's JIT
+          # self-test actually ran and reported jit.active == true.
+          jit_report = {"active": False, "fallback_reason": "no report"}
+          try:
+              jit_report = json.load(open("/tmp/jit-selftest.json"))
+          except Exception as e:
+              jit_report["fallback_reason"] = f"report unreadable: {e}"
+          signed_jit_selftest = "pass" if jit_report.get("active") is True else "fail"
+          json.dump(jit_report, open("e2e-evidence/jit-selftest.json", "w"), indent=2)
+
           evidence = {
               "schema_version": 1,
-              "commit": open("e2e-evidence/commit.txt").read().strip(),
+              "commit": open("e2e-evidence/steam-e2e-evidence/commit.txt").read().strip(),
               "steam_e2e_artifact": "steam-e2e-evidence",
               "steam_e2e_artifact_sha256": digest,
               "steam_e2e_acceptance": os.environ.get("STEAM_PASS", "fail"),
               "steam_e2e_milestones": os.environ.get("STEAM_PASS", "fail"),
-              "signed_jit_selftest": "pass" if signing == "developer-id" else "ad-hoc",
+              "signed_jit_selftest": signed_jit_selftest,
               "signing_mode": signing,
               "cargo_tests": "pass",
-              "signed_candidate": "",
-              "signed_candidate_sha256": "",
+              "signed_candidate": "signed-casa1-runner",
+              "signed_candidate_sha256": os.environ.get("SIGNED_CANDIDATE_SHA256", ""),
           }
+          if not evidence["signed_candidate_sha256"]:
+              raise SystemExit("signed_candidate_sha256 must never be empty")
           json.dump(evidence, open("e2e-evidence/release-evidence.json", "w"), indent=2)
+          # The artifact embeds the exact evidence being validated.
+          json.dump(evidence, open("e2e-evidence/steam-e2e-evidence/release-evidence.json", "w"), indent=2)
           PY
 
-          ls -la e2e-evidence/
+          ls -la e2e-evidence/ e2e-evidence/steam-e2e-evidence/
 
       - name: Upload evidence (steam-e2e-<sha>)
         if: always()

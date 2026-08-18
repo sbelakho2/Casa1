@@ -678,7 +678,11 @@ fn deadline_terminated_run_artifact_retains_perf_trace_frames() {
             event_index: 3,
             category: "network".to_string(),
             call_id: "connect".to_string(),
-            parameters: BTreeMap::new(),
+            parameters: BTreeMap::from([
+                ("socket".to_string(), json!(7)),
+                ("host".to_string(), json!("store.steampowered.com")),
+                ("port".to_string(), json!(443)),
+            ]),
             return_value: json!(0),
             get_last_error: None,
             side_effect_hashes: vec![],
@@ -703,7 +707,17 @@ fn deadline_terminated_run_artifact_retains_perf_trace_frames() {
     assert!(parsed["program_sha256"].as_str().unwrap().len() == 64);
     // Perf / trace / frame data survive the deadline termination.
     assert_eq!(parsed["instruction_count"], 123_456);
-    assert_eq!(parsed["network_summary"][0], "connect -> 0");
+    // The network summary is now STRUCTURED: the connect trace contributes
+    // an endpoint entry (a connect-only entry carries no status/bytes/TLS
+    // evidence — S4 fails honestly on it, see steam_acceptance).
+    assert_eq!(
+        parsed["network_summary"][0]["host"],
+        "store.steampowered.com"
+    );
+    assert_eq!(parsed["network_summary"][0]["port"], 443);
+    assert_eq!(parsed["network_summary"][0]["proto"], "tcp");
+    assert_eq!(parsed["network_summary"][0]["method"], "connect");
+    assert_eq!(parsed["network_summary"][0]["status"], 0);
     let frames = parsed["milestones"].as_object().unwrap();
     assert!(frames.contains_key("graphics"));
     assert_eq!(parsed["exit_code"], -2);

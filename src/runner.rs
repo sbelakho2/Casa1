@@ -1,5 +1,6 @@
 use crate::canonical::{
-    CanonicalTestOutput, GuestException, ToleranceRegistry, compare_outputs, comparison_error,
+    CanonicalTestOutput, GuestException, NetworkSummary, ToleranceRegistry, compare_outputs,
+    comparison_error,
 };
 use crate::error::{AppError, AppResult};
 use crate::ge::{AppliedOverride, GameEnvironment, diff_file_snapshots, diff_registry_snapshots};
@@ -67,7 +68,7 @@ impl RunIntent {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum JitMode {
     /// Runtime decides (current behavior: JIT stays dormant).
     #[default]
@@ -120,7 +121,9 @@ pub struct RunnerOutcome {
     pub steam_artifact_json: Option<PathBuf>,
     /// Steam bootstrap log artifact for this run (Steam.exe jobs only).
     pub steam_artifact_log: Option<PathBuf>,
-    /// The run identifier (job test id).
+    /// The run identifier (UUID v4 live / deterministic DTM), generated once
+    /// at job start and shared by every artifact of this run — identical to
+    /// the `run_id` embedded in the steam-bootstrap artifact.
     #[serde(default)]
     pub run_id: String,
     /// ExecutionTermination variant name (e.g. "GuestExit").
@@ -140,7 +143,19 @@ pub struct RunnerOutcome {
 #[derive(Debug, Parser)]
 struct RunnerCli {
     #[arg(long)]
-    job: PathBuf,
+    job: Option<PathBuf>,
+    /// Run the JIT self-test: compile a translated block into MAP_JIT
+    /// memory, execute it, observe the safepoint flag, re-patch the code
+    /// page and re-execute.  Reports a JSON JitSelfTestReport.  The actual
+    /// test runs in a crash-isolated child process so a MAP_JIT execution
+    /// fault (macOS 26 without the allow-jit entitlement) is reported as
+    /// active:false instead of killing the runner.
+    #[arg(long)]
+    jit_self_test: bool,
+    /// Internal: run the JIT self-test in-process (spawned by
+    /// `--jit-self-test`).  Prints the JSON report on success.
+    #[arg(long, hide = true)]
+    jit_self_test_child: bool,
 }
 
 pub fn runner_main<I, S>(args: I) -> i32
@@ -347,7 +362,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             canonical_output,
             steam_artifact_json: None,
             steam_artifact_log: None,
-            run_id: job.test_id.clone(),
+            run_id: run_id.clone(),
             termination: "GuestExit".to_string(),
             termination_detail: None,
             milestones: crate::steam_milestones::SteamMilestones::default(),
@@ -406,7 +421,10 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         let pe_output = match if job.intent == RunIntent::Play && !job.dtm {
             execute_live_pe_job(job, &ge, &effective_child_environment)
         } else {
-            pe_runtime::execute(
+            // The non-live path must honor the job's jit_mode/steam_ipc too:
+            // a job with JitMode::Enabled constructs the JIT runtime and
+            // reports the requested/active distinction in jit telemetry.
+            pe_runtime::execute_with_options(
                 &job.program,
                 &job.args,
                 &ge,
@@ -414,6 +432,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 &effective_child_environment,
                 job.dtm,
                 &job.test_id,
+                pe_runtime::PeExecutionOptions {
+                    live_session: None,
+                    jit_mode: Some(job.jit_mode),
+                    steam_ipc: job.steam_ipc,
+                },
             )
         } {
             Ok(pe_output) => pe_output,
@@ -516,11 +539,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             steam_artifact_log: steam_artifact_paths
                 .as_ref()
                 .map(|paths| paths.log_path.clone()),
-            run_id: job.test_id.clone(),
+            run_id: run_id.clone(),
             termination: "GuestExit".to_string(),
             termination_detail: None,
-            milestones: crate::steam_milestones::SteamMilestones::default(),
-            jit: pe_runtime::JitTelemetry::default(),
+            milestones: pe_output.milestones.clone(),
+            jit: pe_output.jit_telemetry.clone(),
         });
     }
 
@@ -646,7 +669,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         canonical_output,
         steam_artifact_json: None,
         steam_artifact_log: None,
-        run_id: job.test_id.clone(),
+        run_id: run_id.clone(),
         termination: "GuestExit".to_string(),
         termination_detail: None,
         milestones: crate::steam_milestones::SteamMilestones::default(),
@@ -689,17 +712,30 @@ where
     S: Into<std::ffi::OsString> + Clone,
 {
     let cli = RunnerCli::parse_from(args);
-    let contents = fs::read_to_string(&cli.job).map_err(|error| {
+    if cli.jit_self_test {
+        return util::stable_json(&crate::jit::run_jit_self_test());
+    }
+    if cli.jit_self_test_child {
+        return util::stable_json(&crate::jit::run_jit_self_test_child()?);
+    }
+    let job_path = cli.job.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            "no --job provided (or --jit-self-test)",
+        )
+        .with_hint("usage: casa1-runner --job <job.json> | casa1-runner --jit-self-test")
+    })?;
+    let contents = fs::read_to_string(&job_path).map_err(|error| {
         AppError::from_io(
             ReasonCode::RcRunnerProtocolInvalid,
-            format!("failed to read {}", cli.job.display()),
+            format!("failed to read {}", job_path.display()),
             &error,
         )
     })?;
     let job = serde_json::from_str::<RunnerJob>(&contents).map_err(|error| {
         AppError::new(
             ReasonCode::RcRunnerProtocolInvalid,
-            format!("failed to parse {}", cli.job.display()),
+            format!("failed to parse {}", job_path.display()),
         )
         .with_hint(error.to_string())
     })?;
@@ -1354,7 +1390,10 @@ pub struct SteamBootstrapArtifact {
     pub instruction_count: Option<u64>,
     /// Guest exceptions observed during the run (S12 acceptance check).
     pub guest_exceptions: Vec<crate::canonical::GuestException>,
-    pub network_summary: Vec<String>,
+    /// Structured network exchange summaries (S4 acceptance evidence).  Each
+    /// entry aggregates the trace events for one endpoint; fields the trace
+    /// did not record stay empty/zero.
+    pub network_summary: Vec<crate::canonical::NetworkSummary>,
     /// Metal encoder lifecycle counters at artifact collection (S12
     /// balance check).
     pub metal_encoders_created: u64,
@@ -1373,14 +1412,169 @@ fn instruction_count_from_perf(pe_output: &pe_runtime::PeExecutionResult) -> Opt
         .map(|metric| metric.value as u64)
 }
 
-/// Compact network summary lines from the run's trace events.
-fn network_summary_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<String> {
-    pe_output
-        .trace_events
-        .iter()
-        .filter(|event| event.category == "network")
-        .map(|event| format!("{} -> {}", event.call_id, event.return_value))
-        .collect()
+/// Compact network exchange summaries aggregated from the run's trace events.
+///
+/// Every event in the `network`/`winhttp`/`wininet` categories contributes to
+/// a [`NetworkSummary`] entry keyed by the affected endpoint: connection
+/// events carry the destination host/port, request events carry the HTTP
+/// verb and (when the trace recorded it) the response status, and
+/// read/write events accumulate `bytes_in`/`bytes_out`.  Fields that the
+/// trace did not record stay empty/zero — the acceptance stage S4 then
+/// fails honestly on the missing evidence instead of passing on a
+/// connect-only trace.
+fn network_summary_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<NetworkSummary> {
+    #[derive(Default)]
+    struct Pending {
+        proto: String,
+        host: String,
+        port: u16,
+        method: String,
+        status: u16,
+        bytes_in: u64,
+        bytes_out: u64,
+        tls_version: String,
+        cipher: String,
+    }
+
+    // Request-handle -> pending exchange (WinHTTP/WinINet).
+    let mut requests: BTreeMap<String, Pending> = BTreeMap::new();
+    // Connection-handle -> (host, port, secure).
+    let mut connections: BTreeMap<String, (String, u16, bool)> = BTreeMap::new();
+    // Socket id -> pending exchange (Winsock).
+    let mut sockets: BTreeMap<String, Pending> = BTreeMap::new();
+
+    for event in pe_output.trace_events.iter().filter(|event| {
+        event.category == "network" || event.category == "winhttp" || event.category == "wininet"
+    }) {
+        let param_str = |key: &str| -> String {
+            event
+                .parameters
+                .get(key)
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+        let param_u64 = |key: &str| -> u64 {
+            event
+                .parameters
+                .get(key)
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        };
+        let param_bool = |key: &str| -> bool {
+            event
+                .parameters
+                .get(key)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
+        match event.call_id.as_str() {
+            // Connection establishment (WinHTTP/WinINet): host + port + TLS.
+            "WinHttpConnect" | "InternetConnectW" => {
+                let handle = format!("{:#x}", event.return_value.as_u64().unwrap_or(0));
+                let port = param_u64("port") as u16;
+                let secure = param_bool("secure") || port == 443;
+                connections.insert(handle, (param_str("server"), port, secure));
+            }
+            // Request creation: verb + connection -> host/port/proto.
+            "WinHttpOpenRequest" | "HttpOpenRequestW" => {
+                let handle = format!("{:#x}", event.return_value.as_u64().unwrap_or(0));
+                let connect = param_str("connect");
+                let (host, port, secure) = connections.get(&connect).cloned().unwrap_or_default();
+                let proto = if secure || port == 443 {
+                    "https".to_string()
+                } else if port != 0 {
+                    "http".to_string()
+                } else {
+                    String::new()
+                };
+                let mut pending = Pending {
+                    proto,
+                    host,
+                    port,
+                    method: param_str("verb"),
+                    ..Pending::default()
+                };
+                if let Some(status) = event.parameters.get("status").and_then(|v| v.as_u64()) {
+                    pending.status = status as u16;
+                }
+                requests.insert(handle, pending);
+            }
+            // Request sent: optional body length contributes bytes_out.
+            "WinHttpSendRequest" | "HttpSendRequestW" => {
+                if let Some(pending) = requests.get_mut(&param_str("request")) {
+                    pending.bytes_out = pending.bytes_out.saturating_add(param_u64("bytes_out"));
+                    if let Some(status) = event.parameters.get("status").and_then(|v| v.as_u64()) {
+                        pending.status = status as u16;
+                    }
+                }
+            }
+            // Response received: the trace carries the HTTP status when the
+            // host stack recorded one.
+            "WinHttpReceiveResponse" => {
+                if let Some(pending) = requests.get_mut(&param_str("request"))
+                    && let Some(status) = event.parameters.get("status").and_then(|v| v.as_u64())
+                {
+                    pending.status = status as u16;
+                }
+            }
+            // Body reads accumulate bytes_in.
+            "WinHttpReadData" | "InternetReadFile" => {
+                if let Some(pending) = requests.get_mut(&param_str("request")) {
+                    let read =
+                        param_u64("bytes_read").max(event.return_value.as_u64().unwrap_or(0));
+                    pending.bytes_in = pending.bytes_in.saturating_add(read);
+                }
+            }
+            // Winsock: raw socket endpoint.
+            "connect" => {
+                let handle = format!("{:#x}", param_u64("socket"));
+                let pending = sockets.entry(handle).or_default();
+                pending.host = param_str("host");
+                pending.port = param_u64("port") as u16;
+                if pending.proto.is_empty() {
+                    pending.proto = "tcp".to_string();
+                }
+                if pending.method.is_empty() {
+                    pending.method = "connect".to_string();
+                }
+            }
+            // Winsock data transfer.
+            "recv" | "WSARecv" | "WSARecvFrom" => {
+                let handle = format!("{:#x}", param_u64("socket"));
+                let pending = sockets.entry(handle).or_default();
+                pending.bytes_in = pending
+                    .bytes_in
+                    .saturating_add(event.return_value.as_u64().unwrap_or(0));
+            }
+            "send" | "WSASend" | "WSASendTo" => {
+                let handle = format!("{:#x}", param_u64("socket"));
+                let pending = sockets.entry(handle).or_default();
+                pending.bytes_out = pending
+                    .bytes_out
+                    .saturating_add(event.return_value.as_u64().unwrap_or(0));
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary: Vec<NetworkSummary> = Vec::new();
+    for pending in requests.into_values().chain(sockets.into_values()) {
+        if pending.host.is_empty() && pending.method.is_empty() {
+            continue;
+        }
+        summary.push(NetworkSummary {
+            proto: pending.proto,
+            host: pending.host,
+            port: pending.port,
+            method: pending.method,
+            status: pending.status,
+            bytes_in: pending.bytes_in,
+            bytes_out: pending.bytes_out,
+            tls_version: pending.tls_version,
+            cipher: pending.cipher,
+        });
+    }
+    summary
 }
 
 /// Human-readable milestone block for the log artifact.
@@ -1606,8 +1800,19 @@ pub fn write_steam_bootstrap_artifacts(
         ));
     }
     log_lines.push("network_summary:".to_string());
-    for line in &artifact.network_summary {
-        log_lines.push(format!("  {line}"));
+    for entry in &artifact.network_summary {
+        log_lines.push(format!(
+            "  {} {}://{}:{} -> status={} in={} out={} tls={} cipher={}",
+            entry.method,
+            entry.proto,
+            entry.host,
+            entry.port,
+            entry.status,
+            entry.bytes_in,
+            entry.bytes_out,
+            entry.tls_version,
+            entry.cipher,
+        ));
     }
     util::write_string(&log_path, &format!("{}\n", log_lines.join("\n")))?;
     Ok(SteamArtifactPaths {

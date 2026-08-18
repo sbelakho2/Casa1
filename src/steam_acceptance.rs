@@ -17,8 +17,13 @@
 //! - `S1`  — `bootstrap_started` evidence present.
 //! - `S2`  — `manifest_opened` AND `manifest_full_read` (manifest fully read).
 //! - `S3`  — `package_writability_probe` evidence present.
-//! - `S4`  — at least one network exchange recorded in `network_summary`;
-//!   an empty summary records `NetworkUnproven`.
+//! - `S4`  — a COMPLETE successful exchange chain: at least one
+//!   [`NetworkSummary`](crate::canonical::NetworkSummary) entry with a
+//!   successful HTTP status (`200 <= status < 400`), a non-empty response
+//!   (`bytes_in > 0`), and TLS/HTTPS evidence (`tls_version` non-empty OR
+//!   `proto == "https"`).  A connect-only trace, an empty summary, or any
+//!   exchange missing the success evidence records `NetworkUnproven` with
+//!   the destination host in the failure detail.
 //! - `S5`  — `client_main_started` evidence present.
 //! - `S6`  — `webhelper_processes_started >= 1`.  The artifact's single counter
 //!   records `CreateProcess` requests naming `steamwebhelper`, which covers
@@ -28,9 +33,10 @@
 //! - `S8`  — `cef_first_paint` evidence.
 //! - `S9`  — at least one non-placeholder graphics frame
 //!   (`gdi_frames + cef_software_frames + cef_accelerated_frames >= 1`)
-//!   AND at least one real present (`dxgi_presents >= 1` OR
-//!   `metal_presented_frames >= 1`); placeholder-only rendering records
-//!   `PlaceholderFrame`.
+//!   AND at least one REAL Metal-presented frame (`metal_presented_frames
+//!   >= 1`).  A DXGI `Present` alone is an intermediate guest API event —
+//!   it is NOT evidence that a frame reached the macOS display pipeline;
+//!   placeholder-only rendering records `PlaceholderFrame`.
 //! - `S10` — input consumption evidence (`milestones.input_events_consumed`
 //!   observed); `None` means the stage is not yet verifiable.
 //! - `S11` — audio initialization evidence (`milestones.audio_initialized`
@@ -181,8 +187,10 @@ pub enum SteamAcceptanceFailure {
     /// The harness deadline terminated the run although the policy does not
     /// permit deadline termination.
     HarnessDeadlineBeforeAllMandatory,
-    /// No network exchange was recorded (S4 unproven).
-    NetworkUnproven,
+    /// No COMPLETE successful network exchange was recorded (S4 unproven).
+    /// The detail names the destination host of the best-observed exchange
+    /// (or notes that no exchange was observed at all).
+    NetworkUnproven { detail: String },
 }
 
 /// The outcome of an acceptance evaluation.
@@ -254,12 +262,42 @@ pub fn evaluate(
         &mut missing,
     );
 
-    // S4 — at least one recorded network exchange.
-    if artifact.network_summary.is_empty() {
-        missing.push(Stage::S4);
-        failures.push(SteamAcceptanceFailure::NetworkUnproven);
-    } else {
-        completed.push(Stage::S4);
+    // S4 — at least one COMPLETE successful exchange chain: an HTTP(S)
+    // response with a 2xx/3xx status, response bytes, and TLS/HTTPS
+    // evidence.  A connect-only trace must NOT pass: the status, bytes and
+    // TLS evidence all have to be present in the recorded summary.
+    let successful_exchange = artifact.network_summary.iter().find(|entry| {
+        (200..400).contains(&entry.status)
+            && entry.bytes_in > 0
+            && (!entry.tls_version.is_empty() || entry.proto == "https")
+    });
+    match successful_exchange {
+        Some(_) => completed.push(Stage::S4),
+        None => {
+            missing.push(Stage::S4);
+            let detail = if artifact.network_summary.is_empty() {
+                "no network exchange was recorded".to_string()
+            } else {
+                let best = artifact
+                    .network_summary
+                    .iter()
+                    .max_by_key(|entry| entry.bytes_in)
+                    .expect("non-empty summary");
+                format!(
+                    "no complete TLS/HTTPS exchange with a 2xx/3xx status and response bytes \
+                     was recorded; best observed: {}://{}:{} method={} status={} bytes_in={} \
+                     tls={}",
+                    best.proto,
+                    best.host,
+                    best.port,
+                    best.method,
+                    best.status,
+                    best.bytes_in,
+                    best.tls_version,
+                )
+            };
+            failures.push(SteamAcceptanceFailure::NetworkUnproven { detail });
+        }
     }
 
     // S5 — client main thread created.
@@ -294,12 +332,14 @@ pub fn evaluate(
         &mut missing,
     );
 
-    // S9 — first non-placeholder frame + a real present.
+    // S9 — first non-placeholder frame + a REAL Metal-presented frame.  A
+    // DXGI Present alone is an intermediate guest API event and never
+    // proves a frame reached the macOS display pipeline.
     let non_placeholder_frames = graphics
         .gdi_frames
         .saturating_add(graphics.cef_software_frames)
         .saturating_add(graphics.cef_accelerated_frames);
-    let real_present = graphics.dxgi_presents >= 1 || graphics.metal_presented_frames >= 1;
+    let real_present = graphics.metal_presented_frames >= 1;
     if non_placeholder_frames >= 1 && real_present {
         completed.push(Stage::S9);
     } else {
@@ -392,7 +432,7 @@ mod tests {
     fn artifact_with(
         milestones: SteamMilestones,
         termination: ExecutionTermination,
-        network_summary: Vec<String>,
+        network_summary: Vec<crate::canonical::NetworkSummary>,
     ) -> SteamBootstrapArtifact {
         SteamBootstrapArtifact {
             run_id: "test-run".to_string(),
@@ -431,7 +471,7 @@ mod tests {
         milestones.steam.cef_browser_created = Some(MilestoneEvidence::default());
         milestones.steam.cef_first_paint = Some(MilestoneEvidence::default());
         milestones.graphics.gdi_frames = 3;
-        milestones.graphics.dxgi_presents = 2;
+        milestones.graphics.metal_presented_frames = 2;
         milestones
     }
 
@@ -452,12 +492,42 @@ mod tests {
         milestones
     }
 
+    /// A successful HTTPS exchange chain (S4 evidence).
+    fn https_success() -> Vec<crate::canonical::NetworkSummary> {
+        vec![crate::canonical::NetworkSummary {
+            proto: "https".to_string(),
+            host: "store.steampowered.com".to_string(),
+            port: 443,
+            method: "GET".to_string(),
+            status: 200,
+            bytes_in: 4096,
+            bytes_out: 512,
+            tls_version: String::new(),
+            cipher: String::new(),
+        }]
+    }
+
+    /// A connect-only trace: endpoint recorded, no status/bytes/TLS evidence.
+    fn connect_only() -> Vec<crate::canonical::NetworkSummary> {
+        vec![crate::canonical::NetworkSummary {
+            proto: "tcp".to_string(),
+            host: "store.steampowered.com".to_string(),
+            port: 443,
+            method: "connect".to_string(),
+            status: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            tls_version: String::new(),
+            cipher: String::new(),
+        }]
+    }
+
     #[test]
     fn full_pass_with_guest_exit() {
         let artifact = artifact_with(
             full_ladder_milestones(),
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["InternetOpenW -> 1".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(result.passed, "{result:#?}");
@@ -471,7 +541,7 @@ mod tests {
         let artifact = artifact_with(
             full_ladder_milestones(),
             ExecutionTermination::HarnessDeadline,
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(result.passed, "{result:#?}");
@@ -485,7 +555,7 @@ mod tests {
         let artifact = artifact_with(
             near_full_milestones(),
             ExecutionTermination::HarnessDeadline,
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(!result.passed);
@@ -498,7 +568,7 @@ mod tests {
         let artifact = artifact_with(
             near_full_milestones(),
             ExecutionTermination::HarnessDeadline,
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let policy = SteamAcceptancePolicy {
             allow_harness_deadline_after_all_mandatory: false,
@@ -523,11 +593,57 @@ mod tests {
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(!result.passed);
         assert!(result.missing.contains(&Stage::S4));
-        assert!(
-            result
-                .failures
-                .contains(&SteamAcceptanceFailure::NetworkUnproven)
+        assert!(result.failures.iter().any(|failure| matches!(
+            failure,
+            SteamAcceptanceFailure::NetworkUnproven { detail } if !detail.is_empty()
+        )));
+    }
+
+    #[test]
+    fn connect_only_trace_never_passes_s4() {
+        // A connect-only trace (endpoint known, no status/bytes/TLS evidence)
+        // must FAIL S4 honestly — never pass on the mere presence of an
+        // entry.
+        let artifact = artifact_with(
+            full_ladder_milestones(),
+            ExecutionTermination::GuestExit { code: 0 },
+            connect_only(),
         );
+        let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
+        assert!(!result.passed);
+        assert!(result.missing.contains(&Stage::S4));
+        assert!(
+            result.failures.iter().any(|failure| matches!(
+                failure,
+                SteamAcceptanceFailure::NetworkUnproven { detail } if detail.contains("store.steampowered.com")
+            )),
+            "the failure detail must record the destination host: {:#?}",
+            result.failures,
+        );
+    }
+
+    #[test]
+    fn http_success_without_tls_evidence_fails_s4() {
+        // Plain-HTTP success (2xx + bytes) without any TLS/HTTPS evidence
+        // must NOT satisfy the TLS/HTTPS requirement.
+        let artifact = artifact_with(
+            full_ladder_milestones(),
+            ExecutionTermination::GuestExit { code: 0 },
+            vec![crate::canonical::NetworkSummary {
+                proto: "http".to_string(),
+                host: "example.com".to_string(),
+                port: 80,
+                method: "GET".to_string(),
+                status: 200,
+                bytes_in: 128,
+                bytes_out: 64,
+                tls_version: String::new(),
+                cipher: String::new(),
+            }],
+        );
+        let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
+        assert!(!result.passed);
+        assert!(result.missing.contains(&Stage::S4));
     }
 
     #[test]
@@ -540,7 +656,7 @@ mod tests {
         let artifact = artifact_with(
             milestones,
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(!result.passed);
@@ -559,7 +675,7 @@ mod tests {
         let mut artifact = artifact_with(
             milestones,
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         artifact
             .guest_exceptions
@@ -596,7 +712,7 @@ mod tests {
         let mut artifact = artifact_with(
             near_full_milestones(),
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         artifact.provenance.execution_mode = "model".to_string();
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
@@ -624,7 +740,7 @@ mod tests {
         let artifact = artifact_with(
             milestones,
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         assert!(!result.passed);
@@ -645,7 +761,7 @@ mod tests {
         let artifact = artifact_with(
             full_ladder_milestones(),
             ExecutionTermination::GuestExit { code: 0 },
-            vec!["connect -> 0".to_string()],
+            https_success(),
         );
         let result = evaluate(&artifact, &SteamAcceptancePolicy::default());
         let json = serde_json::to_string(&result).expect("serialize result");

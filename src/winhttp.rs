@@ -1547,6 +1547,17 @@ impl WinHttpStack {
             .min(u32::MAX as usize) as u32)
     }
 
+    /// The HTTP status code of a completed request, or 0 when the request is
+    /// unknown or no response has been received yet.  Recorded into the
+    /// trace by the PE runtime so the steam-bootstrap artifact's network
+    /// summary carries the real response status (S4 evidence).
+    pub fn request_status_code(&self, request_handle: HINTERNET) -> u32 {
+        self.requests
+            .get(&request_handle)
+            .map(|req| req.status_code)
+            .unwrap_or(0)
+    }
+
     // -----------------------------------------------------------------------
     // WinHttpQueryHeaders — query response headers
     // -----------------------------------------------------------------------

@@ -4248,19 +4248,132 @@ impl CpuExecutionEngine {
     /// 4. **Targeted write-back** — only pages in the `synced_pages` set
     ///    are written back from flat memory → MemoryImage after each block.
     ///
-    /// Execute a block of IR instructions.  This is the AOT-compiled
-    /// execution engine: the match dispatch is native code compiled by
-    /// rustc at build time.  There is no JIT (macOS 26 blocks dynamic
-    /// code execution for ad-hoc-signed binaries) and no interpreter
-    /// (the match IS the compiled code path).
+    /// Execute a block of IR instructions, preferring a JIT-compiled native
+    /// block when the runtime has one for `state.rip`; otherwise this is the
+    /// AOT-compiled execution engine (the match dispatch is native code
+    /// compiled by rustc at build time, with no interpreter).
+    ///
+    /// The compiled block runs its straight-line prefix natively and exits
+    /// with a control-flow code for its terminator (Jump / JumpIf / Call /
+    /// Ret / safepoint).  This dispatcher applies the terminator semantics
+    /// that the AOT path would have applied inside the IR:
+    ///
+    /// - `Normal` — straight-line block; the caller advances `rip` past the
+    ///   block as usual.
+    /// - `Safepoint` — the block's prologue polled the host safepoint flag
+    ///   and returned WITHOUT running the body; the flag is cleared and the
+    ///   whole block is executed through the AOT path (no instructions are
+    ///   skipped).
+    /// - `Jump` / `ConditionalBranch` — `rip` is set to the target (the
+    ///   condition was already evaluated from the live flags).
+    /// - `Return` / `ThunkDispatch` / `IndirectCall` — the terminator
+    ///   instruction itself is executed through the AOT single-instruction
+    ///   path (it reads the guest stack / pushes the return address), so
+    ///   `rip` and the stack end up exactly as in AOT execution.
+    ///
+    /// Any error during native execution falls back to AOT for the whole
+    /// block.  Only blocks admitted by the JIT-safe gate
+    /// ([`crate::jit::JitCompiler::can_compile_block`]) are ever compiled,
+    /// so mid-block exits (unimplemented/cpuid) cannot occur.
     pub fn execute_with_jit(
         &self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
         ir: &[IrInstruction],
-        _jit_runtime: Option<&mut crate::jit::JitRuntime>,
+        jit_runtime: Option<&mut crate::jit::JitRuntime>,
     ) -> AppResult<ExecutionSummary> {
-        // Direct AOT execution — no JIT path.
+        if let Some(jit) = jit_runtime {
+            let guest_address = state.rip;
+            if jit.is_compiled(guest_address)
+                && let Some(block) = jit.block_cache.get(&guest_address).cloned()
+            {
+                // Keep the flat-memory mirror coherent (the AOT path mutates
+                // MemoryImage between JIT executions) and install the SIGBUS
+                // page-sync handler so native loads/stores to unsynced pages
+                // are serviced on demand.
+                jit.sync_all_pages_to_flat(memory);
+                jit.ensure_sigbus_handler(memory);
+
+                // SAFETY: block.entry points into this runtime's MAP_JIT code
+                // pages (finalized executable); state/memory are the live
+                // guest objects for the duration of the call.
+                let reason = unsafe { jit.execute_block(&block, state, memory) };
+
+                // Dispatcher: apply the terminator semantics the compiled
+                // block deferred to the host.  The JIT-safe gate guarantees
+                // only these exits; an unexpected one is a hard error (the
+                // prefix already ran — silently re-running the block AOT
+                // would double-execute guest side effects).
+                match reason {
+                    crate::jit::JitExitReason::Normal { .. } => {}
+                    crate::jit::JitExitReason::Safepoint => {
+                        // The block's prologue polled the host safepoint flag
+                        // and returned WITHOUT running the body.  Clear the
+                        // request and execute the whole block through the AOT
+                        // path (the safepoint body runs between dispatches in
+                        // the caller), so no guest instructions are skipped.
+                        crate::jit::JIT_SAFEPOINT_REQUESTED
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        return execute_ir_with_hashing(
+                            state,
+                            memory,
+                            ir,
+                            Some(&self.config.virtualization),
+                            false,
+                        );
+                    }
+                    crate::jit::JitExitReason::Jump { target } => {
+                        state.rip = target;
+                    }
+                    crate::jit::JitExitReason::ConditionalBranch { taken, .. } => match ir.last() {
+                        Some(IrInstruction::JumpIf {
+                            target,
+                            fallthrough,
+                            ..
+                        }) => {
+                            state.rip = if taken { *target } else { *fallthrough };
+                        }
+                        _ => {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                "JIT conditional exit without a JumpIf terminator",
+                            ));
+                        }
+                    },
+                    crate::jit::JitExitReason::Return { .. }
+                    | crate::jit::JitExitReason::ThunkDispatch { .. }
+                    | crate::jit::JitExitReason::IndirectCall { .. } => match ir.last() {
+                        Some(terminator) => {
+                            execute_ir_with_hashing(
+                                state,
+                                memory,
+                                std::slice::from_ref(terminator),
+                                Some(&self.config.virtualization),
+                                false,
+                            )?;
+                        }
+                        None => {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                "JIT control-flow exit without a terminator instruction",
+                            ));
+                        }
+                    },
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("JIT block exited with an unhandled reason: {other:?}"),
+                        ));
+                    }
+                }
+                return Ok(ExecutionSummary {
+                    flags: state.flags,
+                    memory_hash: String::new(),
+                    ordering_log: Vec::new(),
+                });
+            }
+        }
+        // Direct AOT execution (no JIT path / block not compiled / fallback).
         execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), false)
     }
 

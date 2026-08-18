@@ -7,6 +7,7 @@
 use crate::cpu::{ConditionCode, CpuState, GuestArch, IrInstruction, MemoryImage, Register};
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
@@ -627,7 +628,27 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
     if fault_addr >= flat_base && fault_addr < flat_end {
         SIGBUS_IN_FLAT_RANGE.fetch_add(1, Ordering::Relaxed);
     } else {
+        // ── Fail-fast on OUT-OF-RANGE faults ─────────────────────────────
+        // A fault outside the flat guest memory region is NOT a guest page
+        // sync: it is either a MAP_JIT EXECUTION fault (macOS 26 blocks
+        // MAP_JIT execution for ad-hoc-signed binaries — the faulting
+        // instruction is the branch into the compiled code page) or a wild
+        // pointer inside compiled code.  Neither is recoverable by syncing
+        // guest pages: returning would retry the faulting instruction
+        // forever (an infinite SIGBUS spin).  Restore the default SIGBUS
+        // disposition and re-raise so the process dies with the honest
+        // signal — the caller (JIT self-test parent, runner) reports the
+        // failure instead of hanging.
         SIGBUS_OUT_FLAT_RANGE.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
+            libc::raise(libc::SIGBUS);
+        }
+        // Unreachable when the raise terminated the process; keep a final
+        // guard so the handler never returns into the faulting instruction.
+        std::process::abort();
     }
 
     // ── Batch sync: sync the faulting page + surrounding pages ────────
@@ -1663,6 +1684,7 @@ impl Drop for FlatGuestMemory {
 // ---------------------------------------------------------------------------
 
 /// Result of JIT-compiling a block of IR instructions.
+#[derive(Clone)]
 pub struct JitCompiledBlock {
     /// Pointer to the compiled ARM64 code entry point.
     pub entry: *const u8,
@@ -1848,13 +1870,27 @@ impl JitCompiler {
     }
 
     /// Returns true if a single IR instruction has a JIT emission arm.
-    fn can_compile_instruction(_insn: &IrInstruction) -> bool {
-        // ALL instructions can be JIT-compiled.  Instructions with dedicated
-        // native emission arms run natively; all others use the universal
-        // single-instruction executor helper (jit_helper_execute_insn), which
-        // performs the operation directly on CpuState/MemoryImage.  There is
-        // no interpreter and no block-level fallback.
-        true
+    ///
+    /// This is the JIT-SAFE gate: instructions whose emission exits the block
+    /// MID-WAY (before the block's remaining instructions have run) must NOT
+    /// be compiled, because the dispatcher would have to re-run the rest of
+    /// the block and double-execute the already-run prefix.  Excluded:
+    /// virtualization-dependent instructions (Cpuid/Xgetbv), RIP-relative
+    /// memory access (the effective address is unavailable at IR level), and
+    /// FXSAVE/FXRSTOR (x87/SSE state serialization stays in the
+    /// interpreter).  Everything else either has a dedicated native arm or
+    /// runs through the universal single-instruction helper, which is safe.
+    fn can_compile_instruction(insn: &IrInstruction) -> bool {
+        match insn {
+            IrInstruction::Cpuid | IrInstruction::Xgetbv => false,
+            IrInstruction::Fxsave { .. } | IrInstruction::Fxrstor { .. } => false,
+            IrInstruction::LoadMemory { address, .. }
+            | IrInstruction::LoadMemory8 { address, .. }
+            | IrInstruction::StoreMemory { address, .. }
+            | IrInstruction::StoreMemory8 { address, .. }
+            | IrInstruction::StoreImmediate { address, .. } => !address.rip_relative,
+            _ => true,
+        }
     }
 
     pub fn compile_block(
@@ -6072,6 +6108,293 @@ impl JitUnwindTable {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// JIT self-test (--jit-self-test)
+// ---------------------------------------------------------------------------
+
+/// Machine-readable report of the `--jit-self-test` run.
+///
+/// `active` is true only when MAP_JIT code was actually ALLOCATED, compiled,
+/// executed and re-patched in a child process — a self-test that cannot
+/// execute (e.g. macOS 26 blocks MAP_JIT execution for ad-hoc-signed
+/// binaries) reports `active: false` with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JitSelfTestReport {
+    /// True when the full self-test (compile → execute → safepoint →
+    /// re-patch → re-execute) completed in a real process.
+    pub active: bool,
+    /// Number of blocks compiled during the self-test.
+    pub compiled_blocks: u64,
+    /// Number of block executions during the self-test.
+    pub executed_blocks: u64,
+    /// True when the host safepoint flag was observed to produce
+    /// EXIT_SAFEPOINT from compiled code.
+    pub safepoint_observed: bool,
+    /// Why the self-test is not active, when it is not.
+    pub fallback_reason: Option<String>,
+}
+
+/// The guest value the self-test block writes into RAX before any patching.
+const JIT_SELF_TEST_ORIGINAL_VALUE: u64 = 42;
+/// The value written by the RE-PATCHED instruction (the patch must be
+/// observable: executing the changed code must yield this value).
+const JIT_SELF_TEST_PATCHED_VALUE: u64 = 43;
+
+/// ARM64 `movz x4, #imm16` encodings for the two self-test immediates (RAX is
+/// guest GPR 0, mapped to ARM64 x4).  `movz x4, #imm` = `0xd2800000 |
+/// (imm << 5) | 4`.
+fn movz_x4(imm: u16) -> u32 {
+    0xd2800000u32 | ((imm as u32) << 5) | 4
+}
+
+/// Run the FULL self-test inside this process.  Verifies:
+///
+/// 1. MAP_JIT memory is allocated and flipped W→X
+///    ([`JitCompiler::compile_block`] + [`JitMemoryManager::finalize_code`]);
+/// 2. a tiny translated block executes and produces the guest result;
+/// 3. the host safepoint flag produces `EXIT_SAFEPOINT` from compiled code;
+/// 4. the code page is re-patched (W) and the changed code executes (X),
+///    yielding the patched value.
+///
+/// Any verification failure returns an error.  On platforms where MAP_JIT
+/// execution is blocked (macOS 26, ad-hoc-signed binaries) this process
+/// faults inside step 2 — the caller runs it in a child process and turns a
+/// fault into `active: false`.
+pub fn run_jit_self_test_child() -> AppResult<JitSelfTestReport> {
+    let mut runtime = JitRuntime::new(GuestArch::X64);
+    let mut state = CpuState::new(GuestArch::X64);
+    let mut memory = MemoryImage::default();
+
+    // A tiny translated block: `mov rax, 42` at guest 0x1000.  The block has
+    // no control flow, so it exits EXIT_NORMAL and the compiled prefix is
+    // exactly what we verify.
+    let guest_address = 0x1000u64;
+    let ir = vec![IrInstruction::MovImm {
+        dst: Register::Rax,
+        value: JIT_SELF_TEST_ORIGINAL_VALUE,
+    }];
+    state.rip = guest_address;
+
+    // Copy the compiled block's identity out immediately: the reference into
+    // `runtime` must not outlive the mutable borrows below.
+    let (block_entry, block_code_size, compiled) = {
+        let block = runtime
+            .get_or_compile(&ir, guest_address, GuestArch::X64, None)
+            .map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcJitCompilationError,
+                    format!("JIT self-test: compile_block failed: {}", error.message),
+                )
+            })?;
+        (block.entry, block.code_size, runtime.blocks_compiled)
+    };
+    let code_words: Vec<u32> = unsafe {
+        std::slice::from_raw_parts(block_entry as *const u32, block_code_size / 4).to_vec()
+    };
+    let original_insn = movz_x4(JIT_SELF_TEST_ORIGINAL_VALUE as u16);
+    let patched_insn = movz_x4(JIT_SELF_TEST_PATCHED_VALUE as u16);
+    let patch_offset = code_words
+        .iter()
+        .position(|word| *word == original_insn)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcJitCompilationError,
+                "JIT self-test: compiled block does not contain the movz x4 immediate \
+                 (block layout changed?)",
+            )
+        })?;
+
+    // Sync guest memory and install the SIGBUS page-sync handler, exactly as
+    // the live runtime does before native execution.
+    runtime.sync_all_pages_to_flat(&memory);
+    runtime.ensure_sigbus_handler(&memory);
+
+    let mut execute = |runtime: &mut JitRuntime, state: &mut CpuState| -> JitExitReason {
+        let block = runtime
+            .block_cache
+            .get(&guest_address)
+            .cloned()
+            .expect("self-test block remains compiled");
+        // SAFETY: single-threaded self-test; block points into this runtime's
+        // MAP_JIT pages; state/memory are live for the duration of the call.
+        // The read lock prevents a concurrent chain-break from racing the
+        // W/X flip.
+        let _guard = JIT_EXEC_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe { runtime.execute_block(&block, state, &mut memory) }
+    };
+
+    // 1. Execute the original code: guest result must be visible.
+    let reason = execute(&mut runtime, &mut state);
+    if reason != (JitExitReason::Normal { new_rip: state.rip }) {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!("JIT self-test: first execution exited with {reason:?}, expected Normal"),
+        ));
+    }
+    if state.get(Register::Rax) != JIT_SELF_TEST_ORIGINAL_VALUE {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!(
+                "JIT self-test: guest result mismatch: rax={} expected {}",
+                state.get(Register::Rax),
+                JIT_SELF_TEST_ORIGINAL_VALUE
+            ),
+        ));
+    }
+
+    // 2. Safepoint: set the host flag; the compiled prologue must exit with
+    // EXIT_SAFEPOINT without running the body.
+    state.set(Register::Rax, 0);
+    JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Relaxed);
+    let reason = execute(&mut runtime, &mut state);
+    JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
+    if reason != JitExitReason::Safepoint {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!(
+                "JIT self-test: safepoint flag did not produce EXIT_SAFEPOINT (got {reason:?})"
+            ),
+        ));
+    }
+    let safepoint_observed = true;
+
+    // 3. Re-patch the code page (W) and execute the changed code (X): the
+    // patched immediate must be visible to execution.
+    // SAFETY: single-threaded; no code is executing while the page is
+    // writable (we are between execute_block calls).
+    unsafe {
+        runtime
+            .compiler
+            .memory_manager
+            .make_writable(block_entry as *mut u8, block_code_size);
+        let words = std::slice::from_raw_parts_mut(block_entry as *mut u32, block_code_size / 4);
+        words[patch_offset] = patched_insn;
+        runtime
+            .compiler
+            .memory_manager
+            .finalize_code(block_entry as *mut u8, block_code_size);
+    }
+    state.set(Register::Rax, 0);
+    let reason = execute(&mut runtime, &mut state);
+    if reason != (JitExitReason::Normal { new_rip: state.rip }) {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!("JIT self-test: re-patched execution exited with {reason:?}"),
+        ));
+    }
+    if state.get(Register::Rax) != JIT_SELF_TEST_PATCHED_VALUE {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            format!(
+                "JIT self-test: re-patched execution did not observe the patch: rax={} expected {}",
+                state.get(Register::Rax),
+                JIT_SELF_TEST_PATCHED_VALUE
+            ),
+        ));
+    }
+
+    Ok(JitSelfTestReport {
+        active: true,
+        compiled_blocks: compiled,
+        executed_blocks: runtime.blocks_executed,
+        safepoint_observed,
+        fallback_reason: None,
+    })
+}
+
+/// Run the self-test with crash isolation: the actual test executes in a
+/// CHILD process so that a MAP_JIT execution fault (macOS 26 blocks
+/// MAP_JIT execution for ad-hoc-signed binaries) is observed as a child
+/// failure instead of killing the caller.  `active` is true only when the
+/// child ran the full test and reported success.
+pub fn run_jit_self_test() -> JitSelfTestReport {
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return JitSelfTestReport {
+                active: false,
+                compiled_blocks: 0,
+                executed_blocks: 0,
+                safepoint_observed: false,
+                fallback_reason: Some(format!(
+                    "cannot resolve current executable for the self-test child: {error}"
+                )),
+            };
+        }
+    };
+    let output = match std::process::Command::new(&current_exe)
+        .arg("--jit-self-test-child")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return JitSelfTestReport {
+                active: false,
+                compiled_blocks: 0,
+                executed_blocks: 0,
+                safepoint_observed: false,
+                fallback_reason: Some(format!("failed to spawn self-test child: {error}")),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() {
+        match serde_json::from_str::<JitSelfTestReport>(stdout.trim()) {
+            Ok(mut report) => {
+                // The child only reports active=true on full success; keep
+                // its counters but never let a child claim activity it did
+                // not prove.
+                report.active &= report.safepoint_observed;
+                report
+            }
+            Err(error) => JitSelfTestReport {
+                active: false,
+                compiled_blocks: 0,
+                executed_blocks: 0,
+                safepoint_observed: false,
+                fallback_reason: Some(format!(
+                    "self-test child exited 0 without a valid JitSelfTestReport JSON: {error}"
+                )),
+            },
+        }
+    } else {
+        let signal_note = status_signal_description(&output.status);
+        JitSelfTestReport {
+            active: false,
+            compiled_blocks: 0,
+            executed_blocks: 0,
+            safepoint_observed: false,
+            fallback_reason: Some(format!(
+                "JIT self-test child did not complete: exit={:?}{}; stdout={} stderr={}",
+                output.status.code(),
+                signal_note,
+                stdout.trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn status_signal_description(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(signal) => format!(
+            " signal={signal} (fault while executing MAP_JIT code — \
+            macOS 26 blocks MAP_JIT execution for ad-hoc-signed binaries; the binary must be \
+            signed with the com.apple.security.cs.allow-jit entitlement)"
+        ),
+        None => String::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn status_signal_description(_status: &std::process::ExitStatus) -> String {
+    String::new()
 }
 
 #[cfg(test)]

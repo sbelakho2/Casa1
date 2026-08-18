@@ -4,12 +4,18 @@
 #
 # Copies the tracked `ges/steam-live-run-x86` fixture into a fresh temp
 # work dir, validates the initial Steam executable sha256 against a
-# recorded value, runs the real Steam updater (which requires network; when
-# no headless updater is available the existing client is validated and the
-# update step is reported as skipped), collects/verifies the required
-# components (Steam.exe, steamwebhelper.exe, CEF payload if present),
+# recorded value, runs the real Steam updater (network required; headless
+# execution needs the casa1 PE runner or wine), collects/verifies the
+# required components (Steam.exe, steamwebhelper.exe, CEF payload),
 # strips user-specific data (registry HKCU, logs), writes
 # fixture-provenance.json, and prints the hydrated fixture path.
+#
+# FAIL-CLOSED: any updater failure exits non-zero; UPDATER_RUN=true is
+# recorded only when the updater exited 0; a missing steamwebhelper.exe or
+# missing CEF resources FAIL the script (no warnings-only); the final
+# "ready" message prints only when the updated Steam client is present,
+# steamwebhelper.exe is present, CEF resources are present, and
+# fixture-provenance.json was written.
 #
 # The tracked fixture is never mutated: every operation below runs on the
 # temp copy, and the work dir is removed on failure (kept on success so the
@@ -27,8 +33,9 @@
 # Requirements:
 #   - network access for the updater step
 #   - the casa1 PE runner (CASA1_RUNNER or target/release/casa1-runner) or
-#     wine to run the updater headless; without either, the existing client
-#     is validated instead.
+#     wine to run the updater headless.  Without either, the script fails
+#     closed: a hydration that cannot run the real updater cannot claim an
+#     updated client.
 
 set -euo pipefail
 
@@ -81,8 +88,9 @@ echo ":: initial Steam.exe sha256 verified: $ACTUAL_SHA256"
 # The bootstrapper Steam.exe contacts the Steam CDN and hydrates
 # drive_c/Steam/Steam.exe plus payloads.  Headless execution needs a
 # Windows runtime: the casa1 PE runner (CASA1_RUNNER or a release build) or
-# wine.  Without one, the update step cannot run headless: the existing
-# client is validated and the step is reported as skipped.
+# wine.  FAIL-CLOSED: without a runtime, or when the updater exits
+# non-zero, the hydration cannot claim an updated client — the script
+# exits non-zero and UPDATER_RUN is never recorded as true.
 UPDATER_RUN=false
 if [[ -z "$CASA1_RUNNER" && -x "$REPO_ROOT/target/release/casa1-runner" ]]; then
   CASA1_RUNNER="$REPO_ROOT/target/release/casa1-runner"
@@ -106,22 +114,35 @@ if [[ -n "$CASA1_RUNNER" ]]; then
   "test_id": "steam-e2e-updater"
 }
 EOF
-  CASA1_PE_RUNTIME_DEADLINE_SECS="$UPDATE_TIMEOUT_SECS" \
-    "$CASA1_RUNNER" --job "$JOB_FILE" \
-    || echo "!! updater run exited non-zero (network may be unavailable); continuing with client validation"
-  UPDATER_RUN=true
+  if CASA1_PE_RUNTIME_DEADLINE_SECS="$UPDATE_TIMEOUT_SECS" \
+    "$CASA1_RUNNER" --job "$JOB_FILE"; then
+    UPDATER_RUN=true
+    echo ":: updater exited 0"
+  else
+    echo "!! updater run exited non-zero — the Steam client was not updated" >&2
+    echo "   (network may be unavailable or the updater failed); hydration fails closed" >&2
+    exit 1
+  fi
 elif [[ -n "$WINE_BIN" ]]; then
   echo ":: running real updater via wine (bounded to ${UPDATE_TIMEOUT_SECS}s)"
   "$WINE_BIN" "$BOOTSTRAPPER" &
   UPDATER_PID=$!
   ( sleep "$UPDATE_TIMEOUT_SECS" && kill "$UPDATER_PID" 2>/dev/null ) &
   KILLER_PID=$!
-  wait "$UPDATER_PID" || true
+  if wait "$UPDATER_PID"; then
+    UPDATER_RUN=true
+    echo ":: wine updater exited 0"
+  else
+    kill "$KILLER_PID" 2>/dev/null || true
+    echo "!! wine updater failed or was killed by the timeout — hydration fails closed" >&2
+    exit 1
+  fi
   kill "$KILLER_PID" 2>/dev/null || true
-  UPDATER_RUN=true
 else
-  echo "!! no headless Windows runtime (CASA1_RUNNER/wine) available;"
-  echo "   the updater cannot run headless — validating the existing client instead"
+  echo "!! no headless Windows runtime (CASA1_RUNNER/wine) available — the real" >&2
+  echo "   updater cannot run headless.  Hydration fails closed: a fixture that was" >&2
+  echo "   not updated by the real Steam updater is not a valid E2E fixture." >&2
+  exit 1
 fi
 
 # ── Collect and verify required components ───────────────────────────────────
@@ -140,7 +161,8 @@ WEBHELPER="$(find "$CLIENT_DIR" -iname 'steamwebhelper.exe' -print -quit 2>/dev/
 if [[ -n "$WEBHELPER" ]]; then
   echo ":: steamwebhelper.exe present: $WEBHELPER"
 else
-  echo "!! steamwebhelper.exe not found under $CLIENT_DIR (expected after a live update)" >&2
+  echo "!! steamwebhelper.exe not found under $CLIENT_DIR (required after a live update)" >&2
+  exit 1
 fi
 
 CEF_PAYLOAD="$(find "$CLIENT_DIR" \( -iname 'libcef*.dll' -o -iname 'cef.pak' -o -iname 'icudtl.dat' \) -print -quit 2>/dev/null || true)"
@@ -148,6 +170,7 @@ if [[ -n "$CEF_PAYLOAD" ]]; then
   echo ":: CEF payload present: $CEF_PAYLOAD"
 else
   echo "!! CEF payload not found under $CLIENT_DIR (checked libcef*.dll, cef.pak, icudtl.dat)" >&2
+  exit 1
 fi
 
 # ── Strip user-specific data ─────────────────────────────────────────────────
@@ -172,5 +195,21 @@ cat > "$PROVENANCE" <<EOF
 EOF
 echo ":: wrote $PROVENANCE"
 
-echo ":: hydrated fixture ready (never mutates the tracked fixture)"
-echo "$HYDRATED"
+# ── Final readiness gate (fail-closed) ───────────────────────────────────────
+# The "ready" message prints ONLY when every required component is present
+# and the provenance was written.
+READY=1
+[[ -f "$CLIENT" ]] || READY=0
+[[ -n "$WEBHELPER" ]] || READY=0
+[[ -n "$CEF_PAYLOAD" ]] || READY=0
+[[ -f "$PROVENANCE" ]] || READY=0
+if [[ "$READY" -eq 1 ]]; then
+  echo ":: hydrated fixture ready (never mutates the tracked fixture)"
+  echo "$HYDRATED"
+else
+  echo "!! hydration incomplete: client=$([ -f "$CLIENT" ] && echo yes || echo no) \
+webhelper=$([ -n "$WEBHELPER" ] && echo yes || echo no) \
+cef=$([ -n "$CEF_PAYLOAD" ] && echo yes || echo no) \
+provenance=$([ -f "$PROVENANCE" ] && echo yes || echo no)" >&2
+  exit 1
+fi
