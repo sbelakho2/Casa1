@@ -20,11 +20,14 @@
 //! - `S4`  — at least one network exchange recorded in `network_summary`;
 //!   an empty summary records `NetworkUnproven`.
 //! - `S5`  — `client_main_started` evidence present.
-//! - `S6`  — `webhelper_processes_started >= 1`.  The artifact's single counter
-//!   records `CreateProcess` requests naming `steamwebhelper`, which covers
-//!   both the spawn-request and process-started sub-criteria (a request
-//!   that never started would not reach the guest-visible process layer).
-//! - `S7`  — `cef_browser_created` evidence.
+//! - `S6`  — `webhelper_processes_started >= 1`.  The counter aggregates the
+//!   parent's spawn requests AND actually-started evidence: the child runner
+//!   (a separate casa1-runner process) records `webhelper_process_started`
+//!   in its own artifact when the child PE dispatched at least one block,
+//!   and the parent's finalization merges sibling child artifacts of the
+//!   same run id into its milestone (best-effort post-run merge).
+//! - `S7`  — `cef_browser_created` evidence (independent producer: the CEF
+//!   browser-creation API, not the paint callback).
 //! - `S8`  — `cef_first_paint` evidence.
 //! - `S9`  — at least one non-placeholder graphics frame
 //!   (`gdi_frames + cef_software_frames + cef_accelerated_frames >= 1`)
@@ -270,9 +273,9 @@ pub fn evaluate(
         &mut missing,
     );
 
-    // S6 — steamwebhelper spawn request + process start.  The artifact's
-    // single counter records CreateProcess requests naming steamwebhelper,
-    // covering both sub-criteria.
+    // S6 — steamwebhelper process started.  The counter aggregates the
+    // parent's spawn requests and the actually-started evidence merged from
+    // the child runner's artifacts of the same run.
     record_stage(
         Stage::S6,
         steam.webhelper_processes_started >= 1,
@@ -397,6 +400,7 @@ mod tests {
         SteamBootstrapArtifact {
             run_id: "test-run".to_string(),
             test_id: "e2e-test".to_string(),
+            child_of_run_id: None,
             program_path: r"C:\Steam\Steam.exe".to_string(),
             program_sha256: "ab".repeat(32),
             provenance: RunProvenance {

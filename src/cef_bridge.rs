@@ -2754,6 +2754,18 @@ impl CefBridge {
         self.frames.insert((browser_handle, 1), frame);
         self.browser_wk_handles_cache = None;
 
+        // Steam run instrumentation (no behavior change): a CEF browser was
+        // ACTUALLY created — the independent producer of the
+        // cef_browser_created milestone (first-wins).  The paint callback
+        // only proves a paint and never sets this milestone.
+        crate::steam_milestones::note_cef_browser_created(
+            crate::steam_milestones::MilestoneEvidence::context_free(
+                "cef_browser_host_create_browser",
+                Some(url),
+                "CEF browser created",
+            ),
+        );
+
         // Allocate an initial offscreen surface for the browser
         let pixels = vec![0xFF; frame_buffer_len(frame_w, frame_h)]; // white background
         let frame_number = self.next_frame_number();

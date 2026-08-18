@@ -695,6 +695,18 @@ impl RealAudioBackend {
             )
         })?;
 
+        // Steam run instrumentation (no behavior change): the FIRST
+        // successful real audio device initialization — a cpal output stream
+        // was built AND started on a real device.  Never recorded for stubs
+        // or failed opens (both error out above).
+        crate::steam_milestones::note_audio_initialized(
+            crate::steam_milestones::MilestoneEvidence::context_free(
+                "RealAudioBackend::ensure_stream (cpal)",
+                Some(&device.name),
+                "real audio output stream opened on a host device",
+            ),
+        );
+
         // Record initial latency using the device's sample rate (the stream
         // runs at the device rate in shared mode, not necessarily the client
         // format's rate).
@@ -836,6 +848,18 @@ impl RealAudioBackend {
                 format!("failed to start exclusive audio stream: {e}"),
             )
         })?;
+
+        // Steam run instrumentation (no behavior change): the FIRST
+        // successful real audio initialization in exclusive mode — a cpal
+        // exclusive stream was built AND started on a real device.  Never
+        // recorded for stubs or failed opens (both error out above).
+        crate::steam_milestones::note_audio_initialized(
+            crate::steam_milestones::MilestoneEvidence::context_free(
+                "RealAudioBackend::ensure_stream_exclusive (cpal)",
+                Some(&self.device_info(device_id)?.name),
+                "real exclusive-mode audio stream opened on a host device",
+            ),
+        );
 
         self.streams.insert(device_id, stream);
         self.stream_queues.insert(device_id, queue);

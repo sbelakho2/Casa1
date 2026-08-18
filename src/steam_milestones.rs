@@ -278,9 +278,9 @@ pub struct SteamMilestoneGroup {
     pub webhelper_spawn_requested: Option<MilestoneEvidence>,
     /// A spawned steamwebhelper child PE was actually loaded and had at
     /// least one block dispatched (the child truly started).  Child PEs
-    /// currently execute in a separate casa1-runner process, so this stays
-    /// unset in the parent's artifact; the spawn-request hook is the only
-    /// producer today.
+    /// execute in a separate casa1-runner process; the child runner records
+    /// the milestone in its own artifact and the parent folds it in via the
+    /// run-id-scoped child-artifact merge at parent finalization.
     pub webhelper_process_started: Option<MilestoneEvidence>,
     /// `CreateProcessW/A` calls whose image/command line contains
     /// `steamwebhelper` (case-insensitive).
@@ -288,7 +288,8 @@ pub struct SteamMilestoneGroup {
     /// Spawned steamwebhelper child PEs that actually began dispatching
     /// blocks (distinct from spawn requests above).
     pub webhelper_processes_started: u32,
-    /// A CEF browser has been created (set on the first successful paint).
+    /// A CEF browser has been created (independent producer: the CEF
+    /// browser-creation API, NOT the paint callback).
     pub cef_browser_created: Option<MilestoneEvidence>,
     /// The first CEF paint (software or accelerated) was observed.
     pub cef_first_paint: Option<MilestoneEvidence>,
@@ -360,6 +361,12 @@ pub struct SteamMilestones {
     /// S11).  Serialized as `null` until the audio pipeline records evidence.
     #[serde(default)]
     pub audio_initialized: Option<MilestoneEvidence>,
+    /// First block dispatch of ANY PE image (not just Steam.exe): the
+    /// process-first-instruction marker that proves a spawned child PE
+    /// actually began executing.  Child-runner artifacts derive
+    /// `steam.webhelper_process_started` from this record at write time.
+    #[serde(default)]
+    pub process_first_instruction: Option<MilestoneEvidence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -513,11 +520,11 @@ pub fn note_webhelper_spawn_request_in(
 }
 
 /// Record that a spawned steamwebhelper child PE actually loaded and began
-/// dispatching blocks — distinct from the spawn REQUEST above.  Child PEs
-/// currently execute in a separate casa1-runner process, so this hook has no
-/// in-process producer yet; the distinction is modeled so the moment a child
-/// PE executes in-process, `webhelper_processes_started` starts reflecting
-/// reality instead of conflating requests with started processes.
+/// dispatching blocks — distinct from the spawn REQUEST above.  The hook has
+/// two producers: an in-process child PE execution, and the child-runner
+/// artifact write (which derives the milestone from the
+/// `process_first_instruction` record when the child is steamwebhelper.exe);
+/// the parent then aggregates child artifacts into its own milestone.
 pub fn note_webhelper_process_started_in(
     milestones: &mut SteamMilestones,
     evidence: MilestoneEvidence,
@@ -563,8 +570,10 @@ pub fn note_gfx_frame_in(milestones: &mut SteamMilestones, metadata: &BTreeMap<S
     }
 }
 
-/// Count a CEF paint (software or accelerated) and set the browser-created /
-/// first-paint milestones (a paint proves a browser existed).
+/// Count a CEF paint (software or accelerated) and set the first-paint
+/// milestones.  The paint callback only proves a paint; the browser-created
+/// milestone has its OWN producer (the CEF browser-creation API), so a paint
+/// never sets `cef_browser_created`.
 pub fn note_cef_paint_in(
     milestones: &mut SteamMilestones,
     accelerated: bool,
@@ -584,10 +593,45 @@ pub fn note_cef_paint_in(
         }
     }
     if milestones.steam.cef_first_paint.is_none() {
-        milestones.steam.cef_first_paint = Some(evidence.clone());
+        milestones.steam.cef_first_paint = Some(evidence);
     }
+}
+
+/// Record that a CEF browser was actually created — the independent
+/// producer of `cef_browser_created` (first-wins), distinct from the paint
+/// callback which only sets the first-paint milestones.
+pub fn note_cef_browser_created_in(milestones: &mut SteamMilestones, evidence: MilestoneEvidence) {
     if milestones.steam.cef_browser_created.is_none() {
         milestones.steam.cef_browser_created = Some(evidence);
+    }
+}
+
+/// Record the first guest input consumption: a mouse or keyboard message
+/// actually delivered to a guest window procedure (not merely queued).
+/// First-wins on `input_events_consumed`.
+pub fn note_input_consumed_in(milestones: &mut SteamMilestones, evidence: MilestoneEvidence) {
+    if milestones.input_events_consumed.is_none() {
+        milestones.input_events_consumed = Some(evidence);
+    }
+}
+
+/// Record the first successful real audio device/client initialization.
+/// First-wins on `audio_initialized`; never called for stubs or failed
+/// opens.
+pub fn note_audio_initialized_in(milestones: &mut SteamMilestones, evidence: MilestoneEvidence) {
+    if milestones.audio_initialized.is_none() {
+        milestones.audio_initialized = Some(evidence);
+    }
+}
+
+/// Record the first block dispatch of any PE image — the
+/// process-first-instruction marker.  First-wins.
+pub fn note_process_first_instruction_in(
+    milestones: &mut SteamMilestones,
+    evidence: MilestoneEvidence,
+) {
+    if milestones.process_first_instruction.is_none() {
+        milestones.process_first_instruction = Some(evidence);
     }
 }
 
@@ -758,9 +802,9 @@ pub fn note_webhelper_spawn_request(
 }
 
 /// Record a steamwebhelper child PE that actually began dispatching blocks.
-/// No in-process producer exists yet (child PEs run in a separate runner
-/// process); the hook is the single producer of `webhelper_processes_started`
-/// once the child-execution path lands in-process.
+/// Producers: in-process child execution, and the child-runner artifact
+/// write (derived from `process_first_instruction`); the parent aggregates
+/// child artifacts into its own milestone.
 pub fn note_webhelper_process_started(evidence: MilestoneEvidence) {
     with_milestones(|milestones| note_webhelper_process_started_in(milestones, evidence));
 }
@@ -805,6 +849,32 @@ pub fn note_cef_paint(accelerated: bool) {
         CEF_SOFTWARE_PAINTS.fetch_add(1, Ordering::Relaxed);
     }
     with_milestones(|milestones| note_cef_paint_in(milestones, accelerated, evidence));
+}
+
+/// Record that a CEF browser was actually created (first-wins).  This is the
+/// ONLY producer of `cef_browser_created`; the paint callback does not set
+/// it.
+pub fn note_cef_browser_created(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_cef_browser_created_in(milestones, evidence));
+}
+
+/// Record the first guest input consumption (a mouse or keyboard message
+/// delivered to a guest window procedure), first-wins.
+pub fn note_input_consumed(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_input_consumed_in(milestones, evidence));
+}
+
+/// Record the first successful real audio device/client initialization,
+/// first-wins.  Only called after a real successful open — never for stubs
+/// or failed opens.
+pub fn note_audio_initialized(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_audio_initialized_in(milestones, evidence));
+}
+
+/// Record the first block dispatch of any PE image — the
+/// process-first-instruction marker, first-wins.
+pub fn note_process_first_instruction(evidence: MilestoneEvidence) {
+    with_milestones(|milestones| note_process_first_instruction_in(milestones, evidence));
 }
 
 // ---------------------------------------------------------------------------

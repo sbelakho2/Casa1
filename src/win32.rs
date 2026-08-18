@@ -1087,6 +1087,12 @@ impl Win32Subsystem {
         self.current_thread_id
     }
 
+    /// Guest-visible current process id (the runner's host pid, matching
+    /// `GetCurrentProcessId`).
+    pub fn current_process_id(&self) -> u32 {
+        self.current_process_id
+    }
+
     pub fn set_current_thread_id(&mut self, thread_id: u32) -> u32 {
         let previous = self.current_thread_id;
         self.current_thread_id = thread_id;
