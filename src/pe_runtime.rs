@@ -4671,6 +4671,11 @@ pub fn execute_with_options(
 ) -> AppResult<PeExecutionResult> {
     // ── Entry trace ─────────────────────────────────────────────────────────
     crate::live::live_trace("[pe] execute_with_options ENTERED");
+    // Steam run instrumentation (no behavior change): every run starts from a
+    // clean milestone slate — the shared static, the last-thunk recorder, the
+    // run-start marker and the per-run counters — so evidence from a previous
+    // run in this process can never leak into the new run's artifact.
+    crate::steam_milestones::reset_milestones();
     crate::steam_milestones::mark_run_start();
     // ── Diagnostic markers (DISABLED: file I/O was too slow) ─────────────────
     // Was writing to /tmp/casa1_diag.txt but file open/write/flush/close on
@@ -5070,8 +5075,14 @@ pub fn execute_with_options(
         loop {
             block_count += 1;
             // Steam run instrumentation (no behavior change): the first block
-            // dispatch marks bootstrap as started.
-            crate::steam_milestones::note_bootstrap_started();
+            // dispatch marks bootstrap as started, with the guest context in
+            // which the run's first block executed.
+            crate::steam_milestones::note_bootstrap_started(runtime.milestone_evidence(
+                state,
+                "block dispatch",
+                None,
+                "first block dispatch of the PE main loop",
+            ));
             // ── Host-side block-dispatch safepoint ───────────────────────────
             // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
             // guest scheduler between dispatched blocks: pump a pending guest
@@ -8594,6 +8605,149 @@ fn classify_execution_error(error: &AppError) -> ExecutionTermination {
     } else {
         ExecutionTermination::HostError
     }
+}
+
+// ---------------------------------------------------------------------------
+// Thunk-level Steam manifest gate (public test harness)
+// ---------------------------------------------------------------------------
+
+/// Outcome of driving the Steam manifest gate through the host-thunk
+/// dispatch layer (used by the section-38 thunk-level manifest gate).
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ThunkManifestGateResult {
+    /// Bytes read back from the manifest via the `ReadFile` thunk.
+    pub manifest_bytes: Vec<u8>,
+    /// `CreateFileW` on the manifest returned a valid handle.
+    pub manifest_open_ok: bool,
+    /// `ReadFile` on the manifest handle reported success.
+    pub manifest_read_ok: bool,
+    /// The `C:\.crash` writability probe create succeeded.
+    pub probe_create_ok: bool,
+    /// The `C:\.crash` writability probe delete succeeded.
+    pub probe_delete_ok: bool,
+    /// Milestone evidence recorded by the instrumentation hooks during the
+    /// cycle (manifest open/read, writability probe).
+    pub milestones: crate::steam_milestones::SteamMilestones,
+}
+
+/// Drive the Steam manifest open/read/close cycle AND the `C:\.crash`
+/// drive-root writability probe through the real host-thunk dispatch layer
+/// (`alloc_host_thunk` + `dispatch_import` on an x86 guest state) rather
+/// than calling `Win32Subsystem` methods directly.  The checked-in
+/// `steam-live-run-x86` GE is expected.  The instrumentation hooks in the
+/// file layer record milestone evidence during the cycle, returned in
+/// `ThunkManifestGateResult::milestones`.
+#[doc(hidden)]
+pub fn thunk_drive_manifest_gate(ge: GameEnvironment) -> AppResult<ThunkManifestGateResult> {
+    let mut runtime = PeHostRuntime::new(ge, false, Vec::new(), None, None);
+    runtime.guest_arch = GuestArch::X86;
+    runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
+    runtime.next_data_address = data_base_for_arch(GuestArch::X86);
+    runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
+    runtime.next_private_address = private_pages_base_for_arch(GuestArch::X86);
+    runtime.x86_heap_region = 0;
+    let mut memory = MemoryImage::default();
+
+    fn call(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u32],
+    ) -> AppResult<u64> {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        runtime.dispatch_import(thunk, &mut state, memory)?;
+        Ok(state.get(Register::Rax))
+    }
+
+    let mut result = ThunkManifestGateResult::default();
+    crate::steam_milestones::reset_milestones();
+
+    // ── Manifest open/read/close via CreateFileW/ReadFile/CloseHandle ──
+    let manifest_path = r"C:\package\steam_client_win32.installed";
+    let path_ptr = runtime.alloc_utf16_string(&mut memory, manifest_path)?;
+    let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+    let handle = call(
+        &mut runtime,
+        &mut memory,
+        create_file,
+        &[
+            path_ptr as u32,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            0,
+            OPEN_EXISTING,
+            0,
+            0,
+        ],
+    )?;
+    result.manifest_open_ok = handle != 0 && handle != INVALID_HANDLE_VALUE;
+    if result.manifest_open_ok {
+        let buffer_ptr = 0x60_000_u64;
+        // OUTSIDE the buffer region: the ReadFile thunk writes the transfer
+        // count here and must not clobber manifest bytes in the buffer.
+        let bytes_read_ptr = 0x61_000_u64;
+        memory.map_bytes(buffer_ptr, &[0_u8; 0x200]);
+        let read_file = runtime.alloc_host_thunk(HostThunk::ReadFile);
+        let read_ok = call(
+            &mut runtime,
+            &mut memory,
+            read_file,
+            &[
+                handle as u32,
+                buffer_ptr as u32,
+                4096,
+                bytes_read_ptr as u32,
+                0,
+            ],
+        )? == 1;
+        result.manifest_read_ok = read_ok;
+        let bytes_read = if read_ok {
+            read_u32(&memory, bytes_read_ptr)? as usize
+        } else {
+            0
+        };
+        let mut bytes = Vec::with_capacity(bytes_read);
+        for index in 0..bytes_read {
+            bytes.push(memory.read_u8(buffer_ptr + index as u64)?);
+        }
+        result.manifest_bytes = bytes;
+        let close_handle = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        let _ = call(&mut runtime, &mut memory, close_handle, &[handle as u32])?;
+    }
+
+    // ── Steam's drive-root writability probe: create/close/delete C:\.crash ──
+    let probe_path = r"\\?\C:\.crash";
+    let probe_ptr = runtime.alloc_utf16_string(&mut memory, probe_path)?;
+    let probe_handle = call(
+        &mut runtime,
+        &mut memory,
+        create_file,
+        &[probe_ptr as u32, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0],
+    )?;
+    result.probe_create_ok = probe_handle != 0 && probe_handle != INVALID_HANDLE_VALUE;
+    if result.probe_create_ok {
+        let close_handle = runtime.alloc_host_thunk(HostThunk::CloseHandle);
+        let _ = call(
+            &mut runtime,
+            &mut memory,
+            close_handle,
+            &[probe_handle as u32],
+        )?;
+        let delete_file = runtime.alloc_host_thunk(HostThunk::DeleteFileW);
+        result.probe_delete_ok =
+            call(&mut runtime, &mut memory, delete_file, &[probe_ptr as u32])? == 1;
+    }
+
+    result.milestones = crate::steam_milestones::snapshot_milestones();
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -12268,6 +12422,28 @@ impl PeHostRuntime {
         );
     }
 
+    /// Steam run instrumentation (no behavior change): build the milestone
+    /// evidence for the current guest dispatch site.  `process_id` and
+    /// `guest_tick` are not observable here (they stay zero, the established
+    /// "host-side" marker).
+    fn milestone_evidence(
+        &self,
+        state: &CpuState,
+        api: &str,
+        path: Option<&str>,
+        detail: &str,
+    ) -> crate::steam_milestones::MilestoneEvidence {
+        crate::steam_milestones::MilestoneEvidence {
+            guest_pc: state.rip,
+            thread_id: self.win32.current_thread_id(),
+            process_id: 0,
+            guest_tick: 0,
+            api: Some(api.to_string()),
+            path: path.map(str::to_string),
+            detail: Some(detail.to_string()),
+        }
+    }
+
     fn dispatch_import(
         &mut self,
         thunk_address: u64,
@@ -15310,8 +15486,13 @@ impl PeHostRuntime {
             }
             HostThunk::DXGISwapChainPresent => {
                 // Steam run instrumentation (no behavior change): count every
-                // DXGI Present call.
-                crate::steam_milestones::note_dxgi_present();
+                // DXGI Present call and record the first one's guest context.
+                crate::steam_milestones::note_dxgi_present_with(self.milestone_evidence(
+                    state,
+                    "DXGISwapChainPresent",
+                    None,
+                    "DXGI Present call",
+                ));
                 self.dispatch_dxgi_swapchain_present(state)?;
             }
             HostThunk::DXGISwapChainResizeBuffers => {
@@ -28239,10 +28420,18 @@ impl PeHostRuntime {
                     read_utf16_string(memory, command_line_ptr)?
                 };
                 // Steam run instrumentation (no behavior change): count
-                // steamwebhelper child-process launches.
-                crate::steam_milestones::note_webhelper_process(
+                // steamwebhelper child-process spawn REQUESTS (the child PE
+                // runs in a separate casa1-runner process; its actual start is
+                // a distinct milestone with no in-process producer yet).
+                crate::steam_milestones::note_webhelper_spawn_request(
                     &application_name,
                     &command_line,
+                    self.milestone_evidence(
+                        state,
+                        "CreateProcessW",
+                        (!application_name.is_empty()).then_some(application_name.as_str()),
+                        "steamwebhelper child process spawn request",
+                    ),
                 );
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
@@ -28374,10 +28563,17 @@ impl PeHostRuntime {
                     read_c_string(memory, command_line_ptr)?
                 };
                 // Steam run instrumentation (no behavior change): count
-                // steamwebhelper child-process launches.
-                crate::steam_milestones::note_webhelper_process(
+                // steamwebhelper child-process spawn REQUESTS (see the
+                // CreateProcessW arm).
+                crate::steam_milestones::note_webhelper_spawn_request(
                     &application_name,
                     &command_line,
+                    self.milestone_evidence(
+                        state,
+                        "CreateProcessA",
+                        (!application_name.is_empty()).then_some(application_name.as_str()),
+                        "steamwebhelper child process spawn request",
+                    ),
                 );
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
@@ -28504,6 +28700,12 @@ impl PeHostRuntime {
                 // client_main_started.
                 crate::steam_milestones::note_thread_created(
                     self.win32.current_thread_id() == 1,
+                    self.milestone_evidence(
+                        state,
+                        "CreateThread",
+                        None,
+                        "guest thread created",
+                    ),
                 );
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
@@ -33273,7 +33475,15 @@ impl PeHostRuntime {
                 // Steam run instrumentation (no behavior change): count the
                 // thread creation (`_beginthread` is not CreateThread, so it
                 // never marks client_main_started).
-                crate::steam_milestones::note_thread_created(false);
+                crate::steam_milestones::note_thread_created(
+                    false,
+                    self.milestone_evidence(
+                        state,
+                        "_beginthread",
+                        None,
+                        "guest thread created",
+                    ),
+                );
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
             }

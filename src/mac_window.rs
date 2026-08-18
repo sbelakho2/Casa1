@@ -420,6 +420,16 @@ pub struct NSScreenInfo {
 /// On non-macOS targets this returns an empty vec.
 pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
     #[cfg(target_os = "macos")]
+    {
+        // In headless processes (CLI/test binaries) there is no main loop
+        // pumping the dispatch queue, so block before dispatching rather than
+        // inside the queued closure (which would hang forever).  A headless
+        // process has no NSScreens anyway.
+        if is_headless() {
+            return Vec::new();
+        }
+    }
+    #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
         run_on_main(move || {
