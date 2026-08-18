@@ -458,6 +458,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
 
         let after_files = ge.snapshot_files(job.dtm, started)?;
         let after_registry = ge.snapshot_registry()?;
+        let network_summary = network_summary_from_trace(&pe_output);
         let canonical_output = CanonicalTestOutput {
             test_id: job.test_id.clone(),
             build_id: BUILD_ID.to_string(),
@@ -468,7 +469,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             guest_exceptions: pe_output.guest_exceptions,
             file_manifest_delta: diff_file_snapshots(&before_files, &after_files),
             registry_delta: diff_registry_snapshots(&before_registry, &after_registry),
-            network_summary: Vec::new(),
+            network_summary,
             gfx_frames: pe_output.gfx_frames,
             perf: pe_output.perf,
         };
@@ -505,6 +506,10 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         let trace_path = ge.trace_path(&job.test_id);
         util::write_string(&trace_path, &trace_record.stable_json()?)?;
 
+        // The outcome carries the AUTHORITATIVE run state — never
+        // reconstructed: the artifact and the public outcome must always
+        // agree (same run_id, termination, milestones, JIT telemetry, and
+        // the same network aggregation that feeds the artifact).
         return Ok(RunnerOutcome {
             report_path,
             trace_path,
@@ -516,11 +521,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             steam_artifact_log: steam_artifact_paths
                 .as_ref()
                 .map(|paths| paths.log_path.clone()),
-            run_id: job.test_id.clone(),
-            termination: "GuestExit".to_string(),
-            termination_detail: None,
-            milestones: crate::steam_milestones::SteamMilestones::default(),
-            jit: pe_runtime::JitTelemetry::default(),
+            run_id: run_id.clone(),
+            termination: format!("{:?}", pe_output.termination),
+            termination_detail: pe_output.termination_detail.clone(),
+            milestones: pe_output.milestones.clone(),
+            jit: pe_output.jit_telemetry.clone(),
         });
     }
 
@@ -1373,8 +1378,55 @@ fn instruction_count_from_perf(pe_output: &pe_runtime::PeExecutionResult) -> Opt
         .map(|metric| metric.value as u64)
 }
 
-/// Compact network summary lines from the run's trace events.
-fn network_summary_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<String> {
+/// Aggregate the run's network activity into the canonical summary shape —
+/// the SAME aggregation that feeds the Steam artifact, so the public
+/// outcome and the artifact never disagree.
+fn network_summary_from_trace(
+    pe_output: &pe_runtime::PeExecutionResult,
+) -> Vec<crate::canonical::NetworkSummary> {
+    pe_output
+        .trace_events
+        .iter()
+        .filter(|event| event.category == "network")
+        .filter_map(|event| {
+            let kv = &event.parameters;
+            let host = kv.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let proto = kv.get("proto").and_then(|v| v.as_str()).unwrap_or("tcp");
+            let port = kv.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let method = kv.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let status = kv.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let bytes_in = kv.get("bytes_in").and_then(|v| v.as_u64()).unwrap_or(0);
+            let bytes_out = kv.get("bytes_out").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tls_version = kv
+                .get("tls_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cipher = kv
+                .get("cipher")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if host.is_empty() {
+                return None;
+            }
+            Some(crate::canonical::NetworkSummary {
+                proto: proto.to_string(),
+                host: host.to_string(),
+                port,
+                method: method.to_string(),
+                status,
+                bytes_in,
+                bytes_out,
+                tls_version,
+                cipher,
+            })
+        })
+        .collect()
+}
+
+/// Compact network summary lines from the run's trace events (artifact log form).
+fn network_summary_lines_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<String> {
     pe_output
         .trace_events
         .iter()
@@ -1545,7 +1597,7 @@ pub fn write_steam_bootstrap_artifacts(
         exit_code: pe_output.exit_code,
         instruction_count: instruction_count_from_perf(pe_output),
         guest_exceptions: pe_output.guest_exceptions.clone(),
-        network_summary: network_summary_from_trace(pe_output),
+        network_summary: network_summary_lines_from_trace(pe_output),
         metal_encoders_created: crate::metal_backend::METAL_ENCODERS_CREATED
             .load(Ordering::Relaxed),
         metal_encoders_ended: crate::metal_backend::METAL_ENCODERS_ENDED.load(Ordering::Relaxed),

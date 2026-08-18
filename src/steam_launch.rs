@@ -620,8 +620,12 @@ pub fn create_steam_job(
             .as_millis()
     );
 
+    // The Steam profile's jit_enabled = true means the caller REQUIRES JIT
+    // execution for the supported Apple-Silicon configuration — map it to
+    // JitMode::Enabled (never Auto, which can stay dormant).  Auto is
+    // reserved for generic applications.
     let jit_mode = if profile.jit_enabled {
-        crate::runner::JitMode::Auto
+        crate::runner::JitMode::Enabled
     } else {
         crate::runner::JitMode::Disabled
     };
