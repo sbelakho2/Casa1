@@ -5076,8 +5076,17 @@ pub fn execute_with_options(
             block_count += 1;
             // Steam run instrumentation (no behavior change): the first block
             // dispatch marks bootstrap as started, with the guest context in
-            // which the run's first block executed.
+            // which the run's first block executed.  The same event also
+            // records the generic process-first-instruction marker, which
+            // child-runner artifacts use to prove a spawned child PE
+            // actually began executing.
             crate::steam_milestones::note_bootstrap_started(runtime.milestone_evidence(
+                state,
+                "block dispatch",
+                None,
+                "first block dispatch of the PE main loop",
+            ));
+            crate::steam_milestones::note_process_first_instruction(runtime.milestone_evidence(
                 state,
                 "block dispatch",
                 None,
@@ -10252,14 +10261,32 @@ impl PeHostRuntime {
             // process, providing real process isolation.
             let runner_path = find_casa1_runner_binary()?;
             let argv: Vec<String> = result.argv.iter().skip(1).cloned().collect();
-            let env = (*environment).clone();
+            // Child run identity (instrumentation): the child runner inherits
+            // the parent's CASA1_RUN_ID so its bootstrap artifact belongs to
+            // the same run and the parent can merge child evidence, plus the
+            // parent's guest-visible pid.  The injection mirrors real Windows
+            // environment inheritance even when the guest passed its own
+            // environment block.
+            let mut env = (*environment).clone();
+            if let Some(run_id) = self.process_environment.get("CASA1_RUN_ID").cloned() {
+                env.insert("CASA1_RUN_ID".to_string(), run_id);
+            }
+            env.insert(
+                "CASA1_PARENT_PID".to_string(),
+                self.win32.current_process_id().to_string(),
+            );
             let ge = self.win32.ge().clone();
             let dtm = self.dtm;
-            let child_test_id = environment
+            let child_test_base = env
                 .get("CASA1_TEST_ID")
                 .map(String::as_str)
+                .filter(|id| !id.is_empty())
                 .unwrap_or("nested-pe-child")
                 .to_string();
+            // Every child gets a distinct test id (the guest-visible child
+            // process id) so concurrent children never collide on artifact
+            // filenames or trace paths.
+            let child_test_id = format!("{child_test_base}-child-{}", result.process_id);
 
             // Build a RunnerJob for the child PE.
             let job = crate::runner::RunnerJob {
@@ -12423,9 +12450,9 @@ impl PeHostRuntime {
     }
 
     /// Steam run instrumentation (no behavior change): build the milestone
-    /// evidence for the current guest dispatch site.  `process_id` and
-    /// `guest_tick` are not observable here (they stay zero, the established
-    /// "host-side" marker).
+    /// evidence for the current guest dispatch site.  `process_id` is the
+    /// guest-visible current process id and `guest_tick` is the guest tick
+    /// count at the observation site (both observable here).
     fn milestone_evidence(
         &self,
         state: &CpuState,
@@ -12436,8 +12463,8 @@ impl PeHostRuntime {
         crate::steam_milestones::MilestoneEvidence {
             guest_pc: state.rip,
             thread_id: self.win32.current_thread_id(),
-            process_id: 0,
-            guest_tick: 0,
+            process_id: self.win32.current_process_id(),
+            guest_tick: self.win32.get_tick_count64(),
             api: Some(api.to_string()),
             path: path.map(str::to_string),
             detail: Some(detail.to_string()),
@@ -51596,6 +51623,22 @@ impl PeHostRuntime {
         self.user32.dispatch_message_w(message)
     }
 
+    /// Steam run instrumentation (no behavior change): when a mouse or
+    /// keyboard message was ACTUALLY delivered to a guest window procedure
+    /// (the callbacks above returned), record the first guest input
+    /// consumption.  Queued-but-undispatched messages never reach here.
+    fn record_guest_input_consumed(&self, state: &CpuState, message_id: u32) {
+        if !is_guest_input_message_id(message_id) {
+            return;
+        }
+        crate::steam_milestones::note_input_consumed(self.milestone_evidence(
+            state,
+            "DispatchMessageW",
+            None,
+            "mouse/keyboard message delivered to a guest window procedure",
+        ));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_window_message(
         &mut self,
@@ -51620,7 +51663,7 @@ impl PeHostRuntime {
             emit_window_msg_debug(format!(
                 "DWM -> dialog_proc={dialog_proc:#x} hwnd={hwnd:#x} msg=0x{message_id:04x}"
             ));
-            return Ok(self.execute_guest_callback(
+            let result = self.execute_guest_callback(
                 state,
                 memory,
                 dialog_proc,
@@ -51631,14 +51674,16 @@ impl PeHostRuntime {
                     lparam as u64,
                 ],
                 label,
-            )? as i64);
+            )? as i64;
+            self.record_guest_input_consumed(state, message_id);
+            return Ok(result);
         }
         if let Some(window_proc) = self.user32.get_window_long_w(hwnd, GWL_WNDPROC) {
             if window_proc != 0 {
                 emit_window_msg_debug(format!(
                     "DWM -> GWL_WNDPROC={window_proc:#x} hwnd={hwnd:#x} msg=0x{message_id:04x}"
                 ));
-                return Ok(self.execute_guest_callback(
+                let result = self.execute_guest_callback(
                     state,
                     memory,
                     window_proc,
@@ -51649,7 +51694,9 @@ impl PeHostRuntime {
                         lparam as u64,
                     ],
                     label,
-                )? as i64);
+                )? as i64;
+                self.record_guest_input_consumed(state, message_id);
+                return Ok(result);
             } else {
                 emit_window_msg_debug(format!(
                     "DWM -> GWL_WNDPROC=0 (cleared) hwnd={hwnd:#x} msg=0x{message_id:04x}"
@@ -90527,6 +90574,27 @@ fn message_kind(message_id: u32) -> AppResult<MessageKind> {
         0x020e => Ok(MessageKind::MouseHWheel),
         _ => Ok(MessageKind::Other(message_id)),
     }
+}
+
+/// True when `message_id` is a mouse or keyboard input message (WM_KEY*,
+/// WM_CHAR/WM_DEADCHAR, WM_INPUT/WM_RAWINPUT, WM_MOUSE*).  Only these count
+/// as guest input consumption when delivered to a guest window procedure.
+fn is_guest_input_message_id(message_id: u32) -> bool {
+    matches!(
+        message_kind(message_id),
+        Ok(MessageKind::KeyDown
+            | MessageKind::KeyUp
+            | MessageKind::Char
+            | MessageKind::DeadChar
+            | MessageKind::Input
+            | MessageKind::RawInput
+            | MessageKind::MouseMove
+            | MessageKind::LButtonDown
+            | MessageKind::LButtonUp
+            | MessageKind::MouseWheel
+            | MessageKind::MouseHWheel
+            | MessageKind::XButtonDown)
+    )
 }
 
 const PREVIEW_CLIENT_ORIGIN_X: usize = 12;

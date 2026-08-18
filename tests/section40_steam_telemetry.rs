@@ -15,8 +15,9 @@ use casa1::canonical::{GfxFrame, PerfMetric};
 use casa1::ge::{GameEnvironment, GeArch};
 use casa1::pe_runtime::{ExecutionTermination, PeExecutionResult};
 use casa1::runner::{
-    RunIntent, RunnerJob, SteamBootstrapArtifact, deterministic_run_id, is_steam_executable,
-    steam_artifact_stem, write_steam_bootstrap_artifacts,
+    RunIntent, RunnerJob, SteamBootstrapArtifact, child_artifact_stem, deterministic_run_id,
+    is_steam_executable, merge_child_artifacts, steam_artifact_stem,
+    write_child_bootstrap_artifact, write_steam_bootstrap_artifacts,
 };
 use casa1::steam_milestones::{
     FailureCategory, FrameCategory, MILESTONES, MilestoneEvidence, RunProvenance,
@@ -407,7 +408,11 @@ fn snapshot_folds_atomic_counters_and_live_threads() {
     assert_eq!(snapshot.graphics.dxgi_presents, 1);
     assert_eq!(snapshot.steam.cef_software_paints, 1);
     assert!(snapshot.steam.cef_first_paint.is_some());
-    assert!(snapshot.steam.cef_browser_created.is_some());
+    assert!(
+        snapshot.steam.cef_browser_created.is_none(),
+        "a paint must NOT set cef_browser_created — the browser-created \
+         milestone has its own independent producer",
+    );
     assert!(snapshot.steam.first_software_paint.is_some());
     assert!(snapshot.steam.first_dxgi_present.is_some());
     assert_eq!(snapshot.threads.live_at_process_exit, 1);
@@ -811,6 +816,7 @@ fn artifact_declares_explicit_identity_fields() {
         provenance: RunProvenance::default(),
         run_id: "run-x".to_string(),
         test_id: "test-y".to_string(),
+        child_of_run_id: None,
         program_path: r"C:\Steam\Steam.exe".to_string(),
         program_sha256: "ab".repeat(32),
         milestones: SteamMilestones::default(),
@@ -837,4 +843,321 @@ fn artifact_declares_explicit_identity_fields() {
     );
     assert!(json["milestones"].is_object());
     let _: Value = json;
+}
+
+/// (j) S10 input-consumption evidence: recorded ONLY when a mouse/keyboard
+/// message was actually delivered to a guest window procedure; first-wins
+/// and always observed.
+#[test]
+fn input_consumed_evidence_is_first_wins_and_observed() {
+    let mut milestones = SteamMilestones::default();
+    assert!(milestones.input_events_consumed.is_none());
+    casa1::steam_milestones::note_input_consumed_in(
+        &mut milestones,
+        MilestoneEvidence {
+            observed: true,
+            guest_pc: 0x7000,
+            thread_id: 1,
+            process_id: 42,
+            guest_tick: 500,
+            api: Some("DispatchMessageW".to_string()),
+            path: None,
+            detail: Some("WM_KEYDOWN delivered to a guest window procedure".to_string()),
+        },
+    );
+    let first = milestones.input_events_consumed.clone().expect("recorded");
+    assert!(first.observed, "input evidence must be observed");
+    assert_eq!(first.guest_pc, 0x7000);
+    assert_eq!(first.api.as_deref(), Some("DispatchMessageW"));
+    // First-wins: a later consumption keeps the first observation.
+    casa1::steam_milestones::note_input_consumed_in(
+        &mut milestones,
+        MilestoneEvidence {
+            observed: true,
+            guest_pc: 0x7100,
+            detail: Some("WM_LBUTTONDOWN delivered".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        milestones.input_events_consumed.clone().unwrap().guest_pc,
+        0x7000,
+        "first consumption is first-wins",
+    );
+}
+
+/// (k) S11 audio-initialization evidence: recorded only after a REAL
+/// successful device/client open; first-wins and always observed.
+#[test]
+fn audio_initialized_evidence_is_first_wins_and_observed() {
+    let mut milestones = SteamMilestones::default();
+    assert!(milestones.audio_initialized.is_none());
+    casa1::steam_milestones::note_audio_initialized_in(
+        &mut milestones,
+        MilestoneEvidence {
+            observed: true,
+            api: Some("RealAudioBackend::ensure_stream (cpal)".to_string()),
+            path: Some("MacBook Pro Speakers".to_string()),
+            detail: Some("real audio output stream opened on a host device".to_string()),
+            ..Default::default()
+        },
+    );
+    let first = milestones.audio_initialized.clone().expect("recorded");
+    assert!(first.observed, "audio evidence must be observed");
+    assert_eq!(
+        first.api.as_deref(),
+        Some("RealAudioBackend::ensure_stream (cpal)")
+    );
+    // First-wins: a later successful open keeps the first observation.
+    casa1::steam_milestones::note_audio_initialized_in(
+        &mut milestones,
+        MilestoneEvidence {
+            observed: true,
+            api: Some("RealAudioBackend::ensure_stream_exclusive (cpal)".to_string()),
+            detail: Some("later exclusive stream".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        milestones.audio_initialized.clone().unwrap().api.as_deref(),
+        Some("RealAudioBackend::ensure_stream (cpal)"),
+        "first audio initialization is first-wins",
+    );
+}
+
+/// (l) The CEF browser-created milestone has an INDEPENDENT producer: the
+/// browser-creation API sets it; the paint callback never does.
+#[test]
+fn cef_browser_created_has_independent_producer() {
+    let mut milestones = SteamMilestones::default();
+    casa1::steam_milestones::note_cef_paint_in(&mut milestones, false, evidence_at(0x8000));
+    assert!(
+        milestones.steam.cef_first_paint.is_some(),
+        "paint still sets first paint",
+    );
+    assert!(
+        milestones.steam.cef_browser_created.is_none(),
+        "paint must not set cef_browser_created",
+    );
+    casa1::steam_milestones::note_cef_browser_created_in(
+        &mut milestones,
+        MilestoneEvidence {
+            observed: true,
+            api: Some("cef_browser_host_create_browser".to_string()),
+            path: Some("https://store.steampowered.com".to_string()),
+            detail: Some("CEF browser created".to_string()),
+            ..Default::default()
+        },
+    );
+    let created = milestones.steam.cef_browser_created.clone().expect("set");
+    assert_eq!(
+        created.api.as_deref(),
+        Some("cef_browser_host_create_browser")
+    );
+    assert!(created.observed);
+    // First-wins for the browser-created milestone too.
+    casa1::steam_milestones::note_cef_browser_created_in(&mut milestones, evidence_at(0x8100));
+    assert_eq!(
+        milestones.steam.cef_browser_created.unwrap().api.as_deref(),
+        Some("cef_browser_host_create_browser"),
+    );
+}
+
+/// (m) The process-first-instruction milestone is the generic first-block
+/// marker (any PE image, not just Steam.exe) and is first-wins.
+#[test]
+fn process_first_instruction_is_first_wins() {
+    let mut milestones = SteamMilestones::default();
+    assert!(milestones.process_first_instruction.is_none());
+    casa1::steam_milestones::note_process_first_instruction_in(
+        &mut milestones,
+        evidence_at(0x9000),
+    );
+    assert_eq!(
+        milestones
+            .process_first_instruction
+            .clone()
+            .unwrap()
+            .guest_pc,
+        0x9000,
+    );
+    casa1::steam_milestones::note_process_first_instruction_in(
+        &mut milestones,
+        evidence_at(0x9010),
+    );
+    assert_eq!(
+        milestones.process_first_instruction.unwrap().guest_pc,
+        0x9000,
+        "first instruction is first-wins",
+    );
+}
+
+/// (n) Child-runner aggregation: a child artifact (written for the child's
+/// own program, named with the run id + child test id, marked with
+/// `child_of_run_id`) carries `webhelper_process_started` evidence when the
+/// child is steamwebhelper.exe and dispatched at least one block; the
+/// parent's finalization merges that evidence and the counts into the
+/// parent's milestone.
+#[test]
+fn child_artifacts_aggregate_webhelper_evidence_into_parent() {
+    let temp_dir = tempfile::tempdir().expect("temp dir for child-artifact test");
+    let ge = GameEnvironment::create_in(temp_dir.path(), "gate", GeArch::X86, "win11-23h2")
+        .expect("create ge");
+    let run_id = "run-agg-1";
+    let short_sha = &env!("CASA1_COMMIT_SHA")[..8];
+    let parent_stem = steam_artifact_stem(short_sha, "parent-job", run_id);
+    let child_stem = child_artifact_stem(short_sha, "parent-job-child-42", run_id);
+    let diagnostics_dir = ge.diagnostics_dir();
+    std::fs::create_dir_all(&diagnostics_dir).expect("create diagnostics dir");
+
+    // ── Parent PE output: spawn requests only, no in-process start evidence.
+    let mut parent_output = pe_output_for();
+    parent_output.milestones.steam.webhelper_spawn_requests = 1;
+    parent_output.milestones.steam.webhelper_spawn_requested = Some(evidence_at(0xa000));
+    let parent_job = job_for(&temp_dir, &ge, "Steam.exe", "parent-job");
+    let parent_paths = write_steam_bootstrap_artifacts(&ge, &parent_output, &parent_job, run_id)
+        .expect("parent artifact");
+    assert_eq!(
+        parent_paths
+            .json_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        format!("{parent_stem}.json"),
+    );
+
+    // ── Child steamwebhelper output: the child PE actually dispatched at
+    // least one block (process_first_instruction recorded).
+    let mut child_output = pe_output_for();
+    child_output.milestones.process_first_instruction = Some(MilestoneEvidence {
+        observed: true,
+        guest_pc: 0xb000,
+        thread_id: 1,
+        process_id: 42,
+        guest_tick: 900,
+        api: Some("block dispatch".to_string()),
+        path: None,
+        detail: Some("first block dispatch of the PE main loop".to_string()),
+    });
+    let child_job = job_for(&temp_dir, &ge, "steamwebhelper.exe", "parent-job-child-42");
+    let child_paths = write_child_bootstrap_artifact(&ge, &child_output, &child_job, run_id)
+        .expect("child artifact");
+    assert_eq!(
+        child_paths.json_path.file_name().unwrap().to_string_lossy(),
+        format!("{child_stem}.json"),
+        "child artifact is named with the run id + child test id + -child- marker",
+    );
+    let child_json = std::fs::read_to_string(&child_paths.json_path).expect("read child artifact");
+    let child_artifact: SteamBootstrapArtifact =
+        serde_json::from_str(&child_json).expect("parse child artifact");
+    assert_eq!(child_artifact.child_of_run_id.as_deref(), Some(run_id));
+    assert!(
+        child_artifact.program_path.ends_with("steamwebhelper.exe"),
+        "child artifact is written for the child's own program: {}",
+        child_artifact.program_path,
+    );
+    let child_started = child_artifact
+        .milestones
+        .steam
+        .webhelper_process_started
+        .expect("child derived webhelper_process_started evidence");
+    assert!(child_started.observed);
+    assert_eq!(child_started.guest_pc, 0xb000);
+    assert_eq!(
+        child_artifact.milestones.steam.webhelper_processes_started,
+        1
+    );
+
+    // ── Parent finalization merges the child evidence ────────────────────
+    let parent_json = std::fs::read_to_string(&parent_paths.json_path).expect("read parent");
+    let mut parent_artifact: SteamBootstrapArtifact =
+        serde_json::from_str(&parent_json).expect("parse parent");
+    assert!(
+        parent_artifact
+            .milestones
+            .steam
+            .webhelper_process_started
+            .is_none()
+    );
+    assert_eq!(
+        parent_artifact.milestones.steam.webhelper_processes_started,
+        0
+    );
+    let merged = merge_child_artifacts(&ge, &mut parent_artifact);
+    assert_eq!(merged, 1, "one child artifact merged");
+    let merged_evidence = parent_artifact
+        .milestones
+        .steam
+        .webhelper_process_started
+        .expect("parent observed the child's milestone");
+    assert!(merged_evidence.observed);
+    assert_eq!(merged_evidence.guest_pc, 0xb000);
+    let detail = merged_evidence.detail.unwrap_or_default();
+    assert!(
+        detail.contains("merged from child artifact"),
+        "merge provenance documented in the evidence detail: {detail}",
+    );
+    assert!(
+        detail.contains("best-effort post-run merge"),
+        "merge limitation documented honestly: {detail}",
+    );
+    assert_eq!(
+        parent_artifact.milestones.steam.webhelper_processes_started, 1,
+        "child process-started count aggregated into the parent",
+    );
+
+    // ── Child artifacts of other runs never merge into this parent ───────
+    let mut other_output = pe_output_for();
+    other_output.milestones.process_first_instruction = Some(evidence_at(0xc000));
+    let other_job = job_for(&temp_dir, &ge, "steamwebhelper.exe", "other-job-child-7");
+    write_child_bootstrap_artifact(&ge, &other_output, &other_job, "run-agg-other")
+        .expect("other-run child artifact");
+    let mut again: SteamBootstrapArtifact =
+        serde_json::from_str(&parent_json).expect("re-parse parent");
+    assert_eq!(merge_child_artifacts(&ge, &mut again), 1);
+}
+
+/// Minimal `PeExecutionResult` for the artifact-write tests.
+fn pe_output_for() -> PeExecutionResult {
+    PeExecutionResult {
+        jit_telemetry: casa1::pe_runtime::JitTelemetry::default(),
+        synthetic_pid: 42,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 0,
+        guest_exceptions: Vec::new(),
+        gfx_frames: Vec::new(),
+        perf: Vec::new(),
+        trace_events: Vec::new(),
+        milestones: SteamMilestones::default(),
+        provenance: RunProvenance::default(),
+        termination: ExecutionTermination::GuestExit { code: 0 },
+        termination_detail: None,
+    }
+}
+
+/// Minimal `RunnerJob` for the artifact-write tests.
+fn job_for(
+    temp_dir: &tempfile::TempDir,
+    ge: &GameEnvironment,
+    program_name: &str,
+    test_id: &str,
+) -> RunnerJob {
+    let program = temp_dir.path().join(program_name);
+    RunnerJob {
+        jit_mode: Default::default(),
+        steam_ipc: false,
+        window_width: None,
+        window_height: None,
+        ge_name: ge.config.name.clone(),
+        ge_root: ge.root.clone(),
+        program,
+        args: vec![],
+        cwd: ge.root.clone(),
+        env: BTreeMap::new(),
+        dtm: true,
+        intent: RunIntent::Run,
+        trace_categories: vec![],
+        test_id: test_id.to_string(),
+    }
 }

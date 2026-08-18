@@ -165,8 +165,18 @@ where
 pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     // Run identity: generated ONCE at job start and carried through the whole
     // run, so every artifact of this run shares one id and two concurrent
-    // workers can never collide on filenames.
-    let run_id = generate_run_id(job);
+    // workers can never collide on filenames.  A child runner (spawned by the
+    // PE runtime for a guest CreateProcessW) inherits CASA1_RUN_ID instead of
+    // generating a fresh id, so the child's bootstrap artifact joins the
+    // parent's run for the evidence aggregation.
+    let run_id = job
+        .env
+        .get("CASA1_RUN_ID")
+        .cloned()
+        .unwrap_or_else(|| generate_run_id(job));
+    // Guest-visible pid of this runner's process (GetCurrentProcessId),
+    // propagated to child PE runners as CASA1_PARENT_PID.
+    let parent_pid = pe_runtime::synthetic_pid(job.dtm);
     let mut ge = match GameEnvironment::from_root(job.ge_root.clone()) {
         Ok(ge) => ge,
         Err(e) => {
@@ -214,7 +224,8 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         }
     }
 
-    let mut effective_child_environment = child_environment(job, &ge, &guest_trace_path);
+    let mut effective_child_environment =
+        child_environment(job, &ge, &guest_trace_path, &run_id, parent_pid);
     let applied_override = if job.program.exists() {
         ge.apply_overrides_for_program(&job.program, &mut effective_child_environment)?
     } else {
@@ -222,7 +233,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     };
 
     if let Some(request) = steam_zero_touch_request(job)? {
-        let child_pid = pe_runtime::synthetic_pid(job.dtm); // real implementation: generates PID based on dtm mode
+        let child_pid = parent_pid; // real implementation: generates PID based on dtm mode
         let log_path = ge.log_path(&job.test_id, child_pid);
         let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
         let mut runner_events = Vec::new();
@@ -390,7 +401,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
 
     let is_pe = job.program.exists() && pe_runtime::is_pe_image(&job.program)?;
     if is_pe {
-        let child_pid = pe_runtime::synthetic_pid(job.dtm); // real implementation: generates PID based on dtm mode
+        let child_pid = parent_pid; // real implementation: generates PID based on dtm mode
         let log_path = ge.log_path(&job.test_id, child_pid);
         let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
         let mut runner_events = Vec::new();
@@ -435,18 +446,33 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         runner_events.push(log_process_end_code(&mut logger, pe_output.exit_code)?);
 
         // Steam run instrumentation: write the self-identifying run artifact
-        // ONLY for actual Steam.exe executions (the basename helper, never
-        // substring matching — a `foo-Steam.exe.backup` must not produce a
-        // Steam artifact).  Instrumentation only — a failed artifact write
-        // is reported but never fails the run.  The paths are exposed on the
-        // outcome so steam:launch and CI can point at the exact evidence of
-        // this run.
+        // for Steam.exe executions (the basename helper, never substring
+        // matching — a `foo-Steam.exe.backup` must not produce a Steam
+        // artifact).  ANY PE child that inherited CASA1_RUN_ID also writes
+        // its OWN bootstrap artifact (for the child's own program, named with
+        // the run id + child test id), so the parent can aggregate child
+        // evidence — in particular the steamwebhelper process-started
+        // milestone — without waiting for the child to exit.  Instrumentation
+        // only: a failed artifact write is reported but never fails the run.
+        // The paths are exposed on the outcome so steam:launch and CI can
+        // point at the exact evidence of this run.
         let steam_artifact_paths = if is_steam_executable(&job.program) {
             match write_steam_bootstrap_artifacts(&ge, &pe_output, job, &run_id) {
                 Ok(paths) => Some(paths),
                 Err(error) => {
                     eprintln!(
                         "[runner] steam bootstrap artifact write failed: {}",
+                        error.message
+                    );
+                    None
+                }
+            }
+        } else if job.env.contains_key("CASA1_RUN_ID") {
+            match write_child_bootstrap_artifact(&ge, &pe_output, job, &run_id) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    eprintln!(
+                        "[runner] child bootstrap artifact write failed: {}",
                         error.message
                     );
                     None
@@ -716,6 +742,8 @@ fn child_environment(
     job: &RunnerJob,
     ge: &GameEnvironment,
     guest_trace_path: &Path,
+    run_id: &str,
+    parent_pid: u32,
 ) -> BTreeMap<String, String> {
     let mut env = job.env.clone();
     env.insert("CASA1_GE_ROOT".to_string(), ge.root.display().to_string());
@@ -771,6 +799,13 @@ fn child_environment(
         .to_string(),
     );
     env.insert("CASA1_TEST_ID".to_string(), job.test_id.clone());
+    // Run identity inheritance (instrumentation): child PE runners spawned by
+    // the guest inherit CASA1_RUN_ID so their bootstrap artifacts belong to
+    // the same run and the parent can merge child evidence, and
+    // CASA1_PARENT_PID so children can name their parent.  The PE runtime
+    // also injects both into CreateProcessW child environments directly.
+    env.insert("CASA1_RUN_ID".to_string(), run_id.to_string());
+    env.insert("CASA1_PARENT_PID".to_string(), parent_pid.to_string());
     env
 }
 
@@ -1324,6 +1359,22 @@ pub fn steam_artifact_stem(short_sha: &str, test_id: &str, run_id: &str) -> Stri
     format!("{short_sha}-{test_id}-{run_id}-steam-bootstrap")
 }
 
+/// Child-runner bootstrap artifact stem:
+/// `<short-sha>-<test-id>-<run-id>-child-steam-bootstrap`.  The `-child-`
+/// marker (plus the artifact's `child_of_run_id` field) is how the parent's
+/// finalization recognizes sibling artifacts of the same run.
+pub fn child_artifact_stem(short_sha: &str, test_id: &str, run_id: &str) -> String {
+    format!("{short_sha}-{test_id}-{run_id}-child-steam-bootstrap")
+}
+
+/// True when the program basename is `steamwebhelper.exe` (case-insensitive).
+pub fn is_webhelper_program(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("steamwebhelper.exe"))
+}
+
 /// Where the steam-bootstrap JSON and log artifacts were written.
 #[derive(Debug, Clone)]
 pub struct SteamArtifactPaths {
@@ -1343,6 +1394,12 @@ pub struct SteamBootstrapArtifact {
     pub run_id: String,
     /// The runner job's test id.
     pub test_id: String,
+    /// For child-runner artifacts: the parent run id this artifact belongs
+    /// to (set when CASA1_RUN_ID was inherited).  `None` for the parent
+    /// Steam.exe artifact.  The parent's finalization scans sibling artifacts
+    /// with this marker to merge child evidence.
+    #[serde(default)]
+    pub child_of_run_id: Option<String>,
     /// The Steam executable path that was run.
     pub program_path: String,
     /// SHA-256 of the Steam executable that was run.
@@ -1573,20 +1630,157 @@ pub fn write_steam_bootstrap_artifacts(
     job: &RunnerJob,
     run_id: &str,
 ) -> AppResult<SteamArtifactPaths> {
+    let mut artifact = build_steam_bootstrap_artifact(ge, pe_output, job, run_id);
+    // Child-evidence aggregation (S5/S6): the parent cannot observe
+    // webhelper_process_started directly because child PEs run as separate
+    // casa1-runner invocations.  Best-effort post-run merge: scan the same
+    // diagnostics directory for sibling child artifacts of this run and fold
+    // their webhelper-process-started evidence into the parent's milestone.
+    // A child that finalizes AFTER the parent's artifact is written is
+    // merged on a later read via merge_child_artifacts; the limitation is
+    // documented in the merged evidence's detail field.
+    let merged_children = merge_child_artifacts(ge, &mut artifact);
+    let short_sha = short_sha_of(&artifact.provenance);
+    let paths = write_artifact_files(
+        ge,
+        &artifact,
+        &steam_artifact_stem(&short_sha, &job.test_id, run_id),
+    )?;
+    if merged_children > 0 {
+        let line = format!(
+            "child_artifacts_merged: {merged_children} (best-effort post-run merge; \
+             children finalizing after this parent artifact was written are \
+             folded in on a later read)\n"
+        );
+        let mut log = fs::read_to_string(&paths.log_path).unwrap_or_default();
+        log.push_str(&line);
+        let _ = fs::write(&paths.log_path, log);
+    }
+    Ok(paths)
+}
+
+/// Write the bootstrap artifact for a CHILD PE runner (any PE child that
+/// inherited `CASA1_RUN_ID` from its parent).  The artifact is written for
+/// the child's OWN program, named with the run id + the child's test id and
+/// the `-child-` marker, and carries `child_of_run_id` so the parent's
+/// finalization can find and merge it.  When the child is steamwebhelper.exe
+/// and the child PE actually dispatched at least one block, the recorded
+/// process-first-instruction evidence is folded into
+/// `webhelper_process_started`.
+pub fn write_child_bootstrap_artifact(
+    ge: &GameEnvironment,
+    pe_output: &pe_runtime::PeExecutionResult,
+    job: &RunnerJob,
+    run_id: &str,
+) -> AppResult<SteamArtifactPaths> {
+    let mut artifact = build_steam_bootstrap_artifact(ge, pe_output, job, run_id);
+    artifact.child_of_run_id = Some(run_id.to_string());
+    if is_webhelper_program(&job.program)
+        && let Some(evidence) = artifact.milestones.process_first_instruction.clone()
+    {
+        crate::steam_milestones::note_webhelper_process_started_in(
+            &mut artifact.milestones,
+            evidence,
+        );
+    }
+    let short_sha = short_sha_of(&artifact.provenance);
+    write_artifact_files(
+        ge,
+        &artifact,
+        &child_artifact_stem(&short_sha, &job.test_id, run_id),
+    )
+}
+
+/// Merge sibling CHILD artifacts of the same run into `artifact`.
+///
+/// Scans the GE's diagnostics directory for `*-child-steam-bootstrap.json`
+/// files whose `child_of_run_id` matches `artifact.run_id`; for each it
+/// folds the child's `webhelper_process_started` evidence (first-wins, with
+/// the merge provenance recorded in the evidence detail) and adds the
+/// child's `webhelper_processes_started` count to the parent's.  Returns the
+/// number of child artifacts merged.
+///
+/// Best-effort by design: children write their artifacts when THEY finish,
+/// so a parent that finalizes first will not see them yet.  The merge is
+/// therefore re-runnable on a later read of the parent artifact; when a
+/// child's evidence is merged, its detail field documents that the merge was
+/// post-run and that later-finalizing children are folded in by a subsequent
+/// merge.  Apply the merge to a freshly-read artifact (never twice to the
+/// same copy) so counts stay exact.
+pub fn merge_child_artifacts(ge: &GameEnvironment, artifact: &mut SteamBootstrapArtifact) -> usize {
+    let diagnostics_dir = ge.diagnostics_dir();
+    let run_marker = format!("-{}-child-steam-bootstrap.json", artifact.run_id);
+    let mut candidates = Vec::new();
+    let Ok(entries) = fs::read_dir(&diagnostics_dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(&run_marker) {
+            candidates.push((name, path));
+        }
+    }
+    // Sort for determinism (read_dir order is unspecified; DTM runs must
+    // merge deterministically).
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = 0;
+    for (name, path) in candidates {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(child) = serde_json::from_slice::<SteamBootstrapArtifact>(&bytes) else {
+            continue;
+        };
+        if child.child_of_run_id.as_deref() != Some(artifact.run_id.as_str()) {
+            continue;
+        }
+        if let Some(evidence) = child.milestones.steam.webhelper_process_started
+            && artifact
+                .milestones
+                .steam
+                .webhelper_process_started
+                .is_none()
+        {
+            let mut merged_evidence = evidence;
+            merged_evidence.detail = Some(format!(
+                "merged from child artifact {name} (best-effort post-run merge; \
+                 a child finalizing after the parent's artifact was written is \
+                 folded in by a later merge)"
+            ));
+            artifact.milestones.steam.webhelper_process_started = Some(merged_evidence);
+        }
+        artifact.milestones.steam.webhelper_processes_started = artifact
+            .milestones
+            .steam
+            .webhelper_processes_started
+            .saturating_add(child.milestones.steam.webhelper_processes_started);
+        merged += 1;
+    }
+    merged
+}
+
+/// Build the run artifact payload from a PE execution result (shared by the
+/// parent Steam.exe artifact and the child-runner artifacts).
+fn build_steam_bootstrap_artifact(
+    ge: &GameEnvironment,
+    pe_output: &pe_runtime::PeExecutionResult,
+    job: &RunnerJob,
+    run_id: &str,
+) -> SteamBootstrapArtifact {
     // The execution mode travels with the run result (the zero-touch model
     // recovery marks itself `model`); the artifact must keep that marker
     // instead of re-deriving `real_pe` from the environment.
     let mut provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
     provenance.execution_mode = pe_output.provenance.execution_mode.clone();
-    let short_sha = if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
-        "unknown".to_string()
-    } else {
-        provenance.commit_sha.chars().take(8).collect()
-    };
-    let artifact = SteamBootstrapArtifact {
+    SteamBootstrapArtifact {
         provenance: provenance.clone(),
         run_id: run_id.to_string(),
         test_id: job.test_id.clone(),
+        child_of_run_id: None,
         program_path: job.program.display().to_string(),
         program_sha256: crate::steam_milestones::file_content_hash(&job.program),
         milestones: pe_output.milestones.clone(),
@@ -1602,8 +1796,25 @@ pub fn write_steam_bootstrap_artifacts(
             .load(Ordering::Relaxed),
         metal_encoders_ended: crate::metal_backend::METAL_ENCODERS_ENDED.load(Ordering::Relaxed),
         jit: pe_output.jit_telemetry.clone(),
-    };
+    }
+}
 
+/// Short commit sha from the artifact provenance (`unknown` when git is
+/// unavailable).
+fn short_sha_of(provenance: &crate::steam_milestones::RunProvenance) -> String {
+    if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
+        "unknown".to_string()
+    } else {
+        provenance.commit_sha.chars().take(8).collect()
+    }
+}
+
+/// Write the JSON + log artifact files under the GE's diagnostics directory.
+fn write_artifact_files(
+    ge: &GameEnvironment,
+    artifact: &SteamBootstrapArtifact,
+    stem: &str,
+) -> AppResult<SteamArtifactPaths> {
     let diagnostics_dir = ge.diagnostics_dir();
     fs::create_dir_all(&diagnostics_dir).map_err(|error| {
         AppError::from_io(
@@ -1615,7 +1826,6 @@ pub fn write_steam_bootstrap_artifacts(
             &error,
         )
     })?;
-    let stem = steam_artifact_stem(&short_sha, &job.test_id, run_id);
     let json_path = diagnostics_dir.join(format!("{stem}.json"));
     let log_path = diagnostics_dir.join(format!("{stem}.log"));
 
@@ -1623,26 +1833,41 @@ pub fn write_steam_bootstrap_artifacts(
     util::write_string(&json_path, &json_body)?;
 
     let mut log_lines = Vec::new();
-    log_lines.push(format!("Casa1 commit: {}", provenance.commit_sha));
-    log_lines.push(format!("dirty tree: {}", provenance.dirty_tree));
+    log_lines.push(format!("Casa1 commit: {}", artifact.provenance.commit_sha));
+    log_lines.push(format!("dirty tree: {}", artifact.provenance.dirty_tree));
     log_lines.push(format!("run_id: {}", artifact.run_id));
     log_lines.push(format!("test_id: {}", artifact.test_id));
+    if let Some(child_of) = &artifact.child_of_run_id {
+        log_lines.push(format!("child_of_run_id: {child_of}"));
+    }
     log_lines.push(format!("program_path: {}", artifact.program_path));
     log_lines.push(format!("program_sha256: {}", artifact.program_sha256));
-    log_lines.push(format!("fixture hash: {}", provenance.fixture_hash));
-    log_lines.push(format!("GE hash: {}", provenance.ge_hash));
+    log_lines.push(format!(
+        "fixture hash: {}",
+        artifact.provenance.fixture_hash
+    ));
+    log_lines.push(format!("GE hash: {}", artifact.provenance.ge_hash));
     log_lines.push(format!(
         "Steam executable hash: {}",
-        provenance.steam_executable_hash
+        artifact.provenance.steam_executable_hash
     ));
-    log_lines.push(format!("timestamp: {}", provenance.timestamp_utc_rfc3339));
-    log_lines.push(format!("host macOS: {}", provenance.host_os));
-    log_lines.push(format!("host architecture: {}", provenance.host_arch));
-    log_lines.push(format!("execution mode: {}", provenance.execution_mode));
-    log_lines.extend(milestones_log_lines(&pe_output.milestones));
+    log_lines.push(format!(
+        "timestamp: {}",
+        artifact.provenance.timestamp_utc_rfc3339
+    ));
+    log_lines.push(format!("host macOS: {}", artifact.provenance.host_os));
+    log_lines.push(format!(
+        "host architecture: {}",
+        artifact.provenance.host_arch
+    ));
+    log_lines.push(format!(
+        "execution mode: {}",
+        artifact.provenance.execution_mode
+    ));
+    log_lines.extend(milestones_log_lines(&artifact.milestones));
     log_lines.push(format!(
         "termination: {:?} (exit_code {})",
-        pe_output.termination, pe_output.exit_code
+        artifact.termination, artifact.exit_code
     ));
     log_lines.push(format!(
         "instruction_count: {}",
