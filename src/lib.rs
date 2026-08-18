@@ -82,6 +82,7 @@
 //! - [`wininet`] — WinINet API translation
 //! - [`network`] — TLS, certificate pinning, and socket management
 //! - [`steam`] — Steam API (ISteamClient) translation
+//! - [`steam_acceptance`] — Steam E2E acceptance evaluator (S0-S13)
 //! - [`steam_input`] — Steam Input API
 //! - [`steam_integration`] — Steam integration (friends, achievements)
 //! - [`steam_launch`] — Steam game launch orchestration
@@ -205,6 +206,7 @@ pub mod seh;
 pub mod shader;
 pub mod shader_compiler;
 pub mod steam;
+pub mod steam_acceptance;
 pub mod steam_input;
 pub mod steam_integration;
 pub mod steam_launch;

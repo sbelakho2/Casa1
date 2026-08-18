@@ -267,6 +267,18 @@ pub struct ThreadMilestoneGroup {
     pub live_at_process_exit: u32,
 }
 
+/// Optional milestone evidence for acceptance stages whose subsystems do not
+/// yet feed the core milestone groups.  `None` on the enclosing field means
+/// "not instrumented" (the acceptance stage is not verifiable); `Some` with
+/// `observed: false` records an explicit negative.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MilestoneEvidence {
+    /// Whether the subsystem observed the event.
+    pub observed: bool,
+    /// Optional human-readable detail (counts, device names, ...).
+    pub detail: Option<String>,
+}
+
 /// Full milestone set carried in `PeExecutionResult` and written to the
 /// steam-bootstrap artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -275,6 +287,14 @@ pub struct SteamMilestones {
     pub graphics: GraphicsMilestoneGroup,
     pub threads: ThreadMilestoneGroup,
     pub first_failures: FirstFailureGroup,
+    /// Optional evidence of guest input consumption (acceptance stage S10).
+    /// Serialized as `null` until the input pipeline records evidence.
+    #[serde(default)]
+    pub input_events_consumed: Option<MilestoneEvidence>,
+    /// Optional evidence of guest audio initialization (acceptance stage
+    /// S11).  Serialized as `null` until the audio pipeline records evidence.
+    #[serde(default)]
+    pub audio_initialized: Option<MilestoneEvidence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +588,11 @@ pub struct RunProvenance {
     pub host_os: String,
     /// Host architecture (`std::env::consts::ARCH`).
     pub host_arch: String,
+    /// Execution mode of the run: `real_pe` for the normal PE execution
+    /// path, `model` for the zero-touch synthetic recovery model.  The
+    /// acceptance evaluator rejects `model` artifacts (`ModelExecution`).
+    #[serde(default)]
+    pub execution_mode: String,
 }
 
 impl RunProvenance {
@@ -583,6 +608,7 @@ impl RunProvenance {
             timestamp_utc_rfc3339: utc_rfc3339_now(),
             host_os: std::env::consts::OS.to_string(),
             host_arch: std::env::consts::ARCH.to_string(),
+            execution_mode: "real_pe".to_string(),
             ..Self::default()
         }
     }

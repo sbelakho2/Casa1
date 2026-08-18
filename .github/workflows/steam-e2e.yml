@@ -1,0 +1,41 @@
+name: Steam E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 03:00 daily — nightly real-Steam acceptance run.
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  steam-e2e:
+    name: Steam E2E (section41 acceptance)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout exact SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release build
+        run: cargo build --release --all-targets
+
+      - name: Run section41 real Steam E2E acceptance
+        env:
+          CASA1_STEAM_E2E: "1"
+          CASA1_PE_RUNTIME_DEADLINE_SECS: "600"
+        run: cargo test --release --test section41_steam_e2e -- --ignored --nocapture
+
+      - name: Upload Steam E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steam-e2e-${{ github.sha }}
+          path: ges/steam/diagnostics/
+          if-no-files-found: warn
