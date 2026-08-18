@@ -66,7 +66,28 @@ impl RunIntent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub enum JitMode {
+    /// Runtime decides (current behavior: JIT stays dormant).
+    #[default]
+    Auto,
+    /// The caller explicitly requests JIT compilation to be enabled.
+    Enabled,
+    /// The caller explicitly requests JIT compilation to be disabled.
+    Disabled,
+}
+
+impl JitMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunnerJob {
     pub ge_name: String,
     pub ge_root: PathBuf,
@@ -78,6 +99,14 @@ pub struct RunnerJob {
     pub intent: RunIntent,
     pub trace_categories: Vec<TraceCategory>,
     pub test_id: String,
+    #[serde(default)]
+    pub jit_mode: JitMode,
+    #[serde(default)]
+    pub steam_ipc: bool,
+    #[serde(default)]
+    pub window_width: Option<u32>,
+    #[serde(default)]
+    pub window_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +119,21 @@ pub struct RunnerOutcome {
     pub steam_artifact_json: Option<PathBuf>,
     /// Steam bootstrap log artifact for this run (Steam.exe jobs only).
     pub steam_artifact_log: Option<PathBuf>,
+    /// The run identifier (job test id).
+    #[serde(default)]
+    pub run_id: String,
+    /// ExecutionTermination variant name (e.g. "GuestExit").
+    #[serde(default)]
+    pub termination: String,
+    /// Termination detail (error message for non-guest terminations).
+    #[serde(default)]
+    pub termination_detail: Option<String>,
+    /// Steam run milestone snapshot.
+    #[serde(default)]
+    pub milestones: crate::steam_milestones::SteamMilestones,
+    /// JIT telemetry for the run.
+    #[serde(default)]
+    pub jit: pe_runtime::JitTelemetry,
 }
 
 #[derive(Debug, Parser)]
@@ -302,6 +346,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             canonical_output,
             steam_artifact_json: None,
             steam_artifact_log: None,
+            run_id: job.test_id.clone(),
+            termination: "GuestExit".to_string(),
+            termination_detail: None,
+            milestones: crate::steam_milestones::SteamMilestones::default(),
+            jit: pe_runtime::JitTelemetry::default(),
         });
     }
 
@@ -466,6 +515,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             steam_artifact_log: steam_artifact_paths
                 .as_ref()
                 .map(|paths| paths.log_path.clone()),
+            run_id: job.test_id.clone(),
+            termination: "GuestExit".to_string(),
+            termination_detail: None,
+            milestones: crate::steam_milestones::SteamMilestones::default(),
+            jit: pe_runtime::JitTelemetry::default(),
         });
     }
 
@@ -591,6 +645,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         canonical_output,
         steam_artifact_json: None,
         steam_artifact_log: None,
+        run_id: job.test_id.clone(),
+        termination: "GuestExit".to_string(),
+        termination_detail: None,
+        milestones: crate::steam_milestones::SteamMilestones::default(),
+        jit: pe_runtime::JitTelemetry::default(),
     })
 }
 
@@ -608,6 +667,10 @@ pub fn replay_trace(trace_path: &Path, ge: &GameEnvironment) -> AppResult<Canoni
         intent: RunIntent::from_str(&record.command.intent)?,
         trace_categories: trace::parse_categories(Some(&record.categories.join(",")))?,
         test_id: record.test_id.clone(),
+        jit_mode: JitMode::Auto,
+        steam_ipc: false,
+        window_width: None,
+        window_height: None,
     };
     let actual = execute_job(&job)?.canonical_output;
     compare_outputs(
@@ -737,6 +800,8 @@ fn execute_live_pe_job(
     let env = effective_child_environment.clone();
     let dtm = job.dtm;
     let test_id = job.test_id.clone();
+    let jit_mode = job.jit_mode;
+    let steam_ipc = job.steam_ipc;
     let worker = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
@@ -759,6 +824,8 @@ fn execute_live_pe_job(
                 &test_id,
                 pe_runtime::PeExecutionOptions {
                     live_session: Some(live_session),
+                    jit_mode: Some(jit_mode),
+                    steam_ipc,
                 },
             )
         })
@@ -769,10 +836,12 @@ fn execute_live_pe_job(
             )
             .with_hint(error.to_string())
         })?;
+    let requested_window_size = job.window_width.zip(job.window_height);
     live::run_live_host_session(
         &live_window_title(&job.ge_name, &job.program, &job.intent),
         host_session,
         worker,
+        requested_window_size,
     )
 }
 
@@ -991,6 +1060,7 @@ fn try_recover_budget_exhausted_steam_install(
         provenance: crate::steam_milestones::RunProvenance::default(),
         termination: pe_runtime::ExecutionTermination::GuestExit { code: 0 },
         termination_detail: None,
+        jit_telemetry: pe_runtime::JitTelemetry::default(),
     }))
 }
 
@@ -1261,6 +1331,8 @@ pub struct SteamBootstrapArtifact {
     pub milestones: crate::steam_milestones::SteamMilestones,
     pub last_thunk: Option<crate::steam_milestones::LastThunk>,
     pub exit_code: i32,
+    /// JIT telemetry for the run (requested/active mode, block counters).
+    pub jit: pe_runtime::JitTelemetry,
     /// Authoritative termination reason (guest exit / harness deadline /
     /// instruction budget / unsupported instruction / guest exception /
     /// host error).
@@ -1449,6 +1521,7 @@ pub fn write_steam_bootstrap_artifacts(
         milestones: pe_output.milestones.clone(),
         last_thunk: crate::steam_milestones::snapshot_last_thunk(),
         exit_code: pe_output.exit_code,
+        jit: pe_output.jit_telemetry.clone(),
         termination: pe_output.termination,
         instruction_count: instruction_count_from_perf(pe_output),
         network_summary: network_summary_from_trace(pe_output),

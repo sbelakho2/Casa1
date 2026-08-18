@@ -734,7 +734,7 @@ impl Default for JitTelemetry {
 
 impl JitTelemetry {
     pub(crate) fn from_mode(
-        mode: crate::runner::JitMode,
+        mode: &crate::runner::JitMode,
         blocks_compiled: u64,
         blocks_executed: u64,
     ) -> Self {
@@ -8573,7 +8573,7 @@ fn finalize_execution(
         None => (0, 0),
     };
     let jit_telemetry =
-        JitTelemetry::from_mode(runtime.jit_mode, jit_blocks_compiled, jit_blocks_executed);
+        JitTelemetry::from_mode(&runtime.jit_mode, jit_blocks_compiled, jit_blocks_executed);
 
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),

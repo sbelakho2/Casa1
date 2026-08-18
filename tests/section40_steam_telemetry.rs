@@ -9,6 +9,8 @@
 //! functions over local values (parallel-safe, no shared static), except
 //! one manifest-path smoke test against the shared `MILESTONES` static.
 
+use std::sync::Mutex;
+
 use casa1::canonical::{GfxFrame, PerfMetric};
 use casa1::ge::{GameEnvironment, GeArch};
 use casa1::pe_runtime::{ExecutionTermination, PeExecutionResult};
@@ -65,6 +67,7 @@ fn manifest_path_detection_matches_steam_manifest_only() {
 
 #[test]
 fn manifest_static_records_open_then_read() {
+    let _guard = MILESTONES_TEST_LOCK.lock().unwrap();
     reset_milestones();
     {
         let milestones = MILESTONES.lock().unwrap();
@@ -156,6 +159,7 @@ fn webhelper_detection_from_command_lines() {
 
 #[test]
 fn first_failure_records_only_first_per_category() {
+    let _guard = MILESTONES_TEST_LOCK.lock().unwrap();
     let mut milestones = SteamMilestones::default();
     let recorded = record_first_failure_in(
         &mut milestones,
@@ -384,6 +388,7 @@ fn frame_source_counting_helper() {
 
 #[test]
 fn snapshot_folds_atomic_counters_and_live_threads() {
+    let _guard = MILESTONES_TEST_LOCK.lock().unwrap();
     reset_milestones();
     // Simulate a run on a local struct, then push it through the static.
     let mut milestones = SteamMilestones::default();
@@ -467,6 +472,7 @@ fn run_ids_produce_distinct_artifact_filenames() {
 /// recorder and the run-start marker all clear.
 #[test]
 fn milestone_state_resets_between_runs() {
+    let _guard = MILESTONES_TEST_LOCK.lock().unwrap();
     reset_milestones();
     {
         let mut guard = MILESTONES.lock().unwrap();
@@ -630,6 +636,10 @@ fn deadline_terminated_run_artifact_retains_perf_trace_frames() {
     let steam = temp_dir.path().join("Steam.exe");
     std::fs::write(&steam, b"MZ fake steam payload").expect("write steam.exe");
     let job = RunnerJob {
+        jit_mode: Default::default(),
+        steam_ipc: false,
+        window_width: None,
+        window_height: None,
         ge_name: "gate".to_string(),
         ge_root: ge.root.clone(),
         program: steam.clone(),
@@ -644,6 +654,7 @@ fn deadline_terminated_run_artifact_retains_perf_trace_frames() {
     let mut metadata = BTreeMap::new();
     metadata.insert("source".to_string(), "gdi".to_string());
     let pe_output = PeExecutionResult {
+        jit_telemetry: casa1::pe_runtime::JitTelemetry::default(),
         synthetic_pid: 42,
         stdout: "guest stdout".to_string(),
         stderr: "guest stderr".to_string(),
@@ -784,6 +795,11 @@ fn execution_termination_serializes_deterministically() {
     }
 }
 
+/// Serializes tests that touch the process-wide MILESTONES static (and the
+/// atomic graphics/CEF counters): parallel tests in the same binary would
+/// otherwise interleave resets with assertions and poison the mutex.
+static MILESTONES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// The artifact JSON carries the full identity fields declared by
 /// SteamBootstrapArtifact (run_id, test_id, program_path, program_sha256,
 /// termination).
@@ -797,6 +813,7 @@ fn artifact_declares_explicit_identity_fields() {
         program_sha256: "ab".repeat(32),
         milestones: SteamMilestones::default(),
         last_thunk: None,
+        jit: casa1::pe_runtime::JitTelemetry::default(),
         exit_code: 0,
         termination: ExecutionTermination::GuestExit { code: 0 },
         instruction_count: Some(1),
