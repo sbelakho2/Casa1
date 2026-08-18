@@ -12441,6 +12441,7 @@ impl PeHostRuntime {
             api: Some(api.to_string()),
             path: path.map(str::to_string),
             detail: Some(detail.to_string()),
+            observed: true,
         }
     }
 

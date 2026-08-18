@@ -21,6 +21,7 @@ use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
@@ -1047,6 +1048,10 @@ fn try_recover_budget_exhausted_steam_install(
     // install model, never real Steam execution); its termination is a
     // normal GuestExit so the acceptance evaluator can distinguish
     // model artifacts from real-PE artifacts via provenance.execution_mode.
+    let provenance = crate::steam_milestones::RunProvenance {
+        execution_mode: "model".to_string(),
+        ..crate::steam_milestones::RunProvenance::default()
+    };
     Ok(Some(pe_runtime::PeExecutionResult {
         synthetic_pid: pe_runtime::synthetic_pid(job.dtm), // real implementation: generates PID based on dtm mode
         stdout: String::new(),
@@ -1057,7 +1062,7 @@ fn try_recover_budget_exhausted_steam_install(
         perf: Vec::new(),
         trace_events: Vec::new(),
         milestones: crate::steam_milestones::SteamMilestones::default(),
-        provenance: crate::steam_milestones::RunProvenance::default(),
+        provenance,
         termination: pe_runtime::ExecutionTermination::GuestExit { code: 0 },
         termination_detail: None,
         jit_telemetry: pe_runtime::JitTelemetry::default(),
@@ -1314,13 +1319,22 @@ pub fn steam_artifact_stem(short_sha: &str, test_id: &str, run_id: &str) -> Stri
     format!("{short_sha}-{test_id}-{run_id}-steam-bootstrap")
 }
 
-/// The full JSON artifact payload: identity, provenance, milestones,
-/// termination, and the run summary lines.
-#[derive(Debug, Clone, Serialize)]
+/// Where the steam-bootstrap JSON and log artifacts were written.
+#[derive(Debug, Clone)]
+pub struct SteamArtifactPaths {
+    pub json_path: PathBuf,
+    pub log_path: PathBuf,
+}
+
+/// The full JSON artifact payload: provenance, milestones, and the run
+/// summary lines.  Public so the Steam acceptance evaluator
+/// ([`crate::steam_acceptance::evaluate`]) and the E2E tests can read a
+/// written artifact back from disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamBootstrapArtifact {
     pub provenance: crate::steam_milestones::RunProvenance,
-    /// The run id generated once at `execute_job` start (UUID v4 for live
-    /// runs, deterministic for DTM runs).
+    /// Unique run identifier (UUID v4 live / deterministic DTM), distinct
+    /// for every artifact.
     pub run_id: String,
     /// The runner job's test id.
     pub test_id: String,
@@ -1330,22 +1344,23 @@ pub struct SteamBootstrapArtifact {
     pub program_sha256: String,
     pub milestones: crate::steam_milestones::SteamMilestones,
     pub last_thunk: Option<crate::steam_milestones::LastThunk>,
+    /// Guest process id of the synthetic process that ran the PE image.
+    pub guest_pid: u32,
+    /// Authoritative termination reason (GuestExit / HarnessDeadline / ...).
+    pub termination: pe_runtime::ExecutionTermination,
+    /// Error detail for non-guest terminations.
+    pub termination_detail: Option<String>,
     pub exit_code: i32,
+    pub instruction_count: Option<u64>,
+    /// Guest exceptions observed during the run (S12 acceptance check).
+    pub guest_exceptions: Vec<crate::canonical::GuestException>,
+    pub network_summary: Vec<String>,
+    /// Metal encoder lifecycle counters at artifact collection (S12
+    /// balance check).
+    pub metal_encoders_created: u64,
+    pub metal_encoders_ended: u64,
     /// JIT telemetry for the run (requested/active mode, block counters).
     pub jit: pe_runtime::JitTelemetry,
-    /// Authoritative termination reason (guest exit / harness deadline /
-    /// instruction budget / unsupported instruction / guest exception /
-    /// host error).
-    pub termination: pe_runtime::ExecutionTermination,
-    pub instruction_count: Option<u64>,
-    pub network_summary: Vec<String>,
-}
-
-/// Where the steam-bootstrap JSON and log artifacts were written.
-#[derive(Debug, Clone)]
-pub struct SteamArtifactPaths {
-    pub json_path: PathBuf,
-    pub log_path: PathBuf,
 }
 
 /// Instruction count from the run's `pe_runtime_steps` perf metric, if the
@@ -1506,7 +1521,11 @@ pub fn write_steam_bootstrap_artifacts(
     job: &RunnerJob,
     run_id: &str,
 ) -> AppResult<SteamArtifactPaths> {
-    let provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
+    // The execution mode travels with the run result (the zero-touch model
+    // recovery marks itself `model`); the artifact must keep that marker
+    // instead of re-deriving `real_pe` from the environment.
+    let mut provenance = crate::steam_milestones::RunProvenance::collect(&ge.root, &job.program);
+    provenance.execution_mode = pe_output.provenance.execution_mode.clone();
     let short_sha = if provenance.commit_sha.is_empty() || provenance.commit_sha == "unknown" {
         "unknown".to_string()
     } else {
@@ -1520,11 +1539,17 @@ pub fn write_steam_bootstrap_artifacts(
         program_sha256: crate::steam_milestones::file_content_hash(&job.program),
         milestones: pe_output.milestones.clone(),
         last_thunk: crate::steam_milestones::snapshot_last_thunk(),
-        exit_code: pe_output.exit_code,
-        jit: pe_output.jit_telemetry.clone(),
+        guest_pid: pe_output.synthetic_pid,
         termination: pe_output.termination,
+        termination_detail: pe_output.termination_detail.clone(),
+        exit_code: pe_output.exit_code,
         instruction_count: instruction_count_from_perf(pe_output),
+        guest_exceptions: pe_output.guest_exceptions.clone(),
         network_summary: network_summary_from_trace(pe_output),
+        metal_encoders_created: crate::metal_backend::METAL_ENCODERS_CREATED
+            .load(Ordering::Relaxed),
+        metal_encoders_ended: crate::metal_backend::METAL_ENCODERS_ENDED.load(Ordering::Relaxed),
+        jit: pe_output.jit_telemetry.clone(),
     };
 
     let diagnostics_dir = ge.diagnostics_dir();
@@ -1561,9 +1586,12 @@ pub fn write_steam_bootstrap_artifacts(
     log_lines.push(format!("timestamp: {}", provenance.timestamp_utc_rfc3339));
     log_lines.push(format!("host macOS: {}", provenance.host_os));
     log_lines.push(format!("host architecture: {}", provenance.host_arch));
+    log_lines.push(format!("execution mode: {}", provenance.execution_mode));
     log_lines.extend(milestones_log_lines(&pe_output.milestones));
-    log_lines.push(format!("exit_code: {}", pe_output.exit_code));
-    log_lines.push(format!("termination: {:?}", pe_output.termination));
+    log_lines.push(format!(
+        "termination: {:?} (exit_code {})",
+        pe_output.termination, pe_output.exit_code
+    ));
     log_lines.push(format!(
         "instruction_count: {}",
         artifact

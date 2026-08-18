@@ -39,6 +39,7 @@ const MANIFEST_VERBATIM: &str = r"\\?\C:\package\steam_client_win32.installed";
 /// Evidence used by the pure transition tests.
 fn evidence_at(pc: u64) -> MilestoneEvidence {
     MilestoneEvidence {
+        observed: true,
         guest_pc: pc,
         thread_id: 1,
         process_id: 42,
@@ -606,6 +607,7 @@ fn webhelper_spawn_request_vs_process_started_counters() {
 #[test]
 fn milestone_evidence_serialization_round_trip() {
     let evidence = MilestoneEvidence {
+        observed: true,
         guest_pc: 0x401_234,
         thread_id: 7,
         process_id: 42,
@@ -813,11 +815,16 @@ fn artifact_declares_explicit_identity_fields() {
         program_sha256: "ab".repeat(32),
         milestones: SteamMilestones::default(),
         last_thunk: None,
+        guest_pid: 1,
         jit: casa1::pe_runtime::JitTelemetry::default(),
         exit_code: 0,
         termination: ExecutionTermination::GuestExit { code: 0 },
+        termination_detail: None,
         instruction_count: Some(1),
+        guest_exceptions: vec![],
         network_summary: vec![],
+        metal_encoders_created: 0,
+        metal_encoders_ended: 0,
     };
     let json = serde_json::to_value(&artifact).expect("serialize artifact");
     assert_eq!(json["run_id"], "run-x");
