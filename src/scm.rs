@@ -102,6 +102,58 @@ pub enum VmState {
 }
 
 // ---------------------------------------------------------------------------
+// SCM backend kind
+// ---------------------------------------------------------------------------
+
+/// Which SCM backend a handle (or the controller) actually represents.
+///
+/// A `RealVZ` handle wraps a live native `VZVirtualMachine` object. A
+/// `Simulation` handle is a null unit-model — no native virtualization
+/// object exists behind it, so it must never be reported as a real running
+/// VM. `Unavailable` means this host cannot construct a native VM at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendKind {
+    /// A native `VZVirtualMachine` object exists behind the handle.
+    RealVZ,
+    /// Null unit-model/testing handle on a host that could create a real VM.
+    Simulation,
+    /// The host cannot create a native VM (no Virtualization framework).
+    Unavailable,
+}
+
+impl BackendKind {
+    /// Stable string form used in diagnostics and telemetry reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RealVZ => "real_vz",
+            Self::Simulation => "simulation",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Probe the host's ability to construct a native `VZVirtualMachine`.
+///
+/// Returns `Simulation` when the host could create one (so a null
+/// unit-model handle on such a host is a simulation), and `Unavailable`
+/// when it cannot (non-macOS hosts, or hosts without the Virtualization
+/// framework).
+fn scm_host_backend_capability() -> BackendKind {
+    #[cfg(target_os = "macos")]
+    {
+        if load_virtualization_framework() {
+            BackendKind::Simulation
+        } else {
+            BackendKind::Unavailable
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        BackendKind::Unavailable
+    }
+}
+
+// ---------------------------------------------------------------------------
 // virtio device states (legacy, kept for backward compatibility)
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +438,10 @@ pub struct VZVirtualMachineHandle {
     cached_state: VmState,
     /// Whether the VM was started at least once.
     started_once: bool,
+    /// The SCM backend this handle represents, recorded at construction so
+    /// every diagnostics/report surface can distinguish a real VZ VM from a
+    /// null unit-model and from an unavailable host.
+    backend_kind: BackendKind,
 }
 
 // SAFETY: VZVirtualMachine is documented as thread-safe for read operations.
@@ -408,10 +464,16 @@ impl VZVirtualMachineHandle {
             delegate: None,
             cached_state: VmState::Stopped,
             started_once: false,
+            backend_kind: BackendKind::RealVZ,
         }
     }
 
     /// Create a handle with a null pointer (for non-macOS or pre-initialization).
+    ///
+    /// The backend kind is recorded from the host capability probe: a null
+    /// handle on a host that could create a real VM is a `Simulation`
+    /// (unit-model/testing), while a host that cannot create one at all is
+    /// `Unavailable`.
     pub fn null(config: VZVirtualMachineConfiguration) -> Self {
         Self {
             vm: std::ptr::null_mut(),
@@ -419,43 +481,82 @@ impl VZVirtualMachineHandle {
             delegate: None,
             cached_state: VmState::Stopped,
             started_once: false,
+            backend_kind: scm_host_backend_capability(),
         }
+    }
+
+    /// Test-only constructor: a null handle with a forced backend kind, so
+    /// the `Unavailable` start() error path is exercised deterministically.
+    #[cfg(test)]
+    fn null_with_backend_kind(config: VZVirtualMachineConfiguration, kind: BackendKind) -> Self {
+        let mut handle = Self::null(config);
+        handle.backend_kind = kind;
+        handle
+    }
+
+    /// Report which SCM backend this handle represents.
+    ///
+    /// `RealVZ` means a live native `VZVirtualMachine` object exists behind
+    /// this handle. `Simulation` means the handle is a null unit-model
+    /// (never a real running VM). `Unavailable` means the host cannot create
+    /// a native VM.
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend_kind
     }
 
     /// Start the virtual machine.
     ///
     /// Calls `startWithCompletionHandler:` on the underlying VZVirtualMachine.
     /// On success the cached state transitions to `VmState::Running`.
+    ///
+    /// A `Simulation` (null unit-model) handle may transition its cached
+    /// state for unit-model lifecycle semantics, but the recorded backend
+    /// kind stays `Simulation` in every report — it is never presented as a
+    /// real running VM. An `Unavailable` backend fails with
+    /// [`ReasonCode::RcScmUnavailable`]: no native virtualization object can
+    /// exist on this host, so pretending to run would be a lie.
     pub fn start(&mut self) -> AppResult<()> {
-        // Null pointer → simulation mode: transition state directly.
-        if self.vm.is_null() {
-            self.cached_state = VmState::Running;
-            self.started_once = true;
-            return Ok(());
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            unsafe {
-                let started = Self::vz_start_sync(self.vm);
-                if started {
-                    self.cached_state = VmState::Running;
-                    self.started_once = true;
-                    Ok(())
-                } else {
-                    self.cached_state = VmState::Error;
-                    Err(AppError::new(
-                        ReasonCode::RcRunnerSpawnFailed,
-                        "SCM: VZVirtualMachine startWithCompletionHandler: failed",
-                    ))
+        match self.backend_kind {
+            BackendKind::RealVZ => {
+                #[cfg(target_os = "macos")]
+                {
+                    unsafe {
+                        let started = Self::vz_start_sync(self.vm);
+                        if started {
+                            self.cached_state = VmState::Running;
+                            self.started_once = true;
+                            Ok(())
+                        } else {
+                            self.cached_state = VmState::Error;
+                            Err(AppError::new(
+                                ReasonCode::RcRunnerSpawnFailed,
+                                "SCM: VZVirtualMachine startWithCompletionHandler: failed",
+                            ))
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // A non-null VZVirtualMachine cannot exist off-macOS by
+                    // construction (create_vz_virtual_machine is macOS-only).
+                    unreachable!("non-null VZVirtualMachine handle on non-macOS host")
                 }
             }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.cached_state = VmState::Running;
-            self.started_once = true;
-            Ok(())
+            BackendKind::Simulation => {
+                // Unit-model: no native virtualization object exists. The
+                // cached state may transition (unit-model semantics) but the
+                // backend kind stays `Simulation` in the diagnostics.
+                self.cached_state = VmState::Running;
+                self.started_once = true;
+                Ok(())
+            }
+            BackendKind::Unavailable => {
+                self.cached_state = VmState::Error;
+                Err(AppError::new(
+                    ReasonCode::RcScmUnavailable,
+                    "SCM: VZ backend is unavailable on this host",
+                ))
+            }
         }
     }
 
@@ -752,6 +853,7 @@ impl std::fmt::Debug for VZVirtualMachineHandle {
             .field("config", &self.config)
             .field("cached_state", &self.cached_state)
             .field("started_once", &self.started_once)
+            .field("backend", &self.backend_kind.as_str())
             .finish()
     }
 }
@@ -764,7 +866,6 @@ impl std::fmt::Debug for VZVirtualMachineHandle {
 ///
 /// Returns `true` if the framework was loaded successfully or was already loaded.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)] // platform capability probe (Virtualization framework); not yet wired
 fn load_virtualization_framework() -> bool {
     use std::sync::OnceLock;
     static LOADED: OnceLock<bool> = OnceLock::new();
@@ -3005,6 +3106,9 @@ pub struct ScmController {
     guest_memory_size: usize,
     /// Wall-clock timestamp of the last tick, used to track uptime.
     last_tick: Option<std::time::Instant>,
+    /// Recorded SCM backend kind, reported in the diagnostics surface
+    /// (`backend: "real_vz" | "simulation" | "unavailable"`).
+    pub backend_kind: BackendKind,
 }
 
 impl ScmController {
@@ -3040,6 +3144,7 @@ impl ScmController {
             total_instructions: 0,
             guest_memory_size,
             last_tick: None,
+            backend_kind: scm_host_backend_capability(),
             config,
         }
     }
@@ -3503,6 +3608,19 @@ impl ScmRunnerIntegration {
             self.controller.vm_state
         }
     }
+
+    /// The effective SCM backend kind for this integration.
+    ///
+    /// Once a real VM handle exists this is the handle's kind (`real_vz`);
+    /// otherwise the controller records the host capability (`simulation`
+    /// when the host could create a native VM but the handle is a null
+    /// unit-model, `unavailable` when it cannot).
+    pub fn backend_kind(&self) -> BackendKind {
+        self.vm_handle
+            .as_ref()
+            .map(|handle| handle.backend_kind())
+            .unwrap_or(self.controller.backend_kind)
+    }
 }
 
 impl std::fmt::Debug for ScmRunnerIntegration {
@@ -3515,6 +3633,7 @@ impl std::fmt::Debug for ScmRunnerIntegration {
             .field("has_net_bridge", &self.net_bridge.is_some())
             .field("secure_boot", &self.secure_boot)
             .field("measured_launch", &self.measured_launch)
+            .field("backend", &self.backend_kind().as_str())
             .finish()
     }
 }
@@ -4080,5 +4199,109 @@ mod tests {
 
         let dpcs2 = shim.drain_dpcs();
         assert!(dpcs2.is_empty());
+    }
+
+    #[test]
+    fn backend_kind_strings_are_stable_and_distinct() {
+        assert_eq!(BackendKind::RealVZ.as_str(), "real_vz");
+        assert_eq!(BackendKind::Simulation.as_str(), "simulation");
+        assert_eq!(BackendKind::Unavailable.as_str(), "unavailable");
+        assert_ne!(
+            BackendKind::RealVZ.as_str(),
+            BackendKind::Simulation.as_str()
+        );
+        assert_ne!(
+            BackendKind::Simulation.as_str(),
+            BackendKind::Unavailable.as_str()
+        );
+    }
+
+    #[test]
+    fn vz_null_handle_reports_simulation_backend() {
+        let config = VZVirtualMachineConfiguration {
+            cpu_count: 2,
+            memory_size: 1024 * 1024 * 1024,
+            boot_loader: VZBootLoader::Linux {
+                kernel_path: "/tmp/vmlinuz".to_string(),
+                initrd_path: None,
+                command_line: "console=hvc0".to_string(),
+            },
+            devices: vec![VZDeviceConfiguration::Entropy],
+        };
+
+        let mut handle = VZVirtualMachineHandle::null(config);
+
+        // A null-VM handle must never be mistaken for a real VZ backend.
+        assert_eq!(handle.backend_kind(), BackendKind::Simulation);
+        assert_ne!(handle.backend_kind(), BackendKind::RealVZ);
+
+        // The unit-model may transition its cached state, but it stays a
+        // Simulation — never "Running as a real VM".
+        handle.start().expect("simulation start must succeed");
+        assert_eq!(handle.state(), VmState::Running);
+        assert_eq!(handle.backend_kind(), BackendKind::Simulation);
+        assert_ne!(handle.backend_kind(), BackendKind::RealVZ);
+
+        let report = format!("{handle:?}");
+        assert!(report.contains("backend: \"simulation\""), "{report}");
+        assert!(!report.contains("backend: \"real_vz\""), "{report}");
+    }
+
+    #[test]
+    fn vz_unavailable_backend_start_fails_explicitly() {
+        let config = VZVirtualMachineConfiguration {
+            cpu_count: 2,
+            memory_size: 1024 * 1024 * 1024,
+            boot_loader: VZBootLoader::Linux {
+                kernel_path: "/tmp/vmlinuz".to_string(),
+                initrd_path: None,
+                command_line: "console=hvc0".to_string(),
+            },
+            devices: vec![VZDeviceConfiguration::Entropy],
+        };
+
+        let mut handle =
+            VZVirtualMachineHandle::null_with_backend_kind(config, BackendKind::Unavailable);
+        assert_eq!(handle.backend_kind(), BackendKind::Unavailable);
+
+        let err = handle.start().unwrap_err();
+        assert_eq!(err.code, ReasonCode::RcScmUnavailable);
+        assert_eq!(handle.state(), VmState::Error);
+        assert_eq!(handle.backend_kind(), BackendKind::Unavailable);
+    }
+
+    #[test]
+    fn scm_diagnostics_carry_backend_kind() {
+        // The controller records the backend kind in its diagnostics.
+        let controller = ScmController::new(ScmConfig::default());
+        assert_eq!(controller.backend_kind, BackendKind::Simulation);
+        let controller_report = format!("{controller:?}");
+        assert!(
+            controller_report.contains("backend_kind: Simulation"),
+            "{controller_report}"
+        );
+
+        // The integration report carries `backend: "simulation"` before and
+        // after a unit-model launch, and never claims a real VZ backend.
+        let mut integration = ScmRunnerIntegration::new(ScmConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(integration.backend_kind(), BackendKind::Simulation);
+        let report = format!("{integration:?}");
+        assert!(report.contains("backend: \"simulation\""), "{report}");
+
+        integration.launch_vm().expect("unit-model launch");
+        assert_eq!(integration.get_vm_state(), VmState::Running);
+        assert_eq!(integration.backend_kind(), BackendKind::Simulation);
+        let report_after_launch = format!("{integration:?}");
+        assert!(
+            report_after_launch.contains("backend: \"simulation\""),
+            "{report_after_launch}"
+        );
+        assert!(
+            !report_after_launch.contains("backend: \"real_vz\""),
+            "{report_after_launch}"
+        );
     }
 }

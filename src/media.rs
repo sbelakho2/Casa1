@@ -233,6 +233,12 @@ pub const MF_MT_CHANNELS: Guid = Guid::new(
     0x4a37,
     [0xbe, 0xd5, 0x16, 0x63, 0x12, 0xdd, 0xd8, 0x40],
 );
+pub const MF_MT_AUDIO_BITS_PER_SAMPLE: Guid = Guid::new(
+    0xf2deb57f,
+    0x40fa,
+    0x4764,
+    [0xaa, 0x33, 0x99, 0xc5, 0xec, 0x50, 0x0d, 0x97],
+);
 pub const MF_MT_BITRATE: Guid = Guid::new(
     0x203d3e7e,
     0x5c4a,
@@ -1623,12 +1629,41 @@ mod aac_decoder_mft {
         m_reserved: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct AudioBuffer {
+        m_number_channels: u32,
+        m_data_byte_size: u32,
+        m_data: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct AudioBufferList {
+        m_number_buffers: u32,
+        m_buffers: [AudioBuffer; 1],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct AudioStreamPacketDescription {
+        m_start_offset: i64,
+        m_variable_frames_in_packet: u32,
+        m_data_byte_size: u32,
+    }
+
     // AudioToolbox FourCC format IDs (not Media Foundation / WAVE values).
     const kAudioFormatMPEG4AAC: u32 = 0x6161_6320; // 'aac '
     const kAudioFormatLinearPCM: u32 = 0x6C70_636D; // 'lpcm'
-    const kAudioFormatFlagIsSignedInteger: u32 = 1 << 0;
-    const kAudioFormatFlagIsPacked: u32 = 1 << 1;
+    // CoreAudio PCM format flags (kAudioFormatFlagIsSignedInteger = 1<<2,
+    // kAudioFormatFlagIsPacked = 1<<3): together they describe interleaved
+    // little-endian signed integer PCM.
+    const kAudioFormatFlagIsSignedInteger: u32 = 1 << 2;
+    const kAudioFormatFlagIsPacked: u32 = 1 << 3;
     const noErr: i32 = 0;
+    // kAudioConverterDecompressionMagicCookie ('dmgc') — the AudioSpecificConfig
+    // (codec private data) the decoder needs for raw (non-ADTS) AAC frames.
+    const kAudioConverterDecompressionMagicCookie: u32 = 0x646D_6763; // 'dmgc'
 
     #[link(name = "AudioToolbox", kind = "framework")]
     unsafe extern "C" {
@@ -1639,20 +1674,116 @@ mod aac_decoder_mft {
         ) -> i32;
 
         fn AudioConverterDispose(converter: AudioConverterRef) -> i32;
+
+        fn AudioConverterFillComplexBuffer(
+            in_audio_converter: AudioConverterRef,
+            in_input_data_proc: AudioConverterComplexInputDataProc,
+            in_input_data_proc_user_data: *mut std::ffi::c_void,
+            io_output_data_packet_size: *mut u32,
+            out_output_data: *mut AudioBufferList,
+            out_packet_description: *mut AudioStreamPacketDescription,
+        ) -> i32;
+
+        fn AudioConverterSetProperty(
+            in_audio_converter: AudioConverterRef,
+            in_property_id: u32,
+            in_property_data_size: u32,
+            in_property_data: *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    type AudioConverterComplexInputDataProc = unsafe extern "C" fn(
+        AudioConverterRef,
+        *mut u32,
+        *mut AudioBufferList,
+        *mut *mut AudioStreamPacketDescription,
+        *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// State handed to the decoder's `AudioConverterFillComplexBuffer` input
+    /// proc: the compressed packet to feed, one packet at a time.
+    struct InputDataContext {
+        data: Vec<u8>,
+        consumed: bool,
+        packet_desc: AudioStreamPacketDescription,
+    }
+
+    /// A compressed AAC packet waiting to be decoded.
+    struct PendingPacket {
+        data: Vec<u8>,
+        time: i64,
+        duration: i64,
+    }
+
+    /// Decoded PCM ready for `process_output`, with the input sample's
+    /// timestamp/duration preserved.
+    struct DecodedPcm {
+        pcm: Vec<u8>,
+        time: i64,
+        duration: i64,
+    }
+
+    /// Input proc for `AudioConverterFillComplexBuffer`: feeds exactly one
+    /// compressed AAC packet per call.
+    unsafe extern "C" fn fill_complex_input_proc(
+        _in_audio_converter: AudioConverterRef,
+        io_number_data_packets: *mut u32,
+        io_data: *mut AudioBufferList,
+        out_data_packet_description: *mut *mut AudioStreamPacketDescription,
+        in_user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let ctx = unsafe { &mut *(in_user_data as *mut InputDataContext) };
+        let requested = unsafe { *io_number_data_packets };
+        if ctx.consumed || ctx.data.is_empty() || requested == 0 {
+            unsafe { *io_number_data_packets = 0 };
+            return noErr;
+        }
+        let buffers = unsafe { &mut *io_data };
+        if buffers.m_number_buffers == 0 {
+            unsafe { *io_number_data_packets = 0 };
+            return noErr;
+        }
+        let buffer = &mut buffers.m_buffers[0];
+        let capacity = buffer.m_data_byte_size as usize;
+        let n = ctx.data.len().min(capacity);
+        if n > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(ctx.data.as_ptr(), buffer.m_data as *mut u8, n);
+            }
+        }
+        buffer.m_data_byte_size = n as u32;
+        if !out_data_packet_description.is_null() {
+            unsafe {
+                *out_data_packet_description =
+                    &mut ctx.packet_desc as *mut AudioStreamPacketDescription;
+            }
+        }
+        ctx.consumed = true;
+        unsafe { *io_number_data_packets = 1 };
+        noErr
     }
 
     /// AAC decoder using macOS AudioToolbox, implementing MftTransform.
     ///
-    /// Note: real AAC decoding (via `AudioConverterFillComplexBuffer`) is
-    /// not implemented yet; the transform validates formats, creates the
-    /// converter, and deliberately produces no output instead of fabricating
-    /// silence.
+    /// Input is compressed AAC (raw packets or ADTS); the input media type
+    /// may carry the AudioSpecificConfig codec private data in
+    /// `MF_MT_USER_DATA` (used as the decompression magic cookie). Each
+    /// `process_input` decodes its packet synchronously via
+    /// `AudioConverterFillComplexBuffer` and queues the PCM; `process_output`
+    /// hands the decoded sample out with the input sample's time/duration.
     pub struct AacDecoderMft {
         converter: Option<AudioConverterRef>,
         input_desc: AudioStreamBasicDescription,
         output_desc: AudioStreamBasicDescription,
         channels: u32,
         sample_rate: f64,
+        /// Codec private data (AudioSpecificConfig) from MF_MT_USER_DATA,
+        /// applied as the decompression magic cookie.
+        magic_cookie: Option<Vec<u8>>,
+        /// Compressed packet being decoded.
+        pending_input: Option<PendingPacket>,
+        /// Decoded PCM samples awaiting `process_output`.
+        pending_output: VecDeque<DecodedPcm>,
     }
 
     impl AacDecoderMft {
@@ -1664,7 +1795,81 @@ mod aac_decoder_mft {
                 output_desc: unsafe { std::mem::zeroed() },
                 channels: 2,
                 sample_rate: 44100.0,
+                magic_cookie: None,
+                pending_input: None,
+                pending_output: VecDeque::new(),
             }
+        }
+
+        /// Decode one compressed packet into PCM via AudioConverterFillComplexBuffer.
+        ///
+        /// The converter is expected to exist (created in `process_input`).
+        /// Decoded PCM is appended to `pending_output` with the input
+        /// sample's time/duration, or nothing is queued when the converter
+        /// produced no output (e.g. an empty packet).
+        fn decode_packet(&mut self, packet: &PendingPacket) -> AppResult<()> {
+            let Some(converter) = self.converter else {
+                return Ok(());
+            };
+            if packet.data.is_empty() {
+                return Ok(());
+            }
+
+            let frames_per_packet = self.input_desc.m_frames_per_packet.max(1) as usize;
+            let bytes_per_frame = self.output_desc.m_bytes_per_frame.max(1) as usize;
+            let out_capacity = frames_per_packet.saturating_mul(bytes_per_frame);
+            let mut pcm = vec![0u8; out_capacity];
+
+            let mut input_ctx = InputDataContext {
+                data: packet.data.clone(),
+                consumed: false,
+                packet_desc: AudioStreamPacketDescription {
+                    m_start_offset: 0,
+                    m_variable_frames_in_packet: 0,
+                    m_data_byte_size: packet.data.len() as u32,
+                },
+            };
+
+            let mut buffer_list = AudioBufferList {
+                m_number_buffers: 1,
+                m_buffers: [AudioBuffer {
+                    m_number_channels: 0,
+                    m_data_byte_size: out_capacity as u32,
+                    m_data: pcm.as_mut_ptr() as *mut std::ffi::c_void,
+                }],
+            };
+
+            let mut packets = frames_per_packet as u32;
+            let status = unsafe {
+                AudioConverterFillComplexBuffer(
+                    converter,
+                    fill_complex_input_proc,
+                    &mut input_ctx as *mut InputDataContext as *mut std::ffi::c_void,
+                    &mut packets,
+                    &mut buffer_list,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != noErr {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!("AAC decode failed with AudioToolbox status {status}"),
+                ));
+            }
+
+            let produced = buffer_list.m_buffers[0].m_data_byte_size as usize;
+            if produced == 0 || packets == 0 {
+                // The converter buffered the input without producing output
+                // yet; nothing to hand out.
+                return Ok(());
+            }
+            pcm.truncate(produced);
+            self.pending_output.push_back(DecodedPcm {
+                pcm,
+                time: packet.time,
+                duration: packet.duration,
+            });
+            Ok(())
         }
     }
 
@@ -1724,14 +1929,59 @@ mod aac_decoder_mft {
                 m_reserved: 0,
             };
 
+            // Codec private data (AudioSpecificConfig) for raw AAC packets.
+            self.magic_cookie = media_type.get_blob(&MF_MT_USER_DATA).map(|b| b.to_vec());
+
+            // The input format may have changed: rebuild the converter lazily.
+            if let Some(converter) = self.converter.take() {
+                unsafe {
+                    AudioConverterDispose(converter);
+                }
+            }
+
             Ok(())
         }
 
-        fn set_output_type(
-            &mut self,
-            _stream_id: u32,
-            _media_type: &ImfMediaType,
-        ) -> AppResult<()> {
+        fn set_output_type(&mut self, _stream_id: u32, media_type: &ImfMediaType) -> AppResult<()> {
+            let sample_rate = media_type
+                .get_uint32(&MF_MT_SAMPLE_RATE)
+                .unwrap_or(self.sample_rate as u32);
+            let channels = media_type
+                .get_uint32(&MF_MT_CHANNELS)
+                .unwrap_or(self.channels);
+            let bits = media_type
+                .get_uint32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
+                .unwrap_or(16);
+            if bits != 16 && bits != 32 {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!(
+                        "AAC decoder output type requires 16 or 32 bits per sample, got {bits}"
+                    ),
+                ));
+            }
+
+            self.sample_rate = sample_rate as f64;
+            self.channels = channels;
+            self.output_desc = AudioStreamBasicDescription {
+                m_sample_rate: self.sample_rate,
+                m_format_id: kAudioFormatLinearPCM,
+                m_format_flags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+                m_bytes_per_packet: channels * bits / 8,
+                m_frames_per_packet: 1,
+                m_bytes_per_frame: channels * bits / 8,
+                m_channels_per_frame: channels,
+                m_bits_per_channel: bits,
+                m_reserved: 0,
+            };
+
+            // The output format may have changed: rebuild the converter lazily.
+            if let Some(converter) = self.converter.take() {
+                unsafe {
+                    AudioConverterDispose(converter);
+                }
+            }
+
             Ok(())
         }
 
@@ -1758,13 +2008,17 @@ mod aac_decoder_mft {
             mt.set_guid(MF_MT_SUBTYPE, MFAudioFormat_PCM);
             mt.set_uint32(MF_MT_SAMPLE_RATE, self.sample_rate as u32);
             mt.set_uint32(MF_MT_CHANNELS, self.channels);
+            mt.set_uint32(
+                MF_MT_AUDIO_BITS_PER_SAMPLE,
+                self.output_desc.m_bits_per_channel,
+            );
             Ok(mt)
         }
 
         fn process_input(
             &mut self,
             _stream_id: u32,
-            _sample: &ImfSample,
+            sample: &ImfSample,
             _flags: u32,
         ) -> AppResult<()> {
             if self.converter.is_none() {
@@ -1781,29 +2035,71 @@ mod aac_decoder_mft {
                             format!("AudioConverterNew failed with status {status}"),
                         ));
                     }
+                    // Apply the codec private data (AudioSpecificConfig) as
+                    // the decompression magic cookie so raw (non-ADTS) AAC
+                    // packets decode.
+                    if let Some(cookie) = self.magic_cookie.as_deref() {
+                        let set_status = AudioConverterSetProperty(
+                            converter,
+                            kAudioConverterDecompressionMagicCookie,
+                            cookie.len() as u32,
+                            cookie.as_ptr() as *const std::ffi::c_void,
+                        );
+                        if set_status != noErr {
+                            AudioConverterDispose(converter);
+                            return Err(AppError::new(
+                                ReasonCode::RcMediaInvalid,
+                                format!(
+                                    "AudioConverterSetProperty(decompression magic cookie) \
+                                     failed with status {set_status}"
+                                ),
+                            ));
+                        }
+                    }
                     self.converter = Some(converter);
                 }
             }
-            // Real AAC decode is not implemented; input is accepted so the
-            // format negotiation succeeds, and process_output reports no
-            // output rather than fabricating silence.
-            Ok(())
+
+            // Decode the compressed packet right away; the PCM (plus the
+            // input sample's time/duration) is handed out by process_output.
+            self.pending_input = Some(PendingPacket {
+                data: sample.buffer.clone(),
+                time: sample.sample_time,
+                duration: sample.sample_duration,
+            });
+            let packet = self
+                .pending_input
+                .take()
+                .expect("pending input set just above");
+            self.decode_packet(&packet)
         }
 
         fn process_output(
             &mut self,
             _stream_id: u32,
-            _sample: &mut ImfSample,
+            sample: &mut ImfSample,
             flags: &mut u32,
         ) -> AppResult<()> {
-            // No decoded output is available until the AAC decode loop
-            // (AudioConverterFillComplexBuffer) is implemented.
-            *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+            let Some(decoded) = self.pending_output.pop_front() else {
+                *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+                return Ok(());
+            };
+
+            sample.buffer = decoded.pcm;
+            sample.sample_time = decoded.time;
+            sample.sample_duration = decoded.duration;
+            *flags = 0;
             Ok(())
         }
 
         fn has_output(&self) -> bool {
-            false
+            !self.pending_output.is_empty()
+        }
+
+        fn flush(&mut self) -> AppResult<()> {
+            self.pending_input = None;
+            self.pending_output.clear();
+            Ok(())
         }
     }
 }
@@ -4557,6 +4853,139 @@ mod tests {
         assert_eq!(
             output_type.get_guid(&MF_MT_SUBTYPE),
             Some(MFAudioFormat_PCM)
+        );
+    }
+
+    /// One real AAC frame (AAC-LC, 44.1 kHz, stereo) produced by the system
+    /// AAC encoder (`afconvert -f adts -d aac` on a 440 Hz sine wave), with
+    /// the 7-byte ADTS header stripped — a raw AAC data block.
+    ///
+    /// `AAC_FIXTURE_COOKIE` is the matching AudioSpecificConfig as an
+    /// MPEG-4 `esds` descriptor blob, as delivered to
+    /// `kAudioConverterDecompressionMagicCookie`. The raw-packet + cookie
+    /// pairing is how MF pipelines carry AAC codec private data
+    /// (`MF_MT_USER_DATA`).
+    #[cfg(target_os = "macos")]
+    const AAC_FIXTURE_FRAME: &[u8] = &[
+        0x21, 0x4E, 0xEF, 0x51, 0x07, 0xE2, 0xCD, 0x38, 0x66, 0xC2, 0x3E, 0x3E, 0x3E, 0x3E, 0xB5,
+        0xAC, 0x98, 0x87, 0x5A, 0x06, 0xF2, 0xFF, 0xE9, 0xC0, 0xBF, 0xD6, 0x81, 0x44, 0x47, 0xFA,
+        0xF0, 0x30, 0x0F, 0xF7, 0x9D, 0xD8, 0xA3, 0x73, 0x6E, 0xB1, 0x72, 0x9E, 0x37, 0x12, 0xD7,
+        0x55, 0x28, 0x0E, 0x98, 0x96, 0x68, 0x63, 0x63, 0x80, 0x0D, 0x51, 0x2E, 0xD0, 0xEF, 0xBB,
+        0x70, 0x81, 0xC7, 0x29, 0x4A, 0x37, 0x6B, 0x9C, 0x80, 0xEA, 0x99, 0x85, 0x5D, 0xAE, 0x75,
+        0xAD, 0xB0, 0x16, 0xA5, 0xCE, 0x65, 0xA6, 0x56, 0xA5, 0xAB, 0x36, 0xDA, 0xB6, 0x32, 0x96,
+        0xA5, 0xB4, 0xCB, 0x44, 0xAD, 0x4B, 0x57, 0xFD, 0x37, 0xFB, 0x33, 0xA4, 0xF4, 0x99, 0x3F,
+        0xFA, 0x5F, 0x07, 0x64, 0x74, 0x9E, 0x93, 0xCC, 0x1B, 0x3B, 0x3B, 0x20, 0x08, 0x70, 0xFC,
+        0x07, 0xE1, 0x0E, 0xB4, 0x0D, 0xE5, 0xFF, 0xD3, 0x81, 0x7F, 0xAD, 0x02, 0x88, 0x8F, 0xF5,
+        0xE0, 0x60, 0x1F, 0xEF, 0x70,
+    ];
+
+    #[cfg(target_os = "macos")]
+    const AAC_FIXTURE_COOKIE: &[u8] = &[
+        0x03, 0x80, 0x80, 0x80, 0x22, 0x00, 0x00, 0x00, 0x04, 0x80, 0x80, 0x80, 0x14, 0x40, 0x14,
+        0x00, 0x18, 0x00, 0x00, 0x00, 0x45, 0x88, 0x00, 0x01, 0xF4, 0x00, 0x05, 0x80, 0x80, 0x80,
+        0x02, 0x12, 0x10, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
+    ];
+
+    /// Decode a real AAC frame: feed the canned compressed packet (raw AAC
+    /// data block + AudioSpecificConfig cookie via `MF_MT_USER_DATA`) through
+    /// the MFT and assert the decode chain produces non-empty PCM with the
+    /// negotiated format and preserved timestamps.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_mft_aac_decoder_decodes_real_aac_frame() {
+        let mut decoder = AacDecoderMft::new();
+
+        let mut input_type = decoder.get_input_available_type(0, 0).unwrap();
+        input_type.set_uint32(MF_MT_SAMPLE_RATE, 44100);
+        input_type.set_uint32(MF_MT_CHANNELS, 2);
+        input_type.set_blob(MF_MT_USER_DATA, AAC_FIXTURE_COOKIE.to_vec());
+        decoder.set_input_type(0, &input_type).unwrap();
+
+        // The output type must carry the negotiated format: sample rate,
+        // channels, bit depth.
+        let mut output_type = decoder.get_output_available_type(0, 0).unwrap();
+        output_type.set_uint32(MF_MT_SAMPLE_RATE, 44100);
+        output_type.set_uint32(MF_MT_CHANNELS, 2);
+        output_type.set_uint32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        decoder.set_output_type(0, &output_type).unwrap();
+        assert_eq!(
+            output_type.get_uint32(&MF_MT_SAMPLE_RATE),
+            Some(44100),
+            "output type must carry the negotiated sample rate"
+        );
+        assert_eq!(
+            output_type.get_uint32(&MF_MT_CHANNELS),
+            Some(2),
+            "output type must carry the negotiated channel count"
+        );
+        assert_eq!(
+            output_type.get_uint32(&MF_MT_AUDIO_BITS_PER_SAMPLE),
+            Some(16),
+            "output type must carry the negotiated bit depth"
+        );
+
+        // Compressed packet → decoder → PCM → timestamp/duration chain.
+        let mut input = ImfSample::new(AAC_FIXTURE_FRAME.to_vec());
+        input.set_sample_time(123_456); // 100-ns units
+        input.set_sample_duration(232_199); // 1024 frames @ 44.1 kHz
+        decoder
+            .process_input(0, &input, 0)
+            .expect("decode AAC packet");
+
+        assert!(decoder.has_output(), "decode must produce output");
+        let mut output = ImfSample::empty();
+        let mut flags = 0;
+        decoder
+            .process_output(0, &mut output, &mut flags)
+            .expect("retrieve decoded PCM");
+        assert_eq!(
+            flags & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE,
+            0,
+            "a decoded sample must be produced, not NO_SAMPLE"
+        );
+        assert!(!output.buffer.is_empty(), "decoded PCM must not be empty");
+
+        // Timestamps/durations are preserved from the input sample.
+        assert_eq!(output.get_sample_time(), 123_456);
+        assert_eq!(output.get_sample_duration(), 232_199);
+
+        // 1024 frames × 2 channels × 2 bytes (16-bit PCM).
+        assert_eq!(
+            output.buffer.len(),
+            1024 * 2 * 2,
+            "decoded PCM must be exactly one 1024-frame stereo frame"
+        );
+        // The fixture is a 440 Hz sine wave, so the decoded samples are
+        // non-zero.
+        let non_zero = output
+            .buffer
+            .chunks_exact(2)
+            .any(|s| u16::from_le_bytes([s[0], s[1]]) != 0);
+        assert!(non_zero, "decoded PCM must contain non-zero samples");
+
+        // A second input packet decodes too, and an empty queue reports
+        // NO_SAMPLE afterwards.
+        decoder
+            .process_input(0, &input, 0)
+            .expect("decode second packet");
+        assert!(decoder.has_output());
+        let mut output2 = ImfSample::empty();
+        let mut flags2 = 0;
+        decoder
+            .process_output(0, &mut output2, &mut flags2)
+            .expect("retrieve second PCM");
+        assert_eq!(flags2 & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, 0);
+        assert!(!output2.buffer.is_empty());
+
+        let mut drained = ImfSample::empty();
+        let mut drained_flags = 0;
+        decoder
+            .process_output(0, &mut drained, &mut drained_flags)
+            .expect("drain");
+        assert_eq!(
+            drained_flags & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE,
+            MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE,
+            "no further output after the queue is drained"
         );
     }
 

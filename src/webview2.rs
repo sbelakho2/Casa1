@@ -2,6 +2,19 @@
 // WebView2 COM Interface Wrapper — backed by native macOS WKWebView via
 // Objective-C FFI using the `objc` crate.
 //
+// CAPABILITY LEVEL: `WebView2BasicWebKitShim`.
+//
+// This module is a WKWebView-based shim. It is suitable for navigation and
+// JS-injection workloads (Steam's embedded browser surface), but it is NOT
+// semantically equivalent to the Chromium WebView2 runtime: the JS engine
+// (WKJavaScriptCore vs V8), the COM surface (ICoreWebView2* vtables are
+// emulated, not implemented by WebView2's real COM objects), the process
+// model (WKWebView runs in WebKit's processes, not msedgewebview2.exe
+// child processes), the DevTools protocol, WebResourceRequested,
+// composition controller integration, and the WebView2 extension surface
+// are all absent. The eventual Chromium-compatible backend is a separate
+// program, not this shim.
+//
 // Steam.exe and other apps may load webview2.dll and call the
 // CreateWebView2Environment entry point to obtain an ICoreWebView2Environment,
 // from which they create controllers and webview instances.
@@ -42,6 +55,28 @@ pub const E_UNEXPECTED: u64 = 0x8000_FFFF;
 pub const E_POINTER: u64 = 0x8000_4003;
 /// HRESULT class not available (CLASS_E_CLASSNOTAVAILABLE).
 pub const E_CLASSNOTAVAILABLE: u64 = 0x8004_0111;
+
+// ---------------------------------------------------------------------------
+// Capability level
+// ---------------------------------------------------------------------------
+
+/// Honest capability label for this WebView2 compatibility layer.
+///
+/// This is a WKWebView-based shim: navigation and JS-injection workloads
+/// work, but it is NOT semantically equivalent to the Chromium WebView2
+/// runtime (JS engine, COM surface, process model, DevTools protocol,
+/// WebResourceRequested, composition controller, and extensions are not
+/// provided). The eventual Chromium-compatible backend is a separate
+/// program.
+pub const CAPABILITY_LEVEL: &str = "WebView2BasicWebKitShim";
+
+/// Get the capability level of this WebView2 compatibility layer.
+///
+/// Every CLI/reporting surface must carry this value so a consumer never
+/// mistakes the WKWebView shim for the real Chromium WebView2 runtime.
+pub fn capability_level() -> &'static str {
+    CAPABILITY_LEVEL
+}
 
 // ---------------------------------------------------------------------------
 // Navigation callback types
@@ -1790,6 +1825,32 @@ impl WebView2Runtime {
     }
 }
 
+/// Diagnostic snapshot of the WebView2 compatibility layer for CLI /
+/// telemetry reporting surfaces.
+#[derive(Debug, Clone)]
+pub struct WebView2Diagnostics {
+    /// Honest capability label: `WebView2BasicWebKitShim` (WKWebView-based,
+    /// not the Chromium WebView2 runtime).
+    pub capability_level: &'static str,
+    pub environment_count: usize,
+    pub controller_count: usize,
+    pub webview_count: usize,
+}
+
+impl WebView2Runtime {
+    /// Diagnostics snapshot; every report carries the capability level so
+    /// the WKWebView shim is never mistaken for a real Chromium WebView2
+    /// runtime.
+    pub fn diagnostics(&self) -> WebView2Diagnostics {
+        WebView2Diagnostics {
+            capability_level: capability_level(),
+            environment_count: self.environments.len(),
+            controller_count: self.controllers.len(),
+            webview_count: self.webviews.len(),
+        }
+    }
+}
+
 impl Default for WebView2Runtime {
     fn default() -> Self {
         Self::new()
@@ -2771,6 +2832,32 @@ mod tests {
         }
         assert!(env.controllers.is_empty());
         assert!(env.browser_exe_path.is_none());
+    }
+
+    /// The capability level must be reported honestly: this layer is a
+    /// WKWebView shim, never the Chromium WebView2 runtime.
+    #[test]
+    fn test_webview2_capability_level() {
+        assert_eq!(capability_level(), "WebView2BasicWebKitShim");
+        assert_eq!(CAPABILITY_LEVEL, "WebView2BasicWebKitShim");
+
+        let mut runtime = WebView2Runtime::new();
+        let diag = runtime.diagnostics();
+        assert_eq!(diag.capability_level, "WebView2BasicWebKitShim");
+        assert_eq!(diag.environment_count, 0);
+        assert_eq!(diag.controller_count, 0);
+        assert_eq!(diag.webview_count, 0);
+
+        runtime.create_environment(0);
+        let diag = runtime.diagnostics();
+        assert_eq!(diag.capability_level, "WebView2BasicWebKitShim");
+        assert_eq!(diag.environment_count, 1);
+
+        let report = format!("{diag:?}");
+        assert!(
+            report.contains("WebView2BasicWebKitShim"),
+            "diagnostics report must carry the capability level: {report}"
+        );
     }
 
     /// Test that callbacks can be registered and unregistered.

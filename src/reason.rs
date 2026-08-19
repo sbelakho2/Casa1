@@ -66,6 +66,7 @@ pub enum ReasonCode {
     RcInvalidState = 2108,
     RcNotFound = 2109,
     RcGfxFormatUnsupported = 2110,
+    RcScmUnavailable = 2111,
     RcAudioUnsupported = 2200,
     RcAudioBufferSizeMismatch = 2201,
     RcWinsockWouldBlock = 2300,
@@ -183,6 +184,7 @@ impl ReasonCode {
             2108 => Some(Self::RcInvalidState),
             2109 => Some(Self::RcNotFound),
             2110 => Some(Self::RcGfxFormatUnsupported),
+            2111 => Some(Self::RcScmUnavailable),
             2200 => Some(Self::RcAudioUnsupported),
             2201 => Some(Self::RcAudioBufferSizeMismatch),
             2300 => Some(Self::RcWinsockWouldBlock),
@@ -307,6 +309,7 @@ impl ReasonCode {
             Self::RcInvalidState => "RC_INVALID_STATE",
             Self::RcNotFound => "RC_NOT_FOUND",
             Self::RcGfxFormatUnsupported => "RC_GFX_FORMAT_UNSUPPORTED",
+            Self::RcScmUnavailable => "RC_SCM_UNAVAILABLE",
             Self::RcNetDnsResolutionFailed => "RC_NET_DNS_RESOLUTION_FAILED",
             Self::RcNetConnectionFailed => "RC_NET_CONNECTION_FAILED",
             Self::RcNetWriteFailed => "RC_NET_WRITE_FAILED",
@@ -450,6 +453,7 @@ mod tests {
             (ReasonCode::RcInvalidState, 2108),
             (ReasonCode::RcNotFound, 2109),
             (ReasonCode::RcGfxFormatUnsupported, 2110),
+            (ReasonCode::RcScmUnavailable, 2111),
             (ReasonCode::RcAudioUnsupported, 2200),
             (ReasonCode::RcAudioBufferSizeMismatch, 2201),
             (ReasonCode::RcWinsockWouldBlock, 2300),
@@ -544,6 +548,7 @@ mod tests {
             ReasonCode::RcSandboxPathViolation,
             ReasonCode::RcEntitlementValidationError,
             ReasonCode::RcCrashRecoveryError,
+            ReasonCode::RcScmUnavailable,
         ] {
             let value = code.as_u32();
             assert_eq!(
