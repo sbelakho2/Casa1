@@ -3124,6 +3124,7 @@ impl Mp4Demuxer {
 ///
 /// Reads media samples from a file, demuxing and optionally decoding.
 /// Mirrors IMFSourceReader functionality.
+#[allow(dead_code)] // MFT decoder slot for future media-foundation transform
 pub struct SourceReader {
     demuxer: Mp4Demuxer,
     selected_streams: Vec<u32>,

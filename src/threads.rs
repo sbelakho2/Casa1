@@ -39,8 +39,10 @@ pub fn lock_with_recovery<T>(mtx: &Mutex<T>) -> MutexGuard<'_, T> {
 // Thread ID allocation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // guest TID allocation (thread ID table); not yet wired
 static NEXT_GUEST_TID: AtomicU32 = AtomicU32::new(1);
 
+#[allow(dead_code)] // guest TID allocation (thread ID table); not yet wired
 fn allocate_thread_id() -> u32 {
     NEXT_GUEST_TID.fetch_add(1, Ordering::Relaxed)
 }
@@ -1562,6 +1564,7 @@ const ENHANCED_POOL_TIMER_POLL_MS: u64 = 100;
 
 /// A wait registration (for RegisterWaitForSingleObject).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // alertable-wait registration state; not yet wired
 struct WaitRegistration {
     /// Handle being waited on.
     pub handle: u32,

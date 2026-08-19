@@ -1736,9 +1736,11 @@ const CDN_ROUTING_URL: &str = "https://api.steampowered.com/ICMService/GetConten
 const CONTENT_SERVER_TTL_SECS: u64 = 900; // 15 min
 
 /// Default chunk size used for downloading depot content (1 MiB).
+#[allow(dead_code)] // UGC chunking policy constants; not yet referenced
 const DEFAULT_CHUNK_SIZE: u32 = 1_048_576;
 
 /// Maximum concurrent chunk downloads per session.
+#[allow(dead_code)] // UGC chunking policy constants; not yet referenced
 const MAX_CONCURRENT_CHUNKS: usize = 4;
 
 /// Maximum retries for downloading a single chunk.

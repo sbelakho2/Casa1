@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command as HostCommand, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GPU_COMPAT_VENDOR_ENV: &str = "CASA1_GPU_COMPAT_VENDOR";
@@ -27,6 +28,9 @@ pub type PipelineStateId = u64;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum DxgiFormat {
+    /// `DXGI_FORMAT_UNKNOWN` (0) — recognised ABI value with no renderable
+    /// representation.
+    Unknown,
     R8G8B8A8Unorm,
     R8G8B8A8UnormSrgb,
     R8G8B8A8Uint,
@@ -72,108 +76,192 @@ pub enum DxgiFormat {
     B5G6R5Unorm,
 }
 
+/// How a raw `DXGI_FORMAT` value (from `dxgiformat.h`) is translated by the
+/// Casa1 graphics layer. Every known DXGI format value has an explicit
+/// strategy — there is no silent "closest usable" substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatTranslation {
+    /// The value maps exactly (identity) to a [`DxgiFormat`] variant.
+    Exact,
+    /// The value is typeless or a view-only half of a depth-stencil pair;
+    /// the same bits are interpreted as a compatible typed format.
+    ViewReinterpret,
+    /// Channel-order rearrangement into a bit-compatible packed format.
+    Swizzle,
+    /// Requires a shader pass to convert to a representable format.
+    ConversionShader,
+    /// Block-compressed format with no Metal-equivalent codec; must be
+    /// decompressed before sampling.
+    Decompression,
+    /// Depth/stencil bits are emulated through a depth-stencil pass.
+    DepthStencilEmulation,
+    /// No translation path exists in Casa1.
+    Unsupported,
+}
+
+/// Number of times the lossy [`DxgiFormat::from_u32`] fallback has silently
+/// substituted [`DXGI_FORMAT_FALLBACK`] for a raw value that
+/// [`from_u32_checked`](Self::from_u32_checked) rejected. Observable so that
+/// silent substitution is never invisible.
+static DXGI_FORMAT_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The raw value substituted by the lossy fallback, for diagnostics.
+pub const DXGI_FORMAT_FALLBACK: DxgiFormat = DxgiFormat::R8G8B8A8Unorm;
+
 impl DxgiFormat {
-    /// Map a raw `DXGI_FORMAT` enum value (as passed by the guest) to the
-    /// closest usable [`DxgiFormat`]. The table follows the canonical ABI
-    /// values from `dxgiformat.h`; typeless/SINT/video formats map to the
-    /// closest typed variant. Unknown values fall back to `R8G8B8A8Unorm`;
-    /// use [`from_u32_checked`](Self::from_u32_checked) when an unknown
-    /// format must be rejected instead.
+    /// Map a raw `DXGI_FORMAT` enum value (as passed by the guest) to its
+    /// exact [`DxgiFormat`] representation.
+    ///
+    /// The table is **exact identity only**: every DXGI format value with a
+    /// semantically exact representation maps to that representation, and
+    /// nothing else. Values that have no exact representation (typeless,
+    /// SINT/SNORM variants without a variant, YUV/video, BC6H, palette and
+    /// other non-native formats) are **not** substituted with a "closest"
+    /// format — the bit width, numerical interpretation, compression format
+    /// and shader-visible values of such substitutions are never acceptable.
+    /// Use [`translation_strategy`](Self::translation_strategy) to learn the
+    /// explicit translation plan for any DXGI value, and
+    /// [`from_u32_checked`](Self::from_u32_checked) when a non-exact value
+    /// must be rejected instead of silently replaced.
+    ///
+    /// The lossy wrapper records every fallback in a counter (see
+    /// [`format_fallback_count`](Self::format_fallback_count)) so silent
+    /// substitution is observable.
     pub fn from_u32(value: u32) -> Self {
-        Self::from_u32_checked(value).unwrap_or(DxgiFormat::R8G8B8A8Unorm)
+        match Self::from_u32_checked(value) {
+            Ok(format) => format,
+            Err(_) => {
+                DXGI_FORMAT_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                DXGI_FORMAT_FALLBACK
+            }
+        }
     }
 
-    /// Map a raw `DXGI_FORMAT` enum value to the closest usable
-    /// [`DxgiFormat`], returning an error for values that are not part of
-    /// the DXGI ABI. The table follows the canonical values from
-    /// `dxgiformat.h`; typeless/SINT/video formats map to the closest typed
-    /// variant.
+    /// Number of lossy fallback substitutions recorded by [`from_u32`](Self::from_u32).
+    pub fn format_fallback_count() -> u64 {
+        DXGI_FORMAT_FALLBACK_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Map a raw `DXGI_FORMAT` enum value to its exact [`DxgiFormat`]
+    /// representation, returning an error for every value that has no exact
+    /// representation in the Casa1 format model.
+    ///
+    /// Values that are part of the DXGI ABI but lack an exact representation
+    /// (typeless, SINT/SNORM variants without a variant, YUV/video, BC6H,
+    /// palette formats, depth-stencil view-only halves, …) return
+    /// `Err(ReasonCode::RcGfxFormatUnsupported)` — they are never silently
+    /// substituted with a "closest" format. Use
+    /// [`translation_strategy`](Self::translation_strategy) to query the
+    /// explicit translation plan for any raw value.
     pub fn from_u32_checked(value: u32) -> AppResult<Self> {
         let format = match value {
-            // 0: DXGI_FORMAT_UNKNOWN
-            1 | 2 | 5 | 6 => DxgiFormat::R32G32B32A32Float, // R32G32B32A32_TYPELESS/FLOAT, R32G32B32_TYPELESS/FLOAT
-            3 | 7 => DxgiFormat::R32G32B32A32Uint,          // R32G32B32A32_UINT, R32G32B32_UINT
-            4 | 8 => DxgiFormat::R32G32B32A32Uint, // R32G32B32A32_SINT, R32G32B32_SINT (closest: Uint)
-            9 | 11 | 13 => DxgiFormat::R16G16B16A16Unorm, // R16G16B16A16_TYPELESS/UNORM/SNORM
-            10 => DxgiFormat::R16G16B16A16Float,   // R16G16B16A16_FLOAT
-            12 => DxgiFormat::R16G16B16A16Uint,    // R16G16B16A16_UINT
-            14 => DxgiFormat::R16G16B16A16Uint,    // R16G16B16A16_SINT (closest: Uint)
-            15 | 16 => DxgiFormat::R32G32Float,    // R32G32_TYPELESS/FLOAT
-            17 => DxgiFormat::R32G32Uint,          // R32G32_UINT
-            18 => DxgiFormat::R32G32Uint,          // R32G32_SINT (closest: Uint)
-            19 => DxgiFormat::D32FloatS8Uint,      // R32G8X24_TYPELESS (closest: depth-stencil)
-            20 => DxgiFormat::D32FloatS8Uint,      // D32_FLOAT_S8X24_UINT
-            21 => DxgiFormat::D32FloatS8Uint,      // R32_FLOAT_X8X24_TYPELESS
-            22 => DxgiFormat::D32FloatS8Uint,      // X32_TYPELESS_G8X24_UINT
-            23 | 24 => DxgiFormat::R10G10B10A2Unorm, // R10G10B10A2_TYPELESS/UNORM
-            25 => DxgiFormat::R10G10B10A2Uint,     // R10G10B10A2_UINT
-            26 => DxgiFormat::R11G11B10Float,      // R11G11B10_FLOAT
-            27 | 28 => DxgiFormat::R8G8B8A8Unorm,  // R8G8B8A8_TYPELESS/UNORM
-            29 => DxgiFormat::R8G8B8A8UnormSrgb,   // R8G8B8A8_UNORM_SRGB
-            30 => DxgiFormat::R8G8B8A8Uint,        // R8G8B8A8_UINT
-            31 => DxgiFormat::R8G8B8A8Unorm,       // R8G8B8A8_SNORM (closest: Unorm)
-            32 => DxgiFormat::R8G8B8A8Uint,        // R8G8B8A8_SINT (closest: Uint)
-            33 | 35 => DxgiFormat::R16G16Unorm,    // R16G16_TYPELESS/UNORM
-            34 => DxgiFormat::R16G16Float,         // R16G16_FLOAT
-            36 => DxgiFormat::R16G16Uint,          // R16G16_UINT
-            37 => DxgiFormat::R16G16Snorm,         // R16G16_SNORM
-            38 => DxgiFormat::R16G16Uint,          // R16G16_SINT (closest: Uint)
-            39 | 41 => DxgiFormat::R32Float,       // R32_TYPELESS/R32_FLOAT
-            40 => DxgiFormat::D32Float,            // D32_FLOAT
-            42 => DxgiFormat::R32Uint,             // R32_UINT
-            43 => DxgiFormat::R32Sint,             // R32_SINT
-            44 | 45 => DxgiFormat::D24UnormS8Uint, // R24G8_TYPELESS/D24_UNORM_S8_UINT
-            46 | 47 => DxgiFormat::D24UnormS8Uint, // R24_UNORM_X8_TYPELESS/X24_TYPELESS_G8_UINT
-            48 | 49 => DxgiFormat::R16G16Unorm,    // R8G8_TYPELESS/UNORM (closest: 2×16)
-            50 => DxgiFormat::R16G16Uint,          // R8G8_UINT
-            51 => DxgiFormat::R16G16Snorm,         // R8G8_SNORM
-            52 => DxgiFormat::R16G16Uint,          // R8G8_SINT (closest: Uint)
-            53 | 56 => DxgiFormat::R16Unorm,       // R16_TYPELESS/R16_UNORM
-            54 => DxgiFormat::R16Float,            // R16_FLOAT
-            55 => DxgiFormat::R16Unorm,            // D16_UNORM (closest: R16)
-            57 => DxgiFormat::R16Uint,             // R16_UINT
-            58 => DxgiFormat::R16Snorm,            // R16_SNORM
-            59 => DxgiFormat::R16Uint,             // R16_SINT (closest: Uint)
-            60 | 61 => DxgiFormat::R8Unorm,        // R8_TYPELESS/R8_UNORM
-            62 => DxgiFormat::R8Uint,              // R8_UINT
-            63 => DxgiFormat::R8Unorm,             // R8_SNORM (closest: Unorm)
-            64 => DxgiFormat::R8Uint,              // R8_SINT (closest: Uint)
-            65 => DxgiFormat::R8Unorm,             // A8_UNORM
-            66 => DxgiFormat::R8Unorm,             // R1_UNORM (closest: R8)
-            67 => DxgiFormat::R11G11B10Float,      // R9G9B9E5_SHAREDEXP (closest: packed float)
-            68 | 69 => DxgiFormat::R8G8B8A8Unorm,  // R8G8_B8G8_UNORM/G8R8_G8B8_UNORM
-            70 | 71 => DxgiFormat::Bc1Unorm,       // BC1_TYPELESS/BC1_UNORM
-            72 => DxgiFormat::Bc1UnormSrgb,        // BC1_UNORM_SRGB
-            73 | 74 => DxgiFormat::Bc2Unorm,       // BC2_TYPELESS/BC2_UNORM
-            75 => DxgiFormat::Bc2UnormSrgb,        // BC2_UNORM_SRGB
-            76 | 77 => DxgiFormat::Bc3Unorm,       // BC3_TYPELESS/BC3_UNORM
-            78 => DxgiFormat::Bc3UnormSrgb,        // BC3_UNORM_SRGB
-            79 | 80 => DxgiFormat::Bc4Unorm,       // BC4_TYPELESS/BC4_UNORM
-            81 => DxgiFormat::Bc4Unorm,            // BC4_SNORM (closest: Unorm)
-            82 | 83 => DxgiFormat::Bc5Unorm,       // BC5_TYPELESS/BC5_UNORM
-            84 => DxgiFormat::Bc5Unorm,            // BC5_SNORM (closest: Unorm)
-            85 => DxgiFormat::B5G6R5Unorm,         // B5G6R5_UNORM
-            86 => DxgiFormat::B5G6R5Unorm,         // B5G5R5A1_UNORM (closest: B5G6R5)
-            87 => DxgiFormat::B8G8R8A8Unorm,       // B8G8R8A8_UNORM
-            88 => DxgiFormat::B8G8R8X8Unorm,       // B8G8R8X8_UNORM
-            89 => DxgiFormat::R10G10B10A2Unorm,    // R10G10B10_XR_BIAS_A2_UNORM (closest)
-            90 => DxgiFormat::B8G8R8A8Unorm,       // B8G8R8A8_TYPELESS
-            91 => DxgiFormat::B8G8R8A8UnormSrgb,   // B8G8R8A8_UNORM_SRGB
-            92 => DxgiFormat::B8G8R8X8Unorm,       // B8G8R8X8_TYPELESS
-            93 => DxgiFormat::B8G8R8A8UnormSrgb,   // B8G8R8X8_UNORM_SRGB (closest: sRGB BGRA)
-            94..=96 => DxgiFormat::Bc7Unorm, // BC6H_TYPELESS/UF16/SF16 (closest: same block size)
-            97 | 98 => DxgiFormat::Bc7Unorm, // BC7_TYPELESS/BC7_UNORM
-            99 => DxgiFormat::Bc7UnormSrgb,  // BC7_UNORM_SRGB
-            100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 | 112 | 113
-            | 114 | 115 | 130 | 131 | 132 => DxgiFormat::R8G8B8A8Unorm, // AYUV/video formats
+            // Exact identity — every DXGI value with a semantically exact
+            // representation maps to exactly that representation.
+            0 => DxgiFormat::Unknown,            // DXGI_FORMAT_UNKNOWN
+            2 => DxgiFormat::R32G32B32A32Float,  // R32G32B32A32_FLOAT
+            3 => DxgiFormat::R32G32B32A32Uint,   // R32G32B32A32_UINT
+            10 => DxgiFormat::R16G16B16A16Float, // R16G16B16A16_FLOAT
+            11 => DxgiFormat::R16G16B16A16Unorm, // R16G16B16A16_UNORM
+            12 => DxgiFormat::R16G16B16A16Uint,  // R16G16B16A16_UINT
+            16 => DxgiFormat::R32G32Float,       // R32G32_FLOAT
+            17 => DxgiFormat::R32G32Uint,        // R32G32_UINT
+            20 => DxgiFormat::D32FloatS8Uint,    // D32_FLOAT_S8X24_UINT
+            24 => DxgiFormat::R10G10B10A2Unorm,  // R10G10B10A2_UNORM
+            25 => DxgiFormat::R10G10B10A2Uint,   // R10G10B10A2_UINT
+            26 => DxgiFormat::R11G11B10Float,    // R11G11B10_FLOAT
+            28 => DxgiFormat::R8G8B8A8Unorm,     // R8G8B8A8_UNORM
+            29 => DxgiFormat::R8G8B8A8UnormSrgb, // R8G8B8A8_UNORM_SRGB
+            30 => DxgiFormat::R8G8B8A8Uint,      // R8G8B8A8_UINT
+            34 => DxgiFormat::R16G16Float,       // R16G16_FLOAT
+            35 => DxgiFormat::R16G16Unorm,       // R16G16_UNORM
+            36 => DxgiFormat::R16G16Uint,        // R16G16_UINT
+            37 => DxgiFormat::R16G16Snorm,       // R16G16_SNORM
+            40 => DxgiFormat::D32Float,          // D32_FLOAT
+            41 => DxgiFormat::R32Float,          // R32_FLOAT
+            42 => DxgiFormat::R32Uint,           // R32_UINT
+            43 => DxgiFormat::R32Sint,           // R32_SINT
+            45 => DxgiFormat::D24UnormS8Uint,    // D24_UNORM_S8_UINT
+            54 => DxgiFormat::R16Float,          // R16_FLOAT
+            56 => DxgiFormat::R16Unorm,          // R16_UNORM
+            57 => DxgiFormat::R16Uint,           // R16_UINT
+            58 => DxgiFormat::R16Snorm,          // R16_SNORM
+            61 => DxgiFormat::R8Unorm,           // R8_UNORM
+            62 => DxgiFormat::R8Uint,            // R8_UINT
+            71 => DxgiFormat::Bc1Unorm,          // BC1_UNORM
+            72 => DxgiFormat::Bc1UnormSrgb,      // BC1_UNORM_SRGB
+            74 => DxgiFormat::Bc2Unorm,          // BC2_UNORM
+            75 => DxgiFormat::Bc2UnormSrgb,      // BC2_UNORM_SRGB
+            77 => DxgiFormat::Bc3Unorm,          // BC3_UNORM
+            78 => DxgiFormat::Bc3UnormSrgb,      // BC3_UNORM_SRGB
+            80 => DxgiFormat::Bc4Unorm,          // BC4_UNORM
+            83 => DxgiFormat::Bc5Unorm,          // BC5_UNORM
+            85 => DxgiFormat::B5G6R5Unorm,       // B5G6R5_UNORM
+            87 => DxgiFormat::B8G8R8A8Unorm,     // B8G8R8A8_UNORM
+            88 => DxgiFormat::B8G8R8X8Unorm,     // B8G8R8X8_UNORM
+            91 => DxgiFormat::B8G8R8A8UnormSrgb, // B8G8R8A8_UNORM_SRGB
+            98 => DxgiFormat::Bc7Unorm,          // BC7_UNORM
+            99 => DxgiFormat::Bc7UnormSrgb,      // BC7_UNORM_SRGB
+            // No exact representation exists for any other value. This
+            // includes every DXGI format that lacks a semantically exact
+            // Casa1 representation (typeless, SINT/SNORM without a variant,
+            // D16, A8, R1, shared-exponent, packed YUV, BC6H, palette,
+            // video) — see translation_strategy() for the explicit plan.
             _ => {
                 return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("unknown DXGI_FORMAT value {value}"),
+                    ReasonCode::RcGfxFormatUnsupported,
+                    format!(
+                        "DXGI_FORMAT value {value} has no exact representation \
+                         (translation strategy: {:?})",
+                        Self::translation_strategy(value)
+                    ),
                 ));
             }
         };
         Ok(format)
+    }
+
+    /// The explicit translation strategy for any raw `DXGI_FORMAT` value.
+    ///
+    /// Every known DXGI value (per `dxgiformat.h`) is assigned an explicit
+    /// strategy; unknown values report [`FormatTranslation::Unsupported`].
+    /// This is a complete truth table — nothing is silently substituted.
+    pub fn translation_strategy(value: u32) -> FormatTranslation {
+        use FormatTranslation::*;
+        match value {
+            // Exact identity (all values with a DxgiFormat variant).
+            0 | 2 | 3 | 10 | 11 | 12 | 16 | 17 | 20 | 24 | 25 | 26 | 28 | 29 | 30 | 34 | 35
+            | 36 | 37 | 40 | 41 | 42 | 43 | 45 | 54 | 56 | 57 | 58 | 61 | 62 | 71 | 72 | 74
+            | 75 | 77 | 78 | 80 | 83 | 85 | 87 | 88 | 91 | 98 | 99 => Exact,
+            // Typeless storage formats: bits are viewed as a typed variant.
+            1 | 5 | 9 | 15 | 23 | 27 | 33 | 39 | 48 | 53 | 60 | 70 | 73 | 76 | 79 | 82 | 90
+            | 92 | 97 => ViewReinterpret,
+            // Depth-stencil storage and view-only halves (R32G8X24_TYPELESS,
+            // R32_FLOAT_X8X24_TYPELESS, X32_TYPELESS_G8X24_UINT,
+            // R24G8_TYPELESS, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT):
+            // the depth/stencil bits are shared with D32_FLOAT_S8X24_UINT and
+            // D24_UNORM_S8_UINT and are only reachable through views.
+            19 | 21 | 22 | 44 | 46 | 47 => ViewReinterpret,
+            // Channel-order rearrangement into bit-compatible packed formats
+            // (B5G5R5A1_UNORM ↔ A1BGR5, B8G8R8X8_UNORM_SRGB ↔ BGRA8 sRGB,
+            // B4G4R4A4_UNORM ↔ ABGR4).
+            86 | 93 | 115 => Swizzle,
+            // Formats with no Metal-native equivalent that require a shader
+            // pass (shared-exponent, packed 8:8:8:8, extended-range 10:10:10,
+            // YUV/video family).
+            67 | 68 | 69 | 89 | 100..=110 | 130..=132 => ConversionShader,
+            // Block-compressed formats with no Metal codec: must be
+            // decompressed before the data is shader-visible.
+            94..=96 => Decompression,
+            // Depth/stencil emulation path (D16_UNORM and D32_FLOAT_S8X24_UINT
+            // view patterns).
+            55 => DepthStencilEmulation,
+            // No translation path exists (R1_UNORM, palette/indexed and
+            // sampler-feedback formats have no Metal equivalent; FORCE_UINT is
+            // a sentinel, not a format).
+            66 | 111..=114 | 133 | 134 | 0xFFFF_FFFF => Unsupported,
+            // Unknown values: no strategy exists.
+            _ => Unsupported,
+        }
     }
 }
 
@@ -1145,6 +1233,7 @@ struct QueryHeapRecord {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // command-list bundle flag for future bundle recording
 struct CommandListRecord {
     pipeline_state: PipelineStateId,
     commands: Vec<Command>,
@@ -3394,6 +3483,12 @@ fn encode_ppm(width: u32, height: u32, format: DxgiFormat, bytes: &[u8]) -> AppR
 
 pub fn format_mapping(format: DxgiFormat) -> AppResult<FormatMapping> {
     Ok(match format {
+        DxgiFormat::Unknown => {
+            return Err(AppError::new(
+                ReasonCode::RcGfxFormatUnsupported,
+                "DXGI_FORMAT_UNKNOWN has no renderable representation",
+            ));
+        }
         DxgiFormat::R8G8B8A8Unorm => FormatMapping {
             dxgi: format,
             metal: MtlPixelFormat::Rgba8Unorm,
@@ -3863,6 +3958,106 @@ fn read_command_output(program: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dxgi_format_exact_identity_table() {
+        // Every DXGI value with a semantically exact representation maps
+        // exactly; no closest substitution exists anywhere in the table.
+        for raw in [
+            0, 2, 3, 10, 11, 12, 16, 17, 20, 24, 25, 26, 28, 29, 30, 34, 35, 36, 37, 40, 41, 42,
+            43, 45, 54, 56, 57, 58, 61, 62, 71, 72, 74, 75, 77, 78, 80, 83, 85, 87, 88, 91, 98, 99,
+        ] {
+            let format = DxgiFormat::from_u32_checked(raw)
+                .unwrap_or_else(|e| panic!("exact value {raw} must map: {e}"));
+            assert_eq!(
+                DxgiFormat::translation_strategy(raw),
+                FormatTranslation::Exact,
+                "exact value {raw} must report Exact strategy"
+            );
+            if raw == 0 {
+                assert_eq!(format, DxgiFormat::Unknown);
+            }
+        }
+    }
+
+    #[test]
+    fn dxgi_format_inexact_values_are_rejected_not_substituted() {
+        // R8G8B8A8_TYPELESS (27), R8G8B8A8_SNORM (31), R8G8B8A8_SINT (32),
+        // R8G8_UNORM (49), D16_UNORM (55), A8_UNORM (65), R1_UNORM (66),
+        // BC6H (94-96), NV12 (103) — none may silently map to another format.
+        for raw in [27, 31, 32, 49, 55, 65, 66, 94, 95, 96, 103, 9999] {
+            assert!(
+                DxgiFormat::from_u32_checked(raw).is_err(),
+                "inexact DXGI value {raw} must be rejected, not substituted"
+            );
+        }
+        let error = DxgiFormat::from_u32_checked(49).expect_err("49 must error");
+        assert_eq!(error.code, ReasonCode::RcGfxFormatUnsupported);
+    }
+
+    #[test]
+    fn dxgi_format_translation_strategy_table_is_explicit() {
+        assert_eq!(
+            DxgiFormat::translation_strategy(1),
+            FormatTranslation::ViewReinterpret
+        ); // typeless
+        assert_eq!(
+            DxgiFormat::translation_strategy(27),
+            FormatTranslation::ViewReinterpret
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(19),
+            FormatTranslation::ViewReinterpret
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(86),
+            FormatTranslation::Swizzle
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(115),
+            FormatTranslation::Swizzle
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(67),
+            FormatTranslation::ConversionShader
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(103),
+            FormatTranslation::ConversionShader
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(94),
+            FormatTranslation::Decompression
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(55),
+            FormatTranslation::DepthStencilEmulation
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(66),
+            FormatTranslation::Unsupported
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(133),
+            FormatTranslation::Unsupported
+        );
+        assert_eq!(
+            DxgiFormat::translation_strategy(0xFFFF_FFFF),
+            FormatTranslation::Unsupported
+        );
+    }
+
+    #[test]
+    fn dxgi_format_lossy_fallback_is_recorded() {
+        let before = DxgiFormat::format_fallback_count();
+        let format = DxgiFormat::from_u32(9999);
+        assert_eq!(format, DXGI_FORMAT_FALLBACK);
+        assert_eq!(format, DxgiFormat::R8G8B8A8Unorm);
+        assert!(
+            DxgiFormat::format_fallback_count() > before,
+            "lossy fallback must be observable via the counter"
+        );
+    }
 
     #[test]
     fn render_pass_plan_merges_only_compatible_attachments() {

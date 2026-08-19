@@ -28,6 +28,7 @@ const MAX_COMMIT_PAGES: u64 = 0x10_0000;
 /// Iterations for bounded blocking polls (blocking ConnectNamedPipe and
 /// GetOverlappedResult).  Guest threads are scheduled cooperatively, so an
 /// unbounded host-side block would starve the signaler and hang the guest.
+#[allow(dead_code)] // polling policy constant; not yet referenced
 const BLOCKING_POLL_ITERATIONS: usize = 5000;
 
 // ── Win32 file access-right constants ────────────────────────────────────────
@@ -39,14 +40,18 @@ const FILE_WRITE_DATA: u32 = 0x0000_0002;
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
 const FILE_READ_EA: u32 = 0x0000_0008;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
+#[allow(dead_code)] // guest ABI constant (access-rights table)
 const FILE_EXECUTE: u32 = 0x0000_0020;
 const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const READ_CONTROL: u32 = 0x0002_0000;
+#[allow(dead_code)] // guest ABI constant (access-rights table)
 const WRITE_DAC: u32 = 0x0004_0000;
+#[allow(dead_code)] // guest ABI constant (access-rights table)
 const WRITE_OWNER: u32 = 0x0008_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
+#[allow(dead_code)] // guest ABI constant (access-rights table)
 const STANDARD_RIGHTS_REQUIRED: u32 = DELETE_ACCESS | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
 // ── Non-file object access-right constants (winnt.h) ────────────────────────
 // Handles carry the granted mask in `HandleDescriptor.access_mask`; every
@@ -61,6 +66,7 @@ const THREAD_QUERY_INFORMATION: u32 = 0x0000_0040;
 const PROCESS_TERMINATE: u32 = 0x0000_0001;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
 // ── GetFileType result constants ─────────────────────────────────────────────
+#[allow(dead_code)] // guest ABI constant (GetFileType table)
 const FILE_TYPE_UNKNOWN: u32 = 0;
 const FILE_TYPE_DISK: u32 = 1;
 const FILE_TYPE_PIPE: u32 = 3;
@@ -588,6 +594,7 @@ pub struct SocketObject {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // file-object state retained for future share-mode enforcement
 struct FileObject {
     normalized_path: String,
     host_path: PathBuf,
@@ -677,6 +684,7 @@ struct ThreadObject {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // thread fiber state retained for future fiber APIs
 struct ThreadState {
     exit_code: Option<u32>,
     priority: i32,
@@ -772,6 +780,7 @@ pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
 /// Reads consume from the peer's write queue; writes append to the
 /// opposite direction's queue and notify the condvar.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // named-pipe state retained for future pipe APIs
 struct NamedPipeState {
     /// The pipe name (e.g. `\\.\pipe\steam_service`).
     name: String,
@@ -826,6 +835,7 @@ struct NamedPipeState {
 
 /// Backing store for a shared-memory section created via CreateFileMappingW.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // section state retained for future mapping APIs
 struct SharedMemorySection {
     /// Name of the section (may be empty for anonymous).
     name: String,

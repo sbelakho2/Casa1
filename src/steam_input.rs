@@ -128,6 +128,7 @@ const KCF_ALLOCATOR_DEFAULT: *const std::ffi::c_void = std::ptr::null();
 
 /// kCFNumberSInt16Type constant for extracting 16-bit integers from CFNumber.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // CoreFoundation number-type ABI constant; flagged for the API database
 const KCF_NUMBER_SINT16_TYPE: u32 = 2;
 
 /// kCFNumberSInt32Type constant for extracting 32-bit integers from CFNumber.
@@ -1018,6 +1019,7 @@ fn normalize_trigger(value: u8) -> f32 {
 /// When no physical controller is available, generates audio-based or
 /// visual feedback to simulate rumble. This is a simple envelope:
 /// the rumble intensity maps to an audio tone or system notification.
+#[allow(dead_code)] // software-haptics fallback state; not yet wired
 struct SoftwareHapticState {
     /// Active rumble end time for left motor.
     left_end: Instant,
@@ -1032,6 +1034,7 @@ struct SoftwareHapticState {
 }
 
 impl SoftwareHapticState {
+    #[allow(dead_code)] // software-haptics fallback state; not yet wired
     fn new() -> Self {
         Self {
             left_end: Instant::now(),
@@ -1044,6 +1047,7 @@ impl SoftwareHapticState {
 }
 
 use std::sync::{LazyLock, Mutex};
+#[allow(dead_code)] // software-haptics fallback state; not yet wired
 static SOFTWARE_HAPTICS: LazyLock<Mutex<[SoftwareHapticState; 4]>> = LazyLock::new(|| {
     Mutex::new([
         SoftwareHapticState::new(),
@@ -1160,6 +1164,7 @@ pub(crate) fn send_hid_rumble(slot: u8, left_motor: u8, right_motor: u8) {
 /// Software haptic notifications are emitted only by `send_hid_rumble`'s
 /// fallback path (i.e. when no physical device received the report), so the
 /// fallback cannot double-notify.
+#[allow(dead_code)] // HID rumble extension sender; not yet wired
 pub(crate) fn send_hid_rumble_ext(
     slot: u8,
     left_motor: u8,

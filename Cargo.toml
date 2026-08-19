@@ -72,8 +72,13 @@ rcgen = "0.13"
 exclude = ["windows_reference"]
 
 [features]
-default = ["metal", "vulkan", "opengl"]
-metal = []
+# Metal is the MANDATORY host backend on macOS: the `metal`/`objc`/`block`/
+# `core-foundation`/`core-graphics` dependencies below are unconditional and
+# there is deliberately NO `metal` feature flag — every build includes the
+# Metal backend. `vulkan`/`opengl` are guest-translation-layer features: they
+# switch the guest-side translation path (vulkan-1.dll / opengl32.dll thunk
+# registration), not the host backend, which is always Metal.
+default = ["vulkan", "opengl"]
 vulkan = []
 opengl = []
 moltenvk = ["vulkan"]
@@ -82,9 +87,15 @@ websocket = ["tungstenite"]
 ffmpeg = ["ffmpeg-next"]
 proptest = []
 dev-insecure-tls = []
+# Forward-compat hook: `std::alloc::set_alloc_error_hook` is nightly-only.
+# Declared so `unexpected_cfgs` stays enabled and this cfg remains expected.
+nightly_alloc_error_hook = []
 
 [lints.rust]
-unexpected_cfgs = { level = "allow" }
+# `objc` 0.2's msg_send!/class! macros expand to code that queries
+# `feature = "cargo-clippy"`; declare it so `unexpected_cfgs` stays effective
+# without emitting hundreds of dependency-noise warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
 tempfile = "3.20"

@@ -194,7 +194,6 @@ fn write_api_report(out: &std::path::Path) {
     eprintln!("wrote {}", out.display());
 }
 
-
 // ── Environment-driven comparison modes ─────────────────────────────────────
 
 /// When `CASA1_WINDOWS_REFERENCE_EXE` or `CASA1_WINDOWS_REFERENCE_RESULTS` is

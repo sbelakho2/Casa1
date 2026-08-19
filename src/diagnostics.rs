@@ -461,7 +461,9 @@ fn rustc_version() -> String {
 
 fn collect_feature_info() -> FeatureInfo {
     FeatureInfo {
-        metal: cfg!(feature = "metal"),
+        // Metal is the mandatory host backend on macOS; there is no `metal`
+        // feature flag to query.
+        metal: true,
         vulkan: cfg!(feature = "vulkan"),
         opengl: cfg!(feature = "opengl"),
         moltenvk: cfg!(feature = "moltenvk"),
@@ -2020,6 +2022,7 @@ impl MinidumpContext {
         | Self::CONTEXT_DEBUG_REGISTERS;
 
     /// Size of the real AMD64 CONTEXT structure.
+    #[allow(dead_code)] // minidump context size constant for the writer ABI
     const EXPECTED_SIZE: usize = 1232;
 
     fn new(rip: u64, rsp: u64) -> Self {
@@ -2108,6 +2111,7 @@ struct MinidumpThread {
 /// MINIDUMP_THREAD_LIST.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
+#[allow(dead_code)] // minidump thread-list writer; not yet wired
 struct MinidumpThreadList {
     number_of_threads: u32,
     threads: [MinidumpThread; 0], // variable-length — written manually
@@ -2132,6 +2136,7 @@ struct MinidumpModule {
 /// MINIDUMP_MODULE_LIST.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
+#[allow(dead_code)] // minidump module-list writer; not yet wired
 struct MinidumpModuleList {
     number_of_modules: u32,
     modules: [MinidumpModule; 0],
@@ -2200,6 +2205,7 @@ fn read_u64_le(buf: &[u8], offset: usize) -> Option<u64> {
 /// Read a slice of `len` bytes from `buf` starting at `offset`.
 ///
 /// Returns `None` if the slice would exceed the buffer boundary.
+#[allow(dead_code)] // minidump reader helper; not yet wired
 fn read_bytes(buf: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
     if offset.saturating_add(len) > buf.len() {
         return None;

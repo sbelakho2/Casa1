@@ -560,6 +560,7 @@ unsafe impl Send for WKWebViewManager {}
 unsafe impl Sync for WKWebViewManager {}
 
 /// Internal state for a WKWebView instance
+#[allow(dead_code)] // WKWebView JS flag retained for future JS policy APIs
 struct WKWebViewInstance {
     /// Objective-C pointer to the WKWebView object (raw pointer, opaque)
     native_ptr: *mut std::ffi::c_void,
@@ -1087,7 +1088,6 @@ impl WKWebViewManager {
             return Ok(std::ptr::null_mut());
         }
 
-        #[cfg(feature = "metal")]
         // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
         unsafe {
             let view: *mut objc::runtime::Object = instance.native_ptr as *mut _;
@@ -1153,11 +1153,6 @@ impl WKWebViewManager {
                 );
                 Ok(std::ptr::null_mut())
             }
-        }
-
-        #[cfg(not(feature = "metal"))]
-        {
-            Ok(std::ptr::null_mut())
         }
     }
 
@@ -3281,7 +3276,6 @@ impl CefBridge {
     // The frame snapshot format is RGBA8 (4 bytes per pixel) matching
     // Metal's MTLPixelFormatRGBA8Unorm.
     // -----------------------------------------------------------------------
-    #[cfg(feature = "metal")]
     pub fn render_to_metal_texture(
         &mut self,
         browser_handle: CefHandle,
@@ -3375,7 +3369,6 @@ impl CefBridge {
     /// Returns the Metal texture wrapping the IOSurface, or falls back to
     /// `render_to_metal_texture` if no IOSurface is available.
     // -----------------------------------------------------------------------
-    #[cfg(feature = "metal")]
     pub fn render_to_io_surface_texture(
         &mut self,
         browser_handle: CefHandle,
@@ -3589,19 +3582,6 @@ impl CefBridge {
             b.metal_texture_id = Some(frame_number);
         }
         Ok(texture)
-    }
-
-    /// Non-metal fallback: returns an error if the `metal` feature is not enabled.
-    #[cfg(not(feature = "metal"))]
-    pub fn render_to_metal_texture(
-        &mut self,
-        _browser_handle: CefHandle,
-        _metal_device: &crate::metal_backend::MetalDevice,
-    ) -> AppResult<metal::Texture> {
-        Err(AppError::new(
-            ReasonCode::RcInvalidState,
-            "render_to_metal_texture: metal feature not enabled",
-        ))
     }
 
     /// Get the handle of the first registered browser, if any.

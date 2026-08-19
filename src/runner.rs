@@ -1204,6 +1204,7 @@ fn budget_exhausted(error: &AppError) -> bool {
 /// True when the error is the wall-clock run deadline marker.  These runs
 /// end deliberately (exit code -2) and must NOT go through the NSIS
 /// install-recovery path, which targets budget-exhausted installs.
+#[allow(dead_code)] // deadline classification helper; not yet referenced
 fn is_wall_clock_deadline(error: &AppError) -> bool {
     error.code == ReasonCode::RcUnimplInsn && error.message.contains("wall-clock deadline")
 }
@@ -1475,6 +1476,7 @@ fn instruction_count_from_perf(pe_output: &pe_runtime::PeExecutionResult) -> Opt
 }
 
 /// Compact network summary lines from the run's trace events (artifact log form).
+#[allow(dead_code)] // network diagnostics summarizer; not yet referenced
 fn network_summary_lines_from_trace(pe_output: &pe_runtime::PeExecutionResult) -> Vec<String> {
     pe_output
         .trace_events

@@ -166,6 +166,7 @@ pub const DEFAULT_STUN_SERVER: &str = "stun.steam.com:3478";
 /// TURN Method: Allocate (RFC 5766 Section 6).
 const TURN_METHOD_ALLOCATE: u16 = 0x003;
 /// TURN Method: Refresh.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const TURN_METHOD_REFRESH: u16 = 0x004;
 /// TURN Method: Send (data indication).
 const TURN_METHOD_SEND: u16 = 0x006;
@@ -174,9 +175,11 @@ const TURN_METHOD_DATA: u16 = 0x007;
 /// TURN Method: CreatePermission.
 const TURN_METHOD_CREATE_PERMISSION: u16 = 0x008;
 /// TURN Method: ChannelBind.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const TURN_METHOD_CHANNEL_BIND: u16 = 0x009;
 
 /// TURN Attribute: Channel-Number.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const TURN_ATTR_CHANNEL_NUMBER: u16 = 0x000C;
 /// TURN Attribute: Lifetime.
 const TURN_ATTR_LIFETIME: u16 = 0x000D;
@@ -189,11 +192,14 @@ const TURN_ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 /// TURN Attribute: REQUESTED-TRANSPORT.
 const TURN_ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 /// TURN Attribute: DONT-FRAGMENT.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const TURN_ATTR_DONT_FRAGMENT: u16 = 0x001A;
 /// TURN Attribute: RESERVATION-TOKEN.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const TURN_ATTR_RESERVATION_TOKEN: u16 = 0x0022;
 
 /// Default Steam Datagram Relay server.
+#[allow(dead_code)] // STUN/TURN wire protocol constants (ABI table)
 const DEFAULT_SDR_SERVER: &str = "sdr.steam.com:27018";
 
 // ---------------------------------------------------------------------------
@@ -709,6 +715,7 @@ pub enum GnsConnectionState {
 type SignalQueue = std::sync::Arc<std::sync::Mutex<Vec<(GnsConnectionHandle, i32, Vec<u8>)>>>;
 
 #[derive(Debug)]
+#[allow(dead_code)] // TURN channel state retained for future TURN framing
 pub struct GameNetworkingSockets {
     /// Active connections map.
     connections: BTreeMap<GnsConnectionHandle, GnsConnectionState>,
@@ -3337,6 +3344,7 @@ impl Default for SteamProtocolStack {
 // Internal types for the encryption handshake
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // encryption handshake metadata retained for future handshake validation
 struct EncryptRequest {
     key_size: u32,
     rsa_modulus: Vec<u8>,

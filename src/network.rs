@@ -429,6 +429,7 @@ struct HttpResponseRecord {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // WebSocket record metadata for future text-mode framing
 struct WebSocketRecord {
     /// The request handle this WebSocket was upgraded from.
     request_handle: HttpRequestId,

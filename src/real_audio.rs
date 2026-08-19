@@ -2159,6 +2159,7 @@ pub fn decode_xma(xma_data: &[u8], num_channels: u16) -> AppResult<Vec<i16>> {
 ///
 /// The cosine matrix and window are precomputed once and shared, so decoding
 /// does not evaluate transcendental functions per sample or per subframe.
+#[allow(dead_code)] // IMDCT reference implementation for future codec support
 fn imdct(coefficients: &[f32]) -> Vec<f32> {
     let mut time = vec![0.0f32; XMA_FRAME_SAMPLES];
     imdct_into(coefficients, &mut time);
@@ -3010,6 +3011,7 @@ impl XapoEffect for XapoHighPass {
 }
 
 /// Echo / delay effect with configurable feedback.
+#[allow(dead_code)] // echo delay state retained for future XAPO echo tuning
 pub struct XapoEcho {
     /// Delay line buffer.
     delay_buffer: Vec<f32>,

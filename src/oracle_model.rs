@@ -827,6 +827,7 @@ const C1_LOWER: u32 = 0x0002;
 const C1_DIGIT: u32 = 0x0004;
 const C1_SPACE: u32 = 0x0008;
 const C1_PUNCT: u32 = 0x0010;
+#[allow(dead_code)] // reserved for C1 control classification in case-fold vectors
 const C1_CNTRL: u32 = 0x0020;
 const C1_BLANK: u32 = 0x0040;
 const C1_XDIGIT: u32 = 0x0080;

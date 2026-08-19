@@ -24672,6 +24672,7 @@ fn touched_pages(address: u64, length: usize) -> BTreeSet<u64> {
     pages
 }
 
+#[allow(dead_code)] // ARM64 lowering prototype; superseded by the JIT backend
 fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
     let mut instructions = Vec::new();
     for op in ir {
@@ -26778,6 +26779,7 @@ fn f32x4_to_xmm(words: [f32; 4]) -> XmmValue {
     bytes_to_xmm(bytes)
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn ymm_to_f32x8(value: YmmValue) -> [f32; 8] {
     let bytes = ymm_to_bytes(value);
     let mut lanes = [0.0_f32; 8];
@@ -26788,6 +26790,7 @@ fn ymm_to_f32x8(value: YmmValue) -> [f32; 8] {
     lanes
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn f32x8_to_ymm(words: [f32; 8]) -> YmmValue {
     let mut bytes = [0_u8; 32];
     for (index, word) in words.into_iter().enumerate() {
@@ -26796,6 +26799,7 @@ fn f32x8_to_ymm(words: [f32; 8]) -> YmmValue {
     bytes_to_ymm(bytes)
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn f32x16_to_zmm(words: [f32; 16]) -> ZmmValue {
     let mut bytes = [0_u8; 64];
     for (index, word) in words.into_iter().enumerate() {
@@ -26804,6 +26808,7 @@ fn f32x16_to_zmm(words: [f32; 16]) -> ZmmValue {
     bytes_to_zmm(bytes)
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn zmm_to_f32x16(value: ZmmValue) -> [f32; 16] {
     let bytes = zmm_to_bytes(value);
     let mut lanes = [0.0_f32; 16];
@@ -26825,6 +26830,7 @@ fn f64x2_to_xmm(words: [f64; 2]) -> XmmValue {
     }
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn ymm_to_f64x4(value: YmmValue) -> [f64; 4] {
     let bytes = ymm_to_bytes(value);
     let mut lanes = [0.0_f64; 4];
@@ -26835,6 +26841,7 @@ fn ymm_to_f64x4(value: YmmValue) -> [f64; 4] {
     lanes
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn f64x4_to_ymm(words: [f64; 4]) -> YmmValue {
     YmmValue {
         low: XmmValue {
@@ -26848,6 +26855,7 @@ fn f64x4_to_ymm(words: [f64; 4]) -> YmmValue {
     }
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn f64x8_to_zmm(words: [f64; 8]) -> ZmmValue {
     let mut bytes = [0_u8; 64];
     for (index, word) in words.into_iter().enumerate() {
@@ -26856,6 +26864,7 @@ fn f64x8_to_zmm(words: [f64; 8]) -> ZmmValue {
     bytes_to_zmm(bytes)
 }
 
+#[allow(dead_code)] // SIMD register conversion helpers for AVX-512 emulation; not yet wired
 fn zmm_to_f64x8(value: ZmmValue) -> [f64; 8] {
     let bytes = zmm_to_bytes(value);
     let mut lanes = [0.0_f64; 8];
@@ -27377,6 +27386,7 @@ const AES_SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 const AES_INV_SBOX: [u8; 256] = [
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
@@ -27408,6 +27418,7 @@ fn aes_sub_word(word: u32) -> u32 {
 }
 
 /// AES SubBytes: applies S-box to each byte of the 16-byte state.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_sub_bytes(state: &mut [u8; 16]) {
     for byte in state.iter_mut() {
         *byte = AES_SBOX[*byte as usize];
@@ -27415,6 +27426,7 @@ fn aes_sub_bytes(state: &mut [u8; 16]) {
 }
 
 /// AES InvSubBytes: applies inverse S-box to each byte.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_inv_sub_bytes(state: &mut [u8; 16]) {
     for byte in state.iter_mut() {
         *byte = AES_INV_SBOX[*byte as usize];
@@ -27423,6 +27435,7 @@ fn aes_inv_sub_bytes(state: &mut [u8; 16]) {
 
 /// AES ShiftRows: cyclically shifts rows of the 4x4 state matrix.
 /// State is stored column-major: state[0..4] = column 0, state[4..8] = column 1, etc.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_shift_rows(state: &mut [u8; 16]) {
     // Row 0: no shift
     // Row 1: shift left by 1 byte
@@ -27447,6 +27460,7 @@ fn aes_shift_rows(state: &mut [u8; 16]) {
 }
 
 /// AES InvShiftRows: cyclically shifts rows right.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_inv_shift_rows(state: &mut [u8; 16]) {
     // Row 0: no shift
     // Row 1: shift right by 1 byte
@@ -27471,12 +27485,14 @@ fn aes_inv_shift_rows(state: &mut [u8; 16]) {
 }
 
 /// GF(2^8) multiplication by 2 (xtime).
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn xtime(a: u8) -> u8 {
     (a << 1) ^ (if (a & 0x80) != 0 { 0x1b } else { 0 })
 }
 
 /// AES MixColumns: multiplies each column by a fixed polynomial in GF(2^8).
 /// State is column-major: column c = state[4*c .. 4*c+4].
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_mix_columns(state: &mut [u8; 16]) {
     for c in 0..4 {
         let i = c * 4;
@@ -27492,6 +27508,7 @@ fn aes_mix_columns(state: &mut [u8; 16]) {
 }
 
 /// AES InvMixColumns: inverse MixColumns for decryption.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_inv_mix_columns(state: &mut [u8; 16]) {
     for c in 0..4 {
         let i = c * 4;
@@ -27541,6 +27558,7 @@ fn aes_inv_mix_columns(state: &mut [u8; 16]) {
 }
 
 /// AES AddRoundKey: XOR state with round key.
+#[allow(dead_code)] // reference AES implementation for future AES-NI instruction emulation
 fn aes_add_round_key(state: &mut [u8; 16], rk: &[u8; 16]) {
     for i in 0..16 {
         state[i] ^= rk[i];
@@ -27652,6 +27670,7 @@ fn sha1_rounds(
 /// Execute 2 rounds of SHA-256 using the given message schedule words.
 /// Returns the updated (a, b, c, d, e, f, g, h) state.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // reference SHA-256 implementation for future SHA instruction emulation
 fn sha256_rounds(
     a: u32,
     b: u32,
@@ -33501,10 +33520,6 @@ mod tests {
     // =====================================================================
     // E4 — AES-NI instruction tests (IR level)
     // =====================================================================
-
-    fn make_aes_test_state() -> (CpuState, MemoryImage) {
-        (CpuState::new(GuestArch::X64), MemoryImage::default())
-    }
 
     #[test]
     fn execute_aesenc_performs_one_aes_round() {

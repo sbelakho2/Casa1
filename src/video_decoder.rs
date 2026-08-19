@@ -596,6 +596,7 @@ pub const MTLPixelFormatNV12: u32 = 150;
 /// VideoToolbox internal thread, and we create/destroy the cache only on
 /// the decoder's owning thread.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // Metal device pointer cache for zero-copy uploads; not yet referenced
 pub struct MetalVideoTextureCache {
     /// The underlying `CVMetalTextureCacheRef`.
     cache: vt_ffi::CVMetalTextureCacheRef,
@@ -1650,7 +1651,9 @@ pub fn prepare_metal_texture_upload(
 /// * `slice` - The texture slice index (0 for non-array textures).
 ///
 /// Returns the number of bytes uploaded (0 on error).
-#[cfg(feature = "metal")]
+///
+/// Metal is the mandatory host backend on macOS, so this function is always
+/// compiled in.
 pub fn upload_frame_to_metal_texture(
     texture: &metal::TextureRef,
     upload: &MetalTextureUpload,
@@ -1676,106 +1679,6 @@ pub fn upload_frame_to_metal_texture(
     upload.data.len() as u64
 }
 
-// ── Non-Metal software fallback frame storage ─────────────────────────────
-
-/// Holds the most recently uploaded frame data for CPU-side access
-/// when Metal is not available.
-struct SoftwareFrameBuffer {
-    /// RGBA pixel data.
-    data: Vec<u8>,
-    /// Frame width in pixels.
-    width: u32,
-    /// Frame height in pixels.
-    height: u32,
-    /// Bytes per row (stride).
-    stride: u32,
-}
-
-impl SoftwareFrameBuffer {
-    const fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            width: 0,
-            height: 0,
-            stride: 0,
-        }
-    }
-}
-
-/// Global software frame buffer for the non-Metal fallback path.
-static SOFTWARE_FRAME: Mutex<SoftwareFrameBuffer> = Mutex::new(SoftwareFrameBuffer::new());
-
-/// Non-Metal fallback for `upload_frame_to_metal_texture`.
-///
-/// When the `metal` feature is disabled, this function stores the uploaded
-/// frame data in a global software buffer for CPU-side rendering access.
-/// The RGBA data is stored as-is from the upload descriptor (conversion
-/// from YUV to RGB should be done beforehand using `yuv420p_to_rgba`).
-///
-/// Returns the number of bytes stored (0 on error).
-#[cfg(not(feature = "metal"))]
-pub fn upload_frame_to_metal_texture(
-    _texture: &metal::TextureRef,
-    upload: &MetalTextureUpload,
-    _slice: u64,
-) -> u64 {
-    let mut buf = match SOFTWARE_FRAME.lock() {
-        Ok(b) => b,
-        Err(_) => return 0,
-    };
-
-    // Determine bytes per row from upload or default to RGBA (4 bytes per pixel)
-    let bpr = if upload.bytes_per_row > 0 {
-        upload.bytes_per_row
-    } else {
-        upload.width * 4
-    };
-
-    buf.width = upload.width;
-    buf.height = upload.height;
-    buf.stride = bpr;
-    buf.data = upload.data.clone();
-
-    upload.data.len() as u64
-}
-
-/// Retrieve the latest software-rendered frame as RGBA bytes.
-///
-/// Returns `(data, width, height, stride)` where `data` is the RGBA pixel
-/// buffer, or `None` if no frame has been uploaded yet.
-///
-/// This is the primary accessor for CPU-side rendering when Metal is not
-/// available (e.g., software rendering, remote desktop, or off-screen
-/// processing).
-#[cfg(not(feature = "metal"))]
-pub fn get_latest_software_frame() -> Option<(Vec<u8>, u32, u32, u32)> {
-    let buf = SOFTWARE_FRAME.lock().ok()?;
-    if buf.data.is_empty() || buf.width == 0 || buf.height == 0 {
-        return None;
-    }
-    Some((buf.data.clone(), buf.width, buf.height, buf.stride))
-}
-
-/// Check whether a software frame is currently available.
-#[cfg(not(feature = "metal"))]
-pub fn has_software_frame() -> bool {
-    SOFTWARE_FRAME
-        .lock()
-        .map(|b| !b.data.is_empty() && b.width > 0 && b.height > 0)
-        .unwrap_or(false)
-}
-
-/// Clear the software frame buffer, releasing its memory.
-#[cfg(not(feature = "metal"))]
-pub fn clear_software_frame() {
-    if let Ok(mut buf) = SOFTWARE_FRAME.lock() {
-        buf.data.clear();
-        buf.width = 0;
-        buf.height = 0;
-        buf.stride = 0;
-    }
-}
-
 // ===========================================================================
 // IMFTransform-like interface stubs
 // ===========================================================================
@@ -1786,6 +1689,7 @@ pub fn clear_software_frame() {
 /// - `ProcessMessage` - Sends messages to the transform (e.g., start, pause, flush)
 /// - `ProcessInput` - Feeds compressed data into the transform
 /// - `ProcessOutput` - Retrieves decoded output from the transform
+#[allow(dead_code)] // MFT stream ids retained for future stream selection
 pub struct MfTransform {
     decoder: VideoDecoder,
     input_stream_id: u32,

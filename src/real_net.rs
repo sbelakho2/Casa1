@@ -1512,6 +1512,7 @@ fn map_connect_error_kind(kind: std::io::ErrorKind) -> i32 {
 }
 
 impl RealNetworkStack {
+    #[allow(dead_code)] // Winsock refcount diagnostic; flagged for the API database
     fn wsa_refcount_check(&self) -> u32 {
         self.wsa_refcount
     }

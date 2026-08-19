@@ -2186,15 +2186,6 @@ mod tests {
         assert_eq!(p.to_base_string(), "C:file.txt");
     }
 
-    fn parse_ntfs_path_simple() {
-        let (file_path, stream) = parse_ntfs_path("file.exe:Zone.Identifier");
-        assert_eq!(file_path, "file.exe");
-        assert!(stream.is_some());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_name, "Zone.Identifier");
-        assert_eq!(stream.stream_type, "$DATA");
-    }
-
     #[test]
     fn parse_ntfs_path_with_type() {
         let (file_path, stream) = parse_ntfs_path("file.exe:Zone.Identifier:$DATA");

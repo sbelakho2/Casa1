@@ -309,10 +309,13 @@ const GENERIC_EXECUTE: u32 = 0x2000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const FILE_READ_DATA: u32 = 0x0000_0001;
+#[allow(dead_code)] // guest ABI constants (file access-rights table)
 const FILE_LIST_DIRECTORY: u32 = 0x0000_0001; // alias of FILE_READ_DATA
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
+#[allow(dead_code)] // guest ABI constants (file access-rights table)
 const FILE_ADD_FILE: u32 = 0x0000_0002; // alias of FILE_WRITE_DATA
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
+#[allow(dead_code)] // guest ABI constants (file access-rights table)
 const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004; // alias of FILE_APPEND_DATA
 const FILE_READ_EA: u32 = 0x0000_0008;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
@@ -366,6 +369,7 @@ const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 /// FILE_FLAG_DELETE_ON_CLOSE is 0x0400_0000; 0x0800_0000 is
 /// FILE_FLAG_SEQUENTIAL_SCAN and must never trigger deletion.
 const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+#[allow(dead_code)] // guest ABI constant (CreateFile flags table)
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -451,54 +455,86 @@ const CSIDL_COMMON_ADMINTOOLS: i32 = 0x002f;
 const CSIDL_ADMINTOOLS: i32 = 0x0030;
 
 // ── CRT errno values (MSVC errno.h numbering) ────────────────────────────────
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ESRCH: i32 = 3;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EINTR: i32 = 4;
 const EIO: i32 = 5;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENXIO: i32 = 6;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const E2BIG: i32 = 7;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOEXEC: i32 = 8;
 const EBADF: i32 = 9;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ECHILD: i32 = 10;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EAGAIN: i32 = 11;
 const ENOMEM: i32 = 12;
 const EACCES: i32 = 13;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EFAULT: i32 = 14;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EBUSY: i32 = 16;
 const EEXIST: i32 = 17;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EXDEV: i32 = 18;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENODEV: i32 = 19;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOTDIR: i32 = 20;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENFILE: i32 = 23;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EMFILE: i32 = 24;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOTTY: i32 = 25;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EFBIG: i32 = 27;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOSPC: i32 = 28;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ESPIPE: i32 = 29;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EROFS: i32 = 30;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EMLINK: i32 = 31;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EPIPE: i32 = 32;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EDOM: i32 = 33;
 const ERANGE: i32 = 34;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const EDEADLK: i32 = 36;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENAMETOOLONG: i32 = 38;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOLCK: i32 = 39;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOSYS: i32 = 40;
+#[allow(dead_code)] // MSVC CRT errno ABI constants (errno table) for guest CRT emulation
 const ENOTEMPTY: i32 = 41;
 /// `_TRUNCATE` sentinel for the `*_s` string functions (x86 `size_t` is 32-bit).
 const CRTT_TRUNCATE: u64 = 0xFFFF_FFFF;
 /// `_TRUNCATE` as a full-width `size_t` (x64 guests).
 const CRTT_TRUNCATE_64: u64 = u64::MAX;
 // ── CRT stat mode bits (_stat structs) ───────────────────────────────────────
+#[allow(dead_code)] // MSVC CRT stat mode ABI constants
 const S_IFMT: u32 = 0xF000;
 const S_IFDIR: u32 = 0x4000;
+#[allow(dead_code)] // MSVC CRT stat mode ABI constants
 const S_IFCHR: u32 = 0x2000;
 const S_IFREG: u32 = 0x8000;
 const S_IREAD: u32 = 0x0100;
 const S_IWRITE: u32 = 0x0080;
+#[allow(dead_code)] // MSVC CRT stat mode ABI constants
 const S_IEXEC: u32 = 0x0040;
 // ── CRT stdio constants ──────────────────────────────────────────────────────
 const SEEK_SET: i32 = 0;
@@ -620,6 +656,7 @@ const STD_INPUT_HANDLE: u32 = u32::MAX - 9;
 const STD_OUTPUT_HANDLE: u32 = u32::MAX - 10;
 const STD_ERROR_HANDLE: u32 = u32::MAX - 11;
 const FILE_TYPE_UNKNOWN: u32 = 0;
+#[allow(dead_code)] // guest ABI constant (GetFileType table)
 const FILE_TYPE_DISK: u32 = 1;
 const FILE_TYPE_CHAR: u32 = 2;
 const PROCESS_HEAP_HANDLE: u64 = 0x1000;
@@ -806,6 +843,7 @@ struct MenuItem {
 
 /// A Windows menu (HMENU)
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // menu state retained for future menu APIs
 struct Menu {
     handle: u32,
     items: Vec<MenuItem>,
@@ -825,6 +863,7 @@ struct ScrollBarInfo {
 
 /// Represents a common control window's state
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // common-control state retained for future control APIs
 struct CommonControlState {
     /// Registered class name
     class_name: String,
@@ -3449,6 +3488,7 @@ struct CrtGlobals {
 /// guest allocation that mirrors the UCRT `_iobuf` footprint; the fd lives at
 /// offset 0x10 so guests reading `_file` directly observe it).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // CRT file state flag retained for future CRT paths
 struct CrtFileState {
     /// Win32 handle backing the stream (for files opened via the CRT).
     handle: u32,
@@ -3505,6 +3545,7 @@ enum GuestObjectKind {
     /// A COM class factory (IClassFactory).
     ComClassFactory,
     /// A COM dispatch object (IDispatch).
+    #[allow(dead_code)] // guest object kind tags (state-model completeness)
     ComDispatch,
     /// A XAPO audio effect object (IXAPO).
     XapoEffect,
@@ -3540,8 +3581,10 @@ enum GuestObjectKind {
     /// IDirect3DTexture9 COM object.
     D3d9Texture,
     /// IDirect3DQuery9 COM object.
+    #[allow(dead_code)] // guest object kind tags (state-model completeness)
     D3d9Query,
     /// IDirect3DSwapChain9 COM object.
+    #[allow(dead_code)] // guest object kind tags (state-model completeness)
     D3d9SwapChain,
     // ── Phase L: COM/Shell Completion ───────────────────────────────────
     /// IShellFolder COM object (created via CLSID_ShellFolder).
@@ -3786,6 +3829,7 @@ struct GuestD3d11SamplerState {
 }
 
 /// Tracks state for a real (on-disk) DLL loaded via `load_real_dll`.
+#[allow(dead_code)] // real-DLL state retained for future native-DLL loading
 struct RealDllState {
     /// Host path to the on-disk DLL file.
     path: PathBuf,
@@ -3808,6 +3852,7 @@ struct RealDllState {
 /// Tracks metadata for a loaded DLL (both synthetic and real PE).
 /// Used for HMODULE-based lookup and DllMain notification dispatch.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // module-table fields retained for future GetModule* APIs
 struct DllInfo {
     /// Module handle (HMODULE) — the base address in guest space.
     pub handle: u64,
@@ -3826,6 +3871,7 @@ struct DllInfo {
     pub tls_callbacks: Vec<u64>,
 }
 
+#[allow(dead_code)] // runtime state retained for future import paths
 struct PeHostRuntime {
     audio: AudioSubsystem,
     win32: Win32Subsystem,
@@ -4439,6 +4485,7 @@ struct ProgressBarState {
 enum GuestThreadState {
     Runnable,
     Waiting,
+    #[allow(dead_code)] // thread state tag (state-model completeness)
     AlertableWaiting,
     Exiting,
     Exited,
@@ -4509,6 +4556,7 @@ struct GuestWait {
 }
 
 /// The result delivered to a resumed waiter.
+#[allow(dead_code)] // wait-resume payload retained for future alertable waits
 struct WaitResume {
     /// WAIT_OBJECT_0 (+ index for wait-any) / WAIT_TIMEOUT /
     /// WAIT_IO_COMPLETION / WAIT_ABANDONED_0.
@@ -8888,6 +8936,7 @@ pub fn regression_test_steam_bootstrap(
 /// - `-2`  → "error during dispatch"
 /// - `>=0` → guest exit code
 // SAFETY: extern FFI declaration — the function signature matches the C library prototype
+#[allow(dead_code)] // legacy fast-thunk dispatcher (path disabled — see 54243); flagged for the API database
 unsafe extern "C" fn fast_thunk_host_dispatcher(
     runtime_ptr: *mut std::ffi::c_void,
     state_ptr: *mut CpuState,
@@ -9702,6 +9751,7 @@ impl PeHostRuntime {
     /// Returns whether a comctl32 version 6 (Common Controls v6) activation
     /// context is active. When true, the guest expects modern common control
     /// styles and visual themes.
+    #[allow(dead_code)] // comctl32 v6 state query; flagged for the API database
     pub fn is_comctl32_v6_active(&self) -> bool {
         self.comctl32_v6_active
     }
@@ -10133,6 +10183,7 @@ impl PeHostRuntime {
     /// Legacy stub — kept for any leftover callers.  Delegates to the queue-based
     /// mechanism via [`drain_pending_dll_main_calls`] (which is a no-op when the
     /// queue is empty).
+    #[allow(dead_code)] // legacy DllMain stub kept for leftover callers; flagged for the API database
     fn call_dll_entry_point(
         &mut self,
         memory: &mut MemoryImage,
@@ -10160,6 +10211,7 @@ impl PeHostRuntime {
     /// The calls are deferred via [`pending_dll_main_calls`] and must be drained
     /// later (e.g. via [`drain_pending_dll_main_calls`]) from a context where
     /// guest code can safely execute.
+    #[allow(dead_code)] // DllMain notification API; used by tests
     pub fn call_dll_entry_points(&mut self, dll_handles: &[u64], reason: DllReason) {
         let raw_reason = reason.to_raw();
         for &handle in dll_handles {
@@ -10279,6 +10331,7 @@ impl PeHostRuntime {
     /// The callback receives the module handle (HMODULE) and the notification reason
     /// (e.g. `DLL_PROCESS_ATTACH = 1`). Callbacks fire from
     /// [`get_or_create_module_handle`] when a synthetic module is first created.
+    #[allow(dead_code)] // synthetic-DLL init callback registration; used by tests
     pub fn register_synthetic_dll_init_callback(&mut self, cb: Box<dyn FnMut(u64, u32)>) {
         self.synthetic_dll_init_callbacks.push(cb);
     }
@@ -11390,7 +11443,6 @@ impl PeHostRuntime {
         if message_id == 0x000f && self.paint_builtin_window(hwnd)? {
             // After painting a built-in window, submit the CEF frame for the
             // browser specifically associated with this HWND (if any).
-            #[cfg(feature = "metal")]
             if let Some(cef_handle) = self.user32.cef_browser_for_window(hwnd) {
                 crate::cef_bridge::with_global_cef_bridge(|bridge| {
                     bridge.submit_latest_frame_to_compositor(cef_handle);
@@ -11410,14 +11462,13 @@ impl PeHostRuntime {
         if message_id == 0x0005 {
             let new_width = (lparam as u32) & 0xFFFF;
             let new_height = ((lparam as u32) >> 16) & 0xFFFF;
-            if new_width > 0 && new_height > 0 {
-                #[cfg(feature = "metal")]
-                if let Some(cef_handle) = self.user32.cef_browser_for_window(hwnd) {
-                    crate::cef_bridge::with_global_cef_bridge(|bridge| {
-                        let _ =
-                            bridge.cef_browser_host_was_resized(cef_handle, new_width, new_height);
-                    });
-                }
+            if new_width > 0
+                && new_height > 0
+                && let Some(cef_handle) = self.user32.cef_browser_for_window(hwnd)
+            {
+                crate::cef_bridge::with_global_cef_bridge(|bridge| {
+                    let _ = bridge.cef_browser_host_was_resized(cef_handle, new_width, new_height);
+                });
             }
             return Ok(Some(0));
         }
@@ -13744,7 +13795,6 @@ impl PeHostRuntime {
                 let format = state.get(Register::Rdx) as u32;
                 let out_fmt_support = state.get(Register::R8);
                 // Accept common formats as supported; reject unknown formats.
-                const DXGI_FORMAT_UNKNOWN: u32 = 0;
                 const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
                 const DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: u32 = 29;
                 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
@@ -15417,7 +15467,11 @@ impl PeHostRuntime {
                     }
                     1 => { // D3D11_FEATURE_DOUBLES
                         if out_data != 0 && data_size >= 4 {
-                            write_u32(memory, out_data, if cfg!(target_feature = "f64") { 1 } else { 0 });
+                            // x86_64 macOS always has SSE2 (double-precision
+                            // baseline); AArch64 macOS always has fp64.
+                            let doubles = cfg!(target_arch = "x86_64")
+                                || cfg!(target_feature = "fp64");
+                            write_u32(memory, out_data, if doubles { 1 } else { 0 });
                         }
                     }
                     2 => { // D3D11_FEATURE_FORMAT_SUPPORT - delegate to CheckFormatSupport logic
@@ -22481,13 +22535,8 @@ impl PeHostRuntime {
                     const SWP_NOSIZE: u32 = 0x0001;
                     const SWP_NOMOVE: u32 = 0x0002;
                     const SWP_NOZORDER: u32 = 0x0004;
-                    const SWP_NOACTIVATE: u32 = 0x0010;
                     const SWP_SHOWWINDOW: u32 = 0x0040;
                     const SWP_HIDEWINDOW: u32 = 0x0080;
-                    const HWND_TOP: u32 = 0;
-                    const HWND_BOTTOM: u32 = 1;
-                    const HWND_TOPMOST: u32 = !0u32;
-                    const HWND_NOTOPMOST: u32 = !1u32;
                     if flags & SWP_NOMOVE == 0 {
                         self.user32.set_window_position(hwnd, x, y)?;
                     }
@@ -37023,7 +37072,6 @@ impl PeHostRuntime {
                 //   +0x11A wProductType         (BYTE)
                 //   +0x11B wReserved           (BYTE)
                 const VER_PLATFORM_WIN32_NT: u32 = 2;
-                const OSVERSIONINFOW_SIZE: u32 = 0x114; // 276 bytes — base struct
                 const OSVERSIONINFOEXW_SIZE: u32 = 0x11C; // 284 bytes — extended struct
                 let info_ptr = guest_call_arg(state, memory, 0)?;
                 // Derive the reported version from the GE winver profile, exactly
@@ -56840,6 +56888,7 @@ impl PeHostRuntime {
     ///   [4] LockForProcess              → XAPO_LockForProcess
     ///   [5] UnlockForProcess            → XAPO_UnlockForProcess
     ///   [6] Process                     → XAPO_Process
+    #[allow(dead_code)] // XAudio2 XAPO effect allocation; used by tests
     fn alloc_xapo_effect_object(
         &mut self,
         memory: &mut MemoryImage,
@@ -57820,6 +57869,7 @@ impl PeHostRuntime {
         })
     }
 
+    #[allow(dead_code)] // D3D11 deferred-context accessor; used by tests
     fn d3d11_deferred_context_mut(
         &mut self,
         address: u64,
@@ -73300,6 +73350,7 @@ fn read_window(memory: &MemoryImage, address: u64, len: usize) -> AppResult<Vec<
     Ok(bytes)
 }
 
+#[allow(dead_code)] // window-match assertion helper; used by tests
 fn read_window_matches(memory: &MemoryImage, address: u64, expected: &[u8]) -> AppResult<bool> {
     let mut offset = 0_usize;
     let mut scratch = [0_u8; 64];
@@ -91836,6 +91887,7 @@ fn read_guest_bytes(memory: &MemoryImage, address: u64, len: usize) -> AppResult
 ///
 /// Delegates to [`crate::host_thunks::validate_guest_pointer`] for consistent
 /// null-pointer, overflow, and range-mapped checks across all call sites.
+#[allow(dead_code)] // validate_guest_pointer: checked guest-memory access helper; flagged for the API database (no current PE import path reaches it)
 fn validate_guest_pointer(memory: &MemoryImage, address: u64, len: usize) -> AppResult<()> {
     host_validate_guest_pointer(memory, address, len)
 }
@@ -91844,6 +91896,7 @@ fn validate_guest_pointer(memory: &MemoryImage, address: u64, len: usize) -> App
 ///
 /// Delegates to [`crate::host_thunks::read_guest_bytes_checked`] for consistent
 /// validation across all call sites.
+#[allow(dead_code)] // read_guest_bytes_checked: checked guest-memory access helper; flagged for the API database (no current PE import path reaches it)
 fn read_guest_bytes_checked(memory: &MemoryImage, address: u64, len: usize) -> AppResult<Vec<u8>> {
     host_read_guest_bytes_checked(memory, address, len)
 }
@@ -91852,6 +91905,7 @@ fn read_guest_bytes_checked(memory: &MemoryImage, address: u64, len: usize) -> A
 ///
 /// Delegates to [`crate::host_thunks::write_guest_bytes_checked`] for consistent
 /// validation across all call sites.
+#[allow(dead_code)] // write_guest_bytes_checked: checked guest-memory access helper; flagged for the API database (no current PE import path reaches it)
 fn write_guest_bytes_checked(
     memory: &mut MemoryImage,
     address: u64,
@@ -91865,6 +91919,7 @@ fn write_guest_bytes_checked(
 /// Reads code units one at a time until a null terminator is found or
 /// `max_units` code units have been read. Returns an error for null pointers,
 /// unmapped memory, or if the string exceeds `max_units`.
+#[allow(dead_code)] // read_utf16_string_checked: checked guest-memory access helper; flagged for the API database (no current PE import path reaches it)
 fn read_utf16_string_checked(
     memory: &MemoryImage,
     address: u64,
@@ -92303,6 +92358,7 @@ fn read_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
     Ok((u64::from(high) << 32) | u64::from(low))
 }
 
+#[allow(dead_code)] // read_u16: checked guest-memory access helper; flagged for the API database (no current PE import path reaches it)
 fn read_u16(memory: &MemoryImage, address: u64) -> AppResult<u16> {
     Ok(u16::from_le_bytes([
         memory.read_u8(address)?,

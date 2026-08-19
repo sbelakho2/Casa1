@@ -264,6 +264,7 @@ fn is_leap_year(y: i64) -> bool {
 }
 
 /// Get current time as DMTF datetime.
+#[allow(dead_code)] // WMI timestamp formatting helper; not yet referenced
 fn now_dmtf() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
