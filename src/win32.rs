@@ -1027,6 +1027,10 @@ pub struct Win32Subsystem {
     last_config_save_wall_ms: u64,
     current_process_id: u32,
     current_thread_id: u32,
+    /// Shared runtime-event observer list (set by the PE runtime; `None`
+    /// when this subsystem is driven standalone, e.g. in oracle sessions or
+    /// direct tests — event emission is a no-op then).
+    pub(crate) event_observers: Option<crate::runtime_events::ObserverList>,
 }
 
 /// Non-consuming satisfiability result for scheduler wait evaluation.
@@ -1035,6 +1039,52 @@ pub enum WaitSatisfaction {
     NotSignaled,
     Signaled,
     Abandoned,
+}
+
+/// Generic named-pipe service facade: pre-created server-side listeners for
+/// pipe services the workload cannot execute.
+///
+/// Workload workaround, excluded from platform completeness: the Windows
+/// platform provides NO generic pre-create hook for pipe services — this
+/// exists solely so workloads (e.g. the Steam workload's `steam_service`
+/// pipe) can wire launch-time IPC without SteamService.exe running.  It is
+/// deliberately NOT part of the guest-visible Win32 API surface.
+pub struct NamedPipeService<'a> {
+    win32: &'a mut Win32Subsystem,
+}
+
+impl NamedPipeService<'_> {
+    /// Pre-create a server-side named-pipe listener (`PIPE_ACCESS_DUPLEX`,
+    /// message-mode, 1 instance, 64 KiB buffers) so a guest connecting via
+    /// `CreateFileW`/`CallNamedPipe` finds a live listener even though the
+    /// real service process is not being executed.
+    ///
+    /// Workload workaround, excluded from platform completeness (see the
+    /// type-level docs).  Idempotent: if the pipe already exists (the guest
+    /// created it, or a prior call), it is left untouched.
+    pub fn create_compat_listener(&mut self, pipe_name: &str) -> AppResult<()> {
+        let normalized = normalize_pipe_name(pipe_name);
+        if self.win32.named_pipes.contains_key(&normalized) {
+            return Ok(());
+        }
+        let handle = self.win32.create_named_pipe_w(
+            pipe_name,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_READMODE_MESSAGE,
+            1,         // nMaxInstances
+            64 * 1024, // out buffer
+            64 * 1024, // in buffer
+            0,         // default timeout
+            false,     // inheritable
+            None,      // security descriptor
+            None,      // uds path (derived)
+        )?;
+        eprintln!(
+            "[win32] compat pipe listener created: {} (server handle {handle:#x})",
+            pipe_name
+        );
+        Ok(())
+    }
 }
 
 impl Win32Subsystem {
@@ -1086,6 +1136,15 @@ impl Win32Subsystem {
             last_config_save_wall_ms: 0,
             current_process_id,
             current_thread_id,
+            event_observers: None,
+        }
+    }
+
+    /// Emit a generic runtime event to the attached observer list (no-op
+    /// when this subsystem is driven without a runtime).
+    pub(crate) fn emit_event(&mut self, event: crate::runtime_events::RuntimeEvent) {
+        if let Some(observers) = &self.event_observers {
+            crate::runtime_events::dispatch(observers, &event);
         }
     }
 
@@ -2411,13 +2470,22 @@ impl Win32Subsystem {
         delete_on_close: bool,
     ) -> AppResult<Handle> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
-        // Steam run instrumentation (no behavior change): note the
-        // package-writability probe (`C:\package` or `C:\*.crash` opened for
-        // write) in the shared milestone static.
-        crate::steam_milestones::note_package_writability_probe(
-            &normalized_path,
-            granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0,
-        );
+        // Generic runtime event (no behavior change): every file open is
+        // observable at request level (path, raw access/share/disposition).
+        // The Steam workload observer derives the manifest-opened and
+        // package-writability-probe milestones from this event.
+        self.emit_event(crate::runtime_events::RuntimeEvent::FileOpened {
+            path: normalized_path.clone(),
+            desired_access: granted_access,
+            share_mode: share_mode_to_raw(share_mode),
+            disposition: match creation {
+                CreationDisposition::CreateNew => 1,
+                CreationDisposition::CreateAlways => 2,
+                CreationDisposition::OpenExisting => 3,
+                CreationDisposition::OpenAlways => 4,
+                CreationDisposition::TruncateExisting => 5,
+            },
+        });
         let exists = host_path.exists();
         if exists && host_path.is_dir() {
             if !backup_semantics
@@ -2439,10 +2507,6 @@ impl Win32Subsystem {
             // open without compatible share modes fails with a sharing
             // violation.
             let ge_handle = Some(self.ge.open_file(path, desired_access, share_mode)?);
-            // Steam run instrumentation (no behavior change): record a
-            // successful manifest open (the directory branch opens a
-            // `C:\package` handle with backup semantics).
-            crate::steam_milestones::note_manifest_path(&normalized_path);
             return Ok(self.insert_object(
                 ObjectType::File,
                 granted_access,
@@ -2625,9 +2689,6 @@ impl Win32Subsystem {
             .write(desired_access.write)
             .open(&host_path)
             .ok();
-        // Steam run instrumentation (no behavior change): record a successful
-        // manifest open in the shared milestone static.
-        crate::steam_milestones::note_manifest_path(&normalized_path);
         Ok(self.insert_object(
             ObjectType::File,
             granted_access,
@@ -2889,75 +2950,80 @@ impl Win32Subsystem {
         match object_type {
             ObjectType::File => {
                 Self::require_access(self.handle_entry(handle)?, FILE_READ_DATA)?;
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::File(file) = &mut entry.object {
-                    let mut file = file.borrow_mut();
-                    let path_display = file.host_path.display().to_string();
-                    let position = file.position;
-                    if let Some(host_file) = file.host_file.as_mut() {
-                        let size = host_file
-                            .metadata()
-                            .map_err(|error| {
+                let (data, read_path) = (|| -> AppResult<(Vec<u8>, String)> {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::File(file) = &mut entry.object {
+                        let mut file = file.borrow_mut();
+                        let path_display = file.host_path.display().to_string();
+                        let position = file.position;
+                        if let Some(host_file) = file.host_file.as_mut() {
+                            let size = host_file
+                                .metadata()
+                                .map_err(|error| {
+                                    AppError::from_io(
+                                        ReasonCode::RcIo,
+                                        format!("failed to stat {path_display}"),
+                                        &error,
+                                    )
+                                })?
+                                .len();
+                            // Clamp the start position: a guest may seek past
+                            // EOF (Windows allows it) and reads must yield
+                            // zero bytes, not panic on a slice.
+                            let start = position.min(size);
+                            let to_read = (length as u64).min(size - start) as usize;
+                            let mut data = vec![0_u8; to_read];
+                            host_file.seek(SeekFrom::Start(start)).map_err(|error| {
                                 AppError::from_io(
                                     ReasonCode::RcIo,
-                                    format!("failed to stat {path_display}"),
-                                    &error,
-                                )
-                            })?
-                            .len();
-                        // Clamp the start position: a guest may seek past EOF
-                        // (Windows allows it) and reads must yield zero bytes,
-                        // not panic on a slice.
-                        let start = position.min(size);
-                        let to_read = (length as u64).min(size - start) as usize;
-                        let mut data = vec![0_u8; to_read];
-                        host_file.seek(SeekFrom::Start(start)).map_err(|error| {
-                            AppError::from_io(
-                                ReasonCode::RcIo,
-                                format!("failed to seek {path_display}"),
-                                &error,
-                            )
-                        })?;
-                        let mut read_total = 0usize;
-                        while read_total < data.len() {
-                            let n = host_file.read(&mut data[read_total..]).map_err(|error| {
-                                AppError::from_io(
-                                    ReasonCode::RcIo,
-                                    format!("failed to read {path_display}"),
+                                    format!("failed to seek {path_display}"),
                                     &error,
                                 )
                             })?;
-                            if n == 0 {
-                                break;
+                            let mut read_total = 0usize;
+                            while read_total < data.len() {
+                                let n =
+                                    host_file.read(&mut data[read_total..]).map_err(|error| {
+                                        AppError::from_io(
+                                            ReasonCode::RcIo,
+                                            format!("failed to read {path_display}"),
+                                            &error,
+                                        )
+                                    })?;
+                                if n == 0 {
+                                    break;
+                                }
+                                read_total += n;
                             }
-                            read_total += n;
+                            data.truncate(read_total);
+                            file.position = start.saturating_add(read_total as u64);
+                            return Ok((data, file.normalized_path.clone()));
                         }
-                        data.truncate(read_total);
-                        file.position = start.saturating_add(read_total as u64);
-                        // Steam run instrumentation (no behavior change): a
-                        // full read of the manifest file completed.
-                        crate::steam_milestones::note_manifest_read(&file.normalized_path);
-                        return Ok(data);
+                        // Fallback for handles without an open descriptor
+                        // (directories, failed opens): whole-file read with
+                        // clamped slicing.
+                        let bytes = fs::read(&file.host_path).map_err(|error| {
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!("failed to read {path_display}"),
+                                &error,
+                            )
+                        })?;
+                        let start = (file.position as usize).min(bytes.len());
+                        let end = start.saturating_add(length).min(bytes.len());
+                        file.position = end as u64;
+                        return Ok((bytes[start..end].to_vec(), file.normalized_path.clone()));
                     }
-                    // Fallback for handles without an open descriptor
-                    // (directories, failed opens): whole-file read with
-                    // clamped slicing.
-                    let bytes = fs::read(&file.host_path).map_err(|error| {
-                        AppError::from_io(
-                            ReasonCode::RcIo,
-                            format!("failed to read {path_display}"),
-                            &error,
-                        )
-                    })?;
-                    let start = (file.position as usize).min(bytes.len());
-                    let end = start.saturating_add(length).min(bytes.len());
-                    file.position = end as u64;
-                    // Steam run instrumentation (no behavior change): a full
-                    // read of the manifest file completed.
-                    crate::steam_milestones::note_manifest_read(&file.normalized_path);
-                    return Ok(bytes[start..end].to_vec());
-                }
-                invalid_handle("handle is not a file")
+                    invalid_handle("handle is not a file")
+                })()?;
+                // Generic runtime event (no behavior change): a file read
+                // completed; the Steam workload observer derives the manifest
+                // full-read milestone from it.
+                self.emit_event(crate::runtime_events::RuntimeEvent::FileRead {
+                    path: read_path,
+                    bytes: data.clone(),
+                });
+                Ok(data)
             }
             ObjectType::Pipe => {
                 let normalized = match &self.handle_entry(handle)?.object {
@@ -3087,6 +3153,12 @@ impl Win32Subsystem {
                     }
                 };
                 self.sync_entry(&normalized_path, &host_path, false)?;
+                // Generic runtime event (no behavior change): a file write
+                // completed.
+                self.emit_event(crate::runtime_events::RuntimeEvent::FileWritten {
+                    path: normalized_path,
+                    bytes: bytes.to_vec(),
+                });
                 Ok(bytes.len() as u32)
             }
             ObjectType::Pipe => {
@@ -3471,6 +3543,10 @@ impl Win32Subsystem {
             )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
+        // Generic runtime event (no behavior change): a file was deleted.
+        self.emit_event(crate::runtime_events::RuntimeEvent::FileDeleted {
+            path: normalized_path.clone(),
+        });
         // Handles that survived the delete (they were open with
         // FILE_SHARE_DELETE) now reference a deleted file; record
         // delete_pending so close-time cleanup (e.g. FILE_FLAG_DELETE_ON_CLOSE
@@ -4910,43 +4986,19 @@ impl Win32Subsystem {
             message_mode: pipe_mode & PIPE_READMODE_MESSAGE != 0,
             client_connected: false,
         };
-        self.named_pipes.insert(normalized, state.clone());
+        self.named_pipes.insert(normalized.clone(), state.clone());
+
+        // Generic runtime event (no behavior change): a pipe server endpoint
+        // was created.
+        self.emit_event(crate::runtime_events::RuntimeEvent::PipeCreated { name: normalized });
 
         Ok(handle)
     }
 
-    /// SteamService named-pipe listener for launch-time IPC wiring.
-    ///
-    /// When a Steam launch enables `steam_ipc`, the runner pre-creates the
-    /// `\\.\pipe\steam_service` server endpoint (the NamedPipeState
-    /// server-created hook) before the guest runs, so a guest Steam client
-    /// connecting via `CreateFileW`/`CallNamedPipe` finds a live listener
-    /// even though SteamService.exe is not being executed.  Idempotent: if
-    /// the pipe already exists (guest created it, or a prior call), it is
-    /// left untouched.
-    pub fn ensure_steam_service_pipe_listener(&mut self) -> AppResult<()> {
-        const STEAM_SERVICE_PIPE: &str = r"\\.\pipe\steam_service";
-        let normalized = normalize_pipe_name(STEAM_SERVICE_PIPE);
-        if self.named_pipes.contains_key(&normalized) {
-            return Ok(());
-        }
-        let handle = self.create_named_pipe_w(
-            STEAM_SERVICE_PIPE,
-            PIPE_ACCESS_DUPLEX,
-            PIPE_READMODE_MESSAGE,
-            1,         // nMaxInstances
-            64 * 1024, // out buffer
-            64 * 1024, // in buffer
-            0,         // default timeout
-            false,     // inheritable
-            None,      // security descriptor
-            None,      // uds path (derived)
-        )?;
-        eprintln!(
-            "[win32] SteamService pipe listener created: {} (server handle {handle:#x})",
-            STEAM_SERVICE_PIPE
-        );
-        Ok(())
+    /// Access the generic named-pipe service facade (compat-listener
+    /// pre-creation used by workloads).
+    pub fn named_pipe_service(&mut self) -> NamedPipeService<'_> {
+        NamedPipeService { win32: self }
     }
 
     /// `ConnectNamedPipe` — wait for a client to connect to the named pipe.
@@ -5232,6 +5284,9 @@ impl Win32Subsystem {
             state.client_handle = Some(handle);
         }
         self.pipe_complete_connect(&normalized)?;
+        // Generic runtime event (no behavior change): a named-pipe client
+        // connected.
+        self.emit_event(crate::runtime_events::RuntimeEvent::PipeConnected { name: normalized });
         Ok(handle)
     }
 

@@ -1439,6 +1439,9 @@ pub struct User32Subsystem {
     dwm_attributes: BTreeMap<Hwnd, DwmAttributes>,
     /// Visual effect views (NSVisualEffectView) for DWM blur-behind, keyed by HWND.
     blur_effect_views: BTreeMap<Hwnd, u64>,
+    /// Shared runtime-event observer list (set by the PE runtime; `None`
+    /// when driven standalone — event emission is a no-op then).
+    pub(crate) event_observers: Option<crate::runtime_events::ObserverList>,
 }
 
 /// Per-icon data extracted from NOTIFYICONDATAW.
@@ -1641,6 +1644,15 @@ impl User32Subsystem {
             flashing_windows: BTreeMap::new(),
             dwm_attributes: BTreeMap::new(),
             blur_effect_views: BTreeMap::new(),
+            event_observers: None,
+        }
+    }
+
+    /// Emit a generic runtime event to the attached observer list (no-op
+    /// when this subsystem is driven without a runtime).
+    pub(crate) fn emit_event(&mut self, event: crate::runtime_events::RuntimeEvent) {
+        if let Some(observers) = &self.event_observers {
+            crate::runtime_events::dispatch(observers, &event);
         }
     }
 
@@ -1998,6 +2010,12 @@ impl User32Subsystem {
             }
             return Err(e);
         }
+        // Generic runtime event (no behavior change): a guest window was
+        // created.
+        self.emit_event(crate::runtime_events::RuntimeEvent::WindowCreated {
+            hwnd,
+            class: class_name.to_string(),
+        });
         Ok(hwnd)
     }
 

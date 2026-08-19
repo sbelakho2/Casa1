@@ -695,16 +695,16 @@ impl RealAudioBackend {
             )
         })?;
 
-        // Steam run instrumentation (no behavior change): the FIRST
-        // successful real audio device initialization — a cpal output stream
-        // was built AND started on a real device.  Never recorded for stubs
-        // or failed opens (both error out above).
-        crate::steam_milestones::note_audio_initialized(
-            crate::steam_milestones::MilestoneEvidence::context_free(
-                "RealAudioBackend::ensure_stream (cpal)",
-                Some(&device.name),
-                "real audio output stream opened on a host device",
-            ),
+        // Generic runtime event (no behavior change): the FIRST successful
+        // real audio device initialization — a cpal output stream was built
+        // AND started on a real device.  Never emitted for stubs or failed
+        // opens (both error out above).  The Steam workload observer derives
+        // the audio-initialized milestone from it.
+        crate::runtime_events::emit_global(
+            &crate::runtime_events::RuntimeEvent::AudioDeviceOpened {
+                device: self.device_info(device_id)?.name.clone(),
+                api: "RealAudioBackend::ensure_stream (cpal)".to_string(),
+            },
         );
 
         // Record initial latency using the device's sample rate (the stream
@@ -849,16 +849,15 @@ impl RealAudioBackend {
             )
         })?;
 
-        // Steam run instrumentation (no behavior change): the FIRST
-        // successful real audio initialization in exclusive mode — a cpal
-        // exclusive stream was built AND started on a real device.  Never
-        // recorded for stubs or failed opens (both error out above).
-        crate::steam_milestones::note_audio_initialized(
-            crate::steam_milestones::MilestoneEvidence::context_free(
-                "RealAudioBackend::ensure_stream_exclusive (cpal)",
-                Some(&self.device_info(device_id)?.name),
-                "real exclusive-mode audio stream opened on a host device",
-            ),
+        // Generic runtime event (no behavior change): the FIRST successful
+        // real audio initialization in exclusive mode — a cpal exclusive
+        // stream was built AND started on a real device.  Never emitted for
+        // stubs or failed opens (both error out above).
+        crate::runtime_events::emit_global(
+            &crate::runtime_events::RuntimeEvent::AudioDeviceOpened {
+                device: self.device_info(device_id)?.name.clone(),
+                api: "RealAudioBackend::ensure_stream_exclusive (cpal)".to_string(),
+            },
         );
 
         self.streams.insert(device_id, stream);

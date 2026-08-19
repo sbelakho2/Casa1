@@ -822,6 +822,14 @@ pub struct PeExecutionOptions {
     /// When true, the SteamService named-pipe listener is created before the
     /// guest runs so a Steam client can connect to it.
     pub steam_ipc: bool,
+    /// Generic runtime-event observers attached for the duration of the run
+    /// (the Steam workload passes its `SteamMilestoneObserver` here; empty
+    /// by default — the runtime works perfectly with no observer attached).
+    pub observers: Vec<Box<dyn crate::runtime_events::RuntimeObserver>>,
+    /// Named-pipe listeners pre-created before the guest runs (generic
+    /// workload workaround for services the workload cannot execute — see
+    /// [`crate::win32::NamedPipeService::create_compat_listener`]).
+    pub compat_named_pipes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3878,6 +3886,12 @@ struct PeHostRuntime {
     audio: AudioSubsystem,
     win32: Win32Subsystem,
     user32: User32Subsystem,
+    /// Generic runtime-event observers (workloads like the Steam milestone
+    /// observer).  Empty by default — the runtime works perfectly with no
+    /// observer attached.  The same list is shared (via clone) with the
+    /// win32/user32 subsystems and registered as the process-wide current
+    /// list so the global CEF bridge / real-audio backend can publish.
+    observers: crate::runtime_events::ObserverList,
     guest_arch: GuestArch,
     live_session: Option<LivePeSession>,
     live_keyboard_device: Option<String>,
@@ -4805,12 +4819,19 @@ pub fn execute_with_options(
     runtime.jit_mode = options.jit_mode.unwrap_or(crate::runner::JitMode::Auto);
     runtime.set_guest_arch(guest_arch);
     runtime.process_environment = env.clone();
-    if options.steam_ipc {
-        // The SteamService named-pipe listener is part of the launch job:
-        // pre-create the server endpoint so a guest Steam client can connect
-        // to `\\.\pipe\steam_service` without SteamService.exe running.
-        runtime.win32.ensure_steam_service_pipe_listener()?;
-        eprintln!("[pe_runtime] steam_ipc enabled — SteamService pipe listener created");
+    for observer in options.observers {
+        runtime.add_observer(observer);
+    }
+    // Generic named-pipe compat listeners requested by the workload (e.g.
+    // the Steam workload pre-creates the `steam_service` pipe so a guest
+    // Steam client finds a live listener without SteamService.exe running).
+    // The Steam-specific part of that wiring lives in the workload module;
+    // the runtime only honors the generic request.
+    for pipe_name in &options.compat_named_pipes {
+        runtime
+            .win32
+            .named_pipe_service()
+            .create_compat_listener(pipe_name)?;
     }
     let staged_program_path = runtime.stage_main_module(program)?;
     runtime.current_directory =
@@ -4856,6 +4877,12 @@ pub fn execute_with_options(
         &image.exports,
         &main_tls_callbacks_rva,
     );
+    // Generic runtime event (no behavior change): the main image is mapped.
+    runtime.emit_event(crate::runtime_events::RuntimeEvent::ImageLoaded {
+        module: module_file_name(&staged_program_path).to_string(),
+        base: mapped.selected_base,
+        size: image.size_of_image as usize,
+    });
     let start_time = std::time::Instant::now();
     runtime.seed_process_state(
         &mut memory,
@@ -5179,39 +5206,30 @@ pub fn execute_with_options(
             block_count += 1;
             // Steam run instrumentation (no behavior change): the first block
             // dispatch marks bootstrap as started, with the guest context in
-            // which the run's first block executed.  The same event also
-            // records the generic process-first-instruction marker, which
-            // child-runner artifacts use to prove a spawned child PE
-            // actually began executing.
+            // which the run's first block executed.
             crate::steam_milestones::note_bootstrap_started(runtime.milestone_evidence(
                 state,
                 "block dispatch",
                 None,
                 "first block dispatch of the PE main loop",
             ));
-            crate::steam_milestones::note_process_first_instruction(runtime.milestone_evidence(
-                state,
-                "block dispatch",
-                None,
-                "first block dispatch of the PE main loop",
-            ));
-            // A steamwebhelper child PE records its process-started evidence
-            // IMMEDIATELY at FIRST block dispatch (never at child completion)
-            // into the process-wide MILESTONES static: an in-process child's
-            // start is already visible to the parent's snapshot, and an
-            // out-of-process child runner's artifact carries the evidence
-            // from the first dispatched block onward (the artifact remains
-            // the child's vehicle, but it never depends on the child having
-            // completed).  Guarded to the first dispatch: the milestone
-            // counter must not grow per-iteration.
-            if block_count == 1 && crate::runner::is_webhelper_program(program) {
-                crate::steam_milestones::note_webhelper_process_started(
-                    runtime.milestone_evidence(
-                        state,
-                        "block dispatch",
-                        None,
-                        "first block dispatch of the steamwebhelper child PE",
-                    ),
+            // Generic runtime event (no behavior change): the first block
+            // dispatch of ANY PE image is the process-first-instruction
+            // marker.  The Steam workload observer derives
+            // `process_first_instruction` from it, and a steamwebhelper
+            // child PE derives its process-started evidence IMMEDIATELY at
+            // FIRST block dispatch (never at child completion) — an
+            // in-process child's start is already visible to the parent's
+            // snapshot, and an out-of-process child runner's artifact
+            // carries the evidence from the first dispatched block onward.
+            // Guarded to the first dispatch: the marker must not repeat per
+            // iteration.
+            if block_count == 1 {
+                runtime.emit_event(
+                    crate::runtime_events::RuntimeEvent::ProcessFirstInstruction {
+                        pid: runtime.win32.current_process_id(),
+                        image: module_file_name(&runtime.main_module_path).to_string(),
+                    },
                 );
             }
             // ── Host-side block-dispatch safepoint ───────────────────────────
@@ -8682,7 +8700,7 @@ pub fn execute_with_options(
 /// here — the runner never reconstructs a synthetic result.
 #[allow(clippy::too_many_arguments)]
 fn finalize_execution(
-    runtime: PeHostRuntime,
+    mut runtime: PeHostRuntime,
     _memory: &mut MemoryImage,
     image: &pe::ParsedPe,
     mapped: &pe::MappedImage,
@@ -8727,7 +8745,7 @@ fn finalize_execution(
         json!(exit_code),
         vec![image_hash],
     )];
-    trace_events.extend(runtime.trace_events);
+    trace_events.extend(std::mem::take(&mut runtime.trace_events));
 
     let (jit_blocks_compiled, jit_blocks_executed) = match &runtime.jit_runtime {
         Some(jit) => (jit.blocks_compiled, jit.blocks_executed),
@@ -8744,11 +8762,11 @@ fn finalize_execution(
 
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),
-        stdout: runtime.stdout,
-        stderr: runtime.stderr,
+        stdout: std::mem::take(&mut runtime.stdout),
+        stderr: std::mem::take(&mut runtime.stderr),
         exit_code,
         guest_exceptions: Vec::new(),
-        gfx_frames: runtime.gfx_frames,
+        gfx_frames: std::mem::take(&mut runtime.gfx_frames),
         perf,
         trace_events,
         milestones: crate::steam_milestones::snapshot_milestones(),
@@ -8802,12 +8820,32 @@ pub struct ThunkManifestGateResult {
 /// drive-root writability probe through the real host-thunk dispatch layer
 /// (`alloc_host_thunk` + `dispatch_import` on an x86 guest state) rather
 /// than calling `Win32Subsystem` methods directly.  The checked-in
-/// `steam-live-run-x86` GE is expected.  The instrumentation hooks in the
-/// file layer record milestone evidence during the cycle, returned in
-/// `ThunkManifestGateResult::milestones`.
+/// `steam-live-run-x86` GE is expected.  The file layer emits generic
+/// runtime events during the cycle; the Steam milestone observer (attached
+/// here via the `steam_milestones` compatibility shim — this test harness
+/// is part of the Steam workload, not of the generic runtime) infers the
+/// milestone evidence, returned in `ThunkManifestGateResult::milestones`.
 #[doc(hidden)]
 pub fn thunk_drive_manifest_gate(ge: GameEnvironment) -> AppResult<ThunkManifestGateResult> {
+    thunk_drive_manifest_gate_with_observers(
+        ge,
+        vec![Box::new(
+            crate::steam_milestones::SteamMilestoneObserver::default(),
+        )],
+    )
+}
+
+/// `thunk_drive_manifest_gate` with caller-provided runtime-event observers
+/// (test harness for the generic runtime-events layer).
+#[doc(hidden)]
+pub fn thunk_drive_manifest_gate_with_observers(
+    ge: GameEnvironment,
+    observers: Vec<Box<dyn crate::runtime_events::RuntimeObserver>>,
+) -> AppResult<ThunkManifestGateResult> {
     let mut runtime = PeHostRuntime::new(ge, false, Vec::new(), None, None);
+    for observer in observers {
+        runtime.add_observer(observer);
+    }
     runtime.guest_arch = GuestArch::X86;
     runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
     runtime.next_data_address = data_base_for_arch(GuestArch::X86);
@@ -8915,6 +8953,34 @@ pub fn thunk_drive_manifest_gate(ge: GameEnvironment) -> AppResult<ThunkManifest
 
     result.milestones = crate::steam_milestones::snapshot_milestones();
     Ok(result)
+}
+
+/// Drive `dispatch_import` with an UNREGISTERED thunk address — the
+/// unsupported-call fallback path of the generic runtime-events layer (test
+/// harness).  The dispatch fails with `RcUnimplInsn`; the `UnsupportedCall`
+/// event must have been emitted to the attached observers.  Returns the
+/// error message and the observer list so the caller can inspect what the
+/// observers received.
+#[doc(hidden)]
+pub fn thunk_drive_unknown_thunk(
+    ge: GameEnvironment,
+    observers: Vec<Box<dyn crate::runtime_events::RuntimeObserver>>,
+) -> (String, Vec<Box<dyn crate::runtime_events::RuntimeObserver>>) {
+    let mut runtime = PeHostRuntime::new(ge, false, Vec::new(), None, None);
+    for observer in observers {
+        runtime.add_observer(observer);
+    }
+    let mut memory = MemoryImage::default();
+    let mut state = CpuState::new(GuestArch::X86);
+    let error = runtime
+        .dispatch_import(0x0000_0000_DEAD_BEEF, &mut state, &mut memory)
+        .expect_err("dispatch_import must fail for an unregistered thunk");
+    let taken = std::mem::take(&mut runtime.observers);
+    let observers = taken
+        .lock()
+        .map(|mut guard| guard.drain(..).collect())
+        .unwrap_or_default();
+    (error.message, observers)
 }
 
 // ---------------------------------------------------------------------------
@@ -9247,10 +9313,12 @@ impl PeHostRuntime {
         } else {
             None
         };
-        Self {
+        let observers = crate::runtime_events::new_observer_list();
+        let mut runtime = Self {
             audio: AudioSubsystem::new(),
             win32: Win32Subsystem::new_with_live_pacing(ge, dtm, live_session.is_some()),
             user32,
+            observers: observers.clone(),
             guest_arch: GuestArch::X64,
             live_session,
             live_keyboard_device,
@@ -9538,7 +9606,36 @@ impl PeHostRuntime {
             cef_cross_origin_whitelist: HashSet::new(),
             dwm_blur_states: HashMap::new(),
             dwm_margins: HashMap::new(),
+        };
+        // Wire the runtime's observer list into the subsystems that emit
+        // events outside the runtime's own dispatch (the Win32 file layer
+        // and the user32 window layer hold a clone of the shared list; the
+        // global CEF bridge and the real-audio backend publish through the
+        // process-wide current-observer registry for the runtime's lifetime).
+        runtime.win32.event_observers = Some(observers.clone());
+        runtime.user32.event_observers = Some(observers.clone());
+        crate::cef_bridge::set_event_observers(Some(observers.clone()));
+        crate::runtime_events::register_current_observers(observers);
+        runtime
+    }
+
+    /// Attach a generic runtime-event observer.  The runtime works perfectly
+    /// with no observer attached — this is purely opt-in workload wiring.
+    pub fn add_observer(&mut self, observer: Box<dyn crate::runtime_events::RuntimeObserver>) {
+        if let Ok(mut guard) = self.observers.lock() {
+            guard.push(observer);
         }
+    }
+
+    /// Dispatch one generic runtime event to every attached observer.
+    pub(crate) fn emit_event(&mut self, event: crate::runtime_events::RuntimeEvent) {
+        crate::runtime_events::dispatch(&self.observers, &event);
+    }
+
+    /// True when at least one observer is attached (hot paths use this to
+    /// skip constructing events nobody will receive).
+    fn has_observers(&self) -> bool {
+        crate::runtime_events::observer_count(&self.observers) > 0
     }
 
     fn set_guest_arch(&mut self, guest_arch: GuestArch) {
@@ -12574,6 +12671,22 @@ impl PeHostRuntime {
             // blocks can call the host function directly.
             self.register_fast_thunk(thunk_address);
             write_guest_pointer(memory, slot_va, thunk_address, self.guest_arch)?;
+            // Generic runtime event (no behavior change): the import was
+            // resolved to an export.
+            let (name, ordinal) = match &import.symbol {
+                pe::ImportSymbol::ByName { name, .. } => (name.clone(), None),
+                pe::ImportSymbol::ByOrdinal { ordinal } => (
+                    ordinal_import_name(&import.resolved_module, *ordinal)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("ordinal#{ordinal}")),
+                    Some(*ordinal),
+                ),
+            };
+            self.emit_event(crate::runtime_events::RuntimeEvent::ExportResolved {
+                module: import.resolved_module.clone(),
+                name,
+                ordinal,
+            });
         }
         Ok(())
     }
@@ -12821,18 +12934,36 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<Option<i32>> {
-        let thunk = self
-            .host_thunks
-            .get(&thunk_address)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcUnimplInsn,
-                    format!("unknown PE host thunk at {thunk_address:#x}"),
-                )
-            })?;
+        let Some(thunk) = self.host_thunks.get(&thunk_address).cloned() else {
+            // Unsupported-call observability: the dispatch reached an
+            // unknown thunk — emit the UnsupportedCall event (recorded in
+            // the run evidence) before surfacing the failure.
+            self.emit_event(crate::runtime_events::RuntimeEvent::UnsupportedCall {
+                module: String::new(),
+                api: format!("unknown-thunk@{thunk_address:#x}"),
+                guest_pc: state.rip,
+                thread_id: self.win32.current_thread_id(),
+                implementation_level: "unsupported".to_string(),
+                reason: format!("unknown PE host thunk at {thunk_address:#x}"),
+            });
+            return Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("unknown PE host thunk at {thunk_address:#x}"),
+            ));
+        };
         let thunk_name = format!("{thunk:?}");
         crate::steam_milestones::record_last_thunk(&thunk_name, state.rip as u32);
+        // Generic runtime event: every dispatched guest API call is
+        // observable.  Skipped entirely when no observer is attached (the
+        // default) so the hot path never constructs the event.
+        if self.has_observers() {
+            self.emit_event(crate::runtime_events::RuntimeEvent::ApiCalled {
+                module: self.module_base_name(self.mapped_image_base),
+                api: thunk_name.clone(),
+                guest_pc: state.rip,
+                thread_id: self.win32.current_thread_id(),
+            });
+        }
         let callee_saved_before = if self.guest_arch == GuestArch::X86 {
             Some((
                 state.get(Register::Rbx),
@@ -15859,14 +15990,15 @@ impl PeHostRuntime {
                 self.dispatch_dxgi_swapchain_get_buffer(memory, state)?;
             }
             HostThunk::DXGISwapChainPresent => {
-                // Steam run instrumentation (no behavior change): count every
-                // DXGI Present call and record the first one's guest context.
-                crate::steam_milestones::note_dxgi_present_with(self.milestone_evidence(
-                    state,
-                    "DXGISwapChainPresent",
-                    None,
-                    "DXGI Present call",
-                ));
+                // Generic runtime event (no behavior change): count every
+                // DXGI Present call; the Steam workload observer records the
+                // first one's evidence and the presentation counter.
+                self.emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
+                    producer: "dxgi".to_string(),
+                    width: 0,
+                    height: 0,
+                    sequence: self.next_frame_index as u64,
+                });
                 self.dispatch_dxgi_swapchain_present(state)?;
             }
             HostThunk::DXGISwapChainResizeBuffers => {
@@ -28799,20 +28931,16 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, command_line_ptr)?
                 };
-                // Steam run instrumentation (no behavior change): count
-                // steamwebhelper child-process spawn REQUESTS (the child PE
-                // runs in a separate casa1-runner process; its actual start is
-                // a distinct milestone with no in-process producer yet).
-                crate::steam_milestones::note_webhelper_spawn_request(
-                    &application_name,
-                    &command_line,
-                    self.milestone_evidence(
-                        state,
-                        "CreateProcessW",
-                        (!application_name.is_empty()).then_some(application_name.as_str()),
-                        "steamwebhelper child process spawn request",
-                    ),
-                );
+                // Generic runtime event (no behavior change): the spawn
+                // REQUEST — the child PE runs in a separate casa1-runner
+                // process; its actual start is a distinct
+                // ProcessFirstInstruction event.  The Steam workload
+                // observer counts steamwebhelper spawn requests from it.
+                self.emit_event(crate::runtime_events::RuntimeEvent::ProcessSpawnRequested {
+                    image: application_name.clone(),
+                    command_line: command_line.clone(),
+                    parent_pid: self.win32.current_process_id(),
+                });
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
                 } else {
@@ -28942,19 +29070,13 @@ impl PeHostRuntime {
                 } else {
                     read_c_string(memory, command_line_ptr)?
                 };
-                // Steam run instrumentation (no behavior change): count
-                // steamwebhelper child-process spawn REQUESTS (see the
-                // CreateProcessW arm).
-                crate::steam_milestones::note_webhelper_spawn_request(
-                    &application_name,
-                    &command_line,
-                    self.milestone_evidence(
-                        state,
-                        "CreateProcessA",
-                        (!application_name.is_empty()).then_some(application_name.as_str()),
-                        "steamwebhelper child process spawn request",
-                    ),
-                );
+                // Generic runtime event (no behavior change): the spawn
+                // REQUEST (see the CreateProcessW arm).
+                self.emit_event(crate::runtime_events::RuntimeEvent::ProcessSpawnRequested {
+                    image: application_name.clone(),
+                    command_line: command_line.clone(),
+                    parent_pid: self.win32.current_process_id(),
+                });
                 let guest_application = if !application_name.is_empty() {
                     resolve_guest_path(&self.current_directory, &application_name)
                 } else {
@@ -29087,6 +29209,7 @@ impl PeHostRuntime {
                         "guest thread created",
                     ),
                 );
+                self.emit_event(crate::runtime_events::RuntimeEvent::ThreadCreated { thread_id });
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
                 self.push_trace(
@@ -30567,6 +30690,10 @@ impl PeHostRuntime {
                             write_u32(memory, result_ptr, handle);
                             state.set(Register::Rax, 0);
                             self.last_error = 0;
+                            // Generic runtime event (no behavior change).
+                            self.emit_event(crate::runtime_events::RuntimeEvent::RegistryOpened {
+                                key: full_key.clone(),
+                            });
                             self.push_trace(
                                 "registry",
                                 "RegOpenKeyA",
@@ -30617,6 +30744,10 @@ impl PeHostRuntime {
                             write_u32(memory, result_ptr, handle);
                             state.set(Register::Rax, 0);
                             self.last_error = 0;
+                            // Generic runtime event (no behavior change).
+                            self.emit_event(crate::runtime_events::RuntimeEvent::RegistryOpened {
+                                key: full_key.clone(),
+                            });
                             self.push_trace(
                                 "registry",
                                 "RegOpenKeyExA",
@@ -30668,6 +30799,10 @@ impl PeHostRuntime {
                             write_u32(memory, result_ptr, handle);
                             state.set(Register::Rax, 0);
                             self.last_error = 0;
+                            // Generic runtime event (no behavior change).
+                            self.emit_event(crate::runtime_events::RuntimeEvent::RegistryOpened {
+                                key: full_key.clone(),
+                            });
                             self.push_trace(
                                 "registry",
                                 "RegOpenKeyExW",
@@ -33823,6 +33958,9 @@ impl PeHostRuntime {
                 // never overwrite this code (the pump uses the override).
                 // Steam run instrumentation (no behavior change): clean exit.
                 crate::steam_milestones::note_thread_normal_exit();
+                self.emit_event(crate::runtime_events::RuntimeEvent::ThreadExited {
+                    thread_id: self.win32.current_thread_id(),
+                });
                 self.request_current_thread_exit(code, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -33864,6 +34002,9 @@ impl PeHostRuntime {
                         "guest thread created",
                     ),
                 );
+                if let Ok(thread_id) = self.win32.thread_id_for_handle(thread_handle) {
+                    self.emit_event(crate::runtime_events::RuntimeEvent::ThreadCreated { thread_id });
+                }
                 state.set(Register::Rax, u64::from(thread_handle));
                 self.last_error = 0;
             }
@@ -33871,6 +34012,9 @@ impl PeHostRuntime {
                 // `_endthread` is noreturn; the thread ends with code 0.
                 // Steam run instrumentation (no behavior change): clean exit.
                 crate::steam_milestones::note_thread_normal_exit();
+                self.emit_event(crate::runtime_events::RuntimeEvent::ThreadExited {
+                    thread_id: self.win32.current_thread_id(),
+                });
                 self.request_current_thread_exit(0, true);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -35192,6 +35336,10 @@ impl PeHostRuntime {
                 let result = (|| -> AppResult<u32> {
                     let addr = read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)?;
                     self.network.connect(socket, addr.clone())?;
+                    self.emit_event(crate::runtime_events::RuntimeEvent::SocketConnected {
+                        host: addr.host.clone(),
+                        port: addr.port,
+                    });
                     self.push_trace(
                         "network",
                         "connect",
@@ -37888,6 +38036,10 @@ impl PeHostRuntime {
                 // run instead of the code being consumed as the thread's
                 // own exit code.
                 self.process_exit_requested = Some(code as u32);
+                self.emit_event(crate::runtime_events::RuntimeEvent::ProcessExited {
+                    pid: self.win32.current_process_id(),
+                    exit_code: code,
+                });
                 self.push_trace(
                     "process",
                     "ExitProcess",
@@ -40708,6 +40860,13 @@ impl PeHostRuntime {
                     Ok(req_handle) => {
                         state.set(Register::Rax, req_handle);
                         self.last_error = 0;
+                        // Generic runtime event (no behavior change): an HTTP
+                        // request was created.
+                        self.emit_event(crate::runtime_events::RuntimeEvent::HttpRequest {
+                            host: self.winhttp.request_host(req_handle).unwrap_or_default(),
+                            method: verb.clone(),
+                            path: object_name.clone(),
+                        });
                     }
                     Err(error) => {
                         state.set(Register::Rax, 0);
@@ -40755,6 +40914,13 @@ impl PeHostRuntime {
                     Ok(()) => {
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
+                        // Generic runtime event (no behavior change): an HTTP
+                        // response was received.
+                        self.emit_event(crate::runtime_events::RuntimeEvent::HttpResponse {
+                            host: self.winhttp.request_host(request_handle).unwrap_or_default(),
+                            status: self.winhttp.request_status_code(request_handle) as u16,
+                            bytes: 0,
+                        });
                     }
                     Err(error) => {
                         state.set(Register::Rax, 0);
@@ -42176,6 +42342,9 @@ impl PeHostRuntime {
                 // terminates the process).
                 // Steam run instrumentation (no behavior change): clean exit.
                 crate::steam_milestones::note_thread_normal_exit();
+                self.emit_event(crate::runtime_events::RuntimeEvent::ThreadExited {
+                    thread_id: self.win32.current_thread_id(),
+                });
                 self.request_current_thread_exit(code, true);
                 self.last_error = 0;
                 return Ok(Some(code as i32));
@@ -42204,6 +42373,9 @@ impl PeHostRuntime {
                 // Steam run instrumentation (no behavior change): a
                 // TerminateThread call was observed.
                 crate::steam_milestones::note_thread_terminated();
+                self.emit_event(crate::runtime_events::RuntimeEvent::ThreadExited {
+                    thread_id: target_tid,
+                });
                 // A queued (not-yet-run) guest thread is terminated outright:
                 // remove it (marking it Exited) so it never runs, and record
                 // the exit code in the thread state below.
@@ -42440,6 +42612,11 @@ impl PeHostRuntime {
                     // exception code.  The structured termination becomes
                     // GuestException (the finalizer consults the marker).
                     self.unhandled_guest_exception = Some(code);
+                    self.emit_event(crate::runtime_events::RuntimeEvent::GuestException {
+                        code,
+                        guest_pc: state.rip,
+                        thread_id: self.win32.current_thread_id(),
+                    });
                     // Capture the C++ throw context: for 0xE06D7363 (MSVC)
                     // the arguments carry the throw-info pointer and the
                     // exception object; the caller's return address on the
@@ -53453,6 +53630,9 @@ impl PeHostRuntime {
                         // Steam run instrumentation (no behavior change): the
                         // thread procedure returned — a clean exit.
                         crate::steam_milestones::note_thread_normal_exit();
+                        self.emit_event(crate::runtime_events::RuntimeEvent::ThreadExited {
+                            thread_id: pending_thread.thread_id,
+                        });
                         pending_thread.state_machine = GuestThreadState::Exited;
                         Ok((
                             PumpedThreadOutcome {
@@ -61550,9 +61730,24 @@ impl PeHostRuntime {
         // Real D3D11 guest present — count it regardless of live mode.
         self.real_guest_frames += 1;
         if let Some((frame_hash, metadata)) = frame_record {
-            // Steam run instrumentation (no behavior change): count the
-            // frame by its metadata source.
-            crate::steam_milestones::note_gfx_frame(&metadata);
+            // Generic runtime event (no behavior change): a frame was
+            // presented; the Steam workload observer counts it by its
+            // metadata source.
+            let source = metadata.get("source").cloned().unwrap_or_default();
+            let width = metadata
+                .get("width")
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(0);
+            let height = metadata
+                .get("height")
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(0);
+            self.emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
+                producer: source,
+                width,
+                height,
+                sequence: self.next_frame_index as u64,
+            });
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d11".to_string(),
                 frame_index: self.next_frame_index,
@@ -61629,9 +61824,24 @@ impl PeHostRuntime {
                     displayed_frame_index.to_string(),
                 ),
             ]);
-            // Steam run instrumentation (no behavior change): count the
-            // frame by its metadata source.
-            crate::steam_milestones::note_gfx_frame(&metadata);
+            // Generic runtime event (no behavior change): a frame was
+            // presented; the Steam workload observer counts it by its
+            // metadata source.
+            let source = metadata.get("source").cloned().unwrap_or_default();
+            let width = metadata
+                .get("width")
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(0);
+            let height = metadata
+                .get("height")
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(0);
+            self.emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
+                producer: source,
+                width,
+                height,
+                sequence: self.next_frame_index as u64,
+            });
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d12".to_string(),
                 frame_index: self.next_frame_index,
@@ -66048,6 +66258,16 @@ impl PeHostRuntime {
         };
         let target_bitmap = gfx.target_bitmap?;
         Some((target_bitmap, gfx.compositing_mode, gfx.smoothing_mode))
+    }
+}
+
+impl Drop for PeHostRuntime {
+    fn drop(&mut self) {
+        // Unregister the process-wide current-observer slot only when it
+        // still points at THIS runtime's list (a concurrently-created
+        // runtime must not be clobbered).
+        crate::runtime_events::clear_current_observers(&self.observers);
+        crate::cef_bridge::set_event_observers(None);
     }
 }
 

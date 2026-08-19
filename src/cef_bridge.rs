@@ -2749,17 +2749,14 @@ impl CefBridge {
         self.frames.insert((browser_handle, 1), frame);
         self.browser_wk_handles_cache = None;
 
-        // Steam run instrumentation (no behavior change): a CEF browser was
-        // ACTUALLY created — the independent producer of the
-        // cef_browser_created milestone (first-wins).  The paint callback
-        // only proves a paint and never sets this milestone.
-        crate::steam_milestones::note_cef_browser_created(
-            crate::steam_milestones::MilestoneEvidence::context_free(
-                "cef_browser_host_create_browser",
-                Some(url),
-                "CEF browser created",
-            ),
-        );
+        // Generic runtime event (no behavior change): a CEF browser was
+        // ACTUALLY created — reported as the browser-host window it owns.
+        // The Steam workload observer derives the cef_browser_created
+        // milestone (first-wins, independent producer: never a paint).
+        emit_event(crate::runtime_events::RuntimeEvent::WindowCreated {
+            hwnd: browser_handle as u32,
+            class: "CefBrowserHostWindow".to_string(),
+        });
 
         // Allocate an initial offscreen surface for the browser
         let pixels = vec![0xFF; frame_buffer_len(frame_w, frame_h)]; // white background
@@ -4225,23 +4222,19 @@ impl CefBridge {
         width: u32,
         height: u32,
     ) {
-        // Steam run instrumentation (no behavior change): a CEF software
-        // paint was observed.
-        crate::steam_milestones::note_cef_paint(false);
+        // Generic runtime event (no behavior change): a CEF software paint
+        // was observed; the Steam workload observer derives the paint
+        // counters and first-paint milestones from it.
+        emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
+            producer: "cef_software".to_string(),
+            width,
+            height,
+            sequence: self.next_frame_number(),
+        });
         let browser_id = match self.browsers.get(&browser_handle) {
             Some(b) => b.id,
             None => {
                 eprintln!("[CefBridge] OnPaint: browser {browser_handle:#x} not found",);
-                crate::steam_milestones::record_first_failure(
-                    crate::steam_milestones::FailureCategory::Cef,
-                    0,
-                    crate::steam_milestones::host_thread_id(),
-                    Some("CefRenderHandler::OnPaint".to_string()),
-                    None,
-                    format!("OnPaint for unknown browser handle {browser_handle:#x}"),
-                    None,
-                    None,
-                );
                 return;
             }
         };
@@ -4355,23 +4348,20 @@ impl CefBridge {
         _paint_type: u32,
         shared_handle: *mut std::ffi::c_void,
     ) -> bool {
-        // Steam run instrumentation (no behavior change): a CEF accelerated
-        // paint was observed.
-        crate::steam_milestones::note_cef_paint(true);
+        // Generic runtime event (no behavior change): a CEF accelerated
+        // paint was observed; the Steam workload observer derives the paint
+        // counters and first-paint milestones from it.  The accelerated
+        // surface has no CPU-visible dimensions at callback time.
+        emit_event(crate::runtime_events::RuntimeEvent::FramePresented {
+            producer: "cef_accelerated".to_string(),
+            width: 0,
+            height: 0,
+            sequence: self.next_frame_number(),
+        });
         if shared_handle.is_null() {
             eprintln!(
                 "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} \
                  null shared handle — ignoring",
-            );
-            crate::steam_milestones::record_first_failure(
-                crate::steam_milestones::FailureCategory::Cef,
-                0,
-                crate::steam_milestones::host_thread_id(),
-                Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
-                None,
-                format!("null shared handle for browser {browser_handle:#x}"),
-                None,
-                None,
             );
             return false;
         }
@@ -4380,16 +4370,6 @@ impl CefBridge {
             Some(b) => b.id,
             None => {
                 eprintln!("[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} not found",);
-                crate::steam_milestones::record_first_failure(
-                    crate::steam_milestones::FailureCategory::Cef,
-                    0,
-                    crate::steam_milestones::host_thread_id(),
-                    Some("CefRenderHandler::OnAcceleratedPaint".to_string()),
-                    None,
-                    format!("accelerated paint for unknown browser handle {browser_handle:#x}"),
-                    None,
-                    None,
-                );
                 return false;
             }
         };
@@ -6310,6 +6290,27 @@ pub fn register_libcef_dll() {
 /// The steam integration layer can initialize this with `set_global_cef_bridge()`.
 static GLOBAL_CEF_BRIDGE: std::sync::LazyLock<std::sync::Mutex<Option<CefBridge>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// The CURRENT runtime's generic-event observer list (the bridge is a global
+/// singleton and cannot hold a per-runtime field; the PE runtime installs
+/// its list for the duration of its lifetime).  `None` when no runtime is
+/// live — event emission is a no-op then.
+static EVENT_OBSERVERS: std::sync::LazyLock<
+    std::sync::Mutex<Option<crate::runtime_events::ObserverList>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Install/clear the current runtime's observer list for the global bridge.
+pub(crate) fn set_event_observers(list: Option<crate::runtime_events::ObserverList>) {
+    *EVENT_OBSERVERS.lock().unwrap() = list;
+}
+
+/// Emit a generic runtime event from the (global) CEF bridge to the current
+/// runtime's observers.
+pub(crate) fn emit_event(event: crate::runtime_events::RuntimeEvent) {
+    if let Some(observers) = EVENT_OBSERVERS.lock().unwrap().as_ref() {
+        crate::runtime_events::dispatch(observers, &event);
+    }
+}
 
 /// Set the global CefBridge instance. Called during Steam integration setup.
 pub fn set_global_cef_bridge(bridge: CefBridge) {

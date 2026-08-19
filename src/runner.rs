@@ -445,6 +445,25 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             // The non-live path must honor the job's jit_mode/steam_ipc too:
             // a job with JitMode::Enabled constructs the JIT runtime and
             // reports the requested/active distinction in jit telemetry.
+            let mut options = pe_runtime::PeExecutionOptions {
+                live_session: None,
+                jit_mode: Some(job.jit_mode),
+                steam_ipc: job.steam_ipc,
+                ..pe_runtime::PeExecutionOptions::default()
+            };
+            // Steam workload wiring: Steam.exe and steamwebhelper child runs
+            // attach the Steam milestone observer, which INFERS the
+            // steam-bootstrap milestones from the generic runtime event
+            // stream (manifest open/read, webhelper spawn/start, CEF,
+            // audio, presentation) — the runtime itself stays Steam-agnostic.
+            if is_steam_executable(&job.program) || is_webhelper_program(&job.program) {
+                options.observers.push(Box::new(
+                    crate::workloads::steam::SteamMilestoneObserver::default(),
+                ));
+            }
+            if job.steam_ipc {
+                crate::workloads::steam::request_steam_service_compat_listener(&mut options);
+            }
             pe_runtime::execute_with_options(
                 &job.program,
                 &job.args,
@@ -453,11 +472,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 &effective_child_environment,
                 job.dtm,
                 &job.test_id,
-                pe_runtime::PeExecutionOptions {
-                    live_session: None,
-                    jit_mode: Some(job.jit_mode),
-                    steam_ipc: job.steam_ipc,
-                },
+                options,
             )
         } {
             Ok(pe_output) => pe_output,
@@ -894,6 +909,7 @@ fn execute_live_pe_job(
     let test_id = job.test_id.clone();
     let jit_mode = job.jit_mode;
     let steam_ipc = job.steam_ipc;
+    let is_steam_workload = is_steam_executable(&job.program) || is_webhelper_program(&job.program);
     let worker = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
@@ -906,19 +922,26 @@ fn execute_live_pe_job(
                     0,
                 );
             }
+            let mut options = pe_runtime::PeExecutionOptions {
+                live_session: Some(live_session),
+                jit_mode: Some(jit_mode),
+                steam_ipc,
+                ..pe_runtime::PeExecutionOptions::default()
+            };
+            // Steam workload wiring (see the non-live path): the observer
+            // infers the steam-bootstrap milestones from the generic runtime
+            // event stream; the SteamService compat listener is a workload
+            // workaround requested through the generic named-pipe service.
+            if is_steam_workload {
+                options.observers.push(Box::new(
+                    crate::workloads::steam::SteamMilestoneObserver::default(),
+                ));
+            }
+            if steam_ipc {
+                crate::workloads::steam::request_steam_service_compat_listener(&mut options);
+            }
             pe_runtime::execute_with_options(
-                &program,
-                &args,
-                &ge,
-                &cwd,
-                &env,
-                dtm,
-                &test_id,
-                pe_runtime::PeExecutionOptions {
-                    live_session: Some(live_session),
-                    jit_mode: Some(jit_mode),
-                    steam_ipc,
-                },
+                &program, &args, &ge, &cwd, &env, dtm, &test_id, options,
             )
         })
         .map_err(|error| {
@@ -1839,10 +1862,12 @@ pub fn write_steam_bootstrap_artifacts(
 /// the `-child-` marker, and carries `child_of_run_id` so the parent's
 /// finalization can find and merge it.
 ///
-/// `webhelper_process_started` evidence is recorded IMMEDIATELY by the PE
-/// runtime when a steamwebhelper child dispatches its FIRST block (the
-/// first-block site records into the process-wide MILESTONES static, which
-/// the run's `PeExecutionResult` snapshots — never at child completion).
+/// `webhelper_process_started` evidence is recorded IMMEDIATELY by the
+/// Steam workload observer when a steamwebhelper child dispatches its FIRST
+/// block: the runtime emits the generic `ProcessFirstInstruction` event at
+/// the first-block site, the observer (attached for steamwebhelper child
+/// runs) infers the milestone into the process-wide MILESTONES static, which
+/// the run's `PeExecutionResult` snapshots — never at child completion.
 /// The derivation below is only a compatibility fallback for execution
 /// results that predate that immediate recording: it applies when the
 /// child is steamwebhelper.exe, the child dispatched at least one block

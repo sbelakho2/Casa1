@@ -198,6 +198,7 @@ pub mod real_net;
 pub mod real_win32;
 pub mod reason;
 pub mod runner;
+pub mod runtime_events;
 pub mod sandbox;
 pub mod scm;
 pub mod security;
@@ -230,6 +231,9 @@ pub mod winhttp;
 pub mod wininet;
 pub mod winmm;
 pub mod wmi;
+pub mod workloads {
+    pub mod steam;
+}
 pub mod wsl;
 
 pub const PRODUCT_NAME: &str = "Casa1";

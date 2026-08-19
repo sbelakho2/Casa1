@@ -1559,6 +1559,15 @@ impl WinHttpStack {
             .unwrap_or(0)
     }
 
+    /// Best-effort connection host backing `request_handle` (used by the
+    /// generic runtime-event layer for `HttpRequest`/`HttpResponse` events).
+    pub fn request_host(&self, request_handle: HINTERNET) -> Option<String> {
+        let connection_handle = self.requests.get(&request_handle)?.connection_handle;
+        self.connections
+            .get(&connection_handle)
+            .map(|connection| connection.server_name.clone())
+    }
+
     // -----------------------------------------------------------------------
     // WinHttpQueryHeaders — query response headers
     // -----------------------------------------------------------------------
