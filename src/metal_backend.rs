@@ -7361,6 +7361,7 @@ mod tests {
 
     #[test]
     fn variable_rate_shading() {
+        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
         let mut rate_map = create_shading_rate_map(16, 16, ShadingRate::R1x1).expect("rate map");
         assert_eq!(rate_map.width, 16);
         assert_eq!(rate_map.height, 16);
@@ -8276,6 +8277,7 @@ mod tests {
 
     #[test]
     fn command_buffer_blit_encoder() {
+        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
         // Create a command buffer with a blit encoder to test encoding paths.
         let backend = MetalGpuBackend::new().expect("backend creation");
         let cmd_buffer = backend.command_queue().new_command_buffer();
@@ -8317,6 +8319,7 @@ mod tests {
 
     #[test]
     fn command_buffer_compute_encoder() {
+        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
         // Test compute encoder creation and basic encoding.
         let backend = MetalGpuBackend::new().expect("backend creation");
         let device = backend.device();
