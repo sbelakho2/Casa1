@@ -51,6 +51,9 @@ fn memory_indirect_call_updates_rip_and_stack() {
     state.set(Register::Rax, 0x2000);
     state.set(Register::Rsp, 0x3000);
     memory.map_u64(0x2000, 0x4455_6677_8899_aabb);
+    // Loader-mapped stack for the call's return-address push (guest CPU
+    // stores never materialize pages).
+    memory.map_zeroed_if_unmapped(0x2ff8, 8);
 
     let _ = engine
         .execute_ir(&mut state, &mut memory, &ir)
@@ -762,7 +765,10 @@ fn reference_execute_random(
                 let eff_addr = effective_address(address);
                 let original = memory.read_u64(eff_addr).unwrap();
                 let next = original.wrapping_add(state.get(*src));
-                let _ = memory.commit_zeroed_pages(eff_addr, 8);
+                // Guest CPU writes never create or mark pages: the engine
+                // goes through the checked write path, so the reference must
+                // NOT commit_zeroed_pages here either (the loader mapped the
+                // destination).
                 memory.write_u64(eff_addr, next);
                 state.set(*src, original);
                 ordering_log.push(format!("ldaxr:{eff_addr:#x}"));
@@ -785,11 +791,12 @@ fn reference_atomic(initial: u64, adds: &[u64]) -> ReferenceAtomicOutcome {
     let mut memory = MemoryImage::default();
     // The engine does not expose an ordering log (src/cpu.rs:16373), so the
     // reference models only the observable outcome (final memory + registers).
+    // The engine's guest write goes through the checked path (no page
+    // creation/marking), so the reference maps only the loader-mapped bytes.
     for add in adds {
         value = value.wrapping_add(*add);
     }
     memory.map_u64(0xA000, value);
-    let _ = memory.commit_zeroed_pages(0xA000, 8);
     ReferenceAtomicOutcome {
         final_value: value,
         memory_hash: memory.stable_hash(),

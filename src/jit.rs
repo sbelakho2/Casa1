@@ -67,7 +67,10 @@ pub unsafe extern "C" fn jit_helper_load(
             // Guest access violation: remember the faulting address for the
             // dispatcher instead of silently fabricating a zero read.
             if !state.is_null() {
-                unsafe { (*state).jit_pending_fault = Some(address) };
+                unsafe {
+                    (*state).jit_pending_fault = Some(address);
+                    (*state).jit_pending_fault_write = false;
+                };
             }
             0
         }
@@ -76,6 +79,13 @@ pub unsafe extern "C" fn jit_helper_load(
 
 /// Write 1/2/4/8 bytes to guest memory.
 ///
+/// A failed guest write must NEVER surface as a successful write.  The write
+/// goes through [`MemoryImage::guest_write_checked`], so unmapped memory is
+/// never materialized: on fault the precise address is recorded in
+/// `state.jit_pending_fault` (with `jit_pending_fault_write = true`) and the
+/// JIT-compiled caller's immediate flag test exits the block via
+/// `EXIT_GUEST_FAULT` before any later instruction executes.
+///
 /// # Safety
 ///
 /// The raw pointers passed in must be valid for the duration of the call;
@@ -83,6 +93,7 @@ pub unsafe extern "C" fn jit_helper_load(
 /// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_helper_store(
+    state: *mut CpuState,
     memory: *mut MemoryImage,
     address: u64,
     value: u64,
@@ -92,11 +103,21 @@ pub unsafe extern "C" fn jit_helper_store(
         return;
     }
     let mem = unsafe { &mut *memory };
-    match width {
-        1 => mem.write_u8(address, value as u8),
-        2 => mem.write_u16(address, value as u16),
-        4 => mem.write_u32(address, value as u32),
-        _ => mem.write_u64(address, value),
+    let bytes: [u8; 8] = value.to_le_bytes();
+    let write_len = match width {
+        1 | 2 | 4 | 8 => width as usize,
+        _ => 8,
+    };
+    let result = mem.guest_write_checked(address, &bytes[..write_len]);
+    if let Err(fault) = result {
+        // Guest access violation: remember the faulting address (the precise
+        // first-unmapped byte) and the access type for the dispatcher.
+        if !state.is_null() {
+            unsafe {
+                (*state).jit_pending_fault = Some(fault.address);
+                (*state).jit_pending_fault_write = true;
+            };
+        }
     }
 }
 
@@ -188,17 +209,22 @@ pub unsafe extern "C" fn jit_helper_set_flags(
     s.flags.pf = parity_byte(r as u8);
     match op {
         0 => {
-            // add: CF = unsigned wrap of the width-masked sum.  `sum < a` on
-            // the masked operands works for every width including 64 (where
-            // `sum > mask` is never true).
-            let sum = a.wrapping_add(b);
+            // add: CF = unsigned wrap of the width-masked sum.  The sum MUST
+            // be truncated to the operation width BEFORE the comparison: for
+            // an 8-bit add of 0xff+0x01 the unmasked sum is 0x100, and
+            // 0x100 < 0xff is false — reporting CF=0 although the 8-bit
+            // operation overflowed.  `sum & mask` makes CF exact at every
+            // width; at 64 bits the mask is u64::MAX, so `& mask` is the
+            // identity and `sum < a` is the true 64-bit carry.
+            let sum = a.wrapping_add(b) & mask;
             s.flags.cf = sum < a;
             let (sa, sb, sr) = (a & msb != 0, b & msb != 0, r & msb != 0);
             s.flags.of = sa == sb && sr != sa;
             s.flags.af = (a ^ b ^ r) & 0x10 != 0;
         }
         // sub and cmp are the same ALU operation: CMP computes the flags of a
-        // subtraction without storing the result.
+        // subtraction without storing the result.  On width-masked operands
+        // `a < b` is the exact borrow at every width (no truncation needed).
         1 | 3 => {
             s.flags.cf = a < b;
             let (sa, sb, sr) = (a & msb != 0, b & msb != 0, r & msb != 0);
@@ -649,18 +675,19 @@ mod jit_helper_semantics {
     }
 
     /// x86 truth table for ADD, computed with plain overflowing addition on
-    /// the width-masked operands.
+    /// the width-masked operands.  The sum is truncated to the operation
+    /// width BEFORE the carry test: 8-bit 0xff + 0x01 wraps to 0x00 with a
+    /// carry, even though the u64 addition 255 + 1 does not overflow.
     fn truth_add(lhs: u64, rhs: u64, bits: u32) -> ExpectedFlags {
         let m = width_mask(bits);
         let (a, b) = (lhs & m, rhs & m);
-        let (sum, carry) = a.overflowing_add(b);
-        let sum = sum & m;
+        let sum = a.wrapping_add(b) & m;
         let msb = 1u64 << (bits - 1);
         ExpectedFlags {
             zf: sum == 0,
             sf: sum & msb != 0,
             pf: even_low_byte_parity(sum),
-            cf: carry,
+            cf: sum < a,
             of: (a & msb != 0) == (b & msb != 0) && (sum & msb != 0) != (a & msb != 0),
             af: (a ^ b ^ sum) & 0x10 != 0,
         }
@@ -699,9 +726,7 @@ mod jit_helper_semantics {
         }
     }
 
-    fn call_set_flags(result: u64, lhs: u64, rhs: u64, op: u64, width: u64) -> ExpectedFlags {
-        let mut state = CpuState::new(GuestArch::X64);
-        unsafe { jit_helper_set_flags(&mut state, result, lhs, rhs, op, width) };
+    fn read_flags(state: &CpuState) -> ExpectedFlags {
         ExpectedFlags {
             zf: state.flags.zf,
             sf: state.flags.sf,
@@ -710,6 +735,12 @@ mod jit_helper_semantics {
             of: state.flags.of,
             af: state.flags.af,
         }
+    }
+
+    fn call_set_flags(result: u64, lhs: u64, rhs: u64, op: u64, width: u64) -> ExpectedFlags {
+        let mut state = CpuState::new(GuestArch::X64);
+        unsafe { jit_helper_set_flags(&mut state, result, lhs, rhs, op, width) };
+        read_flags(&state)
     }
 
     /// Assert add/sub/cmp/logic flag sets against the x86 truth table for one
@@ -860,12 +891,17 @@ mod jit_helper_semantics {
         let address = 0x0000_0001_0000_0000u64;
         for width in [1u64, 2, 4, 8] {
             state.jit_pending_fault = None;
+            state.jit_pending_fault_write = true;
             let value = unsafe { jit_helper_load(&mut state, &mut memory, address, width) };
             assert_eq!(value, 0, "failed read returns 0 to JIT code (w={width})");
             assert_eq!(
                 state.jit_pending_fault,
                 Some(address),
                 "fault address must be recorded for the dispatcher (w={width})"
+            );
+            assert!(
+                !state.jit_pending_fault_write,
+                "a faulting READ must record access type write=false (w={width})"
             );
         }
     }
@@ -882,6 +918,186 @@ mod jit_helper_semantics {
             state.jit_pending_fault, None,
             "a successful read must not fabricate a fault"
         );
+        assert!(!state.jit_pending_fault_write);
+    }
+
+    #[test]
+    fn jit_helper_store_unmapped_write_marks_fault_and_never_creates_page() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // Cross-page guard probe: map only byte 0x4000, so a store at 0x4001
+        // faults at the first guarded byte.
+        memory.map_bytes(0x4000, &[0x11]);
+        for width in [1u64, 2, 4, 8] {
+            state.jit_pending_fault = None;
+            state.jit_pending_fault_write = false;
+            unsafe {
+                jit_helper_store(
+                    &mut state,
+                    &mut memory,
+                    0x0000_0100_0000,
+                    0xDEAD_BEEF,
+                    width,
+                )
+            };
+            assert_eq!(
+                state.jit_pending_fault,
+                Some(0x0000_0100_0000),
+                "fault address must be recorded for the dispatcher (w={width})"
+            );
+            assert!(
+                state.jit_pending_fault_write,
+                "a faulting WRITE must record access type write=true (w={width})"
+            );
+            assert!(
+                memory
+                    .guest_read_checked(0x0000_0100_0000, &mut [0_u8; 1])
+                    .is_err(),
+                "a failed guest store must NEVER materialize the page (w={width})"
+            );
+        }
+
+        // Precise fault address: store past the single mapped byte.
+        state.jit_pending_fault = None;
+        unsafe { jit_helper_store(&mut state, &mut memory, 0x4001, 0xFFFF, 2) };
+        assert_eq!(
+            state.jit_pending_fault,
+            Some(0x4001),
+            "fault address must be the first guarded byte"
+        );
+        assert!(state.jit_pending_fault_write);
+        assert_eq!(
+            memory.read_u8(0x4000).unwrap(),
+            0x11,
+            "no partial write before the faulting byte"
+        );
+    }
+
+    #[test]
+    fn jit_helper_store_mapped_write_succeeds_without_fault() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.map_zeroed_if_unmapped(0x4000, 0x100);
+        for width in [1u64, 2, 4, 8] {
+            state.jit_pending_fault = None;
+            unsafe {
+                jit_helper_store(
+                    &mut state,
+                    &mut memory,
+                    0x4008,
+                    0x1122_3344_5566_7788,
+                    width,
+                )
+            };
+            assert_eq!(
+                state.jit_pending_fault, None,
+                "a successful store must not fabricate a fault (w={width})"
+            );
+            assert!(!state.jit_pending_fault_write);
+        }
+        assert_eq!(memory.read_u64(0x4008).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(memory.read_u8(0x4008).unwrap(), 0x88);
+    }
+
+    /// All values used by the width-stride samples: the width edges plus a
+    /// uniform stride sample across the full width.
+    fn stride_sample_values(bits: u32) -> Vec<u64> {
+        let mask = width_mask(bits);
+        let msb = 1u64 << (bits - 1);
+        let mut values = vec![
+            0,
+            1,
+            mask,
+            mask - 1,
+            msb,
+            msb - 1,
+            msb + 1,
+            0x0f,
+            0x10,
+            0xff,
+            0x0f_0f,
+            0xf0_f0,
+            0x55_55,
+            0xaa_aa,
+        ];
+        let stride = mask / 257;
+        for k in 0..=256u64 {
+            values.push(k.wrapping_mul(stride) & mask);
+        }
+        values
+    }
+
+    #[test]
+    fn jit_helper_set_flags_add_exhaustive_8bit() {
+        // EXHAUSTIVE: every pair (a, b) in 0..=255 × 0..=255 — this is the
+        // exact vector family where the unmasked-sum carry bug lived (e.g.
+        // 0xff + 0x01 must set CF; the old code computed sum = 0x100 and
+        // 0x100 < 0xff = false).
+        let mut state = CpuState::new(GuestArch::X64);
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let sum = a.wrapping_add(b) & 0xff;
+                unsafe { jit_helper_set_flags(&mut state, sum, a, b, 0, 1) };
+                let got = read_flags(&state);
+                assert_eq!(
+                    got,
+                    truth_add(a, b, 8),
+                    "8-bit ADD flags mismatch for {a:#x} + {b:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_helper_set_flags_sub_exhaustive_8bit() {
+        let mut state = CpuState::new(GuestArch::X64);
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let diff = a.wrapping_sub(b) & 0xff;
+                unsafe { jit_helper_set_flags(&mut state, diff, a, b, 1, 1) };
+                let got = read_flags(&state);
+                assert_eq!(
+                    got,
+                    truth_sub(a, b, 8),
+                    "8-bit SUB flags mismatch for {a:#x} - {b:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_helper_set_flags_add_sub_dense_samples_16_32_64() {
+        // Dense samples at 16/32/64: every width edge (0, 1, msb±1, mask-1,
+        // mask, carry/borrow boundaries, AF nibble edges) plus a stride
+        // sample covering the full width.
+        let mut state = CpuState::new(GuestArch::X64);
+        for (width, bits) in [(2u64, 16u32), (4, 32), (8, 64)] {
+            let values = stride_sample_values(bits);
+            for &a in &values {
+                for &b in &values {
+                    let sum = a.wrapping_add(b) & width_mask(bits);
+                    unsafe { jit_helper_set_flags(&mut state, sum, a, b, 0, width) };
+                    assert_eq!(
+                        read_flags(&state),
+                        truth_add(a, b, bits),
+                        "ADD flags mismatch at {bits} bits for {a:#x} + {b:#x}"
+                    );
+                    let diff = a.wrapping_sub(b) & width_mask(bits);
+                    unsafe { jit_helper_set_flags(&mut state, diff, a, b, 1, width) };
+                    assert_eq!(
+                        read_flags(&state),
+                        truth_sub(a, b, bits),
+                        "SUB flags mismatch at {bits} bits for {a:#x} - {b:#x}"
+                    );
+                    unsafe { jit_helper_set_flags(&mut state, diff, a, b, 3, width) };
+                    assert_eq!(
+                        read_flags(&state),
+                        truth_sub(a, b, bits),
+                        "CMP flags mismatch at {bits} bits for {a:#x} cmp {b:#x}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2439,6 +2655,13 @@ pub enum JitExitReason {
     /// guest threads, drain timers/APCs, advance the guest clock) and then
     /// re-dispatch the block.
     Safepoint,
+    /// A guest load/store faulted on unmapped memory.  The block aborted at
+    /// the faulting instruction (the emitted post-helper fault test branched
+    /// here before any later instruction ran); the dispatcher must raise the
+    /// access violation immediately, using `state.jit_pending_fault` (the
+    /// precise fault address) and `state.jit_pending_fault_write` (the
+    /// access type).
+    GuestFault,
 }
 
 /// Static control-flow metadata captured at compile time for a block's
@@ -2527,6 +2750,14 @@ const EXIT_JUMP: u64 = 9;
 /// dispatcher must run the host-side safepoint body and re-dispatch the
 /// block.  Emitted by `emit_safepoint_check`.
 const EXIT_SAFEPOINT: u64 = 10;
+/// A guest load/store faulted on unmapped memory INSIDE the block.  The
+/// immediate flag test after every helper call branches here so the block
+/// aborts at the faulting instruction — Windows requires that an access
+/// violation at instruction N prevents instructions N+1.. from executing.
+/// The dispatcher reads the precise fault from `CpuState::jit_pending_fault`
+/// (+ `jit_pending_fault_write`) and raises the same access-violation error
+/// the interpreter produces.
+const EXIT_GUEST_FAULT: u64 = 11;
 
 /// Compiles a sequence of IR instructions into ARM64 machine code.
 pub struct JitCompiler {
@@ -2541,6 +2772,10 @@ pub struct JitCompiler {
     /// body and stub have been emitted.  `None` when the block has no
     /// safepoint check (or it has already been patched).
     safepoint_cbnz_patch: Option<usize>,
+    /// Byte offsets of the guest-fault `cbnz` instructions emitted after
+    /// each load/store helper call; all patched to the single fault-exit
+    /// stub by `finish_fault_stub` once the block body has been emitted.
+    fault_cbnz_patches: Vec<usize>,
 }
 
 impl Default for JitCompiler {
@@ -2556,6 +2791,7 @@ impl JitCompiler {
             memory_manager: JitMemoryManager::new(),
             helper_insns: Vec::new(),
             safepoint_cbnz_patch: None,
+            fault_cbnz_patches: Vec::new(),
         }
     }
 
@@ -2628,6 +2864,12 @@ impl JitCompiler {
         // Safepoint stub: the prologue cbnz branches here when the
         // safepoint flag is set; store guest state and return EXIT_SAFEPOINT.
         self.finish_safepoint_stub(arch);
+
+        // Guest-fault stub: every load/store helper call in the body ends
+        // with a cbnz that branches here when `jit_pending_fault` is set;
+        // store guest state and return EXIT_GUEST_FAULT so the dispatcher
+        // raises the access violation at the faulting instruction.
+        self.finish_fault_stub(arch);
 
         // Allocate executable memory and copy the code
         let code_size = self.emitter.len();
@@ -2755,6 +2997,11 @@ impl JitCompiler {
     /// guest GPRs (x4-x17).  So we must save all guest GPRs to CpuState before
     /// the call and reload them after.  We also save the CpuState/MemoryImage
     /// pointers and the address (in callee-saved temps) across the call.
+    ///
+    /// Immediately after the call the emitted sequence tests the
+    /// `jit_pending_fault` channel and branches to the fault-exit stub when a
+    /// fault is pending, so a faulting guest load aborts the block AT the
+    /// faulting instruction (never executing later instructions).
     fn emit_helper_load(&mut self, dst: u32, addr_reg: u32, width: u64, arch: GuestArch) {
         // Save all guest GPRs to CpuState (x0), then save x0 (CpuState ptr) and
         // x2 (MemoryImage ptr) in callee-saved regs before the call.
@@ -2778,9 +3025,13 @@ impl JitCompiler {
         self.emitter.mov_reg(2, 28);
         // Move the result from x27 into the destination guest register.
         self.emitter.mov_reg(dst, 27);
+        self.emit_fault_check();
     }
 
-    /// Emit a call to `jit_helper_store(memory, address, value, width)`.
+    /// Emit a call to `jit_helper_store(state, memory, address, value, width)`.
+    /// Like the load helper call, the emitted sequence immediately tests the
+    /// `jit_pending_fault` channel so a faulting guest store aborts the block
+    /// at the faulting instruction.
     fn emit_helper_store(&mut self, addr_reg: u32, val_reg: u32, width: u64, arch: GuestArch) {
         // Save all guest GPRs to CpuState first.
         self.emit_store_guest_registers(arch);
@@ -2788,16 +3039,71 @@ impl JitCompiler {
         self.emitter.mov_reg(28, 2); // x28 = MemoryImage ptr
         self.emitter.mov_reg(27, addr_reg); // x27 = address
         self.emitter.mov_reg(25, val_reg); // x25 = value
-        // Set up helper args.
-        self.emitter.mov_reg(0, 28); // x0 = MemoryImage ptr
-        self.emitter.mov_reg(1, 27); // x1 = address
-        self.emitter.mov_reg(2, 25); // x2 = value
-        self.emitter.movz(3, width as u16, 0); // x3 = width
+        // Set up helper args: (state, memory, address, value, width).
+        self.emitter.mov_reg(0, 24); // x0 = CpuState ptr
+        self.emitter.mov_reg(1, 28); // x1 = MemoryImage ptr
+        self.emitter.mov_reg(2, 27); // x2 = address
+        self.emitter.mov_reg(3, 25); // x3 = value
+        self.emitter.movz(4, width as u16, 0); // x4 = width
         self.emit_bl_to(jit_helper_store as *const () as usize);
         // Restore x0 = CpuState, then reload guest GPRs.
         self.emitter.mov_reg(0, 24);
         self.emit_load_guest_registers(arch);
         self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
+        self.emit_fault_check();
+    }
+
+    /// Emit the immediate post-helper fault test:
+    ///
+    /// ```text
+    /// mov_imm64 x26, #jit_pending_fault_offset   // field offset in CpuState
+    /// add       x26, x0, x26                     // x26 = &state.jit_pending_fault
+    /// ldrb      w26, [x26]                       // tag byte: 0 = no fault
+    /// cbnz      w26, <fault_stub>                // patched by finish_fault_stub
+    /// ```
+    ///
+    /// x0 holds the CpuState pointer and x26 is a scratch temp at this point
+    /// in both `emit_helper_load` and `emit_helper_store`.  The offset may
+    /// exceed the 12-bit unsigned offset of a plain LDRB (the field sits at
+    /// the end of CpuState), so the address is computed in x26 first.
+    fn emit_fault_check(&mut self) {
+        self.emitter.mov_imm64(26, Self::JIT_FAULT_BASE as u64);
+        self.emitter.add_reg(26, 0, 26);
+        self.emitter.ldr8(26, 26, 0);
+        let pos = self.emitter.len();
+        self.emitter.cbnz(26, 0); // placeholder; patched to the fault stub
+        self.fault_cbnz_patches.push(pos);
+    }
+
+    /// Emit the single guest-fault exit stub shared by every load/store
+    /// fault check in the block, then patch every `cbnz` to branch to it:
+    ///
+    /// ```text
+    /// fault_stub:
+    ///   emit_store_guest_registers(arch)
+    ///   movz x0, EXIT_GUEST_FAULT
+    ///   emit_epilogue()                    // return EXIT_GUEST_FAULT
+    /// ```
+    ///
+    /// The dispatcher maps `EXIT_GUEST_FAULT` to `JitExitReason::GuestFault`
+    /// and converts `CpuState::jit_pending_fault` (+ `jit_pending_fault_write`)
+    /// into the interpreter's access-violation error.
+    fn finish_fault_stub(&mut self, arch: GuestArch) {
+        let patches = std::mem::take(&mut self.fault_cbnz_patches);
+        if patches.is_empty() {
+            return;
+        }
+        let stub_pos = self.emitter.len();
+        self.emit_store_guest_registers(arch);
+        self.emitter.movz(regmap::X0, EXIT_GUEST_FAULT as u16, 0);
+        self.emit_epilogue();
+        for pos in patches {
+            let offset = (stub_pos as i32 - pos as i32) / 4;
+            debug_assert!(offset > 0 && (offset as u32) <= 0x7ffff);
+            let insn = 0xb5000000u32 | (((offset as u32) & 0x7ffff) << 5) | regmap::X26;
+            let bytes = insn.to_le_bytes();
+            self.emitter.code[pos..pos + 4].copy_from_slice(&bytes);
+        }
     }
 
     /// Compute the effective guest address of a MemoryOperand into `dst_reg`.
@@ -3161,7 +3467,8 @@ impl JitCompiler {
                 // Compute addr = rsp - 8 into X21, then rsp -= 8.
                 self.emitter.sub_imm(regmap::X21, arm_sp, 8);
                 self.emitter.sub_imm(arm_sp, arm_sp, 8);
-                // jit_helper_store(memory=x2, addr=X21, val=arm_src, width=8)
+                // jit_helper_store(state=x0, memory=x2, addr=X21, val=arm_src,
+                // width=8); a fault exits the block via EXIT_GUEST_FAULT.
                 self.emit_helper_store(regmap::X21, arm_src, 8, arch);
             }
 
@@ -3604,6 +3911,11 @@ impl JitCompiler {
     const GPR_BASE: u32 = std::mem::offset_of!(CpuState, gpr) as u32;
     /// Byte offset of the xmm[] array within CpuState.
     const XMM_BASE: u32 = std::mem::offset_of!(CpuState, xmm) as u32;
+    /// Byte offset of the `jit_pending_fault` channel within CpuState.  The
+    /// emitted fault check after each load/store helper call does an LDRB of
+    /// this field (the `Option<u64>` tag byte: 0 when no fault is pending, 1
+    /// when one is) and branches to the fault-exit stub when nonzero.
+    const JIT_FAULT_BASE: u32 = std::mem::offset_of!(CpuState, jit_pending_fault) as u32;
 
     /// Get reference to the memory manager.
     pub fn memory_manager(&self) -> &JitMemoryManager {
@@ -4575,6 +4887,7 @@ fn map_exit_reason(
             JitExitReason::Jump { target }
         }
         EXIT_SAFEPOINT => JitExitReason::Safepoint,
+        EXIT_GUEST_FAULT => JitExitReason::GuestFault,
         _ => JitExitReason::Normal { new_rip: state.rip },
     }
 }
@@ -7272,6 +7585,126 @@ mod tests {
         assert!(
             compiler.safepoint_cbnz_patch.is_none(),
             "safepoint patch position must be consumed by finish_safepoint_stub"
+        );
+    }
+
+    #[test]
+    fn compiled_load_store_contain_immediate_fault_check_and_exit_stub() {
+        // Every emitted load/store helper call must be followed IMMEDIATELY
+        // by the fault test — the add/ldrb/cbnz sequence on the
+        // jit_pending_fault channel — branching to a shared stub that stores
+        // guest registers, loads EXIT_GUEST_FAULT into x0 and returns.  This
+        // is what aborts the block AT the faulting instruction so Windows'
+        // "no architecturally-visible instructions after the fault" rule
+        // holds for JIT-executed blocks.
+        let operand = crate::cpu::MemoryOperand {
+            segment: None,
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            rip_relative: false,
+            rip_base: 0,
+            address_size_32: false,
+            absolute_address: Some(0x4000),
+        };
+        let mut compiler = JitCompiler::new();
+        let ir = vec![
+            IrInstruction::LoadMemory {
+                dst: Register::Rax,
+                address: operand,
+                width: 8,
+            },
+            IrInstruction::StoreMemory {
+                src: Register::Rbx,
+                address: operand,
+                width: 8,
+            },
+        ];
+        let block = compiler
+            .compile_block(&ir, 0x1000, GuestArch::X64, None)
+            .expect("compile load+store block");
+        let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // The fault check sequence: ADD X26, X0, X26 (address of the
+        // jit_pending_fault field) followed by LDRB W26, [X26], then a CBNZ
+        // X26.  The safepoint check's LDRB is preceded by a mov_imm64, so
+        // anchoring on the ADD distinguishes the fault checks.
+        let add_x26_x0_x26 = 0x8b000000u32 | (26 << 16) | 26;
+        let ldrb = 0x39400000u32 | (26 << 5) | 26;
+        let mut fault_cbnz_positions = Vec::new();
+        for i in 0..words.len().saturating_sub(2) {
+            if words[i] == add_x26_x0_x26 && words[i + 1] == ldrb {
+                let cbnz = words[i + 2];
+                assert_eq!(
+                    cbnz & 0xff00001fu32,
+                    0xb5000000u32 | 26,
+                    "fault check must end with CBNZ X26"
+                );
+                fault_cbnz_positions.push(i + 2);
+            }
+        }
+        assert_eq!(
+            fault_cbnz_positions.len(),
+            2,
+            "load AND store helper calls must each be followed by an immediate fault check"
+        );
+
+        // Every cbnz must branch FORWARD to the same fault stub, which loads
+        // EXIT_GUEST_FAULT (11) into x0 and ends with RET.
+        let mut stub_positions = Vec::new();
+        for pos in &fault_cbnz_positions {
+            let cbnz = words[*pos];
+            let imm19 = ((cbnz >> 5) & 0x7ffff) as i32;
+            let stub_pos = *pos as i32 + imm19;
+            assert!(imm19 > 0, "fault branch must be forward");
+            assert!(
+                (stub_pos as usize) < words.len(),
+                "fault stub must be inside the block"
+            );
+            stub_positions.push(stub_pos);
+        }
+        assert!(
+            stub_positions.windows(2).all(|w| w[0] == w[1]),
+            "all fault checks must share ONE stub"
+        );
+        let stub_pos = stub_positions[0] as usize;
+        let stub_words = &words[stub_pos..];
+        assert!(
+            stub_words[0] & 0xffc00000 == 0xa9000000 || stub_words[0] & 0xffc00000 == 0xa9800000,
+            "fault stub must begin by storing guest registers (stp), got {:08x}",
+            stub_words[0]
+        );
+        let movz_exit_fault = 0xd2800000u32 | ((EXIT_GUEST_FAULT as u32) << 5);
+        assert!(
+            stub_words.contains(&movz_exit_fault),
+            "fault stub must load EXIT_GUEST_FAULT into x0"
+        );
+        assert!(
+            stub_words.contains(&0xd65f03c0),
+            "fault stub must end with ret"
+        );
+
+        // The patch list must have been consumed.
+        assert!(
+            compiler.fault_cbnz_patches.is_empty(),
+            "fault patch positions must be consumed by finish_fault_stub"
+        );
+    }
+
+    #[test]
+    fn exit_reason_mapping_decodes_guest_fault() {
+        // EXIT_GUEST_FAULT must decode to JitExitReason::GuestFault, never
+        // Normal — the dispatcher raises the access violation on it.
+        let mut state = CpuState::new(GuestArch::X64);
+        state.rip = 0x1000;
+        assert_eq!(
+            map_exit_reason(EXIT_GUEST_FAULT, &state, 0, None),
+            JitExitReason::GuestFault
         );
     }
 
