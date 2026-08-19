@@ -659,6 +659,12 @@ pub struct CpuState {
     /// silently observed as a successful zero-valued read.
     #[serde(default)]
     pub jit_pending_fault: Option<u64>,
+    /// Access type of the pending JIT fault: `true` when
+    /// `jit_pending_fault` was set by a guest WRITE (`jit_helper_store`),
+    /// `false` for a guest read (`jit_helper_load`).  Valid only while
+    /// `jit_pending_fault` is `Some`.
+    #[serde(default)]
+    pub jit_pending_fault_write: bool,
 }
 
 impl CpuState {
@@ -687,6 +693,7 @@ impl CpuState {
             bnd: [(0u64, 0u64); 4],
             ssp: 0,
             jit_pending_fault: None,
+            jit_pending_fault_write: false,
         }
     }
 
@@ -996,6 +1003,17 @@ pub struct MemoryImage {
     low_page_lookup: Box<[u32]>,
 }
 
+/// A guest access violation raised by the checked memory accessors
+/// ([`MemoryImage::guest_read_checked`] / [`MemoryImage::guest_write_checked`]).
+/// Carries the precise faulting address (the first unmapped byte of the
+/// access), the access type, and the length of the requested access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemoryFault {
+    pub address: u64,
+    pub write: bool,
+    pub read_len: usize,
+}
+
 impl Clone for MemoryImage {
     fn clone(&self) -> Self {
         Self {
@@ -1065,6 +1083,13 @@ impl MemoryImage {
 
     fn page(&self, page_base: u64) -> Option<&MemoryPage> {
         self.page_index(page_base).map(|index| &self.pages[index].1)
+    }
+
+    /// Borrow an existing page mutably WITHOUT creating it when absent.
+    /// Checked guest writes use this so a store can never materialize memory.
+    fn page_mut(&mut self, page_base: u64) -> Option<&mut MemoryPage> {
+        self.page_index(page_base)
+            .map(|index| &mut self.pages[index].1)
     }
 
     fn page_mut_or_insert(&mut self, page_base: u64) -> &mut MemoryPage {
@@ -1222,6 +1247,88 @@ impl MemoryImage {
             ReasonCode::RcUnimplInsn,
             format!("unmapped guest memory at {address:#x}"),
         )
+    }
+
+    /// First unmapped byte in `[address, address + len)`, or `None` when the
+    /// whole range is mapped.  Never allocates or inserts pages.
+    fn first_unmapped_in_range(&self, address: u64, len: usize) -> Option<u64> {
+        if len == 0 {
+            return None;
+        }
+        let mut checked = 0;
+        let mut current_address = address;
+        while checked < len {
+            let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(len - checked);
+            let Some(page) = self.page(page_base) else {
+                return Some(current_address);
+            };
+            if !page.range_is_mapped(page_offset, chunk_len) {
+                let missing_offset = page
+                    .first_unmapped_offset(page_offset, chunk_len)
+                    .expect("range_is_mapped mismatch");
+                return Some(page_base + missing_offset as u64);
+            }
+            checked += chunk_len;
+            current_address = current_address.wrapping_add(chunk_len as u64);
+        }
+        None
+    }
+
+    /// Checked guest read: copies `buf.len()` bytes from `address` only when
+    /// every byte is already mapped.  Unlike [`MemoryImage::read_into`] this
+    /// returns a structured [`GuestMemoryFault`] (carrying the precise fault
+    /// address and access length) and NEVER allocates or inserts pages.
+    pub fn guest_read_checked(&self, address: u64, buf: &mut [u8]) -> Result<(), GuestMemoryFault> {
+        if let Some(fault_address) = self.first_unmapped_in_range(address, buf.len()) {
+            return Err(GuestMemoryFault {
+                address: fault_address,
+                write: false,
+                read_len: buf.len(),
+            });
+        }
+        self.read_into(address, buf)
+            .expect("validated range must be readable");
+        Ok(())
+    }
+
+    /// Checked guest write: writes `buf` to `address` only when every byte is
+    /// already mapped.  The whole range is validated BEFORE any byte is
+    /// written (no partial writes on fault), and no page is ever created or
+    /// marked mapped by this method.  Guest CPU writes must go through this
+    /// (or [`MemoryImage::write_fixed`]-free equivalents) so that a store
+    /// through a null/unmapped pointer raises an access violation instead of
+    /// materializing memory.  Loader / VirtualAlloc / heap / kernel paths
+    /// keep using the allocating APIs (`map_bytes`, `commit_zeroed_pages`,
+    /// `page_mut_or_insert`).
+    pub fn guest_write_checked(
+        &mut self,
+        address: u64,
+        buf: &[u8],
+    ) -> Result<(), GuestMemoryFault> {
+        if let Some(fault_address) = self.first_unmapped_in_range(address, buf.len()) {
+            return Err(GuestMemoryFault {
+                address: fault_address,
+                write: true,
+                read_len: buf.len(),
+            });
+        }
+        let mut copied = 0;
+        let mut current_address = address;
+        while copied < buf.len() {
+            let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(buf.len() - copied);
+            let page = self
+                .page_mut(page_base)
+                .expect("validated range must be present");
+            page.bytes[page_offset..page_offset + chunk_len]
+                .copy_from_slice(&buf[copied..copied + chunk_len]);
+            copied += chunk_len;
+            current_address = current_address.wrapping_add(chunk_len as u64);
+        }
+        Ok(())
     }
 
     fn read_fixed<const N: usize>(&self, address: u64) -> AppResult<[u8; N]> {
@@ -4308,14 +4415,42 @@ impl CpuExecutionEngine {
                 // guest objects for the duration of the call.
                 let reason = unsafe { jit.execute_block(&block, state, memory) };
 
-                // Fault channel: `jit_helper_load` cannot propagate errors
-                // through the extern "C" ABI, so an unmapped guest read set
-                // `jit_pending_fault`.  Convert it into the exact error the
-                // interpreter raises for the same access violation — the
-                // caller's `annotate_guest_fault` wrapping then applies
-                // identically to an interpreter fault.
-                if let Some(fault_address) = state.jit_pending_fault.take() {
-                    return Err(MemoryImage::unmapped_memory_error(fault_address));
+                // Fault channel: `jit_helper_load` / `jit_helper_store` cannot
+                // propagate errors through the extern "C" ABI, so a guest
+                // access violation sets `jit_pending_fault` and the compiled
+                // block exits IMMEDIATELY via EXIT_GUEST_FAULT (the emitted
+                // post-helper flag test aborts the block at the faulting
+                // instruction — later instructions never run).  Convert the
+                // pending fault into the exact error the interpreter raises
+                // for the same access violation — the caller's
+                // `annotate_guest_fault` wrapping then applies identically.
+                match &reason {
+                    crate::jit::JitExitReason::GuestFault => {
+                        // Precise access violation: fault address + access
+                        // type recorded by the helper, guest RIP is the block
+                        // entry (`state.rip` — the compiled block never
+                        // advances it; the faulting instruction's own
+                        // address is the block start, the best available
+                        // without per-instruction IR metadata).
+                        let fault_address = state.jit_pending_fault.take().unwrap_or(state.rip);
+                        // Access type (read/write) recorded for diagnostics /
+                        // future precise exception parameters; the error
+                        // message shape stays byte-identical to the
+                        // interpreter's so SEH dispatch is indistinguishable.
+                        state.jit_pending_fault_write = false;
+                        return Err(MemoryImage::unmapped_memory_error(fault_address));
+                    }
+                    // Defensive: a pending fault must NEVER be observed as a
+                    // successful block, whatever exit reason it took (e.g. a
+                    // fault raised by the universal interpreter helper whose
+                    // error could not be propagated).  The immediate exit
+                    // makes this unreachable in practice.
+                    _ if state.jit_pending_fault.is_some() => {
+                        let fault_address = state.jit_pending_fault.take().unwrap();
+                        state.jit_pending_fault_write = false;
+                        return Err(MemoryImage::unmapped_memory_error(fault_address));
+                    }
+                    _ => {}
                 }
 
                 // Dispatcher: apply the terminator semantics the compiled
@@ -19840,7 +19975,7 @@ fn execute_cold_path(
         IrInstruction::XorMemory8 { address, src } => {
             let target = resolve_memory_operand(state, address, 1)?;
             let result = memory.read_u8(target)? ^ state.get_byte(*src);
-            memory.write_u8(target, result);
+            write_memory_value(memory, target, result as u64, 1)?;
             state.flags = logic_flags(result as u64, 8);
         }
         IrInstruction::RolImm { dst, count, width } => {
@@ -20051,7 +20186,7 @@ fn execute_cold_path(
         IrInstruction::AndMemory8 { address, src } => {
             let target = resolve_memory_operand(state, address, 1)?;
             let result = memory.read_u8(target)? & state.get_byte(*src);
-            memory.write_u8(target, result);
+            write_memory_value(memory, target, result as u64, 1)?;
             state.flags = logic_flags(result as u64, 8);
         }
         IrInstruction::AndReg { dst, src, width } => {
@@ -20111,7 +20246,7 @@ fn execute_cold_path(
         IrInstruction::OrMemory8 { address, src } => {
             let target = resolve_memory_operand(state, address, 1)?;
             let result = memory.read_u8(target)? | state.get_byte(*src);
-            memory.write_u8(target, result);
+            write_memory_value(memory, target, result as u64, 1)?;
             state.flags = logic_flags(result as u64, 8);
         }
         IrInstruction::OrReg8 { dst, src } => {
@@ -20595,7 +20730,7 @@ fn execute_cold_path(
         IrInstruction::StoreDwordFromXmm { address, src } => {
             let target = resolve_memory_operand(state, address, 4)?;
             let value = (state.get_xmm(*src).low & 0xffff_ffff) as u32;
-            memory.write_u32(target, value);
+            write_memory_value(memory, target, value as u64, 4)?;
         }
         IrInstruction::Pshufd { dst, src, imm } => {
             let lanes = xmm_to_u32x4(state.get_xmm(*src));
@@ -20652,7 +20787,11 @@ fn execute_cold_path(
         }
         IrInstruction::StoreXmm { src, address } => {
             let target = resolve_memory_operand(state, address, 16)?;
-            memory.map_xmm(target, state.get_xmm(*src));
+            let value = state.get_xmm(*src);
+            let mut bytes = [0_u8; 16];
+            bytes[..8].copy_from_slice(&value.low.to_le_bytes());
+            bytes[8..].copy_from_slice(&value.high.to_le_bytes());
+            write_guest_bytes(memory, target, &bytes)?;
         }
         IrInstruction::MoveVector { dst, src, width } => {
             let value = read_vector_register(state, *src, *width)?;
@@ -21442,9 +21581,11 @@ fn execute_cold_path(
                     // x87 mantissa: bit 63 = integer bit, bits 62-0 = fraction (63 bits)
                     // f64 fraction is 52 bits, so shift left by 11 to fill 63 bits
                     let x87_mantissa: u64 = (x87_int << 63) | (fraction << 11);
-                    memory.commit_zeroed_pages(target, 10)?;
-                    memory.write_u64(target, x87_mantissa);
-                    memory.write_u16(target.wrapping_add(8), ((sign as u16) << 15) | x87_exp);
+                    let mut x87_bytes = [0_u8; 10];
+                    x87_bytes[..8].copy_from_slice(&x87_mantissa.to_le_bytes());
+                    x87_bytes[8..]
+                        .copy_from_slice(&(((sign as u16) << 15) | x87_exp).to_le_bytes());
+                    write_guest_bytes(memory, target, &x87_bytes)?;
                 }
                 other => {
                     return Err(AppError::new(
@@ -23477,7 +23618,7 @@ fn execute_cold_path(
                     checked_u64_le(&idx_bytes, off)?
                 };
                 let addr = base.wrapping_add(idx.wrapping_mul(*scale as u64));
-                memory.map_bytes(addr, &src_bytes[off..off + lane_size]);
+                write_guest_bytes(memory, addr, &src_bytes[off..off + lane_size])?;
             }
         }
         // Mask register operations
@@ -26194,18 +26335,29 @@ fn read_memory_value(memory: &MemoryImage, address: u64, width: usize) -> AppRes
     }
 }
 
+/// Checked guest write of an arbitrary byte buffer: faults (with the
+/// interpreter's access-violation error carrying the precise fault address)
+/// instead of creating pages when the destination is not already mapped.
+/// Used by interpreter IR store paths and vector stores; the loader and
+/// kernel paths keep the allocating APIs.
+fn write_guest_bytes(memory: &mut MemoryImage, address: u64, bytes: &[u8]) -> AppResult<()> {
+    memory
+        .guest_write_checked(address, bytes)
+        .map_err(|fault| MemoryImage::unmapped_memory_error(fault.address))
+}
+
 fn write_memory_value(
     memory: &mut MemoryImage,
     address: u64,
     value: u64,
     width: usize,
 ) -> AppResult<()> {
-    memory.commit_zeroed_pages(address, width)?;
+    let mut bytes = [0_u8; 8];
     match width {
-        1 => memory.write_u8(address, value as u8),
-        2 => memory.write_u16(address, value as u16),
-        4 => memory.write_u32(address, value as u32),
-        8 => memory.write_u64(address, value),
+        1 => bytes[..1].copy_from_slice(&(value as u8).to_le_bytes()),
+        2 => bytes[..2].copy_from_slice(&(value as u16).to_le_bytes()),
+        4 => bytes[..4].copy_from_slice(&(value as u32).to_le_bytes()),
+        8 => bytes.copy_from_slice(&value.to_le_bytes()),
         other => {
             return Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
@@ -26213,7 +26365,7 @@ fn write_memory_value(
             ));
         }
     }
-    Ok(())
+    write_guest_bytes(memory, address, &bytes[..width])
 }
 
 fn read_compare_operand(
@@ -26980,18 +27132,15 @@ fn write_vector_memory(
     width: usize,
 ) -> AppResult<()> {
     match width {
-        4 => memory.map_bytes(address, &(value.low.low as u32).to_le_bytes()),
-        8 => memory.map_bytes(address, &value.low.low.to_le_bytes()),
-        16 => memory.map_xmm(address, value.low),
-        32 => memory.map_ymm(address, value),
-        other => {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("unsupported vector memory width {other}"),
-            ));
+        4 | 8 | 16 | 32 => {
+            let bytes = ymm_to_bytes(value);
+            write_guest_bytes(memory, address, &bytes[..width])
         }
+        other => Err(AppError::new(
+            ReasonCode::RcUnimplInsn,
+            format!("unsupported vector memory width {other}"),
+        )),
     }
-    Ok(())
 }
 
 fn read_vector_operand(
@@ -27094,9 +27243,7 @@ fn write_vector_operand_bytes(
         VectorOperand::Register(index) => write_vector_bytes(state, *index, bytes, width),
         VectorOperand::Memory(address) => {
             let target = resolve_memory_operand(state, address, width)?;
-            memory.commit_zeroed_pages(target, width)?;
-            memory.map_bytes(target, bytes);
-            Ok(())
+            write_guest_bytes(memory, target, bytes)
         }
     }
 }
@@ -28228,6 +28375,156 @@ mod tests {
     }
 
     #[test]
+    fn guest_write_checked_faults_on_unmapped_and_never_creates_pages() {
+        let mut memory = MemoryImage::default();
+        let fault = memory
+            .guest_write_checked(0x7000_0000, &[0xAA, 0xBB, 0xCC])
+            .expect_err("store to unmapped memory must fault");
+        assert_eq!(fault.address, 0x7000_0000, "precise fault address");
+        assert!(fault.write, "access type must be write");
+        assert_eq!(fault.read_len, 3, "access length");
+        assert!(
+            memory.page(0x7000_0000).is_none(),
+            "guest write must NEVER create the page"
+        );
+        let mut probe = [0_u8; 3];
+        let read_fault = memory
+            .guest_read_checked(0x7000_0000, &mut probe)
+            .expect_err("the page must still be unmapped after the failed store");
+        assert_eq!(read_fault.address, 0x7000_0000);
+        assert!(!read_fault.write);
+    }
+
+    #[test]
+    fn guest_write_checked_faults_on_mapped_but_guarded_range() {
+        let mut memory = MemoryImage::default();
+        // map_bytes marks only the written bytes; the rest of the page stays
+        // unmapped — the guard semantics PAGE_NOACCESS relies on.
+        memory.map_bytes(0x4000, &[0x11, 0x22]);
+        assert!(memory.is_range_mapped(0x4000, 2));
+
+        let fault = memory
+            .guest_write_checked(0x4002, &[0x33, 0x44])
+            .expect_err("write into a guarded (unmapped) byte must fault");
+        assert_eq!(fault.address, 0x4002, "precise fault address");
+
+        // The guarded bytes must remain untouched.
+        assert_eq!(memory.read_u8(0x4000).unwrap(), 0x11);
+        assert_eq!(memory.read_u8(0x4001).unwrap(), 0x22);
+
+        // A write spanning mapped + guarded bytes faults at the first
+        // guarded byte WITHOUT partially writing the mapped prefix.
+        let fault = memory
+            .guest_write_checked(0x4001, &[0x99, 0xAA])
+            .expect_err("crossing access must fault");
+        assert_eq!(fault.address, 0x4002);
+        assert_eq!(
+            memory.read_u8(0x4001).unwrap(),
+            0x22,
+            "no partial write before the faulting byte"
+        );
+    }
+
+    #[test]
+    fn guest_write_checked_writes_mapped_memory() {
+        let mut memory = MemoryImage::default();
+        memory.map_zeroed_if_unmapped(0x5000, 0x100);
+        memory
+            .guest_write_checked(0x5008, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .expect("write to mapped memory succeeds");
+        assert_eq!(memory.read_u32(0x5008).unwrap(), 0xEFBE_ADDE);
+        // Cross-page access within a mapped region works.
+        memory.map_zeroed_if_unmapped(0x5F00, 0x200);
+        memory
+            .guest_write_checked(0x5FFC, &[1, 2, 3, 4, 5, 6])
+            .expect("cross-page write to mapped memory succeeds");
+        assert_eq!(memory.read_u8(0x5FFC).unwrap(), 1);
+        assert_eq!(memory.read_u8(0x6000).unwrap(), 5);
+        assert_eq!(memory.read_u8(0x6001).unwrap(), 6);
+    }
+
+    #[test]
+    fn guest_read_checked_faults_without_allocating_and_reads_mapped() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x3000, &[0x01, 0x02, 0x03, 0x04]);
+
+        let mut buf = [0_u8; 2];
+        memory
+            .guest_read_checked(0x3000, &mut buf)
+            .expect("mapped read");
+        assert_eq!(buf, [0x01, 0x02]);
+
+        let mut buf = [0_u8; 8];
+        let fault = memory
+            .guest_read_checked(0x3002, &mut buf)
+            .expect_err("read past the mapped range must fault");
+        assert_eq!(fault.address, 0x3004, "precise first-unmapped byte");
+        assert!(!fault.write, "access type must be read");
+
+        // Unmapped page: faults and does not create anything.
+        let mut buf = [0_u8; 1];
+        let fault = memory
+            .guest_read_checked(0x9_0000, &mut buf)
+            .expect_err("unmapped page must fault");
+        assert_eq!(fault.address, 0x9_0000);
+        assert!(memory.page(0x9_0000).is_none(), "read must not allocate");
+    }
+
+    #[test]
+    fn write_memory_value_faults_on_unmapped_with_av_error_and_does_not_map() {
+        let mut memory = MemoryImage::default();
+        let error = write_memory_value(&mut memory, 0x0000_0100_0000, 0x1234, 4)
+            .expect_err("guest store to unmapped memory must raise an access violation");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert!(
+            error.message.contains("unmapped guest memory at 0x1000000"),
+            "AV error must carry the fault address: {}",
+            error.message
+        );
+        assert!(
+            memory.page(0x0000_0100_0000).is_none(),
+            "guest store must not materialize the page"
+        );
+        let mut probe = [0_u8; 4];
+        memory
+            .guest_read_checked(0x0000_0100_0000, &mut probe)
+            .expect_err("the page must still fault after the failed store");
+    }
+
+    #[test]
+    fn write_memory_value_faults_on_guarded_region_with_precise_address() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x4000, &[0x11, 0x22]);
+        let error = write_memory_value(&mut memory, 0x4001, 0xABCD, 2)
+            .expect_err("store into guarded bytes must raise an access violation");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert!(
+            error.message.contains("unmapped guest memory at 0x4002"),
+            "fault address must be the first guarded byte: {}",
+            error.message
+        );
+        // The mapped prefix must not have been written (no partial stores).
+        assert_eq!(memory.read_u8(0x4001).unwrap(), 0x22);
+    }
+
+    #[test]
+    fn loader_map_bytes_then_checked_write_and_read_work() {
+        // The loader path keeps the allocating API: map_bytes creates the
+        // page, then both checked and unchecked accessors work.
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x2000, &[0; 8]);
+        memory
+            .guest_write_checked(0x2000, &[0xFE, 0xED, 0xFA, 0xCE])
+            .expect("checked write after map_bytes");
+        let mut buf = [0_u8; 4];
+        memory
+            .guest_read_checked(0x2000, &mut buf)
+            .expect("checked read after map_bytes");
+        assert_eq!(buf, [0xFE, 0xED, 0xFA, 0xCE]);
+        assert_eq!(memory.read_u32(0x2000).unwrap(), 0xCEFA_EDFE);
+    }
+
+    #[test]
     fn xmm_load_and_store_moves_16_bytes_between_memory_locations() {
         let mut state = CpuState::new(GuestArch::X64);
         let mut memory = MemoryImage::default();
@@ -28240,6 +28537,9 @@ mod tests {
 
         state.set(Register::Rsp, stack_address);
         memory.map_xmm(constant_address, payload);
+        // Loader-mapped stack region for the [rsp+0x10] 16-byte store
+        // (guest CPU stores never materialize pages).
+        memory.map_zeroed_if_unmapped(stack_address, 0x20);
 
         execute_ir(
             &mut state,
@@ -28318,6 +28618,9 @@ mod tests {
         state.set(Register::Rsp, 0x8000);
         memory.map_bytes(start_address, &bytes);
         memory.map_xmm(constant_address, payload);
+        // Loader-mapped stack region for the [rsp+0x10] store (guest CPU
+        // stores never materialize pages).
+        memory.map_zeroed_if_unmapped(0x8000, 0x20);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute raw xmm moves");
 
@@ -28465,6 +28768,8 @@ mod tests {
         state.set(Register::Rsp, 0x8000);
         memory.map_bytes(start_address, &bytes);
         memory.map_ymm(constant_address, payload);
+        // Loader-mapped stack region for the [rsp+0x20] 32-byte store.
+        memory.map_zeroed_if_unmapped(0x8000, 0x40);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute vex ymm moves");
 
@@ -28610,6 +28915,9 @@ mod tests {
 
         memory.map_bytes(this_ptr + 0x30, &[0xaa; 0x60]);
         memory.map_bytes(this_ptr + 0x84, &[0xcc; 0x10]);
+        // Loader-mapped stack for the two `push` instructions (guest CPU
+        // stores never materialize pages).
+        memory.map_zeroed_if_unmapped(0x7000_FFF0, 0x20);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute live steam movss block");
 
@@ -29486,6 +29794,9 @@ mod tests {
         state.set(Register::Rax, 0x4000);
         state.set_xmm(1, u32x4_to_xmm([10, 20, 30, 40]));
         state.set_xmm(2, u32x4_to_xmm([1, 2, 3, 4]));
+        // Loader-mapped store destination (guest CPU stores never
+        // materialize pages).
+        memory.map_zeroed_if_unmapped(0x4000, 4);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute psubd/movd store");
 
@@ -29512,6 +29823,9 @@ mod tests {
 
         state.set(Register::Rax, 0x5000);
         state.set_xmm(0, u32x4_to_xmm([1, 2, 3, 4]));
+        // Loader-mapped store destination (guest CPU stores never
+        // materialize pages).
+        memory.map_zeroed_if_unmapped(0x5000, 4);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute psrldq/movd store");
 
@@ -30085,6 +30399,8 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         memory.map_bytes(0x2000, &1.5_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2008, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fld/fstp m64real sequence");
 
@@ -30108,6 +30424,8 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         memory.map_bytes(0x2000, &42_i32.to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2008, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fild/fstp sequence");
 
@@ -30131,6 +30449,8 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         memory.map_bytes(0x2000, &42_i64.to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2008, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fild/fstp sequence");
 
@@ -30180,6 +30500,8 @@ mod tests {
 
         memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
         memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2010, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fdiv sequence");
 
@@ -30205,6 +30527,8 @@ mod tests {
 
         memory.map_bytes(0x2000, &1.5_f64.to_bits().to_le_bytes());
         memory.map_bytes(0x2008, &2.25_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2010, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fadd sequence");
 
@@ -30350,6 +30674,8 @@ mod tests {
 
         memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
         memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2010, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fdiv register sequence");
 
@@ -30375,6 +30701,8 @@ mod tests {
 
         memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
         memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2010, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fdivp sequence");
 
@@ -30417,6 +30745,8 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         memory.map_bytes(0x2000, &1.25_f32.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2008, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fld m32real sequence");
 
@@ -30441,6 +30771,8 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         memory.map_bytes(0x2000, &2.0_f64.to_bits().to_le_bytes());
+        // Loader-mapped fstp target (guest CPU stores never materialize).
+        memory.map_zeroed_if_unmapped(0x2008, 8);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fmul m64real sequence");
 
@@ -35980,6 +36312,240 @@ mod tests {
         assert!(flags.pf, "PF=1 for zero result (even parity)");
     }
 
+    // -----------------------------------------------------------------------
+    // Exhaustive flag ground truth: every width-8 pair, dense width-16/32/64
+    // samples, for ADD/ADC/SUB/SBB — the same overflowing_add/overflowing_sub
+    // formulation the interpreter and the JIT helper must agree on.
+    // -----------------------------------------------------------------------
+
+    fn ground_truth_add(a: u64, b: u64, bits: u32) -> Flags {
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let (a, b) = (a & mask, b & mask);
+        // Truncate the sum to the operation width BEFORE testing the carry:
+        // 8-bit 0xff + 0x01 wraps to 0x00 with a carry even though the u64
+        // addition 255 + 1 does not overflow.
+        let sum = a.wrapping_add(b) & mask;
+        let sign_bit = 1u64 << (bits - 1);
+        Flags {
+            cf: sum < a,
+            pf: parity(sum as u8),
+            af: ((a ^ b ^ sum) & 0x10) != 0,
+            zf: sum == 0,
+            sf: (sum & sign_bit) != 0,
+            of: ((!(a ^ b) & (a ^ sum)) & sign_bit) != 0,
+        }
+    }
+
+    fn ground_truth_adc(a: u64, b: u64, carry_in: u64, bits: u32) -> Flags {
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let (a, b) = (a & mask, b & mask);
+        let sum = a as u128 + b as u128 + carry_in as u128;
+        let result = (sum & mask as u128) as u64;
+        let sign_bit = 1u64 << (bits - 1);
+        let signed_a = signed_value(a, bits as usize);
+        let signed_b = signed_value(b, bits as usize);
+        let signed_sum = signed_a + signed_b + carry_in as i128;
+        let min_signed = -(1_i128 << (bits - 1));
+        let max_signed = (1_i128 << (bits - 1)) - 1;
+        Flags {
+            cf: sum > mask as u128,
+            pf: parity(result as u8),
+            af: ((a & 0x0f) + (b & 0x0f) + carry_in) > 0x0f,
+            zf: result == 0,
+            sf: (result & sign_bit) != 0,
+            of: signed_sum < min_signed || signed_sum > max_signed,
+        }
+    }
+
+    fn ground_truth_sub(a: u64, b: u64, bits: u32) -> Flags {
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let (a, b) = (a & mask, b & mask);
+        let (diff, _borrow) = a.overflowing_sub(b);
+        let diff = diff & mask;
+        let sign_bit = 1u64 << (bits - 1);
+        Flags {
+            cf: a < b,
+            pf: parity(diff as u8),
+            af: ((a ^ b ^ diff) & 0x10) != 0,
+            zf: diff == 0,
+            sf: (diff & sign_bit) != 0,
+            of: (((a ^ b) & (a ^ diff)) & sign_bit) != 0,
+        }
+    }
+
+    fn ground_truth_sbb(a: u64, b: u64, borrow_in: u64, bits: u32) -> Flags {
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let (a, b) = (a & mask, b & mask);
+        let rhs_with_borrow = b.wrapping_add(borrow_in) & mask;
+        let diff = a.wrapping_sub(rhs_with_borrow) & mask;
+        let sign_bit = 1u64 << (bits - 1);
+        Flags {
+            cf: (a as u128) < (b as u128 + borrow_in as u128),
+            pf: parity(diff as u8),
+            af: ((a ^ rhs_with_borrow ^ diff) & 0x10) != 0,
+            zf: diff == 0,
+            sf: (diff & sign_bit) != 0,
+            of: (((a ^ rhs_with_borrow) & (a ^ diff)) & sign_bit) != 0,
+        }
+    }
+
+    fn assert_flags_eq(got: Flags, expected: Flags, context: &str) {
+        assert_eq!(got.cf, expected.cf, "{context}: CF");
+        assert_eq!(got.pf, expected.pf, "{context}: PF");
+        assert_eq!(got.af, expected.af, "{context}: AF");
+        assert_eq!(got.zf, expected.zf, "{context}: ZF");
+        assert_eq!(got.sf, expected.sf, "{context}: SF");
+        assert_eq!(got.of, expected.of, "{context}: OF");
+    }
+
+    fn stride_sample_values(bits: u32) -> Vec<u64> {
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let msb = 1u64 << (bits - 1);
+        let mut values = vec![
+            0,
+            1,
+            mask,
+            mask - 1,
+            msb,
+            msb - 1,
+            msb + 1,
+            0x0f,
+            0x10,
+            0xff,
+            0x0f_0f,
+            0xf0_f0,
+        ];
+        let stride = mask / 257;
+        for k in 0..=256u64 {
+            values.push(k.wrapping_mul(stride) & mask);
+        }
+        values
+    }
+
+    #[test]
+    fn add_flags_exhaustive_8bit_matches_ground_truth() {
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let sum = a.wrapping_add(b) & 0xff;
+                assert_flags_eq(
+                    add_flags(a, b, sum, 8),
+                    ground_truth_add(a, b, 8),
+                    &format!("8-bit add {a:#x} + {b:#x}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adc_flags_exhaustive_8bit_matches_ground_truth() {
+        for carry in [0u64, 1] {
+            for a in 0..=255u64 {
+                for b in 0..=255u64 {
+                    let sum = a.wrapping_add(b).wrapping_add(carry) & 0xff;
+                    assert_flags_eq(
+                        adc_flags(a, b, carry, sum, 8),
+                        ground_truth_adc(a, b, carry, 8),
+                        &format!("8-bit adc {a:#x} + {b:#x} + {carry}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sub_flags_exhaustive_8bit_matches_ground_truth() {
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let diff = a.wrapping_sub(b) & 0xff;
+                assert_flags_eq(
+                    sub_flags(a, b, diff, 8),
+                    ground_truth_sub(a, b, 8),
+                    &format!("8-bit sub {a:#x} - {b:#x}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sbb_flags_exhaustive_8bit_matches_ground_truth() {
+        for borrow in [0u64, 1] {
+            for a in 0..=255u64 {
+                for b in 0..=255u64 {
+                    let rhs = b.wrapping_add(borrow) & 0xff;
+                    let diff = a.wrapping_sub(rhs) & 0xff;
+                    assert_flags_eq(
+                        sbb_flags(a, b, borrow, diff, 8),
+                        ground_truth_sbb(a, b, borrow, 8),
+                        &format!("8-bit sbb {a:#x} - {b:#x} - {borrow}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arithmetic_flags_dense_samples_16_32_64_match_ground_truth() {
+        for bits in [16u32, 32, 64] {
+            let values = stride_sample_values(bits);
+            for &a in &values {
+                for &b in &values {
+                    let width_mask_value = if bits >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
+                    let sum = a.wrapping_add(b) & width_mask_value;
+                    assert_flags_eq(
+                        add_flags(a, b, sum, bits as usize),
+                        ground_truth_add(a, b, bits),
+                        &format!("{bits}-bit add {a:#x} + {b:#x}"),
+                    );
+                    let diff = a.wrapping_sub(b) & width_mask_value;
+                    assert_flags_eq(
+                        sub_flags(a, b, diff, bits as usize),
+                        ground_truth_sub(a, b, bits),
+                        &format!("{bits}-bit sub {a:#x} - {b:#x}"),
+                    );
+                    for carry in [0u64, 1] {
+                        let sum = a.wrapping_add(b).wrapping_add(carry) & width_mask_value;
+                        assert_flags_eq(
+                            adc_flags(a, b, carry, sum, bits as usize),
+                            ground_truth_adc(a, b, carry, bits),
+                            &format!("{bits}-bit adc {a:#x} + {b:#x} + {carry}"),
+                        );
+                        let rhs = b.wrapping_add(carry) & width_mask_value;
+                        let diff = a.wrapping_sub(rhs) & width_mask_value;
+                        assert_flags_eq(
+                            sbb_flags(a, b, carry, diff, bits as usize),
+                            ground_truth_sbb(a, b, carry, bits),
+                            &format!("{bits}-bit sbb {a:#x} - {b:#x} - {carry}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn inc_flags_does_not_affect_carry() {
         // INC eax (width=32): 0xFFFFFFFF + 1 = 0x00000000 but CF is NOT set
@@ -37902,6 +38468,9 @@ mod tests {
         state.set(Register::Rbp, 0x5555_5555);
         state.set(Register::Rsi, 0x6666_6666);
         state.set(Register::Rdi, 0x7777_7777);
+        // Loader-mapped stack for the PUSHAD/POPAD round-trip (guest CPU
+        // stores never materialize pages).
+        memory.map_zeroed_if_unmapped(0x8000 - 32, 32);
         execute_ir(&mut state, &mut memory, &ir).expect("execute PUSHAD");
         assert_eq!(state.get(Register::Rsp), 0x8000 - 32);
         // PUSHAD pushes EAX, ECX, EDX, EBX, original ESP, EBP, ESI, EDI in

@@ -79350,6 +79350,10 @@ mod tests {
             write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
             memory.map_bytes(joiner_entry, &joiner_bytes);
             memory.map_bytes(result_ptr, &[0_u8; 4]);
+            // The joiner's `mov [0x42300], eax` stores the join result into
+            // guest memory; the destination must be mapped by the loader
+            // (guest CPU stores never materialize pages).
+            memory.map_zeroed_if_unmapped(0x42_300, 4);
 
             let joiner_handle = dispatch_x86_thunk(
                 &mut runtime,
@@ -80519,6 +80523,10 @@ mod tests {
             write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
             memory.map_bytes(joiner_entry, &joiner_bytes);
             memory.map_bytes(result_ptr, &[0_u8; 4]);
+            // The joiner's `mov [0x42300], eax` stores the join result into
+            // guest memory; the destination must be loader-mapped (guest CPU
+            // stores never materialize pages).
+            memory.map_zeroed_if_unmapped(0x42_300, 4);
 
             let joiner_handle = dispatch_x86_thunk(
                 &mut runtime,
@@ -81138,6 +81146,10 @@ mod tests {
             write_u32(&mut memory, get_slot, get_exit_code_thread as u32);
             write_u32(&mut memory, exit_slot, exit_thread as u32);
             memory.map_bytes(entrypoint, &entrypoint_bytes);
+            // The TLS callback stores `mov [reason_flag], eax`; the
+            // destination must be loader-mapped (guest CPU stores never
+            // materialize pages).
+            memory.map_zeroed_if_unmapped(reason_flag as u64, 4);
             memory.map_bytes(handle_slot as u64, &[0_u8; 4]);
             memory.map_bytes(exit_code_ptr as u64, &[0_u8; 4]);
 
@@ -88087,6 +88099,10 @@ mod tests {
         with_big_stack(|| {
             let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
             let marker_addr = 0x70_000;
+            // The callback stores the marker through a guest `mov [addr], eax`;
+            // the destination must be loader-mapped (guest stores never
+            // materialize pages).
+            memory.map_zeroed_if_unmapped(marker_addr, 4);
             write_x86_stub(
                 &mut memory,
                 0x70_100,
@@ -89697,6 +89713,10 @@ mod tests {
             waiter_bytes[6..10].copy_from_slice(&event_handle.to_le_bytes());
             write_u32(&mut memory, wfso_slot, wait_for_single_object as u32);
             memory.map_bytes(waiter_entry, &waiter_bytes);
+            // The waiter's `mov [0x42300], eax` stores the wait result into
+            // guest memory; the destination must be loader-mapped (guest CPU
+            // stores never materialize pages).
+            memory.map_zeroed_if_unmapped(0x42_300, 4);
 
             let worker_handle = dispatch_x86_thunk(
                 &mut runtime,
