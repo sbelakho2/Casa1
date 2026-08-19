@@ -42228,6 +42228,29 @@ impl PeHostRuntime {
                     // exception code.  The structured termination becomes
                     // GuestException (the finalizer consults the marker).
                     self.unhandled_guest_exception = Some(code);
+                    // Capture the C++ throw context: for 0xE06D7363 (MSVC)
+                    // the arguments carry the throw-info pointer and the
+                    // exception object; the caller's return address on the
+                    // guest stack identifies the throwing function.
+                    let raise_args_count = guest_call_arg_u32(state, memory, 2)?;
+                    let raise_args_ptr = guest_call_arg(state, memory, 3)?;
+                    let mut throw_info = 0u32;
+                    if raise_args_count >= 1 && raise_args_ptr != 0 {
+                        throw_info = read_u32(memory, raise_args_ptr).unwrap_or(0);
+                    }
+                    let caller_rva = if self.guest_arch == GuestArch::X86 {
+                        // The dispatch popped the return address of the
+                        // RaiseException CALL; the throwing function's own
+                        // caller sits above the four pushed arguments.
+                        let rsp = state.get(Register::Rsp);
+                        read_guest_u32(memory, rsp + 16)
+                            .ok()
+                            .map(u64::from)
+                            .unwrap_or(0)
+                            .saturating_sub(self.mapped_image_base)
+                    } else {
+                        0
+                    };
                     crate::steam_milestones::record_first_failure(
                         crate::steam_milestones::FailureCategory::Thread,
                         state.rip as u32,
@@ -42236,7 +42259,9 @@ impl PeHostRuntime {
                         Some(code),
                         format!("unhandled RaiseException code={code:#x} flags={flags:#x}"),
                         None,
-                        None,
+                        Some(format!(
+                            "{{\"args\":{raise_args_count},\"throw_info\":{throw_info:#x},\"caller_rva\":{caller_rva:#x}}}"
+                        )),
                     );
                     state.set(Register::Rax, u64::from(code));
                     self.process_exit_requested = Some(code);
