@@ -1520,6 +1520,7 @@ pub fn coverage_for_steam_fixture_with_invoked(
         .collect();
 
     let mut entries = Vec::new();
+    let database = crate::api_database::global_database();
     for descriptor in parsed.imports.iter().chain(parsed.delay_imports.iter()) {
         let dll = descriptor.dll_name.to_ascii_lowercase();
         for import in &descriptor.imports {
@@ -1531,8 +1532,25 @@ pub fn coverage_for_steam_fixture_with_invoked(
                         .unwrap_or_else(|| format!("ordinal#{ordinal}"))
                 }
             };
-            let (implementation, steam_critical) =
+            // Consult the quantitative API database for the implementation
+            // level (the database is seeded from THUNK_METADATA and is the
+            // whole project's compatibility accounting), and record the
+            // "steam" workload into every matching entry.  The
+            // Steam-criticality flag still comes from the canonical thunk
+            // metadata.
+            let (_, steam_critical) =
                 crate::pe_runtime::import_implementation_quality(&dll, &import.symbol);
+            let implementation = {
+                let mut database = database
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let level = database
+                    .lookup(&dll, &name)
+                    .map(|entry| entry.implementation)
+                    .unwrap_or(ImplementationLevel::Unsupported);
+                database.record_workload(&dll, &name, "steam");
+                level
+            };
             let invoked_in_e2e = invoked_set.contains(&name.to_ascii_lowercase());
             entries.push(SteamImportEntry {
                 steam_sha256: steam_sha256.clone(),

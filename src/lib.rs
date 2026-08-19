@@ -152,6 +152,7 @@
 extern crate objc;
 
 pub mod anticheat;
+pub mod api_database;
 pub mod app_bundle;
 pub mod async_pipeline_compiler;
 pub mod audio;
