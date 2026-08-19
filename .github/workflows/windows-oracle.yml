@@ -1,0 +1,81 @@
+name: windows-oracle
+
+# Windows differential-oracle pipeline:
+#
+#   1. generate-corpus (macOS)   — the vector corpus is pure deterministic
+#      host-side data, so it is generated on macOS (the Casa1 crate is not
+#      built on Windows at all; only the tiny standalone reference crate is).
+#   2. reference-capture (Windows) — builds windows_reference and runs the
+#      REAL Windows reference executable over the corpus; uploads the
+#      canonical results artifact.
+#   3. compare (macOS) — computes Casa1's model results over the same corpus
+#      and compares them against the Windows-captured results. The job
+#      FAILS on any diff: the reference executable is Windows truth, the
+#      model is only a fallback.
+#
+# The checked-in golden fixture (tests/fixtures/section42) is validated by
+# the regular `cargo test --tests` run (tests/section42_windows_oracle.rs).
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  generate-corpus:
+    name: Generate Corpus
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the differential vector corpus
+        run: cargo run -p casa1 --bin casa1-oracle -- vectors --out windows_oracle_vectors.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-oracle-vectors
+          path: windows_oracle_vectors.json
+          retention-days: 7
+
+  reference-capture:
+    name: Reference Capture (Windows)
+    needs: generate-corpus
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-oracle-vectors
+      - name: Build the Windows reference executable
+        run: cargo build --manifest-path windows_reference/Cargo.toml --release
+      - name: Run the reference executable on the corpus
+        run: .\windows_reference\target\release\casa1-windows-reference.exe windows_oracle_vectors.json windows_oracle_reference_results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-oracle-reference-results
+          path: |
+            windows_oracle_vectors.json
+            windows_oracle_reference_results.json
+          retention-days: 7
+
+  compare:
+    name: Compare (fail on any diff)
+    needs: reference-capture
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-oracle-reference-results
+      - name: Compare Casa1 model results against the Windows reference results
+        run: cargo run -p casa1 --bin casa1-oracle -- compare --vectors windows_oracle_vectors.json --results windows_oracle_reference_results.json
