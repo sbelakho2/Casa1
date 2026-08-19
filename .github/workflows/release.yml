@@ -409,6 +409,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The API completeness gate must pass before release: Partial never
+      # passes it, and every Implemented API needs Differential/Conformance
+      # coverage (or a deliberate-unsupported declaration with a precise
+      # compatibility consequence).  Exits non-zero on violations, failing
+      # this job and therefore the release gate.
+      - name: Run API completeness gate (completeness)
+        run: cargo run --bin casa1-oracle -- api-report --gate completeness --out api-completeness.json
       - name: Download Steam E2E evidence artifact (fails closed if absent)
         uses: actions/download-artifact@v4
         with:

@@ -1,11 +1,12 @@
 //! Phase 43 — quantitative Windows API completeness database.
 //!
 //! Unit-style tests of the `api_database` module: seeding from the canonical
-//! thunk metadata, the production gate (Partial-must-be-transitional,
-//! Stub/Unsupported-must-be-deliberately-unsupported-with-compat-error),
-//! lookup semantics, workload recording from the Steam fixture scan, and the
-//! api-completeness.json report shape emitted by the `casa1-oracle
-//! api-report` command.
+//! thunk metadata (Partial entries transitional ONLY with a specific reason),
+//! the two gates (shipping allows explicitly documented Partial entries;
+//! completeness never does), the semantic-coverage requirement, full-key
+//! lookup, workload recording from the Steam fixture scan, the
+//! api-completeness.json report shape, and the `casa1-oracle api-report
+//! --gate` enforcement.
 
 use casa1::api_database::{
     ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, ArchSet, CoverageLevel,
@@ -43,18 +44,24 @@ fn database_seeds_from_thunk_metadata_with_levels() {
     assert_eq!(create_file.implementation, ImplementationLevel::Implemented);
     assert!(!create_file.transitional);
 
-    // A Partial thunk is seeded transitional with a documented reason.
+    // A Partial thunk is seeded transitional WITH a specific reason, never a
+    // generic one: the seed-time classification pass records what is missing.
     let compare_string = database
         .lookup("kernel32.dll", "CompareStringW")
         .expect("CompareStringW must be seeded");
     assert_eq!(compare_string.implementation, ImplementationLevel::Partial);
     assert!(
         compare_string.transitional,
-        "Partial entries must be flagged transitional"
+        "Partial entries with a documented limitation must be flagged transitional"
+    );
+    let reason = compare_string.detail.as_deref().expect("specific reason");
+    assert!(
+        !reason.contains("Partial per THUNK_METADATA"),
+        "the transitional reason must be specific, not the generic metadata note"
     );
     assert!(
-        compare_string.detail.is_some(),
-        "transitional entries must carry a documented reason"
+        reason.contains("locale"),
+        "the reason names the concrete limitation: {reason}"
     );
 
     // Stub and Unsupported entries are seeded with their metadata levels.
@@ -69,6 +76,25 @@ fn database_seeds_from_thunk_metadata_with_levels() {
         tick_count_64.implementation,
         ImplementationLevel::Unsupported
     );
+}
+
+#[test]
+fn seed_classification_never_emits_the_generic_partial_reason() {
+    let database = ApiDatabase::from_thunk_metadata();
+    for entry in database.entries() {
+        if entry.implementation == ImplementationLevel::Partial && entry.transitional {
+            let reason = entry
+                .detail
+                .as_deref()
+                .expect("transitional must carry a reason");
+            assert!(
+                !reason.contains("Partial per THUNK_METADATA"),
+                "{}!{} carries the generic auto-transitional reason: {reason}",
+                entry.dll,
+                entry.export
+            );
+        }
+    }
 }
 
 #[test]
@@ -116,6 +142,7 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .expect("IDispatch entry");
     assert_eq!(dispatch.implementation, ImplementationLevel::Partial);
     assert!(dispatch.transitional);
+    assert!(dispatch.detail.is_some());
     // DXGI/D3D: ID3D11Device and friends are partial vtable dispatches.
     let device = database
         .lookup("d3d11.dll", "ID3D11Device")
@@ -139,11 +166,11 @@ fn database_seeds_interface_tables_at_runtime_levels() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) Production gate: Partial must be transitional
+// (b) Gates: Partial must carry a specific reason to ship; never for release
 // ---------------------------------------------------------------------------
 
 #[test]
-fn production_gate_flags_partial_without_transitional_flag() {
+fn shipping_gate_flags_partial_without_specific_reason() {
     let mut database = ApiDatabase::new();
     database.add_entry(ApiEntry::new(
         "a.dll",
@@ -156,37 +183,159 @@ fn production_gate_flags_partial_without_transitional_flag() {
         ImplementationLevel::Implemented,
     ));
 
-    let violations = database.production_gate();
-    assert_eq!(violations.len(), 1, "only the Partial entry may violate");
-    assert_eq!(violations[0].dll, "a.dll");
-    assert_eq!(violations[0].export, "PartiallyDone");
+    // The Implemented entry without coverage also violates shipping; focus on
+    // the Partial violation.
+    let violations = database.shipping_gate();
+    let partial_violation = violations
+        .iter()
+        .find(|v| v.export == "PartiallyDone")
+        .expect("the Partial entry must violate the shipping gate");
+    assert_eq!(partial_violation.dll, "a.dll");
     assert_eq!(
-        violations[0].kind,
+        partial_violation.kind,
         ApiGateViolationKind::PartialNotTransitional
     );
-    assert!(violations[0].message.contains("transitional"));
+    assert!(partial_violation.message.contains("specific"));
+    // Completeness flags the Partial regardless of the reason.
+    assert!(
+        database
+            .completeness_gate()
+            .iter()
+            .any(|v| v.export == "PartiallyDone"
+                && v.kind == ApiGateViolationKind::PartialNotCompletenessReady)
+    );
 }
 
 #[test]
-fn production_gate_accepts_transitional_partial() {
+fn shipping_gate_accepts_partial_with_specific_reason() {
     let mut database = ApiDatabase::new();
     database.add_entry(ApiEntry {
         transitional: true,
-        detail: Some("documented limitation: only ASCII paths are folded".to_string()),
+        detail: Some("only ASCII paths are folded; Unicode normalization is missing".to_string()),
+        ..ApiEntry::new("a.dll", "PartiallyDone", ImplementationLevel::Partial)
+    });
+    database.add_entry(ApiEntry {
+        semantic_test_coverage: CoverageLevel::Unit,
+        ..ApiEntry::new("a.dll", "FullyDone", ImplementationLevel::Implemented)
+    });
+    assert!(
+        database.shipping_gate().is_empty(),
+        "a Partial with a specific documented reason passes the shipping gate"
+    );
+    // ... but Partial NEVER passes the completeness gate.
+    let completeness_violations = database.completeness_gate();
+    assert_eq!(completeness_violations.len(), 2);
+    assert!(
+        completeness_violations
+            .iter()
+            .any(|v| v.export == "PartiallyDone"
+                && v.kind == ApiGateViolationKind::PartialNotCompletenessReady)
+    );
+}
+
+#[test]
+fn transitional_flag_without_detail_is_not_a_specific_reason() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        transitional: true,
+        detail: None,
         ..ApiEntry::new("a.dll", "PartiallyDone", ImplementationLevel::Partial)
     });
     assert!(
-        database.production_gate().is_empty(),
-        "a transitional Partial with a documented reason passes the gate"
+        database
+            .shipping_gate()
+            .iter()
+            .any(|v| v.kind == ApiGateViolationKind::PartialNotTransitional),
+        "transitional without a recorded reason must still fail the shipping gate"
     );
 }
 
 // ---------------------------------------------------------------------------
-// (c) Deliberately-unsupported entries
+// (c) Semantic-coverage requirement
 // ---------------------------------------------------------------------------
 
 #[test]
-fn deliberately_unsupported_passes_gate_with_compatibility_error() {
+fn implemented_without_coverage_fails_both_gates() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry::new(
+        "c.dll",
+        "NoCoverage",
+        ImplementationLevel::Implemented,
+    ));
+    let shipping = database.shipping_gate();
+    assert_eq!(shipping.len(), 1);
+    assert_eq!(
+        shipping[0].kind,
+        ApiGateViolationKind::ImplementedWithoutCoverage
+    );
+    let completeness = database.completeness_gate();
+    assert_eq!(completeness.len(), 1);
+    assert_eq!(
+        completeness[0].kind,
+        ApiGateViolationKind::ImplementedWithoutSemanticCoverage
+    );
+}
+
+#[test]
+fn implemented_with_unit_coverage_passes_shipping_only() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        semantic_test_coverage: CoverageLevel::Unit,
+        ..ApiEntry::new("c.dll", "UnitCovered", ImplementationLevel::Implemented)
+    });
+    assert!(
+        database.shipping_gate().is_empty(),
+        "Unit coverage satisfies the shipping gate"
+    );
+    assert_eq!(
+        database.completeness_gate()[0].kind,
+        ApiGateViolationKind::ImplementedWithoutSemanticCoverage,
+        "Unit coverage is NOT enough for the completeness gate"
+    );
+}
+
+#[test]
+fn implemented_with_differential_coverage_passes_both_gates() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        semantic_test_coverage: CoverageLevel::Differential,
+        ..ApiEntry::new(
+            "c.dll",
+            "DifferentiallyCovered",
+            ImplementationLevel::Implemented,
+        )
+    });
+    assert!(
+        database.shipping_gate().is_empty(),
+        "Differential coverage satisfies the shipping gate"
+    );
+    assert!(
+        database.completeness_gate().is_empty(),
+        "Differential coverage satisfies the completeness gate"
+    );
+}
+
+#[test]
+fn implemented_with_conformance_coverage_passes_both_gates() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        semantic_test_coverage: CoverageLevel::Conformance,
+        ..ApiEntry::new(
+            "c.dll",
+            "ConformanceCovered",
+            ImplementationLevel::Implemented,
+        )
+    });
+    assert!(database.shipping_gate().is_empty());
+    assert!(database.completeness_gate().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// (d) Deliberately-unsupported entries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
     let mut database = ApiDatabase::new();
     database.add_entry(ApiEntry::new(
         "b.dll",
@@ -199,35 +348,60 @@ fn deliberately_unsupported_passes_gate_with_compatibility_error() {
         ImplementationLevel::Unsupported,
     ));
 
-    // Without registration both fail the gate.
-    let violations = database.production_gate();
-    assert_eq!(violations.len(), 2);
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported)
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported)
-    );
+    // Without registration both fail both gates.
+    let shipping = database.shipping_gate();
+    let completeness = database.completeness_gate();
+    assert_eq!(shipping.len(), 2);
+    assert_eq!(completeness.len(), 2);
+    for violations in [&shipping, &completeness] {
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported)
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.kind == ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported)
+        );
+    }
 
-    // Registering the stub as deliberately unsupported with a
-    // guest-visible compatibility error clears it.
+    // Registering the stub as deliberately unsupported with a guest-visible
+    // compatibility error clears it through BOTH gates.
     database.deliberately_unsupported(
         "b.dll",
         "CannedApi",
         "Returns the canned compatible value; no guest-visible error is raised",
     );
-    let violations = database.production_gate();
-    assert_eq!(violations.len(), 1);
-    assert_eq!(violations[0].export, "MissingApi");
     assert_eq!(
         database
             .deliberately_unsupported_error("b.dll", "CannedApi")
             .expect("registered error"),
         "Returns the canned compatible value; no guest-visible error is raised"
+    );
+    assert!(
+        database
+            .shipping_gate()
+            .iter()
+            .all(|v| v.export == "MissingApi"),
+        "only the unregistered Unsupported entry may violate shipping"
+    );
+    assert!(
+        database
+            .completeness_gate()
+            .iter()
+            .all(|v| v.export == "MissingApi"),
+        "only the unregistered Unsupported entry may violate completeness"
+    );
+    database.deliberately_unsupported(
+        "b.dll",
+        "MissingApi",
+        "No host thunk exists; guest dispatch fails closed",
+    );
+    assert!(database.shipping_gate().is_empty());
+    assert!(
+        database.completeness_gate().is_empty(),
+        "DeliberatelyUnsupported with a precise compatibility consequence passes both gates"
     );
 }
 
@@ -240,17 +414,18 @@ fn seeded_deliberately_unsupported_entries_carry_compatibility_errors() {
         .expect("IsDebuggerPresent must be seeded as deliberately unsupported");
     assert!(error.contains("FALSE"));
     // The stub is therefore not a gate violation.
-    assert!(
-        !database
-            .production_gate()
-            .iter()
-            .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
-        "deliberately-unsupported stubs must not be flagged"
-    );
+    for violations in [&database.shipping_gate(), &database.completeness_gate()] {
+        assert!(
+            !violations
+                .iter()
+                .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
+            "deliberately-unsupported stubs must not be flagged"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
-// (d) Lookup semantics
+// (e) Lookup semantics: full-key lookup, ambiguity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -270,6 +445,78 @@ fn lookup_is_case_insensitive_and_tolerates_dll_suffix() {
     }
     assert!(database.lookup("kernel32.dll", "NoSuchExport").is_none());
     assert!(database.lookup("missing.dll", "CreateFileW").is_none());
+}
+
+#[test]
+fn lookup_entry_uses_the_full_key_when_arch_rows_differ() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        arch: ArchSet::X86,
+        win_version: WindowsVersion::Win10,
+        detail: Some("x86-specific row".to_string()),
+        ..ApiEntry::new("z.dll", "PerArch", ImplementationLevel::Implemented)
+    });
+    database.add_entry(ApiEntry {
+        arch: ArchSet::X64,
+        win_version: WindowsVersion::Win10,
+        detail: Some("x64-specific row".to_string()),
+        ..ApiEntry::new("z.dll", "PerArch", ImplementationLevel::Implemented)
+    });
+    database.add_entry(ApiEntry {
+        arch: ArchSet::X64,
+        win_version: WindowsVersion::Win11,
+        detail: Some("x64 Win11 row".to_string()),
+        ..ApiEntry::new("z.dll", "PerArch", ImplementationLevel::Implemented)
+    });
+
+    // The full key returns exactly the right row.
+    let x86 = database
+        .lookup_entry("z.dll", "perarch", ArchSet::X86, WindowsVersion::Win10)
+        .expect("x86 row");
+    assert_eq!(x86.detail.as_deref(), Some("x86-specific row"));
+    let x64 = database
+        .lookup_entry("Z.DLL", "PerArch", ArchSet::X64, WindowsVersion::Win10)
+        .expect("x64 row");
+    assert_eq!(x64.detail.as_deref(), Some("x64-specific row"));
+    let x64_win11 = database
+        .lookup_entry("z.dll", "PerArch", ArchSet::X64, WindowsVersion::Win11)
+        .expect("x64 Win11 row");
+    assert_eq!(x64_win11.detail.as_deref(), Some("x64 Win11 row"));
+    // A key that does not exist is None.
+    assert!(
+        database
+            .lookup_entry("z.dll", "PerArch", ArchSet::X86, WindowsVersion::Win11)
+            .is_none()
+    );
+
+    // The legacy (DLL, export) lookup is ambiguous across these rows and
+    // returns None instead of silently picking the first.
+    assert!(
+        database.lookup("z.dll", "PerArch").is_none(),
+        "legacy lookup must be None on ambiguity"
+    );
+}
+
+#[test]
+fn shipping_gate_flags_duplicate_full_keys_as_lookup_ambiguity() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry::new(
+        "dup.dll",
+        "Twice",
+        ImplementationLevel::Implemented,
+    ));
+    database.add_entry(ApiEntry::new(
+        "dup.dll",
+        "Twice",
+        ImplementationLevel::Implemented,
+    ));
+    let violations = database.shipping_gate();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.kind == ApiGateViolationKind::LookupAmbiguity),
+        "duplicate full keys must be a shipping violation"
+    );
 }
 
 #[test]
@@ -342,7 +589,7 @@ fn steam_fixture_scan_consults_database_and_records_workload() {
 }
 
 // ---------------------------------------------------------------------------
-// (e) Report generator
+// (f) Report generator
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -390,13 +637,6 @@ fn report_generator_emits_expected_json_shape() {
         "level counts must sum to the DLL total"
     );
     assert_eq!(
-        summary["transitional_partial"]
-            .as_u64()
-            .expect("transitional_partial"),
-        partial,
-        "every seeded Partial is transitional with a documented reason"
-    );
-    assert_eq!(
         summary["differential_tested"]
             .as_u64()
             .expect("differential_tested"),
@@ -409,13 +649,45 @@ fn report_generator_emits_expected_json_shape() {
         0
     );
 
+    // The gate section carries both gate results with counts.
     let gate = object["gate"].as_object().expect("gate object");
-    let violations = gate["violations"].as_array().expect("violations array");
+    for key in [
+        "shipping_violations",
+        "shipping_violation_count",
+        "completeness_violations",
+        "completeness_violation_count",
+    ] {
+        assert!(gate.contains_key(key), "missing gate field {key}");
+    }
+    assert_eq!(
+        gate["shipping_violation_count"]
+            .as_u64()
+            .expect("shipping_violation_count"),
+        gate["shipping_violations"]
+            .as_array()
+            .expect("shipping_violations")
+            .len() as u64
+    );
+    let completeness_count = gate["completeness_violation_count"]
+        .as_u64()
+        .expect("completeness_violation_count");
+    assert_eq!(
+        completeness_count,
+        gate["completeness_violations"]
+            .as_array()
+            .expect("completeness_violations")
+            .len() as u64
+    );
+    // The completeness-gate violation count is the total-compatibility
+    // progress number — the seeded database honestly fails both gates.
     assert!(
-        !violations.is_empty(),
+        completeness_count > 0,
         "the seeded database has honest gate violations"
     );
-    for violation in violations {
+    for violation in gate["completeness_violations"]
+        .as_array()
+        .expect("completeness_violations")
+    {
         let entry = violation.as_object().expect("violation object");
         for key in ["dll", "export", "kind", "message"] {
             assert!(entry.contains_key(key), "missing violation field {key}");
@@ -428,9 +700,22 @@ fn report_generator_emits_expected_json_shape() {
     assert!(
         typed
             .gate
-            .violations
+            .shipping_violations
             .iter()
-            .any(|v| { v.dll == "kernel32.dll" && v.export == "GetTickCount64" })
+            .any(|v| { v.dll == "kernel32.dll" && v.export == "GetTickCount64" }),
+        "unregistered Unsupported entries are honest shipping violations"
+    );
+    assert!(
+        typed.gate.completeness_violations.iter().any(|v| {
+            v.dll == "kernel32.dll"
+                && v.export == "CompareStringW"
+                && v.kind == ApiGateViolationKind::PartialNotCompletenessReady
+        }),
+        "Partial entries are honest completeness violations"
+    );
+    assert_eq!(
+        typed.gate.completeness_violation_count,
+        typed.gate.completeness_violations.len()
     );
 }
 
@@ -454,4 +739,53 @@ fn arch_and_win_version_serialize_with_entries() {
         object["implementation"],
         Value::String("Implemented".to_string())
     );
+}
+
+// ---------------------------------------------------------------------------
+// (g) api-report --gate exits non-zero on violations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_report_gate_enforces_violations_via_the_binary() {
+    let binary = env!("CARGO_BIN_EXE_casa1-oracle");
+    let out = std::env::temp_dir().join("api-completeness-gate-test.json");
+
+    // The seeded database honestly violates the shipping gate (Implemented
+    // without coverage, unregistered Stub/Unsupported): the default gate must
+    // exit non-zero.
+    let status = std::process::Command::new(binary)
+        .args(["api-report", "--gate", "shipping", "--out"])
+        .arg(&out)
+        .status()
+        .expect("invoke casa1-oracle api-report");
+    assert!(
+        !status.success(),
+        "api-report --gate shipping must exit non-zero when the seeded database has \
+         shipping violations"
+    );
+    assert!(
+        out.is_file(),
+        "the report must still be written on gate failure"
+    );
+
+    // The completeness gate also fails on the seeded database (Partial never
+    // passes it).
+    let status = std::process::Command::new(binary)
+        .args(["api-report", "--gate", "completeness", "--out"])
+        .arg(&out)
+        .status()
+        .expect("invoke casa1-oracle api-report");
+    assert!(!status.success());
+
+    // --gate none never fails on violations.
+    let status = std::process::Command::new(binary)
+        .args(["api-report", "--gate", "none", "--out"])
+        .arg(&out)
+        .status()
+        .expect("invoke casa1-oracle api-report");
+    assert!(
+        status.success(),
+        "api-report --gate none must exit zero regardless of violations"
+    );
+    let _ = std::fs::remove_file(&out);
 }
