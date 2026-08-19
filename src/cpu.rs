@@ -1283,12 +1283,7 @@ impl MemoryImage {
     /// Validate `address` against the canonical VM when one is attached;
     /// no-op otherwise.  Faults surface as the interpreter's standard
     /// guest access-violation error carrying the precise fault address.
-    fn check_canonical_access(
-        &self,
-        address: u64,
-        write: bool,
-        execute: bool,
-    ) -> AppResult<()> {
+    fn check_canonical_access(&self, address: u64, write: bool, execute: bool) -> AppResult<()> {
         if let Some(vm) = self.canonical_vm()
             && let Err(fault) = vm.check_access(address, write, execute)
         {

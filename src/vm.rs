@@ -355,7 +355,12 @@ impl VirtualMemory {
     /// (reserved pages keep their state).  Returns the previous protection
     /// of the first page in the range (`None` when that page is not
     /// committed).
-    pub fn protect(&mut self, base: u64, size: u64, protection: VmProtection) -> Option<VmProtection> {
+    pub fn protect(
+        &mut self,
+        base: u64,
+        size: u64,
+        protection: VmProtection,
+    ) -> Option<VmProtection> {
         let start = base & VM_PAGE_MASK;
         let end = start.saturating_add(align_up(size.max(1), VM_PAGE_SIZE));
         let mut first_old = None;
@@ -433,7 +438,12 @@ impl VirtualMemory {
     /// helpers and the VirtualAlloc-family thunks.  Faults when the
     /// address is unmapped (no containing region), reserved, a guard page,
     /// or the protection denies the requested access.
-    pub fn check_access(&self, address: u64, write: bool, execute: bool) -> Result<(), VmAccessFault> {
+    pub fn check_access(
+        &self,
+        address: u64,
+        write: bool,
+        execute: bool,
+    ) -> Result<(), VmAccessFault> {
         let page = address & VM_PAGE_MASK;
         let fault = |guard| VmAccessFault {
             address,
@@ -455,11 +465,7 @@ impl VirtualMemory {
         let allowed = (execute && state.protection.execute)
             || (write && state.protection.write)
             || (!execute && !write && state.protection.read);
-        if allowed {
-            Ok(())
-        } else {
-            Err(fault(false))
-        }
+        if allowed { Ok(()) } else { Err(fault(false)) }
     }
 
     /// True when the page containing `address` is committed and not a
@@ -506,9 +512,17 @@ mod tests {
         let reservation = vm.reserve(Some(0x7400_0000), 0x4000);
         assert_eq!(reservation, 0x7400_0000);
         assert!(vm.can_commit(reservation + 0x1000, 0x2000));
-        assert!(!vm.can_commit(reservation + 0x3000, 0x2000), "past the reservation");
+        assert!(
+            !vm.can_commit(reservation + 0x3000, 0x2000),
+            "past the reservation"
+        );
 
-        vm.commit(reservation + 0x1000, 0x2000, VmProtection::READ_WRITE, false);
+        vm.commit(
+            reservation + 0x1000,
+            0x2000,
+            VmProtection::READ_WRITE,
+            false,
+        );
         let committed = vm.query(reservation + 0x1000);
         assert_eq!(committed.state, VmState::Committed);
         assert_eq!(committed.region_size, 0x2000);
@@ -550,7 +564,10 @@ mod tests {
         assert_eq!(old, Some(VmProtection::READ_WRITE));
         let first = vm.query(base);
         assert_eq!(first.protection, VmProtection::READ);
-        assert_eq!(first.region_size, 0x1000, "coalescing breaks at the protection boundary");
+        assert_eq!(
+            first.region_size, 0x1000,
+            "coalescing breaks at the protection boundary"
+        );
         let second = vm.query(base + 0x1000);
         assert_eq!(second.protection, VmProtection::READ_WRITE);
 
@@ -608,17 +625,23 @@ mod tests {
         assert!(!fault.guard);
 
         // Reserved page inside a reservation.
-        let fault = vm.check_access(base + 0x2000, false, false).expect_err("reserved");
+        let fault = vm
+            .check_access(base + 0x2000, false, false)
+            .expect_err("reserved");
         assert_eq!(fault.address, base + 0x2000);
         assert!(!fault.guard);
 
         // Guard page.
-        let fault = vm.check_access(base + 0x1000, false, false).expect_err("guard");
+        let fault = vm
+            .check_access(base + 0x1000, false, false)
+            .expect_err("guard");
         assert!(fault.guard);
         assert_eq!(fault.address, base + 0x1000);
 
         // Write to a read-only page.
-        let fault = vm.check_access(base, true, false).expect_err("read-only write");
+        let fault = vm
+            .check_access(base, true, false)
+            .expect_err("read-only write");
         assert!(!fault.guard);
         assert!(fault.write);
 
@@ -667,19 +690,34 @@ mod tests {
         let mut vm = VirtualMemory::new(0x7400_0000);
         let base = vm.reserve(Some(0x7400_0000), 0x2000);
         assert_eq!(base, 0x7400_0000);
-        assert_eq!(vm.reserve(Some(0x7400_1000), 0x1000), 0, "interior overlap rejected");
-        assert_eq!(vm.reserve(Some(0x7400_2000), 0x1000), 0x7400_2000, "adjacent OK");
+        assert_eq!(
+            vm.reserve(Some(0x7400_1000), 0x1000),
+            0,
+            "interior overlap rejected"
+        );
+        assert_eq!(
+            vm.reserve(Some(0x7400_2000), 0x1000),
+            0x7400_2000,
+            "adjacent OK"
+        );
 
         // register() allows nesting: a synthetic module image inside the
         // growing CRT data area resolves to the innermost region.
         vm.register(0x7300_0000, 0x1000, VmRegionKind::Heap);
         vm.register(0x7300_0000, 0x3000, VmRegionKind::Heap);
-        assert_eq!(vm.region_size(0x7300_0000), Some(0x3000), "register grows the region");
+        assert_eq!(
+            vm.region_size(0x7300_0000),
+            Some(0x3000),
+            "register grows the region"
+        );
         vm.register(0x7300_1000, 0x1000, VmRegionKind::Image);
         vm.commit(0x7300_1000, 0x1000, VmProtection::READ, false);
         assert!(vm.check_access(0x7300_1000, false, false).is_ok());
         let query = vm.query(0x7300_1000);
         assert_eq!(query.kind, VmRegionKind::Image, "innermost region wins");
-        assert!(vm.check_access(0x7300_2000, false, false).is_err(), "outer heap area still reserved");
+        assert!(
+            vm.check_access(0x7300_2000, false, false).is_err(),
+            "outer heap area still reserved"
+        );
     }
 }

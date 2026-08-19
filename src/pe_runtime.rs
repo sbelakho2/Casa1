@@ -4832,14 +4832,12 @@ pub fn execute_with_options(
         image.size_of_image as u64,
         crate::vm::VmRegionKind::Image,
     );
-    runtime
-        .vm
-        .commit(
-            mapped.selected_base,
-            image.size_of_image as u64,
-            crate::vm::VmProtection::READ_WRITE_EXECUTE,
-            false,
-        );
+    runtime.vm.commit(
+        mapped.selected_base,
+        image.size_of_image as u64,
+        crate::vm::VmProtection::READ_WRITE_EXECUTE,
+        false,
+    );
     // Extract main image TLS callback RVAs for storage in DllInfo.
     let main_tls_callbacks_rva: Vec<u64> = image
         .tls_directory
@@ -5116,14 +5114,12 @@ pub fn execute_with_options(
         STACK_SIZE as u64,
         crate::vm::VmRegionKind::Stack,
     );
-    runtime
-        .vm
-        .commit(
-            stack_bottom,
-            STACK_SIZE as u64,
-            crate::vm::VmProtection::READ_WRITE,
-            false,
-        );
+    runtime.vm.commit(
+        stack_bottom,
+        STACK_SIZE as u64,
+        crate::vm::VmProtection::READ_WRITE,
+        false,
+    );
     let stack_top = stack_bottom + STACK_SIZE as u64;
     let rsp = stack_top - guest_pointer_bytes;
     write_guest_pointer(&mut memory, rsp, 0, guest_arch)?;
