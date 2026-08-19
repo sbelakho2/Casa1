@@ -506,22 +506,25 @@ fn vk_sampler_to_d3d12_static_sampler_desc(
 ) -> crate::gfx::D3D12StaticSamplerDesc {
     use crate::gfx::{D3D12ShaderVisibility, D3D12StaticSamplerDesc};
 
-    // D3D12_FILTER bit layout: min [0:2], mag [2:4], mip [4:6],
-    // anisotropic [6], comparison [7].
-    let filter = (ci.min_filter & 0x3)
+    // D3D12_FILTER bit layout per d3d12.h: mip [0:2], mag [2:4], min [4:6],
+    // anisotropic [6], reduction [7:9]. (Vk filter enums are 0=NEAREST,
+    // 1=LINEAR, the same values as the D3D12_FILTER_TYPE fields.)
+    let filter = (ci.mipmap_mode & 0x3)
         | ((ci.mag_filter & 0x3) << 2)
-        | ((ci.mipmap_mode & 0x3) << 4)
+        | ((ci.min_filter & 0x3) << 4)
         | if ci.max_anisotropy > 0.0 { 0x40 } else { 0 }
         | if ci.compare_op != 0 { 0x80 } else { 0 };
 
-    // D3D12_TEXTURE_ADDRESS_MODE: 1=CLAMP, 2=WRAP, 3=MIRROR, 4=BORDER,
-    // 5=MIRROR_ONCE — mapped from the Vulkan address modes.
+    // D3D12_TEXTURE_ADDRESS_MODE per d3d12.h is 0-based: 0=WRAP, 1=MIRROR,
+    // 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE (the 1-based family is D3D11's
+    // legacy SAMPLER_ADDRESS_MODE). The Vulkan modes map onto it directly.
     let vk_addr = |mode: u32| match mode {
-        0 => 2, // VK_SAMPLER_ADDRESS_MODE_REPEAT -> WRAP
-        1 => 3, // VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT -> MIRROR
-        2 => 1, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE -> CLAMP
-        3 => 4, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER -> BORDER
-        _ => 1,
+        0 => 0, // VK_SAMPLER_ADDRESS_MODE_REPEAT -> WRAP
+        1 => 1, // VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT -> MIRROR
+        2 => 2, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE -> CLAMP
+        3 => 3, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER -> BORDER
+        4 => 4, // VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE -> MIRROR_ONCE
+        _ => 2, // unknown Vulkan mode: CLAMP (only valid D3D12 values reach Metal)
     };
 
     // D3D12_COMPARISON_FUNC: 1=NEVER .. 8=ALWAYS (Vulkan is 0..7).
@@ -4017,8 +4020,10 @@ impl VulkanState {
 
         let metal_sampler_id = if let Some(backend) = self.metal_backend.as_ref() {
             let desc = vk_sampler_to_d3d12_static_sampler_desc(ci);
-            let sampler =
-                crate::metal_backend::create_static_sampler(backend.device().metal_device(), &desc);
+            let sampler = crate::metal_backend::create_static_sampler(
+                backend.device().metal_device(),
+                &desc,
+            )?;
             self.sampler_states.insert(handle, sampler);
             Some(handle)
         } else {

@@ -1019,39 +1019,68 @@ fn t6_8_root_signature_round_trip() {
 
 #[test]
 fn t6_9_static_sampler_filter_modes() {
+    use casa1::d3d12::D3D12FilterReduction::*;
     // Validate filter mode mapping
-    let (min_f, mag_f, mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0); // MIN_MAG_MIP_POINT
-    assert_eq!(min_f, "nearest");
-    assert_eq!(mag_f, "nearest");
-    assert_eq!(mip_f, "nearest");
-    assert!(!aniso);
-    assert!(!cmp);
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0); // MIN_MAG_MIP_POINT
+    assert_eq!(mapping.min_filter, "nearest");
+    assert_eq!(mapping.mag_filter, "nearest");
+    assert_eq!(mapping.mip_filter, "nearest");
+    assert!(!mapping.anisotropic);
+    assert!(!mapping.is_comparison());
+    assert_eq!(mapping.reduction, Standard);
 
-    let (min_f, mag_f, mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x14); // MIN_MAG_LINEAR_MIP_POINT
-    assert_eq!(min_f, "linear");
-    assert_eq!(mag_f, "linear");
-    assert_eq!(mip_f, "nearest");
-    assert!(!aniso);
-    assert!(!cmp);
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0x14); // MIN_MAG_LINEAR_MIP_POINT
+    assert_eq!(mapping.min_filter, "linear");
+    assert_eq!(mapping.mag_filter, "linear");
+    assert_eq!(mapping.mip_filter, "nearest");
+    assert!(!mapping.anisotropic);
+    assert_eq!(mapping.reduction, Standard);
 
-    let (_min_f, _mag_f, _mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x55); // ANISOTROPIC
-    assert!(aniso);
-    assert!(!cmp);
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0x55); // ANISOTROPIC
+    assert!(mapping.anisotropic);
+    assert_eq!(mapping.reduction, Standard);
 
-    let (_min_f, _mag_f, _mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON_MIN_MAG_MIP_POINT
-    assert!(!aniso);
-    assert!(cmp);
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON_MIN_MAG_MIP_POINT
+    assert!(!mapping.anisotropic);
+    assert!(mapping.is_comparison());
+    assert_eq!(mapping.reduction, Comparison);
+
+    // The full four-way reduction: MINIMUM and MAXIMUM are decoded as their
+    // real enum variants (never collapsed into comparison).
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0x100); // MINIMUM_MIN_MAG_MIP_POINT
+    assert!(!mapping.is_comparison());
+    assert_eq!(mapping.reduction, Minimum);
+    let mapping = D3d12Runtime::map_d3d12_filter_to_metal(0x180); // MAXIMUM_MIN_MAG_MIP_POINT
+    assert!(!mapping.is_comparison());
+    assert_eq!(mapping.reduction, Maximum);
 
     // Validate address mode mapping against the real D3D12 enum:
     // 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE.
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(0), "repeat");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(1), "mirror_repeat");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(2), "clamp_to_edge");
-    assert_eq!(D3d12Runtime::map_d3d12_address_mode(3), "clamp_to_border");
+    assert_eq!(D3d12Runtime::map_d3d12_address_mode(0).unwrap(), "repeat");
     assert_eq!(
-        D3d12Runtime::map_d3d12_address_mode(4),
+        D3d12Runtime::map_d3d12_address_mode(1).unwrap(),
+        "mirror_repeat"
+    );
+    assert_eq!(
+        D3d12Runtime::map_d3d12_address_mode(2).unwrap(),
+        "clamp_to_edge"
+    );
+    assert_eq!(
+        D3d12Runtime::map_d3d12_address_mode(3).unwrap(),
+        "clamp_to_border"
+    );
+    assert_eq!(
+        D3d12Runtime::map_d3d12_address_mode(4).unwrap(),
         "mirror_clamp_to_edge"
     );
+    // Values outside 0..=4 are undefined per d3d12.h — a validation error
+    // on Windows, never a silent default.
+    for invalid in [5, 6, 7, 8, 99] {
+        assert!(
+            D3d12Runtime::map_d3d12_address_mode(invalid).is_err(),
+            "address mode {invalid} must be rejected"
+        );
+    }
 
     // Validate comparison function mapping
     assert_eq!(D3d12Runtime::map_d3d12_comparison_func(1), "never");

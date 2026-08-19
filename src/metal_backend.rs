@@ -3288,26 +3288,33 @@ pub fn map_descriptor_range_type_to_metal(range_type: &str) -> &'static str {
 ///   bits 4-5: min filter (0=POINT, 1=LINEAR)
 ///   bit 6   : anisotropic filtering (forces linear on all stages)
 ///   bits 7-8: reduction type (0=standard, 1=comparison, 2=min, 3=max)
-/// Returns `(min_linear, mag_linear, mip_linear, anisotropic, comparison)`.
-pub fn decode_d3d12_filter(filter: u32) -> (bool, bool, bool, bool, bool) {
+/// Returns `(min_linear, mag_linear, mip_linear, anisotropic, reduction)`
+/// with the full four-way [`crate::gfx::D3D12FilterReduction`] — MINIMUM and
+/// MAXIMUM are decoded explicitly, never collapsed into comparison.
+pub fn decode_d3d12_filter(
+    filter: u32,
+) -> (bool, bool, bool, bool, crate::gfx::D3D12FilterReduction) {
     let mip_part = (filter & 0x03) as u8;
     let mag_part = ((filter >> 2) & 0x03) as u8;
     let min_part = ((filter >> 4) & 0x03) as u8;
     let anisotropic = (filter & 0x40) != 0;
-    let comparison = ((filter >> 7) & 0x03) == 1;
+    // Bits 7-8 always decode to a defined reduction (0..=3); the
+    // D3D12_FILTER_REDUCTION_TYPE enum has exactly four members.
+    let reduction = crate::gfx::D3D12FilterReduction::from_u32((filter >> 7) & 0x03)
+        .expect("reduction field bits 7-8 always decode 0..=3");
     (
         anisotropic || min_part != 0,
         anisotropic || mag_part != 0,
         anisotropic || mip_part != 0,
         anisotropic,
-        comparison,
+        reduction,
     )
 }
 
 /// Map a D3D12_FILTER value to Metal MTLSamplerDescriptor properties.
 pub fn d3d12_filter_to_metal_sampler(filter: u32) -> metal::SamplerDescriptor {
     let desc = metal::SamplerDescriptor::new();
-    let (min_linear, mag_linear, mip_linear, anisotropic, comparison) = decode_d3d12_filter(filter);
+    let (min_linear, mag_linear, mip_linear, anisotropic, reduction) = decode_d3d12_filter(filter);
 
     desc.set_min_filter(if min_linear {
         metal::MTLSamplerMinMagFilter::Linear
@@ -3325,14 +3332,21 @@ pub fn d3d12_filter_to_metal_sampler(filter: u32) -> metal::SamplerDescriptor {
         metal::MTLSamplerMipFilter::Nearest
     });
 
+    // D3D12_FILTER_REDUCTION_TYPE MINIMUM/MAXIMUM (reduction): Metal has no
+    // min/max reduction mode — MTLSamplerMinMagFilter is Nearest/Linear
+    // only — so the sampler is built with the standard (non-comparison)
+    // filter mapping. This is a documented translation: the requested
+    // reduction is not expressible in Metal and is visible to every caller
+    // through `decode_d3d12_filter` (it is never silently assumed standard).
+    if reduction == crate::gfx::D3D12FilterReduction::Comparison {
+        desc.set_compare_function(metal::MTLCompareFunction::LessEqual);
+    }
+
     if anisotropic {
         // The anisotropic bit only signals *that* filtering is anisotropic;
         // deriving a value from the filter bits yields 1 (i.e. disabled).
         // Metal clamps the value to the device maximum.
         desc.set_max_anisotropy(16);
-    }
-    if comparison {
-        desc.set_compare_function(metal::MTLCompareFunction::LessEqual);
     }
 
     desc
@@ -3344,31 +3358,55 @@ pub fn d3d12_filter_to_metal_sampler(filter: u32) -> metal::SamplerDescriptor {
 /// 4=MIRROR_ONCE`; each entry must map to the Metal mode with the same
 /// behaviour. BORDER maps to `ClampToBorderColor` (a default border colour
 /// of transparent black), and MIRROR_ONCE maps to `MirrorClampToEdge`, the
-/// closest Metal equivalent. Unknown values map to the documented default
-/// `ClampToEdge` — never a silent arbitrary value.
-pub fn map_d3d12_address_mode_to_metal(mode: u32) -> metal::MTLSamplerAddressMode {
+/// closest Metal equivalent. Values outside `0..=4` are undefined per
+/// d3d12.h — a validation error on Windows — and return `None` (never a
+/// silent default).
+pub fn map_d3d12_address_mode_to_metal(mode: u32) -> Option<metal::MTLSamplerAddressMode> {
     // D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
     // 4=MIRROR_ONCE. The previous mapping was shifted by one and never
     // handled WRAP=0, mis-translating every real D3D12 sampler.
-    match mode {
-        0 => metal::MTLSamplerAddressMode::Repeat,
-        1 => metal::MTLSamplerAddressMode::MirrorRepeat,
-        2 => metal::MTLSamplerAddressMode::ClampToEdge,
-        3 => metal::MTLSamplerAddressMode::ClampToBorderColor,
-        4 => metal::MTLSamplerAddressMode::MirrorClampToEdge,
-        _ => metal::MTLSamplerAddressMode::ClampToEdge,
-    }
+    crate::gfx::D3D12TextureAddressMode::from_u32(mode).map(|decoded| match decoded {
+        crate::gfx::D3D12TextureAddressMode::Wrap => metal::MTLSamplerAddressMode::Repeat,
+        crate::gfx::D3D12TextureAddressMode::Mirror => metal::MTLSamplerAddressMode::MirrorRepeat,
+        crate::gfx::D3D12TextureAddressMode::Clamp => metal::MTLSamplerAddressMode::ClampToEdge,
+        crate::gfx::D3D12TextureAddressMode::Border => {
+            metal::MTLSamplerAddressMode::ClampToBorderColor
+        }
+        crate::gfx::D3D12TextureAddressMode::MirrorOnce => {
+            metal::MTLSamplerAddressMode::MirrorClampToEdge
+        }
+    })
 }
 
 /// Create a Metal MTLSamplerState from a D3D12_STATIC_SAMPLER_DESC.
+///
+/// Rejects address modes outside the defined `0..=4` range (undefined per
+/// d3d12.h — a validation error on Windows) instead of silently substituting.
 pub fn create_static_sampler(
     device: &metal::DeviceRef,
     sampler_desc: &crate::gfx::D3D12StaticSamplerDesc,
-) -> metal::SamplerState {
+) -> AppResult<metal::SamplerState> {
     let desc = d3d12_filter_to_metal_sampler(sampler_desc.filter);
-    desc.set_address_mode_s(map_d3d12_address_mode_to_metal(sampler_desc.address_u));
-    desc.set_address_mode_t(map_d3d12_address_mode_to_metal(sampler_desc.address_v));
-    desc.set_address_mode_r(map_d3d12_address_mode_to_metal(sampler_desc.address_w));
+    let (Some(s), Some(t), Some(r)) = (
+        map_d3d12_address_mode_to_metal(sampler_desc.address_u),
+        map_d3d12_address_mode_to_metal(sampler_desc.address_v),
+        map_d3d12_address_mode_to_metal(sampler_desc.address_w),
+    ) else {
+        // D3D12_TEXTURE_ADDRESS_MODE is 0-based (0=WRAP..4=MIRROR_ONCE);
+        // any other value is undefined per d3d12.h — a validation error on
+        // Windows, never a silent default.
+        return Err(AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!(
+                "static sampler address mode outside D3D12_TEXTURE_ADDRESS_MODE \
+                 0..=4 (u={}, v={}, w={})",
+                sampler_desc.address_u, sampler_desc.address_v, sampler_desc.address_w
+            ),
+        ));
+    };
+    desc.set_address_mode_s(s);
+    desc.set_address_mode_t(t);
+    desc.set_address_mode_r(r);
     desc.set_lod_min_clamp(sampler_desc.min_lod);
     desc.set_lod_max_clamp(sampler_desc.max_lod);
     if sampler_desc.max_anisotropy > 0 {
@@ -3395,7 +3433,7 @@ pub fn create_static_sampler(
         _ => metal::MTLSamplerBorderColor::TransparentBlack,
     };
     desc.set_border_color(border_color);
-    device.new_sampler(&desc)
+    Ok(device.new_sampler(&desc))
 }
 
 /// Map D3D12_SHADER_VISIBILITY to Metal shader stage string.
@@ -8747,35 +8785,38 @@ mod tests {
 
     /// D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
     /// 4=MIRROR_ONCE (per d3d12.h). Every value maps to the Metal mode with
-    /// the same behaviour; unknown values map to the documented default
-    /// `ClampToEdge` — never a silent arbitrary value.
+    /// the same behaviour; values outside 0..=4 are undefined per d3d12.h
+    /// and return `None` — a validation error on Windows, never a silent
+    /// default.
     #[test]
     fn map_d3d12_address_mode_to_metal_full_table() {
         assert_eq!(
             map_d3d12_address_mode_to_metal(0),
-            metal::MTLSamplerAddressMode::Repeat
+            Some(metal::MTLSamplerAddressMode::Repeat)
         );
         assert_eq!(
             map_d3d12_address_mode_to_metal(1),
-            metal::MTLSamplerAddressMode::MirrorRepeat
+            Some(metal::MTLSamplerAddressMode::MirrorRepeat)
         );
         assert_eq!(
             map_d3d12_address_mode_to_metal(2),
-            metal::MTLSamplerAddressMode::ClampToEdge
+            Some(metal::MTLSamplerAddressMode::ClampToEdge)
         );
         assert_eq!(
             map_d3d12_address_mode_to_metal(3),
-            metal::MTLSamplerAddressMode::ClampToBorderColor
+            Some(metal::MTLSamplerAddressMode::ClampToBorderColor)
         );
         assert_eq!(
             map_d3d12_address_mode_to_metal(4),
-            metal::MTLSamplerAddressMode::MirrorClampToEdge
+            Some(metal::MTLSamplerAddressMode::MirrorClampToEdge)
         );
-        for unknown in [5, 6, 99, u32::MAX] {
+        // Reference-derived: every input 5..=8 (and arbitrary values) is
+        // undefined per d3d12.h — the mapping must reject, never default.
+        for unknown in [5, 6, 7, 8, 99, u32::MAX] {
             assert_eq!(
                 map_d3d12_address_mode_to_metal(unknown),
-                metal::MTLSamplerAddressMode::ClampToEdge,
-                "unknown address mode {unknown} must map to the documented default"
+                None,
+                "address mode {unknown} is undefined per d3d12.h and must be rejected"
             );
         }
     }
@@ -8783,37 +8824,50 @@ mod tests {
     /// D3D12_FILTER bit encoding (per d3d12.h): bits 0-1 mip, 2-3 mag, 4-5
     /// min, bit 6 anisotropic, bits 7-8 reduction type. Named constants are
     /// checked against their documented bit patterns — the min and mip
-    /// fields must never be swapped.
+    /// fields must never be swapped — and all four reduction types are
+    /// decoded explicitly.
     #[test]
     fn decode_d3d12_filter_full_table() {
+        use crate::gfx::D3D12FilterReduction::*;
         // D3D12_FILTER_MIN_MAG_MIP_POINT = 0x00
         assert_eq!(
             decode_d3d12_filter(0x00),
-            (false, false, false, false, false)
+            (false, false, false, false, Standard)
         );
         // D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x01
         assert_eq!(
             decode_d3d12_filter(0x01),
-            (false, false, true, false, false)
+            (false, false, true, false, Standard)
         );
         // D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x04
         assert_eq!(
             decode_d3d12_filter(0x04),
-            (false, true, false, false, false)
+            (false, true, false, false, Standard)
         );
         // D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10
         assert_eq!(
             decode_d3d12_filter(0x10),
-            (true, false, false, false, false)
+            (true, false, false, false, Standard)
         );
         // D3D12_FILTER_MIN_MAG_MIP_LINEAR = 0x15
-        assert_eq!(decode_d3d12_filter(0x15), (true, true, true, false, false));
+        assert_eq!(
+            decode_d3d12_filter(0x15),
+            (true, true, true, false, Standard)
+        );
         // D3D12_FILTER_ANISOTROPIC = 0x55: all linear + anisotropic flag.
-        assert_eq!(decode_d3d12_filter(0x55), (true, true, true, true, false));
+        assert_eq!(
+            decode_d3d12_filter(0x55),
+            (true, true, true, true, Standard)
+        );
         // D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT = 0x80: comparison reduction.
         assert_eq!(
             decode_d3d12_filter(0x80),
-            (false, false, false, false, true)
+            (false, false, false, false, Comparison)
+        );
+        // D3D12_FILTER_COMPARISON_ANISOTROPIC = 0xD5
+        assert_eq!(
+            decode_d3d12_filter(0xD5),
+            (true, true, true, true, Comparison)
         );
         // The min/mag/mip fields are decoded from their documented bit
         // positions — a swapped min/mip decode would fail 0x01 vs 0x10.
@@ -8823,9 +8877,12 @@ mod tests {
             "mip field (bits 0-1) and min field (bits 4-5) must not be swapped"
         );
         // Reduction type 1 (0x80) is comparison; types 2 (0x100) and 3
-        // (0x180) are min/max reductions, not comparison.
-        assert!(decode_d3d12_filter(0x80).4);
-        assert!(!decode_d3d12_filter(0x100).4);
-        assert!(!decode_d3d12_filter(0x180).4);
+        // (0x180) are min/max reductions, decoded as their real enum
+        // variants — never collapsed into comparison.
+        assert_eq!(decode_d3d12_filter(0x80).4, Comparison);
+        assert_eq!(decode_d3d12_filter(0x100).4, Minimum);
+        assert_eq!(decode_d3d12_filter(0x180).4, Maximum);
+        assert_eq!(decode_d3d12_filter(0x115).4, Minimum);
+        assert_eq!(decode_d3d12_filter(0x195).4, Maximum);
     }
 }
