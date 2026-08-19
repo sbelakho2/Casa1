@@ -85,6 +85,8 @@ fn vector_corpus_is_versioned_and_deterministic() {
                     | "d3d12_texture_address_mode"
                     | "d3d12_filter_reduction"
                     | "d3d12_filter_translation"
+                    | "cpu_arithmetic_flags"
+                    | "virtual_memory"
             ),
             "unexpected category {category}"
         );
@@ -771,6 +773,7 @@ fn capture_provenance_fields_serialize() {
         os_edition: "Professional".to_string(),
         os_build: "10.0.22631".to_string(),
         arch: "x64".to_string(),
+        target_triple: "x86_64-pc-windows-msvc".to_string(),
         reference_sha256: "a".repeat(64),
         corpus_sha256: "b".repeat(64),
     };
@@ -787,6 +790,7 @@ fn capture_provenance_fields_serialize() {
     .expect("legacy header parses");
     assert_eq!(legacy.os_edition, "");
     assert_eq!(legacy.arch, "");
+    assert_eq!(legacy.target_triple, "");
 
     let real = casa1::windows_oracle::ReferenceResultsFile {
         schema_version: 1,
@@ -805,6 +809,14 @@ fn capture_provenance_fields_serialize() {
     assert!(
         !casa1::oracle_suites::is_real_windows_capture(&without_provenance),
         "a header without provenance must not be accepted as a real capture"
+    );
+    // A capture whose target triple is missing (or a placeholder) is not
+    // provenance — an x86 capture must be distinguishable from an x64 one.
+    let mut no_triple = real.clone();
+    no_triple.capture.target_triple = "".to_string();
+    assert!(
+        !casa1::oracle_suites::is_real_windows_capture(&no_triple),
+        "a header without the compiler target triple must not be a real capture"
     );
 }
 
@@ -843,4 +855,255 @@ fn reference_executable_on_non_windows_reports_diffs() {
         report["diff_count"].as_u64().expect("diff count") > 0,
         "stub results must produce diffs"
     );
+}
+
+// ── cpu_arithmetic_flags ─────────────────────────────────────────────────────
+
+/// The cpu_arithmetic_flags generator emits the documented edge set — every
+/// (lhs, rhs) edge at every width (8/16/32/64) with every op (add/sub/cmp) —
+/// plus the deterministic stride sample over the 8-bit space.  The bounded
+/// corpus stays at ~3.3k vectors; the full 65,536-pair space is the
+/// --exhaustive mode.
+#[test]
+fn cpu_flags_corpus_emits_the_documented_edge_set() {
+    use casa1::windows_oracle::{CPU_FLAGS_EDGES, CPU_FLAGS_OPS, CPU_FLAGS_STRIDE_STEP};
+    let vectors = casa1::windows_oracle::generate_vectors(&["cpu_arithmetic_flags".to_string()]);
+    // Every documented edge runs at every width with every op.
+    for &(lhs, rhs) in CPU_FLAGS_EDGES {
+        for width in [8_u64, 16, 32, 64] {
+            for op in CPU_FLAGS_OPS {
+                assert!(
+                    vectors.iter().any(|vector| {
+                        vector.input["width"] == serde_json::json!(width)
+                            && vector.input["op"] == serde_json::json!(op)
+                            && vector.input["lhs"] == serde_json::json!(lhs)
+                            && vector.input["rhs"] == serde_json::json!(rhs)
+                    }),
+                    "missing edge vector: width {width}, op {op}, lhs {lhs:#x}, rhs {rhs:#x}"
+                );
+            }
+        }
+    }
+    // Corpus size: edges (18 pairs × 4 widths × 3 ops) + the 8-bit stride
+    // sample (32 values per axis → 1,024 pairs × 3 ops).
+    let stride_values = (0..=255_u64)
+        .step_by(CPU_FLAGS_STRIDE_STEP as usize)
+        .count();
+    let expected = CPU_FLAGS_EDGES.len() * 4 * CPU_FLAGS_OPS.len()
+        + stride_values * stride_values * CPU_FLAGS_OPS.len();
+    assert_eq!(vectors.len(), expected, "bounded corpus size");
+    assert!(
+        vectors.len() < 10_000,
+        "the bounded corpus must stay small for the CI capture ({} vectors)",
+        vectors.len()
+    );
+
+    // The exhaustive mode replaces the stride sample with the full 8-bit
+    // operand space (the nightly corpus).
+    let exhaustive =
+        casa1::windows_oracle::generate_vectors_exhaustive(&["cpu_arithmetic_flags".to_string()]);
+    assert_eq!(
+        exhaustive.len(),
+        CPU_FLAGS_EDGES.len() * 4 * CPU_FLAGS_OPS.len() + 256 * 256 * CPU_FLAGS_OPS.len(),
+        "exhaustive corpus size"
+    );
+}
+
+/// The runtime cpu executor matches the KNOWN x86 truth table on the
+/// documented edges — the interpreter's flag model (jit_helper_set_flags)
+/// must agree with real x86 hardware on every edge.  This catches
+/// interpreter flag regressions locally, before any Windows capture.
+#[test]
+fn cpu_flags_runtime_executor_matches_the_known_x86_truth_table() {
+    use casa1::windows_oracle::{Vector, compute_runtime_result};
+    let case = |width: u64, op: &str, lhs: u64, rhs: u64, expected: Value| {
+        let vector = Vector {
+            id: format!("cpu:{width}:{op}:{lhs:#x}:{rhs:#x}"),
+            category: "cpu_arithmetic_flags".to_string(),
+            input: serde_json::json!({ "width": width, "op": op, "lhs": lhs, "rhs": rhs }),
+        };
+        let output = compute_runtime_result(&vector).output;
+        assert_eq!(output, expected, "width {width} {op}({lhs:#x}, {rhs:#x})");
+        // The comparison machinery must report no diff against the
+        // reference-shaped output.
+        let diffs =
+            casa1::windows_oracle::compare_outputs("cpu_arithmetic_flags", &expected, &output);
+        assert!(diffs.is_empty(), "unexpected diffs: {diffs:?}");
+    };
+    let flags = |zf: bool, sf: bool, pf: bool, cf: bool, of: bool, af: bool| serde_json::json!({ "zf": zf, "sf": sf, "pf": pf, "cf": cf, "of": of, "af": af });
+    // 0x7f + 1 → OF=1, CF=0 (8-bit sign overflow, no carry; the low
+    // nibble F+1 also carries → AF=1)
+    case(
+        8,
+        "add",
+        0x7f,
+        1,
+        flags(false, true, false, false, true, true),
+    );
+    // 0x80 + 0x80 → CF=1, OF=1 (8-bit carry AND sign overflow)
+    case(
+        8,
+        "add",
+        0x80,
+        0x80,
+        flags(true, false, true, true, true, false),
+    );
+    // 0xff + 1 → CF=1, ZF=1, AF=1 (wrap to zero with nibble carry)
+    case(
+        8,
+        "add",
+        0xff,
+        1,
+        flags(true, false, true, true, false, true),
+    );
+    // 0x7fffffffffffffff + 1 → OF=1 (64-bit sign overflow; nibble carry)
+    case(
+        64,
+        "add",
+        0x7fff_ffff_ffff_ffff,
+        1,
+        flags(false, true, true, false, true, true),
+    );
+    // 0xffffffffffffffff + 1 → CF=1, ZF=1 (wrap to zero; nibble carry)
+    case(
+        64,
+        "add",
+        0xffff_ffff_ffff_ffff,
+        1,
+        flags(true, false, true, true, false, true),
+    );
+    // 0x80 - 1 → no borrow (CF=0); the subtraction overflows signed 8-bit
+    // (OF=1) and borrows into the low nibble (AF=1).  Real x86 sub:
+    // 0x80 ≥ 1, so there is no carry — the borrow edge is 0x7f - 0x80 below.
+    case(
+        8,
+        "sub",
+        0x80,
+        1,
+        flags(false, false, false, false, true, true),
+    );
+    // 0x7f - 0x80 → OF=1 (and CF=1: unsigned borrow)
+    case(
+        8,
+        "sub",
+        0x7f,
+        0x80,
+        flags(false, true, true, true, true, false),
+    );
+    // 0x0f + 1 → AF=1 (nibble carry)
+    case(
+        8,
+        "add",
+        0x0f,
+        1,
+        flags(false, false, false, false, false, true),
+    );
+    // 0x0f + 0x0f → AF=1 (nibble carry)
+    case(
+        8,
+        "add",
+        0x0f,
+        0x0f,
+        flags(false, false, true, false, false, true),
+    );
+}
+
+// ── virtual_memory ──────────────────────────────────────────────────────────
+
+/// The virtual_memory generator emits the documented session sequence: the
+/// reserve first (address 0 = system-chosen base), then the interior
+/// commit, partial protect, partial decommit, the two mandated failures and
+/// the unmapped-address query — all with session-relative addresses.
+#[test]
+fn virtual_memory_corpus_is_the_documented_session_sequence() {
+    let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
+    let operations: Vec<String> = vectors
+        .iter()
+        .map(|vector| {
+            vector.input["operation"]
+                .as_str()
+                .expect("operation")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        operations,
+        [
+            "reserve", "query", "commit", "protect", "decommit", "release", "commit", "query",
+        ]
+    );
+    assert_eq!(vectors[0].input["address"], serde_json::json!(0));
+    assert_eq!(vectors[0].input["size"], serde_json::json!(0x4000));
+    assert_eq!(
+        vectors[0].input["allocation_type"],
+        serde_json::json!(0x2000)
+    );
+    // The failures and the unmapped-address probes sit outside the session.
+    assert_eq!(vectors[5].input["free_type"], serde_json::json!(0x8000));
+    assert!(vectors[5].input["size"].as_u64().expect("size") != 0);
+    for vector in &vectors {
+        let result = casa1::windows_oracle::compute_runtime_result(vector);
+        assert!(result.output["state"].is_number(), "{}", vector.id);
+    }
+}
+
+/// The runtime vm executor drives the real pe_runtime VM thunk arms: the
+/// reserve→commit→query coherence, the interior commit, the partial
+/// decommit and the mandated failures all produce the reference-shaped
+/// page-granular truth (MEM_COMMIT/MEM_RESERVE/MEM_FREE states, protections,
+/// region-relative bases and sizes).
+#[test]
+fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
+    use casa1::windows_oracle::compute_runtime_result;
+    let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
+    let results: Vec<Value> = vectors
+        .iter()
+        .map(|vector| compute_runtime_result(vector).output)
+        .collect();
+    // The reference-derived truth for the session sequence.  States:
+    // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000, MEM_FREE=0x10000.  Protections:
+    // PAGE_NOACCESS=0x01, PAGE_READWRITE=0x04, PAGE_READONLY=0x02.
+    let expected = [
+        // 0: reserve 0x4000 → the queried base is a 0x4000 reserved region.
+        serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x4000, "base_address": 0, "committed_set_summary": false }),
+        // 1: query mid-range (0x2000 into the reservation): the reserved
+        //    tail reports the reservation base and the remaining 0x2000.
+        serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x2000, "base_address": 0, "committed_set_summary": false }),
+        // 2: interior commit [0x1000, 0x3000) READWRITE: a committed
+        //    region from 0x1000 with size 0x2000.
+        serde_json::json!({ "error": 0, "state": 0x1000, "protection": 0x04, "region_size": 0x2000, "base_address": 0x1000, "committed_set_summary": true }),
+        // 3: partial protect of [0x1000, 0x2000): old protection
+        //    PAGE_READWRITE (0x04), new PAGE_READONLY (0x02), and the
+        //    committed run shrinks to 0x1000.
+        serde_json::json!({ "error": 0, "state": 0x1000, "protection": 0x02, "region_size": 0x1000, "base_address": 0x1000, "committed_set_summary": true, "old_protection": 0x04 }),
+        // 4: partial decommit of [0x2000, 0x3000): the page returns to
+        //    MEM_RESERVE; the reserved run starts at 0x2000 with size
+        //    0x2000 (the READONLY commit at 0x1000 splits the reservation).
+        serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x2000, "base_address": 0x2000, "committed_set_summary": false }),
+        // 5: release with size != 0 must fail with ERROR_INVALID_PARAMETER
+        //    (87); the failed release changed nothing (the base page is
+        //    still the 0x1000 reserved run before the READONLY commit).
+        serde_json::json!({ "error": 87, "state": 0x2000, "protection": 0x01, "region_size": 0x1000, "base_address": 0, "committed_set_summary": false }),
+        // 6: commit WITHOUT a reservation must fail with
+        //    ERROR_INVALID_ADDRESS (487); the target page is MEM_FREE with
+        //    a NULL base and a 0 size.
+        serde_json::json!({ "error": 487, "state": 0x1_0000, "protection": 0x01, "region_size": 0, "base_address": 0, "committed_set_summary": false }),
+        // 7: query an unmapped address → MEM_FREE + NULL base + 0 size.
+        serde_json::json!({ "error": 0, "state": 0x1_0000, "protection": 0x01, "region_size": 0, "base_address": 0, "committed_set_summary": false }),
+    ];
+    assert_eq!(results.len(), expected.len());
+    for (index, (vector, result)) in vectors.iter().zip(results.iter()).enumerate() {
+        assert_eq!(
+            result, &expected[index],
+            "vector {} ({}) must match the reference-derived truth",
+            vector.id, vector.input["operation"]
+        );
+        let diffs =
+            casa1::windows_oracle::compare_outputs("virtual_memory", &expected[index], result);
+        assert!(
+            diffs.is_empty(),
+            "{} unexpected diffs: {diffs:?}",
+            vector.id
+        );
+    }
 }

@@ -388,6 +388,7 @@ const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_ADDRESS: u32 = 487;
 const ERROR_INVALID_FUNCTION: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
@@ -8865,6 +8866,171 @@ pub fn thunk_drive_manifest_gate(ge: GameEnvironment) -> AppResult<ThunkManifest
 
     result.milestones = crate::steam_milestones::snapshot_milestones();
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Oracle VM session — the `virtual_memory` differential runtime executor
+// ---------------------------------------------------------------------------
+
+/// A scratch private-memory VM session driving the REAL
+/// VirtualAlloc/VirtualFree/VirtualProtect/VirtualQuery thunk arms (the
+/// page-granular private-pages/private-reservations model) through the host
+/// thunk dispatch layer (`alloc_host_thunk` + `dispatch_import`), exactly
+/// like a guest program would.  Used by the `virtual_memory` differential
+/// oracle's runtime executor so the comparison validates the runtime's own
+/// VM semantics; the session persists across vectors just like the
+/// reference process's address space persists across vectors.
+#[doc(hidden)]
+pub struct OracleVmSession {
+    runtime: PeHostRuntime,
+    memory: MemoryImage,
+    thunk_virtual_alloc: u64,
+    thunk_virtual_free: u64,
+    thunk_virtual_protect: u64,
+    thunk_virtual_query: u64,
+    stack: u64,
+    mbi_buffer: u64,
+    old_protect_buffer: u64,
+}
+
+/// MEMORY_BASIC_INFORMATION fields read back from a VirtualQuery thunk call.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleVmQuery {
+    pub base_address: u64,
+    pub allocation_base: u64,
+    pub region_size: u64,
+    pub state: u32,
+    pub protect: u32,
+}
+
+impl OracleVmSession {
+    /// Create a fresh session on a scratch X64 runtime.  The guest address
+    /// space starts empty: the first reservation's base is the runtime's
+    /// deterministic private-pages base.
+    #[doc(hidden)]
+    pub fn new(ge: GameEnvironment) -> Self {
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.set_guest_arch(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let stack = 0x10_000;
+        memory.map_bytes(stack, &[0_u8; 0x1000]);
+        let mbi_buffer = 0x30_000;
+        memory.map_bytes(mbi_buffer, &[0_u8; 0x100]);
+        let old_protect_buffer = 0x31_000;
+        memory.map_bytes(old_protect_buffer, &[0_u8; 0x10]);
+        let thunk_virtual_alloc = runtime.alloc_host_thunk(HostThunk::VirtualAlloc);
+        let thunk_virtual_free = runtime.alloc_host_thunk(HostThunk::VirtualFree);
+        let thunk_virtual_protect = runtime.alloc_host_thunk(HostThunk::VirtualProtect);
+        let thunk_virtual_query = runtime.alloc_host_thunk(HostThunk::VirtualQuery);
+        OracleVmSession {
+            runtime,
+            memory,
+            thunk_virtual_alloc,
+            thunk_virtual_free,
+            thunk_virtual_protect,
+            thunk_virtual_query,
+            stack,
+            mbi_buffer,
+            old_protect_buffer,
+        }
+    }
+
+    /// Drive one host thunk with the x64 calling convention and return RAX.
+    /// The runtime's `last_error` carries the GetLastError value.
+    fn call(&mut self, thunk: u64, args: &[u64]) -> u64 {
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, self.stack);
+        write_u64(&mut self.memory, self.stack, 0xDEAD_BEEF_DEAD_BEEF);
+        for (index, arg) in args.iter().copied().enumerate() {
+            match index {
+                0 => state.set(Register::Rcx, arg),
+                1 => state.set(Register::Rdx, arg),
+                2 => state.set(Register::R8, arg),
+                3 => state.set(Register::R9, arg),
+                _ => {
+                    write_u64(
+                        &mut self.memory,
+                        self.stack + 0x28 + ((index - 4) as u64 * 8),
+                        arg,
+                    );
+                }
+            }
+        }
+        let runtime = &mut self.runtime;
+        let memory = &mut self.memory;
+        let _ = runtime.dispatch_import(thunk, &mut state, memory);
+        state.get(Register::Rax)
+    }
+
+    /// Real VirtualAlloc semantics; returns (returned base, last_error).
+    #[doc(hidden)]
+    pub fn virtual_alloc(
+        &mut self,
+        address: u64,
+        size: u64,
+        allocation_type: u32,
+        protect: u32,
+    ) -> (u64, u32) {
+        let rax = self.call(
+            self.thunk_virtual_alloc,
+            &[
+                address,
+                size,
+                u64::from(allocation_type),
+                u64::from(protect),
+            ],
+        );
+        (rax, self.runtime.last_error)
+    }
+
+    /// Real VirtualFree semantics; returns (success, last_error).
+    #[doc(hidden)]
+    pub fn virtual_free(&mut self, address: u64, size: u64, free_type: u32) -> (u64, u32) {
+        let rax = self.call(
+            self.thunk_virtual_free,
+            &[address, size, u64::from(free_type)],
+        );
+        (rax, self.runtime.last_error)
+    }
+
+    /// Real VirtualProtect semantics; returns (success, last_error, old
+    /// protection reported through the old-protect out parameter).
+    #[doc(hidden)]
+    pub fn virtual_protect(
+        &mut self,
+        address: u64,
+        size: u64,
+        new_protect: u32,
+    ) -> (u64, u32, u32) {
+        let rax = self.call(
+            self.thunk_virtual_protect,
+            &[
+                address,
+                size,
+                u64::from(new_protect),
+                self.old_protect_buffer,
+            ],
+        );
+        let old = read_u32(&self.memory, self.old_protect_buffer).unwrap_or(0);
+        (rax, self.runtime.last_error, old)
+    }
+
+    /// Real VirtualQuery semantics at `address`.
+    #[doc(hidden)]
+    pub fn virtual_query(&mut self, address: u64) -> OracleVmQuery {
+        self.call(
+            self.thunk_virtual_query,
+            &[address, self.mbi_buffer, MEMORY_BASIC_INFORMATION64_SIZE],
+        );
+        OracleVmQuery {
+            base_address: read_u64(&self.memory, self.mbi_buffer).unwrap_or(0),
+            allocation_base: read_u64(&self.memory, self.mbi_buffer + 8).unwrap_or(0),
+            region_size: read_u64(&self.memory, self.mbi_buffer + 24).unwrap_or(0),
+            state: read_u32(&self.memory, self.mbi_buffer + 32).unwrap_or(0),
+            protect: read_u32(&self.memory, self.mbi_buffer + 36).unwrap_or(0),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -37338,8 +37504,11 @@ impl PeHostRuntime {
                             rbase.checked_add(rsize).is_some_and(|rend| range_end <= rend)
                         });
                         if !fits {
+                            // Windows: committing at an address that is not
+                            // inside a MEM_RESERVE reservation fails with
+                            // ERROR_INVALID_ADDRESS (487).
                             state.set(Register::Rax, 0);
-                            self.last_error = ERROR_INVALID_PARAMETER;
+                            self.last_error = ERROR_INVALID_ADDRESS;
                             return Ok(None);
                         }
                         memory.map_bytes(base, &vec![0; aligned as usize]);
@@ -37650,7 +37819,10 @@ impl PeHostRuntime {
                         // Page-granular private allocation query with
                         // coalescing: report the run of adjacent pages with
                         // identical state (committed/reserved) and, for
-                        // committed pages, identical protection.
+                        // committed pages, identical protection.  A fully
+                        // unmapped address is MEM_FREE with a NULL base and
+                        // a 0 region size (the documented VirtualQuery
+                        // contract — the canonical unmapped-address check).
                         let page = address & !0xfff;
                         let (allocation_base, allocation_size, mem_state, protection, _ty) =
                             if let Some(&protection) = self.private_pages.get(&page) {
@@ -37676,16 +37848,34 @@ impl PeHostRuntime {
                                 self.private_reservation_containing(address)
                             {
                                 // Reserved (uncommitted) page inside a
-                                // reservation: coalesce forward over
-                                // non-committed pages.
-                                let mut run_end = page + 0x1000;
+                                // reservation: report the maximal run of
+                                // non-committed pages containing the queried
+                                // page — the base is the run START (the page
+                                // after the last committed page below it, or
+                                // the reservation base), and the region size
+                                // runs from the queried page to the run end.
                                 let rend = rbase + rsize;
+                                let mut run_start = page;
+                                while run_start > rbase
+                                    && !self
+                                        .private_pages
+                                        .contains_key(&(run_start - 0x1000))
+                                {
+                                    run_start -= 0x1000;
+                                }
+                                let mut run_end = page + 0x1000;
                                 while run_end < rend
                                     && !self.private_pages.contains_key(&run_end)
                                 {
                                     run_end += 0x1000;
                                 }
-                                (rbase, run_end - page, MEM_RESERVE, PAGE_NOACCESS, MEM_PRIVATE)
+                                (
+                                    run_start,
+                                    run_end - page,
+                                    MEM_RESERVE,
+                                    PAGE_NOACCESS,
+                                    MEM_PRIVATE,
+                                )
                             } else if let Some((&hbase, &hsize)) =
                                 self.heap_allocations.range(..=address).next_back()
                             {
@@ -37693,14 +37883,21 @@ impl PeHostRuntime {
                                 if address < hend {
                                     (hbase, hend - address, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE)
                                 } else {
-                                    (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
+                                    (0, 0, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
                                 }
                             } else {
-                                (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
+                                (0, 0, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
                             };
                         (allocation_base, allocation_base, allocation_size, mem_state, protection, MEM_PRIVATE)
                     };
-                    let region_size = region_size.max(0x1000);
+                    // MEM_FREE regions report a 0 region size (NULL base +
+                    // 0 size is the unmapped-address contract); committed and
+                    // reserved regions are at least one page.
+                    let region_size = if mem_state == MEM_FREE {
+                        0
+                    } else {
+                        region_size.max(0x1000)
+                    };
                     match self.guest_arch {
                         GuestArch::X86 => {
                             write_u32(memory, buffer, base_address as u32);

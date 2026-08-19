@@ -71,6 +71,12 @@ enum OracleCommand {
         /// Comma-separated category filter (default: all categories).
         #[arg(long)]
         categories: Option<String>,
+        /// Emit the EXHAUSTIVE corpus: `cpu_arithmetic_flags` replaces its
+        /// bounded 8-bit stride sample with the full 65,536-pair operand
+        /// space (~196k vectors).  Used by the nightly workflow; the CI
+        /// capture stays on the bounded default.
+        #[arg(long)]
+        exhaustive: bool,
     },
     /// Compare the Casa1 runtime's behavior per vector against the captured
     /// Windows reference results. Exits 1 on any diff unless --report-only,
@@ -114,8 +120,16 @@ fn main() {
             // Handled by the pre-match special case above.
             unreachable!("ApiReport is handled before the match")
         }
-        OracleCommand::Vectors { out, categories } => {
-            let vectors = windows_oracle::generate_vectors(&parse_categories(categories));
+        OracleCommand::Vectors {
+            out,
+            categories,
+            exhaustive,
+        } => {
+            let vectors = if exhaustive {
+                windows_oracle::generate_vectors_exhaustive(&parse_categories(categories))
+            } else {
+                windows_oracle::generate_vectors(&parse_categories(categories))
+            };
             let file = VectorFile {
                 schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
                 vectors,

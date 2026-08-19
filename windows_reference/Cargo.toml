@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Windows differential-oracle reference executable: executes real Win32/CRT calls over a vector corpus and emits canonical results"
 license = "MIT OR Apache-2.0"
+build = "build.rs"
 
 # Standalone workspace root: the crate is excluded from the Casa1 workspace
 # (root Cargo.toml `[workspace] exclude`) and must never be absorbed by a

@@ -24,6 +24,12 @@ fn main() {
         .unwrap_or(true);
     println!("cargo:rustc-env=CASA1_COMMIT_SHA={commit_sha}");
     println!("cargo:rustc-env=CASA1_DIRTY={dirty}");
+    // The compiler target triple (e.g. `x86_64-apple-darwin`).  The `TARGET`
+    // environment variable is only defined for build scripts, so the crate
+    // itself reads it through this emitted env var (the Windows differential
+    // oracle uses it to distinguish an x86 reference capture from an x64 one).
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=CASA1_TARGET_TRIPLE={target}");
     println!("cargo:rerun-if-changed=build.rs");
     if std::path::Path::new(".git/HEAD").exists() {
         println!("cargo:rerun-if-changed=.git/HEAD");
