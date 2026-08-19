@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::gfx::{
-    AdapterId, AdapterInfo, CommandAllocatorId, CommandListId, CommandQueueId, DescriptorHeapId,
-    DescriptorHeapType, DxgiFormat, FenceId, FormatMapping, HeapType, ImmutableCommandStream,
-    MetalBinding, MetalCommandBufferPlan, MetalStorageMode, OutputId, OutputInfo,
-    PipelineStateDesc, PipelineStateId, PresentResult, PresentedFrame, QueryHeapId,
-    QueryResolveResult, QueryType, ResourceDesc, ResourceId, ResourceState, ResourceUsageHint,
-    RootSignatureDesc, RootSignatureId, SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
+    AdapterId, AdapterInfo, CommandAllocatorId, CommandListId, CommandQueueId,
+    D3D12FilterReduction, D3D12TextureAddressMode, DescriptorHeapId, DescriptorHeapType,
+    DxgiFormat, FenceId, FormatMapping, HeapType, ImmutableCommandStream, MetalBinding,
+    MetalCommandBufferPlan, MetalStorageMode, OutputId, OutputInfo, PipelineStateDesc,
+    PipelineStateId, PresentResult, PresentedFrame, QueryHeapId, QueryResolveResult, QueryType,
+    ResourceDesc, ResourceId, ResourceState, ResourceUsageHint, RootSignatureDesc, RootSignatureId,
+    SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +34,31 @@ pub struct D3d12DeviceInfo {
     pub adapter: AdapterInfo,
     pub outputs: Vec<OutputInfo>,
     pub features: D3d12FeatureOptions,
+}
+
+/// The decoded Metal sampler configuration for a D3D12_FILTER value.
+///
+/// The reduction field is carried as the real [`D3D12FilterReduction`] enum:
+/// COMPARISON drives the sampler comparison path, and MINIMUM/MAXIMUM are
+/// recorded here because Metal samplers have no min/max reduction mode
+/// (`MTLSamplerMinMagFilter` is Nearest/Linear only) — the standard
+/// (non-comparison) filter mapping is emitted for them and the requested
+/// reduction stays visible to the caller, never silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12MetalFilterMapping {
+    pub min_filter: &'static str,
+    pub mag_filter: &'static str,
+    pub mip_filter: &'static str,
+    pub anisotropic: bool,
+    pub reduction: D3D12FilterReduction,
+}
+
+impl D3D12MetalFilterMapping {
+    /// Whether the filter uses the comparison reduction (drives the Metal
+    /// sampler comparison function).
+    pub fn is_comparison(&self) -> bool {
+        self.reduction == D3D12FilterReduction::Comparison
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,10 +326,14 @@ impl D3d12Runtime {
     }
 
     /// Map D3D12_FILTER to a Metal sampler descriptor configuration.
-    /// Returns (min_filter, mag_filter, mip_filter, anisotropy_enabled, compare_enabled).
-    pub fn map_d3d12_filter_to_metal(
-        d3d12_filter: u32,
-    ) -> (&'static str, &'static str, &'static str, bool, bool) {
+    ///
+    /// The D3D12_FILTER bit encoding is decoded per d3d12.h: bits 0-1 mip
+    /// filter, bits 2-3 mag filter, bits 4-5 min filter, bit 6 anisotropic,
+    /// bits 7-8 reduction type. The reduction is returned as the real
+    /// [`D3D12FilterReduction`] enum — COMPARISON drives the comparison
+    /// path, MINIMUM/MAXIMUM are recorded on the mapping (Metal samplers
+    /// have no min/max reduction mode; see below).
+    pub fn map_d3d12_filter_to_metal(d3d12_filter: u32) -> D3D12MetalFilterMapping {
         // D3D12_FILTER bit encoding (see d3d12.h):
         //   bits 0-1: mip filter (0=point, 1=linear)
         //   bits 2-3: mag filter (0=point, 1=linear)
@@ -311,7 +341,10 @@ impl D3d12Runtime {
         //   bit 6   : anisotropic filtering (forces linear on all stages)
         //   bits 7-8: reduction type (0=standard, 1=comparison, 2=min, 3=max)
         let anisotropic = (d3d12_filter & 0x40) != 0;
-        let comparison = ((d3d12_filter >> 7) & 0x03) == 1;
+        // Bits 7-8 always decode to a defined reduction (0..=3); the
+        // D3D12_FILTER_REDUCTION_TYPE enum has exactly four members.
+        let reduction = D3D12FilterReduction::from_u32((d3d12_filter >> 7) & 0x03)
+            .expect("reduction field bits 7-8 always decode 0..=3");
 
         let mip_linear = anisotropic || (d3d12_filter & 0x03) != 0;
         let mag_linear = anisotropic || ((d3d12_filter >> 2) & 0x03) != 0;
@@ -321,29 +354,37 @@ impl D3d12Runtime {
         let mag_filter = if mag_linear { "linear" } else { "nearest" };
         let mip_filter = if mip_linear { "linear" } else { "nearest" };
 
-        (min_filter, mag_filter, mip_filter, anisotropic, comparison)
+        D3D12MetalFilterMapping {
+            min_filter,
+            mag_filter,
+            mip_filter,
+            anisotropic,
+            reduction,
+        }
     }
 
-    /// Map D3D12_TEXTURE_ADDRESS_MODE to Metal address mode string.
+    /// Map D3D12_TEXTURE_ADDRESS_MODE to the Metal address mode string.
     ///
-    /// D3D12 values: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE.
-    /// Metal has no `mirror_once` mode, so MIRROR_ONCE maps to
-    /// `mirror_clamp_to_edge` (the closest Metal equivalent). Unknown values
-    /// map to the documented default `clamp_to_edge` — never a silent
-    /// arbitrary value.
-    pub fn map_d3d12_address_mode(mode: u32) -> &'static str {
-        // Per D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP,
-        // 3=BORDER, 4=MIRROR_ONCE (the previous mapping was shifted by one
-        // and never handled WRAP=0, which would mis-translate every real
-        // D3D12 sampler).
-        match mode {
-            0 => "repeat",               // WRAP
-            1 => "mirror_repeat",        // MIRROR
-            2 => "clamp_to_edge",        // CLAMP
-            3 => "clamp_to_border",      // BORDER
-            4 => "mirror_clamp_to_edge", // MIRROR_ONCE
-            _ => "clamp_to_edge",
-        }
+    /// D3D12 values (per d3d12.h): 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
+    /// 4=MIRROR_ONCE. Metal has no `mirror_once` mode, so MIRROR_ONCE maps
+    /// to `mirror_clamp_to_edge` (the closest Metal equivalent).
+    ///
+    /// Values outside `0..=4` are undefined per d3d12.h — a validation
+    /// error on Windows, never a silent default. The runtime rejects them
+    /// exactly like the reference does.
+    pub fn map_d3d12_address_mode(mode: u32) -> AppResult<&'static str> {
+        D3D12TextureAddressMode::from_u32(mode)
+            .map(D3D12TextureAddressMode::metal_name)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "D3D12_TEXTURE_ADDRESS_MODE value {mode} is outside the defined \
+                         0..=4 range (0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE) \
+                         and is a validation error on Windows"
+                    ),
+                )
+            })
     }
 
     /// Map D3D12_COMPARISON_FUNC to Metal compare function string.
@@ -374,17 +415,22 @@ impl D3d12Runtime {
     /// Create a Metal sampler descriptor string from a D3D12_STATIC_SAMPLER_DESC.
     ///
     /// Rejects invalid combinations (anisotropy above the Metal limit of 16,
-    /// min_lod > max_lod) before emitting the descriptor.
+    /// min_lod > max_lod, address modes outside `0..=4`) before emitting the
+    /// descriptor.
     pub fn static_sampler_to_metal_desc(sampler: &D3D12StaticSamplerDesc) -> AppResult<String> {
         Self::validate_static_sampler(sampler)?;
-        let (min_filter, mag_filter, mip_filter, anisotropic, _) =
-            Self::map_d3d12_filter_to_metal(sampler.filter);
-        let address_u = Self::map_d3d12_address_mode(sampler.address_u);
-        let address_v = Self::map_d3d12_address_mode(sampler.address_v);
-        let address_w = Self::map_d3d12_address_mode(sampler.address_w);
+        let mapping = Self::map_d3d12_filter_to_metal(sampler.filter);
+        let address_u = Self::map_d3d12_address_mode(sampler.address_u)?;
+        let address_v = Self::map_d3d12_address_mode(sampler.address_v)?;
+        let address_w = Self::map_d3d12_address_mode(sampler.address_w)?;
         let compare_fn = Self::map_d3d12_comparison_func(sampler.comparison_func);
         let border_color = Self::map_d3d12_border_color(sampler.border_color);
 
+        // D3D12_FILTER_REDUCTION_TYPE MINIMUM/MAXIMUM (mapping.reduction):
+        // Metal has no min/max reduction in samplers, so the descriptor is
+        // emitted with the standard (non-comparison) filter mapping — a
+        // documented translation, with the requested reduction visible on
+        // `mapping.reduction` rather than silently assumed standard.
         Ok(format!(
             "sampler(coord::normalized, address::{addr_u}, address::{addr_v}, address::{addr_w}, \
              filter::{min_f},{mag_f},{mip_f}, compare::{cmp}, lod_clamp({min_lod},{max_lod}), \
@@ -392,13 +438,13 @@ impl D3d12Runtime {
             addr_u = address_u,
             addr_v = address_v,
             addr_w = address_w,
-            min_f = min_filter,
-            mag_f = mag_filter,
-            mip_f = mip_filter,
+            min_f = mapping.min_filter,
+            mag_f = mapping.mag_filter,
+            mip_f = mapping.mip_filter,
             cmp = compare_fn,
             min_lod = sampler.min_lod,
             max_lod = sampler.max_lod,
-            aniso = if anisotropic {
+            aniso = if mapping.anisotropic {
                 sampler.max_anisotropy
             } else {
                 1
@@ -423,6 +469,23 @@ impl D3d12Runtime {
                 ReasonCode::RcD3dInvalidState,
                 "static sampler min_lod > max_lod",
             ));
+        }
+        // D3D12_TEXTURE_ADDRESS_MODE is 0-based (0=WRAP..4=MIRROR_ONCE);
+        // any other value is a validation error on Windows.
+        for (field, mode) in [
+            ("address_u", sampler.address_u),
+            ("address_v", sampler.address_v),
+            ("address_w", sampler.address_w),
+        ] {
+            if D3D12TextureAddressMode::from_u32(mode).is_none() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "static sampler {field} value {mode} is outside \
+                         D3D12_TEXTURE_ADDRESS_MODE 0..=4 (a validation error on Windows)"
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -2272,24 +2335,56 @@ mod tests {
 
     /// D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
     /// 4=MIRROR_ONCE (per d3d12.h). Every value maps to the documented Metal
-    /// mode; unknown values map to the documented default `clamp_to_edge`.
+    /// mode; values outside 0..=4 are undefined per d3d12.h — a validation
+    /// error on Windows — and the runtime rejects them exactly like the
+    /// reference does (never a silent default).
     #[test]
     fn map_d3d12_address_mode_full_table() {
-        assert_eq!(D3d12Runtime::map_d3d12_address_mode(0), "repeat"); // WRAP
-        assert_eq!(D3d12Runtime::map_d3d12_address_mode(1), "mirror_repeat"); // MIRROR
-        assert_eq!(D3d12Runtime::map_d3d12_address_mode(2), "clamp_to_edge"); // CLAMP
-        assert_eq!(D3d12Runtime::map_d3d12_address_mode(3), "clamp_to_border"); // BORDER
-        assert_eq!(
-            D3d12Runtime::map_d3d12_address_mode(4),
-            "mirror_clamp_to_edge"
-        ); // MIRROR_ONCE
-        // Unknown values: documented default, never a silent arbitrary value.
-        for unknown in [5, 6, 99, u32::MAX] {
-            assert_eq!(
-                D3d12Runtime::map_d3d12_address_mode(unknown),
-                "clamp_to_edge",
-                "unknown address mode {unknown} must map to the documented default"
-            );
+        // Reference-derived expectations for every input 0..=8 (the
+        // d3d12_texture_address_mode oracle vectors cover the same range).
+        let expected: [(&str, Option<&str>); 9] = [
+            ("repeat", Some("WRAP")),                      // 0
+            ("mirror_repeat", Some("MIRROR")),             // 1
+            ("clamp_to_edge", Some("CLAMP")),              // 2
+            ("clamp_to_border", Some("BORDER")),           // 3
+            ("mirror_clamp_to_edge", Some("MIRROR_ONCE")), // 4
+            ("", None),                                    // 5 — undefined/validation error
+            ("", None),                                    // 6
+            ("", None),                                    // 7
+            ("", None),                                    // 8
+        ];
+        for (mode, (metal, d3d12_name)) in expected.iter().enumerate() {
+            let decoded = D3D12TextureAddressMode::from_u32(mode as u32);
+            match (d3d12_name, decoded) {
+                (Some(name), Some(decoded)) => {
+                    assert_eq!(
+                        decoded.d3d12_name(),
+                        *name,
+                        "mode {mode} must decode to {name}"
+                    );
+                    assert_eq!(
+                        D3d12Runtime::map_d3d12_address_mode(mode as u32).unwrap(),
+                        *metal,
+                        "mode {mode} must map to Metal {metal}"
+                    );
+                }
+                (None, None) => {
+                    assert!(
+                        D3d12Runtime::map_d3d12_address_mode(mode as u32).is_err(),
+                        "mode {mode} must be rejected (validation error), never a silent default"
+                    );
+                }
+                (Some(name), None) => panic!("mode {mode} must decode to {name}"),
+                (None, Some(decoded)) => panic!(
+                    "mode {mode} is undefined per d3d12.h but decoded to {:?}",
+                    decoded
+                ),
+            }
+        }
+        // Arbitrary out-of-range values are rejected the same way.
+        for unknown in [99, u32::MAX] {
+            assert_eq!(D3D12TextureAddressMode::from_u32(unknown), None);
+            assert!(D3d12Runtime::map_d3d12_address_mode(unknown).is_err());
         }
     }
 
@@ -2333,50 +2428,228 @@ mod tests {
 
     /// D3D12_FILTER bit encoding (per d3d12.h): bits 0-1 mip, 2-3 mag, 4-5
     /// min, bit 6 anisotropic, bits 7-8 reduction type. Named constants are
-    /// checked against their documented bit patterns.
+    /// checked against their documented bit patterns, and all four reduction
+    /// types (STANDARD, COMPARISON, MINIMUM, MAXIMUM) are covered across the
+    /// filter table.
     #[test]
     fn map_d3d12_filter_full_table() {
-        // D3D12_FILTER_MIN_MAG_MIP_POINT = 0x00
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x00);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("nearest", "nearest", "nearest", false, false)
-        );
-        // D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x01
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x01);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("nearest", "nearest", "linear", false, false)
-        );
-        // D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x04
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x04);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("nearest", "linear", "nearest", false, false)
-        );
-        // D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x10);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("linear", "nearest", "nearest", false, false)
-        );
-        // D3D12_FILTER_MIN_MAG_MIP_LINEAR = 0x15
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x15);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("linear", "linear", "linear", false, false)
-        );
-        // D3D12_FILTER_ANISOTROPIC = 0x55: all linear + anisotropic flag.
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x55);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("linear", "linear", "linear", true, false)
-        );
-        // D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT = 0x80: comparison reduction.
-        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x80);
-        assert_eq!(
-            (min, mag, mip, aniso, cmp),
-            ("nearest", "nearest", "nearest", false, true)
-        );
+        use D3D12FilterReduction::*;
+        struct FilterCase {
+            filter: u32,
+            min: &'static str,
+            mag: &'static str,
+            mip: &'static str,
+            aniso: bool,
+            reduction: D3D12FilterReduction,
+        }
+        // Reference-derived expectations: every named D3D12_FILTER value
+        // decomposes exactly as the Windows reference defines it.
+        let cases = [
+            // D3D12_FILTER_MIN_MAG_MIP_POINT = 0x00
+            FilterCase {
+                filter: 0x00,
+                min: "nearest",
+                mag: "nearest",
+                mip: "nearest",
+                aniso: false,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x01
+            FilterCase {
+                filter: 0x01,
+                min: "nearest",
+                mag: "nearest",
+                mip: "linear",
+                aniso: false,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x04
+            FilterCase {
+                filter: 0x04,
+                min: "nearest",
+                mag: "linear",
+                mip: "nearest",
+                aniso: false,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10
+            FilterCase {
+                filter: 0x10,
+                min: "linear",
+                mag: "nearest",
+                mip: "nearest",
+                aniso: false,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_MIN_MAG_MIP_LINEAR = 0x15
+            FilterCase {
+                filter: 0x15,
+                min: "linear",
+                mag: "linear",
+                mip: "linear",
+                aniso: false,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_ANISOTROPIC = 0x55: all linear + anisotropic flag.
+            FilterCase {
+                filter: 0x55,
+                min: "linear",
+                mag: "linear",
+                mip: "linear",
+                aniso: true,
+                reduction: Standard,
+            },
+            // D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT = 0x80
+            FilterCase {
+                filter: 0x80,
+                min: "nearest",
+                mag: "nearest",
+                mip: "nearest",
+                aniso: false,
+                reduction: Comparison,
+            },
+            // D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR = 0x95
+            FilterCase {
+                filter: 0x95,
+                min: "linear",
+                mag: "linear",
+                mip: "linear",
+                aniso: false,
+                reduction: Comparison,
+            },
+            // D3D12_FILTER_COMPARISON_ANISOTROPIC = 0xD5
+            FilterCase {
+                filter: 0xD5,
+                min: "linear",
+                mag: "linear",
+                mip: "linear",
+                aniso: true,
+                reduction: Comparison,
+            },
+            // D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT = 0x100
+            FilterCase {
+                filter: 0x100,
+                min: "nearest",
+                mag: "nearest",
+                mip: "nearest",
+                aniso: false,
+                reduction: Minimum,
+            },
+            // D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR = 0x115
+            FilterCase {
+                filter: 0x115,
+                min: "linear",
+                mag: "linear",
+                mip: "linear",
+                aniso: false,
+                reduction: Minimum,
+            },
+            // D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT = 0x180
+            FilterCase {
+                filter: 0x180,
+                min: "nearest",
+                mag: "nearest",
+                mip: "nearest",
+                aniso: false,
+                reduction: Maximum,
+            },
+        ];
+        for case in cases {
+            let mapping = D3d12Runtime::map_d3d12_filter_to_metal(case.filter);
+            assert_eq!(
+                (
+                    mapping.min_filter,
+                    mapping.mag_filter,
+                    mapping.mip_filter,
+                    mapping.anisotropic,
+                    mapping.reduction,
+                ),
+                (case.min, case.mag, case.mip, case.aniso, case.reduction),
+                "D3D12_FILTER {:#x} must decode exactly per d3d12.h",
+                case.filter
+            );
+            assert_eq!(
+                mapping.is_comparison(),
+                case.reduction == Comparison,
+                "D3D12_FILTER {:#x} comparison flag",
+                case.filter
+            );
+        }
+        // Minimum/Maximum must never be mistaken for comparison.
+        let minimum = D3d12Runtime::map_d3d12_filter_to_metal(0x100);
+        let maximum = D3d12Runtime::map_d3d12_filter_to_metal(0x180);
+        assert!(!minimum.is_comparison() && minimum.reduction == Minimum);
+        assert!(!maximum.is_comparison() && maximum.reduction == Maximum);
+    }
+
+    /// D3D12_FILTER_REDUCTION_TYPE: 0=STANDARD, 1=COMPARISON, 2=MINIMUM,
+    /// 3=MAXIMUM (per d3d12.h). Values outside 0..=3 are undefined — a
+    /// validation error on Windows.
+    #[test]
+    fn d3d12_filter_reduction_full_table() {
+        use D3D12FilterReduction::*;
+        let cases: [(u32, (D3D12FilterReduction, &str)); 4] = [
+            (0, (Standard, "STANDARD")),
+            (1, (Comparison, "COMPARISON")),
+            (2, (Minimum, "MINIMUM")),
+            (3, (Maximum, "MAXIMUM")),
+        ];
+        for (value, (reduction, name)) in cases {
+            assert_eq!(D3D12FilterReduction::from_u32(value), Some(reduction));
+            assert_eq!(reduction.d3d12_name(), name);
+            assert_eq!(reduction.as_u32(), value);
+        }
+        for value in 4..=8 {
+            assert_eq!(
+                D3D12FilterReduction::from_u32(value),
+                None,
+                "reduction type {value} is undefined per d3d12.h"
+            );
+        }
+    }
+
+    /// Out-of-range address modes are rejected by both the validator and the
+    /// descriptor builder — exactly the Windows validation behavior.
+    #[test]
+    fn static_sampler_rejects_undefined_address_modes() {
+        let base = D3D12StaticSamplerDesc {
+            shader_register: 0,
+            register_space: 0,
+            filter: 0,
+            address_u: 0,
+            address_v: 0,
+            address_w: 0,
+            mip_lod_bias: 0.0,
+            max_anisotropy: 1,
+            comparison_func: 1,
+            border_color: 0,
+            min_lod: 0.0,
+            max_lod: 1000.0,
+            shader_visibility: D3D12ShaderVisibility::All,
+        };
+        // Every defined mode 0..=4 is accepted.
+        for mode in 0..=4 {
+            let sampler = D3D12StaticSamplerDesc {
+                address_u: mode,
+                ..base.clone()
+            };
+            assert!(D3d12Runtime::validate_static_sampler(&sampler).is_ok());
+            assert!(D3d12Runtime::static_sampler_to_metal_desc(&sampler).is_ok());
+        }
+        // Every undefined mode 5..=8 (and arbitrary values) is rejected.
+        for mode in [5, 6, 7, 8, 99, u32::MAX] {
+            for field in [0u32, 1, 2] {
+                let mut sampler = base.clone();
+                match field {
+                    0 => sampler.address_u = mode,
+                    1 => sampler.address_v = mode,
+                    _ => sampler.address_w = mode,
+                }
+                let error = D3d12Runtime::validate_static_sampler(&sampler)
+                    .expect_err("undefined address mode must be rejected");
+                assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+                assert!(D3d12Runtime::static_sampler_to_metal_desc(&sampler).is_err());
+            }
+        }
     }
 }

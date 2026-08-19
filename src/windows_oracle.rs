@@ -34,7 +34,7 @@ pub const REFERENCE_CWD: &str = "C:\\Windows\\Temp\\casa1-oracle-cwd";
 pub const REFERENCE_BASE_DIR: &str = "C:\\Windows\\Temp\\casa1-oracle";
 
 /// All category names, in corpus generation order.
-pub const ALL_CATEGORIES: [&str; 10] = [
+pub const ALL_CATEGORIES: [&str; 13] = [
     "path_normalize",
     "case_fold",
     "file_sharing",
@@ -45,6 +45,103 @@ pub const ALL_CATEGORIES: [&str; 10] = [
     "synchronization",
     "crt_printf",
     "thread_tls",
+    "d3d12_texture_address_mode",
+    "d3d12_filter_reduction",
+    "d3d12_filter_translation",
+];
+
+/// Every named D3D12_FILTER value with its d3d12.h name — the runtime-side
+/// truth table for the `d3d12_filter_translation` differential (the Windows
+/// reference carries the same 36 members hardcoded from d3d12.h). Values
+/// not in this table are undefined per d3d12.h — a validation error.
+pub const D3D12_FILTER_NAMES: &[(u32, &str)] = &[
+    (0x0000_0000, "D3D12_FILTER_MIN_MAG_MIP_POINT"),
+    (0x0000_0001, "D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0004, "D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0005, "D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0010, "D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT"),
+    (0x0000_0011, "D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0014, "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0015, "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0055, "D3D12_FILTER_ANISOTROPIC"),
+    (0x0000_0080, "D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT"),
+    (
+        0x0000_0081,
+        "D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0084,
+        "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0085,
+        "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (
+        0x0000_0090,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT",
+    ),
+    (
+        0x0000_0091,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0094,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0095,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (0x0000_00d5, "D3D12_FILTER_COMPARISON_ANISOTROPIC"),
+    (0x0000_0100, "D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT"),
+    (0x0000_0101, "D3D12_FILTER_MINIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+    (
+        0x0000_0104,
+        "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0105,
+        "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (0x0000_0110, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+    (
+        0x0000_0111,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0114,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0115,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (0x0000_0155, "D3D12_FILTER_MINIMUM_ANISOTROPIC"),
+    (0x0000_0180, "D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT"),
+    (0x0000_0181, "D3D12_FILTER_MAXIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+    (
+        0x0000_0184,
+        "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0185,
+        "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (0x0000_0190, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+    (
+        0x0000_0191,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0194,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0195,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (0x0000_01d5, "D3D12_FILTER_MAXIMUM_ANISOTROPIC"),
 ];
 
 // ── Wire schema ────────────────────────────────────────────────────────────
@@ -214,6 +311,21 @@ pub struct TlsInput {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct D3d12AddressModeInput {
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct D3d12FilterReductionInput {
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct D3d12FilterTranslationInput {
+    pub filter: u32,
+}
+
 // ── Corpus generation ──────────────────────────────────────────────────────
 
 /// Generate the deterministic differential vector corpus for the given
@@ -254,6 +366,9 @@ fn generate_category(category: &str) -> Vec<Value> {
         "synchronization" => synchronization_vectors(),
         "crt_printf" => crt_printf_vectors(),
         "thread_tls" => thread_tls_vectors(),
+        "d3d12_texture_address_mode" => d3d12_texture_address_mode_vectors(),
+        "d3d12_filter_reduction" => d3d12_filter_reduction_vectors(),
+        "d3d12_filter_translation" => d3d12_filter_translation_vectors(),
         _ => Vec::new(),
     }
 }
@@ -406,6 +521,31 @@ fn thread_tls_vectors() -> Vec<Value> {
     ]
 }
 
+/// D3D12_TEXTURE_ADDRESS_MODE: every numeric input 0..=8. The reference
+/// emits the REAL d3d12.h names for 0..=4 and marks 5..=8 as undefined
+/// (validation error); the runtime must agree on every input.
+fn d3d12_texture_address_mode_vectors() -> Vec<Value> {
+    (0..=8).map(|mode| json!({ "mode": mode })).collect()
+}
+
+/// D3D12_FILTER_REDUCTION_TYPE: every numeric input 0..=8. The reference
+/// emits STANDARD/COMPARISON/MINIMUM/MAXIMUM for 0..=3, marks 4..=8 as
+/// undefined (validation error), and emits the full D3D12_FILTER bit
+/// layout.
+fn d3d12_filter_reduction_vectors() -> Vec<Value> {
+    (0..=8).map(|value| json!({ "value": value })).collect()
+}
+
+/// D3D12_FILTER: every named enum value (36 members across the STANDARD,
+/// COMPARISON, MINIMUM and MAXIMUM families). The reference emits the enum
+/// decomposition for each; the runtime must decode identically.
+fn d3d12_filter_translation_vectors() -> Vec<Value> {
+    D3D12_FILTER_NAMES
+        .iter()
+        .map(|(filter, _)| json!({ "filter": filter }))
+        .collect()
+}
+
 /// Compute the Casa1 RUNTIME's behavior for a differential vector.  This is
 /// the emulated-Casa1 side of the differential: the reference executable's
 /// captured result is the truth, and this function produces the Casa1
@@ -424,6 +564,74 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
                 "kind": runtime_path_kind(&parsed),
                 "has_ads": parsed.ads_stream.is_some(),
                 "last_error": 0,
+            })
+        }
+        "d3d12_texture_address_mode" => {
+            let mode = vector
+                .input
+                .get("mode")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            // The runtime's production decode of D3D12_TEXTURE_ADDRESS_MODE
+            // (0=WRAP..4=MIRROR_ONCE; outside 0..=4 is undefined per
+            // d3d12.h — a validation error, never a silent default).
+            let decoded = crate::gfx::D3D12TextureAddressMode::from_u32(mode);
+            json!({
+                "mode": mode,
+                "name": decoded.map(crate::gfx::D3D12TextureAddressMode::d3d12_name),
+                "valid": decoded.is_some(),
+            })
+        }
+        "d3d12_filter_reduction" => {
+            let value = vector
+                .input
+                .get("value")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            // The runtime's production decode of D3D12_FILTER_REDUCTION_TYPE
+            // (0=STANDARD..3=MAXIMUM; outside 0..=3 is undefined).
+            let decoded = crate::gfx::D3D12FilterReduction::from_u32(value);
+            let layout = crate::gfx::D3D12_FILTER_BIT_LAYOUT;
+            json!({
+                "value": value,
+                "name": decoded.map(crate::gfx::D3D12FilterReduction::d3d12_name),
+                "valid": decoded.is_some(),
+                "bit_layout": {
+                    "mip_filter_bits": [layout.mip_filter_bits.0, layout.mip_filter_bits.1],
+                    "mag_filter_bits": [layout.mag_filter_bits.0, layout.mag_filter_bits.1],
+                    "min_filter_bits": [layout.min_filter_bits.0, layout.min_filter_bits.1],
+                    "anisotropic_bit": layout.anisotropic_bit,
+                    "reduction_bits": [layout.reduction_bits.0, layout.reduction_bits.1],
+                },
+            })
+        }
+        "d3d12_filter_translation" => {
+            let filter = vector
+                .input
+                .get("filter")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            // The runtime's production decode of D3D12_FILTER (bits 0-1 mip,
+            // 2-3 mag, 4-5 min, 6 anisotropic, 7-8 reduction).
+            let mapping = crate::d3d12::D3d12Runtime::map_d3d12_filter_to_metal(filter);
+            let name = D3D12_FILTER_NAMES
+                .iter()
+                .find(|(value, _)| *value == filter)
+                .map(|(_, name)| *name);
+            let field = |metal: &str| if metal == "linear" { "LINEAR" } else { "POINT" };
+            json!({
+                "filter": filter,
+                "name": name,
+                "min_filter": field(mapping.min_filter),
+                "mag_filter": field(mapping.mag_filter),
+                "mip_filter": field(mapping.mip_filter),
+                "anisotropic": mapping.anisotropic,
+                "reduction": mapping.reduction.as_u32(),
+                "reduction_name": mapping.reduction.d3d12_name(),
+                "valid": name.is_some(),
             })
         }
         _ => json!({ "runtime_unavailable": true }),
@@ -793,4 +1001,250 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     (year, month as u32, day as u32)
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn d3d12_categories_are_in_the_corpus() {
+        for category in [
+            "d3d12_texture_address_mode",
+            "d3d12_filter_reduction",
+            "d3d12_filter_translation",
+        ] {
+            assert!(
+                ALL_CATEGORIES.contains(&category),
+                "{category} must be part of the differential corpus"
+            );
+            let vectors = generate_vectors(&[category.to_string()]);
+            assert!(!vectors.is_empty());
+            for vector in &vectors {
+                assert_eq!(vector.category, category);
+            }
+        }
+    }
+
+    #[test]
+    fn d3d12_address_mode_runtime_matches_reference_derived_truth() {
+        // Reference-derived truth (d3d12.h): 0=WRAP, 1=MIRROR, 2=CLAMP,
+        // 3=BORDER, 4=MIRROR_ONCE; 5..=8 are undefined (validation error).
+        let truth: [(u32, Option<&str>); 9] = [
+            (0, Some("WRAP")),
+            (1, Some("MIRROR")),
+            (2, Some("CLAMP")),
+            (3, Some("BORDER")),
+            (4, Some("MIRROR_ONCE")),
+            (5, None),
+            (6, None),
+            (7, None),
+            (8, None),
+        ];
+        for (mode, name) in truth {
+            let vector = Vector {
+                id: format!("address:{mode}"),
+                category: "d3d12_texture_address_mode".to_string(),
+                input: json!({ "mode": mode }),
+            };
+            let result = compute_runtime_result(&vector);
+            assert_eq!(
+                result.output,
+                json!({ "mode": mode, "name": name, "valid": name.is_some() }),
+                "runtime must match the reference-derived truth for mode {mode}"
+            );
+            // The comparison machinery must report no diff against the
+            // reference-shaped output.
+            let diffs = compare_outputs(
+                "d3d12_texture_address_mode",
+                &json!({ "mode": mode, "name": name, "valid": name.is_some() }),
+                &result.output,
+            );
+            assert!(diffs.is_empty(), "unexpected diffs: {diffs:?}");
+        }
+    }
+
+    #[test]
+    fn d3d12_filter_reduction_runtime_matches_reference_derived_truth() {
+        // Reference-derived truth (d3d12.h): STANDARD=0, COMPARISON=1,
+        // MINIMUM=2, MAXIMUM=3; 4..=8 are undefined (validation error).
+        let truth: [(u32, Option<&str>); 9] = [
+            (0, Some("STANDARD")),
+            (1, Some("COMPARISON")),
+            (2, Some("MINIMUM")),
+            (3, Some("MAXIMUM")),
+            (4, None),
+            (5, None),
+            (6, None),
+            (7, None),
+            (8, None),
+        ];
+        for (value, name) in truth {
+            let vector = Vector {
+                id: format!("reduction:{value}"),
+                category: "d3d12_filter_reduction".to_string(),
+                input: json!({ "value": value }),
+            };
+            let result = compute_runtime_result(&vector);
+            // The bit layout is part of both sides' output — the runtime
+            // must agree with the d3d12.h layout (mip 0-1, mag 2-3, min
+            // 4-5, anisotropic 6, reduction 7-8).
+            let reference_shaped = json!({
+                "value": value,
+                "name": name,
+                "valid": name.is_some(),
+                "bit_layout": {
+                    "mip_filter_bits": [0, 1],
+                    "mag_filter_bits": [2, 3],
+                    "min_filter_bits": [4, 5],
+                    "anisotropic_bit": 6,
+                    "reduction_bits": [7, 8],
+                },
+            });
+            assert_eq!(result.output, reference_shaped);
+            let diffs =
+                compare_outputs("d3d12_filter_reduction", &reference_shaped, &result.output);
+            assert!(diffs.is_empty(), "unexpected diffs: {diffs:?}");
+        }
+    }
+
+    #[test]
+    fn d3d12_filter_translation_runtime_matches_reference_derived_truth() {
+        struct FilterTruthCase {
+            filter: u32,
+            name: &'static str,
+            min: &'static str,
+            mag: &'static str,
+            mip: &'static str,
+            aniso: bool,
+            reduction: u32,
+            reduction_name: &'static str,
+        }
+        // Reference-derived truth: the runtime decodes every named
+        // D3D12_FILTER exactly per the d3d12.h bit layout, including the
+        // four-way reduction.
+        let cases = [
+            FilterTruthCase {
+                filter: 0x00,
+                name: "D3D12_FILTER_MIN_MAG_MIP_POINT",
+                min: "POINT",
+                mag: "POINT",
+                mip: "POINT",
+                aniso: false,
+                reduction: 0,
+                reduction_name: "STANDARD",
+            },
+            FilterTruthCase {
+                filter: 0x15,
+                name: "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+                min: "LINEAR",
+                mag: "LINEAR",
+                mip: "LINEAR",
+                aniso: false,
+                reduction: 0,
+                reduction_name: "STANDARD",
+            },
+            FilterTruthCase {
+                filter: 0x55,
+                name: "D3D12_FILTER_ANISOTROPIC",
+                min: "LINEAR",
+                mag: "LINEAR",
+                mip: "LINEAR",
+                aniso: true,
+                reduction: 0,
+                reduction_name: "STANDARD",
+            },
+            FilterTruthCase {
+                filter: 0x80,
+                name: "D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT",
+                min: "POINT",
+                mag: "POINT",
+                mip: "POINT",
+                aniso: false,
+                reduction: 1,
+                reduction_name: "COMPARISON",
+            },
+            FilterTruthCase {
+                filter: 0xD5,
+                name: "D3D12_FILTER_COMPARISON_ANISOTROPIC",
+                min: "LINEAR",
+                mag: "LINEAR",
+                mip: "LINEAR",
+                aniso: true,
+                reduction: 1,
+                reduction_name: "COMPARISON",
+            },
+            FilterTruthCase {
+                filter: 0x100,
+                name: "D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT",
+                min: "POINT",
+                mag: "POINT",
+                mip: "POINT",
+                aniso: false,
+                reduction: 2,
+                reduction_name: "MINIMUM",
+            },
+            FilterTruthCase {
+                filter: 0x115,
+                name: "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+                min: "LINEAR",
+                mag: "LINEAR",
+                mip: "LINEAR",
+                aniso: false,
+                reduction: 2,
+                reduction_name: "MINIMUM",
+            },
+            FilterTruthCase {
+                filter: 0x180,
+                name: "D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT",
+                min: "POINT",
+                mag: "POINT",
+                mip: "POINT",
+                aniso: false,
+                reduction: 3,
+                reduction_name: "MAXIMUM",
+            },
+        ];
+        for case in cases {
+            let vector = Vector {
+                id: format!("filter:{:#x}", case.filter),
+                category: "d3d12_filter_translation".to_string(),
+                input: json!({ "filter": case.filter }),
+            };
+            let result = compute_runtime_result(&vector);
+            let reference_shaped = json!({
+                "filter": case.filter,
+                "name": case.name,
+                "min_filter": case.min,
+                "mag_filter": case.mag,
+                "mip_filter": case.mip,
+                "anisotropic": case.aniso,
+                "reduction": case.reduction,
+                "reduction_name": case.reduction_name,
+                "valid": true,
+            });
+            assert_eq!(result.output, reference_shaped, "filter {:#x}", case.filter);
+            let diffs = compare_outputs(
+                "d3d12_filter_translation",
+                &reference_shaped,
+                &result.output,
+            );
+            assert!(
+                diffs.is_empty(),
+                "filter {:#x} diffs: {diffs:?}",
+                case.filter
+            );
+        }
+        // Every named member of the corpus decodes valid; the runtime's
+        // name table covers exactly the corpus.
+        let vectors = generate_vectors(&["d3d12_filter_translation".to_string()]);
+        assert_eq!(vectors.len(), D3D12_FILTER_NAMES.len());
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            assert_eq!(result.output["valid"], json!(true), "{}", vector.id);
+            assert!(result.output["name"].is_string(), "{}", vector.id);
+        }
+    }
 }

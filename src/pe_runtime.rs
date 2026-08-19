@@ -8962,7 +8962,9 @@ fn read_d3d11_texture1d_desc(memory: &MemoryImage, desc_ptr: u64) -> AppResult<D
     let format_raw = memory.read_u32(desc_ptr + 12)?;
     Ok(D3d11Texture1dDesc {
         width,
-        format: DxgiFormat::from_u32(format_raw),
+        // Guest-facing production path: never substitute an unsupported
+        // format — reject with an explicit error.
+        format: DxgiFormat::from_u32_checked(format_raw)?,
     })
 }
 
@@ -8976,7 +8978,9 @@ fn read_d3d11_texture3d_desc(memory: &MemoryImage, desc_ptr: u64) -> AppResult<D
         width,
         height,
         depth,
-        format: DxgiFormat::from_u32(format_raw),
+        // Guest-facing production path: never substitute an unsupported
+        // format — reject with an explicit error.
+        format: DxgiFormat::from_u32_checked(format_raw)?,
     })
 }
 
@@ -63822,9 +63826,12 @@ impl PeHostRuntime {
         let dimension = memory.read_u32(desc_ptr + 4)?;
         let width = memory.read_u64(desc_ptr + 8)?;
         let height = memory.read_u32(desc_ptr + 16)?;
+        // Guest-facing production path: never substitute an unsupported
+        // format — reject with an explicit error.
+        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
         let resource_desc = crate::gfx::ResourceDesc {
             name: format!("D3D12PlacedResource({dimension})"),
-            format: crate::gfx::DxgiFormat::from_u32(format_raw),
+            format,
             heap: crate::gfx::HeapType::Default,
             size: width as usize * height.max(1) as usize * 4,
             subresources: 1,
@@ -63839,13 +63846,8 @@ impl PeHostRuntime {
         let resource_id = self
             .d3d12_runtime
             .create_committed_resource(resource_desc)?;
-        let resource_object = self.alloc_d3d12_resource_object(
-            memory,
-            device_object,
-            resource_id,
-            crate::gfx::DxgiFormat::from_u32(format_raw),
-            false,
-        )?;
+        let resource_object =
+            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
         write_u64(memory, out_ptr, resource_object);
         state.set(Register::Rax, 0);
         self.last_error = 0;
@@ -63884,9 +63886,12 @@ impl PeHostRuntime {
         let dimension = memory.read_u32(desc_ptr + 4)?;
         let width = memory.read_u64(desc_ptr + 8)?;
         let height = memory.read_u32(desc_ptr + 16)?;
+        // Guest-facing production path: never substitute an unsupported
+        // format — reject with an explicit error.
+        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
         let resource_desc = crate::gfx::ResourceDesc {
             name: format!("D3D12ReservedResource({dimension})"),
-            format: crate::gfx::DxgiFormat::from_u32(format_raw),
+            format,
             heap: crate::gfx::HeapType::Default,
             size: width as usize * height.max(1) as usize * 4,
             subresources: 1,
@@ -63901,13 +63906,8 @@ impl PeHostRuntime {
         let resource_id = self
             .d3d12_runtime
             .create_committed_resource(resource_desc)?;
-        let resource_object = self.alloc_d3d12_resource_object(
-            memory,
-            device_object,
-            resource_id,
-            crate::gfx::DxgiFormat::from_u32(format_raw),
-            false,
-        )?;
+        let resource_object =
+            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
         write_u64(memory, out_ptr, resource_object);
         state.set(Register::Rax, 0);
         self.last_error = 0;
@@ -64101,9 +64101,12 @@ impl PeHostRuntime {
         let layout = memory.read_u32(desc_ptr + 36)?;
         let flags = memory.read_u32(desc_ptr + 40)?;
 
+        // Guest-facing production path: never substitute an unsupported
+        // format — reject with an explicit error.
+        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
         let resource_desc = crate::gfx::ResourceDesc {
             name: format!("D3D12CommittedResource({dimension})"),
-            format: crate::gfx::DxgiFormat::from_u32(format_raw),
+            format,
             heap: crate::gfx::HeapType::Default,
             size: width as usize * height.max(1) as usize * 4,
             subresources: 1,
@@ -64118,13 +64121,8 @@ impl PeHostRuntime {
         let resource_id = self
             .d3d12_runtime
             .create_committed_resource(resource_desc)?;
-        let resource_object = self.alloc_d3d12_resource_object(
-            memory,
-            device_object,
-            resource_id,
-            crate::gfx::DxgiFormat::from_u32(format_raw),
-            false,
-        )?;
+        let resource_object =
+            self.alloc_d3d12_resource_object(memory, device_object, resource_id, format, false)?;
         write_u64(memory, out_ptr, resource_object);
         state.set(Register::Rax, 0);
         self.last_error = 0;

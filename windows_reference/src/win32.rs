@@ -462,6 +462,9 @@ pub fn execute(category: &str, input: &Value) -> Value {
         "synchronization" => exec_synchronization(input),
         "crt_printf" => exec_crt_printf(input),
         "thread_tls" => exec_thread_tls(input),
+        "d3d12_texture_address_mode" => exec_d3d12_texture_address_mode(input),
+        "d3d12_filter_reduction" => exec_d3d12_filter_reduction(input),
+        "d3d12_filter_translation" => exec_d3d12_filter_translation(input),
         _ => json!({ "error": format!("unknown_category: {category}") }),
     }
 }
@@ -1405,4 +1408,176 @@ fn exec_thread_tls(input: &Value) -> Value {
         }
         _ => json!({ "error": 87 }),
     }
+}
+
+// ── d3d12 enum truth ────────────────────────────────────────────────────────
+//
+// The D3D12 enum values below are hardcoded from d3d12.h — the reference
+// executable is the truth emitter, and there is no Casa1-side model to
+// consult. Every numeric input the corpus sends (including values outside
+// the defined enum range) is answered per the d3d12.h definitions: values
+// the enum does not define are validation errors, never guessed defaults.
+//
+// D3D12_TEXTURE_ADDRESS_MODE (d3d12.h) is 0-based:
+//   WRAP=0, MIRROR=1, CLAMP=2, BORDER=3, MIRROR_ONCE=4.
+// (The 1-based family is D3D11's legacy SAMPLER_ADDRESS_MODE — D3D12 is
+// 0-based, and values outside 0..=4 are undefined.)
+const D3D12_TEXTURE_ADDRESS_MODE_WRAP: u32 = 0;
+const D3D12_TEXTURE_ADDRESS_MODE_MIRROR: u32 = 1;
+const D3D12_TEXTURE_ADDRESS_MODE_CLAMP: u32 = 2;
+const D3D12_TEXTURE_ADDRESS_MODE_BORDER: u32 = 3;
+const D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE: u32 = 4;
+
+fn d3d12_texture_address_mode_name(mode: u32) -> Option<&'static str> {
+    match mode {
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP => Some("WRAP"),
+        D3D12_TEXTURE_ADDRESS_MODE_MIRROR => Some("MIRROR"),
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP => Some("CLAMP"),
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER => Some("BORDER"),
+        D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE => Some("MIRROR_ONCE"),
+        _ => None, // undefined per d3d12.h — validation error
+    }
+}
+
+fn exec_d3d12_texture_address_mode(input: &Value) -> Value {
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let name = d3d12_texture_address_mode_name(mode);
+    json!({
+        "mode": mode,
+        "name": name,
+        "valid": name.is_some(),
+    })
+}
+
+// D3D12_FILTER_REDUCTION_TYPE (d3d12.h):
+//   STANDARD=0, COMPARISON=1, MINIMUM=2, MAXIMUM=3.
+// Values outside 0..=3 are undefined — a validation error.
+const D3D12_FILTER_REDUCTION_TYPE_STANDARD: u32 = 0;
+const D3D12_FILTER_REDUCTION_TYPE_COMPARISON: u32 = 1;
+const D3D12_FILTER_REDUCTION_TYPE_MINIMUM: u32 = 2;
+const D3D12_FILTER_REDUCTION_TYPE_MAXIMUM: u32 = 3;
+
+// The D3D12_FILTER bit layout (d3d12.h macros D3D12_FILTER_TYPE_MASK/SHIFT,
+// D3D12_FILTER_ANISOTROPIC_SHIFT, D3D12_FILTER_REDUCTION_TYPE_SHIFT):
+//   mip filter bits 0-1, mag filter bits 2-3, min filter bits 4-5,
+//   anisotropic bit 6, reduction type bits 7-8.
+// Ground truth from the named constants:
+//   D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x1        -> mip at bits 0-1
+//   D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x4  -> mag at bits 2-3
+//   D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10       -> min at bits 4-5
+//   D3D12_FILTER_ANISOTROPIC = 0x55                    -> bit 6
+//   COMPARISON=0x80 / MINIMUM=0x100 / MAXIMUM=0x180    -> reduction bits 7-8
+fn d3d12_filter_reduction_name(reduction: u32) -> Option<&'static str> {
+    match reduction {
+        D3D12_FILTER_REDUCTION_TYPE_STANDARD => Some("STANDARD"),
+        D3D12_FILTER_REDUCTION_TYPE_COMPARISON => Some("COMPARISON"),
+        D3D12_FILTER_REDUCTION_TYPE_MINIMUM => Some("MINIMUM"),
+        D3D12_FILTER_REDUCTION_TYPE_MAXIMUM => Some("MAXIMUM"),
+        _ => None,
+    }
+}
+
+fn exec_d3d12_filter_reduction(input: &Value) -> Value {
+    let value = input
+        .get("value")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let name = d3d12_filter_reduction_name(value);
+    json!({
+        "value": value,
+        "name": name,
+        "valid": name.is_some(),
+        "bit_layout": {
+            "mip_filter_bits": [0, 1],
+            "mag_filter_bits": [2, 3],
+            "min_filter_bits": [4, 5],
+            "anisotropic_bit": 6,
+            "reduction_bits": [7, 8],
+        },
+    })
+}
+
+// Every named D3D12_FILTER value with its d3d12.h name. The D3D12_FILTER
+// enum has exactly these 36 members (4 families × 8 filter combos + the
+// four ANISOTROPIC variants). Values not in this table are undefined — a
+// validation error on Windows.
+const D3D12_FILTER_NAMES: &[(u32, &str)] = &[
+    (0x0000_0000, "D3D12_FILTER_MIN_MAG_MIP_POINT"),
+    (0x0000_0001, "D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0004, "D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0005, "D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0010, "D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT"),
+    (0x0000_0011, "D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0014, "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0015, "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0055, "D3D12_FILTER_ANISOTROPIC"),
+    (0x0000_0080, "D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT"),
+    (0x0000_0081, "D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0084, "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0085, "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0090, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT"),
+    (0x0000_0091, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0094, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0095, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_00d5, "D3D12_FILTER_COMPARISON_ANISOTROPIC"),
+    (0x0000_0100, "D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT"),
+    (0x0000_0101, "D3D12_FILTER_MINIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0104, "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0105, "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0110, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+    (0x0000_0111, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0114, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0115, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0155, "D3D12_FILTER_MINIMUM_ANISOTROPIC"),
+    (0x0000_0180, "D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT"),
+    (0x0000_0181, "D3D12_FILTER_MAXIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0184, "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0185, "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_0190, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+    (0x0000_0191, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+    (0x0000_0194, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+    (0x0000_0195, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (0x0000_01d5, "D3D12_FILTER_MAXIMUM_ANISOTROPIC"),
+];
+
+/// Decompose a D3D12_FILTER value per the d3d12.h bit layout. The min/mag/
+/// mip fields are 0=POINT, 1=LINEAR (the only values any named filter
+/// uses); the reduction field is the 2-bit D3D12_FILTER_REDUCTION_TYPE.
+fn d3d12_filter_decomposition(filter: u32) -> (u32, u32, u32, bool, u32) {
+    let min = (filter >> 4) & 0x3;
+    let mag = (filter >> 2) & 0x3;
+    let mip = filter & 0x3;
+    let anisotropic = (filter >> 6) & 0x1 != 0;
+    let reduction = (filter >> 7) & 0x3;
+    (min, mag, mip, anisotropic, reduction)
+}
+
+fn exec_d3d12_filter_translation(input: &Value) -> Value {
+    let filter = input
+        .get("filter")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let name = D3D12_FILTER_NAMES
+        .iter()
+        .find(|(value, _)| *value == filter)
+        .map(|(_, name)| *name);
+    let (min, mag, mip, anisotropic, reduction) = d3d12_filter_decomposition(filter);
+    let field = |value: u32| if value == 1 { "LINEAR" } else { "POINT" };
+    json!({
+        "filter": filter,
+        "name": name,
+        "min_filter": field(min),
+        "mag_filter": field(mag),
+        "mip_filter": field(mip),
+        "anisotropic": anisotropic,
+        "reduction": reduction,
+        "reduction_name": d3d12_filter_reduction_name(reduction),
+        "valid": name.is_some(),
+    })
 }

@@ -625,7 +625,7 @@ fn t35_23_d3d12_aliasing_barrier() {
 /// DXGI_FORMAT_UNKNOWN (0) maps exactly to the `Unknown` representation.
 #[test]
 fn t35_24_dxgi_format_unknown() {
-    let fmt = DxgiFormat::from_u32(0);
+    let fmt = DxgiFormat::from_u32_diagnostics(0);
     assert_eq!(format!("{:?}", fmt), "Unknown");
 }
 
@@ -633,33 +633,37 @@ fn t35_24_dxgi_format_unknown() {
 #[test]
 fn t35_25_dxgi_format_common_values() {
     // R8G8B8A8_UNORM = 28
-    let fmt = DxgiFormat::from_u32(28);
+    let fmt = DxgiFormat::from_u32_diagnostics(28);
     assert_eq!(format!("{:?}", fmt), "R8G8B8A8Unorm");
 
     // B8G8R8A8_UNORM = 87
-    let fmt = DxgiFormat::from_u32(87);
+    let fmt = DxgiFormat::from_u32_diagnostics(87);
     assert_eq!(format!("{:?}", fmt), "B8G8R8A8Unorm");
 
     // D24_UNORM_S8_UINT = 45
-    let fmt = DxgiFormat::from_u32(45);
+    let fmt = DxgiFormat::from_u32_diagnostics(45);
     assert_eq!(format!("{:?}", fmt), "D24UnormS8Uint");
 
     // R32_FLOAT = 41
-    let fmt = DxgiFormat::from_u32(41);
+    let fmt = DxgiFormat::from_u32_diagnostics(41);
     assert_eq!(format!("{:?}", fmt), "R32Float");
 }
 
-/// Unknown format values fall through to the documented lossy fallback
-/// `R8G8B8A8Unorm`, and the fallback is recorded so it is observable.
+/// The diagnostics-only lossy mapping substitutes `R8G8B8A8Unorm` and
+/// records the fallback so it is observable. Production guest-facing paths
+/// must never call it: they use `from_u32_checked` (explicit error) or
+/// `translation_strategy` (explicit plan) instead.
 #[test]
-fn t35_26_dxgi_format_unknown_value_fallback() {
+fn t35_26_dxgi_format_unknown_value_diagnostics_only_fallback() {
     let before = DxgiFormat::format_fallback_count();
-    let fmt = DxgiFormat::from_u32(9999);
+    let fmt = DxgiFormat::from_u32_diagnostics(9999);
     assert_eq!(format!("{:?}", fmt), "R8G8B8A8Unorm");
     assert!(
         DxgiFormat::format_fallback_count() > before,
         "the lossy fallback must be recorded"
     );
+    // The checked production path never substitutes.
+    assert!(DxgiFormat::from_u32_checked(9999).is_err());
 }
 
 /// Formats without an exact representation are rejected by the checked

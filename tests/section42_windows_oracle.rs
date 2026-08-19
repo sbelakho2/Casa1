@@ -82,9 +82,515 @@ fn vector_corpus_is_versioned_and_deterministic() {
                     | "synchronization"
                     | "crt_printf"
                     | "thread_tls"
+                    | "d3d12_texture_address_mode"
+                    | "d3d12_filter_reduction"
+                    | "d3d12_filter_translation"
             ),
             "unexpected category {category}"
         );
+    }
+}
+
+/// The D3D12 enum categories carry the reference-derived differential
+/// corpus: every numeric input 0..=8 for the address-mode and reduction
+/// enums (including the undefined range), and every named D3D12_FILTER.
+#[test]
+fn d3d12_enum_corpus_covers_the_reference_derived_range() {
+    let vectors: Vec<Value> = {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("vectors.json");
+        run_oracle(&["vectors", "--out", path.to_str().expect("path")]);
+        let file: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse vectors");
+        file["vectors"].as_array().expect("vectors").clone()
+    };
+    let modes: Vec<u32> = vectors
+        .iter()
+        .filter(|vector| vector["category"] == "d3d12_texture_address_mode")
+        .filter_map(|vector| vector["input"]["mode"].as_u64().map(|mode| mode as u32))
+        .collect();
+    assert_eq!(modes, (0..=8).collect::<Vec<u32>>());
+    let reductions: Vec<u32> = vectors
+        .iter()
+        .filter(|vector| vector["category"] == "d3d12_filter_reduction")
+        .filter_map(|vector| vector["input"]["value"].as_u64().map(|value| value as u32))
+        .collect();
+    assert_eq!(reductions, (0..=8).collect::<Vec<u32>>());
+    let filters: Vec<u64> = vectors
+        .iter()
+        .filter(|vector| vector["category"] == "d3d12_filter_translation")
+        .filter_map(|vector| vector["input"]["filter"].as_u64())
+        .collect();
+    // 36 named D3D12_FILTER members (4 families x 8 combos + 4 aniso).
+    assert_eq!(filters.len(), 36);
+    assert_eq!(
+        filters
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        36,
+        "filter vectors must be unique"
+    );
+}
+
+/// The Casa1 runtime's D3D12 enum mapping must match the reference-derived
+/// truth (d3d12.h) on every vector of the three D3D12 categories. The truth
+/// file below is built from the documented d3d12.h facts — the same facts
+/// the Windows reference executable hardcodes — so this end-to-end run
+/// proves the differential machinery passes exactly when the runtime agrees
+/// with Windows.
+#[test]
+fn d3d12_enum_runtime_matches_reference_derived_truth() {
+    let temp = TempDir::new().expect("temp dir");
+    let vectors_path = temp.path().join("d3d12-vectors.json");
+    let truth_path = temp.path().join("d3d12-truth.json");
+    let (status, _) = run_oracle(&[
+        "vectors",
+        "--out",
+        vectors_path.to_str().expect("path"),
+        "--categories",
+        "d3d12_texture_address_mode,d3d12_filter_reduction,d3d12_filter_translation",
+    ]);
+    assert!(status.success());
+    let vector_file: Value =
+        serde_json::from_slice(&std::fs::read(&vectors_path).expect("read vectors"))
+            .expect("parse vectors");
+    let results: Vec<Value> = vector_file["vectors"]
+        .as_array()
+        .expect("vectors")
+        .iter()
+        .map(reference_derived_truth)
+        .collect();
+    let truth_file = serde_json::json!({
+        "schema_version": 1,
+        "capture": {
+            "source": "windows",
+            "captured_by": "casa1-windows-reference",
+            "captured_on": "windows-10-11",
+            "capture_date": "model-generated",
+            "note": "REFERENCE-DERIVED d3d12.h truth for the section42 differential test"
+        },
+        "results": results,
+    });
+    std::fs::write(
+        &truth_path,
+        serde_json::to_vec_pretty(&truth_file).expect("encode truth"),
+    )
+    .expect("write truth");
+    let (status, stdout) = run_oracle(&[
+        "compare",
+        "--vectors",
+        vectors_path.to_str().expect("path"),
+        "--results",
+        truth_path.to_str().expect("path"),
+    ]);
+    assert!(
+        status.success(),
+        "runtime must match the reference-derived d3d12.h truth:\n{stdout}"
+    );
+    let report = compare_report(&stdout);
+    assert_eq!(report["diff_count"].as_u64(), Some(0));
+}
+
+/// The reference-derived d3d12.h truth for one vector — the same facts the
+/// Windows reference executable hardcodes (0-based address modes, the four
+/// reduction types, the D3D12_FILTER bit layout, the 36 named filters).
+fn reference_derived_truth(vector: &Value) -> Value {
+    let category = vector["category"].as_str().expect("category");
+    let input = &vector["input"];
+    match category {
+        "d3d12_texture_address_mode" => {
+            let mode = input["mode"].as_u64().expect("mode") as u32;
+            let name = match mode {
+                0 => Some("WRAP"),
+                1 => Some("MIRROR"),
+                2 => Some("CLAMP"),
+                3 => Some("BORDER"),
+                4 => Some("MIRROR_ONCE"),
+                _ => None,
+            };
+            serde_json::json!({
+                "id": vector["id"],
+                "category": category,
+                "output": {
+                    "mode": mode,
+                    "name": name,
+                    "valid": name.is_some(),
+                },
+            })
+        }
+        "d3d12_filter_reduction" => {
+            let value = input["value"].as_u64().expect("value") as u32;
+            let name = match value {
+                0 => Some("STANDARD"),
+                1 => Some("COMPARISON"),
+                2 => Some("MINIMUM"),
+                3 => Some("MAXIMUM"),
+                _ => None,
+            };
+            serde_json::json!({
+                "id": vector["id"],
+                "category": category,
+                "output": {
+                    "value": value,
+                    "name": name,
+                    "valid": name.is_some(),
+                    "bit_layout": {
+                        "mip_filter_bits": [0, 1],
+                        "mag_filter_bits": [2, 3],
+                        "min_filter_bits": [4, 5],
+                        "anisotropic_bit": 6,
+                        "reduction_bits": [7, 8],
+                    },
+                },
+            })
+        }
+        "d3d12_filter_translation" => {
+            let filter = input["filter"].as_u64().expect("filter") as u32;
+            let (name, min, mag, mip, aniso, reduction, reduction_name) = match filter {
+                0x0000_0000 => (
+                    Some("D3D12_FILTER_MIN_MAG_MIP_POINT"),
+                    "POINT",
+                    "POINT",
+                    "POINT",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0001 => (
+                    Some("D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR"),
+                    "POINT",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0004 => (
+                    Some("D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+                    "POINT",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0005 => (
+                    Some("D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+                    "POINT",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0010 => (
+                    Some("D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT"),
+                    "LINEAR",
+                    "POINT",
+                    "POINT",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0011 => (
+                    Some("D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+                    "LINEAR",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0014 => (
+                    Some("D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+                    "LINEAR",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0015 => (
+                    Some("D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0055 => (
+                    Some("D3D12_FILTER_ANISOTROPIC"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    true,
+                    0,
+                    "STANDARD",
+                ),
+                0x0000_0080 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT"),
+                    "POINT",
+                    "POINT",
+                    "POINT",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0081 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR"),
+                    "POINT",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0084 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+                    "POINT",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0085 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+                    "POINT",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0090 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT"),
+                    "LINEAR",
+                    "POINT",
+                    "POINT",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0091 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+                    "LINEAR",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0094 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+                    "LINEAR",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0095 => (
+                    Some("D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_00d5 => (
+                    Some("D3D12_FILTER_COMPARISON_ANISOTROPIC"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    true,
+                    1,
+                    "COMPARISON",
+                ),
+                0x0000_0100 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT"),
+                    "POINT",
+                    "POINT",
+                    "POINT",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0101 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+                    "POINT",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0104 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+                    "POINT",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0105 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+                    "POINT",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0110 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+                    "LINEAR",
+                    "POINT",
+                    "POINT",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0111 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+                    "LINEAR",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0114 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+                    "LINEAR",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0115 => (
+                    Some("D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0155 => (
+                    Some("D3D12_FILTER_MINIMUM_ANISOTROPIC"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    true,
+                    2,
+                    "MINIMUM",
+                ),
+                0x0000_0180 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT"),
+                    "POINT",
+                    "POINT",
+                    "POINT",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0181 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_MAG_POINT_MIP_LINEAR"),
+                    "POINT",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0184 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
+                    "POINT",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0185 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+                    "POINT",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0190 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_MIP_POINT"),
+                    "LINEAR",
+                    "POINT",
+                    "POINT",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0191 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
+                    "LINEAR",
+                    "POINT",
+                    "LINEAR",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0194 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
+                    "LINEAR",
+                    "LINEAR",
+                    "POINT",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_0195 => (
+                    Some("D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    false,
+                    3,
+                    "MAXIMUM",
+                ),
+                0x0000_01d5 => (
+                    Some("D3D12_FILTER_MAXIMUM_ANISOTROPIC"),
+                    "LINEAR",
+                    "LINEAR",
+                    "LINEAR",
+                    true,
+                    3,
+                    "MAXIMUM",
+                ),
+                _ => panic!("unexpected filter vector {filter:#x}"),
+            };
+            serde_json::json!({
+                "id": vector["id"],
+                "category": category,
+                "output": {
+                    "filter": filter,
+                    "name": name,
+                    "min_filter": min,
+                    "mag_filter": mag,
+                    "mip_filter": mip,
+                    "anisotropic": aniso,
+                    "reduction": reduction,
+                    "reduction_name": reduction_name,
+                    "valid": name.is_some(),
+                },
+            })
+        }
+        _ => panic!("unexpected category {category}"),
     }
 }
 

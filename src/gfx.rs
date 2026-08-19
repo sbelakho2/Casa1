@@ -99,35 +99,31 @@ pub enum FormatTranslation {
     Unsupported,
 }
 
-/// Number of times the lossy [`DxgiFormat::from_u32`] fallback has silently
-/// substituted [`DXGI_FORMAT_FALLBACK`] for a raw value that
+/// Number of times the lossy [`DxgiFormat::from_u32_diagnostics`] fallback
+/// has substituted [`DXGI_FORMAT_FALLBACK`] for a raw value that
 /// [`from_u32_checked`](Self::from_u32_checked) rejected. Observable so that
-/// silent substitution is never invisible.
+/// substitution is never invisible.
 static DXGI_FORMAT_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The raw value substituted by the lossy fallback, for diagnostics.
+/// The raw value substituted by the diagnostics-only fallback.
 pub const DXGI_FORMAT_FALLBACK: DxgiFormat = DxgiFormat::R8G8B8A8Unorm;
 
 impl DxgiFormat {
-    /// Map a raw `DXGI_FORMAT` enum value (as passed by the guest) to its
-    /// exact [`DxgiFormat`] representation.
+    /// DIAGNOSTICS-ONLY lossy mapping of a raw `DXGI_FORMAT` enum value.
     ///
-    /// The table is **exact identity only**: every DXGI format value with a
-    /// semantically exact representation maps to that representation, and
-    /// nothing else. Values that have no exact representation (typeless,
-    /// SINT/SNORM variants without a variant, YUV/video, BC6H, palette and
-    /// other non-native formats) are **not** substituted with a "closest"
-    /// format — the bit width, numerical interpretation, compression format
-    /// and shader-visible values of such substitutions are never acceptable.
-    /// Use [`translation_strategy`](Self::translation_strategy) to learn the
-    /// explicit translation plan for any DXGI value, and
-    /// [`from_u32_checked`](Self::from_u32_checked) when a non-exact value
-    /// must be rejected instead of silently replaced.
+    /// Production guest-facing paths must NEVER call this: an unsupported
+    /// format is substituted with [`DXGI_FORMAT_FALLBACK`]
+    /// (R8G8B8A8Unorm), which silently changes the bit width, numerical
+    /// interpretation, compression format and shader-visible values of the
+    /// resource. Every production caller uses
+    /// [`from_u32_checked`](Self::from_u32_checked) (explicit error) or
+    /// [`translation_strategy`](Self::translation_strategy) (explicit plan).
     ///
-    /// The lossy wrapper records every fallback in a counter (see
-    /// [`format_fallback_count`](Self::format_fallback_count)) so silent
+    /// This wrapper exists only for diagnostics and test convenience, and
+    /// every fallback it makes is recorded in a counter (see
+    /// [`format_fallback_count`](Self::format_fallback_count)) so the
     /// substitution is observable.
-    pub fn from_u32(value: u32) -> Self {
+    pub fn from_u32_diagnostics(value: u32) -> Self {
         match Self::from_u32_checked(value) {
             Ok(format) => format,
             Err(_) => {
@@ -137,7 +133,8 @@ impl DxgiFormat {
         }
     }
 
-    /// Number of lossy fallback substitutions recorded by [`from_u32`](Self::from_u32).
+    /// Number of lossy fallback substitutions recorded by
+    /// [`from_u32_diagnostics`](Self::from_u32_diagnostics).
     pub fn format_fallback_count() -> u64 {
         DXGI_FORMAT_FALLBACK_COUNT.load(Ordering::Relaxed)
     }
@@ -884,6 +881,130 @@ pub struct D3D12StaticSamplerDesc {
     pub max_lod: f32,
     pub shader_visibility: D3D12ShaderVisibility,
 }
+
+/// D3D12_TEXTURE_ADDRESS_MODE per d3d12.h — the 0-based enumeration
+/// `0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE`. (The 1-based
+/// family is D3D11's legacy SAMPLER_ADDRESS_MODE; D3D12 is 0-based.)
+/// Values outside `0..=4` are undefined and a validation error on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12TextureAddressMode {
+    Wrap,
+    Mirror,
+    Clamp,
+    Border,
+    MirrorOnce,
+}
+
+impl D3D12TextureAddressMode {
+    /// Decode a raw D3D12_TEXTURE_ADDRESS_MODE value; `None` for every
+    /// value outside `0..=4` (undefined per d3d12.h — validation error).
+    pub fn from_u32(mode: u32) -> Option<Self> {
+        match mode {
+            0 => Some(Self::Wrap),
+            1 => Some(Self::Mirror),
+            2 => Some(Self::Clamp),
+            3 => Some(Self::Border),
+            4 => Some(Self::MirrorOnce),
+            _ => None,
+        }
+    }
+
+    /// The D3D12 enum member name as d3d12.h defines it.
+    pub fn d3d12_name(self) -> &'static str {
+        match self {
+            Self::Wrap => "WRAP",
+            Self::Mirror => "MIRROR",
+            Self::Clamp => "CLAMP",
+            Self::Border => "BORDER",
+            Self::MirrorOnce => "MIRROR_ONCE",
+        }
+    }
+
+    /// The closest Metal address mode for each D3D12 mode. Metal has no
+    /// `mirror_once` mode, so MIRROR_ONCE maps to `mirror_clamp_to_edge`.
+    pub fn metal_name(self) -> &'static str {
+        match self {
+            Self::Wrap => "repeat",
+            Self::Mirror => "mirror_repeat",
+            Self::Clamp => "clamp_to_edge",
+            Self::Border => "clamp_to_border",
+            Self::MirrorOnce => "mirror_clamp_to_edge",
+        }
+    }
+}
+
+/// D3D12_FILTER_REDUCTION_TYPE per d3d12.h — the reduction field of
+/// D3D12_FILTER (bits 7-8): `0=STANDARD, 1=COMPARISON, 2=MINIMUM, 3=MAXIMUM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12FilterReduction {
+    Standard,
+    Comparison,
+    Minimum,
+    Maximum,
+}
+
+impl D3D12FilterReduction {
+    /// Decode a raw D3D12_FILTER_REDUCTION_TYPE value; `None` for values
+    /// outside `0..=3` (undefined per d3d12.h — validation error).
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Standard),
+            1 => Some(Self::Comparison),
+            2 => Some(Self::Minimum),
+            3 => Some(Self::Maximum),
+            _ => None,
+        }
+    }
+
+    /// The D3D12 enum member name as d3d12.h defines it.
+    pub fn d3d12_name(self) -> &'static str {
+        match self {
+            Self::Standard => "STANDARD",
+            Self::Comparison => "COMPARISON",
+            Self::Minimum => "MINIMUM",
+            Self::Maximum => "MAXIMUM",
+        }
+    }
+
+    /// The raw D3D12_FILTER_REDUCTION_TYPE value.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::Standard => 0,
+            Self::Comparison => 1,
+            Self::Minimum => 2,
+            Self::Maximum => 3,
+        }
+    }
+}
+
+/// The documented D3D12_FILTER bit layout (d3d12.h): mip filter bits 0-1,
+/// mag filter bits 2-3, min filter bits 4-5, anisotropic bit 6, reduction
+/// type bits 7-8. Ground truth from the named constants:
+/// `D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x1` (mip at bits 0-1),
+/// `D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x4` (mag at bits 2-3),
+/// `D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10` (min at bits 4-5),
+/// `D3D12_FILTER_ANISOTROPIC = 0x55` (bit 6),
+/// `D3D12_FILTER_COMPARISON_* = 0x80` / `MINIMUM_* = 0x100` /
+/// `MAXIMUM_* = 0x180` (reduction at bits 7-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12FilterBitLayout {
+    pub mip_filter_bits: (u32, u32),
+    pub mag_filter_bits: (u32, u32),
+    pub min_filter_bits: (u32, u32),
+    pub anisotropic_bit: u32,
+    pub reduction_bits: (u32, u32),
+}
+
+/// The D3D12_FILTER bit layout as d3d12.h documents it.
+pub const D3D12_FILTER_BIT_LAYOUT: D3D12FilterBitLayout = D3D12FilterBitLayout {
+    mip_filter_bits: (0, 1),
+    mag_filter_bits: (2, 3),
+    min_filter_bits: (4, 5),
+    anisotropic_bit: 6,
+    reduction_bits: (7, 8),
+};
 
 /// A single root parameter (descriptor table, root descriptor, or root constant).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3996,6 +4117,19 @@ mod tests {
     }
 
     #[test]
+    fn dxgi_format_unsupported_via_checked_errors_and_never_substitutes() {
+        // The production checked path must never substitute the lossy
+        // fallback R8G8B8A8Unorm (or anything else) for an unsupported
+        // format: the call fails with an explicit error instead.
+        for raw in [49, 65, 66, 94, 103, 9999, u32::MAX] {
+            let error = DxgiFormat::from_u32_checked(raw)
+                .err()
+                .unwrap_or_else(|| panic!("DXGI_FORMAT {raw} must be rejected"));
+            assert_eq!(error.code, ReasonCode::RcGfxFormatUnsupported);
+        }
+    }
+
+    #[test]
     fn dxgi_format_translation_strategy_table_is_explicit() {
         assert_eq!(
             DxgiFormat::translation_strategy(1),
@@ -4050,7 +4184,7 @@ mod tests {
     #[test]
     fn dxgi_format_lossy_fallback_is_recorded() {
         let before = DxgiFormat::format_fallback_count();
-        let format = DxgiFormat::from_u32(9999);
+        let format = DxgiFormat::from_u32_diagnostics(9999);
         assert_eq!(format, DXGI_FORMAT_FALLBACK);
         assert_eq!(format, DxgiFormat::R8G8B8A8Unorm);
         assert!(
