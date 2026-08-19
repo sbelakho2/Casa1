@@ -5194,6 +5194,25 @@ pub fn execute_with_options(
                 None,
                 "first block dispatch of the PE main loop",
             ));
+            // A steamwebhelper child PE records its process-started evidence
+            // IMMEDIATELY at FIRST block dispatch (never at child completion)
+            // into the process-wide MILESTONES static: an in-process child's
+            // start is already visible to the parent's snapshot, and an
+            // out-of-process child runner's artifact carries the evidence
+            // from the first dispatched block onward (the artifact remains
+            // the child's vehicle, but it never depends on the child having
+            // completed).  Guarded to the first dispatch: the milestone
+            // counter must not grow per-iteration.
+            if block_count == 1 && crate::runner::is_webhelper_program(program) {
+                crate::steam_milestones::note_webhelper_process_started(
+                    runtime.milestone_evidence(
+                        state,
+                        "block dispatch",
+                        None,
+                        "first block dispatch of the steamwebhelper child PE",
+                    ),
+                );
+            }
             // ── Host-side block-dispatch safepoint ───────────────────────────
             // Every SAFEPOINT_INTERVAL_MS (2 ms) of wall-clock time, service the
             // guest scheduler between dispatched blocks: pump a pending guest
