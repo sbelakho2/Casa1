@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 // ── Memory-access helpers called from JIT-compiled code ─────────────────────
@@ -19,14 +19,25 @@ use std::sync::{LazyLock, Mutex};
 // These `extern "C"` functions provide safe MemoryImage access to JIT-compiled
 // blocks.  Instead of a fragile flat-memory mirror (which caused host-SP/state
 // corruption), JIT code computes the effective guest address into a register
-// and `BL`s one of these helpers, passing the MemoryImage pointer (x2 at block
-// entry) and the address.  The helpers return 0 on unmapped reads (and the
-// caller's exit path will detect the unmapped page via a subsequent check).
+// and `BL`s one of these helpers, passing the CpuState pointer (x0 at block
+// entry) and the address.
 //
-// ABI: helper(memory: *mut MemoryImage, address: u64) -> u64
+// Fault channel: a failed guest read must NEVER surface as a successful
+// zero-valued read.  `jit_helper_load` records the faulting address in
+// `CpuState::jit_pending_fault` and returns 0; the dispatcher
+// (`CpuEngine::execute_with_jit` in cpu.rs) checks the marker after the
+// compiled block returns and converts it into the same "unmapped guest
+// memory" error the interpreter produces, which the caller then annotates
+// via `annotate_guest_fault` exactly like an interpreter fault.
+//
+// ABI: helper(state: *mut CpuState, memory: *mut MemoryImage, address: u64,
+// width: u64) -> u64
 
-/// Read 1/2/4/8 bytes from guest memory.  Returns the zero-extended value,
-/// or 0 if the address is unmapped.
+/// Read 1/2/4/8 bytes from guest memory.  Returns the zero-extended value.
+/// On an unmapped address, records the fault in `state.jit_pending_fault` and
+/// returns 0 — the dispatcher converts the marker into a guest access
+/// violation error, so an unmapped read is never treated as a successful read
+/// of zero.
 ///
 /// # Safety
 ///
@@ -35,6 +46,7 @@ use std::sync::{LazyLock, Mutex};
 /// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_helper_load(
+    state: *mut CpuState,
     memory: *mut MemoryImage,
     address: u64,
     width: u64,
@@ -43,11 +55,22 @@ pub unsafe extern "C" fn jit_helper_load(
         return 0;
     }
     let mem = unsafe { &*memory };
-    match width {
-        1 => mem.read_u8(address).map(u64::from).unwrap_or(0),
-        2 => mem.read_u16(address).map(u64::from).unwrap_or(0),
-        4 => mem.read_u32(address).map(u64::from).unwrap_or(0),
-        _ => mem.read_u64(address).unwrap_or(0),
+    let result = match width {
+        1 => mem.read_u8(address).map(u64::from),
+        2 => mem.read_u16(address).map(u64::from),
+        4 => mem.read_u32(address).map(u64::from),
+        _ => mem.read_u64(address),
+    };
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            // Guest access violation: remember the faulting address for the
+            // dispatcher instead of silently fabricating a zero read.
+            if !state.is_null() {
+                unsafe { (*state).jit_pending_fault = Some(address) };
+            }
+            0
+        }
     }
 }
 
@@ -164,14 +187,19 @@ pub unsafe extern "C" fn jit_helper_set_flags(
     s.flags.sf = r & msb != 0;
     s.flags.pf = parity_byte(r as u8);
     match op {
-        0 | 3 => {
+        0 => {
+            // add: CF = unsigned wrap of the width-masked sum.  `sum < a` on
+            // the masked operands works for every width including 64 (where
+            // `sum > mask` is never true).
             let sum = a.wrapping_add(b);
-            s.flags.cf = bits < 64 && sum > mask;
+            s.flags.cf = sum < a;
             let (sa, sb, sr) = (a & msb != 0, b & msb != 0, r & msb != 0);
             s.flags.of = sa == sb && sr != sa;
             s.flags.af = (a ^ b ^ r) & 0x10 != 0;
         }
-        1 => {
+        // sub and cmp are the same ALU operation: CMP computes the flags of a
+        // subtraction without storing the result.
+        1 | 3 => {
             s.flags.cf = a < b;
             let (sa, sb, sr) = (a & msb != 0, b & msb != 0, r & msb != 0);
             s.flags.of = sa != sb && sr != sa;
@@ -182,6 +210,678 @@ pub unsafe extern "C" fn jit_helper_set_flags(
             s.flags.of = false;
             s.flags.af = false;
         }
+    }
+}
+
+/// Number of `IrInstruction` variants — the size of the per-opcode JIT
+/// lowering telemetry arrays.
+pub const IR_OPCODE_COUNT: usize = 361;
+
+/// Per-opcode counters of IR instructions lowered to native ARM64 emission
+/// by [`JitCompiler::compile_instruction`].  Indexed by
+/// [`ir_opcode_index`]; incremented when a dedicated native emission arm
+/// completes (EXIT_UNIMPL early-returns are counted as neither native nor
+/// helper-fallback).
+pub static JIT_NATIVE_LOWERED: [AtomicU64; IR_OPCODE_COUNT] =
+    [const { AtomicU64::new(0) }; IR_OPCODE_COUNT];
+
+/// Per-opcode counters of IR instructions that fell back to the universal
+/// interpreter helper (`jit_helper_execute_insn`, which executes one
+/// instruction via `execute_ir_with_hashing`).  Indexed by
+/// [`ir_opcode_index`].
+pub static JIT_HELPER_FALLBACK: [AtomicU64; IR_OPCODE_COUNT] =
+    [const { AtomicU64::new(0) }; IR_OPCODE_COUNT];
+
+/// Stable opcode index for an [`IrInstruction`], in declaration order.
+/// The match is exhaustive over every variant so adding a variant without
+/// updating this table is a compile error.
+pub fn ir_opcode_index(insn: &IrInstruction) -> usize {
+    match insn {
+        IrInstruction::Cpuid => 0,
+        IrInstruction::Xgetbv => 1,
+        IrInstruction::MovImm { .. } => 2,
+        IrInstruction::MovImm8 { .. } => 3,
+        IrInstruction::MovReg { .. } => 4,
+        IrInstruction::MovReg8 { .. } => 5,
+        IrInstruction::MovdFromXmm { .. } => 6,
+        IrInstruction::NotMemory { .. } => 7,
+        IrInstruction::AddImm { .. } => 8,
+        IrInstruction::AddReg8 { .. } => 9,
+        IrInstruction::AddReg8Op { .. } => 10,
+        IrInstruction::AddMemory8 { .. } => 11,
+        IrInstruction::AddOperand { .. } => 12,
+        IrInstruction::AddMemory { .. } => 13,
+        IrInstruction::AddImmMemory { .. } => 14,
+        IrInstruction::AdcOperand { .. } => 15,
+        IrInstruction::AdcReg8Op { .. } => 16,
+        IrInstruction::AdcMemory { .. } => 17,
+        IrInstruction::AdcMemory8 { .. } => 18,
+        IrInstruction::AdcImm { .. } => 19,
+        IrInstruction::AdcImm8 { .. } => 20,
+        IrInstruction::AddImm8 { .. } => 21,
+        IrInstruction::AdcImmMemory { .. } => 22,
+        IrInstruction::OrImm { .. } => 23,
+        IrInstruction::OrImm8 { .. } => 24,
+        IrInstruction::AndImm8 { .. } => 25,
+        IrInstruction::OrImmMemory { .. } => 26,
+        IrInstruction::SubImm { .. } => 27,
+        IrInstruction::SubImm8 { .. } => 28,
+        IrInstruction::SubImmMemory { .. } => 29,
+        IrInstruction::AndImm { .. } => 30,
+        IrInstruction::AndImmMemory { .. } => 31,
+        IrInstruction::AndReg { .. } => 32,
+        IrInstruction::AndMemory { .. } => 33,
+        IrInstruction::RolImm { .. } => 34,
+        IrInstruction::RorImm { .. } => 35,
+        IrInstruction::RclImm { .. } => 36,
+        IrInstruction::RcrImm { .. } => 37,
+        IrInstruction::RolImmMemory { .. } => 38,
+        IrInstruction::RorImmMemory { .. } => 39,
+        IrInstruction::RclImmMemory { .. } => 40,
+        IrInstruction::RcrImmMemory { .. } => 41,
+        IrInstruction::ShlImm { .. } => 42,
+        IrInstruction::ShrImm { .. } => 43,
+        IrInstruction::SarImm { .. } => 44,
+        IrInstruction::ShlImmMemory { .. } => 45,
+        IrInstruction::ShrImmMemory { .. } => 46,
+        IrInstruction::SarImmMemory { .. } => 47,
+        IrInstruction::RolCl { .. } => 48,
+        IrInstruction::RclCl { .. } => 49,
+        IrInstruction::RcrCl { .. } => 50,
+        IrInstruction::RolClMemory { .. } => 51,
+        IrInstruction::RorClMemory { .. } => 52,
+        IrInstruction::RclClMemory { .. } => 53,
+        IrInstruction::RcrClMemory { .. } => 54,
+        IrInstruction::ShlClMemory { .. } => 55,
+        IrInstruction::ShrClMemory { .. } => 56,
+        IrInstruction::SarClMemory { .. } => 57,
+        IrInstruction::ShlCl { .. } => 58,
+        IrInstruction::RorCl { .. } => 59,
+        IrInstruction::ShrCl { .. } => 60,
+        IrInstruction::SarCl { .. } => 61,
+        IrInstruction::ShldImm { .. } => 62,
+        IrInstruction::ShldCl { .. } => 63,
+        IrInstruction::ShrdImm { .. } => 64,
+        IrInstruction::ImulImm { .. } => 65,
+        IrInstruction::ImulReg { .. } => 66,
+        IrInstruction::MulAcc { .. } => 67,
+        IrInstruction::ImulAcc { .. } => 68,
+        IrInstruction::Div { .. } => 69,
+        IrInstruction::Idiv { .. } => 70,
+        IrInstruction::SubReg8 { .. } => 71,
+        IrInstruction::SbbReg8 { .. } => 72,
+        IrInstruction::NegReg { .. } => 73,
+        IrInstruction::NegReg8 { .. } => 74,
+        IrInstruction::NotReg { .. } => 75,
+        IrInstruction::NotReg8 { .. } => 76,
+        IrInstruction::Cdq { .. } => 77,
+        IrInstruction::Movs { .. } => 78,
+        IrInstruction::Stos { .. } => 79,
+        IrInstruction::Lods { .. } => 80,
+        IrInstruction::Cmps { .. } => 81,
+        IrInstruction::Scas { .. } => 82,
+        IrInstruction::Bound { .. } => 83,
+        IrInstruction::Hlt => 84,
+        IrInstruction::Cli => 85,
+        IrInstruction::Sti => 86,
+        IrInstruction::Std => 87,
+        IrInstruction::Ud2 => 88,
+        IrInstruction::Sahf => 89,
+        IrInstruction::Lahf => 90,
+        IrInstruction::SetCarryFlag { .. } => 91,
+        IrInstruction::ComplementCarryFlag => 92,
+        IrInstruction::PushAll => 93,
+        IrInstruction::PopAll => 94,
+        IrInstruction::LoadSegment { .. } => 95,
+        IrInstruction::PortIn { .. } => 96,
+        IrInstruction::PortOut { .. } => 97,
+        IrInstruction::MovFromDr { .. } => 98,
+        IrInstruction::MovToDr { .. } => 99,
+        IrInstruction::Fxsave { .. } => 100,
+        IrInstruction::Fxrstor { .. } => 101,
+        IrInstruction::Xsave { .. } => 102,
+        IrInstruction::Xrstor { .. } => 103,
+        IrInstruction::SubOperand { .. } => 104,
+        IrInstruction::SubMemory { .. } => 105,
+        IrInstruction::SubMemory8 { .. } => 106,
+        IrInstruction::SbbMemory { .. } => 107,
+        IrInstruction::SbbMemory8 { .. } => 108,
+        IrInstruction::SbbImm8 { .. } => 109,
+        IrInstruction::SbbImm { .. } => 110,
+        IrInstruction::SbbOperand { .. } => 111,
+        IrInstruction::Compare { .. } => 112,
+        IrInstruction::Test { .. } => 113,
+        IrInstruction::ExchangeRegisters { .. } => 114,
+        IrInstruction::ExchangeMemory { .. } => 115,
+        IrInstruction::ExchangeRegisters8 { .. } => 116,
+        IrInstruction::ExchangeMemory8 { .. } => 117,
+        IrInstruction::SignExtendTo64 { .. } => 118,
+        IrInstruction::SignExtend { .. } => 119,
+        IrInstruction::ZeroExtendTo64 { .. } => 120,
+        IrInstruction::XorImm { .. } => 121,
+        IrInstruction::XorImm8 { .. } => 122,
+        IrInstruction::XorImmMemory { .. } => 123,
+        IrInstruction::XorReg { .. } => 124,
+        IrInstruction::XorReg8 { .. } => 125,
+        IrInstruction::XorReg8Op { .. } => 126,
+        IrInstruction::XorMemory8 { .. } => 127,
+        IrInstruction::XorMemory { .. } => 128,
+        IrInstruction::OrReg { .. } => 129,
+        IrInstruction::OrMemory { .. } => 130,
+        IrInstruction::OrMemory8 { .. } => 131,
+        IrInstruction::AndReg8 { .. } => 132,
+        IrInstruction::AndReg8Op { .. } => 133,
+        IrInstruction::AndMemory8 { .. } => 134,
+        IrInstruction::BitTest { .. } => 135,
+        IrInstruction::BitTestImm { .. } => 136,
+        IrInstruction::OrReg8 { .. } => 137,
+        IrInstruction::OrReg8Op { .. } => 138,
+        IrInstruction::IncReg { .. } => 139,
+        IrInstruction::DecReg { .. } => 140,
+        IrInstruction::IncReg8 { .. } => 141,
+        IrInstruction::DecReg8 { .. } => 142,
+        IrInstruction::IncMemory { .. } => 143,
+        IrInstruction::DecMemory { .. } => 144,
+        IrInstruction::Cmov { .. } => 145,
+        IrInstruction::LoadMemory8 { .. } => 146,
+        IrInstruction::LoadMemory { .. } => 147,
+        IrInstruction::StoreMemory8 { .. } => 148,
+        IrInstruction::StoreMemory { .. } => 149,
+        IrInstruction::StoreImmediate { .. } => 150,
+        IrInstruction::Call { .. } => 151,
+        IrInstruction::CallRegister { .. } => 152,
+        IrInstruction::CallMemory { .. } => 153,
+        IrInstruction::JumpRegister { .. } => 154,
+        IrInstruction::JumpMemory { .. } => 155,
+        IrInstruction::Setcc { .. } => 156,
+        IrInstruction::SetccMemory { .. } => 157,
+        IrInstruction::JumpIf { .. } => 158,
+        IrInstruction::Jump { .. } => 159,
+        IrInstruction::Nop => 160,
+        IrInstruction::LoadEffectiveAddress { .. } => 161,
+        IrInstruction::PushReg { .. } => 162,
+        IrInstruction::PushMemory { .. } => 163,
+        IrInstruction::PushImm { .. } => 164,
+        IrInstruction::PushFlags { .. } => 165,
+        IrInstruction::PopReg { .. } => 166,
+        IrInstruction::PopMemory { .. } => 167,
+        IrInstruction::PopFlags { .. } => 168,
+        IrInstruction::Cld => 169,
+        IrInstruction::Leave => 170,
+        IrInstruction::Return { .. } => 171,
+        IrInstruction::Popcnt { .. } => 172,
+        IrInstruction::Lzcnt { .. } => 173,
+        IrInstruction::Bsf { .. } => 174,
+        IrInstruction::Bswap { .. } => 175,
+        IrInstruction::Rdtsc => 176,
+        IrInstruction::MovdToXmm { .. } => 177,
+        IrInstruction::Pshufd { .. } => 178,
+        IrInstruction::Pshuflw { .. } => 179,
+        IrInstruction::Psrldq { .. } => 180,
+        IrInstruction::Pslldq { .. } => 181,
+        IrInstruction::Movlhps { .. } => 182,
+        IrInstruction::StoreDwordFromXmm { .. } => 183,
+        IrInstruction::MoveXmm { .. } => 184,
+        IrInstruction::LoadXmm { .. } => 185,
+        IrInstruction::StoreXmm { .. } => 186,
+        IrInstruction::MoveVector { .. } => 187,
+        IrInstruction::LoadVector { .. } => 188,
+        IrInstruction::StoreVector { .. } => 189,
+        IrInstruction::Pxor { .. } => 190,
+        IrInstruction::VectorOr { .. } => 191,
+        IrInstruction::VectorAnd { .. } => 192,
+        IrInstruction::VectorAndNot { .. } => 193,
+        IrInstruction::VectorXor { .. } => 194,
+        IrInstruction::Paddd { .. } => 195,
+        IrInstruction::Paddq { .. } => 196,
+        IrInstruction::Psubd { .. } => 197,
+        IrInstruction::Pmulld { .. } => 198,
+        IrInstruction::VectorAddQ { .. } => 199,
+        IrInstruction::VectorIntOp { .. } => 200,
+        IrInstruction::VectorCompareEqBytes { .. } => 201,
+        IrInstruction::VectorMoveMaskBytes { .. } => 202,
+        IrInstruction::VzeroUpper => 203,
+        IrInstruction::X87ClearExceptions => 204,
+        IrInstruction::X87LoadInt32 { .. } => 205,
+        IrInstruction::X87LoadInt64 { .. } => 206,
+        IrInstruction::X87Load { .. } => 207,
+        IrInstruction::X87LoadControlWord { .. } => 208,
+        IrInstruction::X87NegateTop => 209,
+        IrInstruction::X87AddMemory { .. } => 210,
+        IrInstruction::X87MulMemory { .. } => 211,
+        IrInstruction::X87DivMemory { .. } => 212,
+        IrInstruction::X87Swap { .. } => 213,
+        IrInstruction::X87StoreControlWord { .. } => 214,
+        IrInstruction::X87Store { .. } => 215,
+        IrInstruction::X87StorePopRegister { .. } => 216,
+        IrInstruction::X87StorePop { .. } => 217,
+        IrInstruction::X87Compare { .. } => 218,
+        IrInstruction::X87Init => 219,
+        IrInstruction::LoadMxcsr { .. } => 220,
+        IrInstruction::StoreMxcsr { .. } => 221,
+        IrInstruction::Cvtpd2ps { .. } => 222,
+        IrInstruction::Cvtdq2pd { .. } => 223,
+        IrInstruction::Addsd { .. } => 224,
+        IrInstruction::Divss { .. } => 225,
+        IrInstruction::SseArith { .. } => 226,
+        IrInstruction::SseSqrt { .. } => 227,
+        IrInstruction::SseRcp { .. } => 228,
+        IrInstruction::SseRsqrt { .. } => 229,
+        IrInstruction::CvtIntToFloat { .. } => 230,
+        IrInstruction::CvtFloatToInt { .. } => 231,
+        IrInstruction::Ucomi { .. } => 232,
+        IrInstruction::Comiss { .. } => 233,
+        IrInstruction::Pcmpistri { .. } => 234,
+        IrInstruction::HaddPs { .. } => 235,
+        IrInstruction::Pshufb { .. } => 236,
+        IrInstruction::BlendD { .. } => 237,
+        IrInstruction::Crc32 { .. } => 238,
+        IrInstruction::Rdrand { .. } => 239,
+        IrInstruction::Rdseed { .. } => 240,
+        IrInstruction::Rdpmc { .. } => 241,
+        IrInstruction::Clflush { .. } => 242,
+        IrInstruction::Clflushopt { .. } => 243,
+        IrInstruction::Clwb { .. } => 244,
+        IrInstruction::Pcommit => 245,
+        IrInstruction::Xbegin { .. } => 246,
+        IrInstruction::Xend => 247,
+        IrInstruction::Xabort { .. } => 248,
+        IrInstruction::Xtest => 249,
+        IrInstruction::Encls => 250,
+        IrInstruction::Enclu => 251,
+        IrInstruction::SaveSsP { .. } => 252,
+        IrInstruction::Rstorssp { .. } => 253,
+        IrInstruction::Incssp { .. } => 254,
+        IrInstruction::Wrss { .. } => 255,
+        IrInstruction::Wruss { .. } => 256,
+        IrInstruction::BndmkReg { .. } => 257,
+        IrInstruction::BndmkMem { .. } => 258,
+        IrInstruction::BndclReg { .. } => 259,
+        IrInstruction::BndclMem { .. } => 260,
+        IrInstruction::BndcuReg { .. } => 261,
+        IrInstruction::BndcuMem { .. } => 262,
+        IrInstruction::BndcnReg { .. } => 263,
+        IrInstruction::BndcnMem { .. } => 264,
+        IrInstruction::BndmovReg { .. } => 265,
+        IrInstruction::BndmovMemLoad { .. } => 266,
+        IrInstruction::BndmovMemStore { .. } => 267,
+        IrInstruction::Andn { .. } => 268,
+        IrInstruction::Bextr { .. } => 269,
+        IrInstruction::Blsi { .. } => 270,
+        IrInstruction::Blsmsk { .. } => 271,
+        IrInstruction::Blsr { .. } => 272,
+        IrInstruction::Bzhi { .. } => 273,
+        IrInstruction::Mulx { .. } => 274,
+        IrInstruction::Pdep { .. } => 275,
+        IrInstruction::Pext { .. } => 276,
+        IrInstruction::Rorx { .. } => 277,
+        IrInstruction::Sarx { .. } => 278,
+        IrInstruction::Shrx { .. } => 279,
+        IrInstruction::Shlx { .. } => 280,
+        IrInstruction::LockCmpxchg { .. } => 281,
+        IrInstruction::CmpxchgRegisters { .. } => 282,
+        IrInstruction::LockCmpxchg8b { .. } => 283,
+        IrInstruction::LockXadd { .. } => 284,
+        IrInstruction::XaddRegisters { .. } => 285,
+        IrInstruction::Mfence => 286,
+        IrInstruction::X87LoadConst { .. } => 287,
+        IrInstruction::X87AddPop { .. } => 288,
+        IrInstruction::X87Mul { .. } => 289,
+        IrInstruction::X87DivRegister { .. } => 290,
+        IrInstruction::X87DivPop { .. } => 291,
+        IrInstruction::X87Add => 292,
+        IrInstruction::X87Div => 293,
+        IrInstruction::AdcReg8 { .. } => 294,
+        IrInstruction::Adcx { .. } => 295,
+        IrInstruction::Adox { .. } => 296,
+        IrInstruction::PopSeg { .. } => 297,
+        IrInstruction::FmaVector { .. } => 298,
+        IrInstruction::ShuffleF32 { .. } => 299,
+        IrInstruction::ShuffleF64 { .. } => 300,
+        IrInstruction::AlignD { .. } => 301,
+        IrInstruction::AlignQ { .. } => 302,
+        IrInstruction::InsertSubVector { .. } => 303,
+        IrInstruction::ExtractSubVector { .. } => 304,
+        IrInstruction::BroadcastSubVector { .. } => 305,
+        IrInstruction::BroadcastMask { .. } => 306,
+        IrInstruction::PermuteVarDq { .. } => 307,
+        IrInstruction::PermuteVarPsPd { .. } => 308,
+        IrInstruction::PermuteI2 { .. } => 309,
+        IrInstruction::PermuteT2 { .. } => 310,
+        IrInstruction::PermuteImm { .. } => 311,
+        IrInstruction::PermuteImm2Src { .. } => 312,
+        IrInstruction::AddPacked { .. } => 313,
+        IrInstruction::SubPacked { .. } => 314,
+        IrInstruction::MulPacked { .. } => 315,
+        IrInstruction::DivPacked { .. } => 316,
+        IrInstruction::MinPacked { .. } => 317,
+        IrInstruction::MaxPacked { .. } => 318,
+        IrInstruction::SqrtPacked { .. } => 319,
+        IrInstruction::ConvertPacked { .. } => 320,
+        IrInstruction::ConvertToInt { .. } => 321,
+        IrInstruction::ConvertFromInt { .. } => 322,
+        IrInstruction::ComparePacked { .. } => 323,
+        IrInstruction::FixupSpecial { .. } => 324,
+        IrInstruction::ExtractExponent { .. } => 325,
+        IrInstruction::ExtractMantissa { .. } => 326,
+        IrInstruction::ReducePrecision { .. } => 327,
+        IrInstruction::RangePacked { .. } => 328,
+        IrInstruction::ScaleByPower2 { .. } => 329,
+        IrInstruction::FloatClass { .. } => 330,
+        IrInstruction::Pternlog { .. } => 331,
+        IrInstruction::ConflictDetect { .. } => 332,
+        IrInstruction::CompressVector { .. } => 333,
+        IrInstruction::ExpandVector { .. } => 334,
+        IrInstruction::GatherVector { .. } => 335,
+        IrInstruction::ScatterVector { .. } => 336,
+        IrInstruction::Kand { .. } => 337,
+        IrInstruction::Kor { .. } => 338,
+        IrInstruction::Kxor { .. } => 339,
+        IrInstruction::Knot { .. } => 340,
+        IrInstruction::Kshiftl { .. } => 341,
+        IrInstruction::Kshiftr { .. } => 342,
+        IrInstruction::Kadd { .. } => 343,
+        IrInstruction::Ktest { .. } => 344,
+        IrInstruction::Kunpck { .. } => 345,
+        IrInstruction::AesEnc { .. } => 346,
+        IrInstruction::AesEncLast { .. } => 347,
+        IrInstruction::AesDec { .. } => 348,
+        IrInstruction::AesDecLast { .. } => 349,
+        IrInstruction::AesImc { .. } => 350,
+        IrInstruction::AesKeyGenAssist { .. } => 351,
+        IrInstruction::Pclmulqdq { .. } => 352,
+        IrInstruction::Sha1Rnds4 { .. } => 353,
+        IrInstruction::Sha1NextE { .. } => 354,
+        IrInstruction::Sha1Msg1 { .. } => 355,
+        IrInstruction::Sha1Msg2 { .. } => 356,
+        IrInstruction::Sha256Rnds2 { .. } => 357,
+        IrInstruction::Sha256Msg1 { .. } => 358,
+        IrInstruction::Sha256Msg2 { .. } => 359,
+        IrInstruction::Breakpoint => 360,
+    }
+}
+
+/// Snapshot the aggregate JIT lowering telemetry: `(native_lowered, helper_fallback)`.
+pub fn jit_lowering_telemetry() -> (u64, u64) {
+    let native = JIT_NATIVE_LOWERED
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .sum();
+    let fallback = JIT_HELPER_FALLBACK
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .sum();
+    (native, fallback)
+}
+
+// ── JIT helper semantic tests ───────────────────────────────────────────────
+//
+// The JIT is dormant on macOS 26 (MAP_JIT execution is blocked for
+// ad-hoc-signed binaries), but the host-side helpers are plain `extern "C"`
+// functions — these tests call `jit_helper_set_flags` / `jit_helper_load`
+// directly and check their semantics against the x86 truth table.
+
+#[cfg(test)]
+mod jit_helper_semantics {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ExpectedFlags {
+        zf: bool,
+        sf: bool,
+        pf: bool,
+        cf: bool,
+        of: bool,
+        af: bool,
+    }
+
+    fn width_mask(bits: u32) -> u64 {
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        }
+    }
+
+    fn even_low_byte_parity(value: u64) -> bool {
+        let low = value as u8;
+        (0..8).filter(|&i| low & (1 << i) != 0).count() % 2 == 0
+    }
+
+    /// x86 truth table for ADD, computed with plain overflowing addition on
+    /// the width-masked operands.
+    fn truth_add(lhs: u64, rhs: u64, bits: u32) -> ExpectedFlags {
+        let m = width_mask(bits);
+        let (a, b) = (lhs & m, rhs & m);
+        let (sum, carry) = a.overflowing_add(b);
+        let sum = sum & m;
+        let msb = 1u64 << (bits - 1);
+        ExpectedFlags {
+            zf: sum == 0,
+            sf: sum & msb != 0,
+            pf: even_low_byte_parity(sum),
+            cf: carry,
+            of: (a & msb != 0) == (b & msb != 0) && (sum & msb != 0) != (a & msb != 0),
+            af: (a ^ b ^ sum) & 0x10 != 0,
+        }
+    }
+
+    /// x86 truth table for SUB/CMP, computed with plain overflowing
+    /// subtraction on the width-masked operands.
+    fn truth_sub(lhs: u64, rhs: u64, bits: u32) -> ExpectedFlags {
+        let m = width_mask(bits);
+        let (a, b) = (lhs & m, rhs & m);
+        let (diff, _borrow) = a.overflowing_sub(b);
+        let diff = diff & m;
+        let msb = 1u64 << (bits - 1);
+        ExpectedFlags {
+            zf: diff == 0,
+            sf: diff & msb != 0,
+            pf: even_low_byte_parity(diff),
+            cf: a < b,
+            of: (a & msb != 0) != (b & msb != 0) && (diff & msb != 0) != (a & msb != 0),
+            af: (a ^ b ^ diff) & 0x10 != 0,
+        }
+    }
+
+    /// x86 truth table for logical ops (and/or/xor/test): carry/overflow/
+    /// auxiliary-carry are cleared.
+    fn truth_logic(result: u64, bits: u32) -> ExpectedFlags {
+        let r = result & width_mask(bits);
+        let msb = 1u64 << (bits - 1);
+        ExpectedFlags {
+            zf: r == 0,
+            sf: r & msb != 0,
+            pf: even_low_byte_parity(r),
+            cf: false,
+            of: false,
+            af: false,
+        }
+    }
+
+    fn call_set_flags(result: u64, lhs: u64, rhs: u64, op: u64, width: u64) -> ExpectedFlags {
+        let mut state = CpuState::new(GuestArch::X64);
+        unsafe { jit_helper_set_flags(&mut state, result, lhs, rhs, op, width) };
+        ExpectedFlags {
+            zf: state.flags.zf,
+            sf: state.flags.sf,
+            pf: state.flags.pf,
+            cf: state.flags.cf,
+            of: state.flags.of,
+            af: state.flags.af,
+        }
+    }
+
+    /// Assert add/sub/cmp/logic flag sets against the x86 truth table for one
+    /// (width, lhs, rhs) vector, and that cmp ≡ sub.
+    fn check_vector(name: &str, lhs: u64, rhs: u64, width: u64) {
+        let bits = (width * 8) as u32;
+        let m = width_mask(bits);
+        let (a, b) = (lhs & m, rhs & m);
+
+        // add
+        let sum = a.wrapping_add(b);
+        let got = call_set_flags(sum, a, b, 0, width);
+        assert_eq!(
+            got,
+            truth_add(a, b, bits),
+            "{name} (w={width}): add flags mismatch for {a:#x} + {b:#x}"
+        );
+
+        // sub
+        let diff = a.wrapping_sub(b);
+        let got_sub = call_set_flags(diff, a, b, 1, width);
+        assert_eq!(
+            got_sub,
+            truth_sub(a, b, bits),
+            "{name} (w={width}): sub flags mismatch for {a:#x} - {b:#x}"
+        );
+
+        // cmp — flags of a subtraction without storing the result
+        let got_cmp = call_set_flags(diff, a, b, 3, width);
+        assert_eq!(
+            got_cmp, got_sub,
+            "{name} (w={width}): cmp({a:#x}, {b:#x}) must produce identical flags to sub"
+        );
+
+        // logic
+        let logic = a & b;
+        let got_logic = call_set_flags(logic, a, b, 2, width);
+        assert_eq!(
+            got_logic,
+            truth_logic(logic, bits),
+            "{name} (w={width}): logic flags mismatch for {a:#x} & {b:#x}"
+        );
+    }
+
+    #[test]
+    fn jit_helper_set_flags_arithmetic_truth_table_vectors() {
+        // Every vector runs at every width; masked operands keep the
+        // semantics well-defined at 8/16/32/64 bits.
+        let vectors: &[(&str, u64, u64)] = &[
+            // 8-bit OF (0x7f + 1)
+            ("0x7f+1", 0x7f, 1),
+            // 8-bit CF+OF (0x80 + 0x80)
+            ("0x80+0x80", 0x80, 0x80),
+            // 8-bit CF (0xff + 1)
+            ("0xff+1", 0xff, 1),
+            // 16-bit OF (0x7fff + 1)
+            ("0x7fff+1", 0x7fff, 1),
+            // 16-bit CF+OF (0x8000 + 0x8000)
+            ("0x8000+0x8000", 0x8000, 0x8000),
+            // 32-bit OF (0x7fffffff + 1)
+            ("0x7fffffff+1", 0x7fff_ffff, 1),
+            // 32-bit CF+OF (0x80000000 + 0x80000000)
+            ("0x80000000+0x80000000", 0x8000_0000, 0x8000_0000),
+            // 64-bit OF (0x7fffffffffffffff + 1)
+            ("0x7fffffffffffffff+1", 0x7fff_ffff_ffff_ffff, 1),
+            // 64-bit CF+OF (0x8000000000000000 + 0x8000000000000000)
+            (
+                "0x8000000000000000+0x8000000000000000",
+                0x8000_0000_0000_0000,
+                0x8000_0000_0000_0000,
+            ),
+            // 64-bit CF (0xffffffffffffffff + 1)
+            ("0xffffffffffffffff+1", 0xffff_ffff_ffff_ffff, 1),
+            // 8-bit CF (0x80 - 1)
+            ("0x80-1", 0x80, 1),
+            // 8-bit signed underflow (0x7f - 0x80)
+            ("0x7f-0x80", 0x7f, 0x80),
+            // 32-bit signed underflow (0x7fffffff - 0x80000000)
+            ("0x7fffffff-0x80000000", 0x7fff_ffff, 0x8000_0000),
+            // 64-bit signed underflow (0x7fffffffffffffff - 0x8000000000000000)
+            (
+                "0x7fffffffffffffff-0x8000000000000000",
+                0x7fff_ffff_ffff_ffff,
+                0x8000_0000_0000_0000,
+            ),
+            // equal operands (ZF + CF=0)
+            ("equal", 0x1234_5678_9abc_def0, 0x1234_5678_9abc_def0),
+            // zero operands (all clear except PF)
+            ("zero", 0, 0),
+            // AF edge: 0x0f + 1
+            ("0x0f+1", 0x0f, 1),
+            // AF edge + CF: 0x0f + 0x0f
+            ("0x0f+0x0f", 0x0f, 0x0f),
+        ];
+        // width is the byte width the helper expects (1/2/4/8 bytes →
+        // 8/16/32/64-bit arithmetic).
+        for width in [1u64, 2, 4, 8] {
+            for &(name, lhs, rhs) in vectors {
+                check_vector(name, lhs, rhs, width);
+            }
+        }
+    }
+
+    #[test]
+    fn jit_helper_cmp_matches_sub_flags() {
+        // CMP must produce exactly the flags SUB produces (no result store).
+        // Broad deterministic operand coverage: sign combinations, borrow
+        // boundaries, and byte/nibble auxiliary-carry boundaries.
+        let pairs: &[(u64, u64)] = &[
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (0x7f, 0x80),
+            (0x80, 0x7f),
+            (0x7f, 0x7f),
+            (0x0f, 0x10),
+            (0x10, 0x0f),
+            (0x0f, 0x0f),
+            (0x7fff_ffff, 0x8000_0000),
+            (0x8000_0000, 0x7fff_ffff),
+            (0x7fff_ffff, 0x7fff_ffff),
+            (0xffff_ffff_ffff_ffff, 1),
+            (0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff),
+            (0x7fff_ffff_ffff_ffff, 0x8000_0000_0000_0000),
+            (0xdead_beef_cafe_f00d, 0x0123_4567_89ab_cdef),
+            (0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff),
+        ];
+        for width in [1u64, 2, 4, 8] {
+            let bits = (width * 8) as u32;
+            let m = width_mask(bits);
+            for &(lhs, rhs) in pairs {
+                let (a, b) = (lhs & m, rhs & m);
+                let diff = a.wrapping_sub(b);
+                let sub_flags = call_set_flags(diff, a, b, 1, width);
+                let cmp_flags = call_set_flags(diff, a, b, 3, width);
+                assert_eq!(
+                    cmp_flags, sub_flags,
+                    "cmp({a:#x}, {b:#x}) @ {width} bits must equal sub flags"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_helper_load_unmapped_read_marks_fault_and_returns_zero() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let address = 0x0000_0001_0000_0000u64;
+        for width in [1u64, 2, 4, 8] {
+            state.jit_pending_fault = None;
+            let value = unsafe { jit_helper_load(&mut state, &mut memory, address, width) };
+            assert_eq!(value, 0, "failed read returns 0 to JIT code (w={width})");
+            assert_eq!(
+                state.jit_pending_fault,
+                Some(address),
+                "fault address must be recorded for the dispatcher (w={width})"
+            );
+        }
+    }
+
+    #[test]
+    fn jit_helper_load_mapped_read_returns_value_without_fault() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let address = 0x4000;
+        memory.write_u64(address, 0x1122_3344_5566_7788);
+        let value = unsafe { jit_helper_load(&mut state, &mut memory, address, 8) };
+        assert_eq!(value, 0x1122_3344_5566_7788);
+        assert_eq!(
+            state.jit_pending_fault, None,
+            "a successful read must not fabricate a fault"
+        );
     }
 }
 
@@ -2049,12 +2749,12 @@ impl JitCompiler {
         self.emitter.blr(26);
     }
 
-    /// Emit a call to `jit_helper_load(memory, address, width) -> u64`, placing
-    /// the result in `dst`.  The helper is a normal `extern "C"` function that
-    /// clobbers caller-saved registers (x0-x18), which hold our guest GPRs
-    /// (x4-x17).  So we must save all guest GPRs to CpuState before the call
-    /// and reload them after.  We also save the MemoryImage pointer (x2) and
-    /// the address (in a callee-saved temp) across the call.
+    /// Emit a call to `jit_helper_load(state, memory, address, width) -> u64`,
+    /// placing the result in `dst`.  The helper is a normal `extern "C"`
+    /// function that clobbers caller-saved registers (x0-x18), which hold our
+    /// guest GPRs (x4-x17).  So we must save all guest GPRs to CpuState before
+    /// the call and reload them after.  We also save the CpuState/MemoryImage
+    /// pointers and the address (in callee-saved temps) across the call.
     fn emit_helper_load(&mut self, dst: u32, addr_reg: u32, width: u64, arch: GuestArch) {
         // Save all guest GPRs to CpuState (x0), then save x0 (CpuState ptr) and
         // x2 (MemoryImage ptr) in callee-saved regs before the call.
@@ -2062,10 +2762,11 @@ impl JitCompiler {
         self.emitter.mov_reg(24, 0); // x24 = CpuState ptr (callee-saved)
         self.emitter.mov_reg(28, 2); // x28 = MemoryImage ptr (callee-saved)
         self.emitter.mov_reg(27, addr_reg); // x27 = address (callee-saved)
-        // Set up helper args.
-        self.emitter.mov_reg(0, 28); // x0 = MemoryImage ptr
-        self.emitter.mov_reg(1, 27); // x1 = address
-        self.emitter.movz(2, width as u16, 0); // x2 = width
+        // Set up helper args: (state, memory, address, width).
+        self.emitter.mov_reg(0, 24); // x0 = CpuState ptr
+        self.emitter.mov_reg(1, 28); // x1 = MemoryImage ptr
+        self.emitter.mov_reg(2, 27); // x2 = address
+        self.emitter.movz(3, width as u16, 0); // x3 = width
         self.emit_bl_to(jit_helper_load as *const () as usize);
         // Result in x0 → save to x27 (callee-saved).
         self.emitter.mov_reg(27, 0);
@@ -2283,13 +2984,15 @@ impl JitCompiler {
         // CpuState layout for gpr[0..16] is identical for x86 and x86_64;
         // arch parameter reserved for future 32-vs-64-bit state differences
         let _ = arch;
-        // CpuState layout (Rust repr(Rust) field reordering):
+        // CpuState layout (Rust repr(Rust) field reordering).  The gpr/xmm
+        // offsets are derived from the real layout via offset_of! (GPR_BASE /
+        // XMM_BASE), not hardcoded, so adding fields cannot drift them.
         //   offset 0x00: (beginning of struct, non-gpr fields with alignment >= 8)
-        //   offset 0x20: gpr[16] (16 x u64 = 128 bytes, verified at offset 32)
-        //   offset 0xA0: xmm[16] (256 bytes)
+        //   offset GPR_BASE: gpr[16] (16 x u64 = 128 bytes)
+        //   offset XMM_BASE: xmm[16] (256 bytes)
         //   ...
         // We need to load gpr[0..16] from CpuState into x4-x15, x16, x17, x19, x20
-        let gpr_base: u32 = 32; // verified offset of gpr array in CpuState
+        let gpr_base: u32 = Self::GPR_BASE; // derived offset of gpr[] in CpuState (offset_of!)
 
         // Load guest registers in pairs for efficiency.
         // Uses signed-offset (no writeback) LDP to avoid corrupting x0.
@@ -2306,7 +3009,7 @@ impl JitCompiler {
         // Same gpr layout for x86 and x86_64; arch reserved for future use
         // when 32-bit state may need partial register saving
         let _ = arch;
-        let gpr_base: u32 = 32; // verified offset of gpr array in CpuState
+        let gpr_base: u32 = Self::GPR_BASE; // derived offset of gpr[] in CpuState (offset_of!)
 
         for i in (0..16).step_by(2) {
             let arm_lo = regmap::guest_to_arm(i);
@@ -2625,7 +3328,7 @@ impl JitCompiler {
 
                         // Reload guest GPRs from CpuState (the bridge may
                         // have modified them via dispatch_import).
-                        let gpr_base: u32 = 32;
+                        let gpr_base: u32 = Self::GPR_BASE;
                         for i in (0..16).step_by(2) {
                             let arm_lo = regmap::guest_to_arm(i);
                             let arm_hi = regmap::guest_to_arm(i + 1);
@@ -2690,9 +3393,10 @@ impl JitCompiler {
 
             // ── Crypto: AES-NI lowering to ARM64 NEON AESE/AESD/AESIMC ──────────
             //
-            // CpuState layout:
-            //   offset 0x20: gpr[16]  (16 × u64)
-            //   offset 0xA0: xmm[16]  (16 × XmmValue = 16 × 16 bytes)
+            // CpuState layout (offsets derived via offset_of!, see GPR_BASE /
+            // XMM_BASE):
+            //   offset GPR_BASE: gpr[16]  (16 × u64)
+            //   offset XMM_BASE: xmm[16]  (16 × XmmValue = 16 × 16 bytes)
             // x0 holds the CpuState pointer throughout the compiled block.
             //
             // We use NEON registers V0 and V1 as temporaries.
@@ -2845,14 +3549,21 @@ impl JitCompiler {
                 self.emit_store_guest_registers(arch);
                 self.emitter.movz(regmap::X0, EXIT_UNIMPL as u16, 0);
                 self.emit_epilogue();
+                // EXIT_UNIMPL exits the whole block to the AOT interpreter:
+                // counted as neither native lowering nor helper fallback.
+                return Ok(());
             }
 
             // Universal catch-all: for any instruction without a dedicated
             // JIT arm, emit a call to jit_helper_execute_insn(state, memory,
             // &insn) so the interpreter executes it with identical semantics.
-            _ => self.emit_interpreter_fallback(insn, arch)?,
+            _ => {
+                JIT_HELPER_FALLBACK[ir_opcode_index(insn)].fetch_add(1, Ordering::Relaxed);
+                self.emit_interpreter_fallback(insn, arch)?;
+            }
         }
 
+        JIT_NATIVE_LOWERED[ir_opcode_index(insn)].fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2883,9 +3594,16 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// Byte offset of the `gpr[]` array within CpuState.
+    /// Derived from the real repr(Rust) layout with `offset_of!` so adding
+    /// fields (e.g. `jit_pending_fault`) can never silently drift the
+    /// offsets baked into emitted code.  Verified by
+    /// `cpu_state_jit_field_offsets_are_verified`.
+    /// Historical anchor (pre-fault-channel layout): gpr at +0x20 (32),
+    /// xmm at +0xA0 (160).
+    const GPR_BASE: u32 = std::mem::offset_of!(CpuState, gpr) as u32;
     /// Byte offset of the xmm[] array within CpuState.
-    /// Verified layout: gpr[16] starts at +0x20 (32 bytes), xmm[16] follows at +0xA0.
-    const XMM_BASE: u32 = 160; // 0xA0
+    const XMM_BASE: u32 = std::mem::offset_of!(CpuState, xmm) as u32;
 
     /// Get reference to the memory manager.
     pub fn memory_manager(&self) -> &JitMemoryManager {
@@ -6623,6 +7341,51 @@ mod tests {
     }
 
     #[test]
+    fn jit_lowering_telemetry_counts_native_and_helper_fallback_per_opcode() {
+        // Compile a batch of a unique native opcode (MovImm) and a unique
+        // helper-fallback opcode (Xgetbv); the per-opcode counters must move
+        // by exactly the batch sizes.  (Nop is compiled by other tests
+        // concurrently, so this test uses opcodes no other test compiles —
+        // exact per-opcode deltas are therefore deterministic.)
+        let native_op = ir_opcode_index(&IrInstruction::MovImm {
+            dst: Register::Rax,
+            value: 0,
+        });
+        let fallback_op = ir_opcode_index(&IrInstruction::Xgetbv);
+        let native_before = JIT_NATIVE_LOWERED[native_op].load(Ordering::Relaxed);
+        let fallback_before = JIT_HELPER_FALLBACK[fallback_op].load(Ordering::Relaxed);
+
+        let mut compiler = JitCompiler::new();
+        let mut ir = Vec::new();
+        for i in 0..8u64 {
+            ir.push(IrInstruction::MovImm {
+                dst: Register::Rax,
+                value: i,
+            });
+            ir.push(IrInstruction::Xgetbv);
+        }
+        let block = compiler
+            .compile_block(&ir, 0x4000, GuestArch::X64, None)
+            .expect("compile block with native + fallback instructions");
+        assert_eq!(block.instruction_count, 16);
+
+        assert_eq!(
+            JIT_NATIVE_LOWERED[native_op].load(Ordering::Relaxed),
+            native_before + 8,
+            "MovImm must be counted as native lowering"
+        );
+        assert_eq!(
+            JIT_HELPER_FALLBACK[fallback_op].load(Ordering::Relaxed),
+            fallback_before + 8,
+            "Xgetbv must be counted as interpreter-helper fallback"
+        );
+
+        let (native_total, fallback_total) = jit_lowering_telemetry();
+        assert!(native_total >= native_before + 8);
+        assert!(fallback_total >= fallback_before + 8);
+    }
+
+    #[test]
     fn exit_reason_mapping_never_collapses_jump_family_or_safepoint() {
         let mut state = CpuState::new(GuestArch::X64);
         state.rip = 0x1000;
@@ -6739,10 +7502,45 @@ mod tests {
     }
 
     #[test]
-    fn cpu_state_gpr_offset_is_verified() {
-        // Verify that Rust's repr(Rust) struct reordering places gpr at offset 32
-        let offset = std::mem::offset_of!(CpuState, gpr);
-        assert_eq!(offset, 32, "gpr base in JIT code must match this offset");
+    fn cpu_state_jit_field_offsets_are_verified() {
+        // The offsets baked into emitted code are derived from the real
+        // repr(Rust) layout via offset_of! (GPR_BASE/XMM_BASE), so adding a
+        // field (e.g. jit_pending_fault) can never drift them.  Verify the
+        // derivation itself, the field strides the emitter assumes, and the
+        // fault channel the load helper writes.
+        assert_eq!(
+            JitCompiler::GPR_BASE as usize,
+            std::mem::offset_of!(CpuState, gpr)
+        );
+        assert_eq!(
+            JitCompiler::XMM_BASE as usize,
+            std::mem::offset_of!(CpuState, xmm)
+        );
+        assert_eq!(std::mem::size_of::<u64>(), 8, "gpr stride must be 8 bytes");
+        assert_eq!(
+            std::mem::size_of::<crate::cpu::XmmValue>(),
+            16,
+            "xmm stride must be 16 bytes"
+        );
+        // The fault channel lives inside CpuState (jit_helper_load writes it
+        // through the state pointer); it must sit at a well-formed offset.
+        let fault_offset = std::mem::offset_of!(CpuState, jit_pending_fault);
+        assert_eq!(fault_offset % std::mem::align_of::<CpuState>(), 0);
+        assert!(
+            fault_offset + std::mem::size_of::<Option<u64>>() <= std::mem::size_of::<CpuState>()
+        );
+        // Historical anchors: the 16-byte fault channel shifts gpr 32→48 and
+        // xmm 160→176; the derived constants pin the emitted-code contract.
+        assert_eq!(
+            JitCompiler::GPR_BASE,
+            48,
+            "gpr base in JIT code must match the actual CpuState layout"
+        );
+        assert_eq!(
+            JitCompiler::XMM_BASE,
+            176,
+            "xmm base in JIT code must match the actual CpuState layout"
+        );
     }
 
     // --- Phase 7: Block Chaining Tests ---

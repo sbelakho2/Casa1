@@ -65,14 +65,38 @@ pub struct CpuFeatureSet {
     pub adx: bool,
 }
 
+/// True when running on Apple Silicon hardware (aarch64 macOS).  Every Apple
+/// Silicon Mac carries the ARMv8 NEON AES/SHA/PMULL instructions the JIT
+/// lowers AES-NI/SHA/PCLMULQDQ to, so the crypto advertisement is honest
+/// exactly on these hosts.
+fn is_apple_silicon_host() -> bool {
+    cfg!(all(target_arch = "aarch64", target_os = "macos"))
+}
+
 impl CpuFeatureSet {
     /// Returns an honest feature set for the given guest architecture.
     ///
     /// Only features with *real* ARMv8 lowering (via JIT NEON emission or
-    /// well-tested interpreter paths) are advertised.  AES/SHA/PCLMULQDQ
-    /// are **false** here because on a generic host there is no guarantee
-    /// of native ARMv8 NEON crypto instructions being available at JIT time.
+    /// well-tested interpreter paths) are advertised.  AES/SHA/PCLMULQDQ are
+    /// advertised only on hosts that guarantee the native ARMv8 NEON crypto
+    /// instructions the JIT lowers them to — i.e. Apple Silicon (aarch64
+    /// macOS always carries the AES/SHA/PMULL hardware).  On any other host
+    /// they are **false** because there is no guarantee of native ARMv8 NEON
+    /// crypto instructions at JIT time.
     pub fn for_arch(arch: GuestArch) -> Self {
+        let mut features = Self::for_arch_generic(arch);
+        if is_apple_silicon_host() {
+            // Production and the Apple-Silicon-optimised advertisement agree:
+            // the JIT can emit real ARM64 NEON crypto instructions here.
+            features.aes = true;
+            features.sha = true;
+            features.pclmulqdq = true;
+        }
+        features
+    }
+
+    /// Core feature set before host-crypto advertisement is applied.
+    fn for_arch_generic(arch: GuestArch) -> Self {
         Self {
             baseline_x86_64: arch == GuestArch::X64,
             sse2: true,
@@ -117,46 +141,17 @@ impl CpuFeatureSet {
     }
 
     /// Returns an Apple Silicon-optimised feature set where AES/SHA/PCLMULQDQ
-    /// are advertised because the JIT can emit real ARM64 NEON crypto instructions.
+    /// are advertised because the JIT can emit real ARM64 NEON crypto
+    /// instructions.  Routes through [`CpuFeatureSet::for_arch`] so the
+    /// advertised flags never drift from the production path.
     pub fn for_apple_silicon() -> Self {
-        Self {
-            baseline_x86_64: true,
-            sse2: true,
-            sse3: true,
-            ssse3: true,
-            sse41: true,
-            sse42: true,
-            avx: true,
-            avx2: true,
-            popcnt: true,
-            lzcnt: true,
-            bmi1: true,
-            bmi2: true,
-            x87: true,
-            // AVX-512: EVEX decode, ZMM register file, all vector arithmetic ops,
-            // mask register ops, and FMA are fully implemented in execute_ir.
-            avx512f: true,
-            avx512dq: true,
-            avx512bw: true,
-            avx512vl: true,
-            avx512cd: true,
-            // REAL ARMv8 NEON lowering exists in the JIT for all AES-NI operations
-            aes: true,
-            // REAL ARMv8 NEON lowering exists in the JIT for all SHA operations
-            sha: true,
-            // REAL ARMv8 PMULL lowering exists in the JIT for PCLMULQDQ
-            pclmulqdq: true,
-            // FXSAVE/FXRSTOR are implemented in the interpreter (state serialization).
-            fxsr: true,
-            // XSAVE/XRSTOR are implemented in the interpreter (x87+SSE+AVX state).
-            xsave: true,
-            // OS XSAVE support is advertised since XSAVE/XRSTOR work.
-            osxsave: true,
-            // RDRAND/RDSEED are implemented via the host CSPRNG (getrandom).
-            rdrand: true,
-            rdseed: true,
-            adx: true,
-        }
+        let mut features = Self::for_arch(GuestArch::X64);
+        // Explicitly request the Apple-Silicon advertisement regardless of
+        // the host this binary happens to run on (the caller asked for it).
+        features.aes = true;
+        features.sha = true;
+        features.pclmulqdq = true;
+        features
     }
 
     pub fn apply_mask(&mut self, mask: &str) -> AppResult<()> {
@@ -655,6 +650,15 @@ pub struct CpuState {
     /// CET shadow stack pointer (SSP).
     #[serde(default)]
     pub ssp: u64,
+    /// Fault channel from JIT-compiled code to the dispatcher: set by
+    /// `jit_helper_load` when a guest read hits unmapped memory (the helper
+    /// cannot propagate an error through the extern "C" ABI).  The dispatcher
+    /// (`CpuEngine::execute_with_jit`) checks and clears this marker after a
+    /// compiled block returns and converts it into the same "unmapped guest
+    /// memory" error the interpreter raises, so an access violation is never
+    /// silently observed as a successful zero-valued read.
+    #[serde(default)]
+    pub jit_pending_fault: Option<u64>,
 }
 
 impl CpuState {
@@ -682,6 +686,7 @@ impl CpuState {
             dr: [0u64; 8],
             bnd: [(0u64, 0u64); 4],
             ssp: 0,
+            jit_pending_fault: None,
         }
     }
 
@@ -1208,7 +1213,11 @@ impl MemoryImage {
         }
     }
 
-    fn unmapped_memory_error(address: u64) -> AppError {
+    /// The interpreter's guest access-violation error for an unmapped read.
+    /// Shared with the JIT dispatcher so a JIT-detected fault is
+    /// indistinguishable from an interpreter-detected one (and the caller's
+    /// `annotate_guest_fault` wrapping applies identically).
+    pub(crate) fn unmapped_memory_error(address: u64) -> AppError {
         AppError::new(
             ReasonCode::RcUnimplInsn,
             format!("unmapped guest memory at {address:#x}"),
@@ -4298,6 +4307,16 @@ impl CpuExecutionEngine {
                 // pages (finalized executable); state/memory are the live
                 // guest objects for the duration of the call.
                 let reason = unsafe { jit.execute_block(&block, state, memory) };
+
+                // Fault channel: `jit_helper_load` cannot propagate errors
+                // through the extern "C" ABI, so an unmapped guest read set
+                // `jit_pending_fault`.  Convert it into the exact error the
+                // interpreter raises for the same access violation — the
+                // caller's `annotate_guest_fault` wrapping then applies
+                // identically to an interpreter fault.
+                if let Some(fault_address) = state.jit_pending_fault.take() {
+                    return Err(MemoryImage::unmapped_memory_error(fault_address));
+                }
 
                 // Dispatcher: apply the terminator semantics the compiled
                 // block deferred to the host.  The JIT-safe gate guarantees
@@ -32718,11 +32737,20 @@ mod tests {
     #[test]
     fn cpu_feature_set_for_arch_is_honest() {
         let features = CpuFeatureSet::for_arch(GuestArch::X64);
-        // Generic for_arch() must NOT advertise features that require
-        // platform-specific lowering which isn't guaranteed.
-        assert!(!features.aes);
-        assert!(!features.sha);
-        assert!(!features.pclmulqdq);
+        // for_arch() must NOT advertise features that require
+        // platform-specific lowering which isn't guaranteed.  The one
+        // exception: on Apple Silicon hosts the ARMv8 NEON AES/SHA/PMULL
+        // hardware IS guaranteed, so the crypto advertisement is honest
+        // there (and must match the production from_profile() path).
+        if !is_apple_silicon_host() {
+            assert!(!features.aes);
+            assert!(!features.sha);
+            assert!(!features.pclmulqdq);
+        } else {
+            assert!(features.aes);
+            assert!(features.sha);
+            assert!(features.pclmulqdq);
+        }
         // Core features should still be present
         assert!(features.baseline_x86_64);
         assert!(features.sse2);
@@ -37086,6 +37114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     fn cpuid_leaf_7_no_sha_no_aes_no_pclmul_on_generic_host() {
         let virt = CpuVirtualization::from_profile(GuestArch::X64, None).unwrap();
         let leaf = virt.leaf(7, 0);
@@ -37094,6 +37123,51 @@ mod tests {
             leaf.ebx & (1 << 29) == 0,
             "SHA should NOT be advertised on generic host"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn cpuid_leaf_7_production_profile_advertises_sha_aes_pclmul_on_apple_silicon() {
+        // The production advertisement path (CpuVirtualization::from_profile,
+        // used by CpuEngineConfig::from_profile) must agree with the
+        // Apple-Silicon-optimised backend: on Apple Silicon hardware the
+        // JIT can emit real ARM64 NEON AES/SHA/PMULL, so CPUID advertises
+        // AES (leaf 1 ECX bit 25), SHA (leaf 7 EBX bit 29) and PCLMULQDQ
+        // (leaf 1 ECX bit 1).
+        let virt = CpuVirtualization::from_profile(GuestArch::X64, None)
+            .expect("CpuVirtualization from production profile");
+        assert!(
+            virt.features.aes,
+            "production path must advertise AES on Apple Silicon hosts"
+        );
+        assert!(
+            virt.features.sha,
+            "production path must advertise SHA on Apple Silicon hosts"
+        );
+        assert!(
+            virt.features.pclmulqdq,
+            "production path must advertise PCLMULQDQ on Apple Silicon hosts"
+        );
+        let leaf_1 = virt.leaf(1, 0);
+        assert!(
+            leaf_1.ecx & (1 << 25) != 0,
+            "AES bit must be set in CPUID leaf 1"
+        );
+        assert!(
+            leaf_1.ecx & (1 << 1) != 0,
+            "PCLMULQDQ bit must be set in CPUID leaf 1"
+        );
+        let leaf_7 = virt.leaf(7, 0);
+        assert!(
+            leaf_7.ebx & (1 << 29) != 0,
+            "SHA bit must be set in CPUID leaf 7"
+        );
+        // And the Apple-Silicon-optimised constructor must agree with the
+        // production path (feature advertisement unification).
+        let apple = CpuFeatureSet::for_apple_silicon();
+        assert_eq!(virt.features.aes, apple.aes);
+        assert_eq!(virt.features.sha, apple.sha);
+        assert_eq!(virt.features.pclmulqdq, apple.pclmulqdq);
     }
 
     #[test]
