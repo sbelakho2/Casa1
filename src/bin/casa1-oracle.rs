@@ -37,10 +37,21 @@ enum OracleCommand {
     Section3DelayLoad,
     #[command(name = "section3-apiset")]
     Section3ApiSet,
+    /// Emit api-completeness.json for the quantitative Windows API
+    /// completeness database (per-DLL counts + production-gate violations).
+    #[command(name = "api-report")]
+    ApiReport {
+        /// Destination path for the api-completeness.json report.
+        out: std::path::PathBuf,
+    },
 }
 
 fn main() {
     let cli = OracleCli::parse();
+    if let OracleCommand::ApiReport { out } = &cli.command {
+        write_api_report(out);
+        return;
+    }
     let output = match cli.command {
         OracleCommand::Section2Path => serde_json::to_string(&section2_path_suite()),
         OracleCommand::Section2Case => serde_json::to_string(&section2_case_suite()),
@@ -49,6 +60,7 @@ fn main() {
         OracleCommand::Section3DllOrder => serde_json::to_string(&section3_dll_order_suite()),
         OracleCommand::Section3DelayLoad => serde_json::to_string(&section3_delay_load_suite()),
         OracleCommand::Section3ApiSet => serde_json::to_string(&section3_api_set_suite()),
+        OracleCommand::ApiReport { .. } => unreachable!("handled above"),
     };
     match output {
         Ok(json) => println!("{json}"),
@@ -57,6 +69,24 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Generate the api-completeness.json report from the seeded database and
+/// write it to `out`.
+fn write_api_report(out: &std::path::Path) {
+    let report = casa1::api_database::ApiDatabase::from_thunk_metadata().completeness_report();
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("failed to encode api-completeness report: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = std::fs::write(out, json) {
+        eprintln!("failed to write {}: {error}", out.display());
+        std::process::exit(1);
+    }
+    eprintln!("wrote {}", out.display());
 }
 
 fn section2_path_suite() -> PathEdgeSuite {
