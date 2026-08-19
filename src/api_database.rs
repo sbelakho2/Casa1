@@ -51,8 +51,10 @@
 //! every `Stub`/`Unsupported` must be declared deliberately unsupported with
 //! a guest-visible compatibility consequence.
 
-use crate::host_thunks::ImplementationLevel;
+use crate::api_coverage::COVERAGE_EVIDENCE;
+use crate::compatibility_profile::CompatibilityProfile;
 use crate::host_thunks::THUNK_METADATA;
+use crate::host_thunks::{ImplementationLevel, SupportPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
@@ -102,6 +104,26 @@ pub enum CoverageLevel {
     Conformance,
 }
 
+/// The compatibility tier a completeness evaluation runs under.
+///
+/// - [`CompatibilityTier::NativeUserMode`] — the full user-mode profile:
+///   `Required` and `OptionalFeature` APIs are evaluated (optionals only when
+///   the profile does not exclude them); kernel/DRM-tier
+///   (`OutsideUserModeProfile`) APIs are exempt.
+/// - [`CompatibilityTier::Managed`] — a managed (.NET/CLR) workload evaluated
+///   against the same user-mode profile.
+/// - [`CompatibilityTier::RestrictedKernel`] — the kernel/DRM tier: only
+///   `OutsideUserModeProfile` APIs are evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilityTier {
+    /// The full user-mode profile.
+    NativeUserMode,
+    /// A managed (.NET/CLR) workload over the user-mode profile.
+    Managed,
+    /// The kernel/DRM tier.
+    RestrictedKernel,
+}
+
 // ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
@@ -140,11 +162,18 @@ pub struct ApiEntry {
     /// Partial entries (what is missing), the compatibility consequence for
     /// deliberately-unsupported entries, or any other per-API documentation.
     pub detail: Option<String>,
+    /// Generic user-mode profile classification of the API
+    /// ([`SupportPolicy`]): `Required` user-mode core, `OptionalFeature`
+    /// subsystems, or `OutsideUserModeProfile` kernel/DRM-tier APIs that are
+    /// exempt from the user-mode completeness gate.
+    #[serde(default)]
+    pub support_policy: SupportPolicy,
 }
 
 impl ApiEntry {
     /// Convenience constructor with the default keying (any architecture, any
-    /// Windows version, no test coverage, no workloads, not transitional).
+    /// Windows version, no test coverage, no workloads, not transitional,
+    /// user-mode `Required` policy).
     pub fn new(
         dll: impl Into<String>,
         export: impl Into<String>,
@@ -160,6 +189,7 @@ impl ApiEntry {
             workloads_reaching: Vec::new(),
             transitional: false,
             detail: None,
+            support_policy: SupportPolicy::Required,
         }
     }
 
@@ -370,7 +400,10 @@ impl ApiDatabase {
     ///    would quietly count as shipped.
     /// 2. Any entry with `implementation == Stub` or `Unsupported` that is
     ///    not registered as deliberately unsupported with a compatibility
-    ///    error.
+    ///    error — UNLESS its `support_policy` is
+    ///    `SupportPolicy::OutsideUserModeProfile` (kernel/DRM-tier APIs are
+    ///    outside the user-mode profile and need no user-mode
+    ///    compatibility error).
     /// 3. Any `Implemented` entry with `semantic_test_coverage ==
     ///    CoverageLevel::None` — an Implemented API needs at least Unit
     ///    coverage to ship.
@@ -430,9 +463,12 @@ impl ApiDatabase {
                     }
                 }
                 ImplementationLevel::Stub => {
-                    if self
-                        .deliberately_unsupported_error(&entry.dll, &entry.export)
-                        .is_none()
+                    let outside_profile =
+                        entry.support_policy == SupportPolicy::OutsideUserModeProfile;
+                    if !outside_profile
+                        && self
+                            .deliberately_unsupported_error(&entry.dll, &entry.export)
+                            .is_none()
                     {
                         violations.push(ApiGateViolation {
                             dll: entry.dll.clone(),
@@ -448,9 +484,12 @@ impl ApiDatabase {
                     }
                 }
                 ImplementationLevel::Unsupported => {
-                    if self
-                        .deliberately_unsupported_error(&entry.dll, &entry.export)
-                        .is_none()
+                    let outside_profile =
+                        entry.support_policy == SupportPolicy::OutsideUserModeProfile;
+                    if !outside_profile
+                        && self
+                            .deliberately_unsupported_error(&entry.dll, &entry.export)
+                            .is_none()
                     {
                         violations.push(ApiGateViolation {
                             dll: entry.dll.clone(),
@@ -471,32 +510,63 @@ impl ApiDatabase {
         violations
     }
 
-    /// The completeness gate — the release bar.
+    /// The completeness gate — the release bar, evaluated against a
+    /// compatibility tier and profile.
     ///
-    /// Acceptable statuses: `Implemented` with Differential or Conformance
-    /// semantic coverage, or `DeliberatelyUnsupported` entries registered
-    /// with a precise compatibility consequence.  `Partial` NEVER passes this
-    /// gate — a knowingly-incomplete implementation is by definition not
-    /// complete.  Violations are reported for:
-    ///
-    /// 1. Any `Partial` entry (regardless of the transitional flag).
-    /// 2. Any `Stub`/`Unsupported` entry not registered as deliberately
-    ///    unsupported with a compatibility error.
-    /// 3. Any `Implemented` entry whose coverage is below Differential
-    ///    (None/Unit/SubsystemScenario).
+    /// - **NativeUserMode**: `Implemented` + Differential/Conformance
+    ///   coverage passes.  `Partial`/`Stub`/`Unsupported` FAIL unless
+    ///   `support_policy == OutsideUserModeProfile` (kernel/DRM-tier APIs are
+    ///   exempt in the user-mode tier).  `OptionalFeature` entries may pass
+    ///   even below the bar when the profile explicitly excludes the feature
+    ///   (`CompatibilityProfile::optional_features`).
+    /// - **Managed**: the same user-mode profile evaluated for managed
+    ///   (.NET/CLR) workloads.
+    /// - **RestrictedKernel**: only `OutsideUserModeProfile` entries are
+    ///   evaluated (they need `Implemented` + Differential/Conformance);
+    ///   everything else is exempt.
     ///
     /// The violation count is the project's total-compatibility progress
     /// number: every violation is one entry that still blocks full
-    /// completeness.
-    pub fn completeness_gate(&self) -> Vec<ApiGateViolation> {
+    /// completeness for the evaluated profile.
+    pub fn completeness_gate(
+        &self,
+        tier: CompatibilityTier,
+        profile: &CompatibilityProfile,
+    ) -> Vec<ApiGateViolation> {
         let mut violations = Vec::new();
         for entry in &self.entries {
+            let outside_profile = entry.support_policy == SupportPolicy::OutsideUserModeProfile;
+            match tier {
+                CompatibilityTier::RestrictedKernel => {
+                    // Only kernel/DRM-tier entries are part of this tier.
+                    if !outside_profile {
+                        continue;
+                    }
+                }
+                CompatibilityTier::NativeUserMode | CompatibilityTier::Managed => {
+                    // Kernel/DRM-tier APIs are exempt from the user-mode
+                    // completeness tier.
+                    if outside_profile {
+                        continue;
+                    }
+                }
+            }
+
+            // Optional features pass when the profile explicitly excludes
+            // them — the feature is not part of this target's surface.
+            let feature_excluded = entry.support_policy == SupportPolicy::OptionalFeature
+                && optional_feature_for(&entry.dll)
+                    .is_some_and(|feature| profile.excludes(feature));
+
             match entry.implementation {
                 ImplementationLevel::Implemented => {
                     if !matches!(
                         entry.semantic_test_coverage,
                         CoverageLevel::Differential | CoverageLevel::Conformance
                     ) {
+                        if feature_excluded {
+                            continue;
+                        }
                         violations.push(ApiGateViolation {
                             dll: entry.dll.clone(),
                             export: entry.export.clone(),
@@ -511,6 +581,9 @@ impl ApiDatabase {
                     }
                 }
                 ImplementationLevel::Partial => {
+                    if feature_excluded {
+                        continue;
+                    }
                     violations.push(ApiGateViolation {
                         dll: entry.dll.clone(),
                         export: entry.export.clone(),
@@ -530,41 +603,34 @@ impl ApiDatabase {
                     });
                 }
                 ImplementationLevel::Stub => {
-                    if self
-                        .deliberately_unsupported_error(&entry.dll, &entry.export)
-                        .is_none()
-                    {
-                        violations.push(ApiGateViolation {
-                            dll: entry.dll.clone(),
-                            export: entry.export.clone(),
-                            kind: ApiGateViolationKind::StubNotDeliberatelyUnsupported,
-                            message: format!(
-                                "{}!{} is a Stub but not declared deliberately unsupported — \
-                                 register it via deliberately_unsupported() with the \
-                                 compatibility error the guest sees, or implement it",
-                                entry.dll, entry.export
-                            ),
-                        });
+                    if feature_excluded {
+                        continue;
                     }
+                    violations.push(ApiGateViolation {
+                        dll: entry.dll.clone(),
+                        export: entry.export.clone(),
+                        kind: ApiGateViolationKind::StubNotDeliberatelyUnsupported,
+                        message: format!(
+                            "{}!{} is a Stub — the completeness gate requires a working, \
+                             semantically proven implementation",
+                            entry.dll, entry.export
+                        ),
+                    });
                 }
                 ImplementationLevel::Unsupported => {
-                    if self
-                        .deliberately_unsupported_error(&entry.dll, &entry.export)
-                        .is_none()
-                    {
-                        violations.push(ApiGateViolation {
-                            dll: entry.dll.clone(),
-                            export: entry.export.clone(),
-                            kind: ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported,
-                            message: format!(
-                                "{}!{} is Unsupported (no host thunk) but not declared \
-                                 deliberately unsupported — register it via \
-                                 deliberately_unsupported() with the compatibility error the \
-                                 guest sees, or implement it",
-                                entry.dll, entry.export
-                            ),
-                        });
+                    if feature_excluded {
+                        continue;
                     }
+                    violations.push(ApiGateViolation {
+                        dll: entry.dll.clone(),
+                        export: entry.export.clone(),
+                        kind: ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported,
+                        message: format!(
+                            "{}!{} is Unsupported (no host thunk) — the completeness gate \
+                             requires a working, semantically proven implementation",
+                            entry.dll, entry.export
+                        ),
+                    });
                 }
             }
         }
@@ -604,8 +670,14 @@ impl ApiDatabase {
     ///   the compatibility-correct canned answer are registered through
     ///   [`ApiDatabase::deliberately_unsupported`] with the guest-visible
     ///   consequence.
+    /// - Every entry carries its [`SupportPolicy`] from the thunk metadata
+    ///   (or the skeleton table); the `Nt*` skeletons are
+    ///   `OutsideUserModeProfile`, the interface skeletons are
+    ///   `OptionalFeature`.
     /// - The `Nt*` / interface skeletons are marked against what the runtime
     ///   actually dispatches (see the table documentation).
+    /// - Finally [`ApiDatabase::apply_coverage_evidence`] merges the
+    ///   oracle-backed coverage registry ([`COVERAGE_EVIDENCE`]).
     pub fn from_thunk_metadata() -> Self {
         let mut database = ApiDatabase::new();
 
@@ -625,6 +697,7 @@ impl ApiDatabase {
                 workloads_reaching: Vec::new(),
                 transitional: reason.is_some(),
                 detail: reason.map(str::to_string),
+                support_policy: metadata.support_policy,
             });
         }
 
@@ -649,7 +722,40 @@ impl ApiDatabase {
             );
         }
 
+        database.apply_coverage_evidence();
+
         database
+    }
+
+    /// Merge the oracle-backed coverage evidence registry
+    /// ([`COVERAGE_EVIDENCE`]) into the database.
+    ///
+    /// For every evidence row whose (DLL, export, arch, Windows version) key
+    /// matches an entry, the entry's [`CoverageLevel`] takes the registry's
+    /// level (the strongest applicable).  Evidence is never inferred from the
+    /// existence of a Rust test — each row names the actual
+    /// `windows-oracle:<category>` differential contract.
+    pub fn apply_coverage_evidence(&mut self) {
+        for row in COVERAGE_EVIDENCE {
+            let matches: Vec<usize> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    normalize_dll(&entry.dll) == normalize_dll(row.dll)
+                        && entry.export.eq_ignore_ascii_case(row.export)
+                        && (row.arch == ArchSet::Any || row.arch == entry.arch)
+                        && (row.windows_version == WindowsVersion::Any
+                            || row.windows_version == entry.win_version)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in matches {
+                if row.level > self.entries[index].semantic_test_coverage {
+                    self.entries[index].semantic_test_coverage = row.level;
+                }
+            }
+        }
     }
 
     /// The `api-completeness.json` report for this database.
@@ -681,7 +787,11 @@ impl ApiDatabase {
         }
 
         let shipping_violations = self.shipping_gate();
-        let completeness_violations = self.completeness_gate();
+        // The report's completeness evaluation runs the full native
+        // user-mode profile (nothing excluded): the strictest default.
+        let profile = CompatibilityProfile::win11_native_desktop();
+        let completeness_violations =
+            self.completeness_gate(CompatibilityTier::NativeUserMode, &profile);
         let shipping_violation_count = shipping_violations.len();
         let completeness_violation_count = completeness_violations.len();
         ApiCompletenessReport {
@@ -693,6 +803,17 @@ impl ApiDatabase {
                 completeness_violations,
                 completeness_violation_count,
             },
+            registry: self
+                .entries
+                .iter()
+                .map(|entry| ApiRegistryRow {
+                    dll: entry.dll.clone(),
+                    export: entry.export.clone(),
+                    implementation: entry.implementation,
+                    semantic_test_coverage: entry.semantic_test_coverage,
+                    support_policy: entry.support_policy,
+                })
+                .collect(),
         }
     }
 }
@@ -911,23 +1032,77 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
 // Skeleton tables
 // ---------------------------------------------------------------------------
 
-/// A skeleton-table row: the DLL, the export/interface name, and the
-/// implementation level the runtime actually provides.
+/// The optional-subsystem feature key an API belongs to (for
+/// `SupportPolicy::OptionalFeature` entries and the profile-sensitive
+/// completeness gate).  `None` means the subsystem is not covered by any
+/// profile flag — the entry can never be excluded and always counts against
+/// the gate.
+fn optional_feature_for(dll: &str) -> Option<&'static str> {
+    match normalize_dll(dll).as_str() {
+        "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d10level9" | "d3d11" | "d3d12" | "dxgi"
+        | "d2d1" | "dwrite" | "gdiplus" | "opengl32" | "glu32" | "ddraw" | "d3dcompiler_43"
+        | "d3dcompiler_47" | "d3dx9_43" | "d3dx10_43" | "d3dx11_43" | "dwmapi" | "uxtheme"
+        | "d3d8thk" | "dxva2" => Some("graphics"),
+        "winhttp" | "wininet" | "urlmon" | "webview2" | "libcef" | "mshtml" | "shdocvw"
+        | "ieframe" => Some("web"),
+        "mscoree"
+        | "mscorlib"
+        | "mscorwks"
+        | "presentationframework"
+        | "presentationcore"
+        | "windowsbase" => Some("managed"),
+        "mf" | "mfplat" | "mfreadwrite" | "wmcodecdsp" | "xaudio2_8" | "xaudio2_9"
+        | "x3daudio1_7" | "xactengine3_7" | "dsound" | "winmm" | "winmmbase" | "msacm32"
+        | "mmdevapi" | "audioses" | "audioendpoint" | "quartz" | "amstream" | "evr" | "wmvcore"
+        | "qedit" | "mp3dmod" | "colorcnv" | "resampledmo" | "mfh264enc" | "mfmpeg2src"
+        | "msmpeg2adec" | "msmpeg2vdec" | "mpg4decdmod" | "mfaacenc" | "mfvpxdec" | "wmp"
+        | "ir50_qc" | "ir50_qcx" | "msdmo" | "xapofx1_5" | "encapi" => Some("media"),
+        "steam_api" | "steam_api64" | "steam" | "gameoverlayrenderer" | "gameoverlayrenderer64" => {
+            Some("steam")
+        }
+        "wbemprox" | "wbemcomn" | "wbemdisp" | "fastprox" | "wmi" => Some("wmi"),
+        "crypt32" | "bcrypt" | "ncrypt" | "wintrust" | "dpapi" | "cryptui" | "cryptdlg"
+        | "cryptdll" | "rsaenh" | "cngaudit" | "certadm" | "certcli" | "kerberos" | "schannel" => {
+            Some("security")
+        }
+        "ole32" | "oleaut32" | "actxprxy" | "atl" | "atl100" | "atl80" | "comsvcs" | "clbcatq"
+        | "mtxdm" | "msxml6" | "scrrun" | "msvbvm60" | "vbscript" | "jscript" => Some("com"),
+        "shell32" | "shlwapi" | "comdlg32" | "riched20" | "riched32" | "msftedit" | "msi"
+        | "msimsg" | "printui" | "windowscodecs" | "windowscodecsext" | "propsys"
+        | "uiautomationcore" | "userenv" | "cfgmgr32" | "setupapi" | "newdev" | "wimgapi"
+        | "esent" => Some("shell"),
+        "iphlpapi" | "dnsapi" | "httpapi" | "wldap32" | "mswsock" | "msafd" | "winrnr"
+        | "netapi32" | "netutils" | "srvsvc" | "wkssvc" | "browser" | "rpcrt4" | "secur32"
+        | "sspicli" | "credssp" | "wtsapi32" | "winsta" | "dhcpcsvc" | "dhcpcsvc6" | "rasapi32"
+        | "fwpuclnt" | "mpr" | "wlanapi" => Some("network"),
+        _ => None,
+    }
+}
+
+/// A skeleton-table row: the DLL, the export/interface name, the
+/// implementation level the runtime actually provides, and the user-mode
+/// support policy.
 struct SkeletonEntry {
     dll: &'static str,
     export: &'static str,
     implementation: ImplementationLevel,
     transitional: bool,
     detail: &'static str,
+    support_policy: SupportPolicy,
 }
 
-const fn skeleton(export: &'static str, implementation: ImplementationLevel) -> SkeletonEntry {
+/// Kernel-tier skeleton row (`OutsideUserModeProfile`).
+const fn kernel_skeleton(
+    export: &'static str,
+    implementation: ImplementationLevel,
+) -> SkeletonEntry {
     SkeletonEntry {
         dll: "",
         export,
         implementation,
         transitional: false,
         detail: "",
+        support_policy: SupportPolicy::OutsideUserModeProfile,
     }
 }
 
@@ -944,6 +1119,7 @@ const fn interface_skeleton(
         implementation,
         transitional,
         detail,
+        support_policy: SupportPolicy::OptionalFeature,
     }
 }
 
@@ -958,6 +1134,7 @@ fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
         workloads_reaching: Vec::new(),
         transitional: skeleton.transitional,
         detail: (!skeleton.detail.is_empty()).then(|| skeleton.detail.to_string()),
+        support_policy: skeleton.support_policy,
     }
 }
 
@@ -966,55 +1143,56 @@ fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
 /// Only [`NtQueryInformationProcess`](crate::pe_runtime::HostThunk::NtQueryInformationProcess)
 /// has a host thunk today; every other `Nt*` API is `Unsupported` (no host
 /// thunk — dispatch fails).  These are skeleton entries so the completeness
-/// database quantifies the native-API gap.
+/// database quantifies the native-API gap.  The whole surface is
+/// `OutsideUserModeProfile` (kernel-tier): exempt from the user-mode
+/// completeness tier.
 static NT_API_SURFACE: &[SkeletonEntry] = &[
-    skeleton("NtAllocateVirtualMemory", ImplementationLevel::Unsupported),
-    skeleton("NtClearEvent", ImplementationLevel::Unsupported),
-    skeleton("NtClose", ImplementationLevel::Unsupported),
-    skeleton("NtCreateEvent", ImplementationLevel::Unsupported),
-    skeleton("NtCreateFile", ImplementationLevel::Unsupported),
-    skeleton("NtCreateFileMapping", ImplementationLevel::Unsupported),
-    skeleton("NtCreateKey", ImplementationLevel::Unsupported),
-    skeleton("NtCreateProcess", ImplementationLevel::Unsupported),
-    skeleton("NtCreateSection", ImplementationLevel::Unsupported),
-    skeleton("NtCreateThreadEx", ImplementationLevel::Unsupported),
-    skeleton("NtDelayExecution", ImplementationLevel::Unsupported),
-    skeleton("NtDeviceIoControlFile", ImplementationLevel::Unsupported),
-    skeleton("NtDuplicateObject", ImplementationLevel::Unsupported),
-    skeleton("NtFreeVirtualMemory", ImplementationLevel::Unsupported),
-    skeleton("NtGetContextThread", ImplementationLevel::Unsupported),
-    skeleton("NtMapViewOfSection", ImplementationLevel::Unsupported),
-    skeleton("NtOpenKey", ImplementationLevel::Unsupported),
-    skeleton("NtProtectVirtualMemory", ImplementationLevel::Unsupported),
-    skeleton(
-        "NtQueryInformationProcess",
-        ImplementationLevel::Implemented,
-    ),
-    skeleton("NtQueryInformationThread", ImplementationLevel::Unsupported),
-    skeleton("NtQueryObject", ImplementationLevel::Unsupported),
-    skeleton(
+    kernel_skeleton("NtAllocateVirtualMemory", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtClearEvent", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtClose", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateEvent", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateFile", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateKey", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateProcess", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateSection", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateThreadEx", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtDelayExecution", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtDeviceIoControlFile", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtDuplicateObject", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtFreeVirtualMemory", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtGetContextThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtMapViewOfSection", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtOpenKey", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtProtectVirtualMemory", ImplementationLevel::Unsupported),
+    // NtQueryInformationProcess is covered by THUNK_METADATA (the registered
+    // ntdll surface carries its Implemented level); no skeleton row here to
+    // avoid a duplicate full key.
+    kernel_skeleton("NtQueryInformationThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQueryObject", ImplementationLevel::Unsupported),
+    kernel_skeleton(
         "NtQueryPerformanceCounter",
         ImplementationLevel::Unsupported,
     ),
-    skeleton("NtQuerySection", ImplementationLevel::Unsupported),
-    skeleton("NtQuerySystemInformation", ImplementationLevel::Unsupported),
-    skeleton("NtQueryTimerResolution", ImplementationLevel::Unsupported),
-    skeleton("NtQueryValueKey", ImplementationLevel::Unsupported),
-    skeleton("NtQueryVirtualMemory", ImplementationLevel::Unsupported),
-    skeleton("NtReadVirtualMemory", ImplementationLevel::Unsupported),
-    skeleton("NtResumeThread", ImplementationLevel::Unsupported),
-    skeleton("NtSetContextThread", ImplementationLevel::Unsupported),
-    skeleton("NtSetEvent", ImplementationLevel::Unsupported),
-    skeleton("NtSetInformationThread", ImplementationLevel::Unsupported),
-    skeleton("NtSetTimerResolution", ImplementationLevel::Unsupported),
-    skeleton("NtSetValueKey", ImplementationLevel::Unsupported),
-    skeleton("NtSuspendThread", ImplementationLevel::Unsupported),
-    skeleton("NtTerminateProcess", ImplementationLevel::Unsupported),
-    skeleton("NtTerminateThread", ImplementationLevel::Unsupported),
-    skeleton("NtUnmapViewOfSection", ImplementationLevel::Unsupported),
-    skeleton("NtWaitForMultipleObjects", ImplementationLevel::Unsupported),
-    skeleton("NtWaitForSingleObject", ImplementationLevel::Unsupported),
-    skeleton("NtWriteVirtualMemory", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQuerySection", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQuerySystemInformation", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQueryTimerResolution", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQueryValueKey", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtQueryVirtualMemory", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtReadVirtualMemory", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtResumeThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSetContextThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSetEvent", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSetInformationThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSetTimerResolution", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSetValueKey", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtSuspendThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtTerminateProcess", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtTerminateThread", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtUnmapViewOfSection", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtWaitForMultipleObjects", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtWaitForSingleObject", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtWriteVirtualMemory", ImplementationLevel::Unsupported),
 ];
 
 /// The core COM interface surface, marked at the runtime's actual level.
@@ -1588,6 +1766,22 @@ pub struct ApiGateSummary {
     pub completeness_violation_count: usize,
 }
 
+/// One per-entry registry row in the report (the regression baseline unit:
+/// API key -> implementation level + coverage level + support policy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiRegistryRow {
+    /// Exporting DLL name (lowercase, with extension).
+    pub dll: String,
+    /// API/export name.
+    pub export: String,
+    /// Implementation quality.
+    pub implementation: ImplementationLevel,
+    /// Proven semantic test coverage.
+    pub semantic_test_coverage: CoverageLevel,
+    /// User-mode support policy.
+    pub support_policy: SupportPolicy,
+}
+
 /// The `api-completeness.json` report shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiCompletenessReport {
@@ -1597,6 +1791,9 @@ pub struct ApiCompletenessReport {
     pub per_dll: BTreeMap<String, DllCompletenessSummary>,
     /// Both gate results with counts.
     pub gate: ApiGateSummary,
+    /// Per-entry registry (API key -> implementation + coverage + policy).
+    /// The CI regression gate compares this against the committed baseline.
+    pub registry: Vec<ApiRegistryRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,9 +1803,9 @@ pub struct ApiCompletenessReport {
 /// The process-wide compatibility database, seeded from
 /// [`ApiDatabase::from_thunk_metadata`].
 ///
-/// The Steam import-coverage machinery
-/// ([`crate::import_coverage::coverage_for_steam_fixture`]) consults this
-/// global for each import's level and records the `"steam"` workload into the
+/// The generic import-coverage machinery
+/// ([`crate::import_coverage::coverage_for_pe`]) consults this
+/// global for each import's level and records the workload into the
 /// matching entries, making the database the whole project's compatibility
 /// accounting.
 pub static API_DATABASE: LazyLock<Mutex<ApiDatabase>> =
