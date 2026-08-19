@@ -4167,6 +4167,10 @@ struct PeHostRuntime {
     /// (~30 FPS) so that GDI previews never flood the live frame channel.
     last_gdi_preview_publish: std::time::Instant,
     delivering_guest_exception: bool,
+    /// Set when an unhandled guest exception (RaiseException with no
+    /// handler, or an unhandled fault) terminates the process: the finalizer
+    /// reports ExecutionTermination::GuestException with this code.
+    unhandled_guest_exception: Option<u32>,
     dtm: bool,
     /// Telemetry collector for unsupported imports, vtable methods,
     /// shader-model requests, and unimplemented CPU instructions.
@@ -4678,6 +4682,10 @@ pub fn execute_with_options(
     // run in this process can never leak into the new run's artifact.
     crate::steam_milestones::reset_milestones();
     crate::steam_milestones::mark_run_start();
+    // The deadline flag is a process-wide static: it MUST be reset per run,
+    // or a previous run's expired deadline instantly ends the next one
+    // (observed: a stale deadline ended a fresh run at iteration 0).
+    RUN_DEADLINE_EXPIRED.store(false, std::sync::atomic::Ordering::Release);
     // ── Diagnostic markers (DISABLED: file I/O was too slow) ─────────────────
     // Was writing to /tmp/casa1_diag.txt but file open/write/flush/close on
     // every call throttled execution to ~10 iterations/second.  All diag()
@@ -8495,7 +8503,13 @@ pub fn execute_with_options(
     ) {
         Ok((code, steps, block_count)) => (code, steps, block_count),
         Err(error) => {
-            let termination = classify_execution_error(&error);
+            let termination = if runtime.unhandled_guest_exception.is_some() {
+                // The root cause was an unhandled guest exception; the fault
+                // that surfaced afterwards is secondary.
+                ExecutionTermination::GuestException
+            } else {
+                classify_execution_error(&error)
+            };
             let detail = Some(error.to_string());
             let exit_code = legacy_exit_code(termination);
             // The error path has no completed step accounting (the budget /
@@ -8518,12 +8532,16 @@ pub fn execute_with_options(
             );
         }
     };
-    let termination =
-        if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) && exit_code == -2 {
-            ExecutionTermination::HarnessDeadline
-        } else {
-            ExecutionTermination::GuestExit { code: exit_code }
-        };
+    let termination = if runtime.unhandled_guest_exception.is_some() {
+        // An unhandled guest exception (RaiseException with no handler, or
+        // an unhandled fault) terminated the process — the structured
+        // termination is GuestException, not a normal guest exit.
+        ExecutionTermination::GuestException
+    } else if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) && exit_code == -2 {
+        ExecutionTermination::HarnessDeadline
+    } else {
+        ExecutionTermination::GuestExit { code: exit_code }
+    };
     let termination_detail = None;
 
     finalize_execution(
@@ -9153,6 +9171,7 @@ impl PeHostRuntime {
             real_guest_frames: 0,
             last_gdi_preview_publish: std::time::Instant::now(),
             delivering_guest_exception: false,
+            unhandled_guest_exception: None,
             dtm,
             telemetry: TelemetryCollector::new(),
             // Steam diagnostic tracing is opt-in via env var.
@@ -25265,6 +25284,10 @@ impl PeHostRuntime {
                     lparam,
                     "SendMessageW::WindowProc",
                 )?;
+                if let Some(code) = self.process_exit_requested {
+                    state.set(Register::Rax, u64::from(code));
+                    return Ok(Some(code as i32));
+                }
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
                 self.push_trace(
@@ -25463,6 +25486,13 @@ impl PeHostRuntime {
                 } else {
                     self.user32.dispatch_message_w(&message)?
                 };
+                // An unhandled exception raised INSIDE the window proc must
+                // terminate the process at the raise — never let the caller
+                // continue into the guest's error path after the raise.
+                if let Some(code) = self.process_exit_requested {
+                    state.set(Register::Rax, u64::from(code));
+                    return Ok(Some(code as i32));
+                }
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
                 self.push_trace(
@@ -42119,15 +42149,99 @@ impl PeHostRuntime {
                 ));
             }
             HostThunk::RaiseException => {
-                let code = arg(0);
+                let code = arg(0) as u32;
                 let flags = arg(1) as u32;
-                // EH_UNWINDING (0x02) means this is called during stack unwinding — just continue.
-                // EH_NONCONTINUABLE (0x01) would normally terminate, but in the VM we log and continue.
-                if flags & 0x02 == 0 {
+                // EH_UNWINDING (0x02) means this is called during stack
+                // unwinding — it is a signal, not a dispatch.
+                if flags & 0x02 != 0 {
                     emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
+                    state.set(Register::Rax, u64::from(code));
+                    self.last_error = 0;
+                    return Ok(None);
                 }
-                // In the VM, we don't deliver exceptions to guest SEH handlers.
-                // The guest code that called RaiseException will see the return and continue.
+                emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
+                // Windows semantics: dispatch through the thread's SEH chain
+                // (VEH first, then SEH).  A claimed exception returns to the
+                // caller; an unhandled exception terminates the process with
+                // the exception code.
+                let handled = if self.guest_arch == GuestArch::X86 {
+                    self.dispatch_x86_exception(state, memory, code, 0, "RaiseException")?
+                } else if self.guest_arch == GuestArch::X64 {
+                    let ctx = crate::seh::X64Context {
+                        rax: state.gpr[0],
+                        rcx: state.gpr[1],
+                        rdx: state.gpr[2],
+                        rbx: state.gpr[3],
+                        rsp: state.gpr[4],
+                        rbp: state.gpr[5],
+                        rsi: state.gpr[6],
+                        rdi: state.gpr[7],
+                        r8: state.gpr[8],
+                        r9: state.gpr[9],
+                        r10: state.gpr[10],
+                        r11: state.gpr[11],
+                        r12: state.gpr[12],
+                        r13: state.gpr[13],
+                        r14: state.gpr[14],
+                        r15: state.gpr[15],
+                        rip: state.rip,
+                        xmm: {
+                            let mut xmm = [crate::seh::Xmm128::default(); 16];
+                            for (i, slot) in xmm.iter_mut().enumerate() {
+                                *slot = crate::seh::Xmm128 {
+                                    low: state.xmm[i].low,
+                                    high: state.xmm[i].high,
+                                };
+                            }
+                            xmm
+                        },
+                    };
+                    let mem_ref: &MemoryImage = memory;
+                    let stack_reader = |addr: u64, buf: &mut [u8]| -> bool {
+                        mem_ref.read_into(addr, buf).is_ok()
+                    };
+                    let handled = self
+                        .seh
+                        .dispatch(code, 0, &ctx, self.mapped_image_base, &stack_reader)
+                        .is_ok();
+                    let pending_veh = crate::seh::drain_pending_guest_veh();
+                    for (veh_callback, veh_record, veh_context) in &pending_veh {
+                        self.invoke_guest_veh_callback(
+                            state,
+                            memory,
+                            *veh_callback,
+                            veh_record,
+                            veh_context,
+                        )?;
+                    }
+                    handled
+                } else {
+                    false
+                };
+                if handled {
+                    // A handler claimed the exception: RaiseException
+                    // returns to the caller with the code as the result.
+                    state.set(Register::Rax, u64::from(code));
+                    self.last_error = 0;
+                } else {
+                    // Unhandled: Windows terminates the process with the
+                    // exception code.  The structured termination becomes
+                    // GuestException (the finalizer consults the marker).
+                    self.unhandled_guest_exception = Some(code);
+                    crate::steam_milestones::record_first_failure(
+                        crate::steam_milestones::FailureCategory::Thread,
+                        state.rip as u32,
+                        self.win32.current_thread_id(),
+                        Some("RaiseException".to_string()),
+                        Some(code),
+                        format!("unhandled RaiseException code={code:#x} flags={flags:#x}"),
+                        None,
+                        None,
+                    );
+                    state.set(Register::Rax, u64::from(code));
+                    self.process_exit_requested = Some(code);
+                    return Ok(Some(code as i32));
+                }
             }
             HostThunk::RtlUnwind => {
                 // RtlUnwind(target_ip, target_frame, record, return_value)
@@ -51713,6 +51827,9 @@ impl PeHostRuntime {
                 label,
             )? as i64;
             self.record_guest_input_consumed(state, message_id);
+            if let Some(code) = self.process_exit_requested {
+                return Ok(code as i64);
+            }
             return Ok(result);
         }
         if let Some(window_proc) = self.user32.get_window_long_w(hwnd, GWL_WNDPROC) {
@@ -51733,6 +51850,12 @@ impl PeHostRuntime {
                     label,
                 )? as i64;
                 self.record_guest_input_consumed(state, message_id);
+                // An unhandled exception raised inside the window proc must
+                // terminate the process at the raise (the caller chain must
+                // not continue into the guest's error path after the raise).
+                if let Some(code) = self.process_exit_requested {
+                    return Ok(code as i64);
+                }
                 return Ok(result);
             } else {
                 emit_window_msg_debug(format!(
@@ -51793,6 +51916,9 @@ impl PeHostRuntime {
                 &message,
                 "DialogBoxParamW::DispatchMessage",
             )?;
+            if let Some(code) = self.process_exit_requested {
+                return Ok(Some(code as i64));
+            }
             if message.kind == MessageKind::Quit {
                 self.user32.post_quit_message(message.wparam as i32)?;
                 return Ok(None);
@@ -53651,28 +53777,36 @@ impl PeHostRuntime {
             );
             return Ok(false);
         }
+        self.dispatch_x86_exception(
+            state,
+            memory,
+            crate::cpu::EXCEPTION_ACCESS_VIOLATION,
+            fault_address,
+            label,
+        )
+    }
+
+    /// Walk the guest's x86 FS:0 SEH chain and invoke handlers for `code`
+    /// (an access violation fault or an explicit RaiseException).  Returns
+    /// true when a handler claimed the exception (the guest resumed).
+    fn dispatch_x86_exception(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        code: u32,
+        fault_address: u64,
+        label: &str,
+    ) -> AppResult<bool> {
+        if self.delivering_guest_exception {
+            return Ok(false);
+        }
+        if state.segment_bases.fs == 0 {
+            return Ok(false);
+        }
         let mut registration =
             match read_guest_pointer(memory, state.segment_bases.fs, GuestArch::X86) {
                 Ok(value) => value,
                 Err(_err) => {
-                    self.push_trace(
-                        "process",
-                        "GuestExceptionAttempt",
-                        BTreeMap::from([
-                            ("label".to_string(), json!(label)),
-                            ("reason".to_string(), json!("unreadable_registration_head")),
-                            (
-                                "fault_address".to_string(),
-                                json!(format!("{fault_address:#x}")),
-                            ),
-                            ("fault_rip".to_string(), json!(format!("{:#x}", state.rip))),
-                            (
-                                "fs_base".to_string(),
-                                json!(format!("{:#x}", state.segment_bases.fs)),
-                            ),
-                        ]),
-                        json!(false),
-                    );
                     return Ok(false);
                 }
             };
@@ -53718,7 +53852,13 @@ impl PeHostRuntime {
             let exception_record =
                 self.alloc_zeroed(memory, X86_EXCEPTION_RECORD_SIZE as usize, 4)?;
             let context_record = self.alloc_zeroed(memory, X86_CONTEXT_SIZE as usize, 4)?;
-            write_x86_exception_record(memory, exception_record, fault_address, state.rip as u32);
+            write_x86_exception_record(
+                memory,
+                exception_record,
+                code,
+                fault_address,
+                state.rip as u32,
+            );
             write_x86_context(memory, context_record, state);
             let saved_state = state.clone();
 
@@ -72436,10 +72576,11 @@ fn unpack_x86_eflags(state: &mut CpuState, value: u32) {
 fn write_x86_exception_record(
     memory: &mut MemoryImage,
     base: u64,
+    code: u32,
     fault_address: u64,
     exception_rip: u32,
 ) {
-    write_u32(memory, base, crate::cpu::EXCEPTION_ACCESS_VIOLATION);
+    write_u32(memory, base, code);
     write_u32(memory, base + 4, 0);
     write_u32(memory, base + 8, 0);
     write_u32(memory, base + 12, exception_rip);
@@ -78222,6 +78363,144 @@ mod tests {
         );
         assert_eq!(read_u32(&memory, buffer + 24).expect("type"), MEM_PRIVATE);
         assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn raise_exception_unhandled_terminates_with_exception_code() {
+        // Windows semantics: RaiseException with no SEH handler terminates
+        // the process with the exception code.  The runtime must dispatch
+        // through the guest FS:0 chain (empty here -> unhandled) and end the
+        // run with GuestException termination, not continue past the raise.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "raise-exception",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime
+                .seed_process_state(&mut memory, "C:\\raise-probe.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let raise_exception = runtime.alloc_host_thunk(HostThunk::RaiseException);
+            // The FS:0 chain head is the chain-end sentinel (no handlers).
+            let fs_base = runtime.teb_base;
+            write_u32(&mut memory, fs_base, X86_EXCEPTION_CHAIN_END as u32);
+
+            // Call RaiseException(0xC000_0005, 0, 0, NULL): unhandled.
+            let code = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                raise_exception,
+                &[0xC000_0005, 0, 0, 0],
+            );
+            assert_eq!(
+                code, 0xC000_0005,
+                "unhandled raise exits with the exception code"
+            );
+            assert_eq!(
+                runtime.unhandled_guest_exception,
+                Some(0xC000_0005),
+                "the unhandled exception marker must be recorded"
+            );
+            // The termination classification follows in the finalizer; the
+            // marker is the authoritative signal.
+            assert!(
+                matches!(runtime.unhandled_guest_exception, Some(0xC000_0005)),
+                "GuestException termination derives from the marker"
+            );
+        })
+    }
+
+    #[test]
+    fn raise_exception_handled_by_guest_seh_resumes() {
+        // A guest-registered FS:0 SEH handler claims the raise: the caller
+        // resumes with the exception code as the result and the process
+        // stays alive.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "raise-handled",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime
+                .seed_process_state(&mut memory, "C:\\raise-handled.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let raise_exception = runtime.alloc_host_thunk(HostThunk::RaiseException);
+            let fs_base = runtime.teb_base;
+            // Handler (real x86 SEH semantics): writes a marker (0xABCD) to
+            // 0x43000, sets the CONTEXT's EIP to a resume stub (the context
+            // record is arg2 = [esp+12] of the callback frame) and returns
+            // EXCEPTION_CONTINUE_EXECUTION (0).
+            let handler = 0x42_000_u64;
+            let marker = 0x43_000_u64;
+            let resume_stub = 0x42_100_u64;
+            let mut handler_bytes = vec![0x90; 0x30];
+            handler_bytes[..27].copy_from_slice(&[
+                0xB8, 0xCD, 0xAB, 0x00, 0x00, // mov eax, 0xABCD
+                0xA3, 0x00, 0x30, 0x04, 0x00, // mov [0x43000], eax
+                0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12] (context_record)
+                0xC7, 0x80, 0xB8, 0x00, 0x00, 0x00, 0x20, 0x01, 0x42,
+                0x00, // mov [eax+0xb8], resume_stub
+                0x31, 0xC0, // xor eax, eax (EXCEPTION_CONTINUE_EXECUTION)
+                0xC3, // ret
+            ]);
+            memory.map_bytes(handler, &handler_bytes);
+            memory.map_bytes(marker, &[0_u8; 4]);
+            let mut stub_bytes = vec![0x90; 0x10];
+            stub_bytes[..4].copy_from_slice(&[0x31, 0xC0, 0xC3, 0x90]); // xor eax,eax; ret
+            memory.map_bytes(resume_stub, &stub_bytes);
+
+            // FS:0 -> registration { next = 0xFFFFFFFF (end), handler }
+            let registration = 0x44_000_u64;
+            write_u32(&mut memory, fs_base, registration as u32);
+            write_u32(&mut memory, registration, X86_EXCEPTION_CHAIN_END as u32);
+            write_u32(&mut memory, registration + 4, handler as u32);
+
+            // The harness state must carry the guest FS base (the real
+            // guest TEB) for the SEH chain walk.
+            let stack = 0x50_000_u64;
+            memory.map_bytes(stack, &[0_u8; 0x200]);
+            write_u32(&mut memory, stack, 0xDEAD_BEEF);
+            for (index, arg) in [0xC000_0005u32, 0, 0, 0].iter().enumerate() {
+                write_u32(&mut memory, stack + 4 + (index as u64 * 4), *arg);
+            }
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, stack);
+            state.segment_bases.fs = fs_base;
+            let dispatch_result = runtime
+                .dispatch_import(raise_exception, &mut state, &mut memory)
+                .expect("dispatch RaiseException");
+            let result = state.get(Register::Rax);
+            assert_eq!(dispatch_result, None, "handled raise continues the caller");
+            assert_eq!(
+                result, 0xC000_0005,
+                "handled raise returns the code to the caller"
+            );
+            assert_eq!(
+                runtime.unhandled_guest_exception, None,
+                "a handled raise must not terminate the process"
+            );
+            assert_eq!(
+                read_u32(&memory, marker).expect("handler marker"),
+                0xABCD,
+                "the guest SEH handler must have run"
+            );
+        })
     }
 
     #[test]
