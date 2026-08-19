@@ -37,17 +37,48 @@ pub struct CaptureHeader {
     pub captured_on: String,
     pub capture_date: String,
     pub note: Option<String>,
+    /// Windows edition of the capture machine (registry EditionID,
+    /// e.g. "Professional"); "unknown" on non-Windows builds.
+    pub os_edition: String,
+    /// `major.minor.build` from RtlGetVersion (e.g. "10.0.22631");
+    /// "unknown" on non-Windows builds.
+    pub os_build: String,
+    /// Capture machine architecture ("x86"/"x64"/"arm64" from
+    /// GetNativeSystemInfo; the host arch name elsewhere).
+    pub arch: String,
+    /// SHA-256 (lowercase hex) of the reference executable itself.
+    pub reference_sha256: String,
+    /// SHA-256 (lowercase hex) of the vector corpus file the capture ran on.
+    pub corpus_sha256: String,
+}
+
+/// Actual capture-machine provenance, computed by the reference executable
+/// at runtime (never hardcoded).
+#[derive(Debug, Clone)]
+pub struct CaptureProvenance {
+    pub os_edition: String,
+    pub os_build: String,
+    pub arch: String,
+    pub reference_sha256: String,
+    pub corpus_sha256: String,
 }
 
 impl CaptureHeader {
-    /// Provenance header for a real capture on Windows 10/11.
-    pub fn windows_capture() -> Self {
+    /// Provenance header for a real capture on Windows 10/11, carrying the
+    /// capture machine's ACTUAL os edition/build/arch and the SHA-256s of
+    /// the reference executable and the input corpus.
+    pub fn windows_capture(provenance: CaptureProvenance) -> Self {
         CaptureHeader {
             source: "windows".to_string(),
             captured_by: "casa1-windows-reference".to_string(),
             captured_on: "windows-10-11".to_string(),
             capture_date: iso_date_now(),
             note: None,
+            os_edition: provenance.os_edition,
+            os_build: provenance.os_build,
+            arch: provenance.arch,
+            reference_sha256: provenance.reference_sha256,
+            corpus_sha256: provenance.corpus_sha256,
         }
     }
 }

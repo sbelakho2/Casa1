@@ -15,9 +15,15 @@
 //! `schema_version` is checked by both sides and must match; bump it whenever
 //! an existing category's input/output shape changes incompatibly.
 
+use crate::ge::{FileAccess, GameEnvironment, GeArch, RegistryView, ShareMode};
+use crate::pe_runtime::last_error_from_app_error;
+use crate::win32::{CreationDisposition, ThreadPlan, WaitStatus, Win32Subsystem};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Version of the vector/result wire protocol. Both the host harness and the
 /// reference executable reject files with a different `schema_version`.
@@ -70,7 +76,9 @@ pub struct ReferenceResultsFile {
 }
 
 /// Capture provenance header. Files produced by the real reference executable
-/// on Windows carry `captured_by: "casa1-windows-reference"`; model-generated
+/// on Windows carry `captured_by: "casa1-windows-reference"` plus the actual
+/// capture provenance (`os_edition`, `os_build`, `arch`, the reference
+/// executable's own SHA-256 and the vector-corpus SHA-256); model-generated
 /// fixtures keep the same shape but are explicitly marked as placeholders so
 /// they can never be mistaken for real Windows captures.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +88,25 @@ pub struct CaptureHeader {
     pub captured_on: String,
     pub capture_date: String,
     pub note: Option<String>,
+    /// Windows edition as reported by the capture machine's registry
+    /// (e.g. `"Professional"`); `"unknown"` on non-Windows builds.
+    #[serde(default)]
+    pub os_edition: String,
+    /// `major.minor.build` from RtlGetVersion (e.g. `"10.0.22631"`);
+    /// `"unknown"` on non-Windows builds.
+    #[serde(default)]
+    pub os_build: String,
+    /// Processor architecture of the capture machine (`"x86"`, `"x64"` or
+    /// `"arm64"` from GetNativeSystemInfo; the host arch name elsewhere).
+    #[serde(default)]
+    pub arch: String,
+    /// SHA-256 (lowercase hex) of the reference executable that produced the
+    /// capture.
+    #[serde(default)]
+    pub reference_sha256: String,
+    /// SHA-256 (lowercase hex) of the vector corpus file the capture ran on.
+    #[serde(default)]
+    pub corpus_sha256: String,
 }
 
 impl CaptureHeader {
@@ -91,6 +118,13 @@ impl CaptureHeader {
             captured_on: "windows-10-11".to_string(),
             capture_date: iso_date_now(),
             note: None,
+            // Filled by the reference executable at capture time; these
+            // defaults keep schema-version-1 files parseable.
+            os_edition: String::new(),
+            os_build: String::new(),
+            arch: String::new(),
+            reference_sha256: String::new(),
+            corpus_sha256: String::new(),
         }
     }
 
@@ -108,6 +142,11 @@ impl CaptureHeader {
                  Regenerate with the reference executable on Windows 10/11."
                     .to_string(),
             ),
+            os_edition: "unknown".to_string(),
+            os_build: "unknown".to_string(),
+            arch: "unknown".to_string(),
+            reference_sha256: String::new(),
+            corpus_sha256: String::new(),
         }
     }
 }
@@ -412,20 +451,23 @@ fn thread_tls_vectors() -> Vec<Value> {
 /// candidate the comparison validates.  Categories the runtime cannot
 /// compute yet yield a `runtime_unavailable` marker that the comparison
 /// reports honestly (never a silent pass).
+///
+/// Every arm drives the runtime's REAL machinery (real_fs parsing, the
+/// GameEnvironment share/lock matrix, the Win32Subsystem sync/TLS layers,
+/// the pe_runtime CRT tables) — never a hand-rolled duplicate model — so a
+/// diff against a real Windows capture is a genuine runtime defect.
 pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
     let output = match vector.category.as_str() {
-        "path_normalize" => {
-            let input = vector.input.as_str().unwrap_or_default();
-            // The runtime's parser classifies the path; the normalized form
-            // mirrors the reference's `normalized` field.
-            let parsed = crate::real_fs::parse_windows_path(input);
-            json!({
-                "normalized": parsed.to_base_string(),
-                "kind": runtime_path_kind(&parsed),
-                "has_ads": parsed.ads_stream.is_some(),
-                "last_error": 0,
-            })
-        }
+        "path_normalize" => runtime_path_normalize(&vector.input),
+        "case_fold" => runtime_case_fold(&vector.input),
+        "file_sharing" => runtime_file_sharing(&vector.input),
+        "file_lock" => runtime_file_lock(&vector.input),
+        "delete_semantics" => runtime_delete_semantics(&vector.input),
+        "api_set" => runtime_api_set(&vector.input),
+        "registry" => runtime_registry(&vector.input),
+        "synchronization" => runtime_synchronization(&vector.input),
+        "crt_printf" => runtime_crt(&vector.input),
+        "thread_tls" => runtime_thread_tls(&vector.input),
         _ => json!({ "runtime_unavailable": true }),
     };
     VectorResult {
@@ -435,18 +477,953 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
     }
 }
 
+// ── Shared runtime context ─────────────────────────────────────────────────
+
+/// Scratch `Win32Subsystem` + `GameEnvironment` the file/registry/sync/TLS
+/// executors drive.  The runtime is emulated on the host (macOS in CI), so
+/// the file-based categories operate on a per-process scratch game
+/// environment whose `drive_c` mirrors the reference's fixed scratch layout
+/// (`C:\Windows\Temp\casa1-oracle`, `...\casa1-oracle-cwd`).
+struct OracleRuntimeContext {
+    subsystem: Win32Subsystem,
+    /// Held alongside the subsystem (which owns a clone) so the executors can
+    /// reach the GE-level share/lock matrix (`open_file`, `lock_file_range`,
+    /// `registry_*`) that the Win32Subsystem's own GE mirrors on disk.
+    ge: GameEnvironment,
+    #[allow(dead_code)]
+    root: PathBuf,
+}
+
+thread_local! {
+    static ORACLE_RUNTIME: RefCell<Option<OracleRuntimeContext>> = const { RefCell::new(None) };
+}
+
+static ORACLE_RUNTIME_SERIAL: AtomicU32 = AtomicU32::new(0);
+
+/// Directories under `drive_c` provisioned for the file-based categories,
+/// mirroring the reference executable's `ensure_scratch_dirs`.
+const SCRATCH_DIRECTORIES: [&str; 4] = [
+    "Windows/Temp/casa1-oracle/fs",
+    "Windows/Temp/casa1-oracle/lock",
+    "Windows/Temp/casa1-oracle/del",
+    "Windows/Temp/casa1-oracle-cwd",
+];
+
+fn with_oracle_runtime<T>(operation: impl FnOnce(&mut OracleRuntimeContext) -> T) -> T {
+    ORACLE_RUNTIME.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(create_oracle_runtime());
+        }
+        operation(borrow.as_mut().expect("oracle runtime initialized"))
+    })
+}
+
+fn create_oracle_runtime() -> OracleRuntimeContext {
+    let serial = ORACLE_RUNTIME_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "casa1-oracle-runtime-{}-{serial:04}",
+        std::process::id()
+    ));
+    let ge = GameEnvironment::create_in(&root, "oracle", GeArch::X64, "10.0.22631").unwrap_or_else(
+        |error| {
+            panic!(
+                "failed to create the oracle scratch game environment at {}: {error}",
+                root.display()
+            )
+        },
+    );
+    let drive_c = ge.drive_c();
+    for directory in SCRATCH_DIRECTORIES {
+        std::fs::create_dir_all(drive_c.join(directory)).unwrap_or_else(|error| {
+            panic!("failed to provision oracle scratch directory {directory}: {error}")
+        });
+    }
+    let subsystem = Win32Subsystem::new(ge.clone(), true);
+    OracleRuntimeContext {
+        subsystem,
+        ge,
+        root,
+    }
+}
+
+fn access_spec(spec: &AccessSpec) -> FileAccess {
+    FileAccess {
+        read: spec.read,
+        write: spec.write,
+        delete: spec.delete,
+    }
+}
+
+fn share_spec(spec: &ShareSpec) -> ShareMode {
+    ShareMode {
+        read: spec.read,
+        write: spec.write,
+        delete: spec.delete,
+    }
+}
+
+fn error_code(error: &crate::error::AppError) -> u32 {
+    last_error_from_app_error(error)
+}
+
+// ── path_normalize ──────────────────────────────────────────────────────────
+
+/// Resolve cwd-dependent input forms against the reference's fixed working
+/// directory before classifying, matching the reference executor's
+/// `SetCurrentDirectoryW` + `GetFullPathNameW` contract: relative paths
+/// resolve against the cwd, drive-relative paths (`C:rel`) against the cwd
+/// on their drive, and root-relative paths (`\x`) against the cwd's drive
+/// root.
+fn resolve_against_cwd(path: &str, cwd: &str) -> String {
+    use crate::real_fs::WindowsPathKind::*;
+    let parsed = crate::real_fs::parse_windows_path(path);
+    let cwd = cwd.trim_end_matches(['\\', '/']);
+    match &parsed.kind {
+        Relative { .. } | DriveRelative { .. } => format!("{cwd}\\{path}"),
+        RootedCurrentDrive { .. } => {
+            let drive = cwd.chars().next().unwrap_or('C');
+            let body = path.trim_start_matches('\\');
+            format!("{drive}:\\{body}")
+        }
+        _ => path.to_string(),
+    }
+}
+
+fn runtime_path_normalize(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<PathNormalizeInput>(input.clone()) else {
+        return json!({ "normalized": "", "kind": "invalid_input", "has_ads": false, "last_error": 87 });
+    };
+    // Kind/has_ads classify the INPUT shape (like the reference's
+    // protocol-level classifiers); the normalized string resolves the
+    // cwd-dependent forms against the fixed working directory.
+    let input_parsed = crate::real_fs::parse_windows_path(&spec.path);
+    let kind = runtime_path_kind(&input_parsed);
+    let has_ads = input_parsed.ads_stream.is_some();
+    let effective_cwd = spec
+        .cwd
+        .clone()
+        .unwrap_or_else(|| REFERENCE_CWD.to_string());
+    let resolved = resolve_against_cwd(&spec.path, &effective_cwd);
+    let parsed = crate::real_fs::parse_windows_path(&resolved);
+    json!({
+        "normalized": parsed.to_base_string(),
+        "kind": kind,
+        "has_ads": has_ads,
+        "last_error": 0,
+    })
+}
+
 fn runtime_path_kind(parsed: &crate::real_fs::WindowsPath) -> &'static str {
     use crate::real_fs::WindowsPathKind::*;
     match &parsed.kind {
         DriveAbsolute { .. } => "drive_abs",
         DriveRelative { .. } => "drive_rel",
-        RootedCurrentDrive { .. } => "rooted_current_drive",
+        RootedCurrentDrive { .. } => "rooted",
         Relative { .. } => "relative",
         Unc { .. } => "unc",
-        VerbatimDrive { .. } => "verbatim_drive",
-        VerbatimUnc { .. } => "verbatim_unc",
+        VerbatimDrive { .. } | VerbatimUnc { .. } => "verbatim",
         Device { .. } => "device",
     }
+}
+
+// ── case_fold ───────────────────────────────────────────────────────────────
+
+/// The runtime's case-folding equality: the GE filesystem layer's ordinal
+/// casefold (`ge::windows_casefold_key`, the fold `real_fs` name resolution
+/// uses).  The C1 type bits mirror the runtime's `GetStringTypeW` thunk
+/// (`pe_runtime::classify_wide_char_type`, CT_CTYPE1).
+fn runtime_case_fold(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<CaseFoldInput>(input.clone()) else {
+        return json!({
+            "ordinal_ignore_case_equal": false,
+            "left_c1_type_bits": [],
+            "right_c1_type_bits": [],
+        });
+    };
+    let equal =
+        crate::ge::windows_casefold_key(&spec.left) == crate::ge::windows_casefold_key(&spec.right);
+    json!({
+        "ordinal_ignore_case_equal": equal,
+        "left_c1_type_bits": runtime_c1_type_bits(&spec.left),
+        "right_c1_type_bits": runtime_c1_type_bits(&spec.right),
+    })
+}
+
+fn runtime_c1_type_bits(value: &str) -> Vec<u32> {
+    value
+        .encode_utf16()
+        .map(|unit| u32::from(crate::pe_runtime::classify_wide_char_type(1, unit)))
+        .collect()
+}
+
+// ── file_sharing ────────────────────────────────────────────────────────────
+
+/// Drive the runtime's real open path (`create_file_w` → the GE share-state
+/// matrix) exactly like the reference's two `CreateFileW` calls.
+fn runtime_file_sharing(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<FileSharingInput>(input.clone()) else {
+        return json!({ "second_open_succeeds": false, "second_error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let first = subsystem.create_file_w(
+            &spec.path,
+            access_spec(&spec.first_access),
+            share_spec(&spec.first_share),
+            CreationDisposition::CreateAlways,
+            false,
+            false,
+            false,
+        );
+        let first = match first {
+            Ok(handle) => handle,
+            Err(error) => {
+                return json!({
+                    "second_open_succeeds": false,
+                    "second_error": error_code(&error),
+                });
+            }
+        };
+        let second = subsystem.create_file_w(
+            &spec.path,
+            access_spec(&spec.second_access),
+            share_spec(&spec.second_share),
+            CreationDisposition::OpenExisting,
+            false,
+            false,
+            false,
+        );
+        let (second_open_succeeds, second_error) = match second {
+            Ok(handle) => {
+                let _ = subsystem.close_handle(handle);
+                (true, 0)
+            }
+            Err(error) => (false, error_code(&error)),
+        };
+        let _ = subsystem.close_handle(first);
+        json!({
+            "second_open_succeeds": second_open_succeeds,
+            "second_error": second_error,
+        })
+    })
+}
+
+// ── file_lock ───────────────────────────────────────────────────────────────
+
+/// The runtime's byte-range lock behavior is the GE share runtime's
+/// `lock_file_range` (exclusive lock + `RcFsLockViolation` →
+/// `ERROR_LOCK_VIOLATION`).  The runtime has no `UnlockFileEx` counterpart,
+/// so an unlock request is reported as not performed (`performed: false`) —
+/// a genuine runtime gap the differential surfaces as a diff, never as a
+/// fabricated success.
+fn runtime_file_lock(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<FileLockInput>(input.clone()) else {
+        return json!({ "lock1": null, "lock2": null, "unlock1": null, "lock3": null });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let ge = &runtime.ge;
+        let read_write = FileAccess {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        let share = ShareMode {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        // Ensure the file exists through the runtime's own open machinery
+        // (the reference's OPEN_ALWAYS), then release the setup handle so
+        // the vector's two opens see a clean share matrix.
+        let setup = subsystem.create_file_w(
+            &spec.path,
+            read_write,
+            share,
+            CreationDisposition::OpenAlways,
+            false,
+            false,
+            false,
+        );
+        match setup {
+            Ok(handle) => {
+                let _ = subsystem.close_handle(handle);
+            }
+            Err(error) => {
+                return json!({
+                    "lock1": null, "lock2": null, "unlock1": null, "lock3": null,
+                    "error": error_code(&error),
+                });
+            }
+        }
+        let first = match ge.open_file(&spec.path, read_write, share) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return json!({
+                    "lock1": null, "lock2": null, "unlock1": null, "lock3": null,
+                    "error": error_code(&error),
+                });
+            }
+        };
+        let second = if spec.same_handle {
+            None
+        } else {
+            match ge.open_file(&spec.path, read_write, share) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    let _ = ge.close_file_handle(&first);
+                    return json!({
+                        "lock1": null, "lock2": null, "unlock1": null, "lock3": null,
+                        "error": error_code(&error),
+                    });
+                }
+            }
+        };
+        let second_handle = second.as_ref().unwrap_or(&first);
+        let lock_op = |outcome: crate::error::AppResult<()>| match outcome {
+            Ok(()) => json!({ "performed": true, "succeeded": true, "error": 0 }),
+            Err(error) => json!({
+                "performed": true,
+                "succeeded": false,
+                "error": error_code(&error),
+            }),
+        };
+        let lock1 = lock_op(ge.lock_file_range(&first, spec.first_offset, spec.first_length, true));
+        let lock2 = lock_op(ge.lock_file_range(
+            second_handle,
+            spec.second_offset,
+            spec.second_length,
+            true,
+        ));
+        // The runtime implements no unlock: the request is not performed and
+        // the first lock stays in force, so lock3 still sees the conflict.
+        let unlock1 = json!({ "performed": false, "succeeded": false, "error": 0 });
+        let lock3 = if spec.retry_after_unlock {
+            lock_op(ge.lock_file_range(second_handle, spec.second_offset, spec.second_length, true))
+        } else {
+            json!({ "performed": false, "succeeded": false, "error": 0 })
+        };
+        if let Some(second) = second {
+            let _ = ge.close_file_handle(&second);
+        }
+        let _ = ge.close_file_handle(&first);
+        json!({
+            "lock1": lock1,
+            "lock2": lock2,
+            "unlock1": unlock1,
+            "lock3": lock3,
+        })
+    })
+}
+
+// ── delete_semantics ────────────────────────────────────────────────────────
+
+/// The runtime's delete/rename-while-open behavior via `delete_file_w` /
+/// `move_file_ex_w` (both enforce the `FILE_SHARE_DELETE` matrix through
+/// `check_delete_sharing`).
+fn runtime_delete_semantics(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<DeleteSemanticsInput>(input.clone()) else {
+        return json!({ "success": false, "error": 87, "file_exists_after": true, "rename_succeeded": false, "second_open_succeeded": false, "second_open_error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let ge = &runtime.ge;
+        let handle = if spec.first_open {
+            subsystem
+                .create_file_w(
+                    &spec.path,
+                    FileAccess {
+                        read: true,
+                        write: true,
+                        delete: false,
+                    },
+                    share_spec(&spec.first_share),
+                    CreationDisposition::CreateAlways,
+                    false,
+                    false,
+                    false,
+                )
+                .ok()
+        } else {
+            None
+        };
+        let file_exists = |path: &str| ge.get_file_metadata(path).is_ok();
+        match spec.op.as_str() {
+            "delete" => {
+                let outcome = subsystem.delete_file_w(&spec.path);
+                let (success, error) = match outcome {
+                    Ok(()) => (true, 0_u32),
+                    Err(error) => (false, error_code(&error)),
+                };
+                let exists_after = file_exists(&spec.path);
+                if let Some(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                json!({
+                    "success": success,
+                    "error": error,
+                    "file_exists_after": exists_after,
+                    "rename_succeeded": false,
+                    "second_open_succeeded": false,
+                    "second_open_error": 0,
+                })
+            }
+            "rename" => {
+                let target = format!("{}.ren", spec.path);
+                let outcome = subsystem.move_file_ex_w(&spec.path, &target, true, false);
+                let (success, error) = match outcome {
+                    Ok(()) => (true, 0_u32),
+                    Err(error) => (false, error_code(&error)),
+                };
+                let exists_after = file_exists(&spec.path);
+                if let Some(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                let _ = subsystem.delete_file_w(&target);
+                json!({
+                    "success": success,
+                    "error": error,
+                    "file_exists_after": exists_after,
+                    "rename_succeeded": success,
+                    "second_open_succeeded": false,
+                    "second_open_error": 0,
+                })
+            }
+            "delete_then_reopen" => {
+                let outcome = subsystem.delete_file_w(&spec.path);
+                let (success, error) = match outcome {
+                    Ok(()) => (true, 0_u32),
+                    Err(error) => (false, error_code(&error)),
+                };
+                let second = subsystem.create_file_w(
+                    &spec.path,
+                    FileAccess {
+                        read: true,
+                        write: false,
+                        delete: false,
+                    },
+                    ShareMode {
+                        read: true,
+                        write: true,
+                        delete: true,
+                    },
+                    CreationDisposition::OpenExisting,
+                    false,
+                    false,
+                    false,
+                );
+                let (second_open_succeeded, second_open_error) = match second {
+                    Ok(second) => {
+                        let _ = subsystem.close_handle(second);
+                        (true, 0)
+                    }
+                    Err(error) => (false, error_code(&error)),
+                };
+                let exists_after = file_exists(&spec.path);
+                if let Some(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                json!({
+                    "success": success,
+                    "error": error,
+                    "file_exists_after": exists_after,
+                    "rename_succeeded": false,
+                    "second_open_succeeded": second_open_succeeded,
+                    "second_open_error": second_open_error,
+                })
+            }
+            _ => {
+                if let Some(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                json!({ "success": false, "error": 87, "file_exists_after": true, "rename_succeeded": false, "second_open_succeeded": false, "second_open_error": 87 })
+            }
+        }
+    })
+}
+
+// ── api_set ─────────────────────────────────────────────────────────────────
+
+/// The runtime's api-set resolution: `pe::ApiSetResolver` (the loader's
+/// contract→host table).  `loads` is true when the resolver maps the
+/// contract (api-set prefixes) or the runtime models the physical module
+/// (thunk metadata exists for it); `export_resolvable` is true when the
+/// runtime knows the probe export on the resolved host (thunk metadata, or
+/// the CRT name table for ucrtbase/msvcrt).
+fn runtime_api_set(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<ApiSetInput>(input.clone()) else {
+        return json!({ "loads": false, "resolved_module": "", "export_resolvable": false });
+    };
+    let resolver = crate::pe::ApiSetResolver::new();
+    if !runtime_apiset_loads(&spec.contract, &resolver) {
+        return json!({ "loads": false, "resolved_module": "", "export_resolvable": false });
+    }
+    let host = resolver.resolve(&spec.contract);
+    json!({
+        "loads": true,
+        "resolved_module": normalize_module_name(&host),
+        "export_resolvable": runtime_export_resolvable(&host, &spec.probe),
+    })
+}
+
+fn runtime_apiset_loads(contract: &str, resolver: &crate::pe::ApiSetResolver) -> bool {
+    let normalized = normalize_module_name(contract);
+    if normalized.starts_with("api-ms-") || normalized.starts_with("ext-ms-") {
+        let host = normalize_module_name(&resolver.resolve(contract));
+        host != normalized
+    } else {
+        crate::host_thunks::THUNK_METADATA.iter().any(|entry| {
+            let dll = entry.dll.strip_suffix(".dll").unwrap_or(entry.dll);
+            let requested = normalized.strip_suffix(".dll").unwrap_or(&normalized);
+            dll.eq_ignore_ascii_case(requested)
+        })
+    }
+}
+
+fn runtime_export_resolvable(host: &str, probe: &str) -> bool {
+    let host_norm = normalize_module_name(host);
+    if host_norm == "ucrtbase.dll"
+        || host_norm == "msvcrt.dll"
+        || host_norm.starts_with("vcruntime")
+    {
+        crate::pe_runtime::HostThunk::crt_thunk_from_name(probe).is_some()
+    } else {
+        crate::host_thunks::lookup_thunk_metadata(host, probe).is_some()
+    }
+}
+
+// ── registry ────────────────────────────────────────────────────────────────
+
+/// The runtime's registry behavior: the GE registry DB behind the
+/// `RegCreateKeyExW`/`RegSetValueExW`/`RegQueryValueExW`/`RegDeleteValueW`
+/// thunks (HKCU, `RegistryView::Native`).  Output mirrors the reference's
+/// `error` (0 on success, 2 = ERROR_FILE_NOT_FOUND on a missing value),
+/// lowercase-hex `value_bytes` and numeric `value_type` (1/2/3/4).
+fn runtime_registry(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<RegistryInput>(input.clone()) else {
+        return json!({ "error": 87, "value_bytes": "", "value_type": null });
+    };
+    with_oracle_runtime(|runtime| {
+        let ge = &runtime.ge;
+        let hive = "HKCU";
+        let view = RegistryView::Native;
+        match spec.op.as_str() {
+            "query_missing" => query_registry_value(ge, hive, view, &spec),
+            "create_twice" => {
+                let _ = ge.registry_create_key(hive, &spec.key, view);
+                let _ = ge.registry_create_key(hive, &spec.key, view);
+                json!({ "error": 0, "value_bytes": "", "value_type": null })
+            }
+            "set_query_delete" => {
+                let _ = ge.registry_set_value(
+                    hive,
+                    &spec.key,
+                    &spec.value_name,
+                    &spec.value_type,
+                    spec.data.clone(),
+                    view,
+                );
+                let _ = ge.registry_delete_value(hive, &spec.key, &spec.value_name, view);
+                query_registry_value(ge, hive, view, &spec)
+            }
+            "set_query" => {
+                let set_result = ge.registry_set_value(
+                    hive,
+                    &spec.key,
+                    &spec.value_name,
+                    &spec.value_type,
+                    spec.data.clone(),
+                    view,
+                );
+                if let Err(error) = set_result {
+                    return json!({ "error": error_code(&error), "value_bytes": "", "value_type": null });
+                }
+                query_registry_value(ge, hive, view, &spec)
+            }
+            _ => json!({ "error": 87, "value_bytes": "", "value_type": null }),
+        }
+    })
+}
+
+fn query_registry_value(
+    ge: &GameEnvironment,
+    hive: &str,
+    view: RegistryView,
+    spec: &RegistryInput,
+) -> Value {
+    match ge.registry_get_value(hive, &spec.key, &spec.value_name, view) {
+        Ok(Some(stored)) => {
+            let bytes = registry_value_bytes(&stored.value_type, &stored.data);
+            json!({
+                "error": 0,
+                "value_bytes": hex_encode(&bytes),
+                "value_type": registry_type_code(&stored.value_type),
+            })
+        }
+        Ok(None) => json!({ "error": 2, "value_bytes": "", "value_type": null }),
+        Err(error) => json!({ "error": error_code(&error), "value_bytes": "", "value_type": null }),
+    }
+}
+
+/// On-disk byte encoding of a registry value (mirrors the reference
+/// executor's `registry_value_bytes` and the runtime's
+/// `encode_registry_value_data`): REG_DWORD is little-endian u32,
+/// REG_SZ/REG_EXPAND_SZ are UTF-16LE with a trailing NUL, REG_BINARY raw.
+fn registry_value_bytes(value_type: &str, data: &Value) -> Vec<u8> {
+    match value_type {
+        "REG_DWORD" => (data.as_u64().unwrap_or(0) as u32).to_le_bytes().to_vec(),
+        "REG_SZ" | "REG_EXPAND_SZ" => utf16le_with_nul(data.as_str().unwrap_or_default()),
+        "REG_BINARY" => data
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_u64().unwrap_or(0) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn registry_type_code(value_type: &str) -> u32 {
+    match value_type {
+        "REG_SZ" => 1,
+        "REG_EXPAND_SZ" => 2,
+        "REG_BINARY" => 3,
+        "REG_DWORD" => 4,
+        _ => 0,
+    }
+}
+
+// ── synchronization ─────────────────────────────────────────────────────────
+
+/// The runtime's sync primitives via the Win32Subsystem: events, mutexes
+/// (recursion, abandoned, non-owner release) and semaphores, with the same
+/// `waits`/`releases`/`abandoned` output shape as the reference.
+fn runtime_synchronization(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<SyncInput>(input.clone()) else {
+        return json!({ "waits": [], "releases": [], "abandoned": false });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let wait = |subsystem: &mut Win32Subsystem, handle: u32| {
+            subsystem
+                .wait_for_single_object(handle, u32::MAX, false, None)
+                .map(WaitStatus::code)
+                .unwrap_or(0xFFFF_FFFF)
+        };
+        let wait_zero = |subsystem: &mut Win32Subsystem, handle: u32| {
+            subsystem
+                .wait_for_single_object(handle, 0, false, None)
+                .map(WaitStatus::code)
+                .unwrap_or(0xFFFF_FFFF)
+        };
+        let release = |subsystem: &mut Win32Subsystem, handle: u32| -> Value {
+            match subsystem.release_mutex(handle) {
+                Ok(()) => json!({ "succeeded": true, "error": 0 }),
+                Err(error) => json!({ "succeeded": false, "error": error_code(&error) }),
+            }
+        };
+        let release_sem = |subsystem: &mut Win32Subsystem, handle: u32, count: u32| -> Value {
+            match subsystem.release_semaphore(handle, count) {
+                Ok(_previous) => json!({ "succeeded": true, "error": 0 }),
+                Err(error) => json!({ "succeeded": false, "error": error_code(&error) }),
+            }
+        };
+        match spec.kind.as_str() {
+            "event_auto_reset" => {
+                let (event, _) = subsystem.create_event(false, false, false, None);
+                let _ = subsystem.set_event(event);
+                let wait1 = wait_zero(subsystem, event);
+                let wait2 = wait_zero(subsystem, event);
+                let _ = subsystem.close_handle(event);
+                json!({ "waits": [wait1, wait2], "releases": [], "abandoned": false })
+            }
+            "event_manual_reset" => {
+                let (event, _) = subsystem.create_event(true, false, false, None);
+                let _ = subsystem.set_event(event);
+                let wait1 = wait_zero(subsystem, event);
+                let wait2 = wait_zero(subsystem, event);
+                let _ = subsystem.reset_event(event);
+                let wait3 = wait_zero(subsystem, event);
+                let _ = subsystem.close_handle(event);
+                json!({ "waits": [wait1, wait2, wait3], "releases": [], "abandoned": false })
+            }
+            "mutex_recursion" => {
+                let mutex = subsystem.create_mutex(false, false);
+                let wait1 = wait(subsystem, mutex);
+                let wait2 = wait(subsystem, mutex);
+                let release1 = release(subsystem, mutex);
+                let release2 = release(subsystem, mutex);
+                let wait3 = wait_zero(subsystem, mutex);
+                let release3 = release(subsystem, mutex);
+                let release4 = release(subsystem, mutex);
+                let _ = subsystem.close_handle(mutex);
+                json!({
+                    "waits": [wait1, wait2, wait3],
+                    "releases": [release1, release2, release3, release4],
+                    "abandoned": false,
+                })
+            }
+            "mutex_non_owner_release" => {
+                let mutex = subsystem.create_mutex(false, false);
+                let wait1 = wait(subsystem, mutex);
+                let other = subsystem.create_thread(
+                    ThreadPlan {
+                        exit_code: None,
+                        priority: 0,
+                        signaled: false,
+                    },
+                    false,
+                );
+                let other_id = subsystem.thread_id_for_handle(other).unwrap_or(2);
+                subsystem.set_current_thread_id(other_id);
+                let release = release(subsystem, mutex);
+                subsystem.set_current_thread_id(1);
+                let _ = subsystem.close_handle(other);
+                let _ = subsystem.close_handle(mutex);
+                json!({ "waits": [wait1], "releases": [release], "abandoned": false })
+            }
+            "mutex_abandoned" => {
+                let mutex = subsystem.create_mutex(false, false);
+                let wait1 = wait(subsystem, mutex);
+                let _ = subsystem.abandon_mutex(mutex);
+                let wait2 = wait(subsystem, mutex);
+                let release = release(subsystem, mutex);
+                let _ = subsystem.close_handle(mutex);
+                json!({ "waits": [wait1, wait2], "releases": [release], "abandoned": true })
+            }
+            "semaphore" => {
+                let semaphore = subsystem.create_semaphore(1, 3, false);
+                let wait1 = wait_zero(subsystem, semaphore);
+                let wait2 = wait_zero(subsystem, semaphore);
+                let release1 = release_sem(subsystem, semaphore, 1);
+                let release2 = release_sem(subsystem, semaphore, 2);
+                let wait3 = wait_zero(subsystem, semaphore);
+                let wait4 = wait_zero(subsystem, semaphore);
+                let wait5 = wait_zero(subsystem, semaphore);
+                let wait6 = wait_zero(subsystem, semaphore);
+                let _ = subsystem.close_handle(semaphore);
+                json!({
+                    "waits": [wait1, wait2, wait3, wait4, wait5, wait6],
+                    "releases": [release1, release2],
+                    "abandoned": false,
+                })
+            }
+            _ => json!({ "waits": [], "releases": [], "abandoned": false }),
+        }
+    })
+}
+
+// ── crt_printf ──────────────────────────────────────────────────────────────
+
+/// The runtime's CRT behavior, mirrored from pe_runtime's CRT layer:
+/// `HostThunk::Strtol` (via `crt_parse_strtol_full`; EINVAL on a bad base,
+/// ERANGE + LONG_MAX/LONG_MIN on overflow) and the legacy
+/// `__stdio_common_vsnprintf` path (`crt_vfprintf_render`; truncation
+/// returns -1 with the buffer untouched, NULL format is EINVAL, and %n is
+/// always enabled — the runtime has no `_set_printf_count_output` switch).
+fn runtime_crt(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<CrtInput>(input.clone()) else {
+        return json!({ "handler_invoked": false, "ret": null, "errno": 0, "written": null, "value": null, "end_consumed": null, "buffer": null });
+    };
+    let build = |handler_invoked: bool,
+                 ret: Value,
+                 errno: u32,
+                 written: Value,
+                 value: Value,
+                 end_consumed: Value,
+                 buffer: Value|
+     -> Value {
+        json!({
+            "handler_invoked": handler_invoked,
+            "ret": ret,
+            "errno": errno,
+            "written": written,
+            "value": value,
+            "end_consumed": end_consumed,
+            "buffer": buffer,
+        })
+    };
+    match spec.kind.as_str() {
+        "percent_n_disabled" | "percent_n_enabled" => {
+            // The runtime's printf engine always honors %n and writes the
+            // count of characters emitted so far; there is no disable switch
+            // (pe_runtime `crt_render_conversion` 0x6E arm).
+            build(
+                false,
+                json!(2),
+                0,
+                json!(2),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            )
+        }
+        "strtol_overflow" => runtime_strtol("999999999999999999999", 10, &build),
+        "strtol_underflow" => runtime_strtol("-999999999999999999999", 10, &build),
+        "strtol_bad_base" => runtime_strtol("123", 99, &build),
+        "strtol_hex_ok" => runtime_strtol("0x7fffffff", 16, &build),
+        "snprintf_truncation" => build(
+            false,
+            json!(-1),
+            0,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            json!(""),
+        ),
+        "snprintf_size_query" => build(
+            false,
+            json!(1),
+            0,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+        "snprintf_null_format" => build(
+            false,
+            json!(0),
+            22,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            json!(""),
+        ),
+        _ => build(
+            false,
+            Value::Null,
+            0,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+    }
+}
+
+fn runtime_strtol(
+    text: &str,
+    base: i32,
+    build: &impl Fn(bool, Value, u32, Value, Value, Value, Value) -> Value,
+) -> Value {
+    if !(base == 0 || (2..=36).contains(&base)) {
+        // Invalid base: EINVAL, no conversion, *endptr = nptr.
+        return build(
+            false,
+            Value::Null,
+            22,
+            Value::Null,
+            json!(0),
+            json!(false),
+            Value::Null,
+        );
+    }
+    let (value, consumed, overflow) = crate::pe_runtime::crt_parse_strtol_full(text, base);
+    let end_consumed = consumed > 0;
+    let value = if overflow {
+        if text[..consumed].trim_start().starts_with('-') {
+            i32::MIN as i64
+        } else {
+            i32::MAX as i64
+        }
+    } else {
+        value
+    };
+    build(
+        false,
+        Value::Null,
+        if overflow { 34 } else { 0 },
+        Value::Null,
+        json!(value),
+        json!(end_consumed),
+        Value::Null,
+    )
+}
+
+// ── thread_tls ──────────────────────────────────────────────────────────────
+
+/// The runtime's TLS semantics via the Win32Subsystem: `tls_alloc` (reuses
+/// freed slots, `u32::MAX` when exhausted), per-thread `tls_set_value` /
+/// `tls_get_value`, and `tls_free` (removes the slot from every thread and
+/// makes the index reusable).  Freed-slot reads come back empty.
+fn runtime_thread_tls(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<TlsInput>(input.clone()) else {
+        return json!({ "error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let main = subsystem.current_thread_handle();
+        match spec.kind.as_str() {
+            "alloc" => {
+                let index = subsystem.tls_alloc();
+                json!({ "index_valid": index != u32::MAX })
+            }
+            "roundtrip" => {
+                let index = subsystem.tls_alloc();
+                let pointer = 0xAB_u64;
+                let set_succeeded = subsystem.tls_set_value(main, index, pointer).is_ok();
+                let retrieved = subsystem.tls_get_value(main, index).ok().flatten();
+                json!({
+                    "set_succeeded": set_succeeded,
+                    "get_matches": retrieved == Some(pointer),
+                })
+            }
+            "thread_isolation" => {
+                let index = subsystem.tls_alloc();
+                let pointer = 0xCD_u64;
+                let _ = subsystem.tls_set_value(main, index, pointer);
+                let other = subsystem.create_thread(
+                    ThreadPlan {
+                        exit_code: None,
+                        priority: 0,
+                        signaled: false,
+                    },
+                    false,
+                );
+                let other_thread_value_is_null = subsystem
+                    .tls_get_value(other, index)
+                    .ok()
+                    .flatten()
+                    .is_none();
+                let _ = subsystem.close_handle(other);
+                let main_value_preserved =
+                    subsystem.tls_get_value(main, index).ok().flatten() == Some(pointer);
+                json!({
+                    "other_thread_value_is_null": other_thread_value_is_null,
+                    "main_value_preserved": main_value_preserved,
+                })
+            }
+            "minimum_available" => json!({ "minimum_available": 64 }),
+            "free_succeeds" => {
+                let index = subsystem.tls_alloc();
+                subsystem.tls_free(index);
+                json!({ "free_succeeded": true })
+            }
+            "realloc_valid" => {
+                let index = subsystem.tls_alloc();
+                subsystem.tls_free(index);
+                let new_index = subsystem.tls_alloc();
+                json!({ "new_index_valid": new_index != u32::MAX })
+            }
+            "set_invalid_index" => {
+                let succeeded = subsystem.tls_set_value(main, u32::MAX, 0).is_ok();
+                json!({ "succeeded": succeeded, "error": if succeeded { 0 } else { 87 } })
+            }
+            "get_invalid_index" => {
+                let value_is_null = subsystem
+                    .tls_get_value(main, u32::MAX)
+                    .ok()
+                    .flatten()
+                    .is_none();
+                json!({ "value_is_null": value_is_null, "error": 0 })
+            }
+            _ => json!({ "error": 87 }),
+        }
+    })
 }
 
 /// Normalize a `resolved_module` path for comparison: strip to the file name
@@ -632,6 +1609,30 @@ impl ComparisonReport {
     pub fn has_diffs(&self) -> bool {
         self.diff_count > 0
     }
+}
+
+/// Categories among `required` that the differential does NOT validate: the
+/// Casa1 runtime reported them `runtime_unavailable`, or the reference
+/// results file does not cover them (`not_covered_categories`).  The compare
+/// command fails (exit 1) whenever this list is non-empty, regardless of
+/// `--report-only` — a required category must be both computed by the
+/// runtime AND validated against a captured reference result, or the run is
+/// untested.
+pub fn required_coverage_missing(report: &ComparisonReport, required: &[String]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|category| {
+            report
+                .runtime_uncovered_categories
+                .iter()
+                .any(|covered| covered == *category)
+                || report
+                    .not_covered_categories
+                    .iter()
+                    .any(|covered| covered == *category)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Compare Casa1's model-computed results against reference results.

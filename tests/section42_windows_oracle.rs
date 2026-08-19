@@ -150,6 +150,159 @@ fn mutated_reference_results_change_the_diff_set() {
 }
 
 #[test]
+fn required_categories_gate_fails_for_uncovered_categories() {
+    // A synthetic reference results file covering ONLY path_normalize: the
+    // differential does not validate case_fold against it, so requiring
+    // case_fold must fail the compare — even with --report-only (which only
+    // suppresses the diff-exit, never the coverage-exit).
+    let temp = TempDir::new().expect("temp dir");
+    let synthetic = temp.path().join("only-path-normalize.json");
+    let mut file: Value =
+        serde_json::from_slice(&std::fs::read(golden_fixture()).expect("read golden"))
+            .expect("parse golden");
+    file["results"] = serde_json::json!(
+        file["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter(|result| result["category"] == "path_normalize")
+            .collect::<Vec<_>>()
+    );
+    std::fs::write(&synthetic, serde_json::to_vec(&file).expect("encode")).expect("write");
+
+    let (status, stdout) = run_oracle(&[
+        "compare",
+        "--results",
+        synthetic.to_str().expect("path"),
+        "--required-categories",
+        "path_normalize,case_fold",
+        "--report-only",
+    ]);
+    assert!(
+        !status.success(),
+        "a required category missing from the differential must fail even with --report-only"
+    );
+    let report = compare_report(&stdout);
+    let uncovered: Vec<&str> = report["not_covered_categories"]
+        .as_array()
+        .expect("not_covered_categories")
+        .iter()
+        .filter_map(|category| category.as_str())
+        .collect();
+    assert!(
+        uncovered.contains(&"case_fold"),
+        "case_fold must be reported as not covered: {uncovered:?}"
+    );
+
+    // Positive control: requiring only the covered category passes the gate
+    // (the placeholder diffs are suppressed by --report-only).
+    let (status, _) = run_oracle(&[
+        "compare",
+        "--results",
+        synthetic.to_str().expect("path"),
+        "--required-categories",
+        "path_normalize",
+        "--report-only",
+    ]);
+    assert!(
+        status.success(),
+        "covered required categories must pass the coverage gate"
+    );
+}
+
+#[test]
+fn path_normalize_vectors_parse_typed_input() {
+    // The path vectors are OBJECTS { path, cwd, long_paths_enabled }; the
+    // runtime executor must operate on the typed `path` field — never on ""
+    // (the pre-fix behavior).  Assert the normalized output corresponds to
+    // the vector's path.
+    let vectors = casa1::windows_oracle::generate_vectors(&["path_normalize".to_string()]);
+    assert!(!vectors.is_empty(), "path_normalize corpus must exist");
+    for vector in &vectors {
+        let result = casa1::windows_oracle::compute_runtime_result(vector);
+        let output = result.output;
+        let normalized = output["normalized"].as_str().expect("normalized");
+        assert!(
+            !normalized.is_empty(),
+            "{} must produce a non-empty normalized path",
+            vector.id
+        );
+    }
+    // The dot-segment vector round-trips through the runtime's parser, and
+    // the cwd-dependent vectors resolve against the fixed working directory.
+    let absolute = &vectors[0];
+    let result = casa1::windows_oracle::compute_runtime_result(absolute);
+    assert_eq!(
+        result.output["normalized"],
+        serde_json::json!("C:\\Alpha\\Beta\\.\\Gamma\\..\\File.txt"),
+        "the normalized output must correspond to the vector's path"
+    );
+    let relative = vectors
+        .iter()
+        .find(|vector| vector.input["path"] == serde_json::json!("foo.txt"))
+        .expect("relative-path vector");
+    let result = casa1::windows_oracle::compute_runtime_result(relative);
+    assert_eq!(
+        result.output["normalized"],
+        serde_json::json!("C:\\Windows\\Temp\\casa1-oracle-cwd\\foo.txt"),
+        "relative paths must resolve against the vector's cwd"
+    );
+    assert_eq!(result.output["kind"], serde_json::json!("relative"));
+}
+
+#[test]
+fn capture_provenance_fields_serialize() {
+    // The reference executable records ACTUAL capture provenance; the header
+    // must round-trip through serde, old files without the fields must still
+    // parse (serde defaults), and is_real_windows_capture must require the
+    // provenance to be present.
+    let header = casa1::windows_oracle::CaptureHeader {
+        source: "windows".to_string(),
+        captured_by: "casa1-windows-reference".to_string(),
+        captured_on: "windows-10-11".to_string(),
+        capture_date: "2026-08-19T12:00Z".to_string(),
+        note: None,
+        os_edition: "Professional".to_string(),
+        os_build: "10.0.22631".to_string(),
+        arch: "x64".to_string(),
+        reference_sha256: "a".repeat(64),
+        corpus_sha256: "b".repeat(64),
+    };
+    let json = serde_json::to_string(&header).expect("serialize header");
+    let parsed: casa1::windows_oracle::CaptureHeader =
+        serde_json::from_str(&json).expect("parse header");
+    assert_eq!(parsed, header, "provenance fields must round-trip");
+
+    // Pre-provenance schema-version-1 files parse with empty defaults and
+    // are NOT real captures.
+    let legacy: casa1::windows_oracle::CaptureHeader = serde_json::from_str(
+        r#"{"source":"windows","captured_by":"casa1-windows-reference","captured_on":"windows-10-11","capture_date":"model-generated","note":null}"#,
+    )
+    .expect("legacy header parses");
+    assert_eq!(legacy.os_edition, "");
+    assert_eq!(legacy.arch, "");
+
+    let real = casa1::windows_oracle::ReferenceResultsFile {
+        schema_version: 1,
+        capture: header,
+        results: Vec::new(),
+    };
+    assert!(
+        casa1::oracle_suites::is_real_windows_capture(&real),
+        "a header with full provenance must be a real Windows capture"
+    );
+    let without_provenance = casa1::windows_oracle::ReferenceResultsFile {
+        schema_version: 1,
+        capture: legacy,
+        results: Vec::new(),
+    };
+    assert!(
+        !casa1::oracle_suites::is_real_windows_capture(&without_provenance),
+        "a header without provenance must not be accepted as a real capture"
+    );
+}
+
+#[test]
 fn reference_executable_on_non_windows_reports_diffs() {
     // The reference executable must be runnable everywhere; on non-Windows
     // hosts its stubs return unsupported_platform for every vector, which

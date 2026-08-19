@@ -81,12 +81,13 @@ conformance.  The suite shapes the section tests consume
 (`src/oracle_suites.rs`) are derived exclusively from the captured
 reference results; categories the reference does not yet cover make the
 corresponding tests skip with a clear message.
-* per-category predictors (`predict(category, input) -> Value`) used by the
-  comparison mode.
 
-The model exists so the harness is runnable without a Windows host; its
-output is compared against real Windows captures and any divergence is a CI
-failure.
+`compute_runtime_result` (`src/windows_oracle.rs`) computes the CASA1
+RUNTIME's own behavior per vector by driving the runtime's real machinery
+(`real_fs::parse_windows_path`, the GameEnvironment share/lock matrix, the
+Win32Subsystem sync/TLS layers, the pe_runtime CRT tables) — the candidate
+the differential validates.  Any divergence from a real Windows capture is
+a runtime defect the CI reports.
 
 ## 3. Vector and result schema (schema_version 1)
 
@@ -109,7 +110,12 @@ failure.
     "captured_by": "casa1-windows-reference",
     "captured_on": "windows-10-11",
     "capture_date": "2026-08-19T14:02Z",
-    "note": null
+    "note": null,
+    "os_edition": "Professional",
+    "os_build": "10.0.22631",
+    "arch": "x64",
+    "reference_sha256": "…64 hex chars of the reference exe…",
+    "corpus_sha256": "…64 hex chars of the vector corpus…"
   },
   "results": [ { "id": "path_normalize:000", "category": "path_normalize",
                  "output": { "normalized": "C:\\Alpha\\Beta\\File.txt",
@@ -117,6 +123,14 @@ failure.
                              "last_error": 0 } } ]
 }
 ```
+
+The provenance fields are computed by the reference executable at capture
+time: os edition from the capture machine's registry (`EditionID`), build
+from `RtlGetVersion`, architecture from `GetNativeSystemInfo`, plus the
+SHA-256 of the reference executable itself and of the input corpus.  The
+reference-results consumers require these fields to be present (serde
+defaults keep old files parseable, but they are not accepted as real
+captures).
 
 Both sides reject files whose `schema_version` differs from the protocol
 version. The schema is deliberately extensible: `input`/`output` are
@@ -145,17 +159,19 @@ across Windows 10/11 x64 machines:
 
 * `path_normalize` inputs are cwd-independent, or carry an explicit `cwd`
   (the reference creates `C:\Windows\Temp\casa1-oracle-cwd` and
-  `SetCurrentDirectoryW`s into it; the model joins the same string).
-  Verbatim/device inputs avoid `.`/`..` components (GetFullPathNameW's
-  handling of dots inside `\\?\` paths is not exercised). Non-verbatim paths
-  longer than MAX_PATH are **not** included: `GetFullPathNameW` behavior
-  depends on the machine's `LongPathsEnabled` policy (the schema keeps
-  `long_paths_enabled` for protocol completeness; the reference cannot honor
-  a per-vector flag because the policy is process-wide).
+  `SetCurrentDirectoryW`s into it; the runtime executor resolves relative,
+  drive-relative and root-relative inputs against the same fixed working
+  directory). Verbatim/device inputs avoid `.`/`..` components
+  (GetFullPathNameW's handling of dots inside `\\?\` paths is not
+  exercised). Non-verbatim paths longer than MAX_PATH are **not** included:
+  `GetFullPathNameW` behavior depends on the machine's `LongPathsEnabled`
+  policy (the schema keeps `long_paths_enabled` for protocol completeness;
+  the reference cannot honor a per-vector flag because the policy is
+  process-wide).
 * `api_set` host DLLs are device-dependent by design (Microsoft's api-set
-  schema does not guarantee a stable host). The model predicts the well-known
-  Windows 10/11 x64 hosts (`kernelbase`, `kernel32`, `ole32`, `ucrtbase`,
-  `user32`); `loads` and `export_resolvable` are compared strictly, and
+  schema does not guarantee a stable host). The runtime executor reports the
+  `pe::ApiSetResolver` host (`kernel32`, `ole32`, `ucrtbase`, `user32`, …);
+  `loads` and `export_resolvable` are compared strictly, and
   `resolved_module` is normalized to the lowercased basename with one
   tolerance: if Windows reports the **virtual alias** itself (a name starting
   with `api-ms-`/`ext-ms-`) the comparison accepts it, because that is a
@@ -188,14 +204,20 @@ across Windows 10/11 x64 machines:
 ```
 casa1-oracle vectors --out vectors.json [--categories a,b,c]
 casa1-oracle compare --results r.json [--vectors v.json] [--categories ...]
-               [--report-only]
+               [--required-categories a,b,c] [--report-only]
 casa1-oracle api-report --out api-completeness.json
 ```
 
 `compare` computes the **Casa1 runtime's behavior** per vector (default
 corpus when `--vectors` is omitted; filtered to the categories present in
 the reference file) and prints a JSON report with per-category summaries and
-per-field diffs. It exits `1` on any diff unless `--report-only`.
+per-field diffs. It exits `1` on any diff unless `--report-only`, and it
+ALWAYS exits `1` when a `--required-categories` category is not validated
+by the differential (the runtime reported it `runtime_unavailable`, or the
+reference file does not cover it) — `--report-only` never suppresses the
+coverage exit.  `--required-categories` defaults to all ten advertised
+categories, so a compare against a reference file that covers a subset must
+name the subset explicitly.
 
 Environment-driven modes (ad-hoc use on a Windows host):
 
@@ -214,9 +236,10 @@ checked-in reference-results file covering the `path_normalize`,
 `case_fold`, and `file_sharing` vectors. It carries the capture header
 (`source: "windows"`, `captured_by: "casa1-windows-reference"`) and is
 currently **model-generated** — the first real Windows capture (CI artifact)
-is the authoritative replacement. `tests/section42_windows_oracle.rs` validates that the golden file compares
-clean and that mutations are detected; the tests also prove the fail-loud
-non-Windows stub behavior.  The reference-results consumers
+is the authoritative replacement. `tests/section42_windows_oracle.rs` validates that the golden file fails
+loudly (placeholder values + the coverage gate) and that mutations are
+detected; the tests also prove the fail-loud non-Windows stub behavior and
+the required-categories gate.  The reference-results consumers
 (`tests/support::reference_results`) REFUSE model-generated placeholders —
 the differential tests skip until a real Windows capture is available.
 
@@ -252,8 +275,11 @@ the differential tests skip until a real Windows capture is available.
    `casa1-windows-reference.exe vectors.json results.json`; uploads the
    results artifact.
 3. **compare** (macos-latest): downloads the artifact, runs
-   `casa1-oracle compare --vectors … --results …`; **the job fails on any
-   diff**.
+   `casa1-oracle compare --vectors … --results … --required-categories
+   path_normalize,case_fold,file_sharing,file_lock,delete_semantics,api_set,registry,synchronization,crt_printf,thread_tls`;
+   **the job fails on any diff**, and on any required category the runtime
+   does not compute or the capture does not cover — the workflow cannot
+   succeed with untested categories.
 
 The checked-in golden fixture is validated by the regular `cargo test
 --tests` run (`tests/section42_windows_oracle.rs`).
@@ -301,5 +327,5 @@ comparison semantics):
   ordering.
 
 Each extension follows the same contract: versioned vectors, real-API
-reference execution, model fallback, strict comparison, CI failure on any
-diff.
+reference execution, runtime executor (never a fabricated pass), strict
+comparison, CI failure on any diff or coverage gap.

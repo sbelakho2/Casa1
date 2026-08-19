@@ -2968,7 +2968,7 @@ fn cleanup_stale_runtime(runtime: &mut SharedFileRuntimeState) {
     });
 }
 
-fn windows_casefold_key(value: &str) -> String {
+pub(crate) fn windows_casefold_key(value: &str) -> String {
     let mut folded = String::new();
     for character in value.chars() {
         folded.push(simple_windows_casefold_char(character));
@@ -2976,7 +2976,7 @@ fn windows_casefold_key(value: &str) -> String {
     folded
 }
 
-fn simple_windows_casefold_char(character: char) -> char {
+pub(crate) fn simple_windows_casefold_char(character: char) -> char {
     let mut uppercase = character.to_uppercase();
     match (uppercase.next(), uppercase.next()) {
         (Some(folded), None) => folded,

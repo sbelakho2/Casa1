@@ -11,9 +11,11 @@ name: windows-oracle
 #   3. compare (macOS) — computes the Casa1 RUNTIME's behavior per vector
 #      over the same corpus and compares against the Windows-captured
 #      results. The job FAILS on any diff: the reference executable is the
-#      ONLY semantic truth (the Casa1-side model was removed entirely);
-#      categories the runtime cannot compute yet are reported honestly as
-#      runtime-uncovered, never as passes.
+#      ONLY semantic truth (the Casa1-side model was removed entirely).
+#      The compare enforces mandatory coverage for all ten advertised
+#      categories (--required-categories): a category the runtime cannot
+#      compute, or one missing from the captured results, fails the job —
+#      untested categories can never pass.
 #
 # The checked-in golden fixture (tests/fixtures/section42) is validated by
 # the regular `cargo test --tests` run (tests/section42_windows_oracle.rs).
@@ -79,5 +81,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-oracle-reference-results
-      - name: Compare Casa1 model results against the Windows reference results
-        run: cargo run -p casa1 --bin casa1-oracle -- compare --vectors windows_oracle_vectors.json --results windows_oracle_reference_results.json
+      - name: Compare Casa1 runtime results against the Windows reference results
+        run: >-
+          cargo run -p casa1 --bin casa1-oracle -- compare
+          --vectors windows_oracle_vectors.json
+          --results windows_oracle_reference_results.json
+          --required-categories path_normalize,case_fold,file_sharing,file_lock,delete_semantics,api_set,registry,synchronization,crt_printf,thread_tls

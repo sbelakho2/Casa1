@@ -9,9 +9,10 @@
 //!   - `vectors --out <path>`: write the deterministic differential vector
 //!     corpus (schema_version 1).
 //!   - `compare --results <path> [--vectors <path>] [--categories ...]
-//!     [--report-only]`: run the Casa1 RUNTIME behavior per vector and
-//!     compare against the captured reference results; exits non-zero on
-//!     any diff (unless --report-only).
+//!     [--required-categories ...] [--report-only]`: run the Casa1 RUNTIME
+//!     behavior per vector and compare against the captured reference
+//!     results; exits non-zero on any diff (unless --report-only) and on any
+//!     required-category coverage gap (always).
 //!
 //! Environment-driven comparison (for ad-hoc use on a Windows host):
 //!   - `CASA1_WINDOWS_REFERENCE_RESULTS=<path>`: compare against an existing
@@ -52,7 +53,8 @@ enum OracleCommand {
         categories: Option<String>,
     },
     /// Compare the Casa1 runtime's behavior per vector against the captured
-    /// Windows reference results. Exits 1 on any diff unless --report-only.
+    /// Windows reference results. Exits 1 on any diff unless --report-only,
+    /// and on any required-category coverage gap (always).
     /// The reference results are the ONLY semantic truth — there is no
     /// Casa1-side model to fall back on.
     Compare {
@@ -66,6 +68,12 @@ enum OracleCommand {
         /// the reference results file).
         #[arg(long)]
         categories: Option<String>,
+        /// Comma-separated categories whose coverage is MANDATORY: the
+        /// compare fails (exit 1) when any of them is runtime-uncovered or
+        /// missing from the reference results, even with --report-only.
+        /// Default: all ten advertised categories.
+        #[arg(long)]
+        required_categories: Option<String>,
         /// Report diffs without failing.
         #[arg(long)]
         report_only: bool,
@@ -98,10 +106,20 @@ fn main() {
             results,
             vectors,
             categories,
+            required_categories,
             report_only,
         } => {
             let report = run_comparison(vectors.as_ref(), &results, &parse_categories(categories));
             print_report(&report);
+            let required = parse_required_categories(required_categories);
+            let coverage_missing = windows_oracle::required_coverage_missing(&report, &required);
+            if !coverage_missing.is_empty() {
+                eprintln!(
+                    "compare: REQUIRED categories are not covered by the differential: {}",
+                    coverage_missing.join(", ")
+                );
+                std::process::exit(1);
+            }
             if report.has_diffs() && !report_only {
                 std::process::exit(1);
             }
@@ -131,16 +149,19 @@ fn write_api_report(out: &std::path::Path) {
 
 /// When `CASA1_WINDOWS_REFERENCE_EXE` or `CASA1_WINDOWS_REFERENCE_RESULTS` is
 /// set, the harness switches to comparison mode over the default corpus:
-/// Casa1's model results are validated against the reference executable's
+/// Casa1's runtime results are validated against the reference executable's
 /// output (running the exe itself when `CASA1_WINDOWS_REFERENCE_EXE` is set,
-/// or reading an existing results file). Exits 1 on any diff.
+/// or reading an existing results file). Exits 1 on any diff or on any
+/// required-category coverage gap (all ten advertised categories).
 fn run_env_driven_comparison() -> bool {
+    let required = all_required_categories();
     let Some(exe) = std::env::var_os("CASA1_WINDOWS_REFERENCE_EXE") else {
         let Some(results_path) = std::env::var_os("CASA1_WINDOWS_REFERENCE_RESULTS") else {
             return false;
         };
         let report = run_comparison(None, &PathBuf::from(results_path), &Vec::new());
         print_report(&report);
+        exit_if_coverage_missing(&report, &required);
         if report.has_diffs() {
             std::process::exit(1);
         }
@@ -168,10 +189,39 @@ fn run_env_driven_comparison() -> bool {
     }
     let report = run_comparison(Some(&vectors_path), &results_path, &Vec::new());
     print_report(&report);
+    exit_if_coverage_missing(&report, &required);
     if report.has_diffs() {
         std::process::exit(1);
     }
     true
+}
+
+fn all_required_categories() -> Vec<String> {
+    windows_oracle::ALL_CATEGORIES
+        .iter()
+        .map(|category| (*category).to_string())
+        .collect()
+}
+
+fn parse_required_categories(required: Option<String>) -> Vec<String> {
+    match required {
+        Some(value) => parse_categories(Some(value)),
+        None => all_required_categories(),
+    }
+}
+
+/// Enforce the required-coverage gate: any required category that is
+/// runtime-uncovered or missing from the reference results fails the run,
+/// regardless of --report-only.
+fn exit_if_coverage_missing(report: &ComparisonReport, required: &[String]) {
+    let missing = windows_oracle::required_coverage_missing(report, required);
+    if !missing.is_empty() {
+        eprintln!(
+            "compare: REQUIRED categories are not covered by the differential: {}",
+            missing.join(", ")
+        );
+        std::process::exit(1);
+    }
 }
 
 // ── Comparison pipeline ─────────────────────────────────────────────────────

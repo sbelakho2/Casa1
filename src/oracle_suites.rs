@@ -175,14 +175,27 @@ pub struct OracleSuites {
 
 /// True when the results file is a REAL Windows capture (produced by the
 /// reference executable) and not a model-generated placeholder.
+///
+/// Since the reference executable records ACTUAL capture provenance, the
+/// check also requires the provenance fields to be present and meaningful:
+/// a known os edition/build, a Windows architecture, and the SHA-256 of the
+/// reference executable and of the vector corpus.  Old schema-version-1
+/// files without these fields (serde defaults) are not real captures.
 pub fn is_real_windows_capture(results: &ReferenceResultsFile) -> bool {
-    results.capture.captured_by == "casa1-windows-reference"
-        && results.capture.capture_date != "model-generated"
-        && results
-            .capture
+    let header = &results.capture;
+    header.captured_by == "casa1-windows-reference"
+        && header.capture_date != "model-generated"
+        && header
             .note
             .as_deref()
             .is_none_or(|note| !note.contains("MODEL-GENERATED"))
+        && !header.os_edition.is_empty()
+        && header.os_edition != "unknown"
+        && !header.os_build.is_empty()
+        && header.os_build != "unknown"
+        && matches!(header.arch.as_str(), "x86" | "x64" | "arm64")
+        && header.reference_sha256.len() == 64
+        && header.corpus_sha256.len() == 64
 }
 
 fn result_for<'a>(

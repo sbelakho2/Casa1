@@ -65918,7 +65918,7 @@ impl HostThunk {
     /// Patch 6b: shared name → thunk table for the CRT-family DLLs
     /// (ucrtbase.dll / msvcrt.dll).  Only names not covered by the explicit
     /// arms above belong here.
-    fn crt_thunk_from_name(name: &str) -> Option<Self> {
+    pub(crate) fn crt_thunk_from_name(name: &str) -> Option<Self> {
         use HostThunk::*;
         Some(match name {
             "_errno" | "__errno" => CrtErrno,
@@ -73791,7 +73791,7 @@ fn crt_make_path(drive: &str, dir: &str, name: &str, ext: &str) -> String {
 
 /// strtol core (32-bit `long` on Windows): parses with base 0/2..=36, returns
 /// (value, consumed_bytes, overflow).
-fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
+pub(crate) fn crt_parse_strtol_full(bytes: &str, base: i32) -> (i64, usize, bool) {
     let bytes = bytes.as_bytes();
     let mut index = 0_usize;
     while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
@@ -74334,7 +74334,7 @@ fn read_ansi_string(memory: &MemoryImage, address: u64) -> String {
     s
 }
 
-fn classify_wide_char_type(info_type: u32, code_unit: u16) -> u16 {
+pub(crate) fn classify_wide_char_type(info_type: u32, code_unit: u16) -> u16 {
     match info_type {
         CT_CTYPE1 => {
             let Some(ch) = char::from_u32(u32::from(code_unit)) else {
