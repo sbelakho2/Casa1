@@ -1,0 +1,381 @@
+{
+  "schema_version": 1,
+  "capture": {
+    "source": "windows",
+    "captured_by": "casa1-windows-reference",
+    "captured_on": "windows-10-11",
+    "capture_date": "model-generated",
+    "note": "MODEL-GENERATED placeholder — not captured from real Windows. Regenerate with the reference executable on Windows 10/11."
+  },
+  "results": [
+    {
+      "id": "path_normalize:000",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "C:\\Alpha\\Beta\\File.txt"
+      }
+    },
+    {
+      "id": "path_normalize:001",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "C:\\Gamma"
+      }
+    },
+    {
+      "id": "path_normalize:002",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "C:\\Alpha\\Beta"
+      }
+    },
+    {
+      "id": "path_normalize:003",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "c:\\Temp\\data.txt"
+      }
+    },
+    {
+      "id": "path_normalize:004",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "unc",
+        "last_error": 0,
+        "normalized": "\\\\server\\share\\file.bin"
+      }
+    },
+    {
+      "id": "path_normalize:005",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "unc",
+        "last_error": 0,
+        "normalized": "\\\\server\\share\\file.bin"
+      }
+    },
+    {
+      "id": "path_normalize:006",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "verbatim",
+        "last_error": 0,
+        "normalized": "\\\\?\\C:\\Temp\\verbatim.txt"
+      }
+    },
+    {
+      "id": "path_normalize:007",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "device",
+        "last_error": 0,
+        "normalized": "\\\\.\\pipe\\steam"
+      }
+    },
+    {
+      "id": "path_normalize:008",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "relative",
+        "last_error": 0,
+        "normalized": "C:\\Windows\\Temp\\casa1-oracle-cwd\\foo.txt"
+      }
+    },
+    {
+      "id": "path_normalize:009",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "relative",
+        "last_error": 0,
+        "normalized": "C:\\Windows\\Temp\\casa1-oracle-cwd\\foo.txt"
+      }
+    },
+    {
+      "id": "path_normalize:010",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "rooted",
+        "last_error": 0,
+        "normalized": "C:\\windows\\system32"
+      }
+    },
+    {
+      "id": "path_normalize:011",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_rel",
+        "last_error": 0,
+        "normalized": "C:\\Windows\\Temp\\casa1-oracle-cwd\\relative.txt"
+      }
+    },
+    {
+      "id": "path_normalize:012",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": true,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "C:\\Temp\\data.txt:stream"
+      }
+    },
+    {
+      "id": "path_normalize:013",
+      "category": "path_normalize",
+      "output": {
+        "has_ads": false,
+        "kind": "drive_abs",
+        "last_error": 0,
+        "normalized": "C:\\Alpha\\Beta"
+      }
+    },
+    {
+      "id": "case_fold:000",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          769,
+          898,
+          898,
+          898,
+          769,
+          898,
+          528,
+          769,
+          769,
+          769
+        ],
+        "ordinal_ignore_case_equal": true,
+        "right_c1_type_bits": [
+          770,
+          898,
+          898,
+          898,
+          770,
+          898,
+          528,
+          770,
+          770,
+          770
+        ]
+      }
+    },
+    {
+      "id": "case_fold:001",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          770,
+          528,
+          770,
+          770,
+          770
+        ],
+        "ordinal_ignore_case_equal": true,
+        "right_c1_type_bits": [
+          769,
+          528,
+          769,
+          769,
+          769
+        ]
+      }
+    },
+    {
+      "id": "case_fold:002",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          770
+        ],
+        "ordinal_ignore_case_equal": false,
+        "right_c1_type_bits": [
+          769,
+          769
+        ]
+      }
+    },
+    {
+      "id": "case_fold:003",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          770
+        ],
+        "ordinal_ignore_case_equal": true,
+        "right_c1_type_bits": [
+          769
+        ]
+      }
+    },
+    {
+      "id": "case_fold:004",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          897,
+          898,
+          898,
+          770
+        ],
+        "ordinal_ignore_case_equal": false,
+        "right_c1_type_bits": [
+          897,
+          897,
+          897,
+          769
+        ]
+      }
+    },
+    {
+      "id": "case_fold:005",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          644,
+          644,
+          644,
+          528,
+          644,
+          644,
+          644,
+          528,
+          644,
+          528,
+          644
+        ],
+        "ordinal_ignore_case_equal": true,
+        "right_c1_type_bits": [
+          644,
+          644,
+          644,
+          528,
+          644,
+          644,
+          644,
+          528,
+          644,
+          528,
+          644
+        ]
+      }
+    },
+    {
+      "id": "case_fold:006",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          897,
+          898,
+          898
+        ],
+        "ordinal_ignore_case_equal": true,
+        "right_c1_type_bits": [
+          897,
+          898,
+          897
+        ]
+      }
+    },
+    {
+      "id": "case_fold:007",
+      "category": "case_fold",
+      "output": {
+        "left_c1_type_bits": [
+          770,
+          770,
+          898
+        ],
+        "ordinal_ignore_case_equal": false,
+        "right_c1_type_bits": [
+          770,
+          770,
+          770
+        ]
+      }
+    },
+    {
+      "id": "file_sharing:000",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 32,
+        "second_open_succeeds": false
+      }
+    },
+    {
+      "id": "file_sharing:001",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 32,
+        "second_open_succeeds": false
+      }
+    },
+    {
+      "id": "file_sharing:002",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 32,
+        "second_open_succeeds": false
+      }
+    },
+    {
+      "id": "file_sharing:003",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 0,
+        "second_open_succeeds": true
+      }
+    },
+    {
+      "id": "file_sharing:004",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 0,
+        "second_open_succeeds": true
+      }
+    },
+    {
+      "id": "file_sharing:005",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 0,
+        "second_open_succeeds": true
+      }
+    },
+    {
+      "id": "file_sharing:006",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 32,
+        "second_open_succeeds": false
+      }
+    },
+    {
+      "id": "file_sharing:007",
+      "category": "file_sharing",
+      "output": {
+        "second_error": 32,
+        "second_open_succeeds": false
+      }
+    }
+  ]
+}

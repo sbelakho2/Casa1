@@ -226,6 +226,7 @@ pub mod vkgl;
 #[allow(non_camel_case_types)]
 pub mod webview2;
 pub mod win32;
+pub mod windows_oracle;
 pub mod winhttp;
 pub mod wininet;
 pub mod winmm;

@@ -1,19 +1,42 @@
+//! Casa1 differential-oracle harness.
+//!
+//! This binary is ONLY the harness: suite generation (legacy section2/section3
+//! expectations), differential vector corpus generation, and result
+//! comparison. All semantic Windows implementations live in
+//! `casa1::oracle_model` (MODEL ONLY — not Windows truth) or in the
+//! standalone reference executable `windows_reference/`.
+//!
+//! Modes:
+//!   - `section2-*` / `section3-*`: legacy expectation suites (unchanged
+//!     output shape, consumed by tests/section2.rs and tests/section3.rs).
+//!   - `vectors --out <path>`: write the deterministic differential vector
+//!     corpus (schema_version 1).
+//!   - `model-results --vectors <path> --out <path>`: compute Casa1's
+//!     expected results with the model implementations (bootstrap/golden
+//!     fixtures; never Windows truth).
+//!   - `compare --results <path> [--vectors <path>] [--categories ...]
+//!     [--report-only]`: compare Casa1's model results against reference
+//!     results; exits non-zero on any diff (unless --report-only).
+//!
+//! Environment-driven comparison (for ad-hoc use on a Windows host):
+//!   - `CASA1_WINDOWS_REFERENCE_RESULTS=<path>`: compare against an existing
+//!     reference results file.
+//!   - `CASA1_WINDOWS_REFERENCE_EXE=<path>`: run the reference executable on
+//!     the generated corpus and compare its output.
+
 use casa1::oracle_model::{
-    ApiSetCase, ApiSetSuite, CaseCollisionSuite, DelayLoadCase, DelayLoadExpectation,
-    DelayLoadSuite, DelayLoadSymbol, DllOrderSuite, ExportSpec, ExportSpecTarget,
-    LifecycleLogEntry, LockShareSuite, PathEdgeCase, PathEdgeOutcome, PathEdgeSuite,
-    RegistryNotifyOperation, RegistryNotifySuite,
+    ApiSetSuite, CaseCollisionSuite, DelayLoadSuite, DllOrderSuite, ExportSpec, ExportSpecTarget,
+    LockShareSuite, PathEdgeSuite, RegistryNotifyOperation, RegistryNotifySuite,
+    resolve_delay_expectation,
+};
+use casa1::windows_oracle::{
+    self, CaptureHeader, ComparisonReport, ReferenceResultsFile, VectorFile, VectorResult,
+    WINDOWS_ORACLE_SCHEMA_VERSION,
 };
 use clap::{Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
-
-const RC_FS_ALREADY_EXISTS: u32 = 1101;
-const RC_FS_RESERVED_NAME: u32 = 1103;
-const RC_FS_PATH_TOO_LONG: u32 = 1104;
-const RC_FS_SHARING_VIOLATION: u32 = 1105;
-const RC_FS_LOCK_VIOLATION: u32 = 1106;
-const STATUS_DLL_NOT_FOUND: u32 = 0xc000_0135;
-const STATUS_ENTRYPOINT_NOT_FOUND: u32 = 0xc000_0139;
+use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Debug, Parser)]
 struct OracleCli {
@@ -44,6 +67,46 @@ enum OracleCommand {
         /// Destination path for the api-completeness.json report.
         out: std::path::PathBuf,
     },
+    /// Write the deterministic differential vector corpus (schema_version 1).
+    Vectors {
+        /// Output path (defaults to stdout when omitted).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Comma-separated category filter (default: all categories).
+        #[arg(long)]
+        categories: Option<String>,
+    },
+    /// Compute Casa1's expected results with the MODEL implementations and
+    /// write them as a results file. For bootstrapping golden fixtures only;
+    /// the output is explicitly marked as model-generated, never Windows
+    /// truth.
+    ModelResults {
+        #[arg(long)]
+        vectors: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Comma-separated category filter (default: all categories in the
+        /// vector file).
+        #[arg(long)]
+        categories: Option<String>,
+    },
+    /// Compare Casa1's model results against reference results. Exits 1 on
+    /// any diff unless --report-only.
+    Compare {
+        /// Reference results file (reference exe output or golden fixture).
+        #[arg(long)]
+        results: PathBuf,
+        /// Vector file (default: the generated default corpus).
+        #[arg(long)]
+        vectors: Option<PathBuf>,
+        /// Comma-separated category filter (default: categories present in
+        /// the reference results file).
+        #[arg(long)]
+        categories: Option<String>,
+        /// Report diffs without failing.
+        #[arg(long)]
+        report_only: bool,
+    },
 }
 
 fn main() {
@@ -52,21 +115,63 @@ fn main() {
         write_api_report(out);
         return;
     }
-    let output = match cli.command {
-        OracleCommand::Section2Path => serde_json::to_string(&section2_path_suite()),
-        OracleCommand::Section2Case => serde_json::to_string(&section2_case_suite()),
-        OracleCommand::Section2Lock => serde_json::to_string(&section2_lock_suite()),
-        OracleCommand::Section2Registry => serde_json::to_string(&section2_registry_suite()),
-        OracleCommand::Section3DllOrder => serde_json::to_string(&section3_dll_order_suite()),
-        OracleCommand::Section3DelayLoad => serde_json::to_string(&section3_delay_load_suite()),
-        OracleCommand::Section3ApiSet => serde_json::to_string(&section3_api_set_suite()),
-        OracleCommand::ApiReport { .. } => unreachable!("handled above"),
-    };
-    match output {
-        Ok(json) => println!("{json}"),
-        Err(error) => {
-            eprintln!("failed to encode oracle suite: {error}");
-            std::process::exit(1);
+    if run_env_driven_comparison() {
+        return;
+    }
+    if run_env_driven_comparison() {
+        return;
+    }
+    match cli.command {
+        OracleCommand::ApiReport { .. } => {
+            // Handled by the pre-match special case above.
+            unreachable!("ApiReport is handled before the match")
+        }
+        OracleCommand::Section2Path => print_suite(&section2_path_suite()),
+        OracleCommand::Section2Case => print_suite(&section2_case_suite()),
+        OracleCommand::Section2Lock => print_suite(&section2_lock_suite()),
+        OracleCommand::Section2Registry => print_suite(&section2_registry_suite()),
+        OracleCommand::Section3DllOrder => print_suite(&section3_dll_order_suite()),
+        OracleCommand::Section3DelayLoad => print_suite(&section3_delay_load_suite()),
+        OracleCommand::Section3ApiSet => print_suite(&section3_api_set_suite()),
+        OracleCommand::Vectors { out, categories } => {
+            let vectors = windows_oracle::generate_vectors(&parse_categories(categories));
+            let file = VectorFile {
+                schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
+                vectors,
+            };
+            write_json_file_or_stdout(out, &file, "vector corpus");
+        }
+        OracleCommand::ModelResults {
+            vectors,
+            out,
+            categories,
+        } => {
+            let vector_file = read_vector_file(&vectors);
+            let wanted = parse_categories(categories);
+            let filtered = vector_file
+                .vectors
+                .iter()
+                .filter(|vector| wanted.is_empty() || wanted.contains(&vector.category))
+                .cloned()
+                .collect::<Vec<_>>();
+            let results = write_results_file(&out, &filtered);
+            eprintln!(
+                "model-results: wrote {} results to {}",
+                results.len(),
+                out.display()
+            );
+        }
+        OracleCommand::Compare {
+            results,
+            vectors,
+            categories,
+            report_only,
+        } => {
+            let report = run_comparison(vectors.as_ref(), &results, &parse_categories(categories));
+            print_report(&report);
+            if report.has_diffs() && !report_only {
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -89,6 +194,120 @@ fn write_api_report(out: &std::path::Path) {
     eprintln!("wrote {}", out.display());
 }
 
+
+// ── Environment-driven comparison modes ─────────────────────────────────────
+
+/// When `CASA1_WINDOWS_REFERENCE_EXE` or `CASA1_WINDOWS_REFERENCE_RESULTS` is
+/// set, the harness switches to comparison mode over the default corpus:
+/// Casa1's model results are validated against the reference executable's
+/// output (running the exe itself when `CASA1_WINDOWS_REFERENCE_EXE` is set,
+/// or reading an existing results file). Exits 1 on any diff.
+fn run_env_driven_comparison() -> bool {
+    let Some(exe) = std::env::var_os("CASA1_WINDOWS_REFERENCE_EXE") else {
+        let Some(results_path) = std::env::var_os("CASA1_WINDOWS_REFERENCE_RESULTS") else {
+            return false;
+        };
+        let report = run_comparison(None, &PathBuf::from(results_path), &Vec::new());
+        print_report(&report);
+        if report.has_diffs() {
+            std::process::exit(1);
+        }
+        return true;
+    };
+    let vectors = windows_oracle::generate_vectors(&Vec::new());
+    let vectors_path = std::env::temp_dir().join("casa1-windows-vectors.json");
+    let results_path = std::env::temp_dir().join("casa1-windows-reference-results.json");
+    let vector_file = VectorFile {
+        schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
+        vectors,
+    };
+    write_json_file(&vectors_path, &vector_file, "vector corpus");
+    let status = Command::new(&exe)
+        .arg(&vectors_path)
+        .arg(&results_path)
+        .status()
+        .expect("run CASA1_WINDOWS_REFERENCE_EXE");
+    if !status.success() {
+        eprintln!(
+            "CASA1_WINDOWS_REFERENCE_EXE failed with status {status} (exe: {})",
+            exe.to_string_lossy()
+        );
+        std::process::exit(1);
+    }
+    let report = run_comparison(Some(&vectors_path), &results_path, &Vec::new());
+    print_report(&report);
+    if report.has_diffs() {
+        std::process::exit(1);
+    }
+    true
+}
+
+// ── Comparison pipeline ─────────────────────────────────────────────────────
+
+fn run_comparison(
+    vectors_path: Option<&PathBuf>,
+    results_path: &PathBuf,
+    categories: &[String],
+) -> ComparisonReport {
+    let vectors = match vectors_path {
+        Some(path) => read_vector_file(path).vectors,
+        None => windows_oracle::generate_vectors(&Vec::new()),
+    };
+    let reference_file: ReferenceResultsFile = read_json(results_path, "reference results");
+    if reference_file.schema_version != WINDOWS_ORACLE_SCHEMA_VERSION {
+        eprintln!(
+            "reference results schema_version {} does not match protocol version {}",
+            reference_file.schema_version, WINDOWS_ORACLE_SCHEMA_VERSION
+        );
+        std::process::exit(1);
+    }
+    let wanted: BTreeSet<String> = categories.iter().cloned().collect();
+    let vectors = if wanted.is_empty() {
+        vectors
+    } else {
+        vectors
+            .into_iter()
+            .filter(|vector| wanted.contains(&vector.category))
+            .collect()
+    };
+    let model_results = windows_oracle::compute_model_results(&vectors);
+    windows_oracle::compare_results(&vectors, &model_results, &reference_file.results)
+}
+
+fn print_report(report: &ComparisonReport) {
+    let json = serde_json::to_string_pretty(report).expect("encode comparison report");
+    println!("{json}");
+    if report.has_diffs() {
+        eprintln!(
+            "compare: {} diffs across {} compared vectors ({} vectors total)",
+            report.diff_count, report.compared, report.vectors_total
+        );
+    } else {
+        eprintln!(
+            "compare: OK — {} vectors compared, no diffs",
+            report.compared
+        );
+    }
+}
+
+// ── Results-file writer (model results with capture header) ────────────────
+
+fn write_results_file(
+    out: &PathBuf,
+    vectors: &[casa1::windows_oracle::Vector],
+) -> Vec<VectorResult> {
+    let results = windows_oracle::compute_model_results(vectors);
+    let file = ReferenceResultsFile {
+        schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
+        capture: CaptureHeader::model_generated(),
+        results,
+    };
+    write_json_file(out, &file, "model results");
+    file.results
+}
+
+// ── Legacy suite generation (unchanged output shapes) ──────────────────────
+
 fn section2_path_suite() -> PathEdgeSuite {
     let long_path = format!(
         "C:\\{}",
@@ -110,16 +329,20 @@ fn section2_path_suite() -> PathEdgeSuite {
             (long_path, true),
         ]
         .into_iter()
-        .map(|(input, long_paths_enabled)| PathEdgeCase {
-            outcome: oracle_parse_windows_path(&input, long_paths_enabled),
-            input,
-            long_paths_enabled,
+        .map(|(input, long_paths_enabled)| {
+            use casa1::oracle_model::PathEdgeCase;
+            PathEdgeCase {
+                outcome: casa1::oracle_model::oracle_parse_windows_path(&input, long_paths_enabled),
+                input,
+                long_paths_enabled,
+            }
         })
         .collect(),
     }
 }
 
 fn section2_case_suite() -> CaseCollisionSuite {
+    use casa1::oracle_model::{OracleDirectory, RC_FS_ALREADY_EXISTS};
     let mut directory = OracleDirectory::default();
     directory.create("ReadMe.TXT").expect("ASCII insert");
     directory.create("Σ.txt").expect("unicode insert");
@@ -140,6 +363,10 @@ fn section2_case_suite() -> CaseCollisionSuite {
 }
 
 fn section2_lock_suite() -> LockShareSuite {
+    use casa1::oracle_model::{
+        OracleFileAccess, OracleOpenState, OracleShareMode, RC_FS_LOCK_VIOLATION,
+        RC_FS_SHARING_VIOLATION, ranges_overlap, share_conflict,
+    };
     let first = OracleOpenState {
         desired_access: OracleFileAccess {
             read: true,
@@ -207,6 +434,7 @@ fn section2_registry_suite() -> RegistryNotifySuite {
 }
 
 fn section3_dll_order_suite() -> DllOrderSuite {
+    use casa1::oracle_model::{oracle_lifecycle_log_lines, oracle_load_order};
     let dependencies = BTreeMap::from([
         (
             "game.exe".to_string(),
@@ -230,6 +458,10 @@ fn section3_dll_order_suite() -> DllOrderSuite {
 }
 
 fn section3_delay_load_suite() -> DelayLoadSuite {
+    use casa1::oracle_model::{
+        DelayLoadCase, DelayLoadExpectation, DelayLoadSymbol, STATUS_DLL_NOT_FOUND,
+        STATUS_ENTRYPOINT_NOT_FOUND,
+    };
     let resolved_provider_exports = BTreeMap::from([
         (
             "kernel32.dll".to_string(),
@@ -294,6 +526,7 @@ fn section3_delay_load_suite() -> DelayLoadSuite {
 }
 
 fn section3_api_set_suite() -> ApiSetSuite {
+    use casa1::oracle_model::{ApiSetCase, oracle_api_set_resolve};
     ApiSetSuite {
         cases: [
             "api-ms-win-core-file-l1-1-0.dll",
@@ -311,411 +544,69 @@ fn section3_api_set_suite() -> ApiSetSuite {
     }
 }
 
-#[derive(Debug, Default)]
-struct OracleDirectory {
-    by_folded_name: BTreeMap<String, String>,
-}
+// ── Shared helpers ──────────────────────────────────────────────────────────
 
-impl OracleDirectory {
-    fn create(&mut self, name: &str) -> Result<(), u32> {
-        let folded = oracle_fold_key(name);
-        if self.by_folded_name.contains_key(&folded) {
-            return Err(RC_FS_ALREADY_EXISTS);
-        }
-        self.by_folded_name.insert(folded, name.to_string());
-        Ok(())
-    }
-
-    fn resolve(&self, requested: &str) -> Option<String> {
-        self.by_folded_name
-            .get(&oracle_fold_key(requested))
-            .cloned()
-    }
-
-    fn enumeration(&self) -> Vec<String> {
-        let mut values = self.by_folded_name.values().cloned().collect::<Vec<_>>();
-        values.sort();
-        values
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OracleFileAccess {
-    read: bool,
-    write: bool,
-    delete: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OracleShareMode {
-    read: bool,
-    write: bool,
-    delete: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OracleOpenState {
-    desired_access: OracleFileAccess,
-    share_mode: OracleShareMode,
-}
-
-fn oracle_parse_windows_path(input: &str, long_paths_enabled: bool) -> PathEdgeOutcome {
-    let mut raw = input.replace('/', "\\");
-    let verbatim = raw.starts_with("\\\\?\\");
-    let device_namespace = raw.starts_with("\\\\.\\");
-    if device_namespace {
-        return PathEdgeOutcome::Success {
-            normalized_path: raw,
-            verbatim: false,
-            device_namespace: true,
-        };
-    }
-    if verbatim {
-        raw = raw.trim_start_matches("\\\\?\\").to_string();
-    }
-    if raw.len() < 2 || !raw.as_bytes()[0].is_ascii_alphabetic() || raw.as_bytes()[1] != b':' {
-        return PathEdgeOutcome::Error {
-            reason_code: RC_FS_RESERVED_NAME,
-        };
-    }
-    let drive = raw[0..1].to_ascii_uppercase();
-    let mut remainder = raw[2..].to_string();
-    if remainder.is_empty() {
-        remainder.push('\\');
-    }
-    let mut components = Vec::new();
-    for component in remainder.split('\\') {
-        if component.is_empty() {
-            continue;
-        }
-        let normalized_component = if verbatim {
-            component.to_string()
-        } else if component == "." {
-            continue;
-        } else if component == ".." {
-            components.pop();
-            continue;
-        } else {
-            let trimmed = component.trim_end_matches([' ', '.']);
-            if trimmed.is_empty() {
-                continue;
-            }
-            if is_reserved_dos_name(trimmed) {
-                return PathEdgeOutcome::Error {
-                    reason_code: RC_FS_RESERVED_NAME,
-                };
-            }
-            trimmed.to_string()
-        };
-        components.push(normalized_component);
-    }
-    let normalized_path = if verbatim {
-        format!("\\\\?\\{}", build_drive_path(&drive, &components))
-    } else {
-        build_drive_path(
-            &drive,
-            &components
-                .iter()
-                .map(|component| component.to_lowercase())
-                .collect::<Vec<_>>(),
-        )
-    };
-    if !verbatim && !long_paths_enabled && normalized_path.len() > 260 {
-        return PathEdgeOutcome::Error {
-            reason_code: RC_FS_PATH_TOO_LONG,
-        };
-    }
-    PathEdgeOutcome::Success {
-        normalized_path,
-        verbatim,
-        device_namespace: false,
-    }
-}
-
-fn oracle_fold_key(value: &str) -> String {
-    let mut folded = String::new();
-    for character in value.chars() {
-        let mut uppercase = character.to_uppercase();
-        match (uppercase.next(), uppercase.next()) {
-            (Some(single), None) => folded.push(single),
-            _ => {
-                let mut lowercase = character.to_lowercase();
-                match (lowercase.next(), lowercase.next()) {
-                    (Some(single), None) => folded.push(single),
-                    _ => folded.push(character),
-                }
-            }
+fn print_suite<T: serde::Serialize>(suite: &T) {
+    match serde_json::to_string(suite) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("failed to encode oracle suite: {error}");
+            std::process::exit(1);
         }
     }
-    folded
 }
 
-fn share_conflict(
-    existing: &OracleOpenState,
-    desired_access: OracleFileAccess,
-    share_mode: OracleShareMode,
-) -> bool {
-    (desired_access.read && !existing.share_mode.read)
-        || (desired_access.write && !existing.share_mode.write)
-        || (desired_access.delete && !existing.share_mode.delete)
-        || (existing.desired_access.read && !share_mode.read)
-        || (existing.desired_access.write && !share_mode.write)
-        || (existing.desired_access.delete && !share_mode.delete)
-}
-
-fn ranges_overlap(
-    left_offset: u64,
-    left_length: u64,
-    right_offset: u64,
-    right_length: u64,
-) -> bool {
-    let left_end = left_offset.saturating_add(left_length);
-    let right_end = right_offset.saturating_add(right_length);
-    left_offset < right_end && right_offset < left_end
-}
-
-fn oracle_load_order(
-    root_module: &str,
-    dependencies: &BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    let mut order = Vec::new();
-    oracle_visit(
-        &normalize_module_name(root_module),
-        dependencies,
-        &mut visiting,
-        &mut visited,
-        &mut order,
-    );
-    order
-}
-
-fn oracle_visit(
-    module: &str,
-    dependencies: &BTreeMap<String, Vec<String>>,
-    visiting: &mut BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
-    order: &mut Vec<String>,
-) {
-    if visited.contains(module) {
-        return;
+fn parse_categories(categories: Option<String>) -> Vec<String> {
+    match categories {
+        Some(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::new(),
     }
-    if !visiting.insert(module.to_string()) {
-        return;
-    }
-    for dependency in dependencies.get(module).into_iter().flatten() {
-        oracle_visit(
-            &normalize_module_name(dependency),
-            dependencies,
-            visiting,
-            visited,
-            order,
+}
+
+fn read_vector_file(path: &PathBuf) -> VectorFile {
+    let file: VectorFile = read_json(path, "vector corpus");
+    if file.schema_version != WINDOWS_ORACLE_SCHEMA_VERSION {
+        eprintln!(
+            "vector file schema_version {} does not match protocol version {}",
+            file.schema_version, WINDOWS_ORACLE_SCHEMA_VERSION
         );
+        std::process::exit(1);
     }
-    visiting.remove(module);
-    visited.insert(module.to_string());
-    order.push(module.to_string());
+    file
 }
 
-fn oracle_lifecycle_log_lines(
-    load_order: &[String],
-    tls_callbacks: &BTreeMap<String, Vec<u64>>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for module in load_order {
-        for callback in tls_callbacks.get(module).into_iter().flatten() {
-            lines.push(log_line(module, "tls_process_attach", Some(*callback)));
-        }
-        lines.push(log_line(module, "dllmain_process_attach", None));
-    }
-    for module in load_order {
-        for callback in tls_callbacks.get(module).into_iter().flatten() {
-            lines.push(log_line(module, "tls_thread_attach", Some(*callback)));
-        }
-        lines.push(log_line(module, "dllmain_thread_attach", None));
-    }
-    for module in load_order.iter().rev() {
-        for callback in tls_callbacks.get(module).into_iter().flatten() {
-            lines.push(log_line(module, "tls_thread_detach", Some(*callback)));
-        }
-        lines.push(log_line(module, "dllmain_thread_detach", None));
-    }
-    for module in load_order.iter().rev() {
-        for callback in tls_callbacks.get(module).into_iter().flatten() {
-            lines.push(log_line(module, "tls_process_detach", Some(*callback)));
-        }
-        lines.push(log_line(module, "dllmain_process_detach", None));
-    }
-    lines
-}
-
-fn log_line(module: &str, stage: &str, value: Option<u64>) -> String {
-    serde_json::to_string(&LifecycleLogEntry {
-        module: module.to_string(),
-        stage: stage.to_string(),
-        value,
+fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, label: &str) -> T {
+    let bytes = std::fs::read(path).unwrap_or_else(|error| {
+        eprintln!("failed to read {label} file {}: {error}", path.display());
+        std::process::exit(1);
+    });
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        eprintln!("failed to parse {label} file {}: {error}", path.display());
+        std::process::exit(1);
     })
-    .expect("encode lifecycle log line")
 }
 
-fn resolve_delay_expectation(
-    requested_module: &str,
-    symbol: &DelayLoadSymbol,
-    provider_exports: &BTreeMap<String, Vec<ExportSpec>>,
-) -> DelayLoadExpectation {
-    let resolved_module = normalize_module_name(requested_module);
-    let Some(exports) = provider_exports.get(&resolved_module) else {
-        return DelayLoadExpectation::StructuredException {
-            code: STATUS_DLL_NOT_FOUND,
-        };
-    };
-    match oracle_lookup_export(
-        symbol,
-        &resolved_module,
-        exports,
-        provider_exports,
-        &mut BTreeSet::new(),
-    ) {
-        Some(export) => DelayLoadExpectation::Resolved { export },
-        None => DelayLoadExpectation::StructuredException {
-            code: STATUS_ENTRYPOINT_NOT_FOUND,
-        },
-    }
+fn write_json_file<T: serde::Serialize>(path: &PathBuf, value: &T, label: &str) {
+    let json = serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| panic!("failed to encode {label}: {error}"));
+    std::fs::write(path, format!("{json}\n")).unwrap_or_else(|error| {
+        eprintln!("failed to write {label} file {}: {error}", path.display());
+        std::process::exit(1);
+    });
 }
 
-fn oracle_lookup_export(
-    symbol: &DelayLoadSymbol,
-    current_module: &str,
-    exports: &[ExportSpec],
-    provider_exports: &BTreeMap<String, Vec<ExportSpec>>,
-    visited: &mut BTreeSet<String>,
-) -> Option<ExportSpec> {
-    let visit_key = format!("{}::{symbol:?}", current_module);
-    if !visited.insert(visit_key) {
-        return None;
-    }
-    let export = match symbol {
-        DelayLoadSymbol::ByName { name } => exports
-            .iter()
-            .find(|export| export.name.as_deref() == Some(name.as_str()))
-            .cloned(),
-        DelayLoadSymbol::ByOrdinal { ordinal } => exports
-            .iter()
-            .find(|export| export.ordinal == *ordinal as u32)
-            .cloned(),
-    }?;
-    match &export.target {
-        ExportSpecTarget::Rva { .. } => Some(export),
-        ExportSpecTarget::Forwarder { value } => {
-            let (module_name, forwarded_symbol) = parse_forwarder(value)?;
-            let exports = provider_exports.get(&module_name)?;
-            oracle_lookup_export(
-                &forwarded_symbol,
-                &module_name,
-                exports,
-                provider_exports,
-                visited,
-            )
+fn write_json_file_or_stdout<T: serde::Serialize>(out: Option<PathBuf>, value: &T, label: &str) {
+    match out {
+        Some(path) => write_json_file(&path, value, label),
+        None => {
+            let json = serde_json::to_string_pretty(value)
+                .unwrap_or_else(|error| panic!("failed to encode {label}: {error}"));
+            println!("{json}");
         }
     }
-}
-
-fn parse_forwarder(value: &str) -> Option<(String, DelayLoadSymbol)> {
-    let (module, symbol) = value.split_once('.')?;
-    if let Some(rest) = symbol.strip_prefix('#') {
-        // Parse failure (e.g. an ordinal beyond u16) fails loudly instead of
-        // silently truncating; the model keeps u16 to match the in-tree
-        // `ImportSymbol::ByOrdinal` consumer.
-        let ordinal = rest.parse::<u16>().ok()?;
-        Some((
-            normalize_module_name(module),
-            DelayLoadSymbol::ByOrdinal { ordinal },
-        ))
-    } else {
-        Some((
-            normalize_module_name(module),
-            DelayLoadSymbol::ByName {
-                name: symbol.to_string(),
-            },
-        ))
-    }
-}
-
-fn oracle_api_set_resolve(dll_name: &str) -> String {
-    let normalized = normalize_module_name(dll_name);
-    // Check the COM api-set contracts first: every `api-ms-win-core-com-*`
-    // name also starts with `api-ms-win-core-`, so the generic core arm must
-    // not shadow it.
-    if normalized.starts_with("api-ms-win-com-") || normalized.starts_with("api-ms-win-core-com-") {
-        return "ole32.dll".to_string();
-    }
-    if normalized.starts_with("api-ms-win-core-") {
-        return "kernel32.dll".to_string();
-    }
-    if normalized.starts_with("api-ms-win-crt-") {
-        return "ucrtbase.dll".to_string();
-    }
-    if normalized.starts_with("api-ms-win-security-")
-        || normalized.starts_with("api-ms-win-service-")
-    {
-        return "advapi32.dll".to_string();
-    }
-    if normalized.starts_with("api-ms-win-shell-") {
-        return "shell32.dll".to_string();
-    }
-    if normalized.starts_with("ext-ms-win-ntuser-") {
-        return "user32.dll".to_string();
-    }
-    normalized
-}
-
-fn normalize_module_name(value: &str) -> String {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.contains('.') {
-        normalized
-    } else {
-        format!("{normalized}.dll")
-    }
-}
-
-fn build_drive_path(drive: &str, components: &[String]) -> String {
-    if components.is_empty() {
-        format!("{drive}:\\")
-    } else {
-        format!("{drive}:\\{}", components.join("\\"))
-    }
-}
-
-fn is_reserved_dos_name(component: &str) -> bool {
-    let name = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .to_ascii_uppercase();
-    matches!(
-        name.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
 }

@@ -1,0 +1,22 @@
+[package]
+name = "casa1-windows-reference"
+version = "0.1.0"
+edition = "2024"
+description = "Windows differential-oracle reference executable: executes real Win32/CRT calls over a vector corpus and emits canonical results"
+license = "MIT OR Apache-2.0"
+
+# Standalone workspace root: the crate is excluded from the Casa1 workspace
+# (root Cargo.toml `[workspace] exclude`) and must never be absorbed by a
+# parent workspace, so it declares its own empty workspace table.
+[workspace]
+
+[[bin]]
+name = "casa1-windows-reference"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+debug = false

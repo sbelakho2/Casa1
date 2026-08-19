@@ -65,6 +65,12 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
 
+[workspace]
+# The Windows differential-oracle reference executable is a standalone crate:
+# it must build on Windows (and macOS for the workspace check) with its own
+# Cargo.lock, and must not be pulled into this workspace's builds or tests.
+exclude = ["windows_reference"]
+
 [features]
 default = ["metal", "vulkan", "opengl"]
 metal = []
