@@ -19,10 +19,11 @@
 //!   - `CASA1_WINDOWS_REFERENCE_EXE=<path>`: run the reference executable on
 //!     the generated corpus and compare its output.
 
+use casa1::api_database::ApiDatabase;
 use casa1::windows_oracle::{
     self, ComparisonReport, ReferenceResultsFile, VectorFile, WINDOWS_ORACLE_SCHEMA_VERSION,
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,14 +34,33 @@ struct OracleCli {
     command: OracleCommand,
 }
 
+/// Which API-completeness gate the report command enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ApiGateSelection {
+    /// The shipping gate: allows explicitly documented Partial entries; fails
+    /// on Stub/Unsupported without a compatibility error, Implemented with no
+    /// coverage, and lookup ambiguity.
+    Shipping,
+    /// The completeness gate: Partial never passes; Implemented requires
+    /// Differential/Conformance coverage.
+    Completeness,
+    /// Emit the report without failing on any gate.
+    None,
+}
+
 #[derive(Debug, Subcommand)]
 enum OracleCommand {
     /// Emit api-completeness.json for the quantitative Windows API
-    /// completeness database (per-DLL counts + production-gate violations).
+    /// completeness database (per-DLL counts + both gate results).  Exits
+    /// non-zero when the selected gate reports violations.
     #[command(name = "api-report")]
     ApiReport {
         /// Destination path for the api-completeness.json report.
+        #[arg(long)]
         out: std::path::PathBuf,
+        /// Gate to enforce on this run (default: shipping).
+        #[arg(long, value_enum, default_value_t = ApiGateSelection::Shipping)]
+        gate: ApiGateSelection,
     },
     /// Write the deterministic differential vector corpus (schema_version 1).
     Vectors {
@@ -74,8 +94,8 @@ enum OracleCommand {
 
 fn main() {
     let cli = OracleCli::parse();
-    if let OracleCommand::ApiReport { out } = &cli.command {
-        write_api_report(out);
+    if let OracleCommand::ApiReport { out, gate } = &cli.command {
+        write_api_report(out, *gate);
         return;
     }
     if run_env_driven_comparison() {
@@ -110,9 +130,11 @@ fn main() {
 }
 
 /// Generate the api-completeness.json report from the seeded database and
-/// write it to `out`.
-fn write_api_report(out: &std::path::Path) {
-    let report = casa1::api_database::ApiDatabase::from_thunk_metadata().completeness_report();
+/// write it to `out`.  When `gate` is not `None` and the selected gate
+/// reports violations, the process exits non-zero (the gate fails).
+fn write_api_report(out: &std::path::Path, gate: ApiGateSelection) {
+    let database = ApiDatabase::from_thunk_metadata();
+    let report = database.completeness_report();
     let json = match serde_json::to_string_pretty(&report) {
         Ok(json) => json,
         Err(error) => {
@@ -125,6 +147,43 @@ fn write_api_report(out: &std::path::Path) {
         std::process::exit(1);
     }
     eprintln!("wrote {}", out.display());
+    eprintln!(
+        "api-completeness: {} entries, {} shipping violations, {} completeness violations \
+         (total-compatibility progress)",
+        database.len(),
+        report.gate.shipping_violation_count,
+        report.gate.completeness_violation_count
+    );
+    match gate {
+        ApiGateSelection::None => {}
+        ApiGateSelection::Shipping => {
+            if report.gate.shipping_violation_count > 0 {
+                eprintln!(
+                    "api-report --gate shipping FAILED: {} violations",
+                    report.gate.shipping_violation_count
+                );
+                for violation in &report.gate.shipping_violations {
+                    eprintln!("  - {:?}: {}", violation.kind, violation.message);
+                }
+                std::process::exit(1);
+            }
+            eprintln!("api-report --gate shipping: PASSED");
+        }
+        ApiGateSelection::Completeness => {
+            if report.gate.completeness_violation_count > 0 {
+                eprintln!(
+                    "api-report --gate completeness FAILED: {} violations (total-compatibility \
+                     progress is not zero)",
+                    report.gate.completeness_violation_count
+                );
+                for violation in &report.gate.completeness_violations {
+                    eprintln!("  - {:?}: {}", violation.kind, violation.message);
+                }
+                std::process::exit(1);
+            }
+            eprintln!("api-report --gate completeness: PASSED");
+        }
+    }
 }
 
 // ── Environment-driven comparison modes ─────────────────────────────────────

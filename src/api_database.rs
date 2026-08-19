@@ -9,36 +9,47 @@
 //!
 //! The database provides:
 //!
-//! - [`ApiEntry`] — per-(DLL, export) completeness records keyed by
-//!   architecture (`X86`/`X64`/`Any`) and Windows version (`Win10`/`Win11`/
-//!   `Any`), carrying the [`ImplementationLevel`], the semantic test coverage
-//!   ([`CoverageLevel`]), the workloads that reach the API, and the
-//!   transitional flag (a `Partial` entry MUST be flagged transitional with a
-//!   reason in `detail` or it fails the release gate).
-//! - [`ApiDatabase`] — the entry table with [`ApiDatabase::lookup`],
-//!   [`ApiDatabase::for_dll`], workload recording, and the **release gate**
-//!   ([`ApiDatabase::production_gate`]): only *Implemented* entries and
-//!   *DeliberatelyUnsupported* entries carrying a compatibility error are
-//!   acceptable production statuses; `Partial` must not quietly count, and
-//!   `Stub`/`Unsupported` must be declared deliberately unsupported.
-//! - Seed tables: the full [`THUNK_METADATA`] surface, the `Nt*` surface of
-//!   ntdll (skeleton entries marked against what the runtime actually
-//!   dispatches), and the COM / DXGI / D3D11 / D3D12 / Media Foundation
-//!   interface tables at the runtime's actual levels.
+//! - [`ApiEntry`] — per-(DLL, export, architecture, Windows version)
+//!   completeness records carrying the [`ImplementationLevel`], the semantic
+//!   test coverage ([`CoverageLevel`]), the workloads that reach the API, and
+//!   the transitional flag (a `Partial` entry is transitional ONLY when it
+//!   carries a specific, concrete documented reason in `detail`).
+//! - [`ApiDatabase`] — the entry table with full-key lookup
+//!   ([`ApiDatabase::lookup_entry`]), the legacy (DLL, export) convenience
+//!   lookup ([`ApiDatabase::lookup`], `None` on ambiguity), workload
+//!   recording, and the two gates:
+//!   - [`ApiDatabase::shipping_gate`] — the CI gate.  Allows explicitly
+//!     documented `Partial` entries (transitional with a specific reason).
+//!     Violations: `Partial` without a specific reason, `Stub`/`Unsupported`
+//!     not declared deliberately unsupported with a compatibility error,
+//!     `Implemented` entries with no semantic coverage at all
+//!     ([`CoverageLevel::None`]), and duplicate full keys (lookup
+//!     ambiguity).
+//!   - [`ApiDatabase::completeness_gate`] — the release gate.  Requires
+//!     `Implemented` entries with Differential or Conformance coverage, or
+//!     `DeliberatelyUnsupported` entries with a precise compatibility
+//!     consequence.  `Partial` NEVER passes this gate.
+//! - Seed tables: the full [`THUNK_METADATA`] surface (with a seed-time
+//!   classification pass that marks each `Partial` entry transitional ONLY
+//!   when its dispatch implementation carries a specific documented
+//!   limitation), the `Nt*` surface of ntdll (skeleton entries marked against
+//!   what the runtime actually dispatches), and the COM / DXGI / D3D11 /
+//!   D3D12 / Media Foundation interface tables at the runtime's actual
+//!   levels.
 //! - [`ApiCompletenessReport`] — the `api-completeness.json` shape
-//!   (`generated_at`, `per_dll` summaries, `gate.violations`), emitted by the
-//!   `casa1-oracle api-report <out.json>` command.
+//!   (`generated_at`, `per_dll` summaries, `gate` with both gate results and
+//!   violation counts), emitted by the `casa1-oracle api-report` command.
 //!
-//! # Release gate
+//! # Gates
 //!
-//! [`ApiDatabase::production_gate`] reports every entry that must not ship
-//! quietly:
-//!
-//! 1. `Partial` entries that are not flagged `transitional` (a Partial
-//!    implementation without a documented reason must not count as done).
-//! 2. `Stub`/`Unsupported` entries that are not registered as
-//!    deliberately-unsupported with a compatibility error via
-//!    [`ApiDatabase::deliberately_unsupported`].
+//! The completeness-gate violation count is the project's total-compatibility
+//! progress number: it counts every entry that still blocks full completeness
+//! (any `Partial`, any `Implemented` entry without Differential/Conformance
+//! coverage, any undeclared `Stub`/`Unsupported`).  The shipping gate is the
+//! weaker, CI-enforced bar: explicitly documented `Partial` entries are
+//! allowed, but `Implemented` entries must have at least Unit coverage and
+//! every `Stub`/`Unsupported` must be declared deliberately unsupported with
+//! a guest-visible compatibility consequence.
 
 use crate::host_thunks::ImplementationLevel;
 use crate::host_thunks::THUNK_METADATA;
@@ -51,7 +62,7 @@ use std::sync::{LazyLock, Mutex};
 // ---------------------------------------------------------------------------
 
 /// Guest architecture an API entry applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ArchSet {
     /// 32-bit (x86) guests only.
     X86,
@@ -62,7 +73,7 @@ pub enum ArchSet {
 }
 
 /// Windows version an API entry applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WindowsVersion {
     /// Windows 10 compatibility.
     Win10,
@@ -98,10 +109,11 @@ pub enum CoverageLevel {
 /// A single (DLL, export) completeness record.
 ///
 /// This is the project-wide compatibility accounting unit: the implementation
-/// level is seeded from [`THUNK_METADATA`], and the gate requires every
-/// `Partial` entry to be explicitly flagged `transitional` with a reason in
-/// `detail`, while `Stub`/`Unsupported` entries must be declared deliberately
-/// unsupported with a compatibility error.
+/// level is seeded from [`THUNK_METADATA`].  A `Partial` entry is
+/// `transitional` ONLY when it carries a specific, concrete documented reason
+/// in `detail` (what is missing); a `Partial` entry without such a reason
+/// fails the shipping gate, and `Stub`/`Unsupported` entries must be declared
+/// deliberately unsupported with a compatibility error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiEntry {
     /// Exporting DLL name (lowercase, with extension, e.g. `"kernel32.dll"`).
@@ -120,12 +132,13 @@ pub struct ApiEntry {
     /// Workloads (fixtures, E2E scenarios) whose scans reach this API.
     pub workloads_reaching: Vec<String>,
     /// `true` when this is a knowingly-incomplete implementation with a
-    /// documented reason in `detail`.  A `Partial` entry that is NOT
-    /// transitional fails the production gate.
+    /// SPECIFIC, concrete documented reason in `detail`.  A `Partial` entry
+    /// that is not transitional (or whose `detail` is missing) fails the
+    /// shipping gate.
     pub transitional: bool,
-    /// Optional human-readable note: the transitional reason for Partial
-    /// entries, the compatibility consequence for deliberately-unsupported
-    /// entries, or any other per-API documentation.
+    /// Optional human-readable note: the specific transitional reason for
+    /// Partial entries (what is missing), the compatibility consequence for
+    /// deliberately-unsupported entries, or any other per-API documentation.
     pub detail: Option<String>,
 }
 
@@ -155,23 +168,46 @@ impl ApiEntry {
     pub fn is_production_acceptable(&self) -> bool {
         matches!(self.implementation, ImplementationLevel::Implemented)
     }
+
+    /// `true` when the entry carries a specific, concrete documented reason
+    /// (`transitional` set AND a non-empty `detail`).
+    pub fn has_specific_reason(&self) -> bool {
+        self.transitional
+            && self
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.is_empty())
+    }
 }
 
-/// Why a single entry fails the production gate.
+/// Why a single entry fails a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ApiGateViolationKind {
-    /// `Partial` implementation without the `transitional` flag (it would
-    /// quietly count as shipped despite documented limitations).
+    /// `Partial` implementation without a specific, concrete documented
+    /// reason (it would quietly count as shipped despite undocumented
+    /// limitations).
     PartialNotTransitional,
+    /// `Partial` implementation — NEVER passes the completeness gate; it must
+    /// be completed and proven with Differential/Conformance coverage.
+    PartialNotCompletenessReady,
     /// `Stub` implementation not declared deliberately unsupported with a
     /// compatibility error.
     StubNotDeliberatelyUnsupported,
     /// `Unsupported` (no host thunk) not declared deliberately unsupported
     /// with a compatibility error.
     UnsupportedNotDeliberatelyUnsupported,
+    /// `Implemented` entry with [`CoverageLevel::None`] — no semantic test
+    /// coverage at all; the shipping gate requires at least Unit coverage.
+    ImplementedWithoutCoverage,
+    /// `Implemented` entry without Differential or Conformance coverage —
+    /// fails the completeness gate.
+    ImplementedWithoutSemanticCoverage,
+    /// Duplicate full keys (DLL, export, arch, winver) make even full-key
+    /// lookups ambiguous.
+    LookupAmbiguity,
 }
 
-/// One production-gate violation: a (DLL, export) that must not ship quietly.
+/// One gate violation: a (DLL, export) that must not ship quietly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiGateViolation {
     /// Exporting DLL name (lowercase, with extension).
@@ -225,7 +261,8 @@ impl ApiDatabase {
     ///
     /// `compatibility_error` documents the guest-visible error the runtime
     /// surfaces when the API is reached.  Only entries registered here pass
-    /// the [`ApiDatabase::production_gate`] while still classified
+    /// the [`ApiDatabase::shipping_gate`] and
+    /// [`ApiDatabase::completeness_gate`] while still classified
     /// `Stub`/`Unsupported`.
     pub fn deliberately_unsupported(
         &mut self,
@@ -247,14 +284,46 @@ impl ApiDatabase {
             .map(String::as_str)
     }
 
-    /// Look up an entry by (DLL, export).
+    /// Legacy (DLL, export) convenience lookup.
     ///
     /// Matching is case-insensitive and tolerates the `.dll` suffix on either
     /// side (`"kernel32"` and `"KERNEL32.DLL"` both match `"kernel32.dll"`).
+    /// Returns `None` when no entry matches OR when several entries match
+    /// (rows can legitimately differ by [`ArchSet`] and [`WindowsVersion`],
+    /// which makes this key ambiguous).  New code should use
+    /// [`ApiDatabase::lookup_entry`] with the full key.
     pub fn lookup(&self, dll: &str, export: &str) -> Option<&ApiEntry> {
         let dll_key = normalize_dll(dll);
-        self.entries.iter().find(|entry| {
+        let mut matches = self.entries.iter().filter(|entry| {
             normalize_dll(&entry.dll) == dll_key && entry.export.eq_ignore_ascii_case(export)
+        });
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Look up an entry by the full key: (DLL, export, architecture, Windows
+    /// version).
+    ///
+    /// DLL matching is case-insensitive and tolerates the `.dll` suffix on
+    /// either side; the export is matched case-insensitively; the arch and
+    /// winver rows must match exactly.  This is the unambiguous keying once
+    /// per-architecture / per-Windows-version rows exist.
+    pub fn lookup_entry(
+        &self,
+        dll: &str,
+        export: &str,
+        arch: ArchSet,
+        winver: WindowsVersion,
+    ) -> Option<&ApiEntry> {
+        let dll_key = normalize_dll(dll);
+        self.entries.iter().find(|entry| {
+            normalize_dll(&entry.dll) == dll_key
+                && entry.export.eq_ignore_ascii_case(export)
+                && entry.arch == arch
+                && entry.win_version == winver
         })
     }
 
@@ -290,38 +359,175 @@ impl ApiDatabase {
         true
     }
 
-    /// The production release gate.
+    /// The shipping gate — the CI-enforced bar.
     ///
-    /// Violations are reported for:
+    /// Explicitly documented `Partial` entries (transitional with a specific
+    /// reason in `detail`) are allowed.  Violations are reported for:
     ///
-    /// 1. Any entry with `implementation == Partial` that is not flagged
-    ///    `transitional` (a Partial implementation must carry a documented
-    ///    reason, or it is quietly counted as shipped).
+    /// 1. Any entry with `implementation == Partial` that does not carry a
+    ///    specific, concrete documented reason (`transitional` + non-empty
+    ///    `detail`).  A Partial implementation without a documented reason
+    ///    would quietly count as shipped.
     /// 2. Any entry with `implementation == Stub` or `Unsupported` that is
     ///    not registered as deliberately unsupported with a compatibility
     ///    error.
-    ///
-    /// Only `Implemented` entries and deliberately-unsupported entries with a
-    /// compatibility error are acceptable production statuses.
-    pub fn production_gate(&self) -> Vec<ApiGateViolation> {
+    /// 3. Any `Implemented` entry with `semantic_test_coverage ==
+    ///    CoverageLevel::None` — an Implemented API needs at least Unit
+    ///    coverage to ship.
+    /// 4. Duplicate full keys (DLL, export, arch, winver) — the database
+    ///    must never make even the full-key lookup ambiguous.
+    pub fn shipping_gate(&self) -> Vec<ApiGateViolation> {
         let mut violations = Vec::new();
+        let mut full_keys = std::collections::BTreeSet::new();
         for entry in &self.entries {
+            let full_key = (
+                normalize_dll(&entry.dll),
+                entry.export.to_ascii_lowercase(),
+                entry.arch,
+                entry.win_version,
+            );
+            if !full_keys.insert(full_key) {
+                violations.push(ApiGateViolation {
+                    dll: entry.dll.clone(),
+                    export: entry.export.clone(),
+                    kind: ApiGateViolationKind::LookupAmbiguity,
+                    message: format!(
+                        "{}!{} ({:?}, {:?}) has a duplicate full key — the database must \
+                         have exactly one row per (DLL, export, arch, winver)",
+                        entry.dll, entry.export, entry.arch, entry.win_version
+                    ),
+                });
+            }
             match entry.implementation {
-                ImplementationLevel::Implemented => {}
+                ImplementationLevel::Implemented => {
+                    if entry.semantic_test_coverage == CoverageLevel::None {
+                        violations.push(ApiGateViolation {
+                            dll: entry.dll.clone(),
+                            export: entry.export.clone(),
+                            kind: ApiGateViolationKind::ImplementedWithoutCoverage,
+                            message: format!(
+                                "{}!{} is Implemented but has no semantic test coverage \
+                                 (CoverageLevel::None) — an Implemented API needs at least \
+                                 Unit coverage to pass the shipping gate",
+                                entry.dll, entry.export
+                            ),
+                        });
+                    }
+                }
                 ImplementationLevel::Partial => {
-                    if !entry.transitional {
+                    if !entry.has_specific_reason() {
                         violations.push(ApiGateViolation {
                             dll: entry.dll.clone(),
                             export: entry.export.clone(),
                             kind: ApiGateViolationKind::PartialNotTransitional,
                             message: format!(
-                                "{}!{} is Partial but not flagged transitional — mark it \
-                                 transitional with a documented reason in detail, or complete \
-                                 the implementation",
+                                "{}!{} is Partial without a specific, concrete documented \
+                                 reason — mark it transitional with a short explanation of \
+                                 what is missing in detail, or complete the implementation",
                                 entry.dll, entry.export
                             ),
                         });
                     }
+                }
+                ImplementationLevel::Stub => {
+                    if self
+                        .deliberately_unsupported_error(&entry.dll, &entry.export)
+                        .is_none()
+                    {
+                        violations.push(ApiGateViolation {
+                            dll: entry.dll.clone(),
+                            export: entry.export.clone(),
+                            kind: ApiGateViolationKind::StubNotDeliberatelyUnsupported,
+                            message: format!(
+                                "{}!{} is a Stub but not declared deliberately unsupported — \
+                                 register it via deliberately_unsupported() with the \
+                                 compatibility error the guest sees, or implement it",
+                                entry.dll, entry.export
+                            ),
+                        });
+                    }
+                }
+                ImplementationLevel::Unsupported => {
+                    if self
+                        .deliberately_unsupported_error(&entry.dll, &entry.export)
+                        .is_none()
+                    {
+                        violations.push(ApiGateViolation {
+                            dll: entry.dll.clone(),
+                            export: entry.export.clone(),
+                            kind: ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported,
+                            message: format!(
+                                "{}!{} is Unsupported (no host thunk) but not declared \
+                                 deliberately unsupported — register it via \
+                                 deliberately_unsupported() with the compatibility error the \
+                                 guest sees, or implement it",
+                                entry.dll, entry.export
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    /// The completeness gate — the release bar.
+    ///
+    /// Acceptable statuses: `Implemented` with Differential or Conformance
+    /// semantic coverage, or `DeliberatelyUnsupported` entries registered
+    /// with a precise compatibility consequence.  `Partial` NEVER passes this
+    /// gate — a knowingly-incomplete implementation is by definition not
+    /// complete.  Violations are reported for:
+    ///
+    /// 1. Any `Partial` entry (regardless of the transitional flag).
+    /// 2. Any `Stub`/`Unsupported` entry not registered as deliberately
+    ///    unsupported with a compatibility error.
+    /// 3. Any `Implemented` entry whose coverage is below Differential
+    ///    (None/Unit/SubsystemScenario).
+    ///
+    /// The violation count is the project's total-compatibility progress
+    /// number: every violation is one entry that still blocks full
+    /// completeness.
+    pub fn completeness_gate(&self) -> Vec<ApiGateViolation> {
+        let mut violations = Vec::new();
+        for entry in &self.entries {
+            match entry.implementation {
+                ImplementationLevel::Implemented => {
+                    if !matches!(
+                        entry.semantic_test_coverage,
+                        CoverageLevel::Differential | CoverageLevel::Conformance
+                    ) {
+                        violations.push(ApiGateViolation {
+                            dll: entry.dll.clone(),
+                            export: entry.export.clone(),
+                            kind: ApiGateViolationKind::ImplementedWithoutSemanticCoverage,
+                            message: format!(
+                                "{}!{} is Implemented but not semantically proven — the \
+                                 completeness gate requires Differential or Conformance \
+                                 coverage (currently {:?})",
+                                entry.dll, entry.export, entry.semantic_test_coverage
+                            ),
+                        });
+                    }
+                }
+                ImplementationLevel::Partial => {
+                    violations.push(ApiGateViolation {
+                        dll: entry.dll.clone(),
+                        export: entry.export.clone(),
+                        kind: ApiGateViolationKind::PartialNotCompletenessReady,
+                        message: format!(
+                            "{}!{} is Partial and NEVER passes the completeness gate — \
+                             complete the implementation and prove it with Differential or \
+                             Conformance coverage{}",
+                            entry.dll,
+                            entry.export,
+                            entry
+                                .detail
+                                .as_deref()
+                                .map(|reason| format!(" (documented limitation: {reason})"))
+                                .unwrap_or_default()
+                        ),
+                    });
                 }
                 ImplementationLevel::Stub => {
                     if self
@@ -388,7 +594,12 @@ impl ApiDatabase {
     ///
     /// - Every [`THUNK_METADATA`] entry maps to an [`ApiEntry`] with the same
     ///   DLL, export, and [`ImplementationLevel`].  `Partial` entries are
-    ///   flagged `transitional` with the documented-limitation reason.
+    ///   flagged `transitional` ONLY when the seed-time classification pass
+    ///   (see `PARTIAL_TRANSITION_REASONS` and `classify_partial_reason`
+    ///   below) finds a specific, concrete documented limitation in the
+    ///   thunk's actual implementation; that reason is recorded in `detail`.
+    ///   A Partial without a specific reason is seeded non-transitional and
+    ///   fails the shipping gate.
     /// - `Stub`/`Unsupported` entries whose dispatch code deliberately returns
     ///   the compatibility-correct canned answer are registered through
     ///   [`ApiDatabase::deliberately_unsupported`] with the guest-visible
@@ -399,13 +610,8 @@ impl ApiDatabase {
         let mut database = ApiDatabase::new();
 
         for metadata in THUNK_METADATA {
-            let transitional = metadata.implementation == ImplementationLevel::Partial;
-            let detail = if transitional {
-                Some(
-                    "Partial per THUNK_METADATA: real implementation with known limitations \
-                     documented in the dispatch code (pe_runtime.rs)."
-                        .to_string(),
-                )
+            let reason = if metadata.implementation == ImplementationLevel::Partial {
+                classify_partial_reason(metadata.dll, metadata.name)
             } else {
                 None
             };
@@ -417,8 +623,8 @@ impl ApiDatabase {
                 implementation: metadata.implementation,
                 semantic_test_coverage: CoverageLevel::None,
                 workloads_reaching: Vec::new(),
-                transitional,
-                detail,
+                transitional: reason.is_some(),
+                detail: reason.map(str::to_string),
             });
         }
 
@@ -474,15 +680,232 @@ impl ApiDatabase {
             }
         }
 
+        let shipping_violations = self.shipping_gate();
+        let completeness_violations = self.completeness_gate();
+        let shipping_violation_count = shipping_violations.len();
+        let completeness_violation_count = completeness_violations.len();
         ApiCompletenessReport {
             generated_at: crate::steam_milestones::utc_rfc3339_now(),
             per_dll,
             gate: ApiGateSummary {
-                violations: self.production_gate(),
+                shipping_violations,
+                shipping_violation_count,
+                completeness_violations,
+                completeness_violation_count,
             },
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Seed-time classification pass
+// ---------------------------------------------------------------------------
+
+/// Classify a `Partial` thunk from [`THUNK_METADATA`] at seed time.
+///
+/// Returns the SPECIFIC, concrete documented limitation (what is missing) of
+/// the thunk's actual implementation, or `None` when no specific reason is
+/// carried anywhere.  A `Partial` entry is seeded `transitional` iff this
+/// returns a reason; otherwise the entry is non-transitional and fails the
+/// shipping gate — the gate must never convert "Partial must not count" into
+/// "all Partial automatically pass".
+///
+/// The reasons below were derived from the dispatch code in `pe_runtime.rs`
+/// (the documented limitations in each `HostThunk::*` arm) and from the
+/// skeleton-table evidence in this module; each entry names what is missing.
+fn classify_partial_reason(dll: &str, export: &str) -> Option<&'static str> {
+    PARTIAL_TRANSITION_REASONS
+        .iter()
+        .find(|(entry_dll, entry_export, _)| *entry_dll == dll && *entry_export == export)
+        .map(|(_, _, reason)| *reason)
+}
+
+/// Seed-time specific reasons for every `Partial` thunk in
+/// [`THUNK_METADATA`]: (dll, export, what is missing).
+///
+/// Each reason is the concrete limitation documented in the thunk's dispatch
+/// implementation (pe_runtime.rs); a Partial entry may only be transitional
+/// with one of these (or an equivalent specific reason in the skeleton
+/// tables' `detail`).
+static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
+    (
+        "kernel32.dll",
+        "CompareStringW",
+        "locale and flags are ignored; comparison is a case-insensitive ordinal compare \
+         (to_lowercase), not locale collation",
+    ),
+    (
+        "kernel32.dll",
+        "DeviceIoControl",
+        "fixed IOCTL subset only (sparse-file, disk/CDROM geometry, storage device \
+         number/media types); unknown codes fail with ERROR_INVALID_FUNCTION",
+    ),
+    (
+        "kernel32.dll",
+        "GetCPInfo",
+        "only DEFAULT_ANSI/OEM code pages and 65001 (UTF-8) are recognized; other code \
+         pages fail with ERROR_INVALID_PARAMETER",
+    ),
+    (
+        "kernel32.dll",
+        "GetDateFormatW",
+        "formats only DATE_SHORTDATE or a fixed yyyy-MM-dd form using the current date — \
+         no locale tables or custom format strings",
+    ),
+    (
+        "kernel32.dll",
+        "GetDiskFreeSpaceA",
+        "reports plausible fixed disk geometry for the virtual filesystem, not host \
+         capacity",
+    ),
+    (
+        "kernel32.dll",
+        "GetDiskFreeSpaceExW",
+        "reports fixed virtual-filesystem figures (8 sectors/cluster, 512-byte sectors, \
+         2 TB total); not host capacity",
+    ),
+    (
+        "kernel32.dll",
+        "GetProcessAffinityMask",
+        "returns a fixed 8-core affinity mask (0xFF), not the actual process/system \
+         affinity",
+    ),
+    (
+        "kernel32.dll",
+        "GetTimeFormatW",
+        "formats only HH:MM:SS; locale and format pointer are ignored",
+    ),
+    (
+        "kernel32.dll",
+        "GlobalMemoryStatusEx",
+        "writes plausible fixed memory figures (16 GB total / 8 GB available); not read \
+         from host state",
+    ),
+    (
+        "kernel32.dll",
+        "IsValidCodePage",
+        "recognizes only DEFAULT_ANSI/OEM code pages and 65001; every other code page is \
+         reported invalid",
+    ),
+    (
+        "kernel32.dll",
+        "RaiseException",
+        "SEH/VEH dispatch is limited to the cooperative guest-thread model — vectored \
+         handler chains are approximated and unhandled codes terminate via GuestException",
+    ),
+    (
+        "kernel32.dll",
+        "RtlUnwind",
+        "simulates the unwind by adjusting RIP to the target; no full SEH frame-walk of \
+         the guest stack",
+    ),
+    (
+        "kernel32.dll",
+        "SetEndOfFile",
+        "cannot truly truncate the host file — truncation is simulated through file \
+         position tracking and treated as success",
+    ),
+    (
+        "kernel32.dll",
+        "SuspendThread",
+        "cooperative scheduling: only queued, not-yet-started threads can be suspended; \
+         running threads cannot be paused",
+    ),
+    (
+        "psapi.dll",
+        "GetProcessMemoryInfo",
+        "writes plausible fixed memory counters; not read from real process accounting",
+    ),
+    (
+        "gdi32.dll",
+        "CreateICW",
+        "returns a valid information-context HDC without driver/device setup",
+    ),
+    (
+        "gdi32.dll",
+        "GetDeviceCaps",
+        "fixed caps table (2560x1600 screen, 32-bit color, LOGPIXELS 144); unrecognized \
+         indexes return 0",
+    ),
+    (
+        "gdi32.dll",
+        "TextOutW",
+        "text extent approximated at 8x16 px per char cell; rendering goes through \
+         draw_text_to_hdc",
+    ),
+    (
+        "user32.dll",
+        "GetSystemMetrics",
+        "fixed metrics table (1024x768 screen, 17px borders, 16px captions); unrecognized \
+         indexes return 0",
+    ),
+    (
+        "user32.dll",
+        "SetClassLongW",
+        "returns 0 and records the call — the class long is not actually stored on the \
+         window class",
+    ),
+    (
+        "user32.dll",
+        "SetClipboardData",
+        "simplified clipboard: reads up to 64 KB from the handle address; format \
+         negotiation is limited",
+    ),
+    (
+        "user32.dll",
+        "SetTimer",
+        "only WM_TIMER-style timers (callback == 0) are registered; a non-null TIMERPROC \
+         cannot be invoked by the host and stays a no-op",
+    ),
+    (
+        "user32.dll",
+        "wsprintfA",
+        "simple format subset only (%s/%d/%u/%x/%c/%%); unsupported specifiers are \
+         skipped",
+    ),
+    (
+        "ws2_32.dll",
+        "WSARecv",
+        "overlapped I/O, completion routines, and non-zero flags are rejected with \
+         WSAEINVAL",
+    ),
+    (
+        "ws2_32.dll",
+        "WSARecvFrom",
+        "overlapped I/O and completion routines are rejected with WSAEINVAL; the source \
+         address is not written (length 0)",
+    ),
+    (
+        "ws2_32.dll",
+        "WSASend",
+        "overlapped I/O, completion routines, and non-zero flags are rejected with \
+         WSAEINVAL",
+    ),
+    (
+        "ws2_32.dll",
+        "WSASendTo",
+        "overlapped I/O and completion routines are rejected with WSAEINVAL; the \
+         destination address is ignored",
+    ),
+    (
+        "ole32.dll",
+        "CoCreateInstance",
+        "supports a fixed CLSID subset; unrecognized CLSIDs return \
+         CLASS_E_CLASSNOTAVAILABLE; aggregation is not supported",
+    ),
+    (
+        "crypt32.dll",
+        "CertCreateCertificateContext",
+        "creates a minimal context wrapping the raw DER bytes; no certificate parsing or \
+         validation",
+    ),
+    (
+        "crypt32.dll",
+        "CertGetCertificateChain",
+        "returns a minimal success chain (cbSize/trustStatus/chainCount) without real \
+         chain building or validation",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Skeleton tables
@@ -1151,12 +1574,18 @@ pub struct DllCompletenessSummary {
     pub transitional_partial: usize,
 }
 
-/// The production-gate section of the report.
+/// The gate section of the report: both gate results with counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiGateSummary {
-    /// Entries that must not ship quietly (see
-    /// [`ApiDatabase::production_gate`]).
-    pub violations: Vec<ApiGateViolation>,
+    /// Shipping-gate violations (see [`ApiDatabase::shipping_gate`]).
+    pub shipping_violations: Vec<ApiGateViolation>,
+    /// Number of shipping-gate violations.
+    pub shipping_violation_count: usize,
+    /// Completeness-gate violations (see [`ApiDatabase::completeness_gate`]).
+    pub completeness_violations: Vec<ApiGateViolation>,
+    /// Number of completeness-gate violations — the total-compatibility
+    /// progress number (every violation blocks full completeness).
+    pub completeness_violation_count: usize,
 }
 
 /// The `api-completeness.json` report shape.
@@ -1166,7 +1595,7 @@ pub struct ApiCompletenessReport {
     pub generated_at: String,
     /// Per-DLL completeness summaries, keyed by lowercase DLL name.
     pub per_dll: BTreeMap<String, DllCompletenessSummary>,
-    /// Production-gate result.
+    /// Both gate results with counts.
     pub gate: ApiGateSummary,
 }
 

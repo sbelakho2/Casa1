@@ -71,6 +71,16 @@ jobs:
       - name: Run unit and binary tests
         run: cargo test --lib --bins
 
+  api-gate:
+    name: API Completeness Gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run API completeness gate (shipping)
+        run: cargo run --bin casa1-oracle -- api-report --out api-completeness.json
+
   integration-tests:
     name: Integration Tests
     runs-on: macos-latest
