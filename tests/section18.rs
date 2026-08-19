@@ -65,16 +65,7 @@ fn t18_1_named_pipe_server_client_roundtrip() {
 // t18_2_named_pipe_get_info
 // ---------------------------------------------------------------------------
 
-// KNOWN-ISSUE: this test asserts the documented `GetNamedPipeInfo` contract — the
-// configured max instance count and the per-direction buffer sizes must be returned.
-// It is #[ignore]d because the implementation hardcodes `(pipe_mode, max_instances,
-// out, in) = (1, 1, max_size, max_size)` in `get_named_pipe_info`
-// (src/win32.rs:2918-2935, hardcoded tuple at line 2931): the requested
-// `max_instances = 5` and the 8192/4096 per-direction buffers are silently collapsed.
-// Expected: (1, 5, 8192, 4096). Actual: (1, 1, 8192, 8192) (verified 2026-08-15).
-// Once the implementation stores and returns the requested values, remove the #[ignore].
 #[test]
-#[ignore] // blocked by src bug: get_named_pipe_info returns hardcoded (1, 1, max_size, max_size)
 fn t18_2_named_pipe_get_info() {
     let (_tmp, mut win32) = setup_win32("pipe-get-info");
 

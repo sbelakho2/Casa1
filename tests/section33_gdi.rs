@@ -1074,7 +1074,8 @@ fn t33_29_image_attributes_color_matrix() {
 
 // KNOWN-ISSUE: quality setters are only implemented in the private
 // `PeHostRuntime` dispatch arms (HostThunk::GdipSetSmoothingMode/
-// GdipSetCompositingMode etc.). The default-value assertions are covered by
+// GdipSetCompositingMode etc., src/pe_runtime.rs:49178-49215). The
+// default-value assertions are covered by
 // t33_36 (which exercises the real `create_graphics_from_hdc`); the
 // set-and-read-back part previously wrote fields by hand.
 #[test]

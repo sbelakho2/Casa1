@@ -32,6 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check compilation
         run: cargo check --all-targets
+      - name: Check KNOWN-ISSUE markers carry tracking evidence
+        run: ./ci/check_known_issues.sh
 
   clippy:
     name: Clippy (default features)

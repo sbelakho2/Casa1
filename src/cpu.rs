@@ -4,6 +4,8 @@ use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use getrandom;
 
@@ -291,26 +293,23 @@ impl CpuVirtualization {
 
     /// Returns an honest XCR0 value based on what is actually implemented.
     ///
+    /// XCR0: the state components enabled for XSAVE/XRSTOR.
+    ///
     /// XCR0 bit assignment:
-    ///   Bit 0 (x87):         true – always available
-    ///   Bit 1 (SSE):         true – always available
-    ///   Bit 2 (AVX):         true if `features.avx` is set (YMM upper halves)
-    ///   Bit 3 (MPX BNDREGS): false – not implemented
-    ///   Bit 4 (MPX BNDCSR):  false – not implemented
-    ///   Bit 5 (AVX-512 OPMASK):     enabled when avx512f is set
-    ///   Bit 6 (AVX-512 ZMM_Hi256):  enabled when avx512f is set
-    ///   Bit 7 (AVX-512 Hi16_ZMM):   enabled when avx512f is set
+    ///   Bit 0 (x87):         always enabled
+    ///   Bit 1 (SSE):         always enabled
+    ///   Bit 2 (AVX):         enabled if `features.avx` is set (YMM upper halves)
+    ///   Bits 3-4 (MPX):      never enabled (not implemented)
+    ///   Bits 5+ (AVX-512 OPMASK/ZMM, PKRU, CET, ...): never enabled — the
+    ///         XSAVE area serializes only x87/SSE/AVX, so no other component
+    ///         may be claimed. XCR0 is masked to the serialized layout so
+    ///         XSTATE_BV can never announce state that is not saved.
     pub fn xcr0(&self) -> u64 {
         let mut val = 0x3_u64; // x87 (bit 0) + SSE (bit 1) – always present
         if self.features.avx {
             val |= 0x4; // YMM upper halves (bit 2)
         }
-        if self.features.avx512f {
-            val |= 1 << 5; // OPMASK state (k0-k7)
-            val |= 1 << 6; // ZMM upper 256 bits (ZMM0-ZMM15 upper halves)
-            val |= 1 << 7; // ZMM Hi16 (ZMM16-ZMM31)
-        }
-        val
+        val & XSAVE_SUPPORTED_STATE
     }
 
     pub fn leaf(&self, leaf: u32, subleaf: u32) -> CpuidLeaf {
@@ -439,11 +438,18 @@ impl CpuVirtualization {
                     edx: 0,
                 }
             }
-            (0xD, 0) if self.features.avx => {
-                let xsa_size = if self.features.avx512f {
-                    2432 // 832 (legacy + header + AVX) + 64 (opmask) + 512 (ZMM upper) + 1024 (ZMM Hi16)
+            (0xD, 0) => {
+                // Sub-leaf 0: XCR0 (the serialized component mask) and the
+                // total XSAVE area size matching the actual serialized
+                // layout: 512-byte legacy region + 64-byte header +
+                // 256-byte AVX YMM region (when AVX is enabled) = 832 bytes.
+                // Software derives the sub-leaf count from the highest XCR0
+                // bit, which is 3 for the serialized components (sub-leaves
+                // 0..=2: XCR0/size, instruction support, AVX).
+                let xsa_size = if self.features.avx {
+                    832
                 } else {
-                    832 // 512 (legacy) + 64 (header) + 256 (AVX YMM upper)
+                    576 // 512 legacy + 64 header
                 };
                 CpuidLeaf {
                     eax: self.xcr0() as u32,
@@ -452,12 +458,30 @@ impl CpuVirtualization {
                     edx: (self.xcr0() >> 32) as u32,
                 }
             }
-            (0xD, 1) if self.features.avx => CpuidLeaf {
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            },
+            (0xD, 1) => {
+                // Sub-leaf 1: XSAVE-family instruction support. Bit 0
+                // (XSAVEOPT) is advertised because the emulator implements
+                // it (0F AE /6, full-save semantics). XSAVEC, XGETBV1 and
+                // XSAVES are not implemented and are not advertised.
+                CpuidLeaf {
+                    eax: 0b001,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                }
+            }
+            (0xD, 2) => {
+                // Sub-leaf 2: AVX YMM upper-half component — 256 bytes at
+                // offset 576, matching the XSAVE area written by the
+                // interpreter. ECX bit 0 = enabled in XCR0.
+                let in_use = u32::from(self.features.avx);
+                CpuidLeaf {
+                    eax: 256,
+                    ebx: 576,
+                    ecx: in_use,
+                    edx: 0,
+                }
+            }
             _ => CpuidLeaf {
                 eax: 0,
                 ebx: 0,
@@ -2430,10 +2454,11 @@ pub enum DecodedOpcode {
     Sha256rnds2,
     Sha256msg1,
     Sha256msg2,
-    // XSAVE/XRSTOR/FXSAVE/FXRSTOR (0x0F 0xAE /0,/1,/4,/5)
+    // XSAVE/XRSTOR/FXSAVE/FXRSTOR (0x0F 0xAE /0,/1,/4,/5,/6)
     Fxsave,
     Fxrstor,
     Xsave,
+    Xsaveopt,
     Xrstor,
     // String compare/scan (0xA6/0xA7 CMPS, 0xAE/0xAF SCAS)
     Cmps,
@@ -2894,6 +2919,9 @@ pub enum IrInstruction {
         address: MemoryOperand,
     },
     Xsave {
+        address: MemoryOperand,
+    },
+    Xsaveopt {
         address: MemoryOperand,
     },
     Xrstor {
@@ -4346,11 +4374,67 @@ pub struct DispatchTrace {
     pub result: ExceptionDisposition,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A port-I/O bus servicing guest IN/OUT instructions.
+///
+/// # Unmapped-port behavior (the documented default)
+/// When no bus is configured on the engine, an unmapped port read returns
+/// 0xFF per byte (the classic ISA-bus float-high behavior of real PC
+/// hardware, which Windows-compatible software expects), while a handful of
+/// known system ports keep their defined values (0x80 POST, PIC 0x20/0xA0,
+/// reset-control 0xCF9 → 0x00). Reads deliberately never return
+/// 0xFFFFFFFF unconditionally for every port — real hardware does not, and
+/// Windows does not. When a bus IS configured, it is consulted for every
+/// port access (including the known ports above), so e.g. a test bus that
+/// returns 0 for unmapped ports overrides the default.
+pub trait IoPortBus {
+    /// Read one byte from `port`.
+    fn read_u8(&self, port: u16) -> u8;
+    /// Read one 16-bit word from `port`.
+    fn read_u16(&self, port: u16) -> u16;
+    /// Read one 32-bit dword from `port`.
+    fn read_u32(&self, port: u16) -> u32;
+    /// Write one byte to `port`.
+    fn write_u8(&mut self, port: u16, value: u8);
+    /// Write one 16-bit word to `port`.
+    fn write_u16(&mut self, port: u16, value: u16);
+    /// Write one 32-bit dword to `port`.
+    fn write_u32(&mut self, port: u16, value: u32);
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CpuExecutionEngine {
     pub config: CpuEngineConfig,
     pub cache: TranslationCache,
     pub dispatcher: ExceptionDispatcher,
+    /// Optional guest port-I/O bus for IN/OUT. When `None`, the documented
+    /// default unmapped-port behavior applies (see [`IoPortBus`]).
+    #[serde(skip)]
+    pub port_bus: Option<Arc<Mutex<dyn IoPortBus + Send + Sync>>>,
+}
+
+impl fmt::Debug for CpuExecutionEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuExecutionEngine")
+            .field("config", &self.config)
+            .field("cache", &self.cache)
+            .field("dispatcher", &self.dispatcher)
+            .field(
+                "port_bus",
+                &self
+                    .port_bus
+                    .as_ref()
+                    .map(|bus| format!("IoPortBus({bus:p})")),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for CpuExecutionEngine {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.cache == other.cache
+            && self.dispatcher == other.dispatcher
+    }
 }
 
 fn default_mxcsr() -> u32 {
@@ -4363,7 +4447,15 @@ impl CpuExecutionEngine {
             config,
             cache: TranslationCache::default(),
             dispatcher: ExceptionDispatcher::default(),
+            port_bus: None,
         }
+    }
+
+    /// Attach a port-I/O bus that IN/OUT instructions consult for every
+    /// port access.
+    pub fn with_port_bus(mut self, port_bus: Arc<Mutex<dyn IoPortBus + Send + Sync>>) -> Self {
+        self.port_bus = Some(port_bus);
+        self
     }
 
     pub fn cpuid_leaf(&self, leaf: u32, subleaf: u32) -> CpuidLeaf {
@@ -4400,7 +4492,14 @@ impl CpuExecutionEngine {
         memory: &mut MemoryImage,
         ir: &[IrInstruction],
     ) -> AppResult<ExecutionSummary> {
-        execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), false)
+        execute_ir_with_hashing(
+            state,
+            memory,
+            ir,
+            Some(&self.config.virtualization),
+            false,
+            self.port_bus.as_deref(),
+        )
     }
 
     pub fn execute_ir_without_memory_hash(
@@ -4409,7 +4508,14 @@ impl CpuExecutionEngine {
         memory: &mut MemoryImage,
         ir: &[IrInstruction],
     ) -> AppResult<ExecutionSummary> {
-        execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), false)
+        execute_ir_with_hashing(
+            state,
+            memory,
+            ir,
+            Some(&self.config.virtualization),
+            false,
+            self.port_bus.as_deref(),
+        )
     }
 
     pub fn execute_ir_with_memory_hash(
@@ -4418,7 +4524,14 @@ impl CpuExecutionEngine {
         memory: &mut MemoryImage,
         ir: &[IrInstruction],
     ) -> AppResult<ExecutionSummary> {
-        execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), true)
+        execute_ir_with_hashing(
+            state,
+            memory,
+            ir,
+            Some(&self.config.virtualization),
+            true,
+            self.port_bus.as_deref(),
+        )
     }
 
     /// Execute a block via JIT if available, falling back to IR interpretation.
@@ -4548,6 +4661,7 @@ impl CpuExecutionEngine {
                             ir,
                             Some(&self.config.virtualization),
                             false,
+                            self.port_bus.as_deref(),
                         );
                     }
                     crate::jit::JitExitReason::Jump { target } => {
@@ -4578,6 +4692,7 @@ impl CpuExecutionEngine {
                                 std::slice::from_ref(terminator),
                                 Some(&self.config.virtualization),
                                 false,
+                                self.port_bus.as_deref(),
                             )?;
                         }
                         None => {
@@ -4602,7 +4717,14 @@ impl CpuExecutionEngine {
             }
         }
         // Direct AOT execution (no JIT path / block not compiled / fallback).
-        execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), false)
+        execute_ir_with_hashing(
+            state,
+            memory,
+            ir,
+            Some(&self.config.virtualization),
+            false,
+            self.port_bus.as_deref(),
+        )
     }
 
     pub fn register_veh(&mut self, handler: ExceptionHandler) {
@@ -9192,7 +9314,10 @@ pub fn decode_block(
                                         }
                                     }
                                     6 => {
-                                        // CLWB: cache line write-back (no-op on Apple Silicon)
+                                        // 0F AE /6: XSAVEOPT (no prefix) or CLWB
+                                        // (66 0F AE /6). The OperandSize (66)
+                                        // prefix selects CLWB; the bare form is
+                                        // XSAVEOPT.
                                         let Operand::Memory(address_operand) = modrm_operand(
                                             &modrm,
                                             arch,
@@ -9204,12 +9329,18 @@ pub fn decode_block(
                                                 "opcode 0x0f 0xae /6 requires a memory operand",
                                             ));
                                         };
+                                        let is_clwb =
+                                            prefixes.contains(&InstructionPrefix::OperandSize);
                                         DecodedInstruction {
                                             address,
                                             size: local - cursor,
                                             prefixes,
                                             rex,
-                                            opcode: DecodedOpcode::Clwb,
+                                            opcode: if is_clwb {
+                                                DecodedOpcode::Clwb
+                                            } else {
+                                                DecodedOpcode::Xsaveopt
+                                            },
                                             operands: vec![Operand::Memory(address_operand)],
                                             precise_faulting_memory: false,
                                             evex_info: EvexInfo::no_mask(),
@@ -15212,6 +15343,11 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     ir.push(IrInstruction::Xsave { address: *address });
                 }
             }
+            DecodedOpcode::Xsaveopt => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::Xsaveopt { address: *address });
+                }
+            }
             DecodedOpcode::Xrstor => {
                 if let [Operand::Memory(address)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::Xrstor { address: *address });
@@ -18277,7 +18413,7 @@ pub fn execute_ir(
     memory: &mut MemoryImage,
     ir: &[IrInstruction],
 ) -> AppResult<ExecutionSummary> {
-    execute_ir_with_hashing(state, memory, ir, None, false)
+    execute_ir_with_hashing(state, memory, ir, None, false, None)
 }
 
 pub fn execute_ir_with_memory_hash(
@@ -18285,7 +18421,7 @@ pub fn execute_ir_with_memory_hash(
     memory: &mut MemoryImage,
     ir: &[IrInstruction],
 ) -> AppResult<ExecutionSummary> {
-    execute_ir_with_hashing(state, memory, ir, None, true)
+    execute_ir_with_hashing(state, memory, ir, None, true, None)
 }
 
 pub fn execute_ir_with_hashing(
@@ -18294,6 +18430,7 @@ pub fn execute_ir_with_hashing(
     ir: &[IrInstruction],
     virtualization: Option<&CpuVirtualization>,
     _capture_memory_hash: bool,
+    port_bus: Option<&Mutex<dyn IoPortBus + Send + Sync>>,
 ) -> AppResult<ExecutionSummary> {
     // HOT PATH executor: handles only the ~30 most common IR variants inline.
     // Rare instructions fall through to execute_cold_path.  This split lets
@@ -18395,14 +18532,14 @@ pub fn execute_ir_with_hashing(
                 rhs: _,
                 width: _,
             } => {
-                execute_cold_path(state, memory, instruction, virtualization)?;
+                execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
             IrInstruction::Test {
                 lhs: _,
                 rhs: _,
                 width: _,
             } => {
-                execute_cold_path(state, memory, instruction, virtualization)?;
+                execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
             IrInstruction::ShlImm { dst, count, width } => {
                 let bits = (*width * 8) as u32;
@@ -18559,7 +18696,7 @@ pub fn execute_ir_with_hashing(
             }
             // Everything else goes to the cold path
             _ => {
-                execute_cold_path(state, memory, instruction, virtualization)?;
+                execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
         }
     }
@@ -18576,6 +18713,7 @@ fn execute_cold_path(
     memory: &mut MemoryImage,
     instruction: &IrInstruction,
     virtualization: Option<&CpuVirtualization>,
+    port_bus: Option<&Mutex<dyn IoPortBus + Send + Sync>>,
 ) -> AppResult<()> {
     // COLD PATH: handles all rare/complex IR variants.
     // This is a separate function so the hot path stays small.
@@ -19032,6 +19170,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RolCl { dst, width } => {
@@ -19046,6 +19185,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RclCl { dst, width } => {
@@ -19060,6 +19200,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RcrCl { dst, width } => {
@@ -19074,6 +19215,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RolClMemory { address, width } => {
@@ -19088,6 +19230,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RorClMemory { address, width } => {
@@ -19102,6 +19245,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RclClMemory { address, width } => {
@@ -19116,6 +19260,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RcrClMemory { address, width } => {
@@ -19130,6 +19275,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::ShlClMemory { address, width } => {
@@ -19144,6 +19290,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::ShrClMemory { address, width } => {
@@ -19158,6 +19305,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::SarClMemory { address, width } => {
@@ -19172,6 +19320,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::RorCl { dst, width } => {
@@ -19206,6 +19355,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::SarCl { dst, width } => {
@@ -19220,6 +19370,7 @@ fn execute_cold_path(
                 }],
                 virtualization,
                 false,
+                port_bus,
             )?;
         }
         IrInstruction::ShldImm {
@@ -19807,25 +19958,53 @@ fn execute_cold_path(
             // Resolve port number: direct-imm8 forms provide it at decode time;
             // indirect (DX) forms read the port from the DX register.
             let port = port.unwrap_or_else(|| (state.get(Register::Rdx) & 0xFFFF) as u16);
-            // Compatibility-layer I/O: specific known ports are handled;
-            // all others return 0xFF-filled values (the safest default).
-            let value = match port {
-                // POST-code port (0x80): reads return 0.
-                0x80 => merge_register_result(state.get(Register::Rax), 0, *width),
-                // PIC master (0x20) / slave (0xA0): no IRQs pending, return 0.
-                0x20 | 0xA0 => merge_register_result(state.get(Register::Rax), 0, *width),
-                // Reset-control port (0xCF9): return 0 (no reset in progress).
-                0xCF9 => merge_register_result(state.get(Register::Rax), 0, *width),
-                // All other ports: return all-ones for the access width.
-                _ => merge_register_result(state.get(Register::Rax), width_mask(*width), *width),
+            let value = if let Some(bus) = port_bus {
+                // A configured bus is authoritative for every port access.
+                let bus = bus.lock().unwrap_or_else(|e| e.into_inner());
+                match *width {
+                    1 => bus.read_u8(port) as u64,
+                    2 => bus.read_u16(port) as u64,
+                    _ => bus.read_u32(port) as u64,
+                }
+            } else {
+                // No bus configured: known system ports return their defined
+                // values; unmapped ports float high (0xFF per byte, the
+                // classic ISA-bus behavior). See `IoPortBus` for the full
+                // documented contract.
+                match port {
+                    // POST-code port (0x80): reads return 0.
+                    0x80 => 0,
+                    // PIC control ports: reads return 0.
+                    0x20 | 0xA0 => 0,
+                    // Reset-control port (0xCF9): return 0 (no reset in progress).
+                    0xCF9 => 0,
+                    // All other ports: float high, 0xFF per byte.
+                    _ => width_mask(*width),
+                }
             };
-            state.set(Register::Rax, value);
+            // IN AL/AX/EAX merge into the accumulator: 8/16-bit writes
+            // preserve the upper bytes, 32-bit writes zero the upper half.
+            state.set(
+                Register::Rax,
+                merge_register_result(state.get(Register::Rax), value, *width),
+            );
         }
-        IrInstruction::PortOut { port, .. } => {
+        IrInstruction::PortOut { port, width } => {
             // Resolve port number: direct-imm8 forms provide it at decode time;
             // indirect (DX) forms read the port from the DX register.
-            let _port = port.unwrap_or_else(|| (state.get(Register::Rdx) & 0xFFFF) as u16);
-            // I/O writes are benignly ignored in this compatibility layer.
+            let port = port.unwrap_or_else(|| (state.get(Register::Rdx) & 0xFFFF) as u16);
+            // OUT imm8/DX, AL/AX/EAX writes the low width bytes of RAX to the
+            // port. With no bus configured, writes are benignly dropped (the
+            // documented default); a configured bus receives every write.
+            let value = state.get(Register::Rax) & width_mask(*width);
+            if let Some(bus) = port_bus {
+                let mut bus = bus.lock().unwrap_or_else(|e| e.into_inner());
+                match *width {
+                    1 => bus.write_u8(port, value as u8),
+                    2 => bus.write_u16(port, value as u16),
+                    _ => bus.write_u32(port, value as u32),
+                }
+            }
         }
         IrInstruction::MovFromDr { dst, index } => {
             state.set(*dst, state.dr[(*index & 0x07) as usize]);
@@ -19843,7 +20022,21 @@ fn execute_cold_path(
         }
         IrInstruction::Xsave { address } => {
             let base = resolve_memory_operand(state, address, 16)?;
-            xsave_to_memory(state, memory, base)?;
+            // XSAVE's requested component mask comes from EDX:EAX.
+            let requested =
+                (state.get(Register::Rdx) << 32) | (state.get(Register::Rax) & 0xFFFF_FFFF);
+            xsave_to_memory(state, memory, base, requested)?;
+        }
+        IrInstruction::Xsaveopt { address } => {
+            let base = resolve_memory_operand(state, address, 16)?;
+            // XSAVEOPT (0F AE /6) uses the same EDX:EAX requested-mask
+            // contract as XSAVE. The emulator always writes every requested
+            // component (it does not track per-component modification since
+            // the last XRSTOR), which is a valid XSAVEOPT implementation: the
+            // instruction may skip saving components, it is never required to.
+            let requested =
+                (state.get(Register::Rdx) << 32) | (state.get(Register::Rax) & 0xFFFF_FFFF);
+            xsave_to_memory(state, memory, base, requested)?;
         }
         IrInstruction::Xrstor { address } => {
             let base = resolve_memory_operand(state, address, 16)?;
@@ -26148,9 +26341,11 @@ fn fxsave_to_memory(state: &CpuState, memory: &mut MemoryImage, base: u64) -> Ap
     write_memory_value(memory, base + 8, 0, 8)?; // FIP / FCS
     write_memory_value(memory, base + 16, 0, 8)?; // FDP / FDS
 
-    // MXCSR and its mask.
+    // MXCSR and its mask. MXCSR_MASK advertises the writable MXCSR bits;
+    // both FXSAVE/XSAVE write it and FXRSTOR/XRSTOR restore MXCSR through it
+    // (non-writable bits keep their previous value), mirroring real hardware.
     write_memory_value(memory, base + 24, state.mxcsr as u64, 4)?;
-    write_memory_value(memory, base + 28, 0x0000_FFFF, 4)?;
+    write_memory_value(memory, base + 28, MXCSR_MASK as u64, 4)?;
 
     // ST(0)..ST(7) as 80-bit extended values (16-byte slots).
     for i in 0..8 {
@@ -26206,8 +26401,10 @@ fn fxrstor_from_memory(state: &mut CpuState, memory: &MemoryImage, base: u64) ->
     }
     state.x87.stack = stack;
 
-    // MXCSR.
-    state.mxcsr = read_memory_value(memory, base + 24, 4)? as u32;
+    // MXCSR: only the writable bits (per MXCSR_MASK) are restored; reserved
+    // bits keep their previous value, as on real hardware.
+    let saved_mxcsr = read_memory_value(memory, base + 24, 4)? as u32;
+    state.mxcsr = (saved_mxcsr & MXCSR_MASK) | (state.mxcsr & !MXCSR_MASK);
 
     // XMM0..XMM15.
     for i in 0..16 {
@@ -26219,48 +26416,77 @@ fn fxrstor_from_memory(state: &mut CpuState, memory: &MemoryImage, base: u64) ->
     Ok(())
 }
 
-/// Write a full XSAVE area: the 512-byte legacy region, the 64-byte XSAVE
-/// header, and the AVX/AVX-512 extended regions.
-///
-/// XSTATE_BV bits: 0=x87, 1=SSE, 2=AVX YMM, 5=AVX-512 OPMASK, 6=AVX-512 ZMM upper, 7=AVX-512 ZMM Hi16.
-fn xsave_to_memory(state: &CpuState, memory: &mut MemoryImage, base: u64) -> AppResult<()> {
-    // Legacy x87 + SSE region.
-    fxsave_to_memory(state, memory, base)?;
+/// MXCSR writable-bit mask. Emulator and guest agree on 0x0000_FFFF (every
+/// MXCSR bit is writable in this implementation).
+const MXCSR_MASK: u32 = 0x0000_FFFF;
 
-    // XSAVE header at offset 512: XSTATE_BV.
-    let xstate_bv: u64 = 0b111 | (1 << 5) | (1 << 6) | (1 << 7);
-    write_memory_value(memory, base + 512, xstate_bv, 8)?;
+/// State components the emulator actually serializes in the XSAVE area.
+///
+/// XCR0/XSTATE_BV bit assignment for the serialized layout:
+///   Bit 0 (x87):   the 512-byte legacy region's x87 area (offset 0, 160 bytes)
+///   Bit 1 (SSE):   the legacy region's XMM area (offset 160, 256 bytes)
+///   Bit 2 (AVX):   YMM upper halves (offset 576, 256 bytes)
+/// No other components (MPX, PKRU, CET, AVX-512 OPMASK/ZMM, ...) are
+/// serialized, so no other XCR0/XSTATE_BV bits are ever claimed.
+const XSAVE_SUPPORTED_STATE: u64 = 0b111;
+
+/// XSAVE/XRSTOR require the memory operand to be 64-byte aligned.
+fn require_xsave_alignment(base: u64) -> AppResult<()> {
+    if !base.is_multiple_of(64) {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!("XSAVE/XRSTOR memory operand {base:#x} is not 64-byte aligned"),
+        ));
+    }
+    Ok(())
+}
+
+/// Write an XSAVE area for exactly the state components in `requested`
+/// (masked by the supported-state mask): the 512-byte legacy region (x87 +
+/// SSE), the 64-byte XSAVE header, and the AVX YMM region.
+///
+/// XSTATE_BV announces exactly the components written: bit 0 = x87, bit 1 =
+/// SSE, bit 2 = AVX — no other bits, because no other state is serialized.
+fn xsave_to_memory(
+    state: &CpuState,
+    memory: &mut MemoryImage,
+    base: u64,
+    requested: u64,
+) -> AppResult<()> {
+    require_xsave_alignment(base)?;
+    // Requesting a component the processor does not support is a #GP on real
+    // hardware; the emulator surfaces it as an error instead.
+    if requested & !XSAVE_SUPPORTED_STATE != 0 {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!(
+                "XSAVE requested mask {requested:#x} includes unsupported state \
+                 components (supported: {XSAVE_SUPPORTED_STATE:#x})"
+            ),
+        ));
+    }
+    // XSAVE only touches the components whose bits are set in the mask.
+    let mask = requested & XSAVE_SUPPORTED_STATE;
+
+    // Legacy x87 + SSE region (bits 0 and 1).
+    if mask & 0b11 != 0 {
+        fxsave_to_memory(state, memory, base)?;
+    }
+
+    // XSAVE header at offset 512: XSTATE_BV / XCOMP_BV / reserved.
+    // XSTATE_BV announces exactly the components written above.
+    write_memory_value(memory, base + 512, mask, 8)?;
     write_memory_value(memory, base + 520, 0, 8)?; // XCOMP_BV (standard format)
     for off in (528..576).step_by(8) {
         write_memory_value(memory, base + off, 0, 8)?; // reserved header bytes
     }
 
-    // AVX state: YMM upper 128 bits at offset 576 (16 registers).
-    for i in 0..16 {
-        let slot = base + 576 + (i as u64) * 16;
-        write_memory_value(memory, slot, state.ymm_upper[i].low, 8)?;
-        write_memory_value(memory, slot + 8, state.ymm_upper[i].high, 8)?;
-    }
-
-    // AVX-512 OPMASK state at offset 832 (8 × 8 bytes).
-    for i in 0..8 {
-        let slot = base + 832 + (i as u64) * 8;
-        write_memory_value(memory, slot, state.opmask[i], 8)?;
-    }
-    // ZMM upper 256 (ZMM0-ZMM15 upper halves) at offset 896 (16 × 32 bytes).
-    for i in 0..16 {
-        let slot = base + 896 + (i as u64) * 32;
-        write_memory_value(memory, slot, state.zmm_upper[i].low.low, 8)?;
-        write_memory_value(memory, slot + 8, state.zmm_upper[i].low.high, 8)?;
-        write_memory_value(memory, slot + 16, state.zmm_upper[i].high.low, 8)?;
-        write_memory_value(memory, slot + 24, state.zmm_upper[i].high.high, 8)?;
-    }
-    // ZMM Hi16 (ZMM16-ZMM31 full 512-bit) at offset 1408 (16 × 64 bytes).
-    // ZMM16-ZMM31 are not tracked in CpuState; write zeros.
-    for i in 16..32 {
-        let slot = base + 1408 + ((i - 16) as u64) * 64;
-        for j in 0..8 {
-            write_memory_value(memory, slot + (j as u64) * 8, 0, 8)?;
+    // Bit 2 (AVX): YMM upper 128 bits at offset 576 (16 registers).
+    if mask & 0b100 != 0 {
+        for i in 0..16 {
+            let slot = base + 576 + (i as u64) * 16;
+            write_memory_value(memory, slot, state.ymm_upper[i].low, 8)?;
+            write_memory_value(memory, slot + 8, state.ymm_upper[i].high, 8)?;
         }
     }
 
@@ -26268,8 +26494,21 @@ fn xsave_to_memory(state: &CpuState, memory: &mut MemoryImage, base: u64) -> App
 }
 
 /// Restore CPU state from an XSAVE area, honoring the XSTATE_BV bitmap.
+///
+/// Only components enabled in the supported-state mask are restored; bits
+/// for unsupported components are ignored (as on real hardware, where
+/// XRSTOR ignores XSTATE_BV bits not enabled in XCR0).
 fn xrstor_from_memory(state: &mut CpuState, memory: &MemoryImage, base: u64) -> AppResult<()> {
-    let xstate_bv = read_memory_value(memory, base + 512, 8)?;
+    require_xsave_alignment(base)?;
+    let xcomp_bv = read_memory_value(memory, base + 520, 8)?;
+    if xcomp_bv != 0 {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "XRSTOR: XCOMP_BV is nonzero (compacted format) but XCR0.B[63] \
+             is not set; compacted format is unsupported",
+        ));
+    }
+    let xstate_bv = read_memory_value(memory, base + 512, 8)? & XSAVE_SUPPORTED_STATE;
 
     // Bits 0 (x87) and 1 (SSE) live in the legacy region.
     if xstate_bv & 0b11 != 0 {
@@ -26284,28 +26523,6 @@ fn xrstor_from_memory(state: &mut CpuState, memory: &MemoryImage, base: u64) -> 
             state.ymm_upper[i].high = read_memory_value(memory, slot + 8, 8)?;
         }
     }
-
-    // Bit 5 (AVX-512 OPMASK): opmask registers at offset 832.
-    if xstate_bv & (1 << 5) != 0 {
-        for i in 0..8 {
-            let slot = base + 832 + (i as u64) * 8;
-            state.opmask[i] = read_memory_value(memory, slot, 8)?;
-        }
-    }
-
-    // Bit 6 (AVX-512 ZMM upper 256): ZMM0-ZMM15 upper halves at offset 896.
-    if xstate_bv & (1 << 6) != 0 {
-        for i in 0..16 {
-            let slot = base + 896 + (i as u64) * 32;
-            state.zmm_upper[i].low.low = read_memory_value(memory, slot, 8)?;
-            state.zmm_upper[i].low.high = read_memory_value(memory, slot + 8, 8)?;
-            state.zmm_upper[i].high.low = read_memory_value(memory, slot + 16, 8)?;
-            state.zmm_upper[i].high.high = read_memory_value(memory, slot + 24, 8)?;
-        }
-    }
-
-    // Bit 7 (AVX-512 ZMM Hi16): ZMM16-ZMM31 full state at offset 1408.
-    // Not implemented as ZMM16-ZMM31 are not tracked in CpuState.
 
     Ok(())
 }
@@ -28203,7 +28420,7 @@ mod tests {
                     .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
                     .expect("exec");
             } else {
-                execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false)
+                execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
                     .expect("exec ref");
             }
             state
@@ -31976,7 +32193,7 @@ mod tests {
     }
 
     #[test]
-    fn xgetbv_returns_avx512_bits_when_enabled() {
+    fn xgetbv_returns_only_serialized_state_bits() {
         let config =
             CpuEngineConfig::from_profile(GuestArch::X64, "test-build", "test-version", None)
                 .expect("cpu config");
@@ -31994,18 +32211,17 @@ mod tests {
             .expect("execute xgetbv");
 
         let rax = state.get(Register::Rax);
-        // x87(0) + SSE(1) + AVX YMM upper(2) + AVX-512 bits 5-7 set
+        // x87(0) + SSE(1) + AVX YMM upper(2) — exactly the components the
+        // XSAVE area serializes. AVX-512 (5-7), PKRU (9) and CET (11-12)
+        // bits must NOT be set even though avx512f is enabled.
         assert_ne!(rax & (1 << 0), 0, "x87 bit should be set");
         assert_ne!(rax & (1 << 1), 0, "SSE bit should be set");
         assert_ne!(rax & (1 << 2), 0, "AVX YMM upper bit should be set");
-        // AVX-512 bits should now be set since avx512f is enabled
-        assert_ne!(
-            rax & (1 << 5),
+        assert_eq!(
+            rax & !0b111,
             0,
-            "opmask bit should be set (AVX-512 enabled)"
+            "no unsupported state components may be claimed, got {rax:#x}"
         );
-        assert_ne!(rax & (1 << 6), 0, "ZMM upper bit should be set");
-        assert_ne!(rax & (1 << 7), 0, "ZMM16-ZMM31 bit should be set");
     }
 
     #[test]
@@ -33184,8 +33400,10 @@ mod tests {
 
     #[test]
     fn xcr0_reports_honest_bits() {
-        // for_arch() has avx=true and avx512f=true, so CR0 should include
-        // bit 2 (AVX), bit 5 (OPMASK), bit 6 (ZMM upper 256), bit 7 (ZMM Hi16).
+        // XCR0 must only claim components the XSAVE area actually serializes:
+        // x87 (bit 0), SSE (bit 1), AVX YMM (bit 2). AVX-512/MPX/PKRU/CET
+        // bits are never claimed, even when the feature flags are enabled,
+        // because the interpreter's XSAVE layout does not contain them.
         let virt = CpuVirtualization::from_profile(GuestArch::X64, None)
             .expect("CpuVirtualization for x64");
         let xcr0 = virt.xcr0();
@@ -33197,16 +33415,14 @@ mod tests {
             xcr0 & 0x4 != 0,
             "AVX bit must be set when features.avx is true"
         );
-        // AVX-512 bits 5 (OPMASK), 6 (ZMM upper 256), 7 (ZMM Hi16) ARE set
+        // Bits 3+ (MPX 3-4, AVX-512 5-7, PKRU 9, CET 11-12, ...) must NOT be
+        // set: those components are not serialized by XSAVE/XRSTOR.
         assert!(
-            xcr0 & 0xE0 == 0xE0,
-            "AVX-512 bits 5-7 must be set when features.avx512f is true"
+            xcr0 & !0b111 == 0,
+            "no unsupported state components may be claimed, got {xcr0:#x}"
         );
         // MPX bits (3-4) must NOT be set (MPX is never implemented)
         assert!(xcr0 & 0x18 == 0, "MPX bits must NOT be set");
-
-        // Verify the invariant: xcr0 never sets bit 3-4 (MPX)
-        assert!(xcr0 & 0x18 == 0, "Bits 3-4 must never be set in xcr0");
     }
 
     // ── FXSAVE x87 tag word tests ──────────────────────────────────────────
@@ -35408,74 +35624,101 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase H — XSAVE/XRSTOR with AVX-512 state
+    // Phase H — XSAVE/XRSTOR serializes exactly x87 | SSE | AVX
     // =====================================================================
 
     #[test]
-    fn xsave_xrstor_round_trip_preserves_avx512_state() {
+    fn xsave_xrstor_round_trip_preserves_only_serialized_state() {
         let mut state = CpuState::new(GuestArch::X64);
         let mut memory = MemoryImage::default();
 
-        // Set up ZMM register values
-        let low = YmmValue {
-            low: XmmValue {
-                low: 0xDEADBEEFCAFEBABE,
-                high: 0x0123456789ABCDEF,
+        // Set up AVX-512 ZMM/opmask state (NOT serialized by the XSAVE area)
+        // FIRST — set_zmm composes ZMM from the XMM/YMM/ZMM register files,
+        // so it must run before the YMM upper-half setup below.
+        state.set_zmm(
+            0,
+            ZmmValue {
+                low: YmmValue {
+                    low: XmmValue {
+                        low: 0xDEADBEEFCAFEBABE,
+                        high: 0x0123456789ABCDEF,
+                    },
+                    high: XmmValue {
+                        low: 0x1111111111111111,
+                        high: 0x2222222222222222,
+                    },
+                },
+                high: YmmValue {
+                    low: XmmValue {
+                        low: 0x3333333333333333,
+                        high: 0x4444444444444444,
+                    },
+                    high: XmmValue {
+                        low: 0x5555555555555555,
+                        high: 0x6666666666666666,
+                    },
+                },
             },
-            high: XmmValue {
-                low: 0x1111111111111111,
-                high: 0x2222222222222222,
-            },
-        };
-        let high = YmmValue {
-            low: XmmValue {
-                low: 0x3333333333333333,
-                high: 0x4444444444444444,
-            },
-            high: XmmValue {
-                low: 0x5555555555555555,
-                high: 0x6666666666666666,
-            },
-        };
-        state.set_zmm(0, ZmmValue { low, high });
-        state.set_zmm(15, ZmmValue { low, high });
-
-        // Set opmask registers
+        );
         state.set_opmask(0, 0xAAAAAAAAAAAAAAAA);
         state.set_opmask(7, 0x5555555555555555);
+        // AVX YMM upper halves (serialized, bit 2).
+        state.ymm_upper[0].low = 0x1111_2222_3333_4444;
+        state.ymm_upper[0].high = 0x5555_6666_7777_8888;
+        state.ymm_upper[7].low = 0xAAAA_BBBB_CCCC_DDDD;
+        state.ymm_upper[7].high = 0xEEEE_FFFF_0000_1111;
+        state.mxcsr = 0x0000_9FC0;
 
-        // Map XSAVE area with sufficient space (at least 2432 bytes)
+        // Map an XSAVE area (832 bytes suffice for the serialized layout).
         let xsave_area: u64 = 0x10000;
-        memory.map_zeroed_if_unmapped(xsave_area, 2560);
+        memory.map_zeroed_if_unmapped(xsave_area, 1024);
 
-        // XSAVE
-        xsave_to_memory(&state, &mut memory, xsave_area)
-            .expect("xsave_to_memory with AVX-512 state");
+        // XSAVE with the full supported mask (x87 | SSE | AVX).
+        xsave_to_memory(&state, &mut memory, xsave_area, XSAVE_SUPPORTED_STATE)
+            .expect("xsave_to_memory");
+        // XSTATE_BV announces exactly the written components: no AVX-512,
+        // PKRU or CET bits.
+        assert_eq!(
+            memory.read_u64(xsave_area + 512).expect("xstate_bv"),
+            0b111,
+            "XSTATE_BV must announce exactly the serialized components"
+        );
+        assert_eq!(
+            memory.read_u64(xsave_area + 520).expect("xcomp_bv"),
+            0,
+            "standard (non-compacted) format"
+        );
 
         // Create a fresh state and restore
         let mut restored = CpuState::new(GuestArch::X64);
-        fxrstor_from_memory(&mut restored, &memory, xsave_area)
-            .expect("fxrstor_from_memory (restore baseline)");
-        xrstor_from_memory(&mut restored, &memory, xsave_area)
-            .expect("xrstor_from_memory with AVX-512 state");
+        xrstor_from_memory(&mut restored, &memory, xsave_area).expect("xrstor_from_memory");
 
-        // Verify ZMM registers preserved
-        let zmm0 = restored.get_zmm(0);
-        assert_eq!(zmm0.low.low.low, 0xDEADBEEFCAFEBABE);
-        assert_eq!(zmm0.low.low.high, 0x0123456789ABCDEF);
-        assert_eq!(zmm0.low.high.low, 0x1111111111111111);
-        assert_eq!(zmm0.low.high.high, 0x2222222222222222);
-        assert_eq!(zmm0.high.low.low, 0x3333333333333333);
-        assert_eq!(zmm0.high.low.high, 0x4444444444444444);
-        assert_eq!(zmm0.high.high.low, 0x5555555555555555);
-        assert_eq!(zmm0.high.high.high, 0x6666666666666666);
+        // YMM upper halves (serialized) are restored.
+        assert_eq!(restored.ymm_upper[0].low, 0x1111_2222_3333_4444);
+        assert_eq!(restored.ymm_upper[0].high, 0x5555_6666_7777_8888);
+        assert_eq!(restored.ymm_upper[7].low, 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(restored.ymm_upper[7].high, 0xEEEE_FFFF_0000_1111);
+        assert_eq!(restored.mxcsr, 0x0000_9FC0);
+        // AVX-512 state is NOT part of the XSAVE layout and must not be
+        // claimed or restored by it. (The low 128 bits of ZMM0 are the XMM0
+        // register, which IS serialized in the SSE region; the upper 256
+        // bits are not.)
+        assert_eq!(restored.get_opmask(0), 0, "opmask is not serialized");
+        assert_eq!(restored.get_opmask(7), 0, "opmask is not serialized");
+        assert_eq!(
+            restored.get_zmm(0).high.low.low,
+            0,
+            "ZMM upper state is not serialized"
+        );
 
-        let zmm15 = restored.get_zmm(15);
-        assert_eq!(zmm15.low.low.low, 0xDEADBEEFCAFEBABE);
+        // Unaligned XSAVE/XRSTOR destinations are rejected (64-byte alignment).
+        let unaligned = xsave_area + 32;
+        assert!(xsave_to_memory(&state, &mut memory, unaligned, XSAVE_SUPPORTED_STATE).is_err());
+        assert!(xrstor_from_memory(&mut restored, &memory, unaligned).is_err());
 
-        // Verify opmask registers preserved
-        assert_eq!(restored.get_opmask(0), 0xAAAAAAAAAAAAAAAA);
-        assert_eq!(restored.get_opmask(7), 0x5555555555555555);
+        // Requesting components outside the supported mask is rejected.
+        assert!(xsave_to_memory(&state, &mut memory, xsave_area, 1 << 9).is_err());
+        assert!(xsave_to_memory(&state, &mut memory, xsave_area, 0b101).is_ok());
     }
 
     // =====================================================================
@@ -37865,15 +38108,37 @@ mod tests {
         let leaf = virt.leaf(0xD, 0);
         assert_eq!(leaf.eax & 0x3, 0x3, "x87 + SSE always enabled in XCR0");
         assert!(leaf.eax & (1 << 2) != 0, "AVX YMM state enabled");
-        // XSAVE size depends on host capabilities; ensure it's at least enough for x87+SSE+AVX
-        assert!(
-            leaf.ebx >= 576,
-            "XSAVE size should include x87 (512) + SSE (64) minimum"
+        // XCR0 must not claim components the XSAVE area does not serialize.
+        assert_eq!(leaf.edx as u64, 0, "no supervisor/high components claimed");
+        // XSAVE size matches the serialized layout: x87+SSE legacy region
+        // (512) + header (64) + AVX YMM (256) = 832.
+        assert_eq!(
+            leaf.ebx, 832,
+            "XSAVE area size must match the serialized layout"
         );
-        assert!(
-            leaf.ebx >= 832,
-            "XSAVE size with AVX should be at least 832"
-        );
+        assert_eq!(leaf.ecx, 832);
+        // Sub-leaf 1 advertises XSAVEOPT (bit 0) but not XSAVEC/XGETBV1/XSAVES.
+        let leaf1 = virt.leaf(0xD, 1);
+        assert_eq!(leaf1.eax & 0b1111, 0b0001, "only XSAVEOPT is advertised");
+        // Sub-leaf 2 reports the AVX YMM component: 256 bytes at offset 576.
+        let leaf2 = virt.leaf(0xD, 2);
+        assert_eq!(leaf2.eax, 256, "AVX YMM component size");
+        assert_eq!(leaf2.ebx, 576, "AVX YMM component offset");
+        assert_eq!(leaf2.ecx & 0b11, 0b01, "AVX component enabled in XCR0");
+        // Sub-leaves beyond the serialized layout are all zeros.
+        for sub in [3u32, 9, 63] {
+            let beyond = virt.leaf(0xD, sub);
+            assert_eq!(
+                beyond,
+                CpuidLeaf {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0
+                },
+                "sub-leaf {sub} must be empty"
+            );
+        }
     }
 
     #[test]
@@ -37899,6 +38164,7 @@ mod tests {
             &[IrInstruction::Cpuid],
             Some(&virt),
             false,
+            None,
         )
         .expect("cpuid leaf 0");
         assert_eq!(state.get(Register::Rax), 0xD, "EAX = max leaf");

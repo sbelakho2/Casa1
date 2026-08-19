@@ -21,7 +21,7 @@ use crate::metal_backend::MetalGpuBackend;
 use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::c_char;
 use std::path::Path;
@@ -759,10 +759,26 @@ pub struct VkInstanceInfo {
     pub enabled_extensions: Vec<String>,
     pub enabled_layers: Vec<String>,
     pub physical_devices: Vec<VkPhysicalDevice>,
+    /// Queue families exposed by the instance's physical device, in family
+    /// index order. Each element is the maximum number of queues a logical
+    /// device may request for that family. Populated at instance creation;
+    /// deserialized state from older saves falls back to the default set.
+    #[serde(default = "default_queue_family_capacities")]
+    pub queue_family_max_queues: Vec<u32>,
     pub application_name: String,
     pub engine_name: String,
     pub api_version: (u32, u32, u32),
 }
+
+/// Default per-physical-device queue family capacities: family 0 = graphics
+/// (16 queues), family 1 = compute (8), family 2 = transfer (4), family 3 =
+/// video/other (2). Used when an instance is created or restored without an
+/// explicit capability table.
+fn default_queue_family_capacities() -> Vec<u32> {
+    DEFAULT_QUEUE_FAMILY_CAPACITIES.to_vec()
+}
+
+const DEFAULT_QUEUE_FAMILY_CAPACITIES: [u32; 4] = [16, 8, 4, 2];
 
 /// Tracks the state of a Vulkan logical device, including queues and
 /// enabled extensions. Maps to a Metal device.
@@ -1645,6 +1661,110 @@ fn decode_spirv_string(operands: &[u32]) -> String {
     String::from_utf8_lossy(&bytes).to_string()
 }
 
+/// Minimum word count (including the opcode word) for every SPIR-V opcode the
+/// translator must structurally validate. For opcodes not listed here the
+/// minimum is 1 (the opcode word alone); their operand layouts are opaque to
+/// the translator, but truncation of the instruction stream is still rejected.
+fn min_spirv_words(opcode: u16) -> u16 {
+    match opcode {
+        0 => 1,                     // OpNop
+        1 => 3,                     // OpUndef
+        2 => 2,                     // OpSourceContinued
+        3 => 2,                     // OpSource
+        4 => 2,                     // OpSourceExtension
+        SPIRV_OP_NAME => 3,         // OpName: target + name (>=1 word)
+        SPIRV_OP_MEMBER_NAME => 4,  // OpMemberName: target + member + name (>=1 word)
+        7 => 3,                     // OpString: result + string (>=1 word)
+        8 => 4,                     // OpLine
+        10 => 2,                    // OpExtension
+        11 => 3,                    // OpExtInstImport: result + name (>=1 word)
+        12 => 5,                    // OpExtInst
+        SPIRV_OP_MEMORY_MODEL => 3, // OpMemoryModel: addressing + memory model
+        SPIRV_OP_ENTRY_POINT => 4,  // OpEntryPoint: model + id + name (>=1 word)
+        16 => 3,                    // OpExecutionMode
+        SPIRV_OP_CAPABILITY => 2,   // OpCapability
+        SPIRV_OP_TYPE_VOID => 2,
+        SPIRV_OP_TYPE_BOOL => 2,
+        SPIRV_OP_TYPE_INT => 4,
+        SPIRV_OP_TYPE_FLOAT => 3,
+        SPIRV_OP_TYPE_VECTOR => 4,
+        SPIRV_OP_TYPE_MATRIX => 4,
+        SPIRV_OP_TYPE_IMAGE => 9,
+        SPIRV_OP_TYPE_SAMPLER => 2,
+        SPIRV_OP_TYPE_SAMPLED_IMAGE => 3,
+        SPIRV_OP_TYPE_ARRAY => 4,
+        SPIRV_OP_TYPE_RUNTIME_ARRAY => 3,
+        SPIRV_OP_TYPE_STRUCT => 2,
+        31 => 3, // OpTypeOpaque
+        SPIRV_OP_TYPE_POINTER => 4,
+        SPIRV_OP_TYPE_FUNCTION => 3,
+        SPIRV_OP_CONSTANT_TRUE | SPIRV_OP_CONSTANT_FALSE => 3,
+        SPIRV_OP_CONSTANT => 4,
+        SPIRV_OP_CONSTANT_COMPOSITE => 4,
+        46 => 3, // OpConstantNull
+        SPIRV_OP_FUNCTION => 5,
+        SPIRV_OP_FUNCTION_PARAMETER => 3,
+        SPIRV_OP_FUNCTION_END => 1,
+        57 => 4, // OpFunctionCall
+        SPIRV_OP_VARIABLE => 4,
+        61 => 4,                          // OpLoad
+        62 => 3,                          // OpStore
+        63 => 4,                          // OpCopyMemory
+        65 => 5,                          // OpAccessChain
+        66 => 5,                          // OpInBoundsAccessChain
+        67 => 6,                          // OpPtrAccessChain
+        SPIRV_OP_DECORATE => 3,           // OpDecorate: target + decoration
+        SPIRV_OP_MEMBER_DECORATE => 4,    // OpMemberDecorate: target + member + decoration
+        73 => 2,                          // OpDecorationGroup
+        74 => 3,                          // OpGroupDecorate
+        75 => 4,                          // OpGroupMemberDecorate
+        SPIRV_OP_RETURN | 252 | 255 => 1, // OpReturn, OpKill, OpUnreachable
+        SPIRV_OP_RETURN_VALUE => 2,
+        SPIRV_OP_LABEL => 2,
+        SPIRV_OP_BRANCH => 2,
+        SPIRV_OP_BRANCH_CONDITIONAL => 4,
+        SPIRV_OP_SWITCH => 3,
+        _ => 1,
+    }
+}
+
+/// Valid SPIR-V storage classes (core 1.0-1.5 plus the widely used KHR
+/// extension classes: CallableDataKHR, IncomingCallableDataKHR, RayPayloadKHR,
+/// HitAttributeKHR, IncomingRayPayloadKHR, ShaderRecordBufferKHR,
+/// PhysicalStorageBuffer).
+fn is_valid_spirv_storage_class(sc: u32) -> bool {
+    sc <= 12 || matches!(sc, 5280 | 5281 | 5338 | 5339 | 5342 | 5343 | 5349)
+}
+
+/// Valid SPIR-V execution models: the seven core models (Vertex through
+/// Kernel) plus the KHR ray-tracing models and the NV mesh/task models.
+fn is_valid_spirv_execution_model(model: u32) -> bool {
+    model <= 6 || matches!(model, 5267 | 5268 | 5313..=5318)
+}
+
+/// SPIR-V instructions that terminate a basic block: OpReturn, OpReturnValue,
+/// OpBranch, OpBranchConditional, OpSwitch, OpKill (OpTerminateInvocation),
+/// OpUnreachable.
+fn is_block_terminator(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        SPIRV_OP_RETURN | SPIRV_OP_RETURN_VALUE | 249 | 250 | 251 | 252 | 255
+    )
+}
+
+/// Require that `id` names a type already defined by the module. SPIR-V does
+/// not allow forward type references (except via OpTypeForwardPointer), so a
+/// reference to an unknown type is malformed.
+fn require_type(types: &BTreeMap<u32, SpirvType>, id: u32, what: &str) -> AppResult<()> {
+    if id == 0 || !types.contains_key(&id) {
+        return Err(AppError::new(
+            ReasonCode::RcDxilInvalid,
+            format!("SPIR-V {what} references unknown type ID {id}"),
+        ));
+    }
+    Ok(())
+}
+
 impl SpirvTranslator {
     /// Create a new translator with empty state.
     pub fn new() -> Self {
@@ -1694,12 +1814,42 @@ impl SpirvTranslator {
         // Header: magic, version, generator, bound, schema
         let _version = spirv[1];
         let _generator = spirv[2];
-        let _bound = spirv[3];
+        let bound = spirv[3];
         let _schema = spirv[4];
+        // A zero bound forbids every result ID, making the module unusable.
+        if bound == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                "invalid SPIR-V header: bound is zero",
+            ));
+        }
+        // A five-word header with no instructions is not a module.
+        if spirv.len() == 5 {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                "SPIR-V module contains no instructions (header only)",
+            ));
+        }
 
-        // Walk instructions starting after the 5-word header
+        // Walk instructions starting after the 5-word header. Every
+        // instruction is validated BEFORE its operands are accepted:
+        //   - word count != 0
+        //   - word count >= the opcode's minimum
+        //   - cursor + word count <= module length (truncated streams rejected)
+        //   - ID operands < bound where required
+        //   - result IDs nonzero, below the bound, and unique
+        //   - type/result references resolve in context
+        //   - function begin/end pairing
+        //   - block termination before the next label / function end
+        // Entry-point and decoration targets are verified in a post-pass.
         let mut offset = 5;
         let mut current_function: Option<SpirvFunction> = None;
+        let mut in_block = false;
+        let mut block_terminated = true;
+        let mut defined_ids: BTreeSet<u32> = BTreeSet::new();
+        let mut function_ids: BTreeSet<u32> = BTreeSet::new();
+        let mut entry_targets: Vec<u32> = Vec::new();
+        let mut decoration_targets: Vec<u32> = Vec::new();
 
         while offset < spirv.len() {
             let word = spirv[offset];
@@ -1712,12 +1862,59 @@ impl SpirvTranslator {
                     format!("SPIR-V instruction with word count 0 at offset {}", offset),
                 ));
             }
+            if (word_count as usize) < min_spirv_words(opcode) as usize {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!(
+                        "SPIR-V opcode 0x{opcode:04X} at offset {offset} has word count \
+                         {word_count}, below its minimum of {}",
+                        min_spirv_words(opcode)
+                    ),
+                ));
+            }
+            // Reject truncated instruction streams: the declared length must
+            // fit inside the module exactly.
+            let Some(end) = offset.checked_add(word_count as usize) else {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!("SPIR-V instruction at offset {offset} overflows the module"),
+                ));
+            };
+            if end > spirv.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!(
+                        "SPIR-V instruction at offset {offset} claims {word_count} words but \
+                         only {} words remain in the module (truncated stream)",
+                        spirv.len() - offset
+                    ),
+                ));
+            }
+            let operands: &[u32] = &spirv[offset + 1..end];
 
-            let end = std::cmp::min(offset + word_count as usize, spirv.len());
-            let operands: Vec<u32> = if end > offset + 1 {
-                spirv[offset + 1..end].to_vec()
-            } else {
-                Vec::new()
+            // Validate and record a newly defined result ID.
+            let mut define_id = |id: u32, what: &str| -> AppResult<()> {
+                if id == 0 {
+                    return Err(AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!("SPIR-V {what} result ID 0 is not allowed"),
+                    ));
+                }
+                if id >= bound {
+                    return Err(AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!(
+                            "SPIR-V {what} result ID {id} is not below the header bound {bound}"
+                        ),
+                    ));
+                }
+                if !defined_ids.insert(id) {
+                    return Err(AppError::new(
+                        ReasonCode::RcDxilInvalid,
+                        format!("SPIR-V {what} result ID {id} is defined more than once"),
+                    ));
+                }
+                Ok(())
             };
 
             match opcode {
@@ -1727,301 +1924,568 @@ impl SpirvTranslator {
                 SPIRV_OP_ENTRY_POINT => {
                     // operands: [execution_model, entry_point_id,
                     //           <null-terminated name>, <interface ids...>]
-                    // Only the null-terminated name (up to the first NUL
-                    // byte) is string data; trailing words are interface IDs.
-                    if operands.len() >= 3 {
-                        let exec_model = operands[0];
-                        let entry_id = operands[1];
-                        let name = decode_spirv_string(&operands[2..]);
-                        if entry_id != 0 && !name.is_empty() {
-                            self.entry_points.push((entry_id, exec_model, name));
-                        }
+                    let exec_model = operands[0];
+                    let entry_id = operands[1];
+                    if !is_valid_spirv_execution_model(exec_model) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpEntryPoint uses invalid execution model {exec_model}"
+                            ),
+                        ));
                     }
+                    if entry_id == 0 || entry_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpEntryPoint target ID {entry_id} is not below the \
+                                 header bound {bound}"
+                            ),
+                        ));
+                    }
+                    let name = decode_spirv_string(&operands[2..]);
+                    entry_targets.push(entry_id);
+                    self.entry_points.push((entry_id, exec_model, name));
                 }
                 SPIRV_OP_NAME => {
                     // operands: [target_id, name_bytes...]
-                    if operands.len() >= 2 {
-                        let target_id = operands[0];
-                        let name = decode_spirv_string(&operands[1..]);
-                        if target_id != 0 && !name.is_empty() {
-                            self.names.insert(target_id, name);
-                        }
+                    let target_id = operands[0];
+                    if target_id == 0 || target_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpName target ID {target_id} is not below the header \
+                                 bound {bound}"
+                            ),
+                        ));
+                    }
+                    let name = decode_spirv_string(&operands[1..]);
+                    decoration_targets.push(target_id);
+                    if !name.is_empty() {
+                        self.names.insert(target_id, name);
                     }
                 }
                 SPIRV_OP_MEMBER_NAME => {
                     // operands: [struct_type_id, member_index, name_bytes...]
-                    if operands.len() >= 3 {
-                        let type_id = operands[0];
-                        let member_index = operands[1];
-                        let name = decode_spirv_string(&operands[2..]);
-                        if !name.is_empty() {
-                            self.member_names.insert((type_id, member_index), name);
-                        }
+                    let type_id = operands[0];
+                    if type_id == 0 || type_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpMemberName target ID {type_id} is not below the \
+                                 header bound {bound}"
+                            ),
+                        ));
+                    }
+                    let member_index = operands[1];
+                    let name = decode_spirv_string(&operands[2..]);
+                    decoration_targets.push(type_id);
+                    if !name.is_empty() {
+                        self.member_names.insert((type_id, member_index), name);
                     }
                 }
                 SPIRV_OP_DECORATE => {
                     // operands: [target_id, decoration, ...]
-                    if operands.len() >= 2 {
-                        let target_id = operands[0];
-                        let decoration = operands[1];
-                        let entry = self
-                            .decorations
-                            .entry(target_id)
-                            .or_insert(SpirvDecoration {
-                                binding: None,
-                                descriptor_set: None,
-                                location: None,
-                                offset: None,
-                            });
-                        match decoration {
-                            SPIRV_DECORATION_BINDING => {
-                                if operands.len() >= 3 {
-                                    entry.binding = Some(operands[2]);
-                                }
-                            }
-                            SPIRV_DECORATION_DESCRIPTOR_SET => {
-                                if operands.len() >= 3 {
-                                    entry.descriptor_set = Some(operands[2]);
-                                }
-                            }
-                            SPIRV_DECORATION_LOCATION => {
-                                if operands.len() >= 3 {
-                                    entry.location = Some(operands[2]);
-                                }
-                            }
-                            SPIRV_DECORATION_OFFSET if operands.len() >= 3 => {
-                                entry.offset = Some(operands[2]);
-                            }
-                            _ => {}
+                    let target_id = operands[0];
+                    if target_id == 0 || target_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpDecorate target ID {target_id} is not below the \
+                                 header bound {bound}"
+                            ),
+                        ));
+                    }
+                    decoration_targets.push(target_id);
+                    let decoration = operands[1];
+                    let entry = self
+                        .decorations
+                        .entry(target_id)
+                        .or_insert(SpirvDecoration {
+                            binding: None,
+                            descriptor_set: None,
+                            location: None,
+                            offset: None,
+                        });
+                    match decoration {
+                        SPIRV_DECORATION_BINDING => {
+                            entry.binding = Some(operands[2]);
                         }
+                        SPIRV_DECORATION_DESCRIPTOR_SET => {
+                            entry.descriptor_set = Some(operands[2]);
+                        }
+                        SPIRV_DECORATION_LOCATION => {
+                            entry.location = Some(operands[2]);
+                        }
+                        SPIRV_DECORATION_OFFSET => {
+                            entry.offset = Some(operands[2]);
+                        }
+                        _ => {}
                     }
                 }
                 SPIRV_OP_MEMBER_DECORATE => {
-                    // Skip for now
+                    // operands: [target_id, member_index, decoration, ...]
+                    let target_id = operands[0];
+                    if target_id == 0 || target_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpMemberDecorate target ID {target_id} is not below \
+                                 the header bound {bound}"
+                            ),
+                        ));
+                    }
+                    decoration_targets.push(target_id);
                 }
                 SPIRV_OP_TYPE_VOID => {
-                    // operands: [result_id]
-                    if !operands.is_empty() {
-                        self.types.insert(operands[0], SpirvType::Void);
-                    }
+                    define_id(operands[0], "OpTypeVoid")?;
+                    self.types.insert(operands[0], SpirvType::Void);
                 }
                 SPIRV_OP_TYPE_BOOL => {
-                    if !operands.is_empty() {
-                        self.types.insert(operands[0], SpirvType::Bool);
-                    }
+                    define_id(operands[0], "OpTypeBool")?;
+                    self.types.insert(operands[0], SpirvType::Bool);
                 }
                 SPIRV_OP_TYPE_INT => {
                     // operands: [result_id, width, signedness]
-                    if operands.len() >= 3 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Int {
-                                width: operands[1],
-                                signed: operands[2] != 0,
-                            },
-                        );
+                    let width = operands[1];
+                    if width == 0 || width > 64 || !width.is_multiple_of(8) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("SPIR-V OpTypeInt declares invalid width {width}"),
+                        ));
                     }
+                    let signedness = operands[2];
+                    if signedness > 1 {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("SPIR-V OpTypeInt declares invalid signedness {signedness}"),
+                        ));
+                    }
+                    define_id(operands[0], "OpTypeInt")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Int {
+                            width,
+                            signed: signedness != 0,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_FLOAT => {
                     // operands: [result_id, width]
-                    if operands.len() >= 2 {
-                        self.types
-                            .insert(operands[0], SpirvType::Float { width: operands[1] });
+                    let width = operands[1];
+                    if !matches!(width, 16 | 32 | 64) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("SPIR-V OpTypeFloat declares invalid width {width}"),
+                        ));
                     }
+                    define_id(operands[0], "OpTypeFloat")?;
+                    self.types.insert(operands[0], SpirvType::Float { width });
                 }
                 SPIRV_OP_TYPE_VECTOR => {
                     // operands: [result_id, component_type_id, component_count]
-                    if operands.len() >= 3 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Vector {
-                                component_type: operands[1],
-                                component_count: operands[2],
-                            },
-                        );
+                    require_type(&self.types, operands[1], "OpTypeVector component")?;
+                    let component_count = operands[2];
+                    if !matches!(component_count, 2 | 3 | 4 | 8 | 16) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpTypeVector declares invalid component count \
+                                 {component_count}"
+                            ),
+                        ));
                     }
+                    define_id(operands[0], "OpTypeVector")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Vector {
+                            component_type: operands[1],
+                            component_count,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_MATRIX => {
                     // operands: [result_id, column_type_id, column_count]
-                    if operands.len() >= 3 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Matrix {
-                                column_type: operands[1],
-                                column_count: operands[2],
-                            },
-                        );
+                    require_type(&self.types, operands[1], "OpTypeMatrix column")?;
+                    let column_count = operands[2];
+                    if !matches!(column_count, 2..=4) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpTypeMatrix declares invalid column count {column_count}"
+                            ),
+                        ));
                     }
+                    define_id(operands[0], "OpTypeMatrix")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Matrix {
+                            column_type: operands[1],
+                            column_count,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_ARRAY => {
                     // operands: [result_id, element_type_id, length_id]
                     // The length is a constant ID that is defined *after* the
                     // type section in SPIR-V; it is resolved in a post-pass
                     // once all constants have been parsed.
-                    if operands.len() >= 3 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Array {
-                                element_type: operands[1],
-                                length: operands[2],
-                            },
-                        );
+                    require_type(&self.types, operands[1], "OpTypeArray element")?;
+                    let length_id = operands[2];
+                    if length_id == 0 || length_id >= bound {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpTypeArray length ID {length_id} is not below the \
+                                 header bound {bound}"
+                            ),
+                        ));
                     }
+                    define_id(operands[0], "OpTypeArray")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Array {
+                            element_type: operands[1],
+                            length: length_id,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_RUNTIME_ARRAY => {
-                    if operands.len() >= 2 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::RuntimeArray {
-                                element_type: operands[1],
-                            },
-                        );
-                    }
+                    require_type(&self.types, operands[1], "OpTypeRuntimeArray element")?;
+                    define_id(operands[0], "OpTypeRuntimeArray")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::RuntimeArray {
+                            element_type: operands[1],
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_STRUCT => {
                     // operands: [result_id, member_type_id_0, ...]
-                    if !operands.is_empty() {
-                        let member_types = operands[1..].to_vec();
-                        let name = self.names.get(&operands[0]).cloned();
-                        self.types
-                            .insert(operands[0], SpirvType::Struct { member_types, name });
+                    for &member in &operands[1..] {
+                        require_type(&self.types, member, "OpTypeStruct member")?;
                     }
+                    define_id(operands[0], "OpTypeStruct")?;
+                    let member_types = operands[1..].to_vec();
+                    let name = self.names.get(&operands[0]).cloned();
+                    self.types
+                        .insert(operands[0], SpirvType::Struct { member_types, name });
                 }
                 SPIRV_OP_TYPE_POINTER => {
                     // operands: [result_id, storage_class, pointee_type_id]
-                    if operands.len() >= 3 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Pointer {
-                                pointee_type: operands[2],
-                                storage_class: operands[1],
-                            },
-                        );
+                    let storage_class = operands[1];
+                    if !is_valid_spirv_storage_class(storage_class) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpTypePointer declares invalid storage class {storage_class}"
+                            ),
+                        ));
                     }
+                    require_type(&self.types, operands[2], "OpTypePointer pointee")?;
+                    define_id(operands[0], "OpTypePointer")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Pointer {
+                            pointee_type: operands[2],
+                            storage_class,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_FUNCTION => {
                     // operands: [result_id, return_type_id, param_type_id_0, ...]
-                    if operands.len() >= 2 {
-                        let return_type = operands[1];
-                        let param_types = operands[2..].to_vec();
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Function {
-                                return_type,
-                                param_types,
-                            },
-                        );
+                    require_type(&self.types, operands[1], "OpTypeFunction return")?;
+                    for &param in &operands[2..] {
+                        require_type(&self.types, param, "OpTypeFunction parameter")?;
                     }
+                    define_id(operands[0], "OpTypeFunction")?;
+                    let return_type = operands[1];
+                    let param_types = operands[2..].to_vec();
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Function {
+                            return_type,
+                            param_types,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_IMAGE => {
-                    if operands.len() >= 2 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::Image {
-                                sampled_type: operands[1],
-                                dim: operands.get(2).copied().unwrap_or(0),
-                            },
-                        );
+                    require_type(&self.types, operands[1], "OpTypeImage sampled")?;
+                    let dim = operands.get(2).copied().unwrap_or(0);
+                    if dim > 7 {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("SPIR-V OpTypeImage declares invalid dim {dim}"),
+                        ));
                     }
+                    define_id(operands[0], "OpTypeImage")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::Image {
+                            sampled_type: operands[1],
+                            dim,
+                        },
+                    );
                 }
                 SPIRV_OP_TYPE_SAMPLER => {
-                    if !operands.is_empty() {
-                        self.types.insert(operands[0], SpirvType::Sampler);
-                    }
+                    define_id(operands[0], "OpTypeSampler")?;
+                    self.types.insert(operands[0], SpirvType::Sampler);
                 }
                 SPIRV_OP_TYPE_SAMPLED_IMAGE => {
-                    if operands.len() >= 2 {
-                        self.types.insert(
-                            operands[0],
-                            SpirvType::SampledImage {
-                                image_type: operands[1],
-                            },
-                        );
-                    }
+                    require_type(&self.types, operands[1], "OpTypeSampledImage image")?;
+                    define_id(operands[0], "OpTypeSampledImage")?;
+                    self.types.insert(
+                        operands[0],
+                        SpirvType::SampledImage {
+                            image_type: operands[1],
+                        },
+                    );
                 }
                 SPIRV_OP_CONSTANT => {
                     // operands: [type_id, result_id, value_words...]
-                    if operands.len() >= 3 {
-                        let type_id = operands[0];
-                        let result_id = operands[1];
-                        // Scalar constants may span multiple words for 64-bit
-                        // int/float types; combine them so the value is not
-                        // silently truncated to the low word.
-                        let lo = operands[2] as u64;
-                        let hi = operands.get(3).copied().unwrap_or(0) as u64;
-                        let value = lo | (hi << 32);
-                        let is_64 = matches!(
-                            self.types.get(&type_id),
-                            Some(SpirvType::Int { width: 64, .. })
-                                | Some(SpirvType::Float { width: 64 })
-                        );
-                        self.constants.insert(result_id, value as u32);
-                        if is_64 {
-                            self.constants64.insert(result_id, value);
-                        }
+                    let type_id = operands[0];
+                    require_type(&self.types, type_id, "OpConstant")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpConstant")?;
+                    let is_64 = matches!(
+                        self.types.get(&type_id),
+                        Some(SpirvType::Int { width: 64, .. })
+                            | Some(SpirvType::Float { width: 64 })
+                    );
+                    let expected_words = if is_64 { 5 } else { 4 };
+                    if word_count as usize != expected_words {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpConstant must have exactly {expected_words} words, \
+                                 got {word_count}"
+                            ),
+                        ));
+                    }
+                    // Scalar constants span two words for 64-bit int/float
+                    // types; combine them so the value is not silently
+                    // truncated to the low word.
+                    let lo = operands[2] as u64;
+                    let hi = operands.get(3).copied().unwrap_or(0) as u64;
+                    let value = lo | (hi << 32);
+                    self.constants.insert(result_id, value as u32);
+                    if is_64 {
+                        self.constants64.insert(result_id, value);
                     }
                 }
                 SPIRV_OP_CONSTANT_COMPOSITE => {
                     // operands: [type_id, result_id, constituent_ids...]
-                    if operands.len() >= 3 {
-                        let result_id = operands[1];
-                        self.composites.insert(result_id, operands[2..].to_vec());
+                    require_type(&self.types, operands[0], "OpConstantComposite")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpConstantComposite")?;
+                    for &constituent in &operands[2..] {
+                        if constituent == 0 || constituent >= bound {
+                            return Err(AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!(
+                                    "SPIR-V OpConstantComposite constituent ID {constituent} is \
+                                     not below the header bound {bound}"
+                                ),
+                            ));
+                        }
+                        if !defined_ids.contains(&constituent) {
+                            return Err(AppError::new(
+                                ReasonCode::RcDxilInvalid,
+                                format!(
+                                    "SPIR-V OpConstantComposite references undefined \
+                                     constituent ID {constituent}"
+                                ),
+                            ));
+                        }
                     }
+                    self.composites.insert(result_id, operands[2..].to_vec());
                 }
                 SPIRV_OP_CONSTANT_TRUE => {
-                    if operands.len() >= 2 {
-                        self.constants.insert(operands[1], 1);
-                    }
+                    require_type(&self.types, operands[0], "OpConstantTrue")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpConstantTrue")?;
+                    self.constants.insert(result_id, 1);
                 }
                 SPIRV_OP_CONSTANT_FALSE => {
-                    if operands.len() >= 2 {
-                        self.constants.insert(operands[1], 0);
-                    }
+                    require_type(&self.types, operands[0], "OpConstantFalse")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpConstantFalse")?;
+                    self.constants.insert(result_id, 0);
                 }
                 SPIRV_OP_VARIABLE => {
                     // operands: [result_type_id, result_id, storage_class, initializer_id]
-                    if operands.len() >= 3 {
-                        self.variables
-                            .insert(operands[1], (operands[0], operands[2]));
+                    require_type(&self.types, operands[0], "OpVariable")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpVariable")?;
+                    let storage_class = operands[2];
+                    if !is_valid_spirv_storage_class(storage_class) {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V OpVariable declares invalid storage class {storage_class}"
+                            ),
+                        ));
                     }
+                    self.variables
+                        .insert(result_id, (operands[0], storage_class));
                 }
                 SPIRV_OP_FUNCTION => {
                     // operands: [result_type_id, result_id, function_control, function_type_id]
-                    if operands.len() >= 4 {
-                        current_function = Some(SpirvFunction {
-                            result_id: operands[1],
-                            return_type: operands[0],
-                            function_type: operands[3],
-                            instructions: Vec::new(),
+                    if current_function.is_some() {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "SPIR-V OpFunction nested inside another function",
+                        ));
+                    }
+                    require_type(&self.types, operands[0], "OpFunction return")?;
+                    let result_id = operands[1];
+                    define_id(result_id, "OpFunction")?;
+                    function_ids.insert(result_id);
+                    let function_type = operands[3];
+                    require_type(&self.types, function_type, "OpFunction type")?;
+                    current_function = Some(SpirvFunction {
+                        result_id,
+                        return_type: operands[0],
+                        function_type,
+                        instructions: Vec::new(),
+                    });
+                    in_block = false;
+                    block_terminated = true;
+                }
+                SPIRV_OP_FUNCTION_PARAMETER => {
+                    // operands: [result_type_id, result_id]
+                    if current_function.is_none() {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "SPIR-V OpFunctionParameter outside a function",
+                        ));
+                    }
+                    require_type(&self.types, operands[0], "OpFunctionParameter")?;
+                    define_id(operands[1], "OpFunctionParameter")?;
+                }
+                SPIRV_OP_FUNCTION_END => {
+                    let Some(func) = current_function.take() else {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "SPIR-V OpFunctionEnd without a matching OpFunction",
+                        ));
+                    };
+                    if in_block && !block_terminated {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V function %{} ends with an unterminated basic block",
+                                func.result_id
+                            ),
+                        ));
+                    }
+                    self.functions.push(func);
+                    in_block = false;
+                    block_terminated = true;
+                }
+                SPIRV_OP_LABEL => {
+                    // operands: [result_id]
+                    if current_function.is_none() {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "SPIR-V OpLabel outside a function",
+                        ));
+                    }
+                    if in_block && !block_terminated {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            "SPIR-V OpLabel found while the previous block is unterminated",
+                        ));
+                    }
+                    define_id(operands[0], "OpLabel")?;
+                    in_block = true;
+                    block_terminated = false;
+                    if let Some(func) = current_function.as_mut() {
+                        func.instructions.push(SpirvInstruction {
+                            opcode,
+                            operands: operands.to_vec(),
                         });
                     }
                 }
-                SPIRV_OP_FUNCTION_END => {
-                    if let Some(func) = current_function.take() {
-                        self.functions.push(func);
+                _ if is_block_terminator(opcode) => {
+                    if current_function.is_none() {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V opcode 0x{opcode:04X} (block terminator) outside a function"
+                            ),
+                        ));
+                    }
+                    if !in_block {
+                        return Err(AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!(
+                                "SPIR-V opcode 0x{opcode:04X} (block terminator) outside a \
+                                 labeled block"
+                            ),
+                        ));
+                    }
+                    block_terminated = true;
+                    if let Some(func) = current_function.as_mut() {
+                        func.instructions.push(SpirvInstruction {
+                            opcode,
+                            operands: operands.to_vec(),
+                        });
                     }
                 }
                 _ => {
                     // Record instructions inside function bodies
-                    if let Some(func) = current_function.as_mut()
-                        && opcode != SPIRV_OP_FUNCTION_PARAMETER
-                    {
-                        func.instructions
-                            .push(SpirvInstruction { opcode, operands });
+                    if let Some(func) = current_function.as_mut() {
+                        func.instructions.push(SpirvInstruction {
+                            opcode,
+                            operands: operands.to_vec(),
+                        });
                     }
                 }
             }
 
             offset += word_count as usize;
-            // The SPIR-V bound field is the max result ID + 1, NOT a word-count limit.
-            // Use the actual SPIR-V length as the iteration bound.
-            if offset > spirv.len() {
-                break;
+        }
+
+        // Post-pass 1: an open function means the module is unterminated.
+        if let Some(func) = current_function.as_ref() {
+            return Err(AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!(
+                    "SPIR-V function %{} is never terminated (missing OpFunctionEnd)",
+                    func.result_id
+                ),
+            ));
+        }
+
+        // Post-pass 2: every entry-point target must exist as a function.
+        for target in entry_targets {
+            if !function_ids.contains(&target) {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!(
+                        "SPIR-V OpEntryPoint target ID {target} does not name a defined function"
+                    ),
+                ));
             }
         }
 
-        // Post-pass: resolve array lengths now that every constant has been
-        // parsed (constants are declared after types in SPIR-V).
+        // Post-pass 3: every OpName/OpMemberName/OpDecorate/OpMemberDecorate
+        // target must be an ID defined by the module.
+        for target in decoration_targets {
+            if !defined_ids.contains(&target) {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!(
+                        "SPIR-V name/decorate target ID {target} does not reference a defined ID"
+                    ),
+                ));
+            }
+        }
+
+        // Post-pass 4: resolve array lengths now that every constant has been
+        // parsed (constants are declared after types in SPIR-V). A length ID
+        // that is not a known constant is malformed.
         let array_ids: Vec<u32> = self
             .types
             .iter()
@@ -2032,9 +2496,16 @@ impl SpirvTranslator {
                 Some(SpirvType::Array { length, .. }) => *length,
                 _ => continue,
             };
-            if let Some(v) = self.resolve_constant_u32(len)
-                && let Some(SpirvType::Array { length, .. }) = self.types.get_mut(&id)
-            {
+            let Some(v) = self.resolve_constant_u32(len) else {
+                return Err(AppError::new(
+                    ReasonCode::RcDxilInvalid,
+                    format!(
+                        "SPIR-V OpTypeArray length ID {len} does not reference a defined \
+                         constant"
+                    ),
+                ));
+            };
+            if let Some(SpirvType::Array { length, .. }) = self.types.get_mut(&id) {
                 *length = v;
             }
         }
@@ -2801,6 +3272,7 @@ impl VulkanState {
             enabled_extensions: extensions.to_vec(),
             enabled_layers: layers.to_vec(),
             physical_devices: vec![physical_device],
+            queue_family_max_queues: default_queue_family_capacities(),
             application_name: app_name.to_string(),
             engine_name: engine_name.to_string(),
             api_version: (1, 3, 280),
@@ -2840,12 +3312,73 @@ impl VulkanState {
     }
 
     /// Create a logical device with requested queues.
+    ///
+    /// The full parameter contract is validated BEFORE any state is mutated
+    /// or any handle is allocated: the physical device must belong to an
+    /// existing instance, every requested queue family must exist on that
+    /// physical device, every requested queue count must be within the
+    /// family's capacity and non-zero, duplicate family declarations are
+    /// rejected, and every requested extension must be supported. On any
+    /// validation failure the state is left untouched.
     pub fn create_device(
         &mut self,
         physical: VkPhysicalDevice,
         extensions: &[String],
         queue_families: &[(u32, u32)],
     ) -> AppResult<VkDevice> {
+        // ── Validation phase (no mutation, no handle allocation) ──────────────
+        // (a) The physical device must belong to an existing instance.
+        let instance = self
+            .instances
+            .values()
+            .find(|instance| instance.physical_devices.contains(&physical))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("physical device {physical} does not belong to any instance"),
+                )
+            })?;
+
+        // (b) queue family exists, (c) queue count valid, (e) no duplicate
+        // family declarations, (f) no zero-count queue specifications.
+        let family_capacities = &instance.queue_family_max_queues;
+        let mut declared_families = BTreeSet::new();
+        for &(family, count) in queue_families {
+            if !declared_families.insert(family) {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("queue family {family} declared more than once"),
+                ));
+            }
+            let Some(&max_queues) = family_capacities.get(family as usize) else {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("queue family {family} does not exist on physical device {physical}"),
+                ));
+            };
+            if count == 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!(
+                        "queue count for family {family} must be at least 1 (Vulkan: queueCount > 0)"
+                    ),
+                ));
+            }
+            if count > max_queues {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!(
+                        "queue count {count} for family {family} exceeds the family's \
+                         capacity of {max_queues} queues"
+                    ),
+                ));
+            }
+        }
+
+        // (d) Requested device extensions must be supported.
+        VkExtensionRegistry::new().validate_device_extensions(extensions)?;
+
+        // ── Commit phase (only reached when validation succeeded) ─────────────
         let handle = self.alloc_handle();
         if self.metal_command_queue.is_none() {
             self.metal_command_queue = Some(self.alloc_handle());
@@ -5129,6 +5662,10 @@ impl VulkanState {
     /// Get shader module info.
     pub fn get_shader_module(&self, m: VkShaderModule) -> Option<&VkShaderModuleInfo> {
         self.shader_modules.get(&m)
+    }
+    /// Get shader module count.
+    pub fn shader_module_count(&self) -> usize {
+        self.shader_modules.len()
     }
     /// Get device memory info.
     pub fn get_device_memory(&self, m: VkDeviceMemory) -> Option<&VkDeviceMemoryInfo> {
