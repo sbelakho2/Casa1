@@ -65,6 +65,7 @@ pub trait ComObject: Send {
 }
 
 /// A simple COM object that wraps a known CLSID→IID mapping.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct SimpleComObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -525,6 +526,7 @@ impl ComClsid {
 /// Supports `IDirectSound8` interface for audio output.
 /// Wires through the existing `crate::audio::AudioSubsystem` for
 /// buffer creation, playback control, and speaker configuration.
+#[allow(dead_code)] // COM CLSID/device id for DirectSound dispatch (ABI surface); flagged for the API database
 pub struct DirectSound8Object {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -556,6 +558,7 @@ impl ComObject for DirectSound8Object {
 /// Functional DirectSound buffer COM object.
 ///
 /// Supports `IDirectSoundBuffer8` interface for audio playback.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct DirectSoundBuffer8Object {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -586,6 +589,7 @@ impl ComObject for DirectSoundBuffer8Object {
 /// Supports `IXAudio2` interface for audio engine management.
 /// Wires through the existing `crate::audio::AudioSubsystem` for
 /// mastering voices, source voices, and submix voices.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct XAudio2Object {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -612,6 +616,7 @@ impl ComObject for XAudio2Object {
 }
 
 /// Functional XAudio2 mastering voice COM object.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct XAudio2MasteringVoiceObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -638,6 +643,7 @@ impl ComObject for XAudio2MasteringVoiceObject {
 }
 
 /// Functional XAudio2 source voice COM object.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct XAudio2SourceVoiceObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -664,6 +670,7 @@ impl ComObject for XAudio2SourceVoiceObject {
 }
 
 /// Functional XAudio2 submix voice COM object.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct XAudio2SubmixVoiceObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -695,6 +702,7 @@ impl ComObject for XAudio2SubmixVoiceObject {
 /// shortcut (.lnk) file operations including path storage,
 /// arguments, description, working directory, icon location,
 /// show command, and persistent storage.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct ShellLinkObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -807,6 +815,7 @@ impl ComObject for ShellLinkObject {
 /// Supports `IFileOpenDialog`, `IFileDialog`, and `IModalWindow`
 /// interfaces for file open/save dialog operations.
 /// In headless mode, returns a default/simulated result path.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct FileOpenDialogObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -985,6 +994,7 @@ impl ComObject for FileOpenDialogObject {
 ///
 /// Supports `IFileSaveDialog`, `IFileDialog`, and `IModalWindow`
 /// interfaces for file save dialog operations.
+#[allow(dead_code)] // COM CLSID + inner dialog state (ABI surface); flagged for the API database
 pub struct FileSaveDialogObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -1031,6 +1041,7 @@ impl ComObject for FileSaveDialogObject {
 /// interfaces for Windows taskbar integration.
 /// On macOS, all operations are no-ops that return S_OK since
 /// there is no native taskbar to interact with.
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct TaskbarListObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -1840,6 +1851,7 @@ impl ShellView {
 }
 
 /// ShellView COM object (IShellView).
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct ShellViewObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -2258,6 +2270,7 @@ impl ContextMenu {
 }
 
 /// ContextMenu COM object (IContextMenu).
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct ContextMenuObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -2557,6 +2570,7 @@ impl PropertyStore {
 }
 
 /// PropertyStore COM object (IPropertyStore).
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct PropertyStoreObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -2929,6 +2943,7 @@ fn serialise_node(node: &roxmltree::Node, out: &mut String, depth: usize) {
 }
 
 /// XmlDomDocument COM object (IXMLDOMDocument).
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct XmlDomDocumentObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,
@@ -3576,6 +3591,7 @@ impl MsHtmlTxtRange {
 }
 
 /// MsHtmlDocument COM object (IHTMLDocument2).
+#[allow(dead_code)] // COM CLSID for CoCreateInstance dispatch (ABI surface); flagged for the API database
 pub struct MsHtmlDocumentObject {
     clsid: [u8; 16],
     supported: Vec<[u8; 16]>,

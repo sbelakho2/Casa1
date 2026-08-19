@@ -35,6 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 /// A work item enqueued by a background thread for execution on the main
 /// thread.  `done` is set to `true` (and the associated `Condvar` signaled)
 /// after `work` has finished executing.
+#[allow(dead_code)] // main-queue completion signaling retained for future sync API
 struct MainQueueItem {
     work: Box<dyn FnMut() + Send>,
     done: Arc<(Mutex<bool>, Condvar)>,
@@ -190,6 +191,7 @@ impl SafePtr {
     fn as_ptr(self) -> *mut std::ffi::c_void {
         self.0
     }
+    #[allow(dead_code)] // safe-pointer null check helper
     fn is_null(self) -> bool {
         self.0.is_null()
     }

@@ -19,9 +19,14 @@
 //!
 //! # Feature Flags
 //!
-//! - `metal` (default): Metal GPU backend for D3D translation
-//! - `vulkan` (default): Vulkan GPU backend via MoltenVK
-//! - `opengl` (default): OpenGL GPU backend via ANGLE
+//! Metal is the **mandatory** host backend on macOS: the `metal`/`objc`/
+//! `core-foundation` dependencies are unconditional and there is no `metal`
+//! feature flag — every build includes the Metal backend.
+//!
+//! - `vulkan` (default): Vulkan **guest-translation** path (`vulkan-1.dll`
+//!   thunk registration); the host backend remains Metal
+//! - `opengl` (default): OpenGL **guest-translation** path (`opengl32.dll`
+//!   thunk registration); the host backend remains Metal
 //! - `moltenvk`: Vulkan via MoltenVK (implies `vulkan`)
 //! - `angle`: OpenGL via ANGLE (implies `opengl`)
 //! - `websocket`: WebSocket support via tungstenite
@@ -142,12 +147,6 @@
 // naming conventions (PascalCase, camelCase, kConstantStyle) for compatibility.
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
-// Many Windows API fields and constants are defined for API completeness even
-// when not yet exercised by current guest code paths.  Removing this blanket
-// allow currently surfaces ~217 dead-code warnings across ~50 modules; it must
-// be removed incrementally (module by module), never in one pass, so the
-// parallel per-module zero-warning gates stay green.
-#![allow(dead_code)]
 #[macro_use]
 extern crate objc;
 

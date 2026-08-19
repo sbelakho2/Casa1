@@ -751,6 +751,7 @@ impl D3d10InputElementDesc {
 ///
 /// This is the primary type representing an ID3D10Device. All D3D10 API calls
 /// on the device are forwarded to the equivalent D3D11 methods.
+#[allow(dead_code)] // D3D10 device creation flags retained for API completeness
 pub struct D3d10Device {
     /// The underlying D3D11 device that does all the real work.
     pub(crate) d3d11_device: D3d11Device,
@@ -769,6 +770,7 @@ pub struct D3d10Device {
 
 /// Resource tracked in the D3D10 layer.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // resource kind retained for D3D10 resource tracking
 struct D3d10Resource {
     d3d11_id: D3d11ResourceId,
     kind: D3d10ResourceKind,
@@ -776,9 +778,13 @@ struct D3d10Resource {
 
 #[derive(Debug, Clone)]
 enum D3d10ResourceKind {
+    #[allow(dead_code)] // D3D10 resource payload retained for future paths
     Buffer(D3d10BufferDesc),
+    #[allow(dead_code)] // D3D10 resource payload retained for future paths
     Texture2D(D3d10Texture2dDesc),
+    #[allow(dead_code)] // D3D10 resource kind tags (state-model completeness)
     Texture1D,
+    #[allow(dead_code)] // D3D10 resource kind tags (state-model completeness)
     Texture3D,
 }
 

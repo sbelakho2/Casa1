@@ -622,33 +622,21 @@ fn t35_23_d3d12_aliasing_barrier() {
 // Item 170 — DXGI format conversion edge cases
 // ============================================================================
 
-// KNOWN-ISSUE: per the DXGI spec, format value 0 is DXGI_FORMAT_UNKNOWN, but
-// `DxgiFormat::from_u32` (src/gfx.rs:78) maps 0 through its catch-all arm to
-// R32G32B32A32Float. Expected: "Unknown". Actual: "R32G32B32A32Float"
-// (verified 2026-08-15). Once the implementation special-cases 0, remove the
-// #[ignore].
+/// DXGI_FORMAT_UNKNOWN (0) maps exactly to the `Unknown` representation.
 #[test]
-#[ignore] // blocked by src bug: from_u32(0) falls through to R32G32B32A32Float instead of Unknown
 fn t35_24_dxgi_format_unknown() {
     let fmt = DxgiFormat::from_u32(0);
     assert_eq!(format!("{:?}", fmt), "Unknown");
 }
 
-/// Common DXGI formats can be created from raw values.
-/// KNOWN-ISSUE: the 87 → B8G8R8A8Unorm assertion is #[ignore]d — see the
-/// inline note; the other values in this test are enforced.
+/// Common DXGI formats are created exactly from raw values.
 #[test]
-#[ignore] // blocked by src bug: from_u32(87) maps to R16Snorm instead of B8G8R8A8Unorm
 fn t35_25_dxgi_format_common_values() {
     // R8G8B8A8_UNORM = 28
     let fmt = DxgiFormat::from_u32(28);
     assert_eq!(format!("{:?}", fmt), "R8G8B8A8Unorm");
 
     // B8G8R8A8_UNORM = 87
-    // KNOWN-ISSUE: 87 must map to B8G8R8A8Unorm per DXGI, but
-    // `DxgiFormat::from_u32` (src/gfx.rs:99) maps 87 to R16Snorm. This
-    // assertion is therefore #[ignore]d (verified 2026-08-15); once the
-    // implementation is corrected, remove the #[ignore] on t35_25.
     let fmt = DxgiFormat::from_u32(87);
     assert_eq!(format!("{:?}", fmt), "B8G8R8A8Unorm");
 
@@ -661,11 +649,112 @@ fn t35_25_dxgi_format_common_values() {
     assert_eq!(format!("{:?}", fmt), "R32Float");
 }
 
-/// Unknown format values fall through to R8G8B8A8Unorm.
+/// Unknown format values fall through to the documented lossy fallback
+/// `R8G8B8A8Unorm`, and the fallback is recorded so it is observable.
 #[test]
 fn t35_26_dxgi_format_unknown_value_fallback() {
+    let before = DxgiFormat::format_fallback_count();
     let fmt = DxgiFormat::from_u32(9999);
     assert_eq!(format!("{:?}", fmt), "R8G8B8A8Unorm");
+    assert!(
+        DxgiFormat::format_fallback_count() > before,
+        "the lossy fallback must be recorded"
+    );
+}
+
+/// Formats without an exact representation are rejected by the checked
+/// mapping — never silently substituted with a "closest" format.
+#[test]
+fn t35_26b_dxgi_format_checked_rejects_inexact_values() {
+    // Typeless (R8G8B8A8_TYPELESS = 27), SINT (R8G8B8A8_SINT = 32),
+    // SNORM-without-variant (R8G8B8A8_SNORM = 31), R8G8 (49), BC6H (95),
+    // YUV (NV12 = 103) — none of these may map to a different format.
+    for raw in [
+        1, 4, 9, 13, 27, 31, 32, 38, 48, 49, 55, 63, 65, 66, 81, 84, 86, 89, 93, 94, 95, 96, 100,
+        103, 111, 115, 133, 134,
+    ] {
+        assert!(
+            DxgiFormat::from_u32_checked(raw).is_err(),
+            "DXGI_FORMAT {raw} has no exact representation and must be rejected, not substituted"
+        );
+    }
+}
+
+/// Every DXGI value with an exact representation maps exactly, and the
+/// translation-strategy table is explicit for every known value.
+#[test]
+fn t35_26c_dxgi_format_exact_identity_and_explicit_strategy() {
+    use casa1::gfx::FormatTranslation;
+    // Exact identity: mapping a value and mapping it back agrees.
+    for raw in [
+        2, 3, 10, 11, 12, 16, 17, 20, 24, 25, 26, 28, 29, 30, 34, 35, 36, 37, 40, 41, 42, 43, 45,
+        54, 56, 57, 58, 61, 62, 71, 72, 74, 75, 77, 78, 80, 83, 85, 87, 88, 91, 98, 99,
+    ] {
+        let fmt = DxgiFormat::from_u32_checked(raw).expect("exact format value");
+        assert_eq!(
+            DxgiFormat::translation_strategy(raw),
+            FormatTranslation::Exact,
+            "exact value {raw} must report the Exact strategy"
+        );
+        let _ = fmt;
+    }
+    // Explicit strategies for previously "closest"-mapped families.
+    assert_eq!(
+        DxgiFormat::translation_strategy(27),
+        FormatTranslation::ViewReinterpret
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(48),
+        FormatTranslation::ViewReinterpret
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(19),
+        FormatTranslation::ViewReinterpret
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(94),
+        FormatTranslation::Decompression
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(96),
+        FormatTranslation::Decompression
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(103),
+        FormatTranslation::ConversionShader
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(67),
+        FormatTranslation::ConversionShader
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(86),
+        FormatTranslation::Swizzle
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(115),
+        FormatTranslation::Swizzle
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(55),
+        FormatTranslation::DepthStencilEmulation
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(66),
+        FormatTranslation::Unsupported
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(133),
+        FormatTranslation::Unsupported
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(u32::MAX),
+        FormatTranslation::Unsupported
+    );
+    assert_eq!(
+        DxgiFormat::translation_strategy(9999),
+        FormatTranslation::Unsupported
+    );
 }
 
 /// DXGI format debug and clone work.

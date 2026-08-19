@@ -202,6 +202,7 @@ struct DirectSoundRecord {
 
 /// A locked region of a DirectSound buffer.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // locked audio region state retained for future lock/unlock paths
 struct LockedRegion {
     /// Audio pointer index (offset into `samples`) for the first locked part.
     offset: usize,
@@ -214,6 +215,7 @@ struct LockedRegion {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // DirectSound buffer priority retained for future priority handling
 struct DirectSoundBufferRecord {
     device_id: DeviceId,
     /// The `IDirectSound8` object that owns this buffer (for listener lookup).

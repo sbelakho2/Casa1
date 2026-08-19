@@ -4,90 +4,87 @@ Casa1 uses Cargo feature flags to enable or disable optional functionality at
 compile time. Features are configured in [`Cargo.toml`](../Cargo.toml) under
 the `[features]` section.
 
+## Host Backend Model: Metal Is Mandatory
+
+Metal is the **mandatory host backend on macOS**. The `metal`, `objc`,
+`block`, `core-foundation`, `core-graphics` and related dependencies are
+unconditional, and there is deliberately **no `metal` feature flag**: every
+build — including `--no-default-features` — compiles and exports the Metal
+backend (`metal_backend::MetalGpuBackend`).
+
+The `vulkan` and `opengl` features do **not** select a host backend. They
+switch the **guest-side translation path**: whether Casa1 registers
+`vulkan-1.dll` / `opengl32.dll` export thunks that translate guest Vulkan/OpenGL
+calls onto the Metal host backend. Disabling them removes the guest
+translation path; the host backend remains Metal.
+
 ## Default Features
 
 The following features are enabled by default:
 
 ```toml
-default = ["metal", "vulkan", "opengl"]
+default = ["vulkan", "opengl"]
 ```
 
-This means a plain `cargo build` includes all three GPU translation backends.
+This means a plain `cargo build` includes both guest-translation paths
+(Vulkan and OpenGL) on top of the always-present Metal host backend.
 
 ## Feature Flag Reference
-
-### `metal` (default)
-
-- **Status**: Enabled by default
-- **Dependencies**: `metal` crate, `objc`, `block`, `core-foundation`, `core-graphics`
-- **Purpose**: Enables the Metal GPU backend for translating Direct3D 10/11/12
-  calls to native Metal render and compute pipelines.
-- **When to disable**: Only if you want a minimal build without GPU support or
-  are building on a platform without Metal (not recommended for macOS).
-
-```bash
-# Build without Metal
-cargo build --no-default-features --features vulkan,opengl
-```
 
 ### `vulkan` (default)
 
 - **Status**: Enabled by default
-- **Dependencies**: None (runtime loads MoltenVK if available)
-- **Purpose**: Enables the Vulkan GPU backend. On macOS, Vulkan is translated
-  to Metal via MoltenVK at runtime.
+- **Dependencies**: None (MoltenVK is loaded at runtime if available)
+- **Purpose**: Enables the **Vulkan guest-translation path** — `vulkan-1.dll`
+  thunk registration so guest binaries can resolve Vulkan API functions,
+  translated to Metal at runtime (via MoltenVK where available). The host
+  backend is always Metal.
 - **Implied by**: `moltenvk`
+- **Observable**: `casa1::vkgl::vulkan_translation_enabled()` reports the
+  compiled-in state; `register_vulkan_dll()` returns an empty table when the
+  feature is off.
 
 ```bash
-# Build with only Vulkan
+# Build with only the Vulkan guest-translation path
 cargo build --no-default-features --features vulkan
 ```
 
 ### `opengl` (default)
 
 - **Status**: Enabled by default
-- **Dependencies**: None (runtime loads ANGLE if available)
-- **Purpose**: Enables the OpenGL GPU backend. On macOS, OpenGL is translated
-  to Metal via ANGLE at runtime.
+- **Dependencies**: None (ANGLE is loaded at runtime if available)
+- **Purpose**: Enables the **OpenGL guest-translation path** — `opengl32.dll`
+  thunk registration so guest binaries can resolve OpenGL/WGL API functions,
+  translated to Metal at runtime (via ANGLE where available). The host
+  backend is always Metal.
 - **Implied by**: `angle`
+- **Observable**: `casa1::vkgl::opengl_translation_enabled()` reports the
+  compiled-in state; `register_opengl_dll()` returns an empty table when the
+  feature is off.
 
 ```bash
-# Build with only OpenGL
+# Build with only the OpenGL guest-translation path
 cargo build --no-default-features --features opengl
 ```
 
 ### `moltenvk`
 
 - **Status**: Optional (implies `vulkan`)
-- **Purpose**: Explicitly enables Vulkan via MoltenVK. This is a convenience
-  alias that also enables the `vulkan` feature.
-- **Use case**: When you want to guarantee MoltenVK is available and want the
-  Vulkan path specifically.
+- **Purpose**: Convenience alias that also enables the `vulkan` feature.
 
 ```toml
 # In Cargo.toml
 moltenvk = ["vulkan"]
 ```
 
-```bash
-cargo build --features moltenvk
-```
-
 ### `angle`
 
 - **Status**: Optional (implies `opengl`)
-- **Purpose**: Explicitly enables OpenGL via ANGLE. This is a convenience
-  alias that also enables the `opengl` feature.
-- **Use case**: When you want to guarantee ANGLE is available and want the
-  OpenGL path specifically.
+- **Purpose**: Convenience alias that also enables the `opengl` feature.
 
 ```toml
 # In Cargo.toml
 angle = ["opengl"]
-```
-
-```bash
-cargo build --features angle
 ```
 
 ### `websocket`
@@ -102,10 +99,6 @@ cargo build --features angle
 ```toml
 # In Cargo.toml
 websocket = ["tungstenite"]
-```
-
-```bash
-cargo build --features websocket
 ```
 
 ### `ffmpeg`
@@ -123,14 +116,6 @@ cargo build --features websocket
 ```toml
 # In Cargo.toml
 ffmpeg = ["ffmpeg-next"]
-```
-
-```bash
-# Install FFmpeg system library first
-brew install ffmpeg
-
-# Build with FFmpeg support
-cargo build --features ffmpeg
 ```
 
 ### `proptest`
@@ -159,16 +144,23 @@ cargo test --features proptest
 cargo build --features dev-insecure-tls
 ```
 
+### `nightly_alloc_error_hook`
+
+- **Status**: Optional — stable builds are unaffected
+- **Purpose**: Forward-compat hook for `std::alloc::set_alloc_error_hook`,
+  which is nightly-only. Declared so `unexpected_cfgs` remains enabled
+  without flagging the cfg.
+
 ## Feature Combinations
 
-### Minimal Build (No GPU Backends)
+### Minimal Build (No Guest GPU Translation Paths)
 
 ```bash
 cargo build --no-default-features
 ```
 
-This produces a binary with CPU emulation only — no GPU translation. Useful for
-headless testing or server-side PE analysis.
+This produces a binary with CPU emulation and the **mandatory Metal host
+backend**, but without the Vulkan/OpenGL guest-translation thunk paths.
 
 ### Full Build (All Features)
 
@@ -185,8 +177,9 @@ cargo build --all-features
 cargo build --release
 ```
 
-Uses default features (Metal + Vulkan + OpenGL). This is the recommended
-configuration for end users.
+Uses default features (Vulkan + OpenGL guest-translation paths over the
+mandatory Metal host backend). This is the recommended configuration for end
+users.
 
 ### Testing with All Safe Features
 
@@ -201,8 +194,19 @@ cargo test --features "websocket,ffmpeg,proptest"
 cargo metadata --format-version=1 | jq '.packages[] | select(.name=="casa1") | .features'
 
 # Check which features are enabled for a specific build
-cargo build --features "metal,websocket" -v 2>&1 | grep "features:"
+cargo build --features "vulkan,websocket" -v 2>&1 | grep "features:"
 ```
+
+## Build-Matrix Truth Test
+
+`tests/section44_backend_matrix.rs` asserts the backend feature model:
+
+- the default build exports the Metal backend (`metal_backend::MetalGpuBackend`);
+- `--no-default-features` still exports the Metal backend (it is mandatory):
+  `cargo test --no-default-features --test section44_backend_matrix`;
+- the `vulkan`/`opengl` features toggle their guest-translation symbols
+  (`vkgl::vulkan_translation_enabled()` / `vkgl::opengl_translation_enabled()`
+  and the `register_vulkan_dll()` / `register_opengl_dll()` tables).
 
 ## Adding a New Feature Flag
 

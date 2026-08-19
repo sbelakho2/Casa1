@@ -1958,18 +1958,7 @@ mod tests {
     /// Helper: construct a simulated stack frame for testing.
     /// Returns (stack_bytes, stack_base) where stack_base is the address
     /// where the stack data is "mapped".
-    fn make_stack(entries: &[(u64, &[u8])]) -> (Vec<u8>, u64) {
-        let base = 0x1_0000_0000u64; // arbitrary high address
-        let mut stack = Vec::new();
-        for &(_offset, data) in entries {
-            stack.extend_from_slice(data);
-        }
-        // Pad to 16 bytes
-        while stack.len() % 16 != 0 {
-            stack.push(0x00);
-        }
-        (stack, base)
-    }
+    // (helper removed — no remaining caller)
 
     #[test]
     fn test_virtual_unwind_push_nonvol() {

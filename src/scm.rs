@@ -764,6 +764,7 @@ impl std::fmt::Debug for VZVirtualMachineHandle {
 ///
 /// Returns `true` if the framework was loaded successfully or was already loaded.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // platform capability probe (Virtualization framework); not yet wired
 fn load_virtualization_framework() -> bool {
     use std::sync::OnceLock;
     static LOADED: OnceLock<bool> = OnceLock::new();

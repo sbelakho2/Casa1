@@ -4498,6 +4498,8 @@ unsafe fn string_from_cfstring(cf_str: core_foundation::base::CFTypeRef) -> Stri
                 encoding: u32,
             ) -> *const i8;
             fn CFStringGetLength(str: core_foundation::base::CFTypeRef) -> isize;
+            #[allow(dead_code)]
+            // CoreFoundation FFI declaration (ABI surface); flagged for the API database
             fn CFStringGetMaximumSizeForFileSystemRepresentation(length: isize) -> isize;
         }
 
@@ -8772,14 +8774,20 @@ pub fn pfx_import_cert_store(
             fn CFDataGetLength(data: *const c_void) -> isize;
 
             /// kSecClass — used for keychain item class.
+            #[allow(dead_code)]
+            // Security framework constants (ABI surface); flagged for the API database
             static kSecClass: *const c_void;
             /// kSecClassCertificate — certificate item class.
+            #[allow(dead_code)]
+            // Security framework constants (ABI surface); flagged for the API database
             static kSecClassCertificate: *const c_void;
             /// kSecImportItemIdentity — key for imported identity.
             static kSecImportItemIdentity: *const c_void;
             /// kSecImportItemCertChain — key for certificate chain.
             static kSecImportItemCertChain: *const c_void;
             /// kSecImportItemTrust — key for trust object.
+            #[allow(dead_code)]
+            // Security framework constants (ABI surface); flagged for the API database
             static kSecImportItemTrust: *const c_void;
             /// kSecImportExportPassphrase — key for password.
             static kSecImportExportPassphrase: *const c_void;
@@ -9017,6 +9025,7 @@ pub fn pfx_import_cert_store(
 
 /// Parse an ASN.1 DER length field starting at the given data.
 /// Returns (length, header_bytes) or None.
+#[allow(dead_code)] // ASN.1 length parser for future certificate paths
 fn parse_asn1_length(data: &[u8]) -> Option<(usize, usize)> {
     if data.len() < 2 {
         return None;

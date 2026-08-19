@@ -106,7 +106,9 @@ type CTFontCopyPostScriptNameFn = unsafe extern "C" fn(font: CTFontRef) -> CFStr
 type CTFontGetAscentFn = unsafe extern "C" fn(font: CTFontRef) -> CGFloat;
 type CTFontGetDescentFn = unsafe extern "C" fn(font: CTFontRef) -> CGFloat;
 type CTFontGetLeadingFn = unsafe extern "C" fn(font: CTFontRef) -> CGFloat;
+#[allow(dead_code)] // CoreText FFI type alias (ABI surface); flagged for the API database
 type CTFontGetCapHeightFn = unsafe extern "C" fn(font: CTFontRef) -> CGFloat;
+#[allow(dead_code)] // CoreText FFI type alias (ABI surface); flagged for the API database
 type CTFontGetXHeightFn = unsafe extern "C" fn(font: CTFontRef) -> CGFloat;
 type CTFontGetUnitsPerEmFn = unsafe extern "C" fn(font: CTFontRef) -> u32;
 type CTFontCopyTableFn =
@@ -681,6 +683,7 @@ impl DWriteFactory {
     /// Convert DWrite weight to a CGFloat suitable for Core Text's weight
     /// axis. Core Text uses negative values for light weights and positive
     /// for bold, typically on a scale where 0.0 is regular.
+    #[allow(dead_code)] // weight→CT conversion helper; not yet referenced
     fn dwrite_weight_to_ct_weight(weight: u16) -> CGFloat {
         // Map DWrite weight (100-900) to Core Text weight (-1.0 to 1.0)
         let normalized = (weight as f64 - 400.0) / 400.0;

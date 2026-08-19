@@ -12,10 +12,12 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // CGEvent source-state constants (ABI surface); flagged for the API database
 const kCGEventSourceStatePrivate: i32 = -1;
 #[cfg(target_os = "macos")]
 const kCGEventSourceStateCombinedSessionState: i32 = 0;
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // CGEvent source-state constants (ABI surface); flagged for the API database
 const kCGEventSourceStateHIDSystemState: i32 = 1;
 
 #[cfg(target_os = "macos")]
@@ -1214,6 +1216,7 @@ struct ControllerRecord {
 
 /// Information about a registered Windows hook.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // hook record state retained for future SetWindowsHookEx paths
 struct HookInfo {
     id: i32,
     hook_type: i32,
@@ -1850,6 +1853,7 @@ impl User32Subsystem {
         // Create a real NSWindow for any non-child window.
         // Overlapped (WS_OVERLAPPED=0), popup (WS_POPUP), or any combination
         // that is not a child needs a real macOS NSWindow.
+        #[allow(dead_code)] // window-style constant (ABI table)
         const WS_OVERLAPPED: u32 = 0x0000_0000;
         let is_child = style & WS_CHILD != 0;
         let is_overlapped_or_popup = !is_child;

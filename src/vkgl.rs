@@ -28,6 +28,30 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 // ===========================================================================
+// Guest-translation feature gates
+// ===========================================================================
+
+/// Whether the Vulkan guest-translation path (`vulkan-1.dll` thunk
+/// registration) is enabled in this build.
+///
+/// Toggled by the `vulkan` Cargo feature. This is a **guest-side translation
+/// path** switch — the host backend is always Metal on macOS, so the feature
+/// does not change host rendering.
+pub const fn vulkan_translation_enabled() -> bool {
+    cfg!(feature = "vulkan")
+}
+
+/// Whether the OpenGL guest-translation path (`opengl32.dll` thunk
+/// registration) is enabled in this build.
+///
+/// Toggled by the `opengl` Cargo feature. This is a **guest-side translation
+/// path** switch — the host backend is always Metal on macOS, so the feature
+/// does not change host rendering.
+pub const fn opengl_translation_enabled() -> bool {
+    cfg!(feature = "opengl")
+}
+
+// ===========================================================================
 // Section 0: Existing types (preserved for backward compatibility)
 // ===========================================================================
 
@@ -1403,6 +1427,7 @@ const SPIRV_MAGIC: u32 = 0x07230203;
 const SPIRV_OP_CAPABILITY: u16 = 17;
 const SPIRV_OP_MEMORY_MODEL: u16 = 14;
 const SPIRV_OP_ENTRY_POINT: u16 = 15;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_EXECUTION_MODE: u16 = 16;
 const SPIRV_OP_NAME: u16 = 5;
 const SPIRV_OP_MEMBER_NAME: u16 = 6;
@@ -1429,6 +1454,7 @@ const SPIRV_OP_CONSTANT_COMPOSITE: u16 = 44;
 const SPIRV_OP_FUNCTION: u16 = 54;
 const SPIRV_OP_FUNCTION_PARAMETER: u16 = 55;
 const SPIRV_OP_FUNCTION_END: u16 = 56;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_FUNCTION_CALL: u16 = 57;
 const SPIRV_OP_VARIABLE: u16 = 59;
 const SPIRV_OP_LOAD: u16 = 61;
@@ -1438,7 +1464,9 @@ const SPIRV_OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const SPIRV_OP_COMPOSITE_EXTRACT: u16 = 81;
 const SPIRV_OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
 const SPIRV_OP_IMAGE_FETCH: u16 = 95;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_IMAGE_READ: u16 = 98;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_IMAGE_WRITE: u16 = 99;
 const SPIRV_OP_SNEGATE: u16 = 126;
 const SPIRV_OP_FNEGATE: u16 = 127;
@@ -1457,11 +1485,17 @@ const SPIRV_OP_CONVERT_S_TO_F: u16 = 111;
 const SPIRV_OP_CONVERT_U_TO_F: u16 = 112;
 const SPIRV_OP_RETURN: u16 = 253;
 const SPIRV_OP_RETURN_VALUE: u16 = 254;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_LABEL: u16 = 248;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_BRANCH: u16 = 249;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_BRANCH_CONDITIONAL: u16 = 250;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_SWITCH: u16 = 251;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_SELECTION_MERGE: u16 = 247;
+#[allow(dead_code)] // SPIR-V opcode constants (ABI table for the SPIR-V translator)
 const SPIRV_OP_LOOP_MERGE: u16 = 246;
 
 /// SPIR-V execution models.
@@ -4408,6 +4442,7 @@ impl VulkanState {
         Ok(())
     }
 
+    #[allow(dead_code)] // command-buffer recording state query; not yet referenced
     fn cmd_in_recording(&self, cmd: VkCommandBuffer) -> AppResult<()> {
         let info = self
             .command_buffers
@@ -6809,7 +6844,14 @@ impl Default for ThreadSafeGLState {
 /// These thunks allow guest binaries to resolve Vulkan API functions by name.
 /// Each thunk address is a stable function pointer that the emulator can call
 /// to route the Vulkan call through Casa1's translation layer.
+///
+/// The table is empty when the `vulkan` guest-translation feature is disabled
+/// (see [`vulkan_translation_enabled`]) — the guest translation path is
+/// switched off, not silently redirected.
 pub fn register_vulkan_dll() -> Vec<(&'static str, u64)> {
+    if !vulkan_translation_enabled() {
+        return Vec::new();
+    }
     vec![
         (
             "vkCreateInstance",
@@ -7755,7 +7797,14 @@ unsafe extern "C" fn vk_thunk_create_semaphore(device: u64, p_semaphore: *mut u6
 /// These thunks allow guest binaries to resolve OpenGL/WGL API functions.
 /// Each thunk marshals its parameters into the matching [`GLState`] method
 /// behind a global mutex (see [`with_gl_state`]).
+///
+/// The table is empty when the `opengl` guest-translation feature is disabled
+/// (see [`opengl_translation_enabled`]) — the guest translation path is
+/// switched off, not silently redirected.
 pub fn register_opengl_dll() -> Vec<(&'static str, u64)> {
+    if !opengl_translation_enabled() {
+        return Vec::new();
+    }
     vec![
         (
             "wglCreateContext",

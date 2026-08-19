@@ -2205,6 +2205,7 @@ const kCGEventSourceStatePrivate: i32 = -1;
 #[cfg(target_os = "macos")]
 const kCGEventFlagMaskShift: u64 = 0x0002_0000;
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // CGEvent flag constant (ABI surface); flagged for the API database
 const kCGEventFlagMaskControl: u64 = 0x0004_0000;
 
 /// macOS HID key code for the Tab key (0x30 = kVK_Tab).
@@ -3597,6 +3598,7 @@ struct SyncStateSnapshot {
 
 /// Tracked UGC item metadata.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // UGC item metadata retained for future size reporting
 struct UGCItem {
     local_path: String,
     size: u64,

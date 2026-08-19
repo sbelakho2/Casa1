@@ -600,6 +600,7 @@ mod core_midi {
     /// Opaque CoreFoundation string handle.
     pub type CFStringRef = *const std::ffi::c_void;
     /// Opaque CoreFoundation run loop handle.
+    #[allow(dead_code)] // CoreMIDI FFI type alias (ABI surface); flagged for the API database
     pub type CFRunLoopRef = *mut std::ffi::c_void;
 
     /// MIDI packet structure.
@@ -942,16 +943,22 @@ mod core_midi_input {
 
         pub fn MIDIPortDisconnectSource(port: MIDIPortRef, source: MIDIEndpointRef) -> i32;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIGetNumberOfDevices() -> u32;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIGetDevice(index: u32) -> u64;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIEntityGetNumberOfSources(entity: u64) -> u32;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIDeviceGetNumberOfEntities(device: u64) -> u32;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIDeviceGetEntity(device: u64, index: u32) -> u64;
 
+        #[allow(dead_code)] // CoreMIDI FFI declarations (ABI surface); flagged for the API database
         pub fn MIDIEntityGetSource(entity: u64, source_index: u32) -> MIDIEndpointRef;
 
         pub fn MIDIGetNumberOfSources() -> u32;

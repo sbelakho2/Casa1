@@ -66,9 +66,13 @@ enum IcnsType {
     Ic10, // 512x512@2x (1024x1024)
     Ic11, // 16x16 1x
     Ic12, // 32x32 1x
+    #[allow(dead_code)] // legacy ICNS type tags (ABI completeness)
     Ic13, // 128x128 2x (256x256)
+    #[allow(dead_code)] // legacy ICNS type tags (ABI completeness)
     Ic14, // 256x256 2x (512x512)
+    #[allow(dead_code)] // legacy ICNS type tags (ABI completeness)
     Ic04, // 16x16 1x (old format)
+    #[allow(dead_code)] // legacy ICNS type tags (ABI completeness)
     Ic05, // 32x32 1x (old format)
 }
 
@@ -88,6 +92,7 @@ impl IcnsType {
         }
     }
 
+    #[allow(dead_code)] // ICNS type dimensions helper; not yet referenced
     fn dimensions(&self) -> (u32, u32) {
         match self {
             Self::Ic07 => (128, 128),

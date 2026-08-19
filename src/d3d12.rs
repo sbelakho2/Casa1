@@ -326,8 +326,11 @@ impl D3d12Runtime {
 
     /// Map D3D12_TEXTURE_ADDRESS_MODE to Metal address mode string.
     ///
-    /// D3D12 values: 1=WRAP, 2=MIRROR, 3=CLAMP, 4=BORDER, 5=MIRROR_ONCE.
-    /// Metal has no `mirror_once` mode, so MIRROR_ONCE maps to `mirror_repeat`.
+    /// D3D12 values: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER, 4=MIRROR_ONCE.
+    /// Metal has no `mirror_once` mode, so MIRROR_ONCE maps to
+    /// `mirror_clamp_to_edge` (the closest Metal equivalent). Unknown values
+    /// map to the documented default `clamp_to_edge` — never a silent
+    /// arbitrary value.
     pub fn map_d3d12_address_mode(mode: u32) -> &'static str {
         // Per D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP,
         // 3=BORDER, 4=MIRROR_ONCE (the previous mapping was shifted by one
@@ -2262,6 +2265,118 @@ mod tests {
         assert_ne!(
             alloc1, alloc2,
             "different allocators should have distinct IDs"
+        );
+    }
+
+    // ── Enum translation tables ────────────────────────────────────────────
+
+    /// D3D12_TEXTURE_ADDRESS_MODE: 0=WRAP, 1=MIRROR, 2=CLAMP, 3=BORDER,
+    /// 4=MIRROR_ONCE (per d3d12.h). Every value maps to the documented Metal
+    /// mode; unknown values map to the documented default `clamp_to_edge`.
+    #[test]
+    fn map_d3d12_address_mode_full_table() {
+        assert_eq!(D3d12Runtime::map_d3d12_address_mode(0), "repeat"); // WRAP
+        assert_eq!(D3d12Runtime::map_d3d12_address_mode(1), "mirror_repeat"); // MIRROR
+        assert_eq!(D3d12Runtime::map_d3d12_address_mode(2), "clamp_to_edge"); // CLAMP
+        assert_eq!(D3d12Runtime::map_d3d12_address_mode(3), "clamp_to_border"); // BORDER
+        assert_eq!(
+            D3d12Runtime::map_d3d12_address_mode(4),
+            "mirror_clamp_to_edge"
+        ); // MIRROR_ONCE
+        // Unknown values: documented default, never a silent arbitrary value.
+        for unknown in [5, 6, 99, u32::MAX] {
+            assert_eq!(
+                D3d12Runtime::map_d3d12_address_mode(unknown),
+                "clamp_to_edge",
+                "unknown address mode {unknown} must map to the documented default"
+            );
+        }
+    }
+
+    /// D3D12_COMPARISON_FUNC: 1=NEVER .. 8=ALWAYS (per d3d12.h).
+    #[test]
+    fn map_d3d12_comparison_func_full_table() {
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(1), "never");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(2), "less");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(3), "equal");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(4), "less_equal");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(5), "greater");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(6), "not_equal");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(7), "greater_equal");
+        assert_eq!(D3d12Runtime::map_d3d12_comparison_func(8), "always");
+        // Unknown values: documented default (D3D12_COMPARISON_FUNC_NEVER).
+        for unknown in [0, 9, 99, u32::MAX] {
+            assert_eq!(
+                D3d12Runtime::map_d3d12_comparison_func(unknown),
+                "never",
+                "unknown comparison func {unknown} must map to the documented default"
+            );
+        }
+    }
+
+    /// D3D12_STATIC_BORDER_COLOR: 0=TRANSPARENT_BLACK, 1=OPAQUE_BLACK,
+    /// 2=OPAQUE_WHITE (per d3d12.h).
+    #[test]
+    fn map_d3d12_border_color_full_table() {
+        assert_eq!(D3d12Runtime::map_d3d12_border_color(0), "transparent_black");
+        assert_eq!(D3d12Runtime::map_d3d12_border_color(1), "opaque_black");
+        assert_eq!(D3d12Runtime::map_d3d12_border_color(2), "opaque_white");
+        // Unknown values: documented default (TRANSPARENT_BLACK).
+        for unknown in [3, 4, 99, u32::MAX] {
+            assert_eq!(
+                D3d12Runtime::map_d3d12_border_color(unknown),
+                "transparent_black",
+                "unknown border color {unknown} must map to the documented default"
+            );
+        }
+    }
+
+    /// D3D12_FILTER bit encoding (per d3d12.h): bits 0-1 mip, 2-3 mag, 4-5
+    /// min, bit 6 anisotropic, bits 7-8 reduction type. Named constants are
+    /// checked against their documented bit patterns.
+    #[test]
+    fn map_d3d12_filter_full_table() {
+        // D3D12_FILTER_MIN_MAG_MIP_POINT = 0x00
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x00);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("nearest", "nearest", "nearest", false, false)
+        );
+        // D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x01
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x01);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("nearest", "nearest", "linear", false, false)
+        );
+        // D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x04
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x04);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("nearest", "linear", "nearest", false, false)
+        );
+        // D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x10);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("linear", "nearest", "nearest", false, false)
+        );
+        // D3D12_FILTER_MIN_MAG_MIP_LINEAR = 0x15
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x15);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("linear", "linear", "linear", false, false)
+        );
+        // D3D12_FILTER_ANISOTROPIC = 0x55: all linear + anisotropic flag.
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x55);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("linear", "linear", "linear", true, false)
+        );
+        // D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT = 0x80: comparison reduction.
+        let (min, mag, mip, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x80);
+        assert_eq!(
+            (min, mag, mip, aniso, cmp),
+            ("nearest", "nearest", "nearest", false, true)
         );
     }
 }

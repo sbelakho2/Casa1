@@ -582,33 +582,49 @@ const LLVM_BC_MAGIC: u32 = 0x4243_C0DE;
 const LLVM_WRAPPER_MAGIC: u32 = 0x0B17_C0DE;
 
 /// DXIL version constants
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const DXIL_VERSION_MAJOR: u32 = 1;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const DXIL_VERSION_MINOR: u32 = 0;
 
 // LLVM bitcode block/record IDs (u32, matching the bitstream entry codes)
 const BLOCKID_BLOCKINFO: u32 = 0;
 const BLOCKID_MODULE: u32 = 8;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_PARAMATTR: u32 = 9;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_PARAMATTR_GROUP: u32 = 10;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_CONSTANTS: u32 = 11;
 const BLOCKID_FUNCTION: u32 = 12;
 const BLOCKID_IDENTIFICATION: u32 = 13;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_VALUE_SYMTAB: u32 = 14;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_METADATA: u32 = 15;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_METADATA_ATTACHMENT: u32 = 16;
 const BLOCKID_TYPE: u32 = 17;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKID_OPERAND_BUNDLE_TAGS: u32 = 18;
 
 // Record codes within BLOCKINFO
 const BLOCKINFO_CODE_SETBID: u32 = 1;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKINFO_CODE_BLOCKNAME: u32 = 2;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const BLOCKINFO_CODE_SETRECORDNAME: u32 = 3;
 
 // Module-level record codes
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const MODULE_CODE_VERSION: u32 = 1;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const MODULE_CODE_TRIPLE: u32 = 2;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const MODULE_CODE_DATALAYOUT: u32 = 3;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const MODULE_CODE_GLOBALVAR: u32 = 7;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const MODULE_CODE_FUNCTION: u32 = 8;
 
 // Type block record codes (per the LLVM bitcode format; DXC writes these)
@@ -647,11 +663,13 @@ const FUNC_CODE_INST_CMP: u32 = 9; // legacy: [opty, op0, op1, pred]
 const FUNC_CODE_INST_RET: u32 = 10;
 const FUNC_CODE_INST_BR: u32 = 11; // [bb#, bb#, cond] or [bb#]
 const FUNC_CODE_INST_SWITCH: u32 = 12; // [opty, cond, default_bb, (case, bb)...]
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const FUNC_CODE_INST_INVOKE: u32 = 13;
 const FUNC_CODE_INST_UNREACHABLE: u32 = 15;
 const FUNC_CODE_INST_PHI: u32 = 16; // [ty, (val#signed, bb)...]
 const FUNC_CODE_INST_ALLOCA: u32 = 19; // [instty, opty, size, align]
 const FUNC_CODE_INST_LOAD: u32 = 20; // [ptr, result_ty, align, vol]
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const FUNC_CODE_INST_VAARG: u32 = 23;
 const FUNC_CODE_INST_STORE_OLD: u32 = 24;
 const FUNC_CODE_INST_EXTRACTVAL: u32 = 26;
@@ -659,8 +677,10 @@ const FUNC_CODE_INST_INSERTVAL: u32 = 27;
 const FUNC_CODE_INST_CMP2: u32 = 28; // [op0, op1, pred, flags?]
 const FUNC_CODE_INST_VSELECT: u32 = 29; // [cond, false_val, true_val]
 const FUNC_CODE_INST_INBOUNDS_GEP_OLD: u32 = 30;
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const FUNC_CODE_INST_INDIRECTBR: u32 = 31;
 const FUNC_CODE_INST_CALL: u32 = 34; // [attr, cc, fnty, fn, args...]
+#[allow(dead_code)] // DXIL bitcode block/record constants (ABI table for the DXIL parser)
 const FUNC_CODE_INST_FENCE: u32 = 36;
 const FUNC_CODE_INST_GEP: u32 = 43; // [inbounds, srcty, ops...]
 const FUNC_CODE_INST_STORE: u32 = 44; // [ptr, val, align, vol]
@@ -919,6 +939,7 @@ enum BitcodeEntry {
 
 /// Parsed LLVM bitcode record: (record_id, operands).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // bitcode record blob retained for future record processing
 struct BitcodeRecord {
     id: u32,
     operands: Vec<u32>,
@@ -1553,6 +1574,7 @@ struct DxilInstruction {
 
 /// A basic block in a DXIL function.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // basic-block label for future block emission
 struct DxilBasicBlock {
     label: String,
     instructions: Vec<DxilInstruction>,
@@ -5170,22 +5192,6 @@ mod tests {
         data.push(4); // length
         data.extend_from_slice(b"main"); // "main"
 
-        data
-    }
-
-    /// Helper: create a simple root signature blob.
-    fn make_test_root_signature(descriptor_count: u32, constants_count: u32) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&descriptor_count.to_le_bytes());
-        data.extend_from_slice(&constants_count.to_le_bytes());
-        for i in 0..descriptor_count {
-            data.push(0); // kind = Buffer
-            data.push(i as u8); // register
-            data.push(0); // space
-            data.push(1); // descriptor_count
-            data.push(0); // arg_buffer_index
-            data.push(i as u8); // binding_index
-        }
         data
     }
 

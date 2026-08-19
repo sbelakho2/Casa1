@@ -3947,6 +3947,7 @@ impl JitRuntime {
     /// block has at most one outgoing chain, the chain graph is a set of
     /// disjoint paths, so this DFS is linear in the number of chained
     /// blocks visited.  The hop cap bounds the worst case.
+    #[allow(dead_code)] // block-chaining reachability query; not yet used by the chaining policy
     fn chain_reaches(&self, start: u64, target: u64) -> bool {
         const MAX_HOPS: usize = 4096;
         let mut current = start;
@@ -4630,6 +4631,7 @@ impl JitCompiler {
 
     /// Return the full bitmask for a given width in bytes.
     /// Used for eliminating redundant `And` instructions.
+    #[allow(dead_code)] // mask helper for SIMD lane widths; not yet referenced
     fn full_mask_for_width(width: usize) -> u64 {
         match width {
             1 => 0xFF,
@@ -5614,6 +5616,7 @@ impl OptimizerConfig {
 
 /// A registered fast-thunk entry: maps a host function pointer to a small
 /// ARM64 trampoline that calls it directly from JIT-compiled guest code.
+#[allow(dead_code)] // fast-thunk machine-code cache (kept for the disabled fast-thunk path)
 struct FastThunkEntry {
     /// The host function to call.
     host_fn: usize,
@@ -5907,6 +5910,7 @@ impl Drop for FastThunkTable {
 // declaration matches the C prototype: void pthread_jit_write_protect_np(int).
 // It is always available on macOS with Apple Silicon.
 unsafe extern "C" {
+    #[allow(dead_code)] // platform FFI declaration (ABI surface); flagged for the API database
     fn pthread_jit_write_protect_np(enabled: i32);
 }
 
@@ -5916,6 +5920,7 @@ unsafe extern "C" {
 
 /// A single unwind info entry for JIT-compiled blocks.
 /// Follows the Windows ARM64 unwind info format for `UNW_FLAG_NO_HANDLER`.
+#[allow(dead_code)] // unwind-info payload for future unwinding support
 struct JitUnwindInfo {
     /// Start RVA (relative to the code base).
     start_rva: u32,
@@ -6753,25 +6758,8 @@ mod tests {
     /// makes the chain unit tests lose the lock race against other parallel
     /// JIT tests and silently skip creating the chain.  Tests have no
     /// watchdog, so we can afford to spin until the lock is acquired.
-    fn chain_blocks_until_locked(rt: &mut JitRuntime, from: u64, to: u64) -> Result<(), AppError> {
-        for _ in 0..1000 {
-            let before = rt.block_chains.contains_key(&(from, to));
-            let res = rt.chain_blocks(from, to);
-            // chain_blocks returns Ok(()) both on success and on a skipped
-            // try_write, so detect success by observing the chain entry
-            // actually being created.
-            if rt.block_chains.contains_key(&(from, to)) {
-                return Ok(());
-            }
-            if before {
-                return Ok(()); // already chained (e.g. cycle guard kept it)
-            }
-            let _ = res;
-            std::thread::sleep(std::time::Duration::from_micros(100));
-        }
-        panic!("chain_blocks {from:#x}->{to:#x} never acquired the JIT lock");
-    }
-
+    // (helper removed — no remaining caller; chain_blocks is a documented
+    // no-op and block chaining is disabled)
     #[test]
     fn block_chaining_patches_jump() {
         // Block chaining is intentionally DISABLED (it caused host-SP drift
@@ -7751,7 +7739,6 @@ mod tests {
     #[test]
     fn unwind_table_compact_unwind_encoding_constants() {
         // Apple ARM64 compact_unwind_encoding.h constants for reference:
-        const UNWIND_ARM64_MODE_MASK: u8 = 0x0F;
         const UNWIND_ARM64_MODE_FRAME: u8 = 0x01;
         const UNWIND_ARM64_MODE_FRAMELESS: u8 = 0x02;
         const UNWIND_ARM64_MODE_DWARF: u8 = 0x03;

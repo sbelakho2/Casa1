@@ -378,6 +378,7 @@ pub struct PacCacheEntry {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // PAC cache retained for future proxy auto-config paths
 pub struct WinHttpStack {
     sessions: BTreeMap<HINTERNET, WinHttpSession>,
     connections: BTreeMap<HINTERNET, WinHttpConnection>,
