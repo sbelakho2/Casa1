@@ -719,6 +719,15 @@ pub struct JitTelemetry {
     /// Reason the JIT stayed inactive despite being requested (e.g. the
     /// macOS 26 MAP_JIT restriction for ad-hoc-signed binaries).
     pub fallback_reason: Option<String>,
+    /// Total IR instructions lowered to native ARM64 emission while compiling
+    /// blocks (per-opcode detail in `JIT_NATIVE_LOWERED`, summed here).
+    #[serde(default)]
+    pub native_lowered: u64,
+    /// Total IR instructions executed through the universal interpreter
+    /// helper (`jit_helper_execute_insn`, one instruction per call) instead
+    /// of native lowering.
+    #[serde(default)]
+    pub helper_fallback: u64,
 }
 
 impl Default for JitTelemetry {
@@ -729,6 +738,8 @@ impl Default for JitTelemetry {
             blocks_compiled: 0,
             blocks_executed: 0,
             fallback_reason: None,
+            native_lowered: 0,
+            helper_fallback: 0,
         }
     }
 }
@@ -738,6 +749,8 @@ impl JitTelemetry {
         mode: &crate::runner::JitMode,
         blocks_compiled: u64,
         blocks_executed: u64,
+        native_lowered: u64,
+        helper_fallback: u64,
     ) -> Self {
         let requested = mode.as_str().to_string();
         let active = blocks_compiled > 0 || blocks_executed > 0;
@@ -756,6 +769,8 @@ impl JitTelemetry {
             blocks_compiled,
             blocks_executed,
             fallback_reason,
+            native_lowered,
+            helper_fallback,
         }
     }
 }
@@ -8620,8 +8635,14 @@ fn finalize_execution(
         Some(jit) => (jit.blocks_compiled, jit.blocks_executed),
         None => (0, 0),
     };
-    let jit_telemetry =
-        JitTelemetry::from_mode(&runtime.jit_mode, jit_blocks_compiled, jit_blocks_executed);
+    let (jit_native_lowered, jit_helper_fallback) = crate::jit::jit_lowering_telemetry();
+    let jit_telemetry = JitTelemetry::from_mode(
+        &runtime.jit_mode,
+        jit_blocks_compiled,
+        jit_blocks_executed,
+        jit_native_lowered,
+        jit_helper_fallback,
+    );
 
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),
