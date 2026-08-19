@@ -145,13 +145,6 @@ fn t16_1b_entitlement_audit_treats_metadata_only_codesign_output_as_empty_entitl
     assert!(report.unexpected_targets.is_empty());
 }
 
-// KNOWN-ISSUE: this test exercises the real `codesign -d --entitlements :-` extraction
-// path and is #[ignore]d because a src bug currently makes it fail on any modern macOS:
-// `codesign` emits a `<!DOCTYPE plist PUBLIC ...>` declaration, and
-// `sanitize_entitlement_xml` (src/security.rs:591-593) rejects ALL DOCTYPE declarations,
-// so `audit_embedded_entitlements` (src/security.rs:165-199) sees empty entitlements for
-// every signed binary and reports `casa1-runner:missing_allow_jit`. Expected: the
-// allow-jit-signed copy is approved. Actual: `report.approved == false` with
 #[test]
 #[cfg(target_os = "macos")]
 fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {

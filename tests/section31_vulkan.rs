@@ -755,24 +755,52 @@ fn t31_17_wrong_type_handle_rejection() {
 // t31_18 — State updates happen only after validation succeeds
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: this test asserts the documented validation contract — creating a
-// device from an unknown physical-device handle must fail and leave state
-// unchanged. It is #[ignore]d because `VulkanState::create_device`
-// (src/vkgl.rs:2564-2587) never validates the `physical` handle and returns Ok
-// for any value. Expected: Err for `create_device(99999, ...)`. Actual: Ok (a
-// device with `physical_device: 99999` is created) (verified 2026-08-15). Once
-// the implementation validates the handle, remove the #[ignore].
+// Every create_device validation failure must leave the state untouched:
+// (a) unknown physical device, (b) unknown queue family, (c) queue count
+// exceeding the family capacity, (d) unsupported extensions, (e) duplicate
+// family declarations, (f) zero queue counts.
 #[test]
-#[ignore] // blocked by src bug: VulkanState::create_device accepts unknown physical device handles
 fn t31_18_state_updates_after_validation() {
     let mut state = VulkanState::new();
     assert_eq!(state.device_count(), 0);
 
-    // create_device with a bogus physical device handle should fail
+    // (a) create_device with a bogus physical device handle should fail
     let result = state.create_device(99999, &[], &[(0, 1)]);
     assert!(result.is_err(), "expected Err, got {result:?}");
     // No device should have been added
     assert_eq!(state.device_count(), 0);
+
+    let inst = state.create_instance("test", "test", &[], &[]).unwrap();
+    let phys = state.enumerate_physical_devices(inst).unwrap()[0];
+
+    // (b) unknown queue family must fail without mutating state
+    let result = state.create_device(phys, &[], &[(99, 1)]);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+    assert_eq!(state.device_count(), 0);
+
+    // (c) queue count beyond the family capacity must fail
+    let result = state.create_device(phys, &[], &[(0, 17)]);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+    assert_eq!(state.device_count(), 0);
+
+    // (d) unsupported device extensions must fail; supported ones must pass
+    let result = state.create_device(phys, &["VK_KHR_nonexistent_ext".to_string()], &[(0, 1)]);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+    assert_eq!(state.device_count(), 0);
+    let _dev = state
+        .create_device(phys, &["VK_KHR_swapchain".to_string()], &[(0, 1)])
+        .expect("supported extension must be accepted");
+    assert_eq!(state.device_count(), 1);
+
+    // (e) duplicate family declarations must fail
+    let result = state.create_device(phys, &[], &[(0, 1), (0, 1)]);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+    assert_eq!(state.device_count(), 1);
+
+    // (f) zero queue counts are forbidden by the Vulkan contract
+    let result = state.create_device(phys, &[], &[(0, 0)]);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+    assert_eq!(state.device_count(), 1);
 
     // create_shader_module with a valid device but empty SPIR-V should fail
     let (mut state2, _inst, _phys, dev) = bootstrap_device();
@@ -799,15 +827,13 @@ fn t31_18_state_updates_after_validation() {
 // t31_19 — Malformed SPIR-V is rejected
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: this test asserts that malformed SPIR-V (header-only, truncated
-// instructions) is rejected. It is #[ignore]d because
-// `VulkanState::create_shader_module` (src/vkgl.rs:2779-2813) only checks the
-// word count and magic; `SpirvTranslator::parse` tolerates an instruction
-// stream that is empty or truncated. Expected: Err for the header-only and
-// truncated modules below. Actual: Ok (verified 2026-08-15). Once the
-// translator validates the instruction stream, remove the #[ignore].
+// Every malformed SPIR-V module below must be rejected by
+// `create_shader_module` (header-only, truncated streams, zero word counts,
+// oversized word counts, truncated OpEntryPoint, zero bound, invalid result
+// IDs, unterminated functions, invalid decoration targets, invalid storage
+// classes, invalid execution models, duplicate result IDs). A rejected module
+// must never become a shader module.
 #[test]
-#[ignore] // blocked by src bug: SpirvTranslator::parse accepts header-only/truncated modules
 fn t31_19_malformed_spirv_rejected() {
     let (mut state, _inst, _phys, dev) = bootstrap_device();
 
@@ -822,6 +848,87 @@ fn t31_19_malformed_spirv_rejected() {
     ];
     let result = state.create_shader_module(dev, &truncated);
     assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Zero word count
+    let zero_wc = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000001, 0x00000000, 0x00000000,
+    ];
+    let result = state.create_shader_module(dev, &zero_wc);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Oversized word count (claims 65535 words with one word present)
+    let oversized = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000001, 0x00000000, 0xFFFF0000,
+    ];
+    let result = state.create_shader_module(dev, &oversized);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Truncated OpEntryPoint: missing the (>=1 word) name operand
+    let truncated_entry = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000006, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000F, 0x00000000, 0x00000005,
+    ];
+    let result = state.create_shader_module(dev, &truncated_entry);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Invalid bound (zero): no result ID may be below it
+    let zero_bound = vec![0x07230203, 0x00010000, 0x00000000, 0x00000000, 0x00000000];
+    let result = state.create_shader_module(dev, &zero_bound);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Invalid result ID: OpTypeVoid declaring ID 7 with bound 7 (ID >= bound)
+    let invalid_result_id = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000007, 0x00000000, 0x00020013, 0x00000007,
+    ];
+    let result = state.create_shader_module(dev, &invalid_result_id);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Unterminated function: minimal module without OpFunctionEnd
+    let mut unterminated = minimal_spirv();
+    unterminated.pop();
+    let result = state.create_shader_module(dev, &unterminated);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Invalid decoration target: OpDecorate targeting ID 99 with bound 7
+    let invalid_decoration = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000007, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000E, 0x00000000, 0x00000001, 0x00030047, 0x00000063, 0x00000002,
+    ];
+    let result = state.create_shader_module(dev, &invalid_decoration);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Invalid storage class: OpVariable with storage class 99
+    let invalid_storage = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000008, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000E, 0x00000000, 0x00000001, 0x00020013, 0x00000002, 0x0004003B, 0x00000002,
+        0x00000003, 0x00000063,
+    ];
+    let result = state.create_shader_module(dev, &invalid_storage);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Invalid execution model: OpEntryPoint with model 99
+    let invalid_model = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000006, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000E, 0x00000000, 0x00000001, 0x0004000F, 0x00000063, 0x00000005, 0x6E69616D,
+    ];
+    let result = state.create_shader_module(dev, &invalid_model);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Duplicate result IDs: two OpTypeVoid both defining ID 2
+    let duplicate_ids = vec![
+        0x07230203, 0x00010000, 0x00000000, 0x00000004, 0x00000000, 0x00020013, 0x00000002,
+        0x00020013, 0x00000002,
+    ];
+    let result = state.create_shader_module(dev, &duplicate_ids);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // A rejected module must not have been registered as a shader module
+    assert_eq!(state.shader_module_count(), 0);
+
+    // And a valid module still succeeds
+    let result = state.create_shader_module(dev, &minimal_spirv());
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert_eq!(state.shader_module_count(), 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -865,8 +972,9 @@ fn minimal_spirv() -> Vec<u32> {
         0x00040005, 0x00000005, 0x6E69616D, 0x00000000, // OpName %main "main"
         0x00020013, 0x00000002, // OpTypeVoid %void
         0x00030021, 0x00000003, 0x00000002, // OpTypeFunction %fn %void
-        0x00050036, 0x00000002, 0x00000000, 0x00000003, 0x00000005, // %main = OpFunction
-        0x000200F8, 0x00000006, // %lbl = OpLabel
+        // %main = OpFunction %void None %fn
+        0x00050036, 0x00000002, 0x00000005, 0x00000000, 0x00000003, 0x000200F8,
+        0x00000006, // %lbl = OpLabel
         0x000100FD, // OpReturn
         0x00010038, // OpFunctionEnd
     ]

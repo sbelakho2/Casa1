@@ -145,7 +145,7 @@ pub unsafe extern "C" fn jit_helper_execute_insn(
     let s = unsafe { &mut *state };
     let m = unsafe { &mut *memory };
     let insn_slice = unsafe { std::slice::from_raw_parts(insn_ptr, 1) };
-    let _ = crate::cpu::execute_ir_with_hashing(s, m, insn_slice, None, false);
+    let _ = crate::cpu::execute_ir_with_hashing(s, m, insn_slice, None, false, None);
 }
 
 /// seg: 0=FS, 1=GS.  Returns the segment base (e.g., TEB address for FS).
@@ -366,6 +366,7 @@ pub fn ir_opcode_index(insn: &IrInstruction) -> usize {
         IrInstruction::Fxsave { .. } => 100,
         IrInstruction::Fxrstor { .. } => 101,
         IrInstruction::Xsave { .. } => 102,
+        IrInstruction::Xsaveopt { .. } => 122,
         IrInstruction::Xrstor { .. } => 103,
         IrInstruction::SubOperand { .. } => 104,
         IrInstruction::SubMemory { .. } => 105,
