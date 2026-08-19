@@ -113,18 +113,29 @@ jobs:
       # Steam V1 acceptance suite. section41 implements the S0-S13
       # acceptance criteria; it runs only when CASA1_STEAM_E2E=1 is set
       # (real Steam client, updater/network, CEF UI, Metal, login screen).
-      # The test prints exactly one machine-readable verdict line
+      # The test spawns the BUILT runner binary as the root Steam host and
+      # prints exactly one machine-readable verdict line
       # (STEAM_ACCEPTANCE=<JSON>) which the evidence step parses.
+      #
+      # The cargo test exit status is captured ALWAYS (the pipeline below
+      # never lets the test failure abort the step): TEST_EXIT is the real
+      # cargo exit code — the evidence step derives cargo_tests and the
+      # acceptance verdict from it, never from an asserted value.
       - name: Run Steam V1 acceptance (section41)
         id: acceptance
         env:
           CASA1_STEAM_E2E: "1"
           CASA1_PE_RUNTIME_DEADLINE_SECS: "600"
+          # The signed runner binary (exact artifact the release gate
+          # validates) is the root Steam host the section41 test spawns.
+          CASA1_STEAM_RUNNER: target/release/casa1-runner
         continue-on-error: true
         run: |
+          set +e
           cargo test --release --test section41_steam_e2e -- --ignored --nocapture \
             2>&1 | tee /tmp/section41-out.txt
           echo "TEST_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          exit 0
 
       - name: Evaluate acceptance verdict and write evidence
         id: evidence
@@ -168,11 +179,20 @@ jobs:
           else:
               print("verdict parsed:", json.dumps(verdict["result"].get("passed")))
 
-          accepted = bool(verdict["result"].get("passed"))
+          # Acceptance is passed ONLY when the acceptance result passed AND
+          # the cargo test process itself exited 0 (the section41 gate ends
+          # with assert!(result.passed) — a failed assert is a failed run
+          # even if the verdict line was printed).
+          accepted = bool(verdict["result"].get("passed")) and test_exit == 0
+          # cargo_tests is DERIVED from the actual cargo test exit status,
+          # never asserted; persisted into acceptance.json so the evidence
+          # block below reads the same derived value.
+          cargo_tests = "pass" if test_exit == 0 else "fail"
           verdict["test_exit"] = test_exit
           verdict["accepted"] = accepted
 
           json.dump({"accepted": accepted, "test_exit": test_exit,
+                     "cargo_tests": cargo_tests,
                      "verdict": verdict,
                      "result": verdict["result"]},
                     open("e2e-evidence/steam-e2e-evidence/acceptance.json", "w"), indent=2)
@@ -213,6 +233,12 @@ jobs:
           digest = open("e2e-evidence/evidence.sha256").read().strip()
           signing = os.environ.get("SIGNING_MODE", "ad-hoc")
 
+          # cargo_tests: the value DERIVED from the actual cargo test exit
+          # status in the verdict step (acceptance.json), never asserted.
+          cargo_tests = json.load(
+              open("e2e-evidence/steam-e2e-evidence/acceptance.json")
+          )["cargo_tests"]
+
           # signed_jit_selftest is "pass" ONLY when the signed runner's JIT
           # self-test actually ran and reported jit.active == true.
           jit_report = {"active": False, "fallback_reason": "no report"}
@@ -232,7 +258,7 @@ jobs:
               "steam_e2e_milestones": os.environ.get("STEAM_PASS", "fail"),
               "signed_jit_selftest": signed_jit_selftest,
               "signing_mode": signing,
-              "cargo_tests": "pass",
+              "cargo_tests": cargo_tests,
               "signed_candidate": "signed-casa1-runner",
               "signed_candidate_sha256": os.environ.get("SIGNED_CANDIDATE_SHA256", ""),
           }

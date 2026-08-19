@@ -1,13 +1,14 @@
 //! Phase 41 — Real Steam E2E acceptance (S0-S13).
 //!
 //! Runs the REAL Steam client from `ges/steam/drive_c/Steam/Steam.exe`
-//! through the runner's `execute_job` path with a bounded wall-clock
-//! deadline (`CASA1_PE_RUNTIME_DEADLINE_SECS`, default 300 s), loads the
-//! steam-bootstrap artifact the runner wrote for THIS run (via
-//! `outcome.steam_artifact_json` — never an mtime scan of the diagnostics
-//! directory), and evaluates it with [`casa1::steam_acceptance::evaluate`]
-//! under a policy that requires stages S0-S12 and allows the harness
-//! deadline.
+//! through the BUILT `casa1-runner` BINARY as the root Steam host (the
+//! signed/downloaded runner when `CASA1_STEAM_RUNNER` is set) with a
+//! bounded wall-clock deadline (`CASA1_PE_RUNTIME_DEADLINE_SECS`, default
+//! 300 s), loads the steam-bootstrap artifact the runner wrote for THIS run
+//! (via `outcome.steam_artifact_json` — never an mtime scan of the
+//! diagnostics directory), and evaluates it with
+//! [`casa1::steam_acceptance::evaluate`] under a policy that requires
+//! stages S0-S12 and allows the harness deadline.
 //!
 //! The job is the PRODUCTION Steam job: it is built by
 //! [`casa1::steam_launch::prepare_steam_job`] from a
@@ -15,6 +16,12 @@
 //! dispatches — so the gate exercises the live PE host path (intent
 //! `Play`), the profile's Steam IPC, JIT mode (Enabled), window dimensions
 //! and launch environment.
+//!
+//! The runner is invoked OUT OF PROCESS — the test never calls
+//! `execute_job` itself.  The runner process exit code is asserted 0 AND
+//! the `RunnerOutcome` JSON is parsed from the runner's stdout: the gate
+//! proves the real binary (the exact artifact CI signs) executes the
+//! Steam job, not a library call inside the test executable.
 //!
 //! The gate is TRUTHFUL: the test PASSES only when the acceptance result
 //! passes.  Missing stages are diagnostics, never success — the gate ends
@@ -35,11 +42,12 @@
 //!   cargo test --release --test section41_steam_e2e -- --ignored --nocapture
 //! ```
 
-use casa1::runner::{SteamBootstrapArtifact, execute_job};
+use casa1::runner::{RunnerOutcome, SteamBootstrapArtifact};
 use casa1::steam_acceptance::{MANDATORY_STAGES, SteamAcceptancePolicy, evaluate};
 use casa1::steam_launch::{SteamLaunchProfile, prepare_steam_job};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The Steam GE whose `drive_c/Steam/Steam.exe` is the real client.
 const STEAM_GE: &str = "steam";
@@ -159,21 +167,75 @@ fn t41_steam_e2e_acceptance() {
         job.window_height,
         (profile.resolution_height > 0).then_some(profile.resolution_height),
     );
-    eprintln!(
-        "[section41] executing real Steam client (deadline {deadline_secs}s): {}",
-        steam_exe.display(),
-    );
-    let outcome = match execute_job(&job) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            panic!(
-                "[section41] execute_job failed before producing a run artifact: {}",
-                error.message,
-            );
-        }
+
+    // ── Invoke the BUILT runner binary as the root Steam host ─────────────
+    // The test never calls execute_job in-process: the runner is spawned as
+    // a separate process with the production job on disk, its stdout is the
+    // RunnerOutcome JSON (the runner prints nothing else to stdout), and
+    // the gate asserts BOTH the runner process exit code 0 AND a parseable
+    // outcome.  CASA1_STEAM_RUNNER selects the exact signed/downloaded
+    // runner when set; otherwise cargo's CARGO_BIN_EXE_casa1-runner (the
+    // binary this package builds) is used.
+    let runner_path = match std::env::var_os("CASA1_STEAM_RUNNER") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(env!("CARGO_BIN_EXE_casa1-runner")),
     };
+    assert!(
+        runner_path.is_file(),
+        "runner binary missing at {} — build the casa1-runner bin target",
+        runner_path.display(),
+    );
+    let job_dir = std::env::temp_dir().join("casa1-section41");
+    std::fs::create_dir_all(&job_dir).expect("create section41 job dir");
+    let job_path = job_dir.join(format!("steam-job-{}.json", std::process::id()));
+    std::fs::write(
+        &job_path,
+        serde_json::to_string(&job).expect("serialize production job"),
+    )
+    .expect("write production job JSON");
     eprintln!(
-        "[section41] run finished: exit_code={} report={}",
+        "[section41] invoking runner binary (deadline {deadline_secs}s): {} --job {}",
+        runner_path.display(),
+        job_path.display(),
+    );
+    let runner_output = Command::new(&runner_path)
+        .arg("--job")
+        .arg(&job_path)
+        .output()
+        .expect("spawn the casa1 runner binary");
+    let _ = std::fs::remove_file(&job_path);
+    assert!(
+        runner_output.status.success(),
+        "the runner binary must exit 0 when it produced an outcome \
+         (process exit: {:?}) — stderr:\n{}",
+        runner_output.status.code(),
+        String::from_utf8_lossy(&runner_output.stderr),
+    );
+    let outcome: RunnerOutcome =
+        serde_json::from_slice(&runner_output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "[section41] runner stdout is not a RunnerOutcome JSON: {error}\n\
+             stdout:\n{}",
+                String::from_utf8_lossy(&runner_output.stdout),
+            )
+        });
+    // The outcome's guest-exit semantics must be honest: the runner's own
+    // exit 0 only means an outcome was produced.  guest_exit_code is Some
+    // exactly when the run ended in a real GuestExit.
+    let outcome_termination_is_guest_exit = outcome.termination == "GuestExit";
+    assert_eq!(
+        outcome.guest_exit_code.is_some(),
+        outcome_termination_is_guest_exit,
+        "[section41] outcome guest_exit_code must be Some({:?}) exactly for a \
+         GuestExit termination, got termination={:?} guest_exit_code={:?}",
+        outcome.canonical_output.exit_code,
+        outcome.termination,
+        outcome.guest_exit_code,
+    );
+    eprintln!(
+        "[section41] runner finished: process_exit=0 termination={} exit_code={} \
+         report={}",
+        outcome.termination,
         outcome.canonical_output.exit_code,
         outcome.report_path.display(),
     );
@@ -183,13 +245,13 @@ fn t41_steam_e2e_acceptance() {
     // never an mtime scan of the diagnostics directory.
     let artifact_path = outcome.steam_artifact_json.clone().unwrap_or_else(|| {
         panic!(
-            "[section41] execute_job returned no steam_artifact_json — the run did not \
+            "[section41] the runner produced no steam_artifact_json — the run did not \
              produce the steam-bootstrap artifact (run_id={}, test_id={})",
             outcome.run_id, job.test_id,
         );
     });
     let artifact_log_path = outcome.steam_artifact_log.clone().unwrap_or_else(|| {
-        panic!("[section41] execute_job returned no steam_artifact_log",);
+        panic!("[section41] the runner produced no steam_artifact_log",);
     });
     assert!(
         artifact_path.is_file(),

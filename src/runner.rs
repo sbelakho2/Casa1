@@ -132,6 +132,15 @@ pub struct RunnerOutcome {
     /// Termination detail (error message for non-guest terminations).
     #[serde(default)]
     pub termination_detail: Option<String>,
+    /// Honest guest-exit semantics: `Some(code)` ONLY when the run's
+    /// termination is `GuestExit { code }` — the guest process actually
+    /// exited with that code.  `None` when the run ended any other way
+    /// (harness deadline, unsupported instruction, ...): the guest never
+    /// exited, so the runner's own zero process exit must NEVER be read as
+    /// a successful guest exit.  Updater/hydration determination reads
+    /// THIS field, never the runner's process exit code.
+    #[serde(default)]
+    pub guest_exit_code: Option<i32>,
     /// Steam run milestone snapshot.
     #[serde(default)]
     pub milestones: crate::steam_milestones::SteamMilestones,
@@ -376,6 +385,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             run_id: run_id.clone(),
             termination: "GuestExit".to_string(),
             termination_detail: None,
+            guest_exit_code: Some(exit_code),
             milestones: crate::steam_milestones::SteamMilestones::default(),
             jit: pe_runtime::JitTelemetry::default(),
         });
@@ -573,6 +583,10 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             run_id: run_id.clone(),
             termination: format!("{:?}", pe_output.termination),
             termination_detail: pe_output.termination_detail.clone(),
+            guest_exit_code: match pe_output.termination {
+                pe_runtime::ExecutionTermination::GuestExit { code } => Some(code),
+                _ => None,
+            },
             milestones: pe_output.milestones.clone(),
             jit: pe_output.jit_telemetry.clone(),
         });
@@ -703,6 +717,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         run_id: run_id.clone(),
         termination: "GuestExit".to_string(),
         termination_detail: None,
+        guest_exit_code: Some(exit_code),
         milestones: crate::steam_milestones::SteamMilestones::default(),
         jit: pe_runtime::JitTelemetry::default(),
     })
@@ -1822,10 +1837,17 @@ pub fn write_steam_bootstrap_artifacts(
 /// inherited `CASA1_RUN_ID` from its parent).  The artifact is written for
 /// the child's OWN program, named with the run id + the child's test id and
 /// the `-child-` marker, and carries `child_of_run_id` so the parent's
-/// finalization can find and merge it.  When the child is steamwebhelper.exe
-/// and the child PE actually dispatched at least one block, the recorded
-/// process-first-instruction evidence is folded into
-/// `webhelper_process_started`.
+/// finalization can find and merge it.
+///
+/// `webhelper_process_started` evidence is recorded IMMEDIATELY by the PE
+/// runtime when a steamwebhelper child dispatches its FIRST block (the
+/// first-block site records into the process-wide MILESTONES static, which
+/// the run's `PeExecutionResult` snapshots — never at child completion).
+/// The derivation below is only a compatibility fallback for execution
+/// results that predate that immediate recording: it applies when the
+/// child is steamwebhelper.exe, the child dispatched at least one block
+/// (`process_first_instruction`), and the milestone was not already
+/// recorded — deriving again would double-count `webhelper_processes_started`.
 pub fn write_child_bootstrap_artifact(
     ge: &GameEnvironment,
     pe_output: &pe_runtime::PeExecutionResult,
@@ -1835,6 +1857,11 @@ pub fn write_child_bootstrap_artifact(
     let mut artifact = build_steam_bootstrap_artifact(ge, pe_output, job, run_id);
     artifact.child_of_run_id = Some(run_id.to_string());
     if is_webhelper_program(&job.program)
+        && artifact
+            .milestones
+            .steam
+            .webhelper_process_started
+            .is_none()
         && let Some(evidence) = artifact.milestones.process_first_instruction.clone()
     {
         crate::steam_milestones::note_webhelper_process_started_in(
@@ -1859,8 +1886,10 @@ pub fn write_child_bootstrap_artifact(
 /// child's `webhelper_processes_started` count to the parent's.  Returns the
 /// number of child artifacts merged.
 ///
-/// Best-effort by design: children write their artifacts when THEY finish,
-/// so a parent that finalizes first will not see them yet.  The merge is
+/// The child's evidence is recorded at its FIRST block dispatch (never at
+/// child completion), so a child artifact carries it as soon as it exists.
+/// The artifact itself is still written when the child runner finalizes,
+/// so a parent that finalizes first will not see it yet — the merge is
 /// therefore re-runnable on a later read of the parent artifact; when a
 /// child's evidence is merged, its detail field documents that the merge was
 /// post-run and that later-finalizing children are folded in by a subsequent
