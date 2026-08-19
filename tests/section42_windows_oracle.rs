@@ -2,17 +2,13 @@
 //!
 //! Covers the host-side harness end to end:
 //!   - vector corpus generation is deterministic and versioned;
-//!   - model-vs-model round trip (both sides computed with the MODEL-ONLY
-//!     implementations in `casa1::oracle_model`) reports zero diffs;
-//!   - the checked-in golden reference-results fixture (marked as
-//!     captured-from-Windows with a capture header) validates clean and
-//!     detects mutations;
-//!   - on a non-Windows host the reference executable's stubs produce diffs
-//!     against the model, and the comparison reports them (exit 1), which is
-//!     the designed fail-loud behavior.
+//!   - the Casa1-runtime-vs-reference comparison reports diffs (exit 1)
+//!     against the placeholder fixture on non-Windows hosts — the designed
+//!     fail-loud behavior (there is NO Casa1-side model to substitute);
+//!   - the capture-header validation refuses model-generated placeholders.
 //!
 //! The authoritative differential validation (real Windows 10/11 reference
-//! capture vs. model) runs in .github/workflows/windows-oracle.yml.
+//! capture vs. the Casa1 runtime) runs in .github/workflows/windows-oracle.yml.
 
 mod support;
 
@@ -93,133 +89,64 @@ fn vector_corpus_is_versioned_and_deterministic() {
 }
 
 #[test]
-fn model_vs_model_round_trip_reports_no_diffs() {
-    let temp = TempDir::new().expect("temp dir");
-    let vectors = temp.path().join("vectors.json");
-    let model_results = temp.path().join("model.json");
+fn placeholder_golden_is_refused_and_compare_fails_loud() {
+    // The checked-in golden is a MODEL-GENERATED placeholder (no real
+    // Windows capture yet).  The reference-results consumer must REFUSE it,
+    // and the compare must FAIL (exit 1): with no Casa1-side model there is
+    // nothing that can "validate clean" against a placeholder.
     assert!(
-        run_oracle(&["vectors", "--out", vectors.to_str().expect("path")])
-            .0
-            .success()
+        support::reference_results().is_none(),
+        "the model-generated placeholder must be refused by the reference-results consumer"
     );
-    assert!(
-        run_oracle(&[
-            "model-results",
-            "--vectors",
-            vectors.to_str().expect("path"),
-            "--out",
-            model_results.to_str().expect("path"),
-        ])
-        .0
-        .success()
-    );
-    let (status, stdout) = run_oracle(&[
-        "compare",
-        "--vectors",
-        vectors.to_str().expect("path"),
-        "--results",
-        model_results.to_str().expect("path"),
-    ]);
-    assert!(status.success(), "model-vs-model must not fail");
-    let report = compare_report(&stdout);
-    assert_eq!(report["diff_count"], 0);
-    assert_eq!(report["compared"], report["vectors_total"]);
-    assert!(
-        !report["categories"]
-            .as_object()
-            .expect("categories")
-            .is_empty()
-    );
-}
-
-#[test]
-fn model_results_carry_capture_header_marked_model_generated() {
-    let temp = TempDir::new().expect("temp dir");
-    let vectors = temp.path().join("vectors.json");
-    let model_results = temp.path().join("model.json");
-    assert!(
-        run_oracle(&["vectors", "--out", vectors.to_str().expect("path")])
-            .0
-            .success()
-    );
-    assert!(
-        run_oracle(&[
-            "model-results",
-            "--vectors",
-            vectors.to_str().expect("path"),
-            "--out",
-            model_results.to_str().expect("path"),
-        ])
-        .0
-        .success()
-    );
-    let file: Value = serde_json::from_slice(&std::fs::read(&model_results).expect("read"))
-        .expect("parse model results");
-    assert_eq!(file["schema_version"], 1);
-    let capture = &file["capture"];
-    assert_eq!(capture["source"], "windows");
-    assert_eq!(capture["captured_by"], "casa1-windows-reference");
-    assert_eq!(capture["captured_on"], "windows-10-11");
-    assert_eq!(capture["capture_date"], "model-generated");
-    assert!(
-        capture["note"]
-            .as_str()
-            .expect("note")
-            .contains("MODEL-GENERATED"),
-        "model-generated files must be explicitly marked"
-    );
-}
-
-#[test]
-fn golden_fixture_validates_clean() {
     let (status, stdout) = run_oracle(&[
         "compare",
         "--results",
         golden_fixture().to_str().expect("path"),
     ]);
-    assert!(status.success(), "golden fixture must validate clean");
-    let report = compare_report(&stdout);
-    assert_eq!(report["diff_count"], 0);
-    // The golden covers exactly the path/case/sharing vectors.
-    let categories = report["categories"].as_object().expect("categories");
-    let category_keys: BTreeSet<&str> = categories.keys().map(String::as_str).collect();
-    assert_eq!(
-        category_keys,
-        ["path_normalize", "case_fold", "file_sharing"]
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(report["compared"], 30);
-    // Everything else is reported as not covered, not as a diff.
     assert!(
-        !report["not_covered_categories"]
-            .as_array()
-            .expect("list")
-            .is_empty()
+        !status.success(),
+        "comparing against a non-Windows placeholder must fail loud"
     );
+    let report = compare_report(&stdout);
+    // The runtime candidate genuinely differs from the placeholder values
+    // (the placeholder was never Windows truth), so the report carries
+    // diffs — the honest fail-loud signal until a real capture exists.
+    assert!(report["diff_count"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
-fn golden_fixture_detects_mutation() {
+fn mutated_reference_results_change_the_diff_set() {
+    // Mutation detection on a REAL capture is validated by the Windows CI
+    // capture; here we prove the compare machinery distinguishes mutated
+    // results from the original placeholder by a different diff signature.
     let temp = TempDir::new().expect("temp dir");
     let mutated = temp.path().join("golden-mutated.json");
     let mut file: Value =
         serde_json::from_slice(&std::fs::read(golden_fixture()).expect("read golden"))
             .expect("parse golden");
     for result in file["results"].as_array_mut().expect("results") {
-        if result["id"] == "file_sharing:000" {
-            result["output"]["second_error"] = serde_json::json!(999);
+        if result["id"] == "path_normalize:000" {
+            result["output"]["normalized"] = serde_json::json!("C:\\MUTATED");
         }
     }
     std::fs::write(&mutated, serde_json::to_vec(&file).expect("encode")).expect("write");
     let (status, stdout) = run_oracle(&["compare", "--results", mutated.to_str().expect("path")]);
-    assert!(!status.success(), "mutated golden must fail the comparison");
+    assert!(
+        !status.success(),
+        "mutated results must fail the comparison"
+    );
     let report = compare_report(&stdout);
-    assert_eq!(report["diff_count"], 1);
-    let diff = &report["diffs"][0];
-    assert_eq!(diff["id"], "file_sharing:000");
-    assert_eq!(diff["field"], "second_error");
+    // The mutation must be present in the reported diffs.
+    let ids: Vec<&str> = report["diffs"]
+        .as_array()
+        .expect("diffs")
+        .iter()
+        .filter_map(|diff| diff["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"path_normalize:000"),
+        "the mutated vector must appear in the diff set: {ids:?}"
+    );
 }
 
 #[test]

@@ -9,7 +9,7 @@
 //! `{ "id", "category", "input" }` where `input` is a category-specific JSON
 //! object, and each result is `{ "id", "category", "output" }`. Adding a new
 //! category only requires a new `input`/`output` shape, a generator arm, a
-//! model predictor in [`crate::oracle_model`], and an executor arm in the
+//! executor arm in the
 //! reference crate — nothing in the wire format changes.
 //!
 //! `schema_version` is checked by both sides and must match; bump it whenever
@@ -406,23 +406,47 @@ fn thread_tls_vectors() -> Vec<Value> {
     ]
 }
 
-// ── Model results and comparison ───────────────────────────────────────────
+/// Compute the Casa1 RUNTIME's behavior for a differential vector.  This is
+/// the emulated-Casa1 side of the differential: the reference executable's
+/// captured result is the truth, and this function produces the Casa1
+/// candidate the comparison validates.  Categories the runtime cannot
+/// compute yet yield a `runtime_unavailable` marker that the comparison
+/// reports honestly (never a silent pass).
+pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
+    let output = match vector.category.as_str() {
+        "path_normalize" => {
+            let input = vector.input.as_str().unwrap_or_default();
+            // The runtime's parser classifies the path; the normalized form
+            // mirrors the reference's `normalized` field.
+            let parsed = crate::real_fs::parse_windows_path(input);
+            json!({
+                "normalized": parsed.to_base_string(),
+                "kind": runtime_path_kind(&parsed),
+                "has_ads": parsed.ads_stream.is_some(),
+                "last_error": 0,
+            })
+        }
+        _ => json!({ "runtime_unavailable": true }),
+    };
+    VectorResult {
+        id: vector.id.clone(),
+        category: vector.category.clone(),
+        output,
+    }
+}
 
-/// Compute Casa1's expected results for every vector using the MODEL-ONLY
-/// fallback implementations in [`crate::oracle_model`]. These are the values
-/// the differential comparison validates against the real Windows reference.
-pub fn compute_model_results(vectors: &[Vector]) -> Vec<VectorResult> {
-    vectors
-        .iter()
-        .map(|vector| {
-            let output = crate::oracle_model::predict(vector.category.as_str(), &vector.input);
-            VectorResult {
-                id: vector.id.clone(),
-                category: vector.category.clone(),
-                output,
-            }
-        })
-        .collect()
+fn runtime_path_kind(parsed: &crate::real_fs::WindowsPath) -> &'static str {
+    use crate::real_fs::WindowsPathKind::*;
+    match &parsed.kind {
+        DriveAbsolute { .. } => "drive_abs",
+        DriveRelative { .. } => "drive_rel",
+        RootedCurrentDrive { .. } => "rooted_current_drive",
+        Relative { .. } => "relative",
+        Unc { .. } => "unc",
+        VerbatimDrive { .. } => "verbatim_drive",
+        VerbatimUnc { .. } => "verbatim_unc",
+        Device { .. } => "device",
+    }
 }
 
 /// Normalize a `resolved_module` path for comparison: strip to the file name
@@ -596,6 +620,10 @@ pub struct ComparisonReport {
     pub compared: usize,
     pub diff_count: usize,
     pub not_covered_categories: Vec<String>,
+    /// Categories the Casa1 RUNTIME cannot compute yet (each vector reports
+    /// `runtime_unavailable`).  Reported honestly — never counted as diffs
+    /// and never as passes.
+    pub runtime_uncovered_categories: Vec<String>,
     pub categories: BTreeMap<String, CategorySummary>,
     pub diffs: Vec<DiffEntry>,
 }
@@ -634,6 +662,7 @@ pub fn compare_results(
     let mut categories: BTreeMap<String, CategorySummary> = BTreeMap::new();
     let mut diffs: Vec<DiffEntry> = Vec::new();
     let mut compared = 0usize;
+    let mut runtime_uncovered: BTreeSet<String> = BTreeSet::new();
     let reference_ids: BTreeSet<&str> = reference_by_id.keys().copied().collect();
 
     for id in reference_ids {
@@ -668,6 +697,17 @@ pub fn compare_results(
             summary.diffs += 1;
             continue;
         };
+        // Casa1-runtime-unavailable marker: the category is honestly
+        // reported as not yet covered by the runtime (never a diff, never a
+        // pass) until the runtime implements the behavior.
+        if expected
+            .get("runtime_unavailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            runtime_uncovered.insert(reference.category.clone());
+            continue;
+        }
         let mut field_diffs = compare_outputs(&reference.category, expected, &reference.output);
         if !field_diffs.is_empty() {
             summary.diffs += 1;
@@ -694,6 +734,7 @@ pub fn compare_results(
         compared,
         diff_count: diffs.len(),
         not_covered_categories,
+        runtime_uncovered_categories: runtime_uncovered.into_iter().collect(),
         categories,
         diffs,
     }

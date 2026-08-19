@@ -16,10 +16,12 @@ The differential oracle breaks that loop:
   runs on **real Windows 10/11** and executes test vectors with **real Win32
   and CRT calls** — it never reimplements semantics, it *is* Windows;
 * the **host harness** (`src/bin/casa1-oracle.rs`) generates the same vectors
-  and computes Casa1-side results with the **model** implementations in
-  `src/oracle_model.rs`, which is explicitly marked
-  `MODEL ONLY — not Windows truth`;
-* the harness **compares** the two result sets and fails on any diff.
+  and computes the **Casa1 runtime's own behavior** per vector (the
+  emulated-Casa1 candidate);
+* the harness **compares** the runtime candidate against the captured
+  reference results and fails on any diff.  There is NO Casa1-side semantic
+  model: the reference executable is the only truth, and categories the
+  runtime cannot compute yet are reported honestly as `runtime_unavailable`.
 
 ## 2. Architecture
 
@@ -33,12 +35,10 @@ windows_reference/            standalone Cargo crate (workspace-excluded,
 
 src/windows_oracle.rs         wire schema, deterministic corpus generator,
                               comparison engine (protocol, NOT semantics)
-src/oracle_model.rs           MODEL ONLY — not Windows truth: the fallback
-                              semantic implementations (legacy section2/3
-                              models + per-category predictors)
-src/bin/casa1-oracle.rs       harness only: suite generation (section2/3),
-                              `vectors`, `model-results`, `compare`, and the
-                              CASA1_WINDOWS_REFERENCE_* env modes
+src/oracle_suites.rs          suite data contracts derived from the captured
+                              reference results (consumed by sections 2/3)
+src/bin/casa1-oracle.rs       harness only: `vectors`, `compare`, `api-report`,
+                              and the CASA1_WINDOWS_REFERENCE_* env modes
 
 tests/section42_windows_oracle.rs
 tests/fixtures/section42/golden_windows_reference_results.json
@@ -73,15 +73,14 @@ it) and every vector reports `unsupported_platform`, which the comparison
 flags as a diff — a non-Windows reference is never mistaken for Windows
 truth.
 
-### 2.2. Casa1 model = fallback only
+### 2.2. No Casa1-side semantic model
 
-`src/oracle_model.rs` opens with `// MODEL ONLY — not Windows truth.` and
-contains:
-
-* the legacy section2/section3 models (`oracle_parse_windows_path`,
-  `oracle_fold_key`, `share_conflict`, `oracle_load_order`,
-  `oracle_api_set_resolve`, …), unchanged in behavior so
-  `tests/section2.rs` / `tests/section3.rs` stay stable;
+The Casa1-side model (`src/oracle_model.rs`) was REMOVED entirely: a test
+comparing Casa1 behavior against Casa1-computed expectations is not Windows
+conformance.  The suite shapes the section tests consume
+(`src/oracle_suites.rs`) are derived exclusively from the captured
+reference results; categories the reference does not yet cover make the
+corresponding tests skip with a clear message.
 * per-category predictors (`predict(category, input) -> Value`) used by the
   comparison mode.
 
@@ -187,16 +186,15 @@ across Windows 10/11 x64 machines:
 ## 4. Harness commands
 
 ```
-casa1-oracle section2-* | section3-*        legacy suites (unchanged shapes)
 casa1-oracle vectors --out vectors.json [--categories a,b,c]
-casa1-oracle model-results --vectors v.json --out m.json [--categories ...]
 casa1-oracle compare --results r.json [--vectors v.json] [--categories ...]
                [--report-only]
+casa1-oracle api-report --out api-completeness.json
 ```
 
-`compare` computes Casa1's model results over the corpus (default corpus
-when `--vectors` is omitted; filtered to the categories present in the
-reference file) and prints a JSON report with per-category summaries and
+`compare` computes the **Casa1 runtime's behavior** per vector (default
+corpus when `--vectors` is omitted; filtered to the categories present in
+the reference file) and prints a JSON report with per-category summaries and
 per-field diffs. It exits `1` on any diff unless `--report-only`.
 
 Environment-driven modes (ad-hoc use on a Windows host):
@@ -206,9 +204,8 @@ Environment-driven modes (ad-hoc use on a Windows host):
 * `CASA1_WINDOWS_REFERENCE_RESULTS=<file>` — the harness compares against an
   existing reference results file.
 
-`model-results` writes the capture header with `capture_date:
-"model-generated"` and a `MODEL-GENERATED placeholder` note, so bootstrap
-fixtures can never be mistaken for real Windows captures.
+(There is no `model-results` command: the harness never computes expected
+values itself.)
 
 ### 4.1. Golden fixture
 
@@ -217,10 +214,11 @@ checked-in reference-results file covering the `path_normalize`,
 `case_fold`, and `file_sharing` vectors. It carries the capture header
 (`source: "windows"`, `captured_by: "casa1-windows-reference"`) and is
 currently **model-generated** — the first real Windows capture (CI artifact)
-is the authoritative replacement. `tests/section42_windows_oracle.rs`
-validates that the golden file compares clean and that mutations are
-detected; the section42 tests also prove the model-vs-model round trip and
-the fail-loud non-Windows stub behavior.
+is the authoritative replacement. `tests/section42_windows_oracle.rs` validates that the golden file compares
+clean and that mutations are detected; the tests also prove the fail-loud
+non-Windows stub behavior.  The reference-results consumers
+(`tests/support::reference_results`) REFUSE model-generated placeholders —
+the differential tests skip until a real Windows capture is available.
 
 ## 5. Adding a category
 
@@ -229,8 +227,9 @@ the fail-loud non-Windows stub behavior.
    categories out).
 2. Add input/output shapes and a generator arm (`generate_category`) in
    `src/windows_oracle.rs`.
-3. Add the model predictor arm in `src/oracle_model.rs` (`predict` +
-   `model_*`), staying within the documented determinism scope.
+3. Add the Casa1 runtime candidate arm in `src/windows_oracle.rs`
+   (`compute_runtime_result`), returning `runtime_unavailable` until the
+   runtime behavior is implemented — never a fabricated pass.
 4. Add the executor arm in `windows_reference/src/win32.rs` using real
    Win32/CRT calls only (and mirror any new input structs).
 5. Add output-shape and determinism notes to this document and to the schema

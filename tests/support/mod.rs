@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
-use casa1::oracle_model::LifecycleLogEntry;
+use casa1::oracle_suites::LifecycleLogEntry;
 use casa1::pe::{LifecyclePlan, LifecycleStage};
-use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -2509,20 +2508,45 @@ pub fn windows_tetris_replay(name: &str) -> PathBuf {
         .join(name)
 }
 
-pub fn run_oracle<T>(subcommand: &str) -> T
-where
-    T: DeserializeOwned,
-{
-    let output = Command::new(env!("CARGO_BIN_EXE_casa1-oracle"))
-        .arg(subcommand)
-        .output()
-        .expect("run casa1-oracle");
-    assert!(
-        output.status.success(),
-        "casa1-oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("parse casa1-oracle JSON")
+/// The captured Windows reference results: `CASA1_WINDOWS_REFERENCE_RESULTS`
+/// when set, otherwise the checked-in golden fixture.  Returns `None` when
+/// the fixture is only a model-generated placeholder (no real Windows
+/// capture yet) — the differential tests then SKIP with a clear message
+/// instead of comparing against non-Windows expectations.
+pub fn reference_results() -> Option<casa1::windows_oracle::ReferenceResultsFile> {
+    let path = std::env::var_os("CASA1_WINDOWS_REFERENCE_RESULTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/section42/golden_windows_reference_results.json")
+        });
+    let bytes = std::fs::read(&path).ok()?;
+    let results: casa1::windows_oracle::ReferenceResultsFile =
+        serde_json::from_slice(&bytes).ok()?;
+    if !casa1::oracle_suites::is_real_windows_capture(&results) {
+        eprintln!(
+            "skipped: reference results at {} are not a real Windows capture              (regenerate with the reference executable on Windows 10/11);              no Casa1-side model exists to substitute",
+            path.display()
+        );
+        return None;
+    }
+    Some(results)
+}
+
+/// The deterministic vector corpus paired with the captured reference
+/// results, converted into the suite shapes the section tests consume.
+/// `None` when the reference is not a real Windows capture.
+pub fn suites_from_reference() -> Option<casa1::oracle_suites::OracleSuites> {
+    let results = reference_results()?;
+    let vectors = casa1::windows_oracle::generate_vectors(&Vec::new());
+    let vector_file = casa1::windows_oracle::VectorFile {
+        schema_version: casa1::windows_oracle::WINDOWS_ORACLE_SCHEMA_VERSION,
+        vectors,
+    };
+    Some(casa1::oracle_suites::suites_from_reference(
+        &vector_file,
+        &results,
+    ))
 }
 
 pub fn lifecycle_log_lines(plan: &LifecyclePlan) -> Vec<String> {

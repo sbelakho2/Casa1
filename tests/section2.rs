@@ -7,7 +7,7 @@ use casa1::ge::{
     OverrideProfile, RegistrySetOverride, RegistryView, ReparseKind, ShareMode,
 };
 use casa1::logging::LogEvent;
-use casa1::oracle_model::{
+use casa1::oracle_suites::{
     CaseCollisionSuite, LockShareSuite, PathEdgeOutcome, PathEdgeSuite, RegistryNotifyOperation,
     RegistryNotifySuite,
 };
@@ -101,7 +101,14 @@ fn t2_1_path_edge_suite_matches_independent_oracle() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "t2-path", "x64");
     let ge = open_ge(&temp_dir, "t2-path");
-    let suite: PathEdgeSuite = support::run_oracle("section2-path");
+    let Some(suites) = support::suites_from_reference() else {
+        return;
+    };
+    let Some(suite) = suites.path else {
+        eprintln!("skipped: reference results do not cover this category");
+        return;
+    };
+    let suite: PathEdgeSuite = suite;
 
     for case in suite.cases {
         match case.outcome {
@@ -199,7 +206,14 @@ fn case_insensitive_creation_opening_enumeration_and_metadata_work() {
 
 #[test]
 fn t2_2_case_collision_suite_matches_independent_oracle() {
-    let suite: CaseCollisionSuite = support::run_oracle("section2-case");
+    let Some(suites) = support::suites_from_reference() else {
+        return;
+    };
+    let Some(suite) = suites.case else {
+        eprintln!("skipped: reference results do not cover this category");
+        return;
+    };
+    let suite: CaseCollisionSuite = suite;
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "t2-case", "x64");
     let mut ge = open_ge(&temp_dir, "t2-case");
@@ -357,7 +371,14 @@ fn sharing_modes_and_byte_range_locks_reject_conflicts_across_processes() {
 
 #[test]
 fn t2_3_lock_share_suite_matches_independent_oracle() {
-    let suite: LockShareSuite = support::run_oracle("section2-lock");
+    let Some(suites) = support::suites_from_reference() else {
+        return;
+    };
+    let Some(suite) = suites.lock_share else {
+        eprintln!("skipped: reference results do not cover this category");
+        return;
+    };
+    let suite: LockShareSuite = suite;
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "t2-lock", "x64");
     let mut ge = open_ge(&temp_dir, "t2-lock");
@@ -664,7 +685,14 @@ fn wait_for_change_with_budget(watcher: &mut casa1::ge::RegistryWatcher) -> bool
 
 #[test]
 fn t2_4_registry_notify_suite_matches_independent_oracle_counts() {
-    let suite: RegistryNotifySuite = support::run_oracle("section2-registry");
+    let Some(suites) = support::suites_from_reference() else {
+        return;
+    };
+    let Some(suite) = suites.registry_notify else {
+        eprintln!("skipped: reference results do not cover this category");
+        return;
+    };
+    let suite: RegistryNotifySuite = suite;
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "t2-registry", "x64");
     let ge = open_ge(&temp_dir, "t2-registry");

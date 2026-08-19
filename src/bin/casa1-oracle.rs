@@ -1,22 +1,17 @@
 //! Casa1 differential-oracle harness.
 //!
-//! This binary is ONLY the harness: suite generation (legacy section2/section3
-//! expectations), differential vector corpus generation, and result
-//! comparison. All semantic Windows implementations live in
-//! `casa1::oracle_model` (MODEL ONLY — not Windows truth) or in the
-//! standalone reference executable `windows_reference/`.
+//! This binary is ONLY the harness: differential vector corpus generation
+//! and result comparison.  ALL semantic Windows truth lives in the
+//! standalone reference executable `windows_reference/` that runs on real
+//! Windows 10/11 — there is deliberately NO Casa1-side semantic model.
 //!
 //! Modes:
-//!   - `section2-*` / `section3-*`: legacy expectation suites (unchanged
-//!     output shape, consumed by tests/section2.rs and tests/section3.rs).
 //!   - `vectors --out <path>`: write the deterministic differential vector
 //!     corpus (schema_version 1).
-//!   - `model-results --vectors <path> --out <path>`: compute Casa1's
-//!     expected results with the model implementations (bootstrap/golden
-//!     fixtures; never Windows truth).
 //!   - `compare --results <path> [--vectors <path>] [--categories ...]
-//!     [--report-only]`: compare Casa1's model results against reference
-//!     results; exits non-zero on any diff (unless --report-only).
+//!     [--report-only]`: run the Casa1 RUNTIME behavior per vector and
+//!     compare against the captured reference results; exits non-zero on
+//!     any diff (unless --report-only).
 //!
 //! Environment-driven comparison (for ad-hoc use on a Windows host):
 //!   - `CASA1_WINDOWS_REFERENCE_RESULTS=<path>`: compare against an existing
@@ -24,17 +19,11 @@
 //!   - `CASA1_WINDOWS_REFERENCE_EXE=<path>`: run the reference executable on
 //!     the generated corpus and compare its output.
 
-use casa1::oracle_model::{
-    ApiSetSuite, CaseCollisionSuite, DelayLoadSuite, DllOrderSuite, ExportSpec, ExportSpecTarget,
-    LockShareSuite, PathEdgeSuite, RegistryNotifyOperation, RegistryNotifySuite,
-    resolve_delay_expectation,
-};
 use casa1::windows_oracle::{
-    self, CaptureHeader, ComparisonReport, ReferenceResultsFile, VectorFile, VectorResult,
-    WINDOWS_ORACLE_SCHEMA_VERSION,
+    self, ComparisonReport, ReferenceResultsFile, VectorFile, WINDOWS_ORACLE_SCHEMA_VERSION,
 };
 use clap::{Parser, Subcommand};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -46,20 +35,6 @@ struct OracleCli {
 
 #[derive(Debug, Subcommand)]
 enum OracleCommand {
-    #[command(name = "section2-path")]
-    Section2Path,
-    #[command(name = "section2-case")]
-    Section2Case,
-    #[command(name = "section2-lock")]
-    Section2Lock,
-    #[command(name = "section2-registry")]
-    Section2Registry,
-    #[command(name = "section3-dll-order")]
-    Section3DllOrder,
-    #[command(name = "section3-delay-load")]
-    Section3DelayLoad,
-    #[command(name = "section3-apiset")]
-    Section3ApiSet,
     /// Emit api-completeness.json for the quantitative Windows API
     /// completeness database (per-DLL counts + production-gate violations).
     #[command(name = "api-report")]
@@ -76,22 +51,10 @@ enum OracleCommand {
         #[arg(long)]
         categories: Option<String>,
     },
-    /// Compute Casa1's expected results with the MODEL implementations and
-    /// write them as a results file. For bootstrapping golden fixtures only;
-    /// the output is explicitly marked as model-generated, never Windows
-    /// truth.
-    ModelResults {
-        #[arg(long)]
-        vectors: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-        /// Comma-separated category filter (default: all categories in the
-        /// vector file).
-        #[arg(long)]
-        categories: Option<String>,
-    },
-    /// Compare Casa1's model results against reference results. Exits 1 on
-    /// any diff unless --report-only.
+    /// Compare the Casa1 runtime's behavior per vector against the captured
+    /// Windows reference results. Exits 1 on any diff unless --report-only.
+    /// The reference results are the ONLY semantic truth — there is no
+    /// Casa1-side model to fall back on.
     Compare {
         /// Reference results file (reference exe output or golden fixture).
         #[arg(long)]
@@ -118,21 +81,11 @@ fn main() {
     if run_env_driven_comparison() {
         return;
     }
-    if run_env_driven_comparison() {
-        return;
-    }
     match cli.command {
         OracleCommand::ApiReport { .. } => {
             // Handled by the pre-match special case above.
             unreachable!("ApiReport is handled before the match")
         }
-        OracleCommand::Section2Path => print_suite(&section2_path_suite()),
-        OracleCommand::Section2Case => print_suite(&section2_case_suite()),
-        OracleCommand::Section2Lock => print_suite(&section2_lock_suite()),
-        OracleCommand::Section2Registry => print_suite(&section2_registry_suite()),
-        OracleCommand::Section3DllOrder => print_suite(&section3_dll_order_suite()),
-        OracleCommand::Section3DelayLoad => print_suite(&section3_delay_load_suite()),
-        OracleCommand::Section3ApiSet => print_suite(&section3_api_set_suite()),
         OracleCommand::Vectors { out, categories } => {
             let vectors = windows_oracle::generate_vectors(&parse_categories(categories));
             let file = VectorFile {
@@ -140,26 +93,6 @@ fn main() {
                 vectors,
             };
             write_json_file_or_stdout(out, &file, "vector corpus");
-        }
-        OracleCommand::ModelResults {
-            vectors,
-            out,
-            categories,
-        } => {
-            let vector_file = read_vector_file(&vectors);
-            let wanted = parse_categories(categories);
-            let filtered = vector_file
-                .vectors
-                .iter()
-                .filter(|vector| wanted.is_empty() || wanted.contains(&vector.category))
-                .cloned()
-                .collect::<Vec<_>>();
-            let results = write_results_file(&out, &filtered);
-            eprintln!(
-                "model-results: wrote {} results to {}",
-                results.len(),
-                out.display()
-            );
         }
         OracleCommand::Compare {
             results,
@@ -269,8 +202,11 @@ fn run_comparison(
             .filter(|vector| wanted.contains(&vector.category))
             .collect()
     };
-    let model_results = windows_oracle::compute_model_results(&vectors);
-    windows_oracle::compare_results(&vectors, &model_results, &reference_file.results)
+    let runtime_results = vectors
+        .iter()
+        .map(windows_oracle::compute_runtime_result)
+        .collect::<Vec<_>>();
+    windows_oracle::compare_results(&vectors, &runtime_results, &reference_file.results)
 }
 
 fn print_report(report: &ComparisonReport) {
@@ -289,271 +225,7 @@ fn print_report(report: &ComparisonReport) {
     }
 }
 
-// ── Results-file writer (model results with capture header) ────────────────
-
-fn write_results_file(
-    out: &PathBuf,
-    vectors: &[casa1::windows_oracle::Vector],
-) -> Vec<VectorResult> {
-    let results = windows_oracle::compute_model_results(vectors);
-    let file = ReferenceResultsFile {
-        schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
-        capture: CaptureHeader::model_generated(),
-        results,
-    };
-    write_json_file(out, &file, "model results");
-    file.results
-}
-
-// ── Legacy suite generation (unchanged output shapes) ──────────────────────
-
-fn section2_path_suite() -> PathEdgeSuite {
-    let long_path = format!(
-        "C:\\{}",
-        (0..40)
-            .map(|index| format!("segment{index:02}"))
-            .collect::<Vec<_>>()
-            .join("\\")
-    );
-    PathEdgeSuite {
-        cases: vec![
-            (
-                "C:\\Alpha\\Beta\\.\\Gamma\\..\\File.txt. ".to_string(),
-                false,
-            ),
-            ("\\\\?\\C:\\Alpha\\Beta. ".to_string(), false),
-            ("\\\\.\\pipe\\steam".to_string(), false),
-            ("C:\\Temp\\NUL".to_string(), false),
-            (long_path.clone(), false),
-            (long_path, true),
-        ]
-        .into_iter()
-        .map(|(input, long_paths_enabled)| {
-            use casa1::oracle_model::PathEdgeCase;
-            PathEdgeCase {
-                outcome: casa1::oracle_model::oracle_parse_windows_path(&input, long_paths_enabled),
-                input,
-                long_paths_enabled,
-            }
-        })
-        .collect(),
-    }
-}
-
-fn section2_case_suite() -> CaseCollisionSuite {
-    use casa1::oracle_model::{OracleDirectory, RC_FS_ALREADY_EXISTS};
-    let mut directory = OracleDirectory::default();
-    directory.create("ReadMe.TXT").expect("ASCII insert");
-    directory.create("Σ.txt").expect("unicode insert");
-    let unicode_collision_code = directory.create("ς.txt").expect_err("collision");
-    let resolved_unicode_name = directory.resolve("ς.txt").expect("resolve unicode");
-    CaseCollisionSuite {
-        create_directory: "C:\\Case".to_string(),
-        collision_directory: "C:\\case".to_string(),
-        ascii_file: "C:\\Case\\ReadMe.TXT".to_string(),
-        unicode_file: "C:\\Case\\Σ.txt".to_string(),
-        unicode_lookup: "C:\\case\\ς.txt".to_string(),
-        enumeration_path: "C:\\CASE".to_string(),
-        directory_collision_code: RC_FS_ALREADY_EXISTS,
-        unicode_collision_code,
-        resolved_unicode_path: format!("C:\\case\\{}", resolved_unicode_name.to_lowercase()),
-        enumeration: directory.enumeration(),
-    }
-}
-
-fn section2_lock_suite() -> LockShareSuite {
-    use casa1::oracle_model::{
-        OracleFileAccess, OracleOpenState, OracleShareMode, RC_FS_LOCK_VIOLATION,
-        RC_FS_SHARING_VIOLATION, ranges_overlap, share_conflict,
-    };
-    let first = OracleOpenState {
-        desired_access: OracleFileAccess {
-            read: true,
-            write: true,
-            delete: false,
-        },
-        share_mode: OracleShareMode {
-            read: false,
-            write: false,
-            delete: false,
-        },
-    };
-    let second_access = OracleFileAccess {
-        read: true,
-        write: false,
-        delete: false,
-    };
-    let second_share = OracleShareMode {
-        read: true,
-        write: true,
-        delete: true,
-    };
-    LockShareSuite {
-        path: "C:\\Locks\\data.bin".to_string(),
-        share_violation_code: if share_conflict(&first, second_access, second_share) {
-            RC_FS_SHARING_VIOLATION
-        } else {
-            0
-        },
-        lock_violation_code: if ranges_overlap(0, 8, 4, 4) {
-            RC_FS_LOCK_VIOLATION
-        } else {
-            0
-        },
-        first_lock_offset: 0,
-        first_lock_length: 8,
-        overlap_offset: 4,
-        overlap_length: 4,
-    }
-}
-
-fn section2_registry_suite() -> RegistryNotifySuite {
-    let operations = vec![
-        RegistryNotifyOperation::Set {
-            value: "Alpha".to_string(),
-            value_type: "REG_SZ".to_string(),
-            data: serde_json::json!("one"),
-        },
-        RegistryNotifyOperation::Set {
-            value: "Beta".to_string(),
-            value_type: "REG_DWORD".to_string(),
-            data: serde_json::json!(7),
-        },
-        RegistryNotifyOperation::Delete {
-            value: "Alpha".to_string(),
-        },
-    ];
-    RegistryNotifySuite {
-        hive: "HKCU".to_string(),
-        key: "Software\\Casa1\\OracleNotify".to_string(),
-        recursive: true,
-        expected_wake_count: operations.len() as u64,
-        operations,
-    }
-}
-
-fn section3_dll_order_suite() -> DllOrderSuite {
-    use casa1::oracle_model::{oracle_lifecycle_log_lines, oracle_load_order};
-    let dependencies = BTreeMap::from([
-        (
-            "game.exe".to_string(),
-            vec!["kernel32.dll".to_string(), "user32.dll".to_string()],
-        ),
-        ("user32.dll".to_string(), vec!["gdi32.dll".to_string()]),
-        ("gdi32.dll".to_string(), Vec::new()),
-        ("kernel32.dll".to_string(), Vec::new()),
-    ]);
-    let tls_callbacks = BTreeMap::from([
-        ("kernel32.dll".to_string(), vec![0x1800_2000]),
-        ("game.exe".to_string(), vec![0x1400_1010]),
-    ]);
-    let load_order = oracle_load_order("game.exe", &dependencies);
-    DllOrderSuite {
-        root_module: "game.exe".to_string(),
-        dependencies,
-        tls_callbacks: tls_callbacks.clone(),
-        expected_log_lines: oracle_lifecycle_log_lines(&load_order, &tls_callbacks),
-    }
-}
-
-fn section3_delay_load_suite() -> DelayLoadSuite {
-    use casa1::oracle_model::{
-        DelayLoadCase, DelayLoadExpectation, DelayLoadSymbol, STATUS_DLL_NOT_FOUND,
-        STATUS_ENTRYPOINT_NOT_FOUND,
-    };
-    let resolved_provider_exports = BTreeMap::from([
-        (
-            "kernel32.dll".to_string(),
-            vec![ExportSpec {
-                ordinal: 18,
-                name: Some("Forwarded".to_string()),
-                target: ExportSpecTarget::Forwarder {
-                    value: "KERNELBASE.Sleep".to_string(),
-                },
-            }],
-        ),
-        (
-            "kernelbase.dll".to_string(),
-            vec![ExportSpec {
-                ordinal: 1,
-                name: Some("Sleep".to_string()),
-                target: ExportSpecTarget::Rva { value: 0x2500 },
-            }],
-        ),
-    ]);
-    DelayLoadSuite {
-        cases: vec![
-            DelayLoadCase {
-                scenario: "resolved_forwarder".to_string(),
-                requested_module: "kernel32.dll".to_string(),
-                symbol: DelayLoadSymbol::ByName {
-                    name: "Forwarded".to_string(),
-                },
-                expected: resolve_delay_expectation(
-                    "kernel32.dll",
-                    &DelayLoadSymbol::ByName {
-                        name: "Forwarded".to_string(),
-                    },
-                    &resolved_provider_exports,
-                ),
-                provider_exports: resolved_provider_exports,
-            },
-            DelayLoadCase {
-                scenario: "missing_provider".to_string(),
-                requested_module: "missing.dll".to_string(),
-                symbol: DelayLoadSymbol::ByName {
-                    name: "Forwarded".to_string(),
-                },
-                expected: DelayLoadExpectation::StructuredException {
-                    code: STATUS_DLL_NOT_FOUND,
-                },
-                provider_exports: BTreeMap::new(),
-            },
-            DelayLoadCase {
-                scenario: "missing_entrypoint".to_string(),
-                requested_module: "kernel32.dll".to_string(),
-                symbol: DelayLoadSymbol::ByName {
-                    name: "Forwarded".to_string(),
-                },
-                expected: DelayLoadExpectation::StructuredException {
-                    code: STATUS_ENTRYPOINT_NOT_FOUND,
-                },
-                provider_exports: BTreeMap::from([("kernel32.dll".to_string(), Vec::new())]),
-            },
-        ],
-    }
-}
-
-fn section3_api_set_suite() -> ApiSetSuite {
-    use casa1::oracle_model::{ApiSetCase, oracle_api_set_resolve};
-    ApiSetSuite {
-        cases: [
-            "api-ms-win-core-file-l1-1-0.dll",
-            "api-ms-win-core-com-l1-1-0.dll",
-            "api-ms-win-crt-runtime-l1-1-0.dll",
-            "ext-ms-win-ntuser-window-l1-1-0.dll",
-            "custom.dll",
-        ]
-        .into_iter()
-        .map(|contract| ApiSetCase {
-            contract: contract.to_string(),
-            expected_host: oracle_api_set_resolve(contract),
-        })
-        .collect(),
-    }
-}
-
 // ── Shared helpers ──────────────────────────────────────────────────────────
-
-fn print_suite<T: serde::Serialize>(suite: &T) {
-    match serde_json::to_string(suite) {
-        Ok(json) => println!("{json}"),
-        Err(error) => {
-            eprintln!("failed to encode oracle suite: {error}");
-            std::process::exit(1);
-        }
-    }
-}
 
 fn parse_categories(categories: Option<String>) -> Vec<String> {
     match categories {

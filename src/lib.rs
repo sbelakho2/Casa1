@@ -125,7 +125,6 @@
 //! - [`live`] — Live guest process management
 //! - [`runner`] — Guest process runner and I/O multiplexing
 //! - [`guest_support`] — Guest-side support library
-//! - [`oracle_model`] — CPUID/model oracle for guest identification
 //! - [`cef_bridge`] — Chromium Embedded Framework bridge
 //! - [`webview2`] — WebView2 API translation
 //! - [`mac_window`] — macOS native window integration
@@ -187,7 +186,7 @@ pub mod metal_backend;
 pub mod metal_renderer;
 pub mod midi;
 pub mod network;
-pub mod oracle_model;
+pub mod oracle_suites;
 pub mod pe;
 pub mod pe_runtime;
 pub mod perf;

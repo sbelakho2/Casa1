@@ -8,10 +8,12 @@ name: windows-oracle
 #   2. reference-capture (Windows) — builds windows_reference and runs the
 #      REAL Windows reference executable over the corpus; uploads the
 #      canonical results artifact.
-#   3. compare (macOS) — computes Casa1's model results over the same corpus
-#      and compares them against the Windows-captured results. The job
-#      FAILS on any diff: the reference executable is Windows truth, the
-#      model is only a fallback.
+#   3. compare (macOS) — computes the Casa1 RUNTIME's behavior per vector
+#      over the same corpus and compares against the Windows-captured
+#      results. The job FAILS on any diff: the reference executable is the
+#      ONLY semantic truth (the Casa1-side model was removed entirely);
+#      categories the runtime cannot compute yet are reported honestly as
+#      runtime-uncovered, never as passes.
 #
 # The checked-in golden fixture (tests/fixtures/section42) is validated by
 # the regular `cargo test --tests` run (tests/section42_windows_oracle.rs).
