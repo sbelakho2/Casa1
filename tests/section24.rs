@@ -10,12 +10,12 @@
 //! Phase 24.2 extends the model with implementation-quality coverage: every
 //! Steam import is classified against the canonical [`ThunkMetadata`] table
 //! ([`crate::host_thunks::THUNK_METADATA`]) as Implemented / Partial / Stub /
-//! Unsupported, and the release requirement *"no runtime-reached
-//! Steam-critical API is Stub or Unsupported"* is encoded as an assertion over
-//! the INVOKED set only (an empty invoked set is trivially satisfied but
-//! reported).  The tracked fixture
+//! Unsupported, and the release requirement *"no runtime-reached Required
+//! (user-mode-profile) API is Stub or Unsupported"* is encoded as an
+//! assertion over the runtime-reached set only (an empty set is trivially
+//! satisfied but reported).  The tracked fixture
 //! ([`Steam.exe`](ges/steam/drive_c/Steam/Steam.exe)) drives the always-on
-//! model; trace-derived invoked sets come from the GE smoke runs.
+//! model; trace-derived runtime-reached sets come from the GE smoke runs.
 //!
 //! These tests require the Steam GE at `ges/steam-live-run-x86/` with
 //! `Steam.exe`.  If the GE is not present, tests are skipped at runtime with a
@@ -26,10 +26,12 @@
 //! cargo test t24_ -- --nocapture
 //! ```
 
+use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::ge::GameEnvironment;
 use casa1::host_thunks::ImplementationLevel;
 use casa1::import_coverage::{
-    SteamCoverageReport, coverage_for_steam_fixture_with_invoked, invoked_api_names_from_trace,
+    BinaryCoverageReport, WorkloadId, coverage_for_pe_with_runtime_trace,
+    invoked_api_names_from_trace,
 };
 use casa1::pe::{self, ApiSetResolver, ImportSymbol};
 use casa1::pe_runtime::{self, PeExecutionOptions, PeExecutionResult, is_import_supported};
@@ -734,12 +736,12 @@ fn tracked_steam_exe() -> PathBuf {
 /// The report is printed twice: a compact per-entry listing (all imported
 /// APIs, (a)) and the JSON serialization, so the full structured report is
 /// visible under `--nocapture`.
-fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
+fn print_quality_telemetry(label: &str, report: &BinaryCoverageReport) {
     eprintln!("\n═══════════════════════════════════════════════════════════════");
     eprintln!("  Steam import quality telemetry [{label}]");
     eprintln!("═══════════════════════════════════════════════════════════════");
-    eprintln!("exe:     {}", report.steam_exe_path);
-    eprintln!("sha256:  {}", report.steam_sha256);
+    eprintln!("binary:  {}", report.binary_path);
+    eprintln!("sha256:  {}", report.image_sha256);
     eprintln!(
         "version: {}",
         report.image_version.as_deref().unwrap_or("<none>")
@@ -765,8 +767,12 @@ fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
             .unwrap_or(0),
     );
     eprintln!(
-        "invoked-in-e2e flag: {}",
-        if report.invoked_in_e2e { "yes" } else { "no" }
+        "runtime-trace flag: {}",
+        if report.runtime_trace_included {
+            "yes"
+        } else {
+            "no"
+        }
     );
 
     // (a) All imported APIs, grouped per DLL, with quality + criticality.
@@ -778,11 +784,16 @@ fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
             eprintln!("  [{current_dll}]");
         }
         eprintln!(
-            "    {:40} {:12} critical={:<5} invoked={}",
-            entry.import,
+            "    {:40} {:12} policy={:<22} reached={}",
+            entry.import.lookup_name(),
             format!("{:?}", entry.implementation),
-            entry.steam_critical,
-            entry.invoked_in_e2e,
+            format!(
+                "{:?}",
+                entry
+                    .support_policy()
+                    .unwrap_or(casa1::host_thunks::SupportPolicy::OptionalFeature)
+            ),
+            entry.runtime_reached,
         );
     }
 
@@ -790,15 +801,17 @@ fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
     let invoked: Vec<_> = report
         .entries
         .iter()
-        .filter(|entry| entry.invoked_in_e2e)
+        .filter(|entry| entry.runtime_reached)
         .collect();
     eprintln!("\n--- (b) actually invoked APIs ({}):", invoked.len());
     for entry in &invoked {
         eprintln!(
-            "    {:40} {:12} critical={}",
-            entry.import,
-            format!("{:?}", entry.implementation),
-            entry.steam_critical,
+            "    {:40} {:12?} policy={:?}",
+            entry.import.lookup_name(),
+            entry.implementation,
+            entry
+                .support_policy()
+                .unwrap_or(casa1::host_thunks::SupportPolicy::OptionalFeature),
         );
     }
 
@@ -814,18 +827,20 @@ fn print_quality_telemetry(label: &str, report: &SteamCoverageReport) {
     for entry in &flagged {
         eprintln!(
             "    {}!{} [{:?}]",
-            entry.dll, entry.import, entry.implementation
+            entry.dll,
+            entry.import.lookup_name(),
+            entry.implementation
         );
     }
 
-    // Release gate (over the invoked set only).
-    let violations = report.invoked_critical_violations();
+    // Release gate (over the runtime-reached set only).
+    let violations = report.runtime_reached_required_violations();
     eprintln!(
-        "\n--- release gate: no invoked Steam-critical API is Stub/Unsupported — violations: {}",
+        "\n--- release gate: no runtime-reached Required API is Stub/Unsupported — violations: {}",
         violations.len()
     );
     if violations.is_empty() && invoked.is_empty() {
-        eprintln!("    (invoked set is empty — gate trivially satisfied but reported)");
+        eprintln!("    (runtime-reached set is empty — gate trivially satisfied but reported)");
     }
 
     eprintln!("\n--- JSON report:");
@@ -846,8 +861,12 @@ fn t24_17_tracked_fixture_import_quality() {
     );
 
     // No E2E trace is available in CI for the tracked fixture, so the
-    // invoked set is empty; t24_18 (ignored, GE smoke) supplies a real one.
-    let report = coverage_for_steam_fixture_with_invoked(&path, &[]).expect("coverage report");
+    // runtime-reached set is empty; t24_18 (ignored, GE smoke) supplies a real
+    // one.
+    let workload = WorkloadId::new("steam-fixture");
+    let target = CompatibilityProfile::win10_legacy_desktop();
+    let report =
+        coverage_for_pe_with_runtime_trace(&path, &workload, target, &[]).expect("coverage report");
 
     print_quality_telemetry("tracked-fixture (invoked set: empty)", &report);
 
@@ -863,22 +882,22 @@ fn t24_17_tracked_fixture_import_quality() {
         "every import must be classified"
     );
 
-    // (b) Invoked set: empty (no trace) — reported, not asserted.
+    // (b) Runtime-reached set: empty (no trace) — reported, not asserted.
     assert!(
-        report.entries.iter().all(|entry| !entry.invoked_in_e2e),
-        "invoked_in_e2e must be false without a trace"
+        report.entries.iter().all(|entry| !entry.runtime_reached),
+        "runtime_reached must be false without a trace"
     );
 
-    // (c) Invoked Partial/Stub/Unsupported: empty (nothing invoked).
-    // Release requirement: encoded ONLY over the invoked set.
-    let violations = report.invoked_critical_violations();
+    // (c) Runtime-reached Partial/Stub/Unsupported: empty (nothing reached).
+    // Release requirement: encoded ONLY over the runtime-reached set.
+    let violations = report.runtime_reached_required_violations();
     assert!(
         violations.is_empty(),
-        "invoked Steam-critical API is Stub/Unsupported: {:#?}",
+        "runtime-reached Required API is Stub/Unsupported: {:#?}",
         violations
     );
     eprintln!(
-        "  ✓ t24_17: release gate over invoked set PASSES ({} violation(s); invoked set empty => trivially satisfied but reported)",
+        "  ✓ t24_17: release gate over runtime-reached set PASSES ({} violation(s); set empty => trivially satisfied but reported)",
         violations.len()
     );
 }
@@ -901,20 +920,22 @@ fn t24_18_tracked_fixture_import_quality_with_trace() {
     );
 
     let path = tracked_steam_exe();
-    let report = coverage_for_steam_fixture_with_invoked(&path, &invoked)
-        .expect("coverage report with invoked set");
+    let workload = WorkloadId::new("steam-fixture");
+    let target = CompatibilityProfile::win10_legacy_desktop();
+    let report = coverage_for_pe_with_runtime_trace(&path, &workload, target, &invoked)
+        .expect("coverage report with runtime trace");
 
     print_quality_telemetry("tracked-fixture (invoked set: smoke trace)", &report);
 
-    // (b) The invoked set is non-empty and reflected in the report.
+    // (b) The runtime-reached set is non-empty and reflected in the report.
     let invoked_entries: Vec<_> = report
         .entries
         .iter()
-        .filter(|entry| entry.invoked_in_e2e)
+        .filter(|entry| entry.runtime_reached)
         .collect();
     assert!(
         !invoked_entries.is_empty(),
-        "smoke trace produced no invoked imports"
+        "smoke trace produced no runtime-reached imports"
     );
 
     // (c) Report the invoked APIs whose quality is not Implemented.
@@ -928,20 +949,25 @@ fn t24_18_tracked_fixture_import_quality_with_trace() {
     );
     for entry in &flagged {
         eprintln!(
-            "  - {}!{} [{:?}] critical={}",
-            entry.dll, entry.import, entry.implementation, entry.steam_critical
+            "  - {}!{} [{:?}] policy={:?}",
+            entry.dll,
+            entry.import.lookup_name(),
+            entry.implementation,
+            entry
+                .support_policy()
+                .unwrap_or(casa1::host_thunks::SupportPolicy::OptionalFeature),
         );
     }
 
-    // Release requirement: over the INVOKED set only.
-    let violations = report.invoked_critical_violations();
+    // Release requirement: over the RUNTIME-REACHED set only.
+    let violations = report.runtime_reached_required_violations();
     assert!(
         violations.is_empty(),
-        "a runtime-reached Steam-critical API is Stub or Unsupported: {:#?}",
+        "a runtime-reached Required API is Stub or Unsupported: {:#?}",
         violations
     );
     eprintln!(
-        "  ✓ t24_18: release gate over the real invoked set PASSES ({} violation(s))",
+        "  ✓ t24_18: release gate over the real runtime-reached set PASSES ({} violation(s))",
         violations.len()
     );
 }

@@ -8,13 +8,24 @@
 //! api-completeness.json report shape, and the `casa1-oracle api-report
 //! --gate` enforcement.
 
+use casa1::api_coverage::coverage_evidence_for;
 use casa1::api_database::{
-    ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, ArchSet, CoverageLevel,
-    WindowsVersion, global_database,
+    ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, ArchSet, CompatibilityTier,
+    CoverageLevel, WindowsVersion, global_database,
 };
-use casa1::host_thunks::ImplementationLevel;
+use casa1::compatibility_profile::CompatibilityProfile;
+use casa1::host_thunks::{ImplementationLevel, SupportPolicy};
+use casa1::import_coverage::{WorkloadId, coverage_for_pe, coverage_for_pe_with_runtime_trace};
 use serde_json::Value;
 use std::path::Path;
+
+/// The default gate evaluation: the full native user-mode profile.
+fn native_user_mode_gate() -> (CompatibilityTier, CompatibilityProfile) {
+    (
+        CompatibilityTier::NativeUserMode,
+        CompatibilityProfile::win11_native_desktop(),
+    )
+}
 
 /// Path to the tracked Steam.exe fixture (committed to the repo).
 fn tracked_steam_fixture() -> std::path::PathBuf {
@@ -199,7 +210,7 @@ fn shipping_gate_flags_partial_without_specific_reason() {
     // Completeness flags the Partial regardless of the reason.
     assert!(
         database
-            .completeness_gate()
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
             .iter()
             .any(|v| v.export == "PartiallyDone"
                 && v.kind == ApiGateViolationKind::PartialNotCompletenessReady)
@@ -223,7 +234,8 @@ fn shipping_gate_accepts_partial_with_specific_reason() {
         "a Partial with a specific documented reason passes the shipping gate"
     );
     // ... but Partial NEVER passes the completeness gate.
-    let completeness_violations = database.completeness_gate();
+    let completeness_violations =
+        database.completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1);
     assert_eq!(completeness_violations.len(), 2);
     assert!(
         completeness_violations
@@ -268,7 +280,8 @@ fn implemented_without_coverage_fails_both_gates() {
         shipping[0].kind,
         ApiGateViolationKind::ImplementedWithoutCoverage
     );
-    let completeness = database.completeness_gate();
+    let completeness =
+        database.completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1);
     assert_eq!(completeness.len(), 1);
     assert_eq!(
         completeness[0].kind,
@@ -288,7 +301,7 @@ fn implemented_with_unit_coverage_passes_shipping_only() {
         "Unit coverage satisfies the shipping gate"
     );
     assert_eq!(
-        database.completeness_gate()[0].kind,
+        database.completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)[0].kind,
         ApiGateViolationKind::ImplementedWithoutSemanticCoverage,
         "Unit coverage is NOT enough for the completeness gate"
     );
@@ -310,7 +323,9 @@ fn implemented_with_differential_coverage_passes_both_gates() {
         "Differential coverage satisfies the shipping gate"
     );
     assert!(
-        database.completeness_gate().is_empty(),
+        database
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
+            .is_empty(),
         "Differential coverage satisfies the completeness gate"
     );
 }
@@ -327,7 +342,11 @@ fn implemented_with_conformance_coverage_passes_both_gates() {
         )
     });
     assert!(database.shipping_gate().is_empty());
-    assert!(database.completeness_gate().is_empty());
+    assert!(
+        database
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +354,7 @@ fn implemented_with_conformance_coverage_passes_both_gates() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
+fn deliberately_unsupported_clears_shipping_but_not_user_mode_completeness() {
     let mut database = ApiDatabase::new();
     database.add_entry(ApiEntry::new(
         "b.dll",
@@ -350,7 +369,8 @@ fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
 
     // Without registration both fail both gates.
     let shipping = database.shipping_gate();
-    let completeness = database.completeness_gate();
+    let completeness =
+        database.completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1);
     assert_eq!(shipping.len(), 2);
     assert_eq!(completeness.len(), 2);
     for violations in [&shipping, &completeness] {
@@ -367,7 +387,7 @@ fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
     }
 
     // Registering the stub as deliberately unsupported with a guest-visible
-    // compatibility error clears it through BOTH gates.
+    // compatibility error clears it through the SHIPPING gate...
     database.deliberately_unsupported(
         "b.dll",
         "CannedApi",
@@ -386,12 +406,17 @@ fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
             .all(|v| v.export == "MissingApi"),
         "only the unregistered Unsupported entry may violate shipping"
     );
+    // ... but the NativeUserMode COMPLETENESS gate still rejects the
+    // deliberately-unsupported user-mode stub: completeness requires a
+    // working, semantically proven implementation.
     assert!(
         database
-            .completeness_gate()
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
             .iter()
-            .all(|v| v.export == "MissingApi"),
-        "only the unregistered Unsupported entry may violate completeness"
+            .any(|v| v.dll == "b.dll"
+                && v.export == "CannedApi"
+                && v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported),
+        "a deliberately-unsupported user-mode Stub still fails NativeUserMode completeness"
     );
     database.deliberately_unsupported(
         "b.dll",
@@ -399,10 +424,119 @@ fn deliberately_unsupported_passes_both_gates_with_compatibility_error() {
         "No host thunk exists; guest dispatch fails closed",
     );
     assert!(database.shipping_gate().is_empty());
-    assert!(
-        database.completeness_gate().is_empty(),
-        "DeliberatelyUnsupported with a precise compatibility consequence passes both gates"
+    assert_eq!(
+        database
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
+            .len(),
+        2,
+        "both user-mode stubs still fail the NativeUserMode completeness gate"
     );
+}
+
+#[test]
+fn outside_user_mode_profile_entries_are_exempt_from_user_mode_completeness() {
+    let mut database = ApiDatabase::new();
+    database.add_entry(ApiEntry {
+        support_policy: SupportPolicy::OutsideUserModeProfile,
+        ..ApiEntry::new(
+            "ntdll.dll",
+            "NtCreateFile",
+            ImplementationLevel::Unsupported,
+        )
+    });
+    database.add_entry(ApiEntry {
+        support_policy: SupportPolicy::OutsideUserModeProfile,
+        ..ApiEntry::new(
+            "d3d8thk.dll",
+            "D3DKMTCloseAdapter",
+            ImplementationLevel::Unsupported,
+        )
+    });
+    database.add_entry(ApiEntry::new(
+        "kernel32.dll",
+        "RequiredUserApi",
+        ImplementationLevel::Unsupported,
+    ));
+
+    let (tier, profile) = native_user_mode_gate();
+    let violations = database.completeness_gate(tier, &profile);
+    // Only the user-mode entry may violate NativeUserMode.
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].dll, "kernel32.dll");
+    assert_eq!(violations[0].export, "RequiredUserApi");
+
+    // The kernel tier evaluates ONLY the OutsideUserModeProfile entries.
+    let kernel_violations =
+        database.completeness_gate(CompatibilityTier::RestrictedKernel, &profile);
+    assert_eq!(kernel_violations.len(), 2);
+    assert!(
+        kernel_violations
+            .iter()
+            .all(|v| v.dll == "ntdll.dll" || v.dll == "d3d8thk.dll")
+    );
+
+    // The shipping gate also exempts OutsideUserModeProfile entries from the
+    // deliberately-unsupported requirement.
+    assert!(
+        database
+            .shipping_gate()
+            .iter()
+            .all(|v| v.export == "RequiredUserApi"),
+        "kernel-tier entries need no user-mode compatibility error"
+    );
+}
+
+#[test]
+fn optional_feature_entries_pass_when_the_profile_excludes_them() {
+    let mut database = ApiDatabase::new();
+    // An optional-subsystem API (web) that is implemented but not yet
+    // semantically proven, plus an optional Stub in the same subsystem.
+    database.add_entry(ApiEntry {
+        support_policy: SupportPolicy::OptionalFeature,
+        ..ApiEntry::new("winhttp.dll", "WinHttpOpen", ImplementationLevel::Partial)
+    });
+    database.add_entry(ApiEntry {
+        support_policy: SupportPolicy::OptionalFeature,
+        ..ApiEntry::new("wininet.dll", "InternetOpenW", ImplementationLevel::Stub)
+    });
+    // A required API for contrast: never excludable.
+    database.add_entry(ApiEntry::new(
+        "kernel32.dll",
+        "RequiredApi",
+        ImplementationLevel::Partial,
+    ));
+
+    let (tier, full_profile) = native_user_mode_gate();
+    // Full desktop profile: nothing excluded — every entry violates.
+    let violations = database.completeness_gate(tier, &full_profile);
+    assert_eq!(violations.len(), 3);
+
+    // Gaming profile: web excluded — the optional web entries pass.
+    let gaming = CompatibilityProfile::win11_gaming();
+    let violations = database.completeness_gate(tier, &gaming);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].export, "RequiredApi");
+
+    // Legacy desktop profile also excludes web.
+    let legacy = CompatibilityProfile::win10_legacy_desktop();
+    let violations = database.completeness_gate(tier, &legacy);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].export, "RequiredApi");
+
+    // The managed profile also excludes web: one violation again.
+    let managed = CompatibilityProfile::managed_desktop();
+    let violations = database.completeness_gate(tier, &managed);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].export, "RequiredApi");
+
+    // A profile that excludes nothing but graphics leaves the web entries
+    // unevaluated-exempt: all three violate.
+    let custom = CompatibilityProfile {
+        optional_features: std::collections::BTreeSet::from(["graphics".to_string()]),
+        ..CompatibilityProfile::win11_native_desktop()
+    };
+    let violations = database.completeness_gate(tier, &custom);
+    assert_eq!(violations.len(), 3);
 }
 
 #[test]
@@ -413,15 +547,24 @@ fn seeded_deliberately_unsupported_entries_carry_compatibility_errors() {
         .deliberately_unsupported_error("kernel32.dll", "IsDebuggerPresent")
         .expect("IsDebuggerPresent must be seeded as deliberately unsupported");
     assert!(error.contains("FALSE"));
-    // The stub is therefore not a gate violation.
-    for violations in [&database.shipping_gate(), &database.completeness_gate()] {
-        assert!(
-            !violations
-                .iter()
-                .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
-            "deliberately-unsupported stubs must not be flagged"
-        );
-    }
+    // The deliberately-unsupported stub is not a SHIPPING violation ...
+    assert!(
+        !database
+            .shipping_gate()
+            .iter()
+            .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
+        "deliberately-unsupported stubs must not be shipping violations"
+    );
+    // ... but it IS a NativeUserMode completeness violation (user-mode Stub).
+    assert!(
+        database
+            .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
+            .iter()
+            .any(|v| v.dll == "kernel32.dll"
+                && v.export == "IsDebuggerPresent"
+                && v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported),
+        "a user-mode Stub is an honest completeness violation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -562,8 +705,13 @@ fn steam_fixture_scan_consults_database_and_records_workload() {
         "tracked Steam fixture missing at {}",
         path.display()
     );
-    let report =
-        casa1::import_coverage::coverage_for_steam_fixture(&path).expect("fixture coverage scan");
+    let workload = WorkloadId::new("steam");
+    let report = coverage_for_pe(
+        &path,
+        &workload,
+        CompatibilityProfile::win11_native_desktop(),
+    )
+    .expect("fixture coverage scan");
     assert!(report.total_imports > 300);
 
     // The fixture scan consults the database: the classified level of every
@@ -578,13 +726,13 @@ fn steam_fixture_scan_consults_database_and_records_workload() {
         ImplementationLevel::Implemented,
         "the database is the compatibility accounting source"
     );
-    // The scan records the "steam" workload into the entries it reaches.
+    // The scan records the workload into the entries it reaches.
     assert!(
         create_file
             .workloads_reaching
             .iter()
             .any(|workload| workload == "steam"),
-        "the fixture scan must record the steam workload on CreateFileW"
+        "the fixture scan must record the workload on CreateFileW"
     );
 }
 
@@ -636,11 +784,15 @@ fn report_generator_emits_expected_json_shape() {
         implemented + partial + stub + unsupported,
         "level counts must sum to the DLL total"
     );
-    assert_eq!(
+    // The oracle-backed coverage registry seeds Differential coverage for the
+    // kernel32 contracts (CreateFileW, VirtualAlloc, ...): the seeded
+    // database must carry them.
+    assert!(
         summary["differential_tested"]
             .as_u64()
-            .expect("differential_tested"),
-        0
+            .expect("differential_tested")
+            > 0,
+        "the coverage registry must promote oracle-covered kernel32 APIs to Differential"
     );
     assert_eq!(
         summary["conformance_tested"]
@@ -788,4 +940,162 @@ fn api_report_gate_enforces_violations_via_the_binary() {
         "api-report --gate none must exit zero regardless of violations"
     );
     let _ = std::fs::remove_file(&out);
+}
+
+// ---------------------------------------------------------------------------
+// (h) Oracle-backed coverage evidence registry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coverage_registry_maps_create_file_w_to_differential_oracle_evidence() {
+    let evidence = coverage_evidence_for(
+        "KERNEL32.DLL",
+        "CreateFileW",
+        ArchSet::Any,
+        WindowsVersion::Any,
+    )
+    .expect("CreateFileW evidence");
+    assert_eq!(evidence.level, CoverageLevel::Differential);
+    assert_eq!(evidence.evidence_id, "windows-oracle:file_sharing");
+
+    // The seeded database carries the registry's level.
+    let database = ApiDatabase::from_thunk_metadata();
+    let create_file = database
+        .lookup("kernel32.dll", "CreateFileW")
+        .expect("CreateFileW entry");
+    assert_eq!(
+        create_file.semantic_test_coverage,
+        CoverageLevel::Differential,
+        "the registry's level must be merged into the seeded database"
+    );
+    // VirtualAlloc / TLS / loader contracts are also oracle-covered.
+    for (dll, export, evidence_id) in [
+        (
+            "kernel32.dll",
+            "VirtualAlloc",
+            "windows-oracle:virtual_memory",
+        ),
+        ("kernel32.dll", "TlsAlloc", "windows-oracle:thread_tls"),
+        ("kernel32.dll", "GetProcAddress", "windows-oracle:api_set"),
+        (
+            "kernel32.dll",
+            "WaitForSingleObject",
+            "windows-oracle:synchronization",
+        ),
+        (
+            "d3d12.dll",
+            "D3D12CreateDevice",
+            "windows-oracle:d3d12_device",
+        ),
+    ] {
+        let entry = database
+            .lookup(dll, export)
+            .unwrap_or_else(|| panic!("{dll}!{export} must be seeded with oracle evidence"));
+        assert_eq!(
+            entry.semantic_test_coverage,
+            CoverageLevel::Differential,
+            "{dll}!{export} must carry the oracle contract level"
+        );
+        let evidence = coverage_evidence_for(dll, export, ArchSet::Any, WindowsVersion::Any)
+            .expect("evidence");
+        assert_eq!(evidence.evidence_id, evidence_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (i) Import-coverage generalization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coverage_for_pe_produces_generic_binary_import_entries() {
+    use casa1::cpu::GuestArch;
+    use casa1::import_coverage::ImportSource;
+
+    let path = tracked_steam_fixture();
+    let workload = WorkloadId::new("section43");
+    let target = CompatibilityProfile::win10_legacy_desktop();
+    let report = coverage_for_pe(&path, &workload, target.clone()).expect("coverage report");
+
+    // The report is generic: it carries the binary identity and the profile.
+    assert_eq!(report.image_arch, GuestArch::X86);
+    assert_eq!(report.target, target);
+    assert!(!report.image_sha256.is_empty());
+    assert!(report.total_imports > 300);
+
+    // Entries carry the new generic fields.
+    let create_file = report
+        .entries
+        .iter()
+        .find(|entry| entry.import.lookup_name() == "CreateFileW")
+        .expect("CreateFileW import");
+    assert_eq!(create_file.dll, "kernel32.dll");
+    assert_eq!(create_file.source, ImportSource::Static);
+    assert_eq!(create_file.implementation, ImplementationLevel::Implemented);
+    assert_eq!(
+        create_file.semantic_coverage,
+        CoverageLevel::Differential,
+        "oracle-covered APIs report their proven coverage"
+    );
+    assert!(!create_file.runtime_reached);
+    assert_eq!(create_file.support_policy(), Some(SupportPolicy::Required));
+    // The profile the report was computed for is recorded.
+    assert_eq!(report.target.windows_version, WindowsVersion::Win10);
+
+    // Delay-loaded imports are attributed separately.
+    assert!(
+        report
+            .entries
+            .iter()
+            .any(|entry| entry.source == ImportSource::DelayLoad)
+            || report
+                .entries
+                .iter()
+                .all(|entry| entry.source == ImportSource::Static),
+        "delay-load imports must be attributed as DelayLoad when present"
+    );
+}
+
+#[test]
+fn dynamic_lookups_recorded_via_get_proc_address_identity() {
+    use casa1::import_coverage::ImportSource;
+
+    // The runtime records GetProcAddress resolutions into the shared log:
+    // simulate exactly what HostThunk::GetProcAddress does.
+    casa1::pe_runtime::record_dynamic_import("kernel32.dll", "GetProcAddress");
+    casa1::pe_runtime::record_dynamic_import("user32.dll", "MessageBoxW");
+
+    let path = tracked_steam_fixture();
+    let workload = WorkloadId::new("section43-dynamic");
+    let report = coverage_for_pe_with_runtime_trace(
+        &path,
+        &workload,
+        CompatibilityProfile::win11_native_desktop(),
+        &[],
+    )
+    .expect("coverage report with trace");
+
+    // Dynamic lookups appear as DynamicLookup entries keyed by (DLL, name) —
+    // never by name alone.
+    let dynamic: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.source == ImportSource::DynamicLookup)
+        .map(|entry| (entry.dll.as_str(), entry.import.lookup_name()))
+        .collect();
+    assert!(
+        dynamic.contains(&("kernel32.dll", "GetProcAddress".to_string())),
+        "GetProcAddress(kernel32) must be recorded"
+    );
+    assert!(
+        dynamic.contains(&("user32.dll", "MessageBoxW".to_string())),
+        "MessageBoxW must be recorded under user32.dll"
+    );
+    assert!(
+        report
+            .entries
+            .iter()
+            .filter(|entry| entry.source == ImportSource::DynamicLookup)
+            .all(|entry| entry.runtime_reached),
+        "dynamic lookups are reached by construction"
+    );
 }

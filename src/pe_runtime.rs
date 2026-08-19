@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::api_database::WindowsVersion;
 use crate::audio::{
     AudioSamples, AudioSubsystem, SampleFormat, SourceBuffer, VoiceId, WaveFormat,
     default_output_matrix,
@@ -29,9 +31,9 @@ use crate::gfx::{
     BufferRole, DescriptorHeapType, DxgiFormat, ResourceState, ResourceUsageHint, SwapchainDesc,
     ViewDescriptor,
 };
-use crate::host_thunks::{ImplementationLevel, lookup_thunk_metadata, ordinal_import_name};
 #[cfg(test)]
-use crate::host_thunks::{LastErrorBehavior, Subsystem, ThunkMetadata};
+use crate::host_thunks::{ArchMask, LastErrorBehavior, Subsystem, SupportPolicy, ThunkMetadata};
+use crate::host_thunks::{ImplementationLevel, lookup_thunk_metadata, ordinal_import_name};
 use crate::host_thunks::{
     read_guest_bytes_checked as host_read_guest_bytes_checked,
     validate_guest_pointer as host_validate_guest_pointer,
@@ -83,6 +85,62 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ---------------------------------------------------------------------------
+// Dynamic-import log
+// ---------------------------------------------------------------------------
+
+/// One dynamically-resolved import: a (DLL, name) pair recorded when the
+/// runtime resolves an export at runtime rather than from the static import
+/// table.
+///
+/// Identity is ALWAYS by (DLL + name) — never by name alone — because the
+/// same export name can exist in several modules.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DynamicImport {
+    /// DLL the export was resolved in (lowercase, with extension).
+    pub dll: String,
+    /// Resolved export name (ordinals are recorded as `ordinal#N`).
+    pub name: String,
+}
+
+/// Shared dynamic-import log.
+///
+/// GetProcAddress / LdrGetProcedureAddress / delay-load resolution /
+/// forwarded-export following / API-set redirection record (DLL, name) pairs
+/// here so the generic import-coverage report
+/// ([`crate::import_coverage::coverage_for_pe_with_runtime_trace`]) can
+/// account for imports that never appear in any import table.
+pub static DYNAMIC_IMPORT_LOG: std::sync::LazyLock<Mutex<Vec<DynamicImport>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Record a dynamically-resolved (DLL, name) import.
+pub fn record_dynamic_import(dll: &str, name: &str) {
+    if dll.is_empty() || name.is_empty() {
+        return;
+    }
+    let mut log = DYNAMIC_IMPORT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dll = dll.to_ascii_lowercase();
+    if !log
+        .iter()
+        .any(|entry| entry.dll == dll && entry.name == name)
+    {
+        log.push(DynamicImport {
+            dll,
+            name: name.to_string(),
+        });
+    }
+}
+
+/// Take (and clear) the recorded dynamic imports.
+pub fn drain_dynamic_import_log() -> Vec<DynamicImport> {
+    let mut log = DYNAMIC_IMPORT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *log)
+}
 
 // Global state for ISteamNetworkingSockets and ISteamNetworkingMessages
 // PE runtime dispatch. Initialised lazily on first API call.
@@ -10015,6 +10073,11 @@ impl PeHostRuntime {
                 name: symbol_part.to_string(),
             }
         };
+
+        // Dynamic-import instrumentation: following a forwarded export is a
+        // runtime resolution into the forwarding target module — record the
+        // (DLL, name) pair so import coverage sees the resolution.
+        record_dynamic_import(&dll_name, symbol_part);
 
         let result = Some(self.resolve_proc_address(target_handle, import_sym));
 
@@ -35002,6 +35065,11 @@ impl PeHostRuntime {
                             .then(|| self.main_module_name.clone())
                     })
                     .unwrap_or_default();
+                // Dynamic-import instrumentation: GetProcAddress is the
+                // canonical runtime import-resolution path — record the
+                // resolved (DLL, name) pair into the shared log so import
+                // coverage can account for it.
+                record_dynamic_import(&module_name, &symbol_name);
                 let address = self.resolve_proc_address(module_handle, symbol);
                 state.set(Register::Rax, address);
                 self.last_error = if address == 0 { ERROR_PROC_NOT_FOUND } else { 0 };
@@ -50705,6 +50773,14 @@ impl PeHostRuntime {
                 }
 
                 // 2. Resolve the proc address for the import symbol
+                let symbol_name = match &symbol {
+                    ImportSymbol::ByName { name, .. } => name.clone(),
+                    ImportSymbol::ByOrdinal { ordinal } => format!("ordinal#{ordinal}"),
+                };
+                // Dynamic-import instrumentation: delay-load resolution is a
+                // runtime import resolution — record (DLL, name) into the
+                // shared log so import coverage sees it as a DynamicLookup.
+                record_dynamic_import(&resolved_module, &symbol_name);
                 let resolved_addr = self.resolve_proc_address(module_handle, symbol.clone());
                 if resolved_addr == 0 {
                     return Err(AppError::new(
@@ -72302,22 +72378,83 @@ pub fn is_import_supported(dll: &str, symbol: &ImportSymbol) -> bool {
     !matches!(thunk, HostThunk::Unsupported { .. })
 }
 
+/// The implementation level the runtime ACTUALLY provides for a (dll, name)
+/// export, resolved through the canonical import-name tables
+/// ([`HostThunk::from_import`]).
+///
+/// This is the runtime-truth counterpart of the static
+/// [`ThunkMetadata`] table: `Implemented` when the import-name tables
+/// dispatch a concrete host thunk for the export, `Unsupported` when the
+/// export falls through to `HostThunk::Unsupported` (no host thunk exists).
+/// Some APIs (the ws2_32/wsock32 byte-order helpers) are registered by
+/// ordinal only; the ordinal table is probed as a fallback.
+pub fn registered_export_implementation_level(dll: &str, name: &str) -> ImplementationLevel {
+    let by_name = ImportSymbol::ByName {
+        hint: 0,
+        name: name.to_string(),
+    };
+    let import = ResolvedImport {
+        requested_module: dll.to_string(),
+        resolved_module: dll.to_string(),
+        symbol: by_name,
+        iat_rva: 0,
+        export: synthetic_export_symbol(&ImportSymbol::ByName {
+            hint: 0,
+            name: name.to_string(),
+        }),
+    };
+    match HostThunk::from_import(&import) {
+        HostThunk::Unsupported { .. } => match ordinal_for_registered_export(dll, name) {
+            Some(ordinal) => {
+                let import = ResolvedImport {
+                    requested_module: dll.to_string(),
+                    resolved_module: dll.to_string(),
+                    symbol: ImportSymbol::ByOrdinal { ordinal },
+                    iat_rva: 0,
+                    export: synthetic_export_symbol(&ImportSymbol::ByOrdinal { ordinal }),
+                };
+                match HostThunk::from_import(&import) {
+                    HostThunk::Unsupported { .. } => ImplementationLevel::Unsupported,
+                    _ => ImplementationLevel::Implemented,
+                }
+            }
+            None => ImplementationLevel::Unsupported,
+        },
+        _ => ImplementationLevel::Implemented,
+    }
+}
+
+/// Reverse of [`ordinal_import_name`]: the ordinal(s) the runtime registers
+/// a name under, where the registration is ordinal-only (used by
+/// [`registered_export_implementation_level`] as a fallback).
+fn ordinal_for_registered_export(dll: &str, name: &str) -> Option<u16> {
+    let dll_stem = dll.strip_suffix(".dll").unwrap_or(dll).to_ascii_lowercase();
+    match (dll_stem.as_str(), name) {
+        ("ws2_32" | "wsock32", "htonl") => Some(8),
+        ("ws2_32" | "wsock32", "htons") => Some(9),
+        ("ws2_32" | "wsock32", "ntohl") => Some(14),
+        ("ws2_32" | "wsock32", "ntohs") => Some(15),
+        _ => None,
+    }
+}
+
 /// Diagnostics: classify a (dll, symbol) import against the canonical thunk
 /// implementation-quality metadata ([`ThunkMetadata`] /
 /// [`crate::host_thunks::THUNK_METADATA`]).
 ///
-/// Returns the [`ImplementationLevel`] and the Steam-bootstrap-critical flag
-/// for the import.  Ordinal-only imports are resolved through
-/// [`ordinal_import_name`]; imports with no metadata entry are classified
-/// [`ImplementationLevel::Unsupported`] (no host thunk / no metadata).
+/// Returns the [`ImplementationLevel`] and the generic user-mode
+/// [`SupportPolicy`] for the import.  Ordinal-only imports are resolved
+/// through [`ordinal_import_name`]; imports with no metadata entry are
+/// classified [`ImplementationLevel::Unsupported`] (no host thunk / no
+/// metadata) with [`SupportPolicy::OptionalFeature`].
 ///
-/// This is the metadata-consuming diagnostic used by the fixture-derived
-/// import coverage ([`crate::import_coverage::coverage_for_steam_fixture`])
-/// and by the section24 integration model.
+/// This is the metadata-consuming diagnostic used by the generic import
+/// coverage ([`crate::import_coverage::coverage_for_pe`]) and by the
+/// section24 integration model.
 pub fn import_implementation_quality(
     dll: &str,
     symbol: &ImportSymbol,
-) -> (ImplementationLevel, bool) {
+) -> (ImplementationLevel, crate::host_thunks::SupportPolicy) {
     let api = match symbol {
         ImportSymbol::ByName { name, .. } => name.clone(),
         ImportSymbol::ByOrdinal { ordinal } => ordinal_import_name(dll, *ordinal)
@@ -72325,8 +72462,11 @@ pub fn import_implementation_quality(
             .unwrap_or_else(|| format!("ordinal#{ordinal}")),
     };
     match lookup_thunk_metadata(dll, &api) {
-        Some(metadata) => (metadata.implementation, metadata.steam_critical),
-        None => (ImplementationLevel::Unsupported, false),
+        Some(metadata) => (metadata.implementation, metadata.support_policy),
+        None => (
+            ImplementationLevel::Unsupported,
+            crate::host_thunks::SupportPolicy::OptionalFeature,
+        ),
     }
 }
 
@@ -87654,7 +87794,9 @@ mod tests {
             x86_arg_bytes: 0,
             last_error: LastErrorBehavior::Preserves,
             implementation: ImplementationLevel::Implemented,
-            steam_critical: true,
+            architectures: ArchMask::ANY,
+            min_windows_version: WindowsVersion::Any,
+            support_policy: SupportPolicy::Required,
         };
         assert_eq!(_meta.name, "GetVersion");
         assert_eq!(_meta.subsystem, Subsystem::Kernel);
@@ -97953,7 +98095,7 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         },
     ];
 
-    BTreeMap::from([
+    let mut tables = BTreeMap::from([
         ("advapi32.dll".to_string(), advapi32_exports),
         ("bcrypt.dll".to_string(), bcrypt_exports),
         ("cfgmgr32.dll".to_string(), cfgmgr32_exports),
@@ -104170,7 +104312,274 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                 target: ExportTarget::Rva(0xc9000),
             }],
         ),
-    ])
+    ]);
+    merge_registered_surface_exports(&mut tables);
+    tables
+}
+
+/// Merge the host-thunk metadata surface into the registered export
+/// tables.
+///
+/// Every (DLL, export) covered by [`crate::host_thunks::THUNK_METADATA`]
+/// must be present in the registered export surface and vice versa
+/// (asserted by tests/section45_thunk_metadata.rs).  These are the
+/// metadata entries that the per-DLL synthetic tables above predate.
+fn merge_registered_surface_exports(tables: &mut BTreeMap<String, Vec<ExportSymbol>>) {
+    const SURFACE: &[(&str, &[&str])] = &[
+        (
+            "advapi32.dll",
+            &[
+                "DeregisterEventSource",
+                "InitializeSecurityDescriptor",
+                "RegCreateKeyExA",
+                "RegOpenKeyA",
+                "RegOpenKeyExA",
+                "RegQueryValueExA",
+                "RegSetValueExA",
+                "RegisterEventSourceW",
+                "ReportEventW",
+                "SetSecurityDescriptorDacl",
+            ],
+        ),
+        ("crypt32.dll", &["CertFreeCertificateChain"]),
+        (
+            "gdi32.dll",
+            &[
+                "AddFontMemResourceEx",
+                "ChoosePixelFormat",
+                "CreateICW",
+                "RemoveFontMemResourceEx",
+                "SetPixelFormat",
+                "SwapBuffers",
+            ],
+        ),
+        (
+            "kernel32.dll",
+            &[
+                "CallNamedPipeW",
+                "CompareStringW",
+                "ConnectNamedPipe",
+                "ConvertFiberToThread",
+                "ConvertThreadToFiber",
+                "CreateFiber",
+                "CreateFileA",
+                "CreateFileMappingW",
+                "CreateMutexW",
+                "CreateNamedPipeW",
+                "CreateSemaphoreW",
+                "DebugBreak",
+                "DecodePointer",
+                "DeleteFiber",
+                "DeviceIoControl",
+                "DisableThreadLibraryCalls",
+                "EncodePointer",
+                "ExitThread",
+                "FileTimeToSystemTime",
+                "FindFirstFileExW",
+                "FindResourceA",
+                "GetACP",
+                "GetCPInfo",
+                "GetCommandLineA",
+                "GetConsoleCP",
+                "GetConsoleMode",
+                "GetCurrentDirectoryA",
+                "GetCurrentProcessId",
+                "GetCurrentThreadId",
+                "GetDateFormatW",
+                "GetDiskFreeSpaceA",
+                "GetDriveTypeW",
+                "GetFileAttributesA",
+                "GetFileInformationByHandleEx",
+                "GetFileSizeEx",
+                "GetFileTime",
+                "GetFileType",
+                "GetModuleHandleExA",
+                "GetModuleHandleExW",
+                "GetOEMCP",
+                "GetOverlappedResult",
+                "GetProcessAffinityMask",
+                "GetProcessHeap",
+                "GetProcessHeaps",
+                "GetStartupInfoW",
+                "GetStdHandle",
+                "GetStringTypeW",
+                "GetSystemInfo",
+                "GetSystemTime",
+                "GetTickCount64",
+                "GetTimeFormatW",
+                "GetVersionExA",
+                "GetVersionExW",
+                "GlobalMemoryStatusEx",
+                "HeapAlloc",
+                "HeapFree",
+                "HeapLock",
+                "HeapQueryInformation",
+                "HeapReAlloc",
+                "HeapSetInformation",
+                "HeapSize",
+                "HeapUnlock",
+                "HeapValidate",
+                "HeapWalk",
+                "InitializeCriticalSectionAndSpinCount",
+                "InitializeCriticalSectionEx",
+                "InitializeSListHead",
+                "InterlockedCompareExchange",
+                "InterlockedDecrement",
+                "InterlockedExchange",
+                "InterlockedExchangeAdd",
+                "InterlockedIncrement",
+                "InterlockedPushEntrySList",
+                "IsBadWritePtr",
+                "IsProcessorFeaturePresent",
+                "IsValidCodePage",
+                "LCMapStringW",
+                "LoadResource",
+                "LocalAlloc",
+                "LocalFree",
+                "LockResource",
+                "MapViewOfFile",
+                "OpenMutexW",
+                "OpenProcess",
+                "OpenSemaphoreW",
+                "OpenThread",
+                "PeekNamedPipe",
+                "QueryPerformanceCounter",
+                "QueryPerformanceFrequency",
+                "RaiseException",
+                "ReadConsoleA",
+                "ReadConsoleW",
+                "ReleaseMutex",
+                "ReleaseSemaphore",
+                "RemoveDirectoryA",
+                "ResumeThread",
+                "RtlUnwind",
+                "SetConsoleCtrlHandler",
+                "SetConsoleMode",
+                "SetEndOfFile",
+                "SetFilePointerEx",
+                "SetHandleInformation",
+                "SetLastError",
+                "SetProcessAffinityMask",
+                "SetStdHandle",
+                "SetThreadAffinityMask",
+                "SetThreadPriority",
+                "SizeofResource",
+                "SleepEx",
+                "SuspendThread",
+                "SwitchToFiber",
+                "SwitchToThread",
+                "SystemTimeToFileTime",
+                "SystemTimeToTzSpecificLocalTime",
+                "TerminateThread",
+                "TlsAlloc",
+                "TlsFree",
+                "TlsSetValue",
+                "UnmapViewOfFile",
+                "VerSetConditionMask",
+                "WaitForMultipleObjects",
+                "WaitForSingleObjectEx",
+                "WriteConsoleW",
+            ],
+        ),
+        ("msvcrt.dll", &["_errno", "printf"]),
+        (
+            "psapi.dll",
+            &[
+                "GetModuleFileNameExW",
+                "GetModuleInformation",
+                "GetProcessMemoryInfo",
+            ],
+        ),
+        ("shell32.dll", &["CommandLineToArgvW", "IsUserAnAdmin"]),
+        (
+            "user32.dll",
+            &[
+                "AllowSetForegroundWindow",
+                "BeginPaint",
+                "CloseClipboard",
+                "DestroyWindow",
+                "DialogBoxParamA",
+                "EmptyClipboard",
+                "EndDialog",
+                "EndPaint",
+                "EnumChildWindows",
+                "EnumWindows",
+                "GetClassInfoExW",
+                "GetDC",
+                "GetDesktopWindow",
+                "GetDlgItem",
+                "GetDlgItemInt",
+                "GetFocus",
+                "GetMessageA",
+                "GetMonitorInfoW",
+                "GetProcessWindowStation",
+                "GetSystemMetrics",
+                "GetUserObjectInformationW",
+                "GetWindowLongW",
+                "GetWindowRect",
+                "GetWindowTextA",
+                "GetWindowTextLengthA",
+                "GetWindowTextW",
+                "GetWindowThreadProcessId",
+                "InvalidateRect",
+                "IsWindowVisible",
+                "KillTimer",
+                "LoadCursorW",
+                "MapWindowPoints",
+                "MessageBoxA",
+                "MonitorFromPoint",
+                "MonitorFromWindow",
+                "MoveWindow",
+                "MsgWaitForMultipleObjects",
+                "OpenClipboard",
+                "PostMessageA",
+                "PostMessageW",
+                "RegisterClassW",
+                "ReleaseDC",
+                "SendMessageW",
+                "SetClassLongW",
+                "SetClipboardData",
+                "SetDlgItemInt",
+                "SetDlgItemTextA",
+                "SetFocus",
+                "SetTimer",
+                "SetWindowLongW",
+                "SetWindowPos",
+                "SetWindowTextW",
+                "ShowWindow",
+                "UnregisterClassW",
+                "UpdateWindow",
+                "wsprintfA",
+            ],
+        ),
+        ("ws2_32.dll", &["WSASocketA", "getsockname"]),
+        ("wsock32.dll", &["WSAStartup"]),
+    ];
+    for (dll, names) in SURFACE {
+        let table = tables.entry(dll.to_string()).or_default();
+        // Continue each DLL's ordinal sequence (the synthetic tables are
+        // ordinal-continuous; tests/section1.rs asserts that).
+        let next_ordinal = table
+            .iter()
+            .map(|export| export.ordinal)
+            .max()
+            .map_or(1, |max| max + 1);
+        let base_rva = table
+            .iter()
+            .filter_map(|export| match export.target {
+                ExportTarget::Rva(rva) => Some(rva),
+                ExportTarget::Forwarder(_) => None,
+            })
+            .max()
+            .map_or(0x1000, |max| max + 0x10);
+        for (index, name) in names.iter().enumerate() {
+            table.push(ExportSymbol {
+                ordinal: next_ordinal + index as u32,
+                name: Some((*name).to_string()),
+                target: ExportTarget::Rva(base_rva + index as u32 * 0x10),
+            });
+        }
+    }
 }
 
 fn extend_named_exports(
