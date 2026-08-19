@@ -46,6 +46,9 @@ pub struct CaptureHeader {
     /// Capture machine architecture ("x86"/"x64"/"arm64" from
     /// GetNativeSystemInfo; the host arch name elsewhere).
     pub arch: String,
+    /// Compiler target triple of the reference executable (env!("TARGET")) —
+    /// distinguishes an x86 capture from an x64 capture.
+    pub target_triple: String,
     /// SHA-256 (lowercase hex) of the reference executable itself.
     pub reference_sha256: String,
     /// SHA-256 (lowercase hex) of the vector corpus file the capture ran on.
@@ -77,6 +80,7 @@ impl CaptureHeader {
             os_edition: provenance.os_edition,
             os_build: provenance.os_build,
             arch: provenance.arch,
+            target_triple: env!("CASA1_REFERENCE_TARGET").to_string(),
             reference_sha256: provenance.reference_sha256,
             corpus_sha256: provenance.corpus_sha256,
         }

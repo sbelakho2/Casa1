@@ -193,6 +193,8 @@ pub fn is_real_windows_capture(results: &ReferenceResultsFile) -> bool {
         && header.os_edition != "unknown"
         && !header.os_build.is_empty()
         && header.os_build != "unknown"
+        && !header.target_triple.is_empty()
+        && header.target_triple != "model-generated"
         && matches!(header.arch.as_str(), "x86" | "x64" | "arm64")
         && header.reference_sha256.len() == 64
         && header.corpus_sha256.len() == 64

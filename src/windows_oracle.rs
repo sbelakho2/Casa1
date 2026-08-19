@@ -40,7 +40,7 @@ pub const REFERENCE_CWD: &str = "C:\\Windows\\Temp\\casa1-oracle-cwd";
 pub const REFERENCE_BASE_DIR: &str = "C:\\Windows\\Temp\\casa1-oracle";
 
 /// All category names, in corpus generation order.
-pub const ALL_CATEGORIES: [&str; 13] = [
+pub const ALL_CATEGORIES: [&str; 15] = [
     "path_normalize",
     "case_fold",
     "file_sharing",
@@ -54,6 +54,8 @@ pub const ALL_CATEGORIES: [&str; 13] = [
     "d3d12_texture_address_mode",
     "d3d12_filter_reduction",
     "d3d12_filter_translation",
+    "cpu_arithmetic_flags",
+    "virtual_memory",
 ];
 
 /// Every named D3D12_FILTER value with its d3d12.h name — the runtime-side
@@ -197,6 +199,10 @@ pub struct CaptureHeader {
     /// `"arm64"` from GetNativeSystemInfo; the host arch name elsewhere).
     #[serde(default)]
     pub arch: String,
+    /// Compiler target triple of the reference executable (env!("TARGET")) —
+    /// distinguishes an x86 capture from an x64 capture.
+    #[serde(default)]
+    pub target_triple: String,
     /// SHA-256 (lowercase hex) of the reference executable that produced the
     /// capture.
     #[serde(default)]
@@ -220,6 +226,7 @@ impl CaptureHeader {
             os_edition: String::new(),
             os_build: String::new(),
             arch: String::new(),
+            target_triple: env!("CASA1_TARGET_TRIPLE").to_string(),
             reference_sha256: String::new(),
             corpus_sha256: String::new(),
         }
@@ -242,6 +249,7 @@ impl CaptureHeader {
             os_edition: "unknown".to_string(),
             os_build: "unknown".to_string(),
             arch: "unknown".to_string(),
+            target_triple: "model-generated".to_string(),
             reference_sha256: String::new(),
             corpus_sha256: String::new(),
         }
@@ -365,12 +373,56 @@ pub struct D3d12FilterTranslationInput {
     pub filter: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuFlagsInput {
+    /// Arithmetic width in bits: 8 | 16 | 32 | 64.
+    pub width: u32,
+    /// "add" | "sub" | "cmp".
+    pub op: String,
+    pub lhs: u64,
+    pub rhs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualMemoryInput {
+    /// "reserve" | "commit" | "decommit" | "release" | "protect" | "query".
+    pub operation: String,
+    /// For "reserve": 0 lets the system choose the base.  For every other
+    /// operation the address is RELATIVE to the session's first reservation
+    /// base (each side — the reference process and the runtime session —
+    /// resolves it against its own first reserve's base, so the corpus is
+    /// host-agnostic despite ASLR).
+    #[serde(default)]
+    pub address: u64,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub allocation_type: u32,
+    #[serde(default)]
+    pub protection: u32,
+    #[serde(default)]
+    pub free_type: u32,
+}
+
 // ── Corpus generation ──────────────────────────────────────────────────────
 
 /// Generate the deterministic differential vector corpus for the given
 /// categories (all categories when `categories` is empty). The generator is
 /// pure host-side logic and produces byte-identical files on any platform.
 pub fn generate_vectors(categories: &[String]) -> Vec<Vector> {
+    generate_vectors_with_mode(categories, false)
+}
+
+/// Generate the corpus with the `--exhaustive` mode enabled: the
+/// `cpu_arithmetic_flags` category replaces its bounded stride sample with
+/// the FULL 8-bit exhaustive operand space (65,536 pairs × add/sub/cmp ≈
+/// 196k vectors).  Used by the nightly workflow; the bounded default keeps
+/// the CI capture quick.
+pub fn generate_vectors_exhaustive(categories: &[String]) -> Vec<Vector> {
+    generate_vectors_with_mode(categories, true)
+}
+
+fn generate_vectors_with_mode(categories: &[String], exhaustive: bool) -> Vec<Vector> {
     let wanted: BTreeSet<&str> = if categories.is_empty() {
         ALL_CATEGORIES.iter().copied().collect()
     } else {
@@ -381,7 +433,7 @@ pub fn generate_vectors(categories: &[String]) -> Vec<Vector> {
         if !wanted.contains(category) {
             continue;
         }
-        let mut cases = generate_category(category);
+        let mut cases = generate_category_with_mode(category, exhaustive);
         for (index, input) in cases.drain(..).enumerate() {
             vectors.push(Vector {
                 id: format!("{category}:{index:03}"),
@@ -393,7 +445,7 @@ pub fn generate_vectors(categories: &[String]) -> Vec<Vector> {
     vectors
 }
 
-fn generate_category(category: &str) -> Vec<Value> {
+fn generate_category_with_mode(category: &str, exhaustive: bool) -> Vec<Value> {
     match category {
         "path_normalize" => path_normalize_vectors(),
         "case_fold" => case_fold_vectors(),
@@ -408,6 +460,8 @@ fn generate_category(category: &str) -> Vec<Value> {
         "d3d12_texture_address_mode" => d3d12_texture_address_mode_vectors(),
         "d3d12_filter_reduction" => d3d12_filter_reduction_vectors(),
         "d3d12_filter_translation" => d3d12_filter_translation_vectors(),
+        "cpu_arithmetic_flags" => cpu_arithmetic_flags_vectors(exhaustive),
+        "virtual_memory" => virtual_memory_vectors(),
         _ => Vec::new(),
     }
 }
@@ -585,6 +639,126 @@ fn d3d12_filter_translation_vectors() -> Vec<Value> {
         .collect()
 }
 
+/// The arithmetic edge set shared with the JIT flag truth-table tests:
+/// every (lhs, rhs) pair below runs at widths 8/16/32/64 with ops
+/// add/sub/cmp.  These are the width-masked edges that exercise OF (sign
+/// overflow), CF (unsigned wrap), ZF, AF (nibble carry) and the subtract
+/// borrow/underflow boundaries.
+pub const CPU_FLAGS_EDGES: &[(u64, u64)] = &[
+    // 8-bit OF (0x7f + 1)
+    (0x7f, 1),
+    // 8-bit CF+OF (0x80 + 0x80)
+    (0x80, 0x80),
+    // 8-bit CF (0xff + 1)
+    (0xff, 1),
+    // 16-bit OF (0x7fff + 1)
+    (0x7fff, 1),
+    // 16-bit CF+OF (0x8000 + 0x8000)
+    (0x8000, 0x8000),
+    // 32-bit OF (0x7fffffff + 1)
+    (0x7fff_ffff, 1),
+    // 32-bit CF+OF (0x80000000 + 0x80000000)
+    (0x8000_0000, 0x8000_0000),
+    // 64-bit OF (0x7fffffffffffffff + 1)
+    (0x7fff_ffff_ffff_ffff, 1),
+    // 64-bit CF+OF (0x8000000000000000 + 0x8000000000000000)
+    (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+    // 64-bit CF (0xffffffffffffffff + 1)
+    (0xffff_ffff_ffff_ffff, 1),
+    // 8-bit CF (0x80 - 1)
+    (0x80, 1),
+    // 8-bit signed underflow (0x7f - 0x80)
+    (0x7f, 0x80),
+    // 32-bit signed underflow (0x7fffffff - 0x80000000)
+    (0x7fff_ffff, 0x8000_0000),
+    // 64-bit signed underflow (0x7fffffffffffffff - 0x8000000000000000)
+    (0x7fff_ffff_ffff_ffff, 0x8000_0000_0000_0000),
+    // equal operands (ZF + CF=0)
+    (0x1234_5678_9abc_def0, 0x1234_5678_9abc_def0),
+    // zero operands (all clear except PF)
+    (0, 0),
+    // AF edge: 0x0f + 1
+    (0x0f, 1),
+    // AF edge + CF: 0x0f + 0x0f
+    (0x0f, 0x0f),
+];
+
+pub const CPU_FLAGS_OPS: [&str; 3] = ["add", "sub", "cmp"];
+
+/// The 8-bit stride step of the bounded corpus (every 8th value per axis →
+/// 1,024 of the 65,536 possible pairs).
+pub const CPU_FLAGS_STRIDE_STEP: u32 = 8;
+
+/// The documented CPU edge set at every width and op, plus a deterministic
+/// stride sample over the 8-bit operand space (every 8th value on each axis
+/// → 1,024 pairs × add/sub/cmp).  In `exhaustive` mode the stride sample is
+/// replaced by the FULL 8-bit operand space (65,536 pairs) for the nightly
+/// capture.
+fn cpu_arithmetic_flags_vectors(exhaustive: bool) -> Vec<Value> {
+    let mut vectors = Vec::new();
+    for width in [8_u32, 16, 32, 64] {
+        for &(lhs, rhs) in CPU_FLAGS_EDGES {
+            for op in CPU_FLAGS_OPS {
+                vectors.push(json!({ "width": width, "op": op, "lhs": lhs, "rhs": rhs }));
+            }
+        }
+    }
+    let sample = if exhaustive {
+        (0..=255).collect::<Vec<u32>>()
+    } else {
+        (0..=255)
+            .step_by(CPU_FLAGS_STRIDE_STEP as usize)
+            .collect::<Vec<u32>>()
+    };
+    for lhs in &sample {
+        for rhs in &sample {
+            for op in CPU_FLAGS_OPS {
+                vectors.push(json!({ "width": 8, "op": op, "lhs": lhs, "rhs": rhs }));
+            }
+        }
+    }
+    vectors
+}
+
+/// The `virtual_memory` corpus: a single stateful address-space session
+/// (the reference process on one side, the runtime's private-pages session
+/// on the other).  The vectors run strictly in order — reserve first, then
+/// interior commit, partial protect, partial decommit, the two mandated
+/// failures, and the unmapped-address query.  Addresses are RELATIVE to the
+/// session's first reservation base (0 = the reservation base itself).
+fn virtual_memory_vectors() -> Vec<Value> {
+    vec![
+        // 0: reserve 0x4000 (system-chosen base); the output queries the
+        //    returned base: MEM_RESERVE, PAGE_NOACCESS, size 0x4000.
+        json!({ "operation": "reserve", "address": 0, "size": 0x4000, "allocation_type": 0x2000, "protection": 0x01, "free_type": 0 }),
+        // 1: query mid-range of the reservation (2 pages in): MEM_RESERVE,
+        //    PAGE_NOACCESS, base-relative 0, size 0x2000.
+        json!({ "operation": "query", "address": 0x2000, "size": 0, "allocation_type": 0, "protection": 0, "free_type": 0 }),
+        // 2: commit an interior range [0x1000, 0x3000) READWRITE; the output
+        //    queries 0x1000: MEM_COMMIT, PAGE_READWRITE, base 0x1000,
+        //    size 0x2000.
+        json!({ "operation": "commit", "address": 0x1000, "size": 0x2000, "allocation_type": 0x1000, "protection": 0x04, "free_type": 0 }),
+        // 3: partial protect: only [0x1000, 0x2000) → PAGE_READONLY with
+        //    old-protection reporting (PAGE_READWRITE); the output queries
+        //    0x1000: MEM_COMMIT, PAGE_READONLY, base 0x1000, size 0x1000.
+        json!({ "operation": "protect", "address": 0x1000, "size": 0x1000, "allocation_type": 0, "protection": 0x02, "free_type": 0 }),
+        // 4: partial decommit of [0x2000, 0x3000): the output queries
+        //    0x2000: MEM_RESERVE, PAGE_NOACCESS, base 0x2000, size 0x2000.
+        json!({ "operation": "decommit", "address": 0x2000, "size": 0x1000, "allocation_type": 0, "protection": 0, "free_type": 0x4000 }),
+        // 5: release with size != 0 — must fail with ERROR_INVALID_PARAMETER
+        //    (87); the output queries the reservation base: still
+        //    MEM_RESERVE (the failed release changed nothing).
+        json!({ "operation": "release", "address": 0, "size": 0x1000, "allocation_type": 0, "protection": 0, "free_type": 0x8000 }),
+        // 6: commit WITHOUT a reservation (0x10000 past the session base) —
+        //    must fail with ERROR_INVALID_ADDRESS (487); the output queries
+        //    the same address: MEM_FREE, base 0, size 0.
+        json!({ "operation": "commit", "address": 0x1_0000, "size": 0x1000, "allocation_type": 0x1000, "protection": 0x04, "free_type": 0 }),
+        // 7: query an unmapped address (0x8000 past the session base):
+        //    MEM_FREE + NULL base + 0 size.
+        json!({ "operation": "query", "address": 0x8000, "size": 0, "allocation_type": 0, "protection": 0, "free_type": 0 }),
+    ]
+}
+
 /// Compute the Casa1 RUNTIME's behavior for a differential vector.  This is
 /// the emulated-Casa1 side of the differential: the reference executable's
 /// captured result is the truth, and this function produces the Casa1
@@ -676,6 +850,8 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
                 "valid": name.is_some(),
             })
         }
+        "cpu_arithmetic_flags" => runtime_cpu_arithmetic_flags(&vector.input),
+        "virtual_memory" => runtime_virtual_memory(&vector.input),
         _ => json!({ "runtime_unavailable": true }),
     };
     VectorResult {
@@ -698,6 +874,15 @@ struct OracleRuntimeContext {
     /// reach the GE-level share/lock matrix (`open_file`, `lock_file_range`,
     /// `registry_*`) that the Win32Subsystem's own GE mirrors on disk.
     ge: GameEnvironment,
+    /// The `virtual_memory` session: a scratch PeHostRuntime driving the
+    /// REAL VirtualAlloc/VirtualFree/VirtualProtect/VirtualQuery thunk arms
+    /// (page-granular private pages/reservations).  Persists across vectors
+    /// like the reference process's address space does.
+    vm: crate::pe_runtime::OracleVmSession,
+    /// Base of the session's first reservation — the reference point for
+    /// every relative `base_address` in the `virtual_memory` output (0 until
+    /// the reserve vector establishes it).
+    vm_session_base: u64,
     #[allow(dead_code)]
     root: PathBuf,
 }
@@ -748,9 +933,12 @@ fn create_oracle_runtime() -> OracleRuntimeContext {
         });
     }
     let subsystem = Win32Subsystem::new(ge.clone(), true);
+    let vm = crate::pe_runtime::OracleVmSession::new(ge.clone());
     OracleRuntimeContext {
         subsystem,
         ge,
+        vm,
+        vm_session_base: 0,
         root,
     }
 }
@@ -1631,6 +1819,142 @@ fn runtime_thread_tls(input: &Value) -> Value {
             }
             _ => json!({ "error": 87 }),
         }
+    })
+}
+
+// ── cpu_arithmetic_flags ────────────────────────────────────────────────────
+
+/// The runtime's x86 flag computation for add/sub/cmp at a width: the Casa1
+/// CPU's OWN flag model, driven through `jit_helper_set_flags` — the exact
+/// function the interpreter and the JIT use to set guest flags (op 0=add,
+/// 1=sub, 3=cmp; the width parameter is in BYTES).  The result operand is
+/// the width-masked wrapping add/sub, exactly what the interpreter's
+/// add/sub paths produce.  This differential therefore validates the
+/// interpreter's flag semantics against the real x86 flags the reference
+/// executable captures with inline assembly.
+fn runtime_cpu_arithmetic_flags(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<CpuFlagsInput>(input.clone()) else {
+        return json!({ "error": "invalid_input" });
+    };
+    let bits = spec.width;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return json!({ "error": "invalid_input" });
+    }
+    let (result, op) = match spec.op.as_str() {
+        "add" => (spec.lhs.wrapping_add(spec.rhs), 0_u64),
+        "sub" => (spec.lhs.wrapping_sub(spec.rhs), 1_u64),
+        "cmp" => (spec.lhs.wrapping_sub(spec.rhs), 3_u64),
+        _ => return json!({ "error": "invalid_input" }),
+    };
+    let mut state = crate::cpu::CpuState::new(crate::cpu::GuestArch::X64);
+    // SAFETY: `state` is a live, owned CpuState for the duration of the call.
+    unsafe {
+        crate::jit::jit_helper_set_flags(
+            &mut state,
+            result,
+            spec.lhs,
+            spec.rhs,
+            op,
+            u64::from(bits / 8),
+        );
+    }
+    json!({
+        "zf": state.flags.zf,
+        "sf": state.flags.sf,
+        "pf": state.flags.pf,
+        "cf": state.flags.cf,
+        "of": state.flags.of,
+        "af": state.flags.af,
+    })
+}
+
+// ── virtual_memory ──────────────────────────────────────────────────────────
+
+// Memory-state constants shared with the reference executor (WinNT.h).
+const VM_MEM_COMMIT: u32 = 0x1000;
+const VM_MEM_RESERVE: u32 = 0x2000;
+const VM_MEM_DECOMMIT: u32 = 0x4000;
+const VM_MEM_RELEASE: u32 = 0x8000;
+const VM_MEM_FREE: u32 = 0x0001_0000;
+const VM_PAGE_NOACCESS: u32 = 0x01;
+
+/// The runtime's virtual-memory behavior: the REAL
+/// VirtualAlloc/VirtualFree/VirtualProtect/VirtualQuery thunk arms of the
+/// pe_runtime VM layer (page-granular private pages/reservations) driven on
+/// a scratch session, mirroring the reference's process-wide sequence.  The
+/// session base is the first reservation's returned base; `base_address`
+/// output is relative to it (the absolute base is ASLR-environmental, the
+/// relative layout is the semantic contract), and MEM_FREE queries report
+/// NULL base + 0 size.
+fn runtime_virtual_memory(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<VirtualMemoryInput>(input.clone()) else {
+        return json!({
+            "error": 87, "state": VM_MEM_FREE, "protection": VM_PAGE_NOACCESS,
+            "region_size": 0, "base_address": 0, "committed_set_summary": false,
+        });
+    };
+    with_oracle_runtime(|runtime| {
+        let session = &mut runtime.vm;
+        let session_base = runtime.vm_session_base;
+        let absolute = if spec.operation == "reserve" {
+            spec.address
+        } else {
+            session_base.wrapping_add(spec.address)
+        };
+        let (error, query_address, old_protection) = match spec.operation.as_str() {
+            "reserve" => {
+                // The corpus always sends MEM_RESERVE explicitly; a missing
+                // allocation_type defaults to a pure reservation.
+                let allocation_type = if spec.allocation_type == 0 {
+                    VM_MEM_RESERVE
+                } else {
+                    spec.allocation_type
+                };
+                let (base, error) =
+                    session.virtual_alloc(absolute, spec.size, allocation_type, spec.protection);
+                if base != 0 && runtime.vm_session_base == 0 {
+                    runtime.vm_session_base = base;
+                }
+                (error, if absolute == 0 { base } else { absolute }, None)
+            }
+            "commit" => {
+                let (_, error) =
+                    session.virtual_alloc(absolute, spec.size, VM_MEM_COMMIT, spec.protection);
+                (error, absolute, None)
+            }
+            "decommit" => {
+                let (_, error) = session.virtual_free(absolute, spec.size, VM_MEM_DECOMMIT);
+                (error, absolute, None)
+            }
+            "release" => {
+                let (_, error) = session.virtual_free(absolute, spec.size, VM_MEM_RELEASE);
+                (error, absolute, None)
+            }
+            "protect" => {
+                let (_, error, old) = session.virtual_protect(absolute, spec.size, spec.protection);
+                (error, absolute, Some(old))
+            }
+            "query" => (0, absolute, None),
+            _ => (87, absolute, None),
+        };
+        let query = session.virtual_query(query_address);
+        let base_address = if query.state == VM_MEM_FREE {
+            0
+        } else {
+            query.base_address.wrapping_sub(runtime.vm_session_base)
+        };
+        let mut output = json!({
+            "error": error,
+            "state": query.state,
+            "protection": query.protect,
+            "region_size": query.region_size,
+            "base_address": base_address,
+            "committed_set_summary": query.state == VM_MEM_COMMIT,
+        });
+        if let Some(old) = old_protection {
+            output["old_protection"] = json!(old);
+        }
+        output
     })
 }
 

@@ -64,9 +64,28 @@ Category coverage (all executed with real calls, never reimplemented):
 | `synchronization` | `CreateEventW`/`CreateMutexW`/`CreateSemaphoreW`, waits, `ReleaseMutex`, `ReleaseSemaphore`, worker threads for `WAIT_ABANDONED`/`ERROR_NOT_OWNER` |
 | `crt_printf` | UCRT `snprintf`/`%n`, `_set_invalid_parameter_handler`, `_set_printf_count_output`, `strtol`, `_errno` |
 | `thread_tls` | `TlsAlloc`/`TlsSetValue`/`TlsGetValue`/`TlsFree`, thread isolation, `TLS_MINIMUM_AVAILABLE` |
+| `cpu_arithmetic_flags` | real x86 add/sub/cmp executed with stable inline assembly (`core::arch::asm!`), FLAGS captured via `lahf`/`seto` — REAL CPU truth, never a reimplementation |
+| `virtual_memory` | `VirtualAlloc`/`VirtualFree`/`VirtualProtect`/`VirtualQuery` sequences over a session address space (reserve, interior commit, partial protect/decommit, the mandated failures, unmapped-address queries) |
 
-`arithmetic_flags` is intentionally **not** a Windows category — the CPU
-vectors belong to the CPU differential harness and are skipped here.
+`cpu_arithmetic_flags` is a REAL Windows/CPU category: the reference
+executable runs natively on Windows x86/x64, so it executes the actual
+instruction (add/sub/cmp at the vector width) and captures the FLAGS
+register (`zf`/`sf`/`pf`/`cf`/`of`/`af`) with stable inline assembly.  On
+x86_64 the asm blocks use the x86_64 register forms; on i686 the x86 forms
+(64-bit vectors are reported as an explicit error there — the CI runner is
+x64).  The capture header records the reference executable's compiler
+target triple (`target_triple`), so an x86 capture is distinguishable from
+an x64 one.  The bounded corpus (~3.3k vectors) keeps the CI capture fast;
+the full 65,536-pair 8-bit operand space is the `--exhaustive` corpus used
+by the nightly workflow.
+
+`virtual_memory` vectors form a single stateful address-space session: the
+reference process's address space IS the session, and the runtime executor
+drives the pe_runtime VM layer (page-granular private pages/reservations)
+on a scratch session that persists across vectors the same way.  Vector
+addresses are RELATIVE to the session's first reservation base (the
+absolute base is ASLR-environmental); MEM_FREE queries report the
+documented NULL base + 0 region size.
 
 On non-Windows hosts the crate still builds (the workspace check depends on
 it) and every vector reports `unsupported_platform`, which the comparison
@@ -114,6 +133,7 @@ a runtime defect the CI reports.
     "os_edition": "Professional",
     "os_build": "10.0.22631",
     "arch": "x64",
+    "target_triple": "x86_64-pc-windows-msvc",
     "reference_sha256": "…64 hex chars of the reference exe…",
     "corpus_sha256": "…64 hex chars of the vector corpus…"
   },
@@ -126,11 +146,12 @@ a runtime defect the CI reports.
 
 The provenance fields are computed by the reference executable at capture
 time: os edition from the capture machine's registry (`EditionID`), build
-from `RtlGetVersion`, architecture from `GetNativeSystemInfo`, plus the
-SHA-256 of the reference executable itself and of the input corpus.  The
-reference-results consumers require these fields to be present (serde
-defaults keep old files parseable, but they are not accepted as real
-captures).
+from `RtlGetVersion`, architecture from `GetNativeSystemInfo`, the
+reference executable's compiler target triple (`env!`-injected from the
+build script's `TARGET`), plus the SHA-256 of the reference executable
+itself and of the input corpus.  The reference-results consumers require
+these fields to be present (serde defaults keep old files parseable, but
+they are not accepted as real captures).
 
 Both sides reject files whose `schema_version` differs from the protocol
 version. The schema is deliberately extensible: `input`/`output` are
@@ -215,7 +236,7 @@ per-field diffs. It exits `1` on any diff unless `--report-only`, and it
 ALWAYS exits `1` when a `--required-categories` category is not validated
 by the differential (the runtime reported it `runtime_unavailable`, or the
 reference file does not cover it) — `--report-only` never suppresses the
-coverage exit.  `--required-categories` defaults to all ten advertised
+coverage exit.  `--required-categories` defaults to all advertised
 categories, so a compare against a reference file that covers a subset must
 name the subset explicitly.
 
@@ -290,12 +311,13 @@ The protocol is designed to grow. Planned categories (each needs a real-API
 executor in the reference, a model predictor, corpus vectors, and
 comparison semantics):
 
-* **CPU** — arithmetic flags, x87/SSE state: belongs to the CPU differential
-  harness (not Windows); the protocol can host them via a future
-  `cpu_*` category or a sibling harness.
-* **VM** — VirtualAlloc/VirtualProtect/VirtualQuery commit/reserve states,
-  page guard, `MEM_TOP_DOWN`, allocation granularity, `PAGE_GUARD` one-shot
-  behavior.
+* **CPU** — x87/SSE state, `lahf`-style flag capture beyond the arithmetic
+  edge set: belongs to the CPU differential harness; the protocol hosts it
+  via the `cpu_arithmetic_flags` category (real-CPU truth) and its
+  `--exhaustive` corpus.
+* **VM** — page guard, `MEM_TOP_DOWN`, allocation granularity,
+  `PAGE_GUARD` one-shot behavior (the reserve/commit/protect/decommit core
+  is the shipped `virtual_memory` category).
 * **Loader** — import resolution order, DLL search order (`SafeDllSearchMode`
   off/on), `LOAD_LIBRARY_SEARCH_*` flags, delay-load failures, TLS
   callbacks, module base randomization (`GetModuleHandleExW` probing).

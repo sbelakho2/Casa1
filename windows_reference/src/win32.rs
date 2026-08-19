@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::ffi::{CString, c_int, c_void};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // ── Win32 types ─────────────────────────────────────────────────────────────
 
@@ -65,6 +65,49 @@ const TLS_OUT_OF_INDEXES: DWORD = 0xffff_ffff;
 // TLS_MINIMUM_AVAILABLE from the Windows SDK (WinNT.h): the guaranteed
 // minimum number of TLS indexes per process.
 const TLS_MINIMUM_AVAILABLE: DWORD = 64;
+
+// Virtual-memory constants (WinNT.h / WinBase.h).
+const MEM_COMMIT: DWORD = 0x1000;
+const MEM_RESERVE: DWORD = 0x2000;
+const MEM_DECOMMIT: DWORD = 0x4000;
+const MEM_RELEASE: DWORD = 0x8000;
+const MEM_FREE: DWORD = 0x0001_0000;
+const MEM_PRIVATE: DWORD = 0x0002_0000;
+const PAGE_NOACCESS: DWORD = 0x01;
+const PAGE_READONLY: DWORD = 0x02;
+const PAGE_READWRITE: DWORD = 0x04;
+const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
+const ERROR_INVALID_ADDRESS: DWORD = 487;
+
+/// MEMORY_BASIC_INFORMATION (WinNT.h).  The x64 layout is the 48-byte form;
+/// the x86 layout is the 28-byte form (used when a 32-bit runner is added).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Default)]
+struct MemoryBasicInformation {
+    base_address: LPVOID,
+    allocation_base: LPVOID,
+    allocation_protect: DWORD,
+    alignment1: DWORD,
+    region_size: SIZE_T,
+    state: DWORD,
+    protect: DWORD,
+    ty: DWORD,
+    alignment2: DWORD,
+}
+
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Default)]
+struct MemoryBasicInformation {
+    base_address: LPVOID,
+    allocation_base: LPVOID,
+    allocation_protect: DWORD,
+    region_size: DWORD,
+    state: DWORD,
+    protect: DWORD,
+    ty: DWORD,
+}
 
 #[repr(C)]
 struct Overlapped {
@@ -176,6 +219,20 @@ unsafe extern "C" {
     fn TlsFree(index: DWORD) -> BOOL;
     fn TlsSetValue(index: DWORD, value: LPVOID) -> BOOL;
     fn TlsGetValue(index: DWORD) -> LPVOID;
+    fn VirtualAlloc(
+        address: LPVOID,
+        size: SIZE_T,
+        allocation_type: DWORD,
+        protect: DWORD,
+    ) -> LPVOID;
+    fn VirtualFree(address: LPVOID, size: SIZE_T, free_type: DWORD) -> BOOL;
+    fn VirtualProtect(
+        address: LPVOID,
+        size: SIZE_T,
+        new_protect: DWORD,
+        old_protect: *mut DWORD,
+    ) -> BOOL;
+    fn VirtualQuery(address: LPVOID, info: *mut MemoryBasicInformation, length: SIZE_T) -> SIZE_T;
 }
 
 type ThreadProc = unsafe extern "system" fn(LPVOID) -> DWORD;
@@ -331,6 +388,36 @@ struct TlsInput {
     kind: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CpuFlagsInput {
+    /// Arithmetic width in bits: 8 | 16 | 32 | 64.
+    width: u32,
+    /// "add" | "sub" | "cmp".
+    op: String,
+    lhs: u64,
+    rhs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct VirtualMemoryInput {
+    /// "reserve" | "commit" | "decommit" | "release" | "protect" | "query".
+    operation: String,
+    /// For "reserve": 0 lets the system choose the base.  For every other
+    /// operation the address is RELATIVE to the session's first reservation
+    /// base (the reference resolves it against the base its own first
+    /// reserve returned, so the corpus is host-agnostic).
+    #[serde(default)]
+    address: u64,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    allocation_type: u32,
+    #[serde(default)]
+    protection: u32,
+    #[serde(default)]
+    free_type: u32,
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 fn to_wide(value: &str) -> Vec<u16> {
@@ -462,6 +549,8 @@ pub fn execute(category: &str, input: &Value) -> Value {
         "synchronization" => exec_synchronization(input),
         "crt_printf" => exec_crt_printf(input),
         "thread_tls" => exec_thread_tls(input),
+        "cpu_arithmetic_flags" => exec_cpu_arithmetic_flags(input),
+        "virtual_memory" => exec_virtual_memory(input),
         "d3d12_texture_address_mode" => exec_d3d12_texture_address_mode(input),
         "d3d12_filter_reduction" => exec_d3d12_filter_reduction(input),
         "d3d12_filter_translation" => exec_d3d12_filter_translation(input),
@@ -1102,8 +1191,8 @@ fn exec_synchronization(input: &Value) -> Value {
                 CloseHandle(thread);
             }
             let release = json!({
-                "succeeded": (*context).release_succeeded.load(Ordering::SeqCst),
-                "error": (*context).release_error.load(Ordering::SeqCst),
+                "succeeded": unsafe { (*context).release_succeeded.load(Ordering::SeqCst) },
+                "error": unsafe { (*context).release_error.load(Ordering::SeqCst) },
             });
             drop(unsafe { Box::from_raw(context) });
             close_handle(mutex);
@@ -1308,7 +1397,7 @@ fn strtol_vector(text: &str, base: c_int) -> Value {
         "errno": errno as u32,
         "written": null,
         "value": value,
-        "end_consumed": end != input.as_ptr(),
+        "end_consumed": end as *const i8 != input.as_ptr(),
         "buffer": null,
     })
 }
@@ -1517,31 +1606,82 @@ const D3D12_FILTER_NAMES: &[(u32, &str)] = &[
     (0x0000_0015, "D3D12_FILTER_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
     (0x0000_0055, "D3D12_FILTER_ANISOTROPIC"),
     (0x0000_0080, "D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT"),
-    (0x0000_0081, "D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0084, "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0085, "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
-    (0x0000_0090, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT"),
-    (0x0000_0091, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0094, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0095, "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (
+        0x0000_0081,
+        "D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0084,
+        "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0085,
+        "D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
+    (
+        0x0000_0090,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT",
+    ),
+    (
+        0x0000_0091,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0094,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0095,
+        "D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
     (0x0000_00d5, "D3D12_FILTER_COMPARISON_ANISOTROPIC"),
     (0x0000_0100, "D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT"),
     (0x0000_0101, "D3D12_FILTER_MINIMUM_MIN_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0104, "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0105, "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (
+        0x0000_0104,
+        "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0105,
+        "D3D12_FILTER_MINIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
     (0x0000_0110, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_MIP_POINT"),
-    (0x0000_0111, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0114, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0115, "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (
+        0x0000_0111,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0114,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0115,
+        "D3D12_FILTER_MINIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
     (0x0000_0155, "D3D12_FILTER_MINIMUM_ANISOTROPIC"),
     (0x0000_0180, "D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT"),
     (0x0000_0181, "D3D12_FILTER_MAXIMUM_MIN_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0184, "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0185, "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR"),
+    (
+        0x0000_0184,
+        "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0185,
+        "D3D12_FILTER_MAXIMUM_MIN_POINT_MAG_LINEAR_MIP_LINEAR",
+    ),
     (0x0000_0190, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_MIP_POINT"),
-    (0x0000_0191, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR"),
-    (0x0000_0194, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT"),
-    (0x0000_0195, "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR"),
+    (
+        0x0000_0191,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_POINT_MIP_LINEAR",
+    ),
+    (
+        0x0000_0194,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_POINT",
+    ),
+    (
+        0x0000_0195,
+        "D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_LINEAR_MIP_LINEAR",
+    ),
     (0x0000_01d5, "D3D12_FILTER_MAXIMUM_ANISOTROPIC"),
 ];
 
@@ -1580,4 +1720,296 @@ fn exec_d3d12_filter_translation(input: &Value) -> Value {
         "reduction_name": d3d12_filter_reduction_name(reduction),
         "valid": name.is_some(),
     })
+}
+
+// ── cpu_arithmetic_flags ────────────────────────────────────────────────────
+//
+// REAL x86 flag truth via stable inline assembly (core::arch::asm!, stable
+// since Rust 1.59).  The reference executable runs natively on Windows
+// x86/x64, so it executes the ACTUAL instruction (add/sub/cmp at the vector
+// width) and captures the FLAGS register — never a reimplementation.  The
+// flags are the contract: for add/sub the result is discarded, for cmp the
+// instruction itself is the operation.
+//
+// Flags are captured with `lahf` (AH = SF:ZF:0:AF:0:PF:1:CF, i.e. RFLAGS
+// bits 0/2/4/6/7) plus `seto al` (OF, RFLAGS bit 11), which avoids touching
+// the stack.  On x86_64-pc-windows-msvc the asm blocks use the x86_64
+// register forms; on i686-pc-windows-msvc the x86 forms (64-bit arithmetic
+// does not exist in 32-bit mode and is reported as an explicit error).  The
+// crate is compiled for the target Windows runner — x64 first; x86 is
+// documented as a follow-up when a 32-bit runner is added.
+
+#[derive(Debug, Clone, Copy)]
+enum FlagsOp {
+    Add,
+    Sub,
+    Cmp,
+}
+
+fn flags_op(name: &str) -> Option<FlagsOp> {
+    match name {
+        "add" => Some(FlagsOp::Add),
+        "sub" => Some(FlagsOp::Sub),
+        "cmp" => Some(FlagsOp::Cmp),
+        _ => None,
+    }
+}
+
+/// Capture RFLAGS after the width-masked instruction as a packed u64:
+/// bit 0 = CF, bit 2 = PF, bit 4 = AF, bit 6 = ZF, bit 7 = SF,
+/// bit 8 = OF (the lahf/seto layout).
+#[cfg(target_arch = "x86_64")]
+macro_rules! flags_after_arithmetic {
+    ($insn:expr, $lhs:expr, $rhs:expr, $dst:tt, $src:tt) => {{
+        let mut flags: u64 = 0;
+        unsafe {
+            core::arch::asm!(
+                "mov rcx, {lhs}",
+                "mov rdx, {rhs}",
+                concat!($insn, " ", $dst, ", ", $src),
+                "lahf",
+                "seto al",
+                "movzx eax, ax",
+                "mov {flags}, rax",
+                lhs = in(reg) $lhs,
+                rhs = in(reg) $rhs,
+                flags = inout(reg) flags,
+                out("rax") _,
+                out("rcx") _,
+                out("rdx") _,
+                options(nostack),
+            );
+        }
+        flags
+    }};
+}
+
+#[cfg(target_arch = "x86")]
+macro_rules! flags_after_arithmetic {
+    ($insn:expr, $lhs:expr, $rhs:expr, $dst:tt, $src:tt) => {{
+        // 32-bit mode has no u64 register class; the operands and the
+        // captured flags are 32-bit (64-bit arithmetic is unsupported on
+        // x86 anyway — the executor reports it explicitly).
+        let mut flags: u32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "mov ecx, {lhs}",
+                "mov edx, {rhs}",
+                concat!($insn, " ", $dst, ", ", $src),
+                "lahf",
+                "seto al",
+                "movzx eax, ax",
+                "mov {flags}, eax",
+                lhs = in(reg) $lhs,
+                rhs = in(reg) $rhs,
+                flags = inout(reg) flags,
+                out("eax") _,
+                out("ecx") _,
+                out("edx") _,
+                options(nostack),
+            );
+        }
+        u64::from(flags)
+    }};
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn real_cpu_flags(op: FlagsOp, width: u32, lhs: u64, rhs: u64) -> u64 {
+    let insn = match op {
+        FlagsOp::Add => "add",
+        FlagsOp::Sub => "sub",
+        FlagsOp::Cmp => "cmp",
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        match (insn, width) {
+            ("add", 8) => flags_after_arithmetic!("add", lhs, rhs, "cl", "dl"),
+            ("add", 16) => flags_after_arithmetic!("add", lhs, rhs, "cx", "dx"),
+            ("add", 32) => flags_after_arithmetic!("add", lhs, rhs, "ecx", "edx"),
+            ("add", 64) => flags_after_arithmetic!("add", lhs, rhs, "rcx", "rdx"),
+            ("sub", 8) => flags_after_arithmetic!("sub", lhs, rhs, "cl", "dl"),
+            ("sub", 16) => flags_after_arithmetic!("sub", lhs, rhs, "cx", "dx"),
+            ("sub", 32) => flags_after_arithmetic!("sub", lhs, rhs, "ecx", "edx"),
+            ("sub", 64) => flags_after_arithmetic!("sub", lhs, rhs, "rcx", "rdx"),
+            ("cmp", 8) => flags_after_arithmetic!("cmp", lhs, rhs, "cl", "dl"),
+            ("cmp", 16) => flags_after_arithmetic!("cmp", lhs, rhs, "cx", "dx"),
+            ("cmp", 32) => flags_after_arithmetic!("cmp", lhs, rhs, "ecx", "edx"),
+            ("cmp", 64) => flags_after_arithmetic!("cmp", lhs, rhs, "rcx", "rdx"),
+            _ => 0,
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        // The operands are 32-bit (the low 8/16/32 bits of the vector's
+        // operands); 64-bit arithmetic does not exist in 32-bit mode.
+        let (lhs, rhs) = (lhs as u32, rhs as u32);
+        match (insn, width) {
+            ("add", 8) => flags_after_arithmetic!("add", lhs, rhs, "cl", "dl"),
+            ("add", 16) => flags_after_arithmetic!("add", lhs, rhs, "cx", "dx"),
+            ("add", 32) => flags_after_arithmetic!("add", lhs, rhs, "ecx", "edx"),
+            ("sub", 8) => flags_after_arithmetic!("sub", lhs, rhs, "cl", "dl"),
+            ("sub", 16) => flags_after_arithmetic!("sub", lhs, rhs, "cx", "dx"),
+            ("sub", 32) => flags_after_arithmetic!("sub", lhs, rhs, "ecx", "edx"),
+            ("cmp", 8) => flags_after_arithmetic!("cmp", lhs, rhs, "cl", "dl"),
+            ("cmp", 16) => flags_after_arithmetic!("cmp", lhs, rhs, "cx", "dx"),
+            ("cmp", 32) => flags_after_arithmetic!("cmp", lhs, rhs, "ecx", "edx"),
+            // 64-bit arithmetic is reported by the executor, never here.
+            _ => 0,
+        }
+    }
+}
+
+fn flags_output(raw: u64) -> Value {
+    json!({
+        "zf": raw & (1 << 6) != 0,
+        "sf": raw & (1 << 7) != 0,
+        "pf": raw & (1 << 2) != 0,
+        "cf": raw & (1 << 0) != 0,
+        "of": raw & (1 << 8) != 0,
+        "af": raw & (1 << 4) != 0,
+    })
+}
+
+fn exec_cpu_arithmetic_flags(input: &Value) -> Value {
+    let Some(spec) = parse::<CpuFlagsInput>(input) else {
+        return json!({ "error": "invalid_input" });
+    };
+    let Some(op) = flags_op(&spec.op) else {
+        return json!({ "error": "invalid_input" });
+    };
+    if !matches!(spec.width, 8 | 16 | 32 | 64) {
+        return json!({ "error": "invalid_input" });
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        #[cfg(target_arch = "x86")]
+        if spec.width == 64 {
+            // A 32-bit reference build cannot execute 64-bit arithmetic; an
+            // x86 capture therefore reports the vector explicitly instead of
+            // fabricating flags.  The CI runner is x64.
+            return json!({ "error": "no_64bit_arithmetic_on_x86" });
+        }
+        return flags_output(real_cpu_flags(op, spec.width, spec.lhs, spec.rhs));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        let _ = (op, spec.width, spec.lhs, spec.rhs);
+        json!({ "error": "unsupported_arch" })
+    }
+}
+
+// ── virtual_memory ──────────────────────────────────────────────────────────
+//
+// REAL VirtualAlloc / VirtualFree / VirtualProtect / VirtualQuery sequences.
+// The reference process's address space IS the session: state carries across
+// vectors in file order exactly like the runtime session carries across
+// vectors in the compare run.  The base of the session's first reservation
+// is recorded (the corpus's first vector is the reserve), and every
+// `base_address` in the output is reported RELATIVE to that base — the
+// absolute base is ASLR-environmental, while the relative layout is the
+// semantic contract.  For MEM_FREE regions the query reports NULL base + 0
+// size (the documented VirtualQuery contract for unmapped addresses).
+
+static VM_SESSION_BASE: AtomicU64 = AtomicU64::new(0);
+
+fn exec_virtual_memory(input: &Value) -> Value {
+    let Some(spec) = parse::<VirtualMemoryInput>(input) else {
+        return json!({ "error": 87, "state": MEM_FREE, "protection": PAGE_NOACCESS, "region_size": 0, "base_address": 0, "committed_set_summary": false });
+    };
+    let session_base = VM_SESSION_BASE.load(Ordering::SeqCst);
+    let absolute = if spec.operation == "reserve" {
+        spec.address
+    } else {
+        session_base.wrapping_add(spec.address)
+    };
+    let (error, query_address, old_protection) = match spec.operation.as_str() {
+        "reserve" => {
+            let base = unsafe {
+                VirtualAlloc(
+                    absolute as LPVOID,
+                    spec.size as SIZE_T,
+                    spec.allocation_type,
+                    spec.protection,
+                )
+            };
+            if base.is_null() {
+                (last_error(), if absolute == 0 { 0 } else { absolute }, None)
+            } else {
+                if VM_SESSION_BASE.load(Ordering::SeqCst) == 0 {
+                    VM_SESSION_BASE.store(base as u64, Ordering::SeqCst);
+                }
+                (0, base as u64, None)
+            }
+        }
+        "commit" => {
+            let base = unsafe {
+                VirtualAlloc(
+                    absolute as LPVOID,
+                    spec.size as SIZE_T,
+                    MEM_COMMIT,
+                    spec.protection,
+                )
+            };
+            (
+                if base.is_null() { last_error() } else { 0 },
+                absolute,
+                None,
+            )
+        }
+        "decommit" => {
+            let ok = unsafe { VirtualFree(absolute as LPVOID, spec.size as SIZE_T, MEM_DECOMMIT) };
+            (if ok == 0 { last_error() } else { 0 }, absolute, None)
+        }
+        "release" => {
+            let ok = unsafe { VirtualFree(absolute as LPVOID, spec.size as SIZE_T, MEM_RELEASE) };
+            (if ok == 0 { last_error() } else { 0 }, absolute, None)
+        }
+        "protect" => {
+            let mut old: DWORD = 0;
+            let ok = unsafe {
+                VirtualProtect(
+                    absolute as LPVOID,
+                    spec.size as SIZE_T,
+                    spec.protection,
+                    &mut old,
+                )
+            };
+            (if ok == 0 { last_error() } else { 0 }, absolute, Some(old))
+        }
+        "query" => (0, absolute, None),
+        _ => (87, absolute, None),
+    };
+    // VirtualQuery at the target address — the post-operation memory state.
+    let mut mbi = MemoryBasicInformation::default();
+    let written = unsafe {
+        VirtualQuery(
+            query_address as LPVOID,
+            &mut mbi,
+            std::mem::size_of::<MemoryBasicInformation>() as SIZE_T,
+        )
+    };
+    let (state, protection, region_size, base_address) = if written == 0 {
+        (MEM_FREE, PAGE_NOACCESS, 0_u64, 0_u64)
+    } else {
+        let session_base = VM_SESSION_BASE.load(Ordering::SeqCst);
+        let base = mbi.base_address as u64;
+        let relative = if mbi.state == MEM_FREE {
+            0
+        } else {
+            base.wrapping_sub(session_base)
+        };
+        (mbi.state, mbi.protect, mbi.region_size as u64, relative)
+    };
+    let mut output = json!({
+        "error": error,
+        "state": state,
+        "protection": protection,
+        "region_size": region_size,
+        "base_address": base_address,
+        "committed_set_summary": state == MEM_COMMIT,
+    });
+    if let Some(old) = old_protection {
+        output["old_protection"] = json!(old);
+    }
+    output
 }

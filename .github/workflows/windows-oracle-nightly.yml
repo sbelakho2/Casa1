@@ -1,0 +1,82 @@
+name: windows-oracle-nightly
+
+# Nightly Windows differential-oracle capture over the EXHAUSTIVE corpus:
+#
+#   - The `--exhaustive` corpus replaces the bounded 8-bit stride sample of
+#     `cpu_arithmetic_flags` with the FULL 65,536-pair operand space
+#     (~196k vectors).  The reference executable executes every vector with
+#     real x86 instructions, and the compare enforces the same required
+#     categories as the PR pipeline.
+#
+#   - The nightly capture is an artifact, not a gate on PRs: the bounded
+#     corpus (windows-oracle.yml) stays the fast required gate; this job
+#     exercises the full operand space once per day.
+#
+#   - The checked-in golden fixture (tests/fixtures/section42) is validated
+#     by the regular `cargo test --tests` run.
+
+on:
+  schedule:
+    - cron: "30 3 * * *" # UTC 03:30 daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  generate-corpus:
+    name: Generate Exhaustive Corpus
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the exhaustive differential vector corpus
+        run: cargo run -p casa1 --bin casa1-oracle -- vectors --exhaustive --out windows_oracle_vectors_exhaustive.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-oracle-vectors-exhaustive
+          path: windows_oracle_vectors_exhaustive.json
+          retention-days: 7
+
+  reference-capture:
+    name: Reference Capture (Windows, exhaustive)
+    needs: generate-corpus
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-oracle-vectors-exhaustive
+      - name: Build the Windows reference executable
+        run: cargo build --manifest-path windows_reference/Cargo.toml --release
+      - name: Run the reference executable on the exhaustive corpus
+        run: .\windows_reference\target\release\casa1-windows-reference.exe windows_oracle_vectors_exhaustive.json windows_oracle_reference_results_exhaustive.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-oracle-reference-results-exhaustive
+          path: |
+            windows_oracle_vectors_exhaustive.json
+            windows_oracle_reference_results_exhaustive.json
+          retention-days: 7
+
+  compare:
+    name: Compare (fail on any diff)
+    needs: reference-capture
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-oracle-reference-results-exhaustive
+      - name: Compare Casa1 runtime results against the Windows reference results
+        run: >-
+          cargo run -p casa1 --bin casa1-oracle -- compare
+          --vectors windows_oracle_vectors_exhaustive.json
+          --results windows_oracle_reference_results_exhaustive.json
+          --required-categories path_normalize,case_fold,file_sharing,file_lock,delete_semantics,api_set,registry,synchronization,crt_printf,thread_tls,cpu_arithmetic_flags,virtual_memory
