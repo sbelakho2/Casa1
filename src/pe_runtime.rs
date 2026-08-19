@@ -180,10 +180,11 @@ const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PAGE_GUARD: u32 = 0x100;
 
-/// Translate Windows page-protection flags to the win32 protection model.
-fn protection_from_page_flags(flags: u32) -> crate::win32::MemoryProtection {
+/// Translate Windows page-protection flags to the canonical VM protection
+/// model.
+fn protection_from_page_flags(flags: u32) -> crate::vm::VmProtection {
     let flags = flags & !PAGE_GUARD;
-    crate::win32::MemoryProtection {
+    crate::vm::VmProtection {
         read: flags & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)
             != 0,
         write: flags & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0,
@@ -191,8 +192,8 @@ fn protection_from_page_flags(flags: u32) -> crate::win32::MemoryProtection {
     }
 }
 
-/// Translate the win32 protection model back to Windows page flags.
-fn page_flags_from_protection(protection: &crate::win32::MemoryProtection) -> u32 {
+/// Translate the canonical VM protection model back to Windows page flags.
+fn page_flags_from_protection(protection: &crate::vm::VmProtection) -> u32 {
     match (protection.read, protection.write, protection.execute) {
         (false, false, false) => PAGE_NOACCESS,
         (true, false, false) => PAGE_READONLY,
@@ -3943,7 +3944,6 @@ struct PeHostRuntime {
     next_gdi_object_handle: u64,
     next_descriptor_handle: u64,
     next_heap_address: u64,
-    next_private_address: u64,
     /// Tracks which x86 heap region is currently active (0 = primary at
     /// X86_CRT_HEAP_BASE, 1 = secondary at X86_CRT_HEAP_BASE_2, etc.).
     /// Incremented when the bump pointer exceeds the 32-bit address space.
@@ -3953,15 +3953,13 @@ struct PeHostRuntime {
     /// (malloc/calloc/realloc and the CRT FILE-block allocation) fails with
     /// ENOMEM and NULL instead of succeeding.  Cleared on consumption.
     crt_alloc_fail_next: bool,
-    /// Tracks private page allocations (VirtualAlloc / MEM_RESERVE|MEM_COMMIT)
-    /// so `VirtualFree` / `MEM_RELEASE` can validate and free them.
-    /// Committed private pages (VirtualAlloc), keyed by page base; the value
-    /// is the page's protection.  Page-granular so MEM_DECOMMIT /
-    /// VirtualProtect / VirtualQuery handle partial ranges correctly.
-    private_pages: BTreeMap<u64, crate::win32::MemoryProtection>,
-    /// Reserved ranges (VirtualAlloc(MEM_RESERVE)), keyed by base with the
-    /// size.  Commits inside an existing reservation commit its pages.
-    private_reservations: BTreeMap<u64, usize>,
+    /// The canonical virtual-memory layer: ONE authoritative bookkeeper for
+    /// reservations, committed regions, protection and VirtualQuery,
+    /// replacing the former `private_pages`/`private_reservations` maps.
+    /// The VirtualAlloc/Free/Protect/Query thunks, the private allocator
+    /// and the loader/stack/heap registrations all delegate to it, and the
+    /// CPU's MemoryImage validates every guest access through it.
+    vm: crate::vm::VirtualMemory,
     critical_sections: BTreeMap<u64, usize>,
     condition_variables: BTreeMap<u64, GuestConditionVariable>,
     srw_locks: BTreeMap<u64, Arc<GuestSRWLock>>,
@@ -4822,7 +4820,26 @@ pub fn execute_with_options(
     let image_hash = util::sha256_bytes(&bytes);
     let mapped = pe::map_image(&bytes, &image, &image_hash, dtm)?;
     let mut memory = MemoryImage::default();
+    // Attach the canonical VM: every guest access is now validated by the
+    // VM layer FIRST (the raw page map only supplies the bytes), so the
+    // interpreter, the JIT helpers and the VirtualAlloc-family thunks share
+    // ONE authoritative view of reservations / commits / protection.
+    memory.set_vm(&mut runtime.vm);
     memory.map_bytes(mapped.selected_base, &mapped.memory);
+    // Canonical VM: the loader-mapped main image is an Image region.
+    runtime.vm.register(
+        mapped.selected_base,
+        image.size_of_image as u64,
+        crate::vm::VmRegionKind::Image,
+    );
+    runtime
+        .vm
+        .commit(
+            mapped.selected_base,
+            image.size_of_image as u64,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
+        );
     // Extract main image TLS callback RVAs for storage in DllInfo.
     let main_tls_callbacks_rva: Vec<u64> = image
         .tls_directory
@@ -5090,6 +5107,23 @@ pub fn execute_with_options(
     let guest_pointer_bytes = guest_arch.pointer_bytes() as u64;
     let stack_bottom = stack_base_for_arch(guest_arch);
     memory.map_bytes(stack_bottom, &vec![0_u8; STACK_SIZE]);
+    // Canonical VM: the main-thread stack is a Stack region, fully
+    // committed.  The pages below the base belong to no region, so a stack
+    // overflow faults through the canonical layer exactly as before (the
+    // region boundary is the stack guard).
+    runtime.vm.register(
+        stack_bottom,
+        STACK_SIZE as u64,
+        crate::vm::VmRegionKind::Stack,
+    );
+    runtime
+        .vm
+        .commit(
+            stack_bottom,
+            STACK_SIZE as u64,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
     let stack_top = stack_bottom + STACK_SIZE as u64;
     let rsp = stack_top - guest_pointer_bytes;
     write_guest_pointer(&mut memory, rsp, 0, guest_arch)?;
@@ -8762,7 +8796,7 @@ pub fn thunk_drive_manifest_gate(ge: GameEnvironment) -> AppResult<ThunkManifest
     runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
     runtime.next_data_address = data_base_for_arch(GuestArch::X86);
     runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
-    runtime.next_private_address = private_pages_base_for_arch(GuestArch::X86);
+    runtime.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(GuestArch::X86));
     runtime.x86_heap_region = 0;
     let mut memory = MemoryImage::default();
 
@@ -9097,12 +9131,10 @@ impl PeHostRuntime {
             next_gdi_object_handle: 0xa000,
             next_descriptor_handle: DESCRIPTOR_HANDLE_BASE,
             next_heap_address: CRT_HEAP_BASE,
-            next_private_address: PRIVATE_PAGES_BASE,
             x86_heap_region: 0,
             heap_allocations: BTreeMap::new(),
             crt_alloc_fail_next: false,
-            private_pages: BTreeMap::new(),
-            private_reservations: BTreeMap::new(),
+            vm: crate::vm::VirtualMemory::new(PRIVATE_PAGES_BASE),
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),
@@ -9333,7 +9365,7 @@ impl PeHostRuntime {
         self.next_thunk_address = thunk_base_for_arch(guest_arch);
         self.next_data_address = data_base_for_arch(guest_arch);
         self.next_heap_address = heap_base_for_arch(guest_arch);
-        self.next_private_address = private_pages_base_for_arch(guest_arch);
+        self.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(guest_arch));
         self.x86_heap_region = 0;
         // JIT enablement is part of the runner protocol (RunnerJob.jit_mode):
         //   - Disabled: never construct the JIT runtime.
@@ -9484,9 +9516,20 @@ impl PeHostRuntime {
         {
             return;
         }
-        memory.map_bytes(
+        let bytes = minimal_synthetic_module_image(module_handle, self.guest_arch);
+        memory.map_bytes(module_handle, &bytes);
+        // Canonical VM: synthetic module images are guest-accessible Image
+        // regions (nested inside the growing CRT data area).
+        self.vm.register(
             module_handle,
-            &minimal_synthetic_module_image(module_handle, self.guest_arch),
+            bytes.len() as u64,
+            crate::vm::VmRegionKind::Image,
+        );
+        self.vm.commit(
+            module_handle,
+            bytes.len() as u64,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
         );
     }
 
@@ -37310,45 +37353,32 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
                     let commits = allocation_type & MEM_COMMIT != 0;
-                    let _reserves = allocation_type & MEM_RESERVE != 0;
                     let aligned = align_up_u64(bytes as u64, 0x1000);
                     let address = if !commits {
                         // MEM_RESERVE only: record the reservation; the pages
                         // stay unmapped and VirtualQuery reports Reserved.
-                        let base = if requested_address == 0 {
-                            let current = self.next_private_address;
-                            self.next_private_address = current.checked_add(aligned).ok_or_else(|| {
-                                AppError::new(ReasonCode::RcUnimplInsn, "virtual address space exhausted")
-                            })?;
-                            current
-                        } else {
-                            requested_address & !0xfff
-                        };
-                        self.private_reservations.insert(base, aligned as usize);
+                        let base = self.vm.reserve(
+                            (requested_address != 0).then_some(requested_address & !0xfff),
+                            aligned,
+                        );
+                        if base == 0 {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                            return Ok(None);
+                        }
                         base
                     } else if requested_address != 0 {
                         // MEM_COMMIT at a specific address: commit the pages
                         // INSIDE an existing reservation (interior commit).
                         let base = requested_address & !0xfff;
-                        let range_end = base.checked_add(aligned).ok_or_else(|| {
-                            AppError::new(ReasonCode::RcUnimplInsn, "commit range overflow")
-                        })?;
-                        let containing = self.private_reservation_containing(base);
-                        let fits = containing.is_some_and(|(rbase, rsize)| {
-                            rbase.checked_add(rsize).is_some_and(|rend| range_end <= rend)
-                        });
-                        if !fits {
+                        if !self.vm.can_commit(base, aligned) {
                             state.set(Register::Rax, 0);
                             self.last_error = ERROR_INVALID_PARAMETER;
                             return Ok(None);
                         }
                         memory.map_bytes(base, &vec![0; aligned as usize]);
-                        for page in (0..aligned / 0x1000).map(|i| base + i * 0x1000) {
-                            self.private_pages.insert(
-                                page,
-                                protection_from_page_flags(protect),
-                            );
-                        }
+                        self.vm
+                            .commit(base, aligned, protection_from_page_flags(protect), false);
                         base
                     } else {
                         // MEM_COMMIT (or RESERVE|COMMIT) without a base:
@@ -37391,12 +37421,9 @@ impl PeHostRuntime {
                             ]),
                             json!(0),
                         );
-                    } else if let Some(&size) = self.private_reservations.get(&address) {
-                        memory.unmap_range(address, size);
-                        self.private_reservations.remove(&address);
-                        for page in (0..size / 0x1000).map(|i| address + i as u64 * 0x1000) {
-                            self.private_pages.remove(&page);
-                        }
+                    } else if let Some(size) = self.vm.region_size(address) {
+                        memory.unmap_range(address, size as usize);
+                        self.vm.release(address);
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -37419,7 +37446,7 @@ impl PeHostRuntime {
                                 ("address".to_string(), json!(format!("{address:#x}"))),
                                 ("size".to_string(), json!(bytes)),
                                 ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
-                                ("error".to_string(), json!("address not found in private_pages")),
+                                ("error".to_string(), json!("address not found in reserved regions")),
                             ]),
                             json!(0),
                         );
@@ -37432,9 +37459,7 @@ impl PeHostRuntime {
                     // reservation itself is kept.
                     let aligned = align_up_u64(bytes.max(1) as u64, 0x1000) as usize;
                     memory.unmap_range(address, aligned);
-                    for page in (0..aligned / 0x1000).map(|i| address + i as u64 * 0x1000) {
-                        self.private_pages.remove(&page);
-                    }
+                    self.vm.decommit(address, aligned as u64);
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
                     self.push_trace(
@@ -37475,19 +37500,9 @@ impl PeHostRuntime {
                 let aligned = align_up_u64(bytes.max(1) as u64, 0x1000);
                 let first_page = address & !0xfff;
                 let old_protection = self
-                    .private_pages
-                    .get(&first_page)
-                    .cloned()
-                    .unwrap_or(crate::win32::MemoryProtection {
-                        read: false,
-                        write: false,
-                        execute: false,
-                    });
-                for page in (0..aligned / 0x1000).map(|i| first_page + i * 0x1000) {
-                    if let Some(protection) = self.private_pages.get_mut(&page) {
-                        *protection = new_protection;
-                    }
-                }
+                    .vm
+                    .protect(first_page, aligned, new_protection)
+                    .unwrap_or(crate::vm::VmProtection::NONE);
                 if old_protect_ptr != 0 {
                     write_u32(memory, old_protect_ptr, page_flags_from_protection(&old_protection));
                 }
@@ -37619,88 +37634,27 @@ impl PeHostRuntime {
                         json!(0),
                     );
                 } else {
-                    let (base_address, allocation_base, region_size, mem_state, protection, ty) = if address >= self.mapped_image_base
-                        && address < self.mapped_image_base + self.mapped_image_size
-                    {
-                        (
-                            self.mapped_image_base,
-                            self.mapped_image_base,
-                            self.mapped_image_size - (address - self.mapped_image_base),
-                            MEM_COMMIT,
-                            PAGE_EXECUTE_READWRITE,
-                            MEM_IMAGE,
-                        )
-                    } else if (address >= STACK_BASE && address < STACK_BASE + STACK_SIZE as u64)
-                        || (address >= X86_STACK_BASE && address < X86_STACK_BASE + STACK_SIZE as u64)
-                    {
-                        let sb = if address >= STACK_BASE && address < STACK_BASE + STACK_SIZE as u64 {
-                            STACK_BASE
-                        } else {
-                            X86_STACK_BASE
-                        };
-                        (
-                            sb,
-                            sb,
-                            sb + STACK_SIZE as u64 - address,
-                            MEM_COMMIT,
-                            PAGE_READWRITE,
-                            MEM_PRIVATE,
-                        )
-                    } else {
-                        // Page-granular private allocation query with
-                        // coalescing: report the run of adjacent pages with
-                        // identical state (committed/reserved) and, for
-                        // committed pages, identical protection.
-                        let page = address & !0xfff;
-                        let (allocation_base, allocation_size, mem_state, protection, _ty) =
-                            if let Some(&protection) = self.private_pages.get(&page) {
-                                // Committed page: coalesce forward over
-                                // committed pages with the same protection.
-                                let mut run_end = page + 0x1000;
-                                loop {
-                                    match self.private_pages.get(&run_end) {
-                                        Some(next) if next == &protection => {
-                                            run_end += 0x1000;
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                (
-                                    page,
-                                    run_end - page,
-                                    MEM_COMMIT,
-                                    page_flags_from_protection(&protection),
-                                    MEM_PRIVATE,
-                                )
-                            } else if let Some((rbase, rsize)) =
-                                self.private_reservation_containing(address)
-                            {
-                                // Reserved (uncommitted) page inside a
-                                // reservation: coalesce forward over
-                                // non-committed pages.
-                                let mut run_end = page + 0x1000;
-                                let rend = rbase + rsize;
-                                while run_end < rend
-                                    && !self.private_pages.contains_key(&run_end)
-                                {
-                                    run_end += 0x1000;
-                                }
-                                (rbase, run_end - page, MEM_RESERVE, PAGE_NOACCESS, MEM_PRIVATE)
-                            } else if let Some((&hbase, &hsize)) =
-                                self.heap_allocations.range(..=address).next_back()
-                            {
-                                let hend = hbase.saturating_add(hsize as u64);
-                                if address < hend {
-                                    (hbase, hend - address, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE)
-                                } else {
-                                    (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
-                                }
-                            } else {
-                                (page, 0x1000, MEM_FREE, PAGE_NOACCESS, MEM_PRIVATE)
-                            };
-                        (allocation_base, allocation_base, allocation_size, mem_state, protection, MEM_PRIVATE)
+                    // The canonical VM answers every query — private
+                    // allocations, the mapped image, the stacks and the heap
+                    // are all registered regions, and query() coalesces
+                    // adjacent pages with identical state/protection into
+                    // the reported run exactly like the page-granular
+                    // Windows VirtualQuery.
+                    let query = self.vm.query(address);
+                    let mem_state = match query.state {
+                        crate::vm::VmState::Free => MEM_FREE,
+                        crate::vm::VmState::Reserved => MEM_RESERVE,
+                        crate::vm::VmState::Committed => MEM_COMMIT,
                     };
-                    let region_size = region_size.max(0x1000);
+                    let protection = page_flags_from_protection(&query.protection);
+                    let ty = if query.kind == crate::vm::VmRegionKind::Image {
+                        MEM_IMAGE
+                    } else {
+                        MEM_PRIVATE
+                    };
+                    let base_address = query.base;
+                    let allocation_base = query.base;
+                    let region_size = query.region_size.max(0x1000);
                     match self.guest_arch {
                         GuestArch::X86 => {
                             write_u32(memory, buffer, base_address as u32);
@@ -54296,6 +54250,20 @@ impl PeHostRuntime {
             )
         })?;
         memory.map_bytes(address, &vec![0; size]);
+        // Canonical VM: the CRT data area (globals, PEB/TEB, TLS blocks,
+        // module handles) is a growing region the guest reads and writes.
+        let data_base = data_base_for_arch(self.guest_arch);
+        self.vm.register(
+            data_base,
+            self.next_data_address.saturating_sub(data_base),
+            crate::vm::VmRegionKind::Private,
+        );
+        self.vm.commit(
+            address,
+            size as u64,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
         Ok(address)
     }
 
@@ -54391,6 +54359,26 @@ impl PeHostRuntime {
             vec![0u8; mapped_size]
         };
         memory.map_bytes(address, &bytes);
+        // Canonical VM: the heap is a growing Heap region (the bump
+        // allocator shares pages between consecutive allocations, so the
+        // region covers the whole active heap area and only the allocated
+        // ranges are committed).
+        let heap_base = match self.guest_arch {
+            GuestArch::X86 if self.x86_heap_region == 1 => X86_CRT_HEAP_BASE_2,
+            GuestArch::X86 => X86_CRT_HEAP_BASE,
+            GuestArch::X64 => CRT_HEAP_BASE,
+        };
+        self.vm.register(
+            heap_base,
+            self.next_heap_address.saturating_sub(heap_base),
+            crate::vm::VmRegionKind::Heap,
+        );
+        self.vm.commit(
+            address,
+            mapped_size as u64,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
         self.heap_allocations.insert(address, requested_size);
         Ok(address)
     }
@@ -54403,69 +54391,35 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let size = align_up_u64(size.max(1) as u64, 0x1000) as usize;
         let address = if requested_address == 0 {
-            align_up_u64(self.next_private_address, 0x1000)
+            // The canonical VM's cursor picks the address (and advances).
+            self.vm.reserve(None, size as u64)
         } else {
             let candidate = requested_address & !0xfff;
-            // Check for overlap with existing private page allocations
-            let candidate_end = candidate.checked_add(size as u64).ok_or_else(|| {
-                AppError::new(
+            let base = self.vm.reserve(Some(candidate), size as u64);
+            if base == 0 {
+                return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
-                    "PE runtime virtual allocation overflow",
-                )
-            })?;
-            for (&existing_base, &existing_size) in &self.private_reservations {
-                let existing_end =
-                    existing_base
-                        .checked_add(existing_size as u64)
-                        .ok_or_else(|| {
-                            AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                "PE runtime virtual allocation overflow",
-                            )
-                        })?;
-                if candidate < existing_end && existing_base < candidate_end {
-                    return Err(AppError::new(
-                        ReasonCode::RcUnimplInsn,
-                        format!(
-                            "VirtualAlloc at {candidate:#x} size {size:#x} overlaps existing allocation at {existing_base:#x} size {existing_size:#x}"
-                        ),
-                    ));
-                }
+                    format!(
+                        "VirtualAlloc at {candidate:#x} size {size:#x} overlaps an existing allocation"
+                    ),
+                ));
             }
-            candidate
+            base
         };
-        let end = address.checked_add(size as u64).ok_or_else(|| {
-            AppError::new(
+        if address == 0 {
+            return Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
                 "PE runtime virtual allocation overflow",
-            )
-        })?;
-        self.next_private_address = self.next_private_address.max(end);
-        memory.map_bytes(address, &vec![0; size]);
-        for page in (0..size / 0x1000).map(|i| address + i as u64 * 0x1000) {
-            self.private_pages.insert(
-                page,
-                crate::win32::MemoryProtection {
-                    read: true,
-                    write: true,
-                    execute: true,
-                },
-            );
+            ));
         }
-        self.private_reservations.insert(address, size);
+        memory.map_bytes(address, &vec![0; size]);
+        self.vm.commit(
+            address,
+            size as u64,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
+        );
         Ok(address)
-    }
-
-    /// Find the private reservation containing `address` (or None).
-    fn private_reservation_containing(&self, address: u64) -> Option<(u64, u64)> {
-        self.private_reservations
-            .range(..=address)
-            .next_back()
-            .filter(|(base, size)| {
-                base.checked_add(**size as u64)
-                    .is_some_and(|end| address < end)
-            })
-            .map(|(&base, &size)| (base, size as u64))
     }
 
     /// Register a fast-thunk for the given host thunk address.
@@ -75196,7 +75150,7 @@ mod tests {
         runtime.next_thunk_address = thunk_base_for_arch(guest_arch);
         runtime.next_data_address = data_base_for_arch(guest_arch);
         runtime.next_heap_address = heap_base_for_arch(guest_arch);
-        runtime.next_private_address = private_pages_base_for_arch(guest_arch);
+        runtime.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(guest_arch));
         runtime.x86_heap_region = 0;
     }
 

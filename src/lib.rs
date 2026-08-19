@@ -219,6 +219,7 @@ pub mod user32;
 pub mod util;
 pub mod video_decoder;
 pub mod vkgl;
+pub mod vm;
 // WebView2 COM interface types use Windows-style naming (ICoreWebView2*, IID_*).
 // These are defined to match the upstream API surface exactly.
 #[allow(non_camel_case_types)]

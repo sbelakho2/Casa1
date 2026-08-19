@@ -1001,6 +1001,13 @@ pub struct MemoryImage {
     pages: Vec<(u64, MemoryPage)>,
     high_page_lookup: PageLookup,
     low_page_lookup: Box<[u32]>,
+    /// Handle to the canonical virtual-memory layer
+    /// ([`crate::vm::VirtualMemory`]).  The loader keeps this null (raw
+    /// page-map validation only); the PE runtime attaches its live VM with
+    /// [`MemoryImage::set_vm`] so every guest access is validated by the
+    /// canonical layer FIRST and the page map is used ONLY for the actual
+    /// bytes.
+    vm: *mut crate::vm::VirtualMemory,
 }
 
 /// A guest access violation raised by the checked memory accessors
@@ -1020,6 +1027,7 @@ impl Clone for MemoryImage {
             pages: self.pages.clone(),
             high_page_lookup: self.high_page_lookup.clone(),
             low_page_lookup: self.low_page_lookup.clone(),
+            vm: self.vm,
         }
     }
 }
@@ -1031,6 +1039,7 @@ impl Default for MemoryImage {
             high_page_lookup: PageLookup::default(),
             low_page_lookup: vec![LOW_PAGE_DIRECTORY_MISSING; LOW_PAGE_DIRECTORY_LEN]
                 .into_boxed_slice(),
+            vm: std::ptr::null_mut(),
         }
     }
 }
@@ -1249,6 +1258,45 @@ impl MemoryImage {
         )
     }
 
+    /// Attach the canonical virtual-memory layer: from here on every guest
+    /// access is validated by [`crate::vm::VirtualMemory::check_access`]
+    /// FIRST, with the raw page map used only for the actual bytes.
+    /// `vm` must outlive this image.
+    pub fn set_vm(&mut self, vm: &mut crate::vm::VirtualMemory) {
+        self.vm = vm;
+    }
+
+    /// The attached canonical VM, or `None` when the loader has not wired
+    /// one up (standalone / test images fall back to raw page-map
+    /// validation).
+    fn canonical_vm(&self) -> Option<&crate::vm::VirtualMemory> {
+        if self.vm.is_null() {
+            None
+        } else {
+            // SAFETY: `set_vm` requires the VM to outlive this image, and
+            // the PE runtime only attaches VMs it keeps alive for the whole
+            // run.
+            Some(unsafe { &*self.vm })
+        }
+    }
+
+    /// Validate `address` against the canonical VM when one is attached;
+    /// no-op otherwise.  Faults surface as the interpreter's standard
+    /// guest access-violation error carrying the precise fault address.
+    fn check_canonical_access(
+        &self,
+        address: u64,
+        write: bool,
+        execute: bool,
+    ) -> AppResult<()> {
+        if let Some(vm) = self.canonical_vm()
+            && let Err(fault) = vm.check_access(address, write, execute)
+        {
+            return Err(Self::unmapped_memory_error(fault.address));
+        }
+        Ok(())
+    }
+
     /// First unmapped byte in `[address, address + len)`, or `None` when the
     /// whole range is mapped.  Never allocates or inserts pages.
     fn first_unmapped_in_range(&self, address: u64, len: usize) -> Option<u64> {
@@ -1280,7 +1328,20 @@ impl MemoryImage {
     /// every byte is already mapped.  Unlike [`MemoryImage::read_into`] this
     /// returns a structured [`GuestMemoryFault`] (carrying the precise fault
     /// address and access length) and NEVER allocates or inserts pages.
+    ///
+    /// When a canonical VM is attached it is consulted FIRST (and is
+    /// authoritative): a stray raw page can never satisfy the read if the VM
+    /// says the address is unmapped, reserved, guarded or read-protected.
     pub fn guest_read_checked(&self, address: u64, buf: &mut [u8]) -> Result<(), GuestMemoryFault> {
+        if let Some(vm) = self.canonical_vm()
+            && let Err(fault) = vm.check_access(address, false, false)
+        {
+            return Err(GuestMemoryFault {
+                address: fault.address,
+                write: false,
+                read_len: buf.len(),
+            });
+        }
         if let Some(fault_address) = self.first_unmapped_in_range(address, buf.len()) {
             return Err(GuestMemoryFault {
                 address: fault_address,
@@ -1302,11 +1363,24 @@ impl MemoryImage {
     /// materializing memory.  Loader / VirtualAlloc / heap / kernel paths
     /// keep using the allocating APIs (`map_bytes`, `commit_zeroed_pages`,
     /// `page_mut_or_insert`).
+    ///
+    /// When a canonical VM is attached it is consulted FIRST (and is
+    /// authoritative): a stray raw page can never satisfy the write if the
+    /// VM says the address is unmapped, reserved, guarded or write-protected.
     pub fn guest_write_checked(
         &mut self,
         address: u64,
         buf: &[u8],
     ) -> Result<(), GuestMemoryFault> {
+        if let Some(vm) = self.canonical_vm()
+            && let Err(fault) = vm.check_access(address, true, false)
+        {
+            return Err(GuestMemoryFault {
+                address: fault.address,
+                write: true,
+                read_len: buf.len(),
+            });
+        }
         if let Some(fault_address) = self.first_unmapped_in_range(address, buf.len()) {
             return Err(GuestMemoryFault {
                 address: fault_address,
@@ -1366,6 +1440,7 @@ impl MemoryImage {
             let page_base = current_address & MEMORY_PAGE_MASK;
             let page_offset = (current_address - page_base) as usize;
             let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(target.len() - copied);
+            self.check_canonical_access(current_address, false, false)?;
             let page = self
                 .page(page_base)
                 .ok_or_else(|| Self::unmapped_memory_error(current_address))?;
@@ -1442,6 +1517,7 @@ impl MemoryImage {
     }
 
     pub fn read_u8(&self, address: u64) -> AppResult<u8> {
+        self.check_canonical_access(address, false, false)?;
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if let Some(index) = self.page_index(page_base) {
@@ -1461,6 +1537,7 @@ impl MemoryImage {
     }
 
     pub fn read_u16(&self, address: u64) -> AppResult<u16> {
+        self.check_canonical_access(address, false, false)?;
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 2 <= MEMORY_PAGE_SIZE {
@@ -1498,6 +1575,7 @@ impl MemoryImage {
     }
 
     pub fn read_u32(&self, address: u64) -> AppResult<u32> {
+        self.check_canonical_access(address, false, false)?;
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 4 <= MEMORY_PAGE_SIZE {
@@ -1571,6 +1649,7 @@ impl MemoryImage {
     }
 
     pub fn read_u64(&self, address: u64) -> AppResult<u64> {
+        self.check_canonical_access(address, false, false)?;
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 8 <= MEMORY_PAGE_SIZE {
