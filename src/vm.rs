@@ -386,9 +386,10 @@ impl VirtualMemory {
     pub fn query(&self, address: u64) -> VmQueryResult {
         let page = address & VM_PAGE_MASK;
         let Some(region) = self.region_containing(address) else {
+            // Windows VirtualQuery on free memory: NULL base and 0 size.
             return VmQueryResult {
-                base: page,
-                region_size: VM_PAGE_SIZE,
+                base: 0,
+                region_size: 0,
                 state: VmState::Free,
                 protection: VmProtection::NONE,
                 kind: VmRegionKind::Private,
@@ -396,6 +397,25 @@ impl VirtualMemory {
             };
         };
         if let Some(state) = region.pages.get(&page) {
+            // Windows VirtualQuery semantics: BaseAddress is the START of
+            // the coalesced run of pages with identical state/protection
+            // containing the queried page — for a partially committed
+            // reservation that is the first page of the committed run, NOT
+            // the reservation base.  Walk backward to find it.
+            let mut run_start = page;
+            while run_start > region.base {
+                let prev = run_start - VM_PAGE_SIZE;
+                match region.pages.get(&prev) {
+                    Some(prev_state)
+                        if prev_state.committed
+                            && prev_state.protection == state.protection
+                            && prev_state.guard == state.guard =>
+                    {
+                        run_start = prev;
+                    }
+                    _ => break,
+                }
+            }
             let mut run_end = page + VM_PAGE_SIZE;
             loop {
                 match region.pages.get(&run_end) {
@@ -410,22 +430,31 @@ impl VirtualMemory {
                 }
             }
             VmQueryResult {
-                base: region.base,
-                region_size: run_end - page,
+                base: run_start,
+                region_size: run_end - run_start,
                 state: VmState::Committed,
                 protection: state.protection,
                 kind: region.kind,
                 guard: state.guard,
             }
         } else {
+            // Reserved run: coalesce backward over absent pages too.
+            let mut run_start = page;
+            while run_start > region.base {
+                let prev = run_start - VM_PAGE_SIZE;
+                if region.pages.contains_key(&prev) {
+                    break;
+                }
+                run_start = prev;
+            }
             let mut run_end = page + VM_PAGE_SIZE;
             let region_end = region.end();
             while run_end < region_end && !region.pages.contains_key(&run_end) {
                 run_end += VM_PAGE_SIZE;
             }
             VmQueryResult {
-                base: region.base,
-                region_size: run_end - page,
+                base: run_start,
+                region_size: run_end - run_start,
                 state: VmState::Reserved,
                 protection: VmProtection::NONE,
                 kind: region.kind,
@@ -527,7 +556,9 @@ mod tests {
         assert_eq!(committed.state, VmState::Committed);
         assert_eq!(committed.region_size, 0x2000);
         assert_eq!(committed.protection, VmProtection::READ_WRITE);
-        assert_eq!(committed.base, reservation);
+        // Windows: BaseAddress is the START of the coalesced committed run
+        // (the first committed page), not the reservation base.
+        assert_eq!(committed.base, reservation + 0x1000);
 
         let tail = vm.query(reservation + 0x3000);
         assert_eq!(tail.state, VmState::Reserved);
@@ -592,24 +623,27 @@ mod tests {
         assert_eq!(committed.state, VmState::Committed);
         assert_eq!(committed.region_size, 0x3000);
         assert_eq!(committed.base, reservation);
-        // A query in the middle of the committed run reports the remainder.
+        // A query in the middle of the committed run reports the FULL
+        // coalesced run (Windows: BaseAddress + RegionSize describe the
+        // whole run containing the queried address).
         let committed = vm.query(reservation + 0x1000);
         assert_eq!(committed.state, VmState::Committed);
-        assert_eq!(committed.region_size, 0x2000);
+        assert_eq!(committed.region_size, 0x3000);
         assert_eq!(committed.base, reservation);
 
-        // The reserved run spans the two uncommitted tail pages and is
-        // reported from the queried page forward with the reservation base.
+        // The reserved tail run starts at the first uncommitted page and
+        // spans to the reservation end.
         let reserved = vm.query(reservation + 0x3000);
         assert_eq!(reserved.state, VmState::Reserved);
         assert_eq!(reserved.region_size, 0x2000);
-        assert_eq!(reserved.base, reservation);
+        assert_eq!(reserved.base, reservation + 0x3000);
 
-        // A query in the middle of the reserved run reports the same run.
+        // A query in the middle of the reserved run reports the same
+        // coalesced run (base = the run start).
         let reserved = vm.query(reservation + 0x4000);
         assert_eq!(reserved.state, VmState::Reserved);
-        assert_eq!(reserved.region_size, 0x1000);
-        assert_eq!(reserved.base, reservation);
+        assert_eq!(reserved.region_size, 0x2000);
+        assert_eq!(reserved.base, reservation + 0x3000);
     }
 
     #[test]

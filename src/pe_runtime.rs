@@ -37835,7 +37835,11 @@ impl PeHostRuntime {
                     };
                     let base_address = query.base;
                     let allocation_base = query.base;
-                    let region_size = query.region_size.max(0x1000);
+                    // The canonical query already reports Windows-correct
+                    // sizes (free memory -> 0; committed/reserved runs are
+                    // always >= 1 page); the old `.max(0x1000)` made free
+                    // memory report a phantom page.
+                    let region_size = query.region_size;
                     match self.guest_arch {
                         GuestArch::X86 => {
                             write_u32(memory, buffer, base_address as u32);

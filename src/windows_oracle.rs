@@ -851,7 +851,7 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
             })
         }
         "cpu_arithmetic_flags" => runtime_cpu_arithmetic_flags(&vector.input),
-        "virtual_memory" => runtime_virtual_memory(&vector.input),
+        "virtual_memory" => runtime_virtual_memory(&vector.id, &vector.input),
         _ => json!({ "runtime_unavailable": true }),
     };
     VectorResult {
@@ -1886,7 +1886,19 @@ const VM_PAGE_NOACCESS: u32 = 0x01;
 /// output is relative to it (the absolute base is ASLR-environmental, the
 /// relative layout is the semantic contract), and MEM_FREE queries report
 /// NULL base + 0 size.
-fn runtime_virtual_memory(input: &Value) -> Value {
+fn runtime_virtual_memory(id: &str, input: &Value) -> Value {
+    // The virtual_memory vectors form a SEQUENCE (each depends on the
+    // previous state).  The thread-local oracle session persists across
+    // test invocations, so the session must be reset at the sequence start
+    // ("virtual_memory:000") — otherwise a stale vm/session_base from a
+    // previous run shifts every address in the comparison.
+    if id.ends_with(":000") {
+        with_oracle_runtime(|runtime| {
+            let ge = runtime.ge.clone();
+            runtime.vm = crate::pe_runtime::OracleVmSession::new(ge);
+            runtime.vm_session_base = 0;
+        });
+    }
     let Ok(spec) = serde_json::from_value::<VirtualMemoryInput>(input.clone()) else {
         return json!({
             "error": 87, "state": VM_MEM_FREE, "protection": VM_PAGE_NOACCESS,

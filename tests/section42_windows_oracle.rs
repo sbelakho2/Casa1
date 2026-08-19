@@ -1066,9 +1066,10 @@ fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
     let expected = [
         // 0: reserve 0x4000 → the queried base is a 0x4000 reserved region.
         serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x4000, "base_address": 0, "committed_set_summary": false }),
-        // 1: query mid-range (0x2000 into the reservation): the reserved
-        //    tail reports the reservation base and the remaining 0x2000.
-        serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x2000, "base_address": 0, "committed_set_summary": false }),
+        // 1: query mid-range (0x2000 into the reservation): Windows
+        //    VirtualQuery reports BaseAddress = the region base and
+        //    RegionSize = the FULL region size (0x4000), not the tail.
+        serde_json::json!({ "error": 0, "state": 0x2000, "protection": 0x01, "region_size": 0x4000, "base_address": 0, "committed_set_summary": false }),
         // 2: interior commit [0x1000, 0x3000) READWRITE: a committed
         //    region from 0x1000 with size 0x2000.
         serde_json::json!({ "error": 0, "state": 0x1000, "protection": 0x04, "region_size": 0x2000, "base_address": 0x1000, "committed_set_summary": true }),
