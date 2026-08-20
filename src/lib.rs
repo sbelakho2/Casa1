@@ -200,6 +200,7 @@ pub mod real_net;
 pub mod real_win32;
 pub mod reason;
 pub mod runner;
+pub mod runtime;
 pub mod runtime_events;
 pub mod sandbox;
 pub mod scm;
