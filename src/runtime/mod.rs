@@ -8348,6 +8348,66 @@ impl NtThunkSession {
         self.runtime.pending_guest_threads.len()
     }
 
+    /// The scheduler's suspend count for a pending guest thread handle
+    /// (the record the pump gate reads).
+    #[doc(hidden)]
+    pub fn pending_thread_suspend_count(&self, thread_handle: u32) -> Option<u32> {
+        self.runtime
+            .pending_guest_threads
+            .iter()
+            .find(|thread| thread.handle == thread_handle)
+            .map(|thread| thread.suspended)
+    }
+
+    /// Switch the guest architecture of this session.  Thread creation only
+    /// queues scheduler records for x86 guests, so suspend/wait tests run
+    /// with `GuestArch::X86`.  The arch switch rebuilds the canonical VM,
+    /// so the scratch arena is re-registered and the image re-wired exactly
+    /// as the constructor does.
+    #[doc(hidden)]
+    pub fn set_guest_arch(&mut self, guest_arch: GuestArch) {
+        self.runtime.set_guest_arch(guest_arch);
+        self.runtime.win32.address_space_mut().register(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmRegionKind::Private,
+        );
+        self.runtime.win32.address_space_mut().commit(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
+        self.memory.set_vm(self.runtime.win32.address_space_mut());
+    }
+
+    /// Drive one host thunk with the x86 stack calling convention (return
+    /// address at `[esp]`, args below it) and return EAX.
+    #[doc(hidden)]
+    pub fn call_x86(&mut self, thunk: u64, args: &[u32]) -> u32 {
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, self.stack);
+        write_u32(&mut self.memory, self.stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().copied().enumerate() {
+            write_u32(&mut self.memory, self.stack + 4 + (index as u64 * 4), arg);
+        }
+        let _ = self
+            .runtime
+            .dispatch_import(thunk, &mut state, &mut self.memory);
+        state.get(Register::Rax) as u32
+    }
+
+    /// Run one scheduler pump cycle: runs a ready guest thread, or reports
+    /// false when nothing was runnable (suspended / parked threads are not
+    /// runnable).
+    #[doc(hidden)]
+    pub fn pump_pending_guest_thread(&mut self) -> bool {
+        self.runtime
+            .pump_pending_guest_thread(&mut self.memory)
+            .map(|outcome| outcome.did_work)
+            .unwrap_or(false)
+    }
+
     /// The scheduler readiness probe for the parked waiter: true when the
     /// pump's readiness pass would resume it right now (the wait descriptor
     /// became satisfiable — an event was signaled, an APC arrived or the
