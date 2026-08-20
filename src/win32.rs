@@ -1,8 +1,16 @@
 use crate::error::{AppError, AppResult};
 use crate::ge::{
-    FileAccess, FileHandle, FsEntryKind, FsMetadataRecord, GameEnvironment, RegistryView, ShareMode,
+    FileAccess, FsEntryKind, FsMetadataRecord, GameEnvironment, RegistryView, ShareMode,
 };
 use crate::reason::ReasonCode;
+pub use crate::runtime::object_manager::ObjectType;
+use crate::runtime::object_manager::{
+    DirectorySearchObject, EventObject, FileHandleObject, FileObject, IoCompletionPortObject,
+    KernelObject, KeyObject, MutexObject, NamedPipeState, ObjectId, ObjectManager, PipeObject,
+    ProcessObject, SectionObject, SemaphoreObject, ThreadObject, TimerObject,
+};
+use crate::runtime::process::{GuestProcess, allocate_guest_pid};
+use crate::vm::{VmProtection, VmRegionKind, VmState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
@@ -10,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -310,25 +318,6 @@ mod iconv_ffi {
 /// All bits set (0xFFFF_FFFF_FFFF_FFFF).
 pub const INVALID_HANDLE_VALUE: u64 = u64::MAX;
 const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
-const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-const HANDLE_FLAG_PROTECT_FROM_CLOSE: u32 = 0x0000_0002;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ObjectType {
-    File,
-    Event,
-    IoCompletionPort,
-    Mutex,
-    Semaphore,
-    Thread,
-    Process,
-    Section,
-    Key,
-    Timer,
-    Pipe,
-    DirectorySearch,
-    Socket,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleDescriptor {
@@ -556,31 +545,16 @@ pub struct SleepObservation {
     pub drift_ms: i64,
 }
 
+/// Subsystem view of one live handle.  Rebuilt from the canonical handle
+/// table + object manager on every access: `object` is a fresh clone of the
+/// manager-owned payload (Rc-shared for File/Event), `descriptor` carries
+/// the granted access mask / type / refcount, and `generation` detects
+/// stale references after the value was closed and recycled.
 #[derive(Debug, Clone)]
 struct HandleEntry {
     descriptor: HandleDescriptor,
+    /// Fresh clone of the manager-owned kernel-object payload.
     object: KernelObject,
-    /// Monotonically increasing generation counter.  Incremented every time
-    /// the same handle value is reused so that stale references (cached before
-    /// the handle was closed) can be detected.
-    generation: u32,
-}
-
-#[derive(Debug, Clone)]
-enum KernelObject {
-    File(FileHandleObject),
-    Event(EventHandle),
-    IoCompletionPort(IoCompletionPortObject),
-    Mutex(MutexObject),
-    Semaphore(SemaphoreObject),
-    Thread(ThreadObject),
-    Process(ProcessObject),
-    Section(SectionObject),
-    Key(KeyObject),
-    Timer(TimerObject),
-    Pipe(PipeObject),
-    DirectorySearch(DirectorySearchObject),
-    Socket(SocketObject),
 }
 
 /// A winsock socket.  The payload is the socket's id, which is ALWAYS the
@@ -588,100 +562,7 @@ enum KernelObject {
 /// as every other kernel object, so a socket value can never alias a live
 /// win32 object (and vice versa).  The per-socket transport state lives in
 /// the `NetworkStack`, keyed by this id.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SocketObject {
-    pub id: u64,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // file-object state retained for future share-mode enforcement
-struct FileObject {
-    normalized_path: String,
-    host_path: PathBuf,
-    ge_handle: Option<FileHandle>,
-    position: u64,
-    overlapped: bool,
-    /// Open host file descriptor used for positional reads/writes.  `None`
-    /// for directory handles or files that could not be opened; those fall
-    /// back to whole-file I/O.
-    host_file: Option<std::fs::File>,
-    /// The expanded Win32 desired-access mask (generic bits already replaced
-    /// by their concrete `FILE_*` equivalents) this handle was granted at
-    /// open time.  Per-operation access checks evaluate against this.
-    granted_access: u32,
-    /// The raw `FILE_SHARE_*` share-mode value supplied at open time.
-    share_mode: u32,
-    /// True when the file has been deleted (via DeleteFileW) while this
-    /// handle is still open (the handle survived because it was opened with
-    /// FILE_SHARE_DELETE).  The file is already gone from the filesystem;
-    /// there is nothing to clean up at close time.
-    delete_pending: bool,
-    /// True for directory handles, recorded at open time (never recomputed
-    /// via `is_dir()` afterwards, so a deleted directory does not turn into
-    /// a file handle).
-    is_directory: bool,
-    /// FILE_FLAG_DELETE_ON_CLOSE semantics: the file is removed when this
-    /// handle is closed.
-    delete_on_close: bool,
-}
-
-type FileHandleObject = Rc<RefCell<FileObject>>;
-
-#[derive(Debug, Clone)]
-struct EventObject {
-    manual_reset: bool,
-    signaled: bool,
-}
-
-type EventHandle = Rc<RefCell<EventObject>>;
-type EventWeak = Weak<RefCell<EventObject>>;
-
-/// Minimal pipe object stored directly in the kernel-object enum.
-/// Used by the older `create_named_pipe` / `create_named_pipe_w` code paths;
-/// the newer `NamedPipeState`-based infrastructure lives in
-/// `self.named_pipes` and provides condvar-backed sync.
-#[derive(Debug, Clone)]
-struct PipeObject {
-    name: String,
-    connected: bool,
-    buffer: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct IoCompletionPacket {
-    pub bytes_transferred: u32,
-    pub completion_key: u64,
-    pub overlapped: u64,
-    pub internal: u64,
-}
-
-#[derive(Debug, Clone)]
-struct IoCompletionPortObject {
-    concurrent_threads: u32,
-    queue: VecDeque<IoCompletionPacket>,
-}
-
-#[derive(Debug, Clone)]
-struct MutexObject {
-    owner_thread_id: Option<u32>,
-    /// Recursion count: a thread waiting on its own mutex succeeds and
-    /// increments recursion; ReleaseMutex decrements and only releases the
-    /// ownership at recursion 0.  This is Windows mutex semantics — a mutex
-    /// is not a Boolean signal.
-    recursion: u32,
-    abandoned: bool,
-}
-
-#[derive(Debug, Clone)]
-struct SemaphoreObject {
-    count: u32,
-    maximum: u32,
-}
-
-#[derive(Debug, Clone)]
-struct ThreadObject {
-    thread_id: u32,
-}
+pub use crate::runtime::object_manager::{IoCompletionPacket, SocketObject};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // thread fiber state retained for future fiber APIs
@@ -695,49 +576,6 @@ struct ThreadState {
     terminated: bool,
     /// Fiber ID if this thread is converted to a fiber (0 = not a fiber).
     fiber_id: u32,
-}
-
-#[derive(Debug, Clone)]
-struct ProcessObject {
-    process_id: u32,
-    executable: String,
-    argv: Vec<String>,
-    cwd: String,
-    environment: BTreeMap<String, String>,
-    inherited_handles: Vec<HandleDescriptor>,
-    modules: Vec<String>,
-    exit_code: Option<u32>,
-    /// Synchronisation primitive for async child-process exit.
-    /// When a child is spawned on a worker thread, the thread sets the exit
-    /// code inside this condvar pair and notifies all waiters.  The parent
-    /// `WaitForSingleObject` call blocks on this condvar instead of spinning.
-    exit_sync: Option<Arc<(Mutex<Option<u32>>, Condvar)>>,
-}
-
-#[derive(Debug, Clone)]
-struct SectionObject {
-    base_address: u64,
-    size: usize,
-    protection: MemoryProtection,
-    /// Name of the section (None for anonymous sections created via
-    /// `create_section` / `heap_create`).
-    name: Option<String>,
-    /// Shared byte storage for file-mapping sections, so that every
-    /// `MapViewOfFile` view shares the same backing.
-    backing: Option<Arc<Mutex<Vec<u8>>>>,
-}
-
-#[derive(Debug, Clone)]
-struct KeyObject {
-    hive: String,
-    key: String,
-    view: RegistryView,
-}
-
-#[derive(Debug, Clone)]
-struct TimerObject {
-    due_tick: u64,
-    signaled: bool,
 }
 
 /// Named pipe open mode constants.
@@ -770,88 +608,6 @@ pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
     // Replace backslashes with underscores for safety
     let safe_name = name.replace(['\\', '/'], "_");
     format!("{}/{}", PIPE_SOCKET_BASE_DIR, safe_name)
-}
-
-/// State tracking for a Windows named pipe.
-///
-/// A pipe has two real ends with independent direction queues:
-/// server-to-client (bytes written by the server, read by the client) and
-/// client-to-server (bytes written by the client, read by the server).
-/// Reads consume from the peer's write queue; writes append to the
-/// opposite direction's queue and notify the condvar.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // named-pipe state retained for future pipe APIs
-struct NamedPipeState {
-    /// The pipe name (e.g. `\\.\pipe\steam_service`).
-    name: String,
-    /// Whether a server endpoint has been created via CreateNamedPipeW.
-    server_created: bool,
-    /// Server writes append here; client-side reads consume it.
-    server_to_client: Arc<Mutex<VecDeque<u8>>>,
-    /// Client writes append here; server-side reads consume it.
-    client_to_server: Arc<Mutex<VecDeque<u8>>>,
-    /// Condition variable signalled when new data arrives or the pipe is
-    /// disconnected.
-    data_ready: Arc<Condvar>,
-    /// Maximum pipe size (from nMaxInstances / nOutBufferSize).
-    max_buffer_size: usize,
-    /// Whether the server end has been disconnected (DisconnectNamedPipe).
-    server_disconnected: bool,
-    /// Whether the client end has been disconnected (the server called
-    /// DisconnectNamedPipe, or the server handle was closed while a client
-    /// was connected).  A waiting CallNamedPipe / pipe reader observes this
-    /// as ERROR_BROKEN_PIPE.
-    client_disconnected: bool,
-    /// Optional security descriptor pointer (guest virtual address of the
-    /// `SECURITY_DESCRIPTOR` passed via `lpSecurityAttributes`). Stored for
-    /// future ACL enforcement; currently unused beyond record-keeping.
-    security_descriptor: Option<u64>,
-    /// Unix-domain socket path for cross-process pipe communication.
-    /// Only populated when the pipe is created with cross-process intent.
-    uds_socket_path: Option<String>,
-    /// Pipe open mode (PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND).
-    open_mode: u32,
-    /// Pipe mode (PIPE_WAIT or PIPE_NOWAIT).
-    pipe_mode: u32,
-    /// Maximum number of pipe instances.
-    max_instances: u32,
-    /// Default timeout for WaitNamedPipe (in milliseconds).
-    default_timeout: u32,
-    /// Outbound buffer size as requested at creation time.
-    out_buffer_size: u32,
-    /// Inbound buffer size as requested at creation time.
-    in_buffer_size: u32,
-    /// The server-end handle (from CreateNamedPipeW), when open.
-    server_handle: Option<Handle>,
-    /// The client-end handle (from CreateFileW on `\\.\pipe\NAME`), when
-    /// connected.
-    client_handle: Option<Handle>,
-    /// PIPE_READMODE_MESSAGE: writes append a [u32 length][bytes...] frame
-    /// and reads return exactly one message.
-    message_mode: bool,
-    /// Whether a client has connected (ConnectNamedPipe completes).
-    client_connected: bool,
-}
-
-/// Backing store for a shared-memory section created via CreateFileMappingW.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // section state retained for future mapping APIs
-struct SharedMemorySection {
-    /// Name of the section (may be empty for anonymous).
-    name: String,
-    /// The actual byte storage, reference-counted so that multiple
-    /// `MapViewOfFile` calls share the same backing.
-    data: Arc<Mutex<Vec<u8>>>,
-    /// Maximum size requested at creation time.
-    maximum_size: usize,
-    /// Protection flags at creation time.
-    protection: MemoryProtection,
-}
-
-#[derive(Debug, Clone)]
-struct DirectorySearchObject {
-    entries: Vec<FindData>,
-    index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -895,33 +651,6 @@ struct OverlappedRequest {
     /// Guest pointer to the bytes-transferred out-parameter (pipe I/O
     /// requests only; 0 when the caller passed NULL).
     bytes_read_ptr: u64,
-}
-
-/// State of a single committed 4 KiB page.
-#[derive(Debug, Clone)]
-struct CommittedPage {
-    protection: MemoryProtection,
-}
-
-/// Page-granular virtual memory region: a reservation (base + size) whose
-/// pages are individually Reserved / Committed(protection).  This gives
-/// correct partial-range semantics: VirtualFree(MEM_DECOMMIT) decommits
-/// only the requested pages, VirtualProtect changes only the requested
-/// range, VirtualAlloc(MEM_COMMIT) commits an interior range of an existing
-/// reservation, and VirtualQuery reports the coalesced run of pages with
-/// identical state/protection.
-#[derive(Debug, Clone)]
-struct VirtualRegion {
-    base_address: u64,
-    size: usize,
-    /// Committed pages, keyed by page base address (0x1000-aligned).
-    /// Pages absent from this map are Reserved within the reservation.
-    pages: BTreeMap<u64, CommittedPage>,
-    /// Shared section backing for regions created by `map_view_of_file`
-    /// (`None` for plain `VirtualAlloc` regions).
-    backing: Option<Arc<Mutex<Vec<u8>>>>,
-    /// Offset into the section backing where this view starts.
-    backing_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -981,43 +710,30 @@ struct ComRegistration {
 //   * parent missing        → ERROR_PATH_NOT_FOUND
 //   * file missing, parent present → ERROR_FILE_NOT_FOUND
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Win32Subsystem {
     ge: GameEnvironment,
-    pub(crate) next_handle: Handle,
-    next_process_id: u32,
+    /// THE canonical guest process: identity (guest pid, image, argv, env,
+    /// cwd, arch), the canonical address space and the canonical handle
+    /// table.
+    process: GuestProcess,
+    /// THE canonical kernel object manager: one owner of every kernel
+    /// object and the unified named-object namespace.
+    objects: ObjectManager,
     next_thread_id: u32,
-    next_virtual_address: u64,
     next_overlapped_id: u64,
     next_tls_slot: u32,
-    handles: BTreeMap<Handle, HandleEntry>,
     threads: BTreeMap<u32, ThreadState>,
-    handle_history: BTreeMap<Handle, ObjectType>,
-    /// Per-handle-value generation counters.  When a handle value is reused
-    /// after being closed, the generation is incremented so that stale
-    /// references can be detected via [`Win32Subsystem::validate_handle_generation`].
-    handle_generations: BTreeMap<Handle, u32>,
-    protected_close_handles: BTreeSet<Handle>,
     overlapped: BTreeMap<u64, OverlappedRequest>,
     /// File handles associated with an I/O completion port (the association
     /// records only existence; the port itself lives in the handle table).
     io_completion_associations: BTreeSet<Handle>,
-    memory_regions: BTreeMap<u64, VirtualRegion>,
     heaps: BTreeMap<Handle, HeapState>,
-    named_events: BTreeMap<String, EventWeak>,
-    named_mutexes: BTreeMap<String, Handle>,
-    named_semaphores: BTreeMap<String, Handle>,
-    named_pipes: BTreeMap<String, NamedPipeState>,
-    shared_memory_sections: BTreeMap<String, SharedMemorySection>,
     time: TimeState,
     locale: LocaleState,
     thread_apcs: BTreeMap<u32, VecDeque<String>>,
     com_apartments: BTreeMap<u32, ApartmentModel>,
     com_registrations: BTreeMap<String, ComRegistration>,
-    recently_closed_handles: VecDeque<(Handle, ObjectType)>,
-    /// Closed handle values recycled by `insert_object` (FIFO, so the oldest
-    /// freed value is reused first, which keeps generations meaningful).
-    closed_handle_values: VecDeque<Handle>,
     /// Monotonic serial for `get_temp_file_name_w` uniqueness.
     next_temp_file_serial: u32,
     /// TLS slot indices freed via `tls_free`, reused by `tls_alloc`.
@@ -1025,7 +741,6 @@ pub struct Win32Subsystem {
     /// Wall-clock time (ms) of the last full config save, used to throttle
     /// `sync_entry` persistence.
     last_config_save_wall_ms: u64,
-    current_process_id: u32,
     current_thread_id: u32,
     /// Shared runtime-event observer list (set by the PE runtime; `None`
     /// when this subsystem is driven standalone, e.g. in oracle sessions or
@@ -1064,7 +779,7 @@ impl NamedPipeService<'_> {
     /// created it, or a prior call), it is left untouched.
     pub fn create_compat_listener(&mut self, pipe_name: &str) -> AppResult<()> {
         let normalized = normalize_pipe_name(pipe_name);
-        if self.win32.named_pipes.contains_key(&normalized) {
+        if self.win32.named_pipe_server_exists(pipe_name) {
             return Ok(());
         }
         let handle = self.win32.create_named_pipe_w(
@@ -1083,6 +798,7 @@ impl NamedPipeService<'_> {
             "[win32] compat pipe listener created: {} (server handle {handle:#x})",
             pipe_name
         );
+        let _ = normalized;
         Ok(())
     }
 }
@@ -1093,30 +809,31 @@ impl Win32Subsystem {
     }
 
     pub fn new_with_live_pacing(ge: GameEnvironment, dtm: bool, live_pacing: bool) -> Self {
-        let current_process_id = std::process::id();
+        Self::new_with_guest_process(ge, dtm, live_pacing, GuestProcess::default_initial())
+    }
+
+    /// Construct the subsystem around a canonical guest process: the guest
+    /// pid comes from [`allocate_guest_pid`], the address space and handle
+    /// table are THE instances the subsystem operates on, and the guest
+    /// identity (pid / image / argv / env / cwd / arch) is never the host's.
+    pub fn new_with_guest_process(
+        ge: GameEnvironment,
+        dtm: bool,
+        live_pacing: bool,
+        process: GuestProcess,
+    ) -> Self {
         let current_thread_id = 1;
         Self {
             ge,
-            next_handle: 4,
-            next_process_id: current_process_id + 1,
+            process,
+            objects: ObjectManager::new(),
             next_thread_id: 2,
-            next_virtual_address: 0x1_0000_0000,
             next_overlapped_id: 1,
             next_tls_slot: 0,
-            handles: BTreeMap::new(),
             threads: BTreeMap::new(),
-            handle_history: BTreeMap::new(),
-            handle_generations: BTreeMap::new(),
-            protected_close_handles: BTreeSet::new(),
             overlapped: BTreeMap::new(),
             io_completion_associations: BTreeSet::new(),
-            memory_regions: BTreeMap::new(),
             heaps: BTreeMap::new(),
-            named_events: BTreeMap::new(),
-            named_mutexes: BTreeMap::new(),
-            named_semaphores: BTreeMap::new(),
-            named_pipes: BTreeMap::new(),
-            shared_memory_sections: BTreeMap::new(),
             time: TimeState {
                 dtm,
                 live_pacing: live_pacing && !dtm,
@@ -1129,15 +846,33 @@ impl Win32Subsystem {
             thread_apcs: BTreeMap::new(),
             com_apartments: BTreeMap::new(),
             com_registrations: BTreeMap::new(),
-            recently_closed_handles: VecDeque::new(),
-            closed_handle_values: VecDeque::new(),
             next_temp_file_serial: 0,
             tls_free_slots: Vec::new(),
             last_config_save_wall_ms: 0,
-            current_process_id,
             current_thread_id,
             event_observers: None,
         }
+    }
+
+    /// The canonical guest address space (shared with the interpreter/JIT).
+    pub fn address_space(&self) -> &crate::vm::VirtualMemory {
+        &self.process.address_space
+    }
+
+    /// Mutable access to the canonical guest address space.
+    pub fn address_space_mut(&mut self) -> &mut crate::vm::VirtualMemory {
+        &mut self.process.address_space
+    }
+
+    /// Rebuild the address space with a fresh cursor (guest-arch switches).
+    pub fn reset_address_space(&mut self, private_region_cursor: u64) {
+        self.process.reset_address_space(private_region_cursor);
+    }
+
+    /// The next fresh handle value (diagnostics: anonymous-pipe name
+    /// derivation in the runtime).
+    pub fn next_handle_value(&self) -> Handle {
+        self.process.handle_table.next_handle_value()
     }
 
     /// Emit a generic runtime event to the attached observer list (no-op
@@ -1156,10 +891,11 @@ impl Win32Subsystem {
         self.current_thread_id
     }
 
-    /// Guest-visible current process id (the runner's host pid, matching
-    /// `GetCurrentProcessId`).
+    /// Guest-visible current process id: the GUEST pid from the guest pid
+    /// namespace (a runtime-side identity starting at 4, matching
+    /// `GetCurrentProcessId`) — never the host's POSIX pid.
     pub fn current_process_id(&self) -> u32 {
-        self.current_process_id
+        self.process.pid
     }
 
     pub fn set_current_thread_id(&mut self, thread_id: u32) -> u32 {
@@ -1169,15 +905,20 @@ impl Win32Subsystem {
     }
 
     pub fn current_thread_handle(&mut self) -> Handle {
-        if let Some(handle) = self
-            .handles
-            .iter()
-            .find_map(|(handle, entry)| match &entry.object {
-                KernelObject::Thread(thread) if thread.thread_id == self.current_thread_id => {
-                    Some(*handle)
-                }
-                _ => None,
-            })
+        if let Some(handle) =
+            self.process
+                .handle_table
+                .iter()
+                .find_map(
+                    |(handle, entry)| match self.objects.object(entry.object_id) {
+                        KernelObject::Thread(thread)
+                            if thread.thread_id == self.current_thread_id =>
+                        {
+                            Some(handle)
+                        }
+                        _ => None,
+                    },
+                )
         {
             handle
         } else {
@@ -1193,16 +934,23 @@ impl Win32Subsystem {
         }
     }
 
+    /// The current process is the guest process: `GetCurrentProcessId` /
+    /// `GetCurrentProcess` return the GUEST pid (a runtime-side identity
+    /// from the guest pid namespace) — never the host's POSIX pid.
     pub fn current_process_handle(&mut self) -> Handle {
-        if let Some(handle) = self
-            .handles
-            .iter()
-            .find_map(|(handle, entry)| match &entry.object {
-                KernelObject::Process(process) if process.process_id == self.current_process_id => {
-                    Some(*handle)
-                }
-                _ => None,
-            })
+        let guest_pid = self.process.pid;
+        if let Some(handle) =
+            self.process
+                .handle_table
+                .iter()
+                .find_map(
+                    |(handle, entry)| match self.objects.object(entry.object_id) {
+                        KernelObject::Process(process) if process.process_id == guest_pid => {
+                            Some(handle)
+                        }
+                        _ => None,
+                    },
+                )
         {
             handle
         } else {
@@ -1211,17 +959,13 @@ impl Win32Subsystem {
                 0x1F1FFF,
                 false,
                 KernelObject::Process(ProcessObject {
-                    process_id: self.current_process_id,
-                    executable: "macwin".to_string(),
-                    argv: vec!["macwin".to_string()],
-                    cwd: "C:\\".to_string(),
-                    environment: BTreeMap::new(),
+                    process_id: guest_pid,
+                    executable: self.process.image_path.clone(),
+                    argv: self.process.argv.clone(),
+                    cwd: self.process.cwd.clone(),
+                    environment: self.process.environment.clone(),
                     inherited_handles: Vec::new(),
-                    modules: vec![
-                        "macwin".to_string(),
-                        "kernel32.dll".to_string(),
-                        "ntdll.dll".to_string(),
-                    ],
+                    modules: self.process.modules.clone(),
                     exit_code: None,
                     exit_sync: None,
                 }),
@@ -1262,20 +1006,9 @@ impl Win32Subsystem {
         mask: u32,
         flags: u32,
     ) -> AppResult<()> {
-        {
-            let entry = self.handle_entry_mut(handle)?;
-            if mask & HANDLE_FLAG_INHERIT != 0 {
-                entry.descriptor.inheritable = flags & HANDLE_FLAG_INHERIT != 0;
-            }
-        }
-        if mask & HANDLE_FLAG_PROTECT_FROM_CLOSE != 0 {
-            if flags & HANDLE_FLAG_PROTECT_FROM_CLOSE != 0 {
-                self.protected_close_handles.insert(handle);
-            } else {
-                self.protected_close_handles.remove(&handle);
-            }
-        }
-        Ok(())
+        self.process
+            .handle_table
+            .set_handle_information(handle, mask, flags)
     }
 
     pub fn duplicate_handle(
@@ -1286,7 +1019,7 @@ impl Win32Subsystem {
         same_access: bool,
         close_source: bool,
     ) -> AppResult<Handle> {
-        let source_entry = self.handle_entry(source_handle)?.clone();
+        let source_entry = self.handle_entry(source_handle)?;
         if source_entry.descriptor.object_type == ObjectType::Socket {
             // Sockets are winsock handles, not kernel handles — Windows
             // `DuplicateHandle` on a SOCKET fails with ERROR_INVALID_HANDLE.
@@ -1308,12 +1041,19 @@ impl Win32Subsystem {
             }
             desired_access
         };
-        let duplicated_handle = self.insert_object(
-            source_entry.descriptor.object_type,
-            access_mask,
-            inheritable,
-            source_entry.object,
-        );
+        // The duplicate references the SAME object (the object manager
+        // refcount goes up; object identity != handle identity).
+        let duplicated_handle =
+            self.process
+                .handle_table
+                .duplicate(source_handle, access_mask, inheritable)?;
+        let object_id = self
+            .process
+            .handle_table
+            .entry(duplicated_handle)
+            .expect("fresh duplicate entry")
+            .object_id;
+        self.objects.handle_added(object_id);
         if close_source {
             self.close_handle(source_handle)?;
         }
@@ -1384,14 +1124,12 @@ impl Win32Subsystem {
         name: Option<&str>,
     ) -> (Handle, bool) {
         if let Some(name) = name
-            && let Some(event) = self.named_events.get(name).and_then(Weak::upgrade)
+            && let Some(event_id) = self.objects.resolve(name)
         {
-            let handle = self.insert_object(
-                ObjectType::Event,
-                0x1F0003,
-                inheritable,
-                KernelObject::Event(event),
-            );
+            // The unified named-object namespace resolves the name across
+            // every prefix spelling; CreateEventW mints a FRESH handle to
+            // the SAME object (the manager refcount goes up).
+            let handle = self.insert_object_id(event_id, 0x1F0003, inheritable);
             return (handle, true);
         }
 
@@ -1399,12 +1137,9 @@ impl Win32Subsystem {
             manual_reset,
             signaled: initial_state,
         }));
-        if let Some(name) = name {
-            self.named_events
-                .insert(name.to_string(), Rc::downgrade(&event));
-        }
-        let handle = self.insert_object(
+        let handle = self.insert_object_named(
             ObjectType::Event,
+            name,
             0x1F0003,
             inheritable,
             KernelObject::Event(event),
@@ -1418,20 +1153,14 @@ impl Win32Subsystem {
         inheritable: bool,
         name: &str,
     ) -> AppResult<Handle> {
-        let Some(event) = self.named_events.get(name).and_then(Weak::upgrade) else {
-            self.named_events.remove(name);
+        let Some(event_id) = self.objects.resolve(name) else {
             return Err(AppError::new(
                 ReasonCode::RcFsNotFound,
                 format!("event {name} not found"),
             ));
         };
 
-        Ok(self.insert_object(
-            ObjectType::Event,
-            desired_access,
-            inheritable,
-            KernelObject::Event(event),
-        ))
+        Ok(self.insert_object_id(event_id, desired_access, inheritable))
     }
 
     pub fn create_io_completion_port(
@@ -1449,7 +1178,7 @@ impl Win32Subsystem {
         }
 
         let port_handle = if let Some(port_handle) = existing_completion_port {
-            match &self.handle_entry(port_handle)?.object {
+            match self.handle_object(port_handle)? {
                 KernelObject::IoCompletionPort(_) => port_handle,
                 _ => return invalid_handle("handle is not an I/O completion port"),
             }
@@ -1488,8 +1217,7 @@ impl Win32Subsystem {
         completion_key: u64,
         overlapped: u64,
     ) -> AppResult<()> {
-        let entry = self.handle_entry_mut(completion_port)?;
-        match &mut entry.object {
+        match self.handle_object_mut(completion_port)? {
             KernelObject::IoCompletionPort(port) => {
                 port.queue.push_back(IoCompletionPacket {
                     bytes_transferred,
@@ -1514,8 +1242,7 @@ impl Win32Subsystem {
                 "GetQueuedCompletionStatusEx requires a non-zero entry count",
             ));
         }
-        let entry = self.handle_entry_mut(completion_port)?;
-        match &mut entry.object {
+        match self.handle_object_mut(completion_port)? {
             KernelObject::IoCompletionPort(port) => {
                 // A non-zero `concurrent_threads` throttles how many
                 // completion packets may be handed out at once.
@@ -1548,36 +1275,40 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Event(_) => {
-                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+                Self::require_access(&entry, EVENT_MODIFY_STATE)?;
             }
             _ => return invalid_handle("handle is not an event"),
         }
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
-            KernelObject::Event(event) => {
-                event.borrow_mut().signaled = true;
-                Ok(())
-            }
-            _ => invalid_handle("handle is not an event"),
+        let object_id = self
+            .process
+            .handle_table
+            .entry(handle)
+            .expect("checked live")
+            .object_id;
+        if !self.objects.signal_event(object_id) {
+            return invalid_handle("handle is not an event");
         }
+        Ok(())
     }
 
     pub fn reset_event(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Event(_) => {
-                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+                Self::require_access(&entry, EVENT_MODIFY_STATE)?;
             }
             _ => return invalid_handle("handle is not an event"),
         }
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
-            KernelObject::Event(event) => {
-                event.borrow_mut().signaled = false;
-                Ok(())
-            }
-            _ => invalid_handle("handle is not an event"),
+        let object_id = self
+            .process
+            .handle_table
+            .entry(handle)
+            .expect("checked live")
+            .object_id;
+        if !self.objects.reset_event(object_id) {
+            return invalid_handle("handle is not an event");
         }
+        Ok(())
     }
 
     pub fn create_mutex(&mut self, initially_owned: bool, inheritable: bool) -> Handle {
@@ -1594,8 +1325,7 @@ impl Win32Subsystem {
     }
 
     pub fn abandon_mutex(&mut self, handle: Handle) -> AppResult<()> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::Mutex(mutex) => {
                 mutex.owner_thread_id = None;
                 mutex.abandoned = true;
@@ -1609,13 +1339,18 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Mutex(_) => {
-                Self::require_access(entry, MUTEX_MODIFY_STATE)?;
+                Self::require_access(&entry, MUTEX_MODIFY_STATE)?;
             }
             _ => return invalid_handle("handle is not a mutex"),
         }
         let current_thread_id = self.current_thread_id;
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        let object_id = self
+            .process
+            .handle_table
+            .entry(handle)
+            .expect("checked live")
+            .object_id;
+        match self.objects.object_mut(object_id) {
             KernelObject::Mutex(mutex) => {
                 if mutex.owner_thread_id != Some(current_thread_id) {
                     return Err(AppError::new(
@@ -1657,21 +1392,19 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Semaphore(_) => {
-                Self::require_access(entry, SEMAPHORE_MODIFY_STATE)?;
+                Self::require_access(&entry, SEMAPHORE_MODIFY_STATE)?;
             }
             _ => return invalid_handle("handle is not a semaphore"),
         }
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
-            KernelObject::Semaphore(semaphore) => {
-                let prev = semaphore.count;
-                semaphore.count = semaphore
-                    .count
-                    .saturating_add(release_count)
-                    .min(semaphore.maximum);
-                Ok(prev)
-            }
-            _ => invalid_handle("handle is not a semaphore"),
+        let object_id = self
+            .process
+            .handle_table
+            .entry(handle)
+            .expect("checked live")
+            .object_id;
+        match self.objects.release_semaphore(object_id, release_count) {
+            Some(previous) => Ok(previous),
+            None => invalid_handle("handle is not a semaphore"),
         }
     }
 
@@ -1688,8 +1421,7 @@ impl Win32Subsystem {
     }
 
     pub fn set_waitable_timer(&mut self, handle: Handle, due_tick: u64) -> AppResult<()> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::Timer(timer) => {
                 timer.due_tick = due_tick;
                 timer.signaled = false;
@@ -1779,7 +1511,7 @@ impl Win32Subsystem {
             | ObjectType::Thread
             | ObjectType::Timer
             | ObjectType::Process => {
-                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
+                Self::require_access(&self.handle_entry(handle)?, SYNCHRONIZE)?;
             }
             _ => {
                 return Err(AppError::new(
@@ -1789,66 +1521,12 @@ impl Win32Subsystem {
             }
         }
         match object_type {
-            ObjectType::Event => {
-                let entry = self.handle_entry(handle)?;
-                if let KernelObject::Event(event) = &entry.object {
-                    if event.borrow().signaled {
-                        Ok(WaitSatisfaction::Signaled)
-                    } else {
-                        Ok(WaitSatisfaction::NotSignaled)
-                    }
-                } else {
-                    invalid_handle("handle is not an event")
-                }
-            }
-            ObjectType::Mutex => {
-                let entry = self.handle_entry(handle)?;
-                if let KernelObject::Mutex(mutex) = &entry.object {
-                    if mutex.abandoned {
-                        Ok(WaitSatisfaction::Abandoned)
-                    } else if mutex.owner_thread_id.is_none()
-                        || mutex.owner_thread_id == Some(current_thread_id)
-                    {
-                        // Unlocked, or already owned by the waiting thread
-                        // (recursive acquisition always succeeds).
-                        Ok(WaitSatisfaction::Signaled)
-                    } else {
-                        Ok(WaitSatisfaction::NotSignaled)
-                    }
-                } else {
-                    invalid_handle("handle is not a mutex")
-                }
-            }
-            ObjectType::Semaphore => {
-                let entry = self.handle_entry(handle)?;
-                if let KernelObject::Semaphore(semaphore) = &entry.object {
-                    if semaphore.count > 0 {
-                        Ok(WaitSatisfaction::Signaled)
-                    } else {
-                        Ok(WaitSatisfaction::NotSignaled)
-                    }
-                } else {
-                    invalid_handle("handle is not a semaphore")
-                }
-            }
             ObjectType::Thread => {
                 let thread_id = self.thread_id(handle)?;
                 if self.thread_state(thread_id)?.exit_code.is_some() {
                     Ok(WaitSatisfaction::Signaled)
                 } else {
                     Ok(WaitSatisfaction::NotSignaled)
-                }
-            }
-            ObjectType::Timer => {
-                let entry = self.handle_entry(handle)?;
-                if let KernelObject::Timer(timer) = &entry.object {
-                    if timer.signaled || now >= timer.due_tick {
-                        Ok(WaitSatisfaction::Signaled)
-                    } else {
-                        Ok(WaitSatisfaction::NotSignaled)
-                    }
-                } else {
-                    invalid_handle("handle is not a timer")
                 }
             }
             ObjectType::Process => {
@@ -1863,58 +1541,49 @@ impl Win32Subsystem {
                     invalid_handle("handle is not a process")
                 }
             }
-            _ => unreachable!("non-waitable types rejected above"),
+            _ => {
+                let object_id = self
+                    .process
+                    .handle_table
+                    .entry(handle)
+                    .expect("checked live")
+                    .object_id;
+                Ok(
+                    match self
+                        .objects
+                        .wait_satisfaction(object_id, current_thread_id, now)
+                    {
+                        crate::runtime::object_manager::WaitSatisfaction::NotSignaled => {
+                            WaitSatisfaction::NotSignaled
+                        }
+                        crate::runtime::object_manager::WaitSatisfaction::Signaled => {
+                            WaitSatisfaction::Signaled
+                        }
+                        crate::runtime::object_manager::WaitSatisfaction::Abandoned => {
+                            WaitSatisfaction::Abandoned
+                        }
+                    },
+                )
+            }
         }
     }
 
     /// Atomically consume the signals of a satisfied wait set — the complete
     /// set is observed and acquired as one dispatcher operation.
     fn consume_wait_set(&mut self, handles: &[Handle], current_thread_id: u32) -> AppResult<()> {
+        let now = self.time.ticks_ms;
         for &handle in handles {
             let object_type = self.handle_entry(handle)?.descriptor.object_type;
             match object_type {
-                ObjectType::Event => {
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Event(event) = &mut entry.object {
-                        let mut event = event.borrow_mut();
-                        if !event.manual_reset {
-                            event.signaled = false;
-                        }
-                    }
-                }
-                ObjectType::Mutex => {
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Mutex(mutex) = &mut entry.object {
-                        if mutex.abandoned {
-                            mutex.abandoned = false;
-                            mutex.owner_thread_id = Some(current_thread_id);
-                            mutex.recursion = 1;
-                        } else if mutex.owner_thread_id == Some(current_thread_id) {
-                            mutex.recursion += 1;
-                        } else {
-                            mutex.owner_thread_id = Some(current_thread_id);
-                            mutex.recursion = 1;
-                        }
-                    }
-                }
-                ObjectType::Semaphore => {
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Semaphore(semaphore) = &mut entry.object {
-                        semaphore.count = semaphore.count.saturating_sub(1);
-                    }
-                }
-                ObjectType::Timer => {
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Timer(timer) = &mut entry.object {
-                        timer.signaled = true;
-                    }
-                }
                 ObjectType::Thread | ObjectType::Process => {}
                 _ => {
-                    return Err(AppError::new(
-                        ReasonCode::RcWin32InvalidHandle,
-                        format!("handle {handle} is not a waitable object"),
-                    ));
+                    let object_id = self
+                        .process
+                        .handle_table
+                        .entry(handle)
+                        .expect("checked live")
+                        .object_id;
+                    self.objects.consume_wait(object_id, current_thread_id, now);
                 }
             }
         }
@@ -1970,17 +1639,7 @@ impl Win32Subsystem {
         if request.kind != OverlappedKind::Read {
             return false;
         }
-        let Some(state) =
-            self.handle_entry(request.handle)
-                .ok()
-                .and_then(|entry| match &entry.object {
-                    KernelObject::Pipe(pipe) => self
-                        .named_pipes
-                        .get(&normalize_pipe_name(&pipe.name))
-                        .cloned(),
-                    _ => None,
-                })
-        else {
+        let Some(state) = self.pipe_state_for_handle(request.handle) else {
             return false;
         };
         let is_server = state.server_handle == Some(request.handle);
@@ -2007,31 +1666,15 @@ impl Win32Subsystem {
             })
             .unwrap_or(false)
             || self
-                .handle_entry(handle)
-                .ok()
-                .and_then(|entry| match &entry.object {
-                    KernelObject::Pipe(pipe) => self
-                        .named_pipes
-                        .get(&normalize_pipe_name(&pipe.name))
-                        .map(|state| state.client_connected),
-                    _ => None,
-                })
+                .pipe_state_for_handle(handle)
+                .map(|state| state.client_connected)
                 .unwrap_or(false)
     }
 
     pub fn mark_owned_mutexes_abandoned(&mut self, thread_id: u32) {
-        for entry in self.handles.values_mut() {
-            if let KernelObject::Mutex(mutex) = &mut entry.object
-                && mutex.owner_thread_id == Some(thread_id)
-            {
-                mutex.owner_thread_id = None;
-                mutex.recursion = 0;
-                mutex.abandoned = true;
-            }
-        }
+        self.objects.mark_mutexes_abandoned_by_thread(thread_id);
     }
 
-    /// Single non-blocking signal-state check for a waitable object.
     /// Single non-blocking signal-state check for a waitable object.
     /// Consumes the signal only on success (auto-reset events, mutex
     /// acquisition, semaphore decrement), matching `wait_for_single_object`
@@ -2054,12 +1697,12 @@ impl Win32Subsystem {
             | ObjectType::Semaphore
             | ObjectType::Thread
             | ObjectType::Timer => {
-                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
+                Self::require_access(&self.handle_entry(handle)?, SYNCHRONIZE)?;
             }
             ObjectType::Process => {
                 // Process waits take the blocking `wait_for_single_object_process`
                 // path, but a zero-timeout poll can still land here.
-                Self::require_access(self.handle_entry(handle)?, SYNCHRONIZE)?;
+                Self::require_access(&self.handle_entry(handle)?, SYNCHRONIZE)?;
             }
             _ => {
                 return Err(AppError::new(
@@ -2069,63 +1712,6 @@ impl Win32Subsystem {
             }
         }
         match object_type {
-            ObjectType::Event => {
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::Event(event) = &mut entry.object {
-                    let mut event = event.borrow_mut();
-                    if event.signaled {
-                        if !event.manual_reset {
-                            event.signaled = false;
-                        }
-                        Ok(WaitStatus::Object0)
-                    } else {
-                        Ok(WaitStatus::Timeout)
-                    }
-                } else {
-                    invalid_handle("handle is not an event")
-                }
-            }
-            ObjectType::Mutex => {
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::Mutex(mutex) = &mut entry.object {
-                    if mutex.abandoned {
-                        // The previous owner terminated without releasing;
-                        // the next successful waiter receives WAIT_ABANDONED
-                        // and takes ownership.
-                        mutex.abandoned = false;
-                        mutex.owner_thread_id = Some(current_thread_id);
-                        mutex.recursion = 1;
-                        Ok(WaitStatus::Abandoned)
-                    } else if let Some(owner) = mutex.owner_thread_id {
-                        if owner == current_thread_id {
-                            // Recursive acquisition succeeds and increments.
-                            mutex.recursion += 1;
-                            Ok(WaitStatus::Object0)
-                        } else {
-                            Ok(WaitStatus::Timeout)
-                        }
-                    } else {
-                        mutex.owner_thread_id = Some(current_thread_id);
-                        mutex.recursion = 1;
-                        Ok(WaitStatus::Object0)
-                    }
-                } else {
-                    invalid_handle("handle is not a mutex")
-                }
-            }
-            ObjectType::Semaphore => {
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::Semaphore(semaphore) = &mut entry.object {
-                    if semaphore.count > 0 {
-                        semaphore.count -= 1;
-                        Ok(WaitStatus::Object0)
-                    } else {
-                        Ok(WaitStatus::Timeout)
-                    }
-                } else {
-                    invalid_handle("handle is not a semaphore")
-                }
-            }
             ObjectType::Thread => {
                 let thread_id = self.thread_id(handle)?;
                 if self.thread_state(thread_id)?.exit_code.is_some() {
@@ -2134,22 +1720,9 @@ impl Win32Subsystem {
                     Ok(WaitStatus::Timeout)
                 }
             }
-            ObjectType::Timer => {
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::Timer(timer) = &mut entry.object {
-                    if timer.signaled || now >= timer.due_tick {
-                        timer.signaled = true;
-                        Ok(WaitStatus::Object0)
-                    } else {
-                        Ok(WaitStatus::Timeout)
-                    }
-                } else {
-                    invalid_handle("handle is not a timer")
-                }
-            }
             ObjectType::Process => {
-                let entry = self.handle_entry_mut(handle)?;
-                if let KernelObject::Process(process) = &mut entry.object {
+                let entry = self.handle_entry(handle)?;
+                if let KernelObject::Process(process) = &entry.object {
                     if process.exit_code.is_some() {
                         Ok(WaitStatus::Object0)
                     } else {
@@ -2159,7 +1732,26 @@ impl Win32Subsystem {
                     invalid_handle("handle is not a process")
                 }
             }
-            _ => unreachable!("non-waitable types rejected above"),
+            _ => {
+                let object_id = self
+                    .process
+                    .handle_table
+                    .entry(handle)
+                    .expect("checked live")
+                    .object_id;
+                Ok(
+                    match self.objects.consume_wait(object_id, current_thread_id, now) {
+                        crate::runtime::object_manager::WaitStatus::Object0 => WaitStatus::Object0,
+                        crate::runtime::object_manager::WaitStatus::Timeout => WaitStatus::Timeout,
+                        crate::runtime::object_manager::WaitStatus::Abandoned => {
+                            WaitStatus::Abandoned
+                        }
+                        crate::runtime::object_manager::WaitStatus::IoCompletion => {
+                            WaitStatus::IoCompletion
+                        }
+                    },
+                )
+            }
         }
     }
 
@@ -2174,7 +1766,7 @@ impl Win32Subsystem {
         match &entry.object {
             KernelObject::Process(_) => {
                 // Waits require SYNCHRONIZE in the granted access mask.
-                Self::require_access(entry, SYNCHRONIZE)?;
+                Self::require_access(&entry, SYNCHRONIZE)?;
             }
             _ => return invalid_handle("handle is not a process"),
         }
@@ -2304,7 +1896,7 @@ impl Win32Subsystem {
             | ObjectType::Thread
             | ObjectType::Process
             | ObjectType::Timer => {
-                Self::require_access(entry, SYNCHRONIZE)?;
+                Self::require_access(&entry, SYNCHRONIZE)?;
             }
             _ => {
                 return Err(AppError::new(
@@ -2336,24 +1928,36 @@ impl Win32Subsystem {
         initially_owned: bool,
         inheritable: bool,
     ) -> (Handle, bool) {
-        if let Some(&handle) = self.named_mutexes.get(name) {
+        if let Some(object_id) = self.objects.resolve(name) {
             // Reject stale entries left behind by closed handles; Windows
-            // forgets the name once the last handle is closed.
-            if self.handles.contains_key(&handle) {
+            // forgets the name once the last handle is closed.  The manager
+            // drops the name with the last handle, so a resolved object
+            // always has a live handle.
+            if matches!(self.objects.object(object_id), KernelObject::Mutex(_))
+                && let Some(handle) = self.find_handle_for_object(object_id)
+            {
                 return (handle, true);
             }
-            self.named_mutexes.remove(name);
+            // A name held by a DIFFERENT object type: the new object wins
+            // the name (the old object survives through its handles).
         }
-        let handle = self.create_mutex(initially_owned, inheritable);
-        self.named_mutexes.insert(name.to_string(), handle);
+        let handle = self.insert_object_named(
+            ObjectType::Mutex,
+            Some(name),
+            0x1F0001,
+            inheritable,
+            KernelObject::Mutex(MutexObject {
+                owner_thread_id: initially_owned.then_some(self.current_thread_id),
+                recursion: 0,
+                abandoned: false,
+            }),
+        );
         (handle, false)
     }
 
     pub fn open_named_mutex(&self, name: &str) -> Option<Handle> {
-        self.named_mutexes
-            .get(name)
-            .copied()
-            .filter(|handle| self.handles.contains_key(handle))
+        let object_id = self.objects.resolve(name)?;
+        self.find_handle_for_object(object_id)
     }
 
     /// Named semaphore support.  Returns `(handle, existed)` — the boolean is
@@ -2365,42 +1969,46 @@ impl Win32Subsystem {
         maximum: u32,
         inheritable: bool,
     ) -> (Handle, bool) {
-        if let Some(&handle) = self.named_semaphores.get(name) {
-            // Reject stale entries left behind by closed handles; Windows
-            // forgets the name once the last handle is closed.
-            if self.handles.contains_key(&handle) {
+        if let Some(object_id) = self.objects.resolve(name) {
+            // A name held by a DIFFERENT object type: the new object wins
+            // the name (the old object survives through its handles).
+            if matches!(self.objects.object(object_id), KernelObject::Semaphore(_))
+                && let Some(handle) = self.find_handle_for_object(object_id)
+            {
                 return (handle, true);
             }
-            self.named_semaphores.remove(name);
         }
-        let handle = self.create_semaphore(initial_count, maximum, inheritable);
-        self.named_semaphores.insert(name.to_string(), handle);
+        let handle = self.insert_object_named(
+            ObjectType::Semaphore,
+            Some(name),
+            0x1F0003,
+            inheritable,
+            KernelObject::Semaphore(SemaphoreObject {
+                count: initial_count,
+                maximum,
+            }),
+        );
         (handle, false)
     }
 
     pub fn open_named_semaphore(&self, name: &str) -> Option<Handle> {
-        self.named_semaphores
-            .get(name)
-            .copied()
-            .filter(|handle| self.handles.contains_key(handle))
+        let object_id = self.objects.resolve(name)?;
+        self.find_handle_for_object(object_id)
     }
 
-    /// Named event support (open by name).
+    /// Named event support (open by name): mints a fresh handle to the
+    /// named object (the manager refcount goes up).
     pub fn open_named_event(&mut self, name: &str) -> Option<Handle> {
-        let event = self.named_events.get(name).and_then(Weak::upgrade);
-        let event = match event {
-            Some(event) => event,
-            None => {
-                self.named_events.remove(name);
-                return None;
-            }
-        };
-        Some(self.insert_object(
-            ObjectType::Event,
-            0x1F0003,
-            false,
-            KernelObject::Event(event),
-        ))
+        let object_id = self.objects.resolve(name)?;
+        Some(self.insert_object_id(object_id, 0x1F0003, false))
+    }
+
+    /// The live handle referencing `object_id`, if any.
+    fn find_handle_for_object(&self, object_id: ObjectId) -> Option<Handle> {
+        self.process
+            .handle_table
+            .iter()
+            .find_map(|(handle, entry)| (entry.object_id == object_id).then_some(handle))
     }
 
     pub fn queue_apc(&mut self, thread_handle: Handle, token: impl Into<String>) -> AppResult<()> {
@@ -2710,35 +2318,34 @@ impl Win32Subsystem {
     }
 
     pub fn close_handle(&mut self, handle: Handle) -> AppResult<()> {
-        if self.protected_close_handles.contains(&handle) {
-            return Err(AppError::new(
-                ReasonCode::RcHelperPermissionDenied,
-                format!("handle {handle} is protected from close"),
-            ));
-        }
         // Sockets are winsock handles, not kernel handles: Windows
         // `CloseHandle` on a SOCKET fails with ERROR_INVALID_HANDLE.  With
         // the unified namespace this is enforced by type, so a socket value
         // can never close a (recycled) win32 object.
-        if self
-            .handles
-            .get(&handle)
-            .is_some_and(|entry| entry.descriptor.object_type == ObjectType::Socket)
-        {
+        let (object_type, object, last_handle) = {
+            let entry = self.process.handle_table.entry(handle)?;
+            let object_type = self.objects.object_type(entry.object_id);
+            // The GE share-state claim dies with the LAST handle to the
+            // object (the object manager owns the single object payload;
+            // handle count is the reference count).
+            let last_handle = self.objects.handle_count(entry.object_id) == 1;
+            (
+                object_type,
+                self.objects.object(entry.object_id).clone(),
+                last_handle,
+            )
+        };
+        if object_type == ObjectType::Socket {
             return Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("handle {handle} is a socket, not a kernel handle"),
             ));
         }
-        let entry = self.handles.remove(&handle).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("invalid handle {handle}"),
-            )
-        })?;
-        self.protected_close_handles.remove(&handle);
-        if let KernelObject::File(file) = &entry.object {
-            let ge_handle = if Rc::strong_count(file) == 1 {
+        // Subsystem teardown runs against the object BEFORE the handle table
+        // and the object manager drop it (the table returns the removed
+        // entry so the manager refcount can be decremented).
+        if let KernelObject::File(file) = &object {
+            let ge_handle = if last_handle {
                 file.borrow().ge_handle.clone()
             } else {
                 None
@@ -2762,77 +2369,110 @@ impl Win32Subsystem {
                 self.ge.config.fs_state.entries.remove(&normalized_path);
             }
         }
-        // Windows forgets named objects once the last handle closes, so a
-        // guest can recreate a pipe/section/mutex/semaphore with the same
-        // name.  Drop name-table entries when no other handle references the
-        // object.
-        match &entry.object {
-            KernelObject::Mutex(_) => {
-                self.named_mutexes.retain(|_, stored| *stored != handle);
-            }
-            KernelObject::Semaphore(_) => {
-                self.named_semaphores.retain(|_, stored| *stored != handle);
-            }
-            KernelObject::Pipe(pipe) => {
-                let name = pipe.name.clone();
-                let still_open = self.handles.values().any(|other| {
-                    matches!(&other.object, KernelObject::Pipe(other) if other.name == name)
-                });
-                if !still_open {
-                    self.named_pipes.remove(&name);
-                } else {
-                    // The peer end survives: forget the closed end so a
-                    // recycled handle value can never be misclassified as
-                    // it, and mark the surviving end's direction broken so
-                    // parked pipe waiters wake with ERROR_BROKEN_PIPE.
-                    let surviving = {
-                        let state = self.named_pipes.get_mut(&name);
-                        if let Some(state) = state {
-                            if state.server_handle == Some(handle) {
-                                state.server_handle = None;
-                                state.client_disconnected = true;
-                                state.client_handle
-                            } else if state.client_handle == Some(handle) {
-                                state.client_handle = None;
-                                state.server_disconnected = true;
-                                state.server_handle
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    // Signal pending pipe I/O events on the surviving end so
-                    // event waiters wake; the requests stay Pending and
-                    // complete as broken pipe through the scheduler.
-                    if let Some(surviving) = surviving {
-                        self.signal_pending_pipe_io_events(surviving)?;
-                    }
-                }
-            }
-            KernelObject::Section(section) => {
-                if let Some(ref name) = section.name {
-                    let still_open = self.handles.values().any(|other| {
-                        matches!(&other.object, KernelObject::Section(other)
-                            if other.name.as_deref() == Some(name.as_str()))
-                    });
-                    if !still_open {
-                        self.shared_memory_sections.remove(name);
-                    }
-                }
-            }
-            _ => {}
+        if let KernelObject::Pipe(pipe) = &object {
+            self.close_pipe_teardown(handle, pipe)?;
         }
-        // Increment the generation counter so stale references to the old
-        // handle value are detected, and recycle the value so future
-        // allocations can reuse it (Windows reuses handle values).
-        let generation = self.handle_generations.entry(handle).or_insert(0);
-        *generation = generation.saturating_add(1);
-        self.closed_handle_values.push_back(handle);
-        self.record_closed_handle(handle, entry.descriptor.object_type);
-        if let KernelObject::Thread(thread) = &entry.object {
+        // The canonical table validates close-protection, rejects sockets by
+        // type, removes the entry, bumps the value's generation and recycles
+        // the value for future reuse (Windows reuses handle values).
+        let removed = self.process.handle_table.close(handle, object_type)?;
+        // Windows forgets named objects once the last handle closes; the
+        // object manager drops the object and its name at refcount 0.
+        self.objects.handle_removed(removed.object_id);
+        if let KernelObject::Thread(thread) = &object {
             self.cleanup_exited_thread_state(thread.thread_id);
+        }
+        Ok(())
+    }
+
+    /// Pipe-specific close teardown: when the server end closes while a
+    /// client still holds the pipe open, the surviving client objects get a
+    /// broken state so parked pipe waiters wake with ERROR_BROKEN_PIPE (the
+    /// name itself is forgotten — Windows frees the pipe name once the
+    /// server instance closes).
+    fn close_pipe_teardown(&mut self, handle: Handle, pipe: &PipeObject) -> AppResult<()> {
+        let name = pipe.name.clone();
+        let state = pipe.state.clone();
+        let normalized = normalize_pipe_name(&name);
+        let is_server = state
+            .as_ref()
+            .is_some_and(|state| state.server_handle == Some(handle));
+        let is_client = state
+            .as_ref()
+            .is_some_and(|state| state.client_handle == Some(handle));
+        if !is_server && !is_client && state.is_none() {
+            // Legacy anonymous pipe without a state record: nothing to do.
+            return Ok(());
+        }
+        // Other pipe objects with the same name (the peer end).
+        let peers = self
+            .objects
+            .objects_iter()
+            .filter_map(|(id, object)| match object {
+                KernelObject::Pipe(peer) if peer.name == name => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if is_server {
+            // The server end closed: give every surviving peer (client) a
+            // broken state so its waiters observe the disconnection; the
+            // named record dies with this object's last handle.
+            let broken = state.map(|state| NamedPipeState {
+                server_handle: None,
+                client_handle: None,
+                server_disconnected: true,
+                client_disconnected: true,
+                ..state
+            });
+            if let Some(broken) = broken {
+                for peer_id in &peers {
+                    if let KernelObject::Pipe(peer) = self.objects.object_mut(*peer_id) {
+                        peer.state = Some(broken.clone());
+                    }
+                }
+            }
+            // Signal pending pipe I/O events on every surviving peer so
+            // event waiters wake; the requests stay Pending and complete as
+            // broken pipe through the scheduler.
+            let mut surviving_handles = self
+                .process
+                .handle_table
+                .iter()
+                .filter_map(|(peer_handle, entry)| {
+                    peers.contains(&entry.object_id).then_some(peer_handle)
+                })
+                .collect::<Vec<_>>();
+            surviving_handles.sort_unstable();
+            surviving_handles.dedup();
+            for surviving in surviving_handles {
+                if surviving != handle {
+                    self.signal_pending_pipe_io_events(surviving)?;
+                }
+            }
+        } else if is_client {
+            // A client end closed while the server survives: mark the
+            // server-side state broken for that direction so the server's
+            // parked pipe waiters wake.
+            if let Some(server_id) = self.objects.resolve(&normalized)
+                && let KernelObject::Pipe(server_pipe) = self.objects.object_mut(server_id)
+                && let Some(state) = server_pipe.state.as_mut()
+                && state.client_handle == Some(handle)
+            {
+                state.client_handle = None;
+                state.client_disconnected = true;
+            }
+            if let Some(server_id) = self.objects.resolve(&normalized) {
+                let server_handle =
+                    self.process
+                        .handle_table
+                        .iter()
+                        .find_map(|(peer_handle, entry)| {
+                            (entry.object_id == server_id).then_some(peer_handle)
+                        });
+                if let Some(server_handle) = server_handle {
+                    self.signal_pending_pipe_io_events(server_handle)?;
+                }
+            }
         }
         Ok(())
     }
@@ -2858,8 +2498,8 @@ impl Win32Subsystem {
             false,
             KernelObject::Socket(SocketObject { id: 0 }),
         );
-        if let Some(entry) = self.handles.get_mut(&handle)
-            && let KernelObject::Socket(socket) = &mut entry.object
+        if let KernelObject::Socket(socket) =
+            self.handle_object_mut(handle).expect("fresh socket handle")
         {
             socket.id = u64::from(handle);
         }
@@ -2870,10 +2510,10 @@ impl Win32Subsystem {
     /// (anything else is `RcWin32InvalidHandle`, which the winsock thunks
     /// map to WSAENOTSOCK).
     pub fn socket_id(&self, handle: Handle) -> AppResult<u64> {
-        match self.handles.get(&handle).map(|entry| &entry.object) {
-            Some(KernelObject::Socket(socket)) => Ok(socket.id),
-            Some(_) => invalid_handle("handle is not a socket"),
-            None => Err(self.invalid_handle_error(handle)),
+        match self.handle_object(handle) {
+            Ok(KernelObject::Socket(socket)) => Ok(socket.id),
+            Ok(_) => invalid_handle("handle is not a socket"),
+            Err(error) => Err(error),
         }
     }
 
@@ -2881,17 +2521,13 @@ impl Win32Subsystem {
     /// bookkeeping as `close_handle`) and return the socket id so the caller
     /// can tear down the `NetworkStack` record.
     pub fn close_socket(&mut self, handle: Handle) -> AppResult<u64> {
-        let id = match self.handles.get(&handle).map(|entry| &entry.object) {
-            Some(KernelObject::Socket(socket)) => socket.id,
-            Some(_) => return invalid_handle("handle is not a socket"),
-            None => return Err(self.invalid_handle_error(handle)),
+        let id = match self.handle_object(handle) {
+            Ok(KernelObject::Socket(socket)) => socket.id,
+            Ok(_) => return invalid_handle("handle is not a socket"),
+            Err(error) => return Err(error),
         };
-        self.handles.remove(&handle);
-        self.protected_close_handles.remove(&handle);
-        let generation = self.handle_generations.entry(handle).or_insert(0);
-        *generation = generation.saturating_add(1);
-        self.closed_handle_values.push_back(handle);
-        self.record_closed_handle(handle, ObjectType::Socket);
+        let removed = self.process.handle_table.close_raw(handle)?;
+        self.objects.handle_removed(removed.object_id);
         Ok(id)
     }
 
@@ -2942,16 +2578,16 @@ impl Win32Subsystem {
     /// access mask.
     pub fn require_file_access(&self, handle: Handle, required: u32) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
-        Self::require_access(entry, required)
+        Self::require_access(&entry, required)
     }
 
     pub fn read_file(&mut self, handle: Handle, length: usize) -> AppResult<Vec<u8>> {
         let object_type = self.handle_entry(handle)?.descriptor.object_type;
         match object_type {
             ObjectType::File => {
-                Self::require_access(self.handle_entry(handle)?, FILE_READ_DATA)?;
+                Self::require_access(&self.handle_entry(handle)?, FILE_READ_DATA)?;
                 let (data, read_path) = (|| -> AppResult<(Vec<u8>, String)> {
-                    let entry = self.handle_entry_mut(handle)?;
+                    let mut entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
                         let mut file = file.borrow_mut();
                         let path_display = file.host_path.display().to_string();
@@ -3026,11 +2662,11 @@ impl Win32Subsystem {
                 Ok(data)
             }
             ObjectType::Pipe => {
-                let normalized = match &self.handle_entry(handle)?.object {
+                let normalized = match self.handle_object(handle)? {
                     KernelObject::Pipe(pipe) => normalize_pipe_name(&pipe.name),
                     _ => return invalid_handle("handle is not a pipe"),
                 };
-                if let Some(state) = self.named_pipes.get(&normalized) {
+                if let Some(state) = self.pipe_state_by_name(&normalized) {
                     if state.server_disconnected && !state.client_connected {
                         return Err(AppError::new(
                             ReasonCode::RcIo,
@@ -3041,12 +2677,12 @@ impl Win32Subsystem {
                 } else {
                     // Legacy pipe without shared state: read from the
                     // per-object buffer.
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Pipe(pipe) = &mut entry.object {
-                        let take = length.min(pipe.buffer.len());
-                        Ok(pipe.buffer.drain(..take).collect())
-                    } else {
-                        invalid_handle("handle is not a pipe")
+                    match self.handle_object_mut(handle)? {
+                        KernelObject::Pipe(pipe) => {
+                            let take = length.min(pipe.buffer.len());
+                            Ok(pipe.buffer.drain(..take).collect())
+                        }
+                        _ => invalid_handle("handle is not a pipe"),
                     }
                 }
             }
@@ -3059,11 +2695,11 @@ impl Win32Subsystem {
         match object_type {
             ObjectType::File => {
                 Self::require_access(
-                    self.handle_entry(handle)?,
+                    &self.handle_entry(handle)?,
                     FILE_WRITE_DATA | FILE_APPEND_DATA,
                 )?;
                 let (normalized_path, host_path) = {
-                    let entry = self.handle_entry_mut(handle)?;
+                    let mut entry = self.handle_entry_mut(handle)?;
                     if let KernelObject::File(file) = &mut entry.object {
                         let mut file = file.borrow_mut();
                         let path_display = file.host_path.display().to_string();
@@ -3162,13 +2798,12 @@ impl Win32Subsystem {
                 Ok(bytes.len() as u32)
             }
             ObjectType::Pipe => {
-                let normalized = match &self.handle_entry(handle)?.object {
+                let normalized = match self.handle_object(handle)? {
                     KernelObject::Pipe(pipe) => normalize_pipe_name(&pipe.name),
                     _ => return invalid_handle("handle is not a pipe"),
                 };
                 let disconnected = self
-                    .named_pipes
-                    .get(&normalized)
+                    .pipe_state_by_name(&normalized)
                     .is_some_and(|state| state.server_disconnected);
                 if disconnected {
                     return Err(AppError::new(
@@ -3176,7 +2811,7 @@ impl Win32Subsystem {
                         format!("pipe {normalized} is disconnected"),
                     ));
                 }
-                if let Some(state) = self.named_pipes.get_mut(&normalized) {
+                if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
                     // Server writes append to server-to-client; client writes
                     // append to client-to-server.
                     let is_server = state.server_handle == Some(handle);
@@ -3196,11 +2831,11 @@ impl Win32Subsystem {
                     pipe_queue_append(&queue, &data_ready, bytes, message_mode);
                 } else {
                     // Legacy pipe without shared state: buffer on the object.
-                    let entry = self.handle_entry_mut(handle)?;
-                    if let KernelObject::Pipe(pipe) = &mut entry.object {
-                        pipe.buffer.extend_from_slice(bytes);
-                    } else {
-                        return invalid_handle("handle is not a pipe");
+                    match self.handle_object_mut(handle)? {
+                        KernelObject::Pipe(pipe) => {
+                            pipe.buffer.extend_from_slice(bytes);
+                        }
+                        _ => return invalid_handle("handle is not a pipe"),
                     }
                 }
                 Ok(bytes.len() as u32)
@@ -3221,7 +2856,7 @@ impl Win32Subsystem {
         // Windows FlushFileBuffers requires GENERIC_WRITE access to the file
         // (the expanded mask grants FILE_WRITE_DATA|FILE_APPEND_DATA); a
         // read-only handle must fail with ERROR_ACCESS_DENIED.
-        Self::require_access(entry, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
+        Self::require_access(&entry, FILE_WRITE_DATA | FILE_APPEND_DATA)?;
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::File(file) => {
@@ -3259,7 +2894,7 @@ impl Win32Subsystem {
             KernelObject::File(_) => {}
             _ => return invalid_handle("handle is not a file"),
         }
-        Self::require_access(entry, FILE_READ_ATTRIBUTES)?;
+        Self::require_access(&entry, FILE_READ_ATTRIBUTES)?;
         match &entry.object {
             KernelObject::File(file) => {
                 let file = file.borrow();
@@ -3293,8 +2928,11 @@ impl Win32Subsystem {
         // Seeking moves the file pointer, which both reads and writes build
         // on; a handle granted neither FILE_READ_DATA nor FILE_WRITE_DATA
         // must not be able to reposition it.
-        Self::require_access(self.handle_entry(handle)?, FILE_READ_DATA | FILE_WRITE_DATA)?;
-        let entry = self.handle_entry_mut(handle)?;
+        Self::require_access(
+            &self.handle_entry(handle)?,
+            FILE_READ_DATA | FILE_WRITE_DATA,
+        )?;
+        let mut entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::File(file) => {
                 let mut file = file.borrow_mut();
@@ -3492,8 +3130,7 @@ impl Win32Subsystem {
     }
 
     pub fn find_next_file_w(&mut self, handle: Handle) -> AppResult<Option<FindData>> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::DirectorySearch(search) => {
                 if search.index >= search.entries.len() {
                     Ok(None)
@@ -3551,8 +3188,8 @@ impl Win32Subsystem {
         // FILE_SHARE_DELETE) now reference a deleted file; record
         // delete_pending so close-time cleanup (e.g. FILE_FLAG_DELETE_ON_CLOSE
         // removal) does not double-delete.
-        for entry in self.handles.values_mut() {
-            if let KernelObject::File(file) = &mut entry.object {
+        for (_, object) in self.objects.objects_iter_mut() {
+            if let KernelObject::File(file) = object {
                 let mut file = file.borrow_mut();
                 if file.normalized_path == normalized_path {
                     file.delete_pending = true;
@@ -4042,6 +3679,7 @@ impl Win32Subsystem {
                 name: normalize_pipe_name(name),
                 connected: false,
                 buffer: Vec::new(),
+                state: None,
             }),
         )
     }
@@ -4059,8 +3697,13 @@ impl Win32Subsystem {
         overlapped: bool,
     ) -> AppResult<Option<u64>> {
         let pipe_name = {
-            let entry = self.handle_entry_mut(handle)?;
-            match &mut entry.object {
+            let object_id = self
+                .process
+                .handle_table
+                .entry(handle)
+                .expect("checked live")
+                .object_id;
+            match self.objects.object_mut(object_id) {
                 KernelObject::Pipe(pipe) => {
                     if pipe.connected {
                         self.signal_event_if_needed(event_handle)?;
@@ -4075,14 +3718,13 @@ impl Win32Subsystem {
         // Mark ourselves as ready to connect – the client side (CreateFileW
         // with `\\.\pipe\...`) performs the connection.  A new connect
         // cycle clears the previous disconnect.
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
             state.server_created = true;
             state.server_handle = Some(handle);
             state.server_disconnected = false;
         }
         if self
-            .named_pipes
-            .get(&normalized)
+            .pipe_state_by_name(&normalized)
             .is_some_and(|state| state.client_connected)
         {
             self.signal_event_if_needed(event_handle)?;
@@ -4112,7 +3754,7 @@ impl Win32Subsystem {
     /// was closed and recycled must be dropped, never applied to the wrong
     /// object).
     fn pipe_complete_connect(&mut self, normalized: &str) -> AppResult<()> {
-        let server_handle = if let Some(state) = self.named_pipes.get_mut(normalized) {
+        let server_handle = if let Some(state) = self.pipe_state_mut_by_name(normalized) {
             state.client_connected = true;
             state.client_disconnected = false;
             state.server_disconnected = false;
@@ -4120,13 +3762,16 @@ impl Win32Subsystem {
         } else {
             None
         };
-        if let Some(server_handle) = server_handle
-            && let Some(HandleEntry {
-                object: KernelObject::Pipe(pipe),
-                ..
-            }) = self.handles.get_mut(&server_handle)
-        {
-            pipe.connected = true;
+        if let Some(server_handle) = server_handle {
+            let object_id = self
+                .process
+                .handle_table
+                .entry(server_handle)
+                .expect("live server handle")
+                .object_id;
+            if let KernelObject::Pipe(pipe) = self.objects.object_mut(object_id) {
+                pipe.connected = true;
+            }
         }
         // Complete pending ConnectNamedPipe overlapped requests on the
         // server end.
@@ -4181,12 +3826,15 @@ impl Win32Subsystem {
     pub fn call_named_pipe(&mut self, name: &str, request: &[u8]) -> AppResult<Vec<u8>> {
         let normalized = normalize_pipe_name(name);
         let pipe_handle = self
-            .handles
+            .process
+            .handle_table
             .iter()
-            .find_map(|(handle, entry)| match &entry.object {
-                KernelObject::Pipe(pipe) if pipe.name == normalized => Some(*handle),
-                _ => None,
-            })
+            .find_map(
+                |(handle, entry)| match self.objects.object(entry.object_id) {
+                    KernelObject::Pipe(pipe) if pipe.name == normalized => Some(handle),
+                    _ => None,
+                },
+            )
             .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcPipeBusy,
@@ -4196,7 +3844,7 @@ impl Win32Subsystem {
         // Client connection: this call is a client; complete the server's
         // pending ConnectNamedPipe overlapped requests.
         self.pipe_complete_connect(&normalized)?;
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
             // The request goes into client-to-server so server-side
             // `read_file` calls observe it.
             pipe_queue_append(
@@ -4207,11 +3855,13 @@ impl Win32Subsystem {
             );
         } else {
             // Legacy pipe without shared state: buffer on the object.
-            if let Some(HandleEntry {
-                object: KernelObject::Pipe(pipe),
-                ..
-            }) = self.handles.get_mut(&pipe_handle)
-            {
+            let object_id = self
+                .process
+                .handle_table
+                .entry(pipe_handle)
+                .expect("live pipe handle")
+                .object_id;
+            if let KernelObject::Pipe(pipe) = self.objects.object_mut(object_id) {
                 pipe.connected = true;
                 pipe.buffer.extend_from_slice(request);
             }
@@ -4220,7 +3870,7 @@ impl Win32Subsystem {
         // The response is whatever the server wrote into the pipe; when the
         // server has not responded yet there is nothing to return (the thunk
         // layer parks the caller on the scheduler wait).
-        if let Some(state) = self.named_pipes.get(&normalized) {
+        if let Some(state) = self.pipe_state_by_name(&normalized) {
             Ok(pipe_queue_read(
                 &state.server_to_client,
                 &state.data_ready,
@@ -4247,29 +3897,34 @@ impl Win32Subsystem {
                 format!("commit of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"),
             ));
         }
-        let reserves = matches!(
-            allocation_type,
-            AllocationType::Reserve | AllocationType::ReserveCommit
-        );
         let commits = matches!(
             allocation_type,
             AllocationType::Commit | AllocationType::ReserveCommit
         );
+        let vm_protection = VmProtection {
+            read: protection.read,
+            write: protection.write,
+            execute: protection.execute,
+        };
         let base = match base_address {
             Some(base) => base & !0xfff,
             None => {
-                if !reserves {
-                    // MEM_COMMIT without a base: reserve + commit a fresh
-                    // region (Windows treats it as reserve-commit).
-                }
-                let current = self.next_virtual_address;
-                self.next_virtual_address = current.checked_add(aligned).ok_or_else(|| {
-                    AppError::new(
+                // Anonymous reservation from the canonical cursor (MEM_COMMIT
+                // without a base is treated as reserve+commit, matching
+                // Windows).
+                let base = self.process.address_space.reserve(None, aligned);
+                if base == 0 {
+                    return Err(AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
                         "virtual address space exhausted",
-                    )
-                })?;
-                current
+                    ));
+                }
+                if commits {
+                    self.process
+                        .address_space
+                        .commit(base, aligned, vm_protection, false);
+                }
+                return Ok(base);
             }
         };
         base.checked_add(aligned).ok_or_else(|| {
@@ -4279,90 +3934,41 @@ impl Win32Subsystem {
             )
         })?;
 
-        if commits && base_address.is_some() {
+        if commits {
             // MEM_COMMIT at an interior address of an existing reservation:
             // commit only the requested pages of the containing region.
-            if let Some(containing_base) = self
-                .region_containing(base)
-                .map(|region| region.base_address)
-            {
-                let range_end = base.checked_add(aligned).ok_or_else(|| {
-                    AppError::new(ReasonCode::RcCliInvalid, "commit range overflow")
-                })?;
-                let containing_size = self
-                    .memory_regions
-                    .get(&containing_base)
-                    .map(|region| region.size)
-                    .unwrap_or(0);
-                if range_end > containing_base + containing_size as u64 {
-                    return Err(AppError::new(
-                        ReasonCode::RcCliInvalid,
-                        format!(
-                            "commit range {base:#x}..{range_end:#x} exceeds the reservation at {containing_base:#x} size {containing_size:#x}"
-                        ),
-                    ));
-                }
-                let region = self.memory_regions.get_mut(&containing_base).unwrap();
-                for page in (0..page_count).map(|i| base + i * 0x1000) {
-                    region.pages.insert(page, CommittedPage { protection });
-                }
+            if self.process.address_space.can_commit(base, aligned) {
+                self.process
+                    .address_space
+                    .commit(base, aligned, vm_protection, false);
                 return Ok(base);
             }
-            // No containing reservation: an explicit-base commit of an
-            // unreserved range fails on Windows (VirtualAlloc(MEM_COMMIT)
-            // requires the range to be reserved).
+            // No containing reservation (or the range exceeds it): an
+            // explicit-base commit of an unreserved range fails on Windows
+            // (VirtualAlloc(MEM_COMMIT) requires the range to be reserved).
+            let query = self.process.address_space.query(base);
+            if query.state != VmState::Free {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!(
+                        "commit range {base:#x}..{:#x} exceeds the containing reservation",
+                        base.saturating_add(aligned)
+                    ),
+                ));
+            }
             return Err(AppError::new(
                 ReasonCode::RcMemoryAccessViolation,
                 format!("commit at {base:#x} has no containing reservation"),
             ));
         }
 
-        // Fresh reservation (Reserve / ReserveCommit / implicit commit).
-        if let Some(region) = self.memory_regions.get_mut(&base) {
-            // Extending an existing reservation at the same base.
-            if region.size < aligned as usize {
-                region.size = aligned as usize;
-            }
-            if commits {
-                for page in (0..page_count).map(|i| base + i * 0x1000) {
-                    region.pages.insert(page, CommittedPage { protection });
-                }
-            }
-            return Ok(base);
-        }
-        let mut region = VirtualRegion {
-            base_address: base,
-            size: aligned as usize,
-            pages: BTreeMap::new(),
-            backing: None,
-            backing_offset: 0,
-        };
-        if commits {
-            for page in (0..page_count).map(|i| base + i * 0x1000) {
-                region.pages.insert(page, CommittedPage { protection });
-            }
-        }
-        self.memory_regions.insert(base, region);
+        // Pure Reserve at an explicit base: grow an existing reservation at
+        // the base or create a fresh one (canonical `register` tolerates
+        // nesting exactly like the historical flat region map).
+        self.process
+            .address_space
+            .register(base, aligned, VmRegionKind::Private);
         Ok(base)
-    }
-
-    /// Find the region containing `address` (address inside base..base+size).
-    fn region_containing(&self, address: u64) -> Option<&VirtualRegion> {
-        self.memory_regions
-            .range(..=address)
-            .next_back()
-            .filter(|(_, region)| {
-                region
-                    .base_address
-                    .checked_add(region.size as u64)
-                    .is_some_and(|end| address < end)
-            })
-            .map(|(_, region)| region)
-    }
-
-    fn region_containing_mut(&mut self, address: u64) -> Option<&mut VirtualRegion> {
-        let base = self.region_containing(address).map(|r| r.base_address)?;
-        self.memory_regions.get_mut(&base)
     }
 
     pub fn virtual_free(
@@ -4379,7 +3985,7 @@ impl Win32Subsystem {
                         "MEM_RELEASE requires size=0",
                     ));
                 }
-                if self.memory_regions.remove(&base_address).is_none() {
+                if !self.process.address_space.release(base_address) {
                     return Err(AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
                         format!("unknown region {base_address:#x}"),
@@ -4396,20 +4002,14 @@ impl Win32Subsystem {
                         "decommit range overflow",
                     )
                 })?;
-                let region = self.region_containing_mut(base_address).ok_or_else(|| {
-                    AppError::new(
+                if self.process.address_space.query(base_address).state == VmState::Free {
+                    return Err(AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
                         format!("no reservation containing {base_address:#x}"),
-                    )
-                })?;
-                let pages = (0..aligned / 0x1000)
-                    .map(|i| base_address + i * 0x1000)
-                    .filter(|page| *page < region.base_address + region.size as u64)
-                    .collect::<Vec<_>>();
-                for page in pages {
-                    region.pages.remove(&page);
+                    ));
                 }
                 // Keep the reservation: decommitted pages become Reserved.
+                self.process.address_space.decommit(base_address, aligned);
                 let _ = range_end;
             }
         }
@@ -4425,86 +4025,47 @@ impl Win32Subsystem {
         // Protect only the requested range's committed pages; return the
         // previous protection of the first page in the range.
         let aligned = align_up(size.max(1) as u64, 0x1000);
-        let region = self.region_containing_mut(base_address).ok_or_else(|| {
-            AppError::new(
+        if self.process.address_space.query(base_address).state == VmState::Free {
+            return Err(AppError::new(
                 ReasonCode::RcMemoryAccessViolation,
                 format!("no reservation containing {base_address:#x}"),
-            )
-        })?;
-        let range_end = base_address.saturating_add(aligned);
-        let mut previous = MemoryProtection {
-            read: false,
-            write: false,
-            execute: false,
-        };
-        let mut found = false;
-        for page in region.pages.range_mut(base_address..range_end) {
-            if !found {
-                previous = page.1.protection;
-                found = true;
-            }
-            page.1.protection = protection;
+            ));
         }
-        Ok(previous)
+        let vm_protection = VmProtection {
+            read: protection.read,
+            write: protection.write,
+            execute: protection.execute,
+        };
+        let previous = self
+            .process
+            .address_space
+            .protect(base_address, aligned, vm_protection)
+            .unwrap_or(VmProtection::NONE);
+        Ok(MemoryProtection {
+            read: previous.read,
+            write: previous.write,
+            execute: previous.execute,
+        })
     }
 
     pub fn virtual_query(&self, address: u64) -> MemoryBasicInformation {
-        // Page-granular query: report the coalesced run of adjacent pages
-        // with identical state/protection (Windows VirtualQuery semantics —
-        // a query against an uncommitted page inside a partially committed
-        // reservation reports a Reserved region, not the whole region).
-        let Some(region) = self.region_containing(address) else {
-            return MemoryBasicInformation {
-                base_address: 0,
-                region_size: 0,
-                state: MemoryState::Free,
-                protection: MemoryProtection {
-                    read: false,
-                    write: false,
-                    execute: false,
-                },
-            };
-        };
-        let page = address & !0xfff;
-        let region_end = region.base_address + region.size as u64;
-        let committed = region.pages.contains_key(&page);
-        let protection = region
-            .pages
-            .get(&page)
-            .map(|committed_page| committed_page.protection)
-            .unwrap_or(MemoryProtection {
-                read: false,
-                write: false,
-                execute: false,
-            });
-        // Coalesce: extend the reported region while adjacent pages share
-        // the same state and protection.
-        let mut run_end = page + 0x1000;
-        loop {
-            if run_end >= region_end {
-                break;
-            }
-            let next_committed = region.pages.contains_key(&run_end);
-            if next_committed != committed {
-                break;
-            }
-            if committed {
-                let next_protection = &region.pages.get(&run_end).unwrap().protection;
-                if next_protection != &protection {
-                    break;
-                }
-            }
-            run_end += 0x1000;
-        }
+        // Page-granular query against the canonical VM: reports the
+        // coalesced run of adjacent pages with identical state/protection
+        // (Windows VirtualQuery semantics).
+        let result = self.process.address_space.query(address);
         MemoryBasicInformation {
-            base_address: page,
-            region_size: (run_end - page) as usize,
-            state: if committed {
-                MemoryState::Committed
-            } else {
-                MemoryState::Reserved
+            base_address: result.base,
+            region_size: result.region_size as usize,
+            state: match result.state {
+                VmState::Free => MemoryState::Free,
+                VmState::Reserved => MemoryState::Reserved,
+                VmState::Committed => MemoryState::Committed,
             },
-            protection,
+            protection: MemoryProtection {
+                read: result.protection.read,
+                write: result.protection.write,
+                execute: result.protection.execute,
+            },
         }
     }
 
@@ -4731,15 +4292,25 @@ impl Win32Subsystem {
         } else {
             argv[0] = application.to_string();
         }
-        let process_id = self.next_process_id;
-        self.next_process_id += 1;
+        // Children are guest processes too: their ids come from the SAME
+        // guest pid namespace (monotonic, never the host pid).
+        let process_id = allocate_guest_pid();
         let thread_id = self.next_thread_id;
         self.next_thread_id += 1;
         let inherited_handles = if inherit_handles {
-            self.handles
-                .values()
-                .filter(|entry| entry.descriptor.inheritable)
-                .map(|entry| entry.descriptor.clone())
+            self.process
+                .handle_table
+                .iter()
+                .filter(|(_, entry)| entry.inheritable)
+                .map(|(_, entry)| {
+                    let object_type = self.objects.object_type(entry.object_id);
+                    HandleDescriptor {
+                        object_type,
+                        access_mask: entry.access_mask,
+                        refcount: self.objects.handle_count(entry.object_id),
+                        inheritable: entry.inheritable,
+                    }
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -4796,8 +4367,7 @@ impl Win32Subsystem {
     }
 
     pub fn set_process_exit_code(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::Process(process) => {
                 process.exit_code = Some(exit_code);
                 Ok(())
@@ -4812,7 +4382,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Process(process) => {
-                Self::require_access(entry, PROCESS_QUERY_LIMITED_INFORMATION)?;
+                Self::require_access(&entry, PROCESS_QUERY_LIMITED_INFORMATION)?;
                 Ok(process.exit_code)
             }
             _ => invalid_handle("handle is not a process"),
@@ -4825,7 +4395,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Process(_) => {
-                Self::require_access(entry, PROCESS_TERMINATE)?;
+                Self::require_access(&entry, PROCESS_TERMINATE)?;
             }
             _ => return invalid_handle("handle is not a process"),
         }
@@ -4839,8 +4409,7 @@ impl Win32Subsystem {
         handle: Handle,
         exit_code: u32,
     ) -> AppResult<()> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::Process(process) => {
                 process.exit_code = Some(exit_code);
                 if let Some(ref sync) = process.exit_sync {
@@ -4862,8 +4431,7 @@ impl Win32Subsystem {
         handle: Handle,
         sync: Arc<(Mutex<Option<u32>>, Condvar)>,
     ) -> AppResult<()> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
+        match self.handle_object_mut(handle)? {
             KernelObject::Process(process) => {
                 process.exit_sync = Some(sync);
                 Ok(())
@@ -4873,20 +4441,21 @@ impl Win32Subsystem {
     }
 
     /// `OpenProcess` — returns a new handle to an existing process object.
-    /// Only `PROCESS_ALL_ACCESS` is supported; we match against our internal
-    /// process-id table.
+    /// The duplicate references the SAME object (shared state, one
+    /// refcount).
     pub fn open_process(
         &mut self,
         desired_access: u32,
         inherit_handle: bool,
         process_id: u32,
     ) -> AppResult<Handle> {
-        let existing = self
-            .handles
-            .values()
-            .find_map(|entry| match &entry.object {
-                KernelObject::Process(p) if p.process_id == process_id => {
-                    Some(entry.object.clone())
+        let object_id = self
+            .process
+            .handle_table
+            .iter()
+            .find_map(|(_, entry)| match self.objects.object(entry.object_id) {
+                KernelObject::Process(process) if process.process_id == process_id => {
+                    Some(entry.object_id)
                 }
                 _ => None,
             })
@@ -4896,12 +4465,7 @@ impl Win32Subsystem {
                     format!("no process with id {process_id}"),
                 )
             })?;
-        Ok(self.insert_object(
-            ObjectType::Process,
-            desired_access,
-            inherit_handle,
-            existing,
-        ))
+        Ok(self.insert_object_id(object_id, desired_access, inherit_handle))
     }
 
     // -----------------------------------------------------------------------
@@ -4920,11 +4484,11 @@ impl Win32Subsystem {
         in_buffer_size: u32,
         default_timeout: u32,
         inheritable: bool,
-        security_descriptor: Option<u64>,
+        _security_descriptor: Option<u64>,
         uds_socket_path: Option<String>,
     ) -> AppResult<Handle> {
         let normalized = normalize_pipe_name(name);
-        if self.named_pipes.contains_key(&normalized) {
+        if self.named_pipe_server_exists(name) {
             return Err(AppError::new(
                 ReasonCode::RcFsAlreadyExists,
                 format!("named pipe already exists: {name}"),
@@ -4953,15 +4517,19 @@ impl Win32Subsystem {
         }
 
         // Create the server handle first so the state can record it as the
-        // server end.
-        let handle = self.insert_object(
+        // server end.  The pipe registers its name in the unified named-object
+        // namespace; the condvar-backed transport state lives ON the named
+        // pipe object (one state record per pipe name).
+        let handle = self.insert_object_named(
             ObjectType::Pipe,
+            Some(&normalized),
             0x1F0FFF,
             inheritable,
             KernelObject::Pipe(PipeObject {
                 name: normalized.clone(),
                 connected: false,
                 buffer: Vec::new(),
+                state: None,
             }),
         );
         let state = NamedPipeState {
@@ -4973,7 +4541,7 @@ impl Win32Subsystem {
             max_buffer_size: buf_size,
             server_disconnected: false,
             client_disconnected: false,
-            security_descriptor,
+            security_descriptor: None,
             uds_socket_path: Some(uds_path),
             open_mode,
             pipe_mode: pipe_mode & 0x0000_0003, // PIPE_WAIT or PIPE_NOWAIT
@@ -4986,7 +4554,15 @@ impl Win32Subsystem {
             message_mode: pipe_mode & PIPE_READMODE_MESSAGE != 0,
             client_connected: false,
         };
-        self.named_pipes.insert(normalized.clone(), state.clone());
+        let object_id = self
+            .process
+            .handle_table
+            .entry(handle)
+            .expect("fresh server pipe handle")
+            .object_id;
+        if let KernelObject::Pipe(pipe) = self.objects.object_mut(object_id) {
+            pipe.state = Some(state);
+        }
 
         // Generic runtime event (no behavior change): a pipe server endpoint
         // was created.
@@ -5011,7 +4587,7 @@ impl Win32Subsystem {
         let normalized = normalize_pipe_name(&pipe_name);
         // Mark ourselves as ready to connect – the client side (CreateFileW
         // with `\\.\pipe\...`) performs the connection.
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
             state.server_created = true;
             state.server_handle = Some(handle);
             // A new connect cycle clears the previous disconnect.
@@ -5026,7 +4602,7 @@ impl Win32Subsystem {
         match &entry.object {
             KernelObject::Pipe(pipe) => {
                 let normalized = normalize_pipe_name(&pipe.name);
-                if let Some(state) = self.named_pipes.get(&normalized) {
+                if let Some(state) = self.pipe_state_by_name(&normalized) {
                     // (pipe_mode, max_instances, out_buffer_size, in_buffer_size)
                     Ok((
                         state.pipe_mode & 0x0000_0003,
@@ -5059,7 +4635,7 @@ impl Win32Subsystem {
             _ => return invalid_handle("handle is not a pipe"),
         };
         let normalized = normalize_pipe_name(&pipe_name);
-        if let Some(state) = self.named_pipes.get_mut(&normalized)
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized)
             && let Some(mode) = mode
         {
             // Apply the same PIPE_WAIT/NOWAIT + READMODE mask used at
@@ -5083,7 +4659,7 @@ impl Win32Subsystem {
         match &entry.object {
             KernelObject::Pipe(pipe) => {
                 let normalized = normalize_pipe_name(&pipe.name);
-                let state = self.named_pipes.get(&normalized).ok_or_else(|| {
+                let state = self.pipe_state_by_name(&normalized).ok_or_else(|| {
                     AppError::new(
                         ReasonCode::RcFsNotFound,
                         format!("peek_named_pipe: pipe not found: {}", pipe.name),
@@ -5125,7 +4701,7 @@ impl Win32Subsystem {
         };
         let normalized = normalize_pipe_name(&pipe_name);
         let mut pipe_handles = Vec::new();
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
             state.client_connected = false;
             state.server_disconnected = true;
             state.client_disconnected = true;
@@ -5139,18 +4715,22 @@ impl Win32Subsystem {
         // Mark every pipe handle's `connected` flag false so blocking
         // ConnectNamedPipe/read paths observe the new cycle.
         for pipe_handle in pipe_handles.into_iter().flatten() {
-            if let Some(HandleEntry {
-                object: KernelObject::Pipe(pipe),
-                ..
-            }) = self.handles.get_mut(&pipe_handle)
+            if let Ok(object_id) = self
+                .process
+                .handle_table
+                .entry(pipe_handle)
+                .map(|entry| entry.object_id)
+                && let KernelObject::Pipe(pipe) = self.objects.object_mut(object_id)
             {
                 pipe.connected = false;
             }
         }
-        if let Some(HandleEntry {
-            object: KernelObject::Pipe(pipe),
-            ..
-        }) = self.handles.get_mut(&handle)
+        if let Ok(object_id) = self
+            .process
+            .handle_table
+            .entry(handle)
+            .map(|entry| entry.object_id)
+            && let KernelObject::Pipe(pipe) = self.objects.object_mut(object_id)
         {
             pipe.connected = false;
         }
@@ -5174,7 +4754,7 @@ impl Win32Subsystem {
     ) -> AppResult<Vec<u8>> {
         let normalized = normalize_pipe_name(pipe_name);
         let server_handle = {
-            let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+            let state = self.pipe_state_mut_by_name(&normalized).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!("named pipe not found: {pipe_name}"),
@@ -5185,7 +4765,7 @@ impl Win32Subsystem {
         // Client connection: this call is a client; complete the server's
         // pending ConnectNamedPipe overlapped requests.
         self.pipe_complete_connect(&normalized)?;
-        let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+        let state = self.pipe_state_mut_by_name(&normalized).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcFsNotFound,
                 format!("named pipe not found: {pipe_name}"),
@@ -5204,7 +4784,7 @@ impl Win32Subsystem {
         // The response is whatever the server already wrote; when the
         // server has not responded yet the thunk layer parks the caller on
         // the scheduler wait.
-        let state = self.named_pipes.get(&normalized).ok_or_else(|| {
+        let state = self.pipe_state_by_name(&normalized).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcFsNotFound,
                 format!("named pipe not found: {pipe_name}"),
@@ -5220,8 +4800,7 @@ impl Win32Subsystem {
 
     /// `WaitNamedPipeW` — wait for a named pipe to become available.
     pub fn wait_named_pipe_w(&mut self, pipe_name: &str, _timeout_ms: u32) -> AppResult<()> {
-        let normalized = normalize_pipe_name(pipe_name);
-        if self.named_pipes.contains_key(&normalized) {
+        if self.named_pipe_server_exists(pipe_name) {
             Ok(())
         } else {
             Err(AppError::new(
@@ -5233,17 +4812,18 @@ impl Win32Subsystem {
 
     /// Whether a named-pipe server instance is registered for `pipe_name`
     /// (used by the WaitNamedPipeW / CallNamedPipeW thunks and the pump's
-    /// pipe-availability evaluator).
+    /// pipe-availability evaluator).  Resolves through the unified
+    /// named-object namespace.
     pub fn named_pipe_server_exists(&self, pipe_name: &str) -> bool {
-        self.named_pipes
-            .contains_key(&normalize_pipe_name(pipe_name))
+        self.objects
+            .resolve(&normalize_pipe_name(pipe_name))
+            .is_some()
     }
 
     /// The default timeout recorded at CreateNamedPipeW time (used by
     /// CallNamedPipeW when the caller passes nTimeOut == 0).
     pub fn named_pipe_default_timeout(&self, pipe_name: &str) -> Option<u32> {
-        self.named_pipes
-            .get(&normalize_pipe_name(pipe_name))
+        self.pipe_state_by_name(&normalize_pipe_name(pipe_name))
             .map(|state| state.default_timeout)
     }
 
@@ -5258,16 +4838,14 @@ impl Win32Subsystem {
     ) -> AppResult<Handle> {
         let normalized = normalize_pipe_name(pipe_name);
         let name = self
-            .named_pipes
-            .get_mut(&normalized)
+            .pipe_state_by_name(&normalized)
             .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!("named pipe not found: {pipe_name}"),
                 )
             })?
-            .name
-            .clone();
+            .name;
         let handle = self.insert_object(
             ObjectType::Pipe,
             0x1F0FFF,
@@ -5276,11 +4854,12 @@ impl Win32Subsystem {
                 name: name.clone(),
                 connected: true,
                 buffer: Vec::new(),
+                state: None,
             }),
         );
         // Record the client end and complete the server's pending
         // ConnectNamedPipe overlapped requests.
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+        if let Some(state) = self.pipe_state_mut_by_name(&normalized) {
             state.client_handle = Some(handle);
         }
         self.pipe_complete_connect(&normalized)?;
@@ -5295,23 +4874,50 @@ impl Win32Subsystem {
     // the ReadFile/WriteFile/GetOverlappedResult thunks)
     // -----------------------------------------------------------------------
 
-    /// The pipe state behind a pipe handle, cloned for lock-free use.
+    /// The pipe state behind a pipe handle, cloned for lock-free use.  The
+    /// ONE per-name state record lives on the named server object in the
+    /// object manager; a surviving client that outlives the server carries
+    /// its own broken state (see [`Self::close_pipe_teardown`]).
     fn pipe_state_for_handle(&self, handle: Handle) -> Option<NamedPipeState> {
-        self.handle_entry(handle)
-            .ok()
-            .and_then(|entry| match &entry.object {
-                KernelObject::Pipe(pipe) => self
-                    .named_pipes
-                    .get(&normalize_pipe_name(&pipe.name))
-                    .cloned(),
-                _ => None,
-            })
+        let entry = self.process.handle_table.get(handle)?;
+        let object = self.objects.object(entry.object_id);
+        let KernelObject::Pipe(pipe) = object else {
+            return None;
+        };
+        let normalized = normalize_pipe_name(&pipe.name);
+        if let Some(server_id) = self.objects.resolve(&normalized)
+            && let KernelObject::Pipe(server) = self.objects.object(server_id)
+            && let Some(state) = &server.state
+        {
+            return Some(state.clone());
+        }
+        // Fallback: the handle's own object carries a (broken) state record.
+        pipe.state.clone()
+    }
+
+    /// The shared per-name pipe state record, cloned for lock-free use.
+    fn pipe_state_by_name(&self, normalized: &str) -> Option<NamedPipeState> {
+        let server_id = self.objects.resolve(normalized)?;
+        let KernelObject::Pipe(server) = self.objects.object(server_id) else {
+            return None;
+        };
+        server.state.clone()
+    }
+
+    /// Mutable access to the shared per-name pipe state record (the named
+    /// server object in the object manager).
+    fn pipe_state_mut_by_name(&mut self, normalized: &str) -> Option<&mut NamedPipeState> {
+        let server_id = self.objects.resolve(normalized)?;
+        let KernelObject::Pipe(server) = self.objects.object_mut(server_id) else {
+            return None;
+        };
+        server.state.as_mut()
     }
 
     /// Non-consuming: has the server queued a response for a CallNamedPipe
     /// waiter (server-to-client non-empty)?
     pub fn pipe_response_available(&self, name: &str) -> bool {
-        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+        let Some(state) = self.pipe_state_by_name(&normalize_pipe_name(name)) else {
             return false;
         };
         pipe_queue_peek_len(&state.server_to_client, state.message_mode) > 0
@@ -5320,7 +4926,7 @@ impl Win32Subsystem {
     /// Non-consuming: would a CallNamedPipe waiter wake with
     /// ERROR_BROKEN_PIPE (server disconnected / pipe state gone)?
     pub fn pipe_call_broken(&self, name: &str) -> bool {
-        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+        let Some(state) = self.pipe_state_by_name(&normalize_pipe_name(name)) else {
             return true;
         };
         state.client_disconnected || state.server_disconnected
@@ -5329,7 +4935,7 @@ impl Win32Subsystem {
     /// Consume the server's queued response (up to `capacity` bytes) for a
     /// CallNamedPipe waiter.
     pub fn take_pipe_response(&self, name: &str, capacity: u32) -> Vec<u8> {
-        let Some(state) = self.named_pipes.get(&normalize_pipe_name(name)) else {
+        let Some(state) = self.pipe_state_by_name(&normalize_pipe_name(name)) else {
             return Vec::new();
         };
         pipe_queue_read(
@@ -5620,6 +5226,9 @@ impl Win32Subsystem {
     // -----------------------------------------------------------------------
 
     /// `CreateFileMappingW` — create or open a named shared-memory section.
+    /// Named sections resolve through the unified named-object namespace
+    /// (prefix spellings are equivalent); every handle to the same section
+    /// references the SAME object and its shared backing storage.
     pub fn create_file_mapping_w(
         &mut self,
         name: Option<&str>,
@@ -5636,45 +5245,33 @@ impl Win32Subsystem {
             ));
         }
         let key = name.unwrap_or("").to_string();
+        let section_name = (!key.is_empty()).then(|| key.clone());
         if !key.is_empty()
-            && let Some(section) = self.shared_memory_sections.get(&key)
+            && let Some(section_id) = self.objects.resolve(&key)
         {
-            let size = section.data.lock().unwrap().len();
-            let prot = section.protection;
-            let backing = section.data.clone();
-            let handle = self.insert_object(
-                ObjectType::Section,
-                0x1F0FFF,
-                inheritable,
-                KernelObject::Section(SectionObject {
-                    base_address: 0,
-                    size,
-                    protection: prot,
-                    name: Some(key),
-                    backing: Some(backing),
-                }),
-            );
+            match self.objects.object(section_id) {
+                KernelObject::Section(_) => {}
+                _ => {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!("name {key} resolves to a non-section object"),
+                    ));
+                }
+            }
+            let handle = self.insert_object_id(section_id, 0x1F0FFF, inheritable);
             return Ok((handle, true));
         }
         let data = Arc::new(Mutex::new(vec![0_u8; maximum_size.max(1)]));
-        let section = SharedMemorySection {
-            name: key.clone(),
-            data: data.clone(),
-            maximum_size,
-            protection,
-        };
-        if !key.is_empty() {
-            self.shared_memory_sections.insert(key.clone(), section);
-        }
-        let handle = self.insert_object(
+        let handle = self.insert_object_named(
             ObjectType::Section,
+            section_name.as_deref(),
             0x1F0FFF,
             inheritable,
             KernelObject::Section(SectionObject {
                 base_address: 0,
                 size: maximum_size,
                 protection,
-                name: (!key.is_empty()).then_some(key),
+                name: section_name.clone(),
                 backing: Some(data),
             }),
         );
@@ -5682,9 +5279,10 @@ impl Win32Subsystem {
     }
 
     /// `MapViewOfFile` — return a base address for the shared memory section.
-    /// We allocate a virtual address range in the guest's address space and
-    /// store the mapping, tied to the section's shared byte storage so all
-    /// views of the same section observe the same data.
+    /// The view is a committed reservation in the canonical guest address
+    /// space (the SAME VirtualMemory the interpreter/JIT validate through),
+    /// tied to the section's shared byte storage so all views of the same
+    /// section observe the same data; the mapping record lives in the VM.
     pub fn map_view_of_file(
         &mut self,
         handle: Handle,
@@ -5716,55 +5314,61 @@ impl Win32Subsystem {
         // `next_power_of_two` panics on overflow; reject absurd sizes instead.
         let size = view_size
             .checked_next_power_of_two()
-            .ok_or_else(|| AppError::new(ReasonCode::RcCliInvalid, "mapping size is too large"))?
-            as usize;
-        let page_count = (size / 0x1000) as u64;
+            .ok_or_else(|| AppError::new(ReasonCode::RcCliInvalid, "mapping size is too large"))?;
+        let page_count = size / 0x1000;
         if page_count > MAX_COMMIT_PAGES {
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
                 format!("mapping of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"),
             ));
         }
-        let base = self.next_virtual_address;
-        self.next_virtual_address = self
-            .next_virtual_address
-            .checked_add(size as u64)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcMemoryAccessViolation,
-                    "virtual address space exhausted",
-                )
-            })?;
-        let mut pages = BTreeMap::new();
-        for page in 0..page_count {
-            pages.insert(base + page * 0x1000, CommittedPage { protection });
+        let base = self.process.address_space.reserve(None, size);
+        if base == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                "virtual address space exhausted",
+            ));
         }
-        self.memory_regions.insert(
+        self.process.address_space.commit(
             base,
-            VirtualRegion {
-                base_address: base,
-                size,
-                pages,
-                backing,
-                backing_offset: offset,
+            size,
+            VmProtection {
+                read: protection.read,
+                write: protection.write,
+                execute: protection.execute,
             },
+            false,
         );
+        let backing = backing.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("section {handle} has no backing storage"),
+            )
+        })?;
+        if !self.process.address_space.map_view(base, offset, backing) {
+            return Err(AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("{base:#x} is already a mapped file view"),
+            ));
+        }
         Ok(base)
     }
 
     /// `UnmapViewOfFile` — release a previously mapped view.
     pub fn unmap_view_of_file(&mut self, base_address: u64) -> AppResult<()> {
-        let is_mapping = self
-            .memory_regions
-            .get(&base_address)
-            .is_some_and(|region| region.backing.is_some());
-        if !is_mapping {
+        if self
+            .process
+            .address_space
+            .mapped_view(base_address)
+            .is_none()
+        {
             return Err(AppError::new(
                 ReasonCode::RcMemoryAccessViolation,
                 format!("{base_address:#x} is not a mapped file view"),
             ));
         }
-        self.memory_regions.remove(&base_address);
+        self.process.address_space.unmap_view(base_address);
+        self.process.address_space.release(base_address);
         Ok(())
     }
 
@@ -5772,12 +5376,10 @@ impl Win32Subsystem {
     /// region was created by `map_view_of_file`.  Lets the memory model route
     /// guest accesses to the section's shared storage.
     pub fn mapped_view_section(&self, base_address: u64) -> Option<(u64, Arc<Mutex<Vec<u8>>>)> {
-        self.memory_regions.get(&base_address).and_then(|region| {
-            region
-                .backing
-                .clone()
-                .map(|backing| (region.backing_offset, backing))
-        })
+        self.process
+            .address_space
+            .mapped_view(base_address)
+            .map(|mapping| (mapping.offset, mapping.backing.clone()))
     }
 
     pub fn set_thread_exit_code(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
@@ -5828,20 +5430,20 @@ impl Win32Subsystem {
     }
 
     pub fn get_exit_code_thread(&self, handle: Handle) -> AppResult<Option<u32>> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         Ok(self.thread_state(thread_id)?.exit_code)
     }
 
     pub fn set_thread_priority(&mut self, handle: Handle, priority: i32) -> AppResult<()> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_SET_INFORMATION)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_SET_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         self.thread_state_mut(thread_id)?.priority = priority;
         Ok(())
     }
 
     pub fn get_thread_priority(&self, handle: Handle) -> AppResult<i32> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_QUERY_INFORMATION)?;
         let thread_id = self.thread_id(handle)?;
         Ok(self.thread_state(thread_id)?.priority)
     }
@@ -5865,7 +5467,7 @@ impl Win32Subsystem {
     }
 
     pub fn suspend_thread(&mut self, handle: Handle) -> AppResult<u32> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         let prev = state.suspend_count;
@@ -5874,7 +5476,7 @@ impl Win32Subsystem {
     }
 
     pub fn resume_thread(&mut self, handle: Handle) -> AppResult<u32> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         let prev = state.suspend_count;
@@ -5883,7 +5485,7 @@ impl Win32Subsystem {
     }
 
     pub fn terminate_thread(&mut self, handle: Handle, exit_code: u32) -> AppResult<bool> {
-        Self::require_access(self.handle_entry(handle)?, THREAD_TERMINATE)?;
+        Self::require_access(&self.handle_entry(handle)?, THREAD_TERMINATE)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
         if state.exit_code.is_some() {
@@ -5933,17 +5535,21 @@ impl Win32Subsystem {
     }
 
     pub fn create_toolhelp_snapshot(&self) -> ToolhelpSnapshot {
+        // The runner's provenance entry ("macwin") keys the snapshot by the
+        // HOST pid — a DIAGNOSTIC key only: the guest-visible current
+        // process id is the guest pid, and guest processes are enumerated
+        // below with their guest pids.
         let mut processes = vec![ProcessSnapshot {
-            process_id: self.current_process_id,
+            process_id: std::process::id(),
             executable: "macwin".to_string(),
             argv: vec!["macwin".to_string()],
         }];
         let mut modules = vec![ModuleSnapshot {
-            process_id: self.current_process_id,
+            process_id: std::process::id(),
             module_name: "macwin".to_string(),
         }];
-        for entry in self.handles.values() {
-            if let KernelObject::Process(process) = &entry.object {
+        for (_, entry) in self.process.handle_table.iter() {
+            if let KernelObject::Process(process) = self.objects.object(entry.object_id) {
                 processes.push(ProcessSnapshot {
                     process_id: process.process_id,
                     executable: process.executable.clone(),
@@ -6521,8 +6127,11 @@ impl Win32Subsystem {
         if thread_id == self.current_thread_id {
             return;
         }
-        if self.handles.values().any(|entry| {
-            matches!(&entry.object, KernelObject::Thread(thread) if thread.thread_id == thread_id)
+        if self.process.handle_table.iter().any(|(_, entry)| {
+            matches!(
+                self.objects.object(entry.object_id),
+                KernelObject::Thread(thread) if thread.thread_id == thread_id
+            )
         }) {
             return;
         }
@@ -6539,6 +6148,10 @@ impl Win32Subsystem {
         }
     }
 
+    /// Insert a kernel object into the object manager and mint a handle
+    /// through the canonical handle table (the ONLY handle allocator: it
+    /// recycles closed values FIFO and bumps generations so stale references
+    /// are detectable).
     fn insert_object(
         &mut self,
         object_type: ObjectType,
@@ -6546,44 +6159,50 @@ impl Win32Subsystem {
         inheritable: bool,
         object: KernelObject,
     ) -> Handle {
-        // Recycle closed handle values (FIFO) like Windows does, so closed
-        // values are reused and generation counters can detect stale
-        // references.  With recycling, `next_handle` saturation at u32::MAX
-        // is unreachable in practice (it would require ~2^30 live handles).
-        let handle = if let Some(handle) = self.closed_handle_values.pop_front() {
-            handle
-        } else {
-            let handle = self.next_handle;
-            self.next_handle = self.next_handle.saturating_add(4);
-            handle
-        };
-        let generation = *self.handle_generations.get(&handle).unwrap_or(&0);
-        self.handle_history.insert(handle, object_type);
-        // Keep only recent history for diagnostics; it grows one entry per
-        // handle value ever allocated.
-        if self.handle_history.len() > 1024 {
-            self.handle_history.pop_first();
-        }
-        self.handles.insert(
-            handle,
-            HandleEntry {
-                descriptor: HandleDescriptor {
-                    object_type,
-                    access_mask,
-                    refcount: 1,
-                    inheritable,
-                },
-                object,
-                generation,
-            },
-        );
+        self.insert_object_named(object_type, None, access_mask, inheritable, object)
+    }
+
+    /// Insert a kernel object (optionally registered in the unified
+    /// named-object namespace) and mint a handle referencing it.
+    fn insert_object_named(
+        &mut self,
+        object_type: ObjectType,
+        name: Option<&str>,
+        access_mask: u32,
+        inheritable: bool,
+        object: KernelObject,
+    ) -> Handle {
+        let object_id = self
+            .objects
+            .insert(object_type, name.map(str::to_string), None, object);
+        self.insert_object_id(object_id, access_mask, inheritable)
+    }
+
+    /// Mint a handle referencing an EXISTING object (duplicate/Open*
+    /// semantics: object identity != handle identity — the manager refcount
+    /// goes up).
+    fn insert_object_id(
+        &mut self,
+        object_id: ObjectId,
+        access_mask: u32,
+        inheritable: bool,
+    ) -> Handle {
+        let object_type = self.objects.object_type(object_id);
+        let handle = self
+            .process
+            .handle_table
+            .insert(object_id, access_mask, inheritable);
+        self.process
+            .handle_table
+            .record_history(handle, object_type);
+        self.objects.handle_added(object_id);
         handle
     }
 
     /// Return the current generation counter for a handle value.
     /// Returns `None` if the handle is not currently allocated.
     pub fn handle_generation(&self, handle: Handle) -> Option<u32> {
-        self.handles.get(&handle).map(|e| e.generation)
+        self.process.handle_table.handle_generation(handle)
     }
 
     /// Validate that a cached `(handle, generation)` pair still matches the
@@ -6595,17 +6214,9 @@ impl Win32Subsystem {
         handle: Handle,
         expected_generation: u32,
     ) -> AppResult<()> {
-        match self.handles.get(&handle) {
-            Some(entry) if entry.generation == expected_generation => Ok(()),
-            Some(_) => Err(AppError::new(
-                ReasonCode::RcHandleStaleOrInvalid,
-                format!("handle {handle} generation mismatch — stale reference detected"),
-            )),
-            None => Err(AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("invalid handle {handle}"),
-            )),
-        }
+        self.process
+            .handle_table
+            .validate_handle_generation(handle, expected_generation)
     }
 
     fn insert_overlapped(
@@ -6617,7 +6228,11 @@ impl Win32Subsystem {
     ) -> u64 {
         let id = self.next_overlapped_id;
         self.next_overlapped_id += 1;
-        let generation = self.handle_generations.get(&handle).copied().unwrap_or(0);
+        let generation = self
+            .process
+            .handle_table
+            .handle_generation(handle)
+            .unwrap_or(0);
         self.overlapped.insert(
             id,
             OverlappedRequest {
@@ -6650,7 +6265,11 @@ impl Win32Subsystem {
     ) -> u64 {
         let id = self.next_overlapped_id;
         self.next_overlapped_id += 1;
-        let generation = self.handle_generations.get(&handle).copied().unwrap_or(0);
+        let generation = self
+            .process
+            .handle_table
+            .handle_generation(handle)
+            .unwrap_or(0);
         self.overlapped.insert(
             id,
             OverlappedRequest {
@@ -6682,41 +6301,40 @@ impl Win32Subsystem {
         Ok(())
     }
 
-    fn handle_entry(&self, handle: Handle) -> AppResult<&HandleEntry> {
-        self.handles
-            .get(&handle)
-            .ok_or_else(|| self.invalid_handle_error(handle))
+    /// Subsystem view of a live handle, rebuilt from the canonical handle
+    /// table + object manager on every access (the payload clone shares
+    /// Rc-backed state; value payloads are only read through this view).
+    fn handle_entry(&self, handle: Handle) -> AppResult<HandleEntry> {
+        let entry = self.process.handle_table.entry(handle)?;
+        Ok(HandleEntry {
+            descriptor: HandleDescriptor {
+                object_type: self.objects.object_type(entry.object_id),
+                access_mask: entry.access_mask,
+                refcount: self.objects.handle_count(entry.object_id),
+                inheritable: entry.inheritable,
+            },
+            object: self.objects.object(entry.object_id).clone(),
+        })
     }
 
-    fn handle_entry_mut(&mut self, handle: Handle) -> AppResult<&mut HandleEntry> {
-        if self.handles.contains_key(&handle) {
-            Ok(self.handles.get_mut(&handle).expect("checked contains_key"))
-        } else {
-            Err(self.invalid_handle_error(handle))
-        }
+    /// Mutable view accessor: see [`Self::handle_entry`].  Mutations of
+    /// Rc-backed payloads (File/Event) propagate through the shared cell;
+    /// value-payload mutations must go through [`Self::handle_object_mut`].
+    fn handle_entry_mut(&mut self, handle: Handle) -> AppResult<HandleEntry> {
+        self.handle_entry(handle)
     }
 
-    fn record_closed_handle(&mut self, handle: Handle, object_type: ObjectType) {
-        self.recently_closed_handles
-            .push_back((handle, object_type));
-        while self.recently_closed_handles.len() > 32 {
-            self.recently_closed_handles.pop_front();
-        }
+    /// The manager-owned payload of the object behind `handle`.
+    fn handle_object(&self, handle: Handle) -> AppResult<&KernelObject> {
+        let entry = self.process.handle_table.entry(handle)?;
+        Ok(self.objects.object(entry.object_id))
     }
 
-    fn invalid_handle_error(&self, handle: Handle) -> AppError {
-        let mut message = format!("invalid handle {handle}");
-        if let Some(object_type) = self.handle_history.get(&handle) {
-            message.push_str(&format!(" (known as {object_type:?})"));
-        } else if let Some((_, object_type)) = self
-            .recently_closed_handles
-            .iter()
-            .rev()
-            .find(|(closed_handle, _)| *closed_handle == handle)
-        {
-            message.push_str(&format!(" (recently closed {object_type:?})"));
-        }
-        AppError::new(ReasonCode::RcWin32InvalidHandle, message)
+    /// Mutable access to the manager-owned payload of the object behind
+    /// `handle` (the SINGLE owner of kernel-object state).
+    fn handle_object_mut(&mut self, handle: Handle) -> AppResult<&mut KernelObject> {
+        let object_id = self.process.handle_table.entry(handle)?.object_id;
+        Ok(self.objects.object_mut(object_id))
     }
 }
 
@@ -9192,8 +8810,7 @@ mod tests {
         win32
             .delete_file_w("C:\\del-share.txt")
             .expect("delete allowed with FILE_SHARE_DELETE");
-        let entry = win32.handles.get(&h2).expect("surviving handle");
-        match &entry.object {
+        match win32.handle_object(h2).expect("surviving handle") {
             KernelObject::File(file) => {
                 assert!(
                     file.borrow().delete_pending,

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Stage-3 canonical-state surface: the Win32Subsystem integration that consumes these types is the next work item; removing this allowance is part of that integration.
 //! Canonical handle table.
 //!

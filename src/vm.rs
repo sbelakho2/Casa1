@@ -27,6 +27,7 @@
 //!   are reported identically to the interpreter, the JIT and the thunks.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Guest page size (Windows 4 KiB pages).
 pub const VM_PAGE_SIZE: u64 = 0x1000;
@@ -151,6 +152,19 @@ pub struct VmAccessFault {
     pub guard: bool,
 }
 
+/// A mapped file-view record: the section backing storage and the offset
+/// into it where the view starts.  The region at the view base is a normal
+/// committed reservation; the mapping record ties it to the section's
+/// backing so `MapViewOfFile` / `UnmapViewOfFile` bookkeeping lives HERE
+/// (sections own their storage; the mapping state lives in the VM).
+#[derive(Debug, Clone)]
+pub struct VmMapping {
+    /// Offset into the section backing where this view starts.
+    pub offset: u64,
+    /// Shared byte storage of the mapped section.
+    pub backing: Arc<Mutex<Vec<u8>>>,
+}
+
 /// The canonical guest virtual-memory layer.
 #[derive(Debug)]
 pub struct VirtualMemory {
@@ -159,6 +173,8 @@ pub struct VirtualMemory {
     regions: BTreeMap<u64, VmRegion>,
     /// Cursor for [`VirtualMemory::reserve`] with `base = None`.
     next_region_address: u64,
+    /// Section-backed file views keyed by their (page-aligned) view base.
+    mappings: BTreeMap<u64, VmMapping>,
 }
 
 impl Default for VirtualMemory {
@@ -166,6 +182,7 @@ impl Default for VirtualMemory {
         Self {
             regions: BTreeMap::new(),
             next_region_address: 0x0000_7fff_8400_0000,
+            mappings: BTreeMap::new(),
         }
     }
 }
@@ -177,6 +194,7 @@ impl VirtualMemory {
         Self {
             regions: BTreeMap::new(),
             next_region_address: align_up(private_region_cursor, VM_PAGE_SIZE),
+            mappings: BTreeMap::new(),
         }
     }
 
@@ -504,6 +522,32 @@ impl VirtualMemory {
         self.region_containing(address)
             .and_then(|region| region.pages.get(&page))
             .is_some_and(|state| state.committed && !state.guard)
+    }
+
+    // ── Section-backed file views ────────────────────────────────────────────
+
+    /// Record a section-backed file view at `base` (a committed reservation
+    /// created with `reserve` + `commit`).  Returns `false` when `base` is
+    /// already a mapped view.
+    pub fn map_view(&mut self, base: u64, offset: u64, backing: Arc<Mutex<Vec<u8>>>) -> bool {
+        let base = base & VM_PAGE_MASK;
+        if self.mappings.contains_key(&base) {
+            return false;
+        }
+        self.mappings.insert(base, VmMapping { offset, backing });
+        true
+    }
+
+    /// Remove the mapping record of a view (the reservation itself is
+    /// released separately via [`Self::release`]).  Returns `false` when
+    /// `base` is not a mapped view.
+    pub fn unmap_view(&mut self, base: u64) -> bool {
+        self.mappings.remove(&(base & VM_PAGE_MASK)).is_some()
+    }
+
+    /// The mapping record of a section-backed view at `base`, if any.
+    pub fn mapped_view(&self, base: u64) -> Option<&VmMapping> {
+        self.mappings.get(&(base & VM_PAGE_MASK))
     }
 }
 

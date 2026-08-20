@@ -140,12 +140,12 @@ impl PeHostRuntime {
         memory.map_bytes(module_handle, &bytes);
         // Canonical VM: synthetic module images are guest-accessible Image
         // regions (nested inside the growing CRT data area).
-        self.vm.register(
+        self.win32.address_space_mut().register(
             module_handle,
             bytes.len() as u64,
             crate::vm::VmRegionKind::Image,
         );
-        self.vm.commit(
+        self.win32.address_space_mut().commit(
             module_handle,
             bytes.len() as u64,
             crate::vm::VmProtection::READ_WRITE_EXECUTE,

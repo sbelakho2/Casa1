@@ -485,13 +485,6 @@ pub(crate) struct PeHostRuntime {
     /// (malloc/calloc/realloc and the CRT FILE-block allocation) fails with
     /// ENOMEM and NULL instead of succeeding.  Cleared on consumption.
     pub(crate) crt_alloc_fail_next: bool,
-    /// The canonical virtual-memory layer: ONE authoritative bookkeeper for
-    /// reservations, committed regions, protection and VirtualQuery,
-    /// replacing the former `private_pages`/`private_reservations` maps.
-    /// The VirtualAlloc/Free/Protect/Query thunks, the private allocator
-    /// and the loader/stack/heap registrations all delegate to it, and the
-    /// CPU's MemoryImage validates every guest access through it.
-    pub(crate) vm: crate::vm::VirtualMemory,
     pub(crate) critical_sections: BTreeMap<u64, usize>,
     pub(crate) condition_variables: BTreeMap<u64, GuestConditionVariable>,
     pub(crate) srw_locks: BTreeMap<u64, Arc<GuestSRWLock>>,
@@ -1041,9 +1034,26 @@ impl PeHostRuntime {
             None
         };
         let observers = crate::runtime_events::new_observer_list();
+        // The initial guest process: a fresh guest pid from the ONE guest
+        // pid namespace, the standalone diagnostic context ("macwin"
+        // provenance — the host pid is never the guest identity), and the
+        // runtime's historical address-space cursor so anonymous
+        // reservations land where they always have.  The address space is
+        // THE canonical VirtualMemory the interpreter/JIT/win32 share.
+        let guest_process = crate::runtime::process::GuestProcess::new(
+            crate::runtime::process::allocate_guest_pid(),
+            None,
+            crate::runtime::process::InitialProcessContext::macwin_default(),
+            super::private_pages_base_for_arch(GuestArch::X64),
+        );
         let mut runtime = Self {
             audio: AudioSubsystem::new(),
-            win32: Win32Subsystem::new_with_live_pacing(ge, dtm, live_session.is_some()),
+            win32: Win32Subsystem::new_with_guest_process(
+                ge,
+                dtm,
+                live_session.is_some(),
+                guest_process,
+            ),
             user32,
             observers: observers.clone(),
             guest_arch: GuestArch::X64,
@@ -1110,7 +1120,6 @@ impl PeHostRuntime {
             x86_heap_region: 0,
             heap_allocations: BTreeMap::new(),
             crt_alloc_fail_next: false,
-            vm: crate::vm::VirtualMemory::new(PRIVATE_PAGES_BASE),
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),

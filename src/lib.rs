@@ -201,6 +201,10 @@ pub mod real_win32;
 pub mod reason;
 pub mod runner;
 pub mod runtime;
+pub use crate::runtime::object_manager::ObjectId;
+pub use crate::runtime::process::{
+    EnvironmentBlock, GuestProcess, InitialProcessContext, ProcessExitState, allocate_guest_pid,
+};
 pub mod runtime_events;
 pub mod sandbox;
 pub mod scm;

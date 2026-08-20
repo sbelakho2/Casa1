@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Stage-3 canonical-state surface: the Win32Subsystem integration that consumes these types is the next work item; removing this allowance is part of that integration.
 //! Canonical kernel object manager.
 //!
@@ -33,7 +32,6 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// Global object-id counter: every object in every subsystem gets its id
 /// from ONE counter (a guest-visible identity, never a host pointer).
-#[allow(dead_code)] // Stage-3 integration pending
 static NEXT_OBJECT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Identity of a kernel object in the canonical object manager.
@@ -472,6 +470,18 @@ impl ObjectManager {
         self.objects
             .get_mut(&id)
             .expect("object manager: object referenced by a live handle")
+    }
+
+    /// Iterate every live object (id, payload).
+    pub(crate) fn objects_iter(&self) -> impl Iterator<Item = (ObjectId, &KernelObject)> {
+        self.objects.iter().map(|(id, object)| (*id, object))
+    }
+
+    /// Iterate every live object payload mutably.
+    pub(crate) fn objects_iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (ObjectId, &mut KernelObject)> {
+        self.objects.iter_mut().map(|(id, object)| (*id, object))
     }
 
     /// The type of a live object.

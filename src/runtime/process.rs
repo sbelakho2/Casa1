@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Stage-3 canonical-state surface: the Win32Subsystem integration that consumes these types is the next work item; removing this allowance is part of that integration.
 //! Canonical guest process model.
 //!
@@ -142,6 +141,12 @@ impl GuestProcess {
             InitialProcessContext::macwin_default(),
             0x1_0000_0000,
         )
+    }
+
+    /// Replace the address space (arch switches rebuild the canonical VM
+    /// with the arch's private-pages cursor).
+    pub fn reset_address_space(&mut self, private_region_cursor: u64) {
+        self.address_space = VirtualMemory::new(private_region_cursor);
     }
 }
 

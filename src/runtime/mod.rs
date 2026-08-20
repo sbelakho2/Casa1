@@ -9,7 +9,7 @@ mod thread;
 pub(crate) use self::thread::*;
 pub mod handle_table;
 pub mod object_manager;
-mod process;
+pub(crate) mod process;
 mod scheduler;
 pub(crate) use self::scheduler::*;
 mod callback;
@@ -3775,15 +3775,15 @@ pub fn execute_with_options(
     // VM layer FIRST (the raw page map only supplies the bytes), so the
     // interpreter, the JIT helpers and the VirtualAlloc-family thunks share
     // ONE authoritative view of reservations / commits / protection.
-    memory.set_vm(&mut runtime.vm);
+    memory.set_vm(runtime.win32.address_space_mut());
     memory.map_bytes(mapped.selected_base, &mapped.memory);
     // Canonical VM: the loader-mapped main image is an Image region.
-    runtime.vm.register(
+    runtime.win32.address_space_mut().register(
         mapped.selected_base,
         image.size_of_image as u64,
         crate::vm::VmRegionKind::Image,
     );
-    runtime.vm.commit(
+    runtime.win32.address_space_mut().commit(
         mapped.selected_base,
         image.size_of_image as u64,
         crate::vm::VmProtection::READ_WRITE_EXECUTE,
@@ -4066,12 +4066,12 @@ pub fn execute_with_options(
     // committed.  The pages below the base belong to no region, so a stack
     // overflow faults through the canonical layer exactly as before (the
     // region boundary is the stack guard).
-    runtime.vm.register(
+    runtime.win32.address_space_mut().register(
         stack_bottom,
         STACK_SIZE as u64,
         crate::vm::VmRegionKind::Stack,
     );
-    runtime.vm.commit(
+    runtime.win32.address_space_mut().commit(
         stack_bottom,
         STACK_SIZE as u64,
         crate::vm::VmProtection::READ_WRITE,
@@ -7779,7 +7779,9 @@ pub fn thunk_drive_manifest_gate_with_observers(
     runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
     runtime.next_data_address = data_base_for_arch(GuestArch::X86);
     runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
-    runtime.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(GuestArch::X86));
+    runtime
+        .win32
+        .reset_address_space(private_pages_base_for_arch(GuestArch::X86));
     runtime.x86_heap_region = 0;
     let mut memory = MemoryImage::default();
 
@@ -8231,7 +8233,8 @@ impl PeHostRuntime {
         self.next_thunk_address = thunk_base_for_arch(guest_arch);
         self.next_data_address = data_base_for_arch(guest_arch);
         self.next_heap_address = heap_base_for_arch(guest_arch);
-        self.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(guest_arch));
+        self.win32
+            .reset_address_space(private_pages_base_for_arch(guest_arch));
         self.x86_heap_region = 0;
         // JIT enablement is part of the runner protocol (RunnerJob.jit_mode):
         //   - Disabled: never construct the JIT runtime.
@@ -27037,7 +27040,9 @@ impl PeHostRuntime {
                     ]),
                     json!(1),
                 );
-                if handle == current_process_handle || process.process_id == std::process::id() {
+                if handle == current_process_handle
+                    || process.process_id == self.win32.current_process_id()
+                {
                     // Terminating the current process: record the exit
                     // request so a pumped caller propagates it instead of
                     // consuming the code as the thread's own exit code.
@@ -33351,7 +33356,9 @@ impl PeHostRuntime {
                 self.push_trace("thread", "GetCurrentThread", BTreeMap::new(), json!(format!("{handle:#x}")));
             }
             HostThunk::GetCurrentProcessId => {
-                let process_id = std::process::id();
+                // The GUEST pid (a Casa1 runtime-side identity) — never the
+                // host's POSIX pid.
+                let process_id = self.win32.current_process_id();
                 state.set(Register::Rax, u64::from(process_id));
                 self.last_error = 0;
                 self.push_trace("process", "GetCurrentProcessId", BTreeMap::new(), json!(process_id));
@@ -34683,7 +34690,7 @@ impl PeHostRuntime {
                     let address = if !commits {
                         // MEM_RESERVE only: record the reservation; the pages
                         // stay unmapped and VirtualQuery reports Reserved.
-                        let base = self.vm.reserve(
+                        let base = self.win32.address_space_mut().reserve(
                             (requested_address != 0).then_some(requested_address & !0xfff),
                             aligned,
                         );
@@ -34697,13 +34704,14 @@ impl PeHostRuntime {
                         // MEM_COMMIT at a specific address: commit the pages
                         // INSIDE an existing reservation (interior commit).
                         let base = requested_address & !0xfff;
-                        if !self.vm.can_commit(base, aligned) {
+                        if !self.win32.address_space_mut().can_commit(base, aligned) {
                             state.set(Register::Rax, 0);
                             self.last_error = ERROR_INVALID_ADDRESS;
                             return Ok(None);
                         }
                         memory.map_bytes(base, &vec![0; aligned as usize]);
-                        self.vm
+                        self.win32
+                            .address_space_mut()
                             .commit(base, aligned, protection_from_page_flags(protect), false);
                         base
                     } else {
@@ -34747,9 +34755,9 @@ impl PeHostRuntime {
                             ]),
                             json!(0),
                         );
-                    } else if let Some(size) = self.vm.region_size(address) {
+                    } else if let Some(size) = self.win32.address_space_mut().region_size(address) {
                         memory.unmap_range(address, size as usize);
-                        self.vm.release(address);
+                        self.win32.address_space_mut().release(address);
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -34785,7 +34793,7 @@ impl PeHostRuntime {
                     // reservation itself is kept.
                     let aligned = align_up_u64(bytes.max(1) as u64, 0x1000) as usize;
                     memory.unmap_range(address, aligned);
-                    self.vm.decommit(address, aligned as u64);
+                    self.win32.address_space_mut().decommit(address, aligned as u64);
                     state.set(Register::Rax, 1);
                     self.last_error = 0;
                     self.push_trace(
@@ -34826,7 +34834,8 @@ impl PeHostRuntime {
                 let aligned = align_up_u64(bytes.max(1) as u64, 0x1000);
                 let first_page = address & !0xfff;
                 let old_protection = self
-                    .vm
+                    .win32
+                    .address_space_mut()
                     .protect(first_page, aligned, new_protection)
                     .unwrap_or(crate::vm::VmProtection::NONE);
                 if old_protect_ptr != 0 {
@@ -34966,7 +34975,7 @@ impl PeHostRuntime {
                     // adjacent pages with identical state/protection into
                     // the reported run exactly like the page-granular
                     // Windows VirtualQuery.
-                    let query = self.vm.query(address);
+                    let query = self.win32.address_space_mut().query(address);
                     let mem_state = match query.state {
                         crate::vm::VmState::Free => MEM_FREE,
                         crate::vm::VmState::Reserved => MEM_RESERVE,
@@ -36776,7 +36785,7 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
                     // Create an anonymous pipe backed by named-pipe infrastructure
-                    let pipe_name = format!("\\\\.\\pipe\\casa1_anon_{}", self.win32.next_handle);
+                    let pipe_name = format!("\\\\.\\pipe\\casa1_anon_{}", self.win32.next_handle_value());
                     let inheritable = if security_attrs == 0 { false } else {
                         let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                         read_u32(memory, security_attrs + inherit_offset)? != 0
@@ -50136,12 +50145,12 @@ impl PeHostRuntime {
         // Canonical VM: the CRT data area (globals, PEB/TEB, TLS blocks,
         // module handles) is a growing region the guest reads and writes.
         let data_base = data_base_for_arch(self.guest_arch);
-        self.vm.register(
+        self.win32.address_space_mut().register(
             data_base,
             self.next_data_address.saturating_sub(data_base),
             crate::vm::VmRegionKind::Private,
         );
-        self.vm.commit(
+        self.win32.address_space_mut().commit(
             address,
             size as u64,
             crate::vm::VmProtection::READ_WRITE,
@@ -50251,12 +50260,12 @@ impl PeHostRuntime {
             GuestArch::X86 => X86_CRT_HEAP_BASE,
             GuestArch::X64 => CRT_HEAP_BASE,
         };
-        self.vm.register(
+        self.win32.address_space_mut().register(
             heap_base,
             self.next_heap_address.saturating_sub(heap_base),
             crate::vm::VmRegionKind::Heap,
         );
-        self.vm.commit(
+        self.win32.address_space_mut().commit(
             address,
             mapped_size as u64,
             crate::vm::VmProtection::READ_WRITE,
@@ -50275,10 +50284,13 @@ impl PeHostRuntime {
         let size = align_up_u64(size.max(1) as u64, 0x1000) as usize;
         let address = if requested_address == 0 {
             // The canonical VM's cursor picks the address (and advances).
-            self.vm.reserve(None, size as u64)
+            self.win32.address_space_mut().reserve(None, size as u64)
         } else {
             let candidate = requested_address & !0xfff;
-            let base = self.vm.reserve(Some(candidate), size as u64);
+            let base = self
+                .win32
+                .address_space_mut()
+                .reserve(Some(candidate), size as u64);
             if base == 0 {
                 return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
@@ -50296,7 +50308,7 @@ impl PeHostRuntime {
             ));
         }
         memory.map_bytes(address, &vec![0; size]);
-        self.vm.commit(
+        self.win32.address_space_mut().commit(
             address,
             size as u64,
             crate::vm::VmProtection::READ_WRITE_EXECUTE,
@@ -71137,7 +71149,9 @@ mod tests {
         runtime.next_thunk_address = thunk_base_for_arch(guest_arch);
         runtime.next_data_address = data_base_for_arch(guest_arch);
         runtime.next_heap_address = heap_base_for_arch(guest_arch);
-        runtime.vm = crate::vm::VirtualMemory::new(private_pages_base_for_arch(guest_arch));
+        runtime
+            .win32
+            .reset_address_space(private_pages_base_for_arch(guest_arch));
         runtime.x86_heap_region = 0;
     }
 
@@ -88518,7 +88532,7 @@ fn heap_base_for_arch(arch: GuestArch) -> u64 {
     }
 }
 
-fn private_pages_base_for_arch(arch: GuestArch) -> u64 {
+pub(crate) fn private_pages_base_for_arch(arch: GuestArch) -> u64 {
     match arch {
         GuestArch::X64 => PRIVATE_PAGES_BASE,
         GuestArch::X86 => X86_PRIVATE_PAGES_BASE,
