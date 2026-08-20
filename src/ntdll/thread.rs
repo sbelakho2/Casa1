@@ -73,12 +73,22 @@ impl NtThreadBasicInformation {
 }
 
 /// The info classes `NtQueryInformationThread` implements.
+///
+/// Class numbers are the verified current-Windows `THREADINFOCLASS` values
+/// (see the constants in `crate::ntdll` — wine/mingw-w64/phnt all agree).
 pub fn validate_thread_information_class(info_class: u32) -> Result<(), NtStatus> {
     match info_class {
         crate::ntdll::THREAD_BASIC_INFORMATION_CLASS
         | crate::ntdll::THREAD_TIMES_CLASS
+        | crate::ntdll::THREAD_IS_TERMINATED_CLASS
+        | crate::ntdll::THREAD_PRIORITY_CLASS
+        | crate::ntdll::THREAD_BASE_PRIORITY_CLASS
         | crate::ntdll::THREAD_AFFINITY_MASK_CLASS
-        | crate::ntdll::THREAD_PRIORITY_CLASS => Ok(()),
+        | crate::ntdll::THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS
+        | crate::ntdll::THREAD_AM_I_LAST_THREAD_CLASS
+        | crate::ntdll::THREAD_PRIORITY_BOOST_CLASS
+        | crate::ntdll::THREAD_HIDE_FROM_DEBUGGER_CLASS
+        | crate::ntdll::THREAD_SUSPEND_COUNT_CLASS => Ok(()),
         _ => Err(crate::ntdll::STATUS_INVALID_INFO_CLASS),
     }
 }
@@ -181,13 +191,36 @@ mod tests {
 
     #[test]
     fn thread_info_classes_validate() {
-        assert!(validate_thread_information_class(0).is_ok());
+        // Every supported query class validates; unsupported classes are
+        // rejected with STATUS_INVALID_INFO_CLASS.
+        for supported in [
+            crate::ntdll::THREAD_BASIC_INFORMATION_CLASS,
+            crate::ntdll::THREAD_TIMES_CLASS,
+            crate::ntdll::THREAD_IS_TERMINATED_CLASS,
+            crate::ntdll::THREAD_PRIORITY_CLASS,
+            crate::ntdll::THREAD_BASE_PRIORITY_CLASS,
+            crate::ntdll::THREAD_AFFINITY_MASK_CLASS,
+            crate::ntdll::THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
+            crate::ntdll::THREAD_AM_I_LAST_THREAD_CLASS,
+            crate::ntdll::THREAD_PRIORITY_BOOST_CLASS,
+            crate::ntdll::THREAD_HIDE_FROM_DEBUGGER_CLASS,
+            crate::ntdll::THREAD_SUSPEND_COUNT_CLASS,
+        ] {
+            assert!(validate_thread_information_class(supported).is_ok());
+        }
         assert_eq!(
             validate_thread_information_class(99),
             Err(crate::ntdll::STATUS_INVALID_INFO_CLASS)
         );
-        assert!(validate_set_thread_information_class(16).is_ok());
-        assert!(validate_set_thread_information_class(3).is_ok());
+        // The verified current-Windows numbering.
+        assert_eq!(crate::ntdll::THREAD_PRIORITY_CLASS, 2);
+        assert_eq!(crate::ntdll::THREAD_BASE_PRIORITY_CLASS, 3);
+        assert_eq!(crate::ntdll::THREAD_AFFINITY_MASK_CLASS, 4);
+        assert_eq!(crate::ntdll::THREAD_IS_TERMINATED_CLASS, 20);
+        assert_eq!(crate::ntdll::THREAD_SUSPEND_COUNT_CLASS, 35);
+        // The set surface: ThreadPriority + ThreadAffinityMask.
+        assert!(validate_set_thread_information_class(2).is_ok());
+        assert!(validate_set_thread_information_class(4).is_ok());
         assert_eq!(
             validate_set_thread_information_class(0),
             Err(crate::ntdll::STATUS_INVALID_INFO_CLASS)

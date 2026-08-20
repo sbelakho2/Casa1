@@ -2760,6 +2760,8 @@ pub enum HostThunk {
     WakeConditionVariable,
     /// `GetThreadPriority` — returns the priority of a thread.
     GetThreadPriority,
+    /// `GetThreadTimes` — returns creation/exit/kernel/user times for a thread.
+    GetThreadTimes,
     /// `CreateRemoteThread` — creates a thread in another process.
     CreateRemoteThread,
     /// `QueueUserAPC` — queues an APC to a thread's APC queue.
@@ -27221,6 +27223,34 @@ impl PeHostRuntime {
                         self.last_error = last_error_from_app_error(&error);
                     }
                 }
+            }
+            HostThunk::GetThreadTimes => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let creation_ptr = guest_call_arg(state, memory, 1)?;
+                let exit_ptr = guest_call_arg(state, memory, 2)?;
+                let kernel_ptr = guest_call_arg(state, memory, 3)?;
+                let user_ptr = guest_call_arg(state, memory, 4)?;
+                if handle == 0
+                    || !matches!(
+                        self.win32.handle_object_type(handle),
+                        Ok(crate::win32::ObjectType::Thread)
+                    )
+                {
+                    state.set(Register::Rax, 0); // FALSE
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                // Four FILETIMEs derived from the SAME guest-clock domain as
+                // the ThreadTimes information class (they share the helper,
+                // so the Win32 and Nt queries always agree).
+                let times = guest_thread_times_filetimes(self.dtm);
+                for (ptr, value) in [(creation_ptr, times[0]), (exit_ptr, times[1]), (kernel_ptr, times[2]), (user_ptr, times[3])] {
+                    if ptr != 0 {
+                        write_u64(memory, ptr, value);
+                    }
+                }
+                state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::GetExitCodeProcess => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
@@ -64929,6 +64959,9 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadPriority" => {
                 Self::GetThreadPriority
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadTimes" => {
+                Self::GetThreadTimes
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateRemoteThread" => {
                 Self::CreateRemoteThread
             }
@@ -65264,6 +65297,11 @@ impl HostThunk {
                 if name == "GetThreadPriority" =>
             {
                 Self::GetThreadPriority
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetThreadTimes" =>
+            {
+                Self::GetThreadTimes
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. })
                 if name == "CreateRemoteThread" =>
@@ -68158,7 +68196,8 @@ impl HostThunk {
             | Self::ModifyMenuW
             | Self::GetMenuStringW
             | Self::SHParseDisplayName
-            | Self::SHGetDataFromIDListW => 20,
+            | Self::SHGetDataFromIDListW
+            | Self::GetThreadTimes => 20,
             Self::LCMapStringW
             | Self::WsaSocketA
             | Self::GetQueuedCompletionStatusEx
@@ -88480,6 +88519,18 @@ fn is_shell_link_interface_iid(iid: &str) -> bool {
 
 fn current_guest_filetime_ticks(dtm: bool) -> u64 {
     if dtm { 0 } else { current_host_ticks_100ns() }
+}
+
+/// The four guest-clock FILETIME values (creation, exit, kernel, user)
+/// reported by GetThreadTimes and the ThreadTimes information class.
+///
+/// BOTH APIs derive from the SAME guest-clock domain through this helper so
+/// they always agree (the process has no modelled creation/exit timestamps,
+/// so those report 0; kernel and user time report the clock delta — 0 in
+/// deterministic mode).
+pub(crate) fn guest_thread_times_filetimes(dtm: bool) -> [u64; 4] {
+    let ticks = current_guest_filetime_ticks(dtm);
+    [0, 0, ticks, ticks]
 }
 
 struct HostTimeZoneInformation {
