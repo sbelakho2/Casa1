@@ -887,6 +887,12 @@ impl Win32Subsystem {
         &self.ge
     }
 
+    /// Whether this subsystem runs in deterministic mode (the guest clock
+    /// drives every guest-visible time domain; see `TimeState::dtm`).
+    pub fn is_dtm(&self) -> bool {
+        self.time.dtm
+    }
+
     pub fn current_thread_id(&self) -> u32 {
         self.current_thread_id
     }

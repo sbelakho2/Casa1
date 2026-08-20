@@ -129,6 +129,13 @@ impl PeHostRuntime {
 
     /// `NtAllocateVirtualMemory` — reserve/commit through the canonical VM
     /// and materialize the committed pages.
+    ///
+    /// PAIR CONTRACT (VirtualAlloc ↔ NtAllocateVirtualMemory): BOTH surfaces
+    /// mutate the ONE canonical [`crate::vm::VirtualMemory`] through the
+    /// same `reserve`/`commit` primitives and the same
+    /// PAGE_* → VmProtection conversion, so the Win32 VirtualAlloc thunk and
+    /// this dispatch write identical state (the section50 cross-surface
+    /// test pins VirtualAlloc → NtQueryVirtualMemory agreement).
     pub(crate) fn dispatch_nt_allocate_virtual_memory(
         &mut self,
         state: &mut CpuState,
@@ -570,6 +577,14 @@ impl PeHostRuntime {
     // ── Synchronization: events + waits ─────────────────────────────────────
 
     /// `NtCreateEvent` — create/open an event in the live object namespace.
+    ///
+    /// PAIR CONTRACT (CreateEventW/OpenEventW ↔ NtCreateEvent): the ONE
+    /// object manager resolves named events across every prefix spelling;
+    /// `NtCreateEvent` with a matching name OPENS the existing object (the
+    /// OBJ_OPENIF role the Win32 OpenEventW thunk plays through
+    /// `win32.open_event`), and the auto-reset consumption on wait is the
+    /// object manager's canonical transition visible to both surfaces (see
+    /// the section50 cross-surface test).
     pub(crate) fn dispatch_nt_create_event(
         &mut self,
         state: &mut CpuState,
@@ -2339,6 +2354,11 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
+                // The configured guest topology (8 processors / 0xFF mask /
+                // 4 KiB pages / 0x10000 granularity) — the SAME numbers the
+                // Win32 GetSystemInfo / GetNativeSystemInfo thunks write
+                // (write_system_info); the ntdll serializer is pinned
+                // against the Win32 topology by the section50 test.
                 memory.map_bytes(
                     buffer,
                     &nt::system::serialize_system_basic_information_x64(8),
@@ -2357,7 +2377,11 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
-                let current = current_guest_filetime_ticks(self.dtm) as i64;
+                // The ONE guest system-time derivation — the same value
+                // GetSystemTimeAsFileTime reports (live: host wall clock;
+                // deterministic: the guest clock, advancing in lockstep
+                // with GetTickCount64).
+                let current = guest_filetime_ticks(&self.win32) as i64;
                 let info = nt::system::NtSystemTimeOfDayInformation {
                     boot_time: 0,
                     current_time: current,
@@ -2432,6 +2456,12 @@ impl PeHostRuntime {
     }
 
     /// `NtQueryTimerResolution` — the configured guest timer resolution.
+    ///
+    /// DOMAIN CONTRACT: the 1 ms minimum (10 000 × 100 ns) is the
+    /// millisecond granularity the Win32 timeGetTime clock exposes, and the
+    /// 15.6 ms maximum is the classic Windows timer period — the two
+    /// surfaces describe the same timer domain (timeBeginPeriod is a
+    /// cooperative no-op on both).
     pub(crate) fn dispatch_nt_query_timer_resolution(
         &mut self,
         state: &mut CpuState,
@@ -2488,7 +2518,10 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `NtQuerySystemTime` — the guest FILETIME.
+    /// `NtQuerySystemTime` — the guest FILETIME, from the SAME single
+    /// derivation the Win32 GetSystemTimeAsFileTime thunk reads (live: host
+    /// wall clock; deterministic: the guest clock, in lockstep with
+    /// GetTickCount64).  The Nt path never invents its own epoch or base.
     pub(crate) fn dispatch_nt_query_system_time(
         &mut self,
         state: &mut CpuState,
@@ -2496,7 +2529,7 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let filetime_ptr = guest_call_arg(state, memory, 0)?;
         if filetime_ptr != 0 {
-            write_u64(memory, filetime_ptr, current_guest_filetime_ticks(self.dtm));
+            write_u64(memory, filetime_ptr, guest_filetime_ticks(&self.win32));
         }
         state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
         self.last_error = 0;

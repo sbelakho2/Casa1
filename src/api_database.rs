@@ -1151,6 +1151,13 @@ static NT_API_SURFACE: &[SkeletonEntry] = &[
     // implemented Nt*/Rtl* API is covered by THUNK_METADATA (the registered
     // ntdll surface carries its Implemented level); only the still-missing
     // Nt* skeletons stay here to quantify the remaining native-API gap.
+    //
+    // The Win32-over-Nt consistency audit (section50) verified each
+    // implemented Nt* pair against its Win32 counterpart — VM, clocks,
+    // topology, version, objects, sync, threads, processes, registry, files,
+    // sections and the error-domain round trips — and the api_database
+    // level for every audited entry is Implemented (the same pattern the
+    // Stage-4 entries were upgraded with).
     kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Unsupported),
     kernel_skeleton("NtCreateProcess", ImplementationLevel::Unsupported),
 ];

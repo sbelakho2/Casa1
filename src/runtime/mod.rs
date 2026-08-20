@@ -34486,7 +34486,11 @@ impl PeHostRuntime {
             }
             HostThunk::GetSystemTimeAsFileTime => {
                 let file_time_ptr = guest_call_arg(state, memory, 0)?;
-                let ticks = current_guest_filetime_ticks(self.dtm);
+                // The single guest system-time derivation (shared with
+                // NtQuerySystemTime): live → host wall clock; deterministic
+                // → the guest clock, advancing in lockstep with
+                // GetTickCount64 after every sleep.
+                let ticks = guest_filetime_ticks(&self.win32);
                 if file_time_ptr != 0 {
                     write_u64(memory, file_time_ptr, ticks);
                 }
@@ -34501,7 +34505,9 @@ impl PeHostRuntime {
             }
             HostThunk::GetSystemTimePreciseAsFileTime => {
                 let file_time_ptr = guest_call_arg(state, memory, 0)?;
-                let ticks = current_guest_filetime_ticks(self.dtm);
+                // The same single derivation as GetSystemTimeAsFileTime /
+                // NtQuerySystemTime.
+                let ticks = guest_filetime_ticks(&self.win32);
                 if file_time_ptr != 0 {
                     write_u64(memory, file_time_ptr, ticks);
                 }
@@ -35234,8 +35240,18 @@ impl PeHostRuntime {
                         base
                     } else {
                         // MEM_COMMIT (or RESERVE|COMMIT) without a base:
-                        // reserve + commit a fresh region.
-                        self.alloc_private_pages(memory, 0, bytes)?
+                        // reserve + commit a fresh region with the REQUESTED
+                        // protection (the same PAGE_* → canonical
+                        // VmProtection conversion the Nt
+                        // NtAllocateVirtualMemory dispatch uses, so both
+                        // surfaces write identical protection into the one
+                        // VirtualMemory).
+                        self.alloc_private_pages(
+                            memory,
+                            0,
+                            bytes,
+                            protection_from_page_flags(protect),
+                        )?
                     };
                     state.set(Register::Rax, address);
                     self.last_error = 0;
@@ -38221,11 +38237,19 @@ impl PeHostRuntime {
                     let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                     read_u32(memory, security_attrs + inherit_offset)? != 0
                 };
-                let protection = crate::win32::MemoryProtection {
-                    read: protect & 0x01 != 0 || protect & 0x02 != 0,
-                    write: protect & 0x02 != 0,
-                    execute: protect & 0x10 != 0 || protect & 0x20 != 0 || protect & 0x40 != 0,
-                };
+                // The SAME PAGE_* → MemoryProtection conversion the
+                // NtCreateSection dispatch uses (crate::ntdll::loader), so
+                // a section created on either surface records the identical
+                // protection in the shared SectionObject.
+                let protection =
+                    match crate::ntdll::loader::protection_from_nt_flags(protect) {
+                        Some(protection) => protection,
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                            return Ok(None);
+                        }
+                    };
                 match self.win32.create_file_mapping_w(name.as_deref(), maximum_size, protection, inheritable) {
                     Ok((handle, existed)) => {
                         state.set(Register::Rax, u64::from(handle));
@@ -38254,7 +38278,11 @@ impl PeHostRuntime {
                 let offset_low = guest_call_arg_u32(state, memory, 3)?;
                 let bytes_to_map = guest_call_arg(state, memory, 4)?;
                 let offset = (offset_high as u64) << 32 | offset_low as u64;
-                let size = if bytes_to_map == 0 { 0x1000 } else { bytes_to_map as usize };
+                // A zero size maps the WHOLE section remainder from the
+                // offset (Windows MapViewOfFile semantics) — the shared
+                // layer resolves it exactly like the NtMapViewOfSection
+                // dispatch's zero view size.
+                let size = bytes_to_map as usize;
                 match self.win32.map_view_of_file(handle, offset, size) {
                     Ok(base_address) => {
                         state.set(Register::Rax, base_address);
@@ -39855,7 +39883,22 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                state.set(Register::Rax, 1); // TRUE
+                let priority = arg(1) as i32;
+                // Routes into the subsystem priority domain — the SAME
+                // storage the Nt SetInformationThread(ThreadPriority) and
+                // both GetThreadPriority / NtQueryInformationThread
+                // (ThreadPriority) query, so the two surfaces can never
+                // disagree.
+                match self.win32.set_thread_priority(handle, priority) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1); // TRUE
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0); // FALSE
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
             }
             HostThunk::ExitThread => {
                 let code = arg(0) as u32;
@@ -50786,6 +50829,7 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         requested_address: u64,
         size: usize,
+        protection: crate::vm::VmProtection,
     ) -> AppResult<u64> {
         let size = align_up_u64(size.max(1) as u64, 0x1000) as usize;
         let address = if requested_address == 0 {
@@ -50814,12 +50858,9 @@ impl PeHostRuntime {
             ));
         }
         memory.map_bytes(address, &vec![0; size]);
-        self.win32.address_space_mut().commit(
-            address,
-            size as u64,
-            crate::vm::VmProtection::READ_WRITE_EXECUTE,
-            false,
-        );
+        self.win32
+            .address_space_mut()
+            .commit(address, size as u64, protection, false);
         Ok(address)
     }
 
@@ -88766,6 +88807,24 @@ fn is_shell_link_interface_iid(iid: &str) -> bool {
 
 fn current_guest_filetime_ticks(dtm: bool) -> u64 {
     if dtm { 0 } else { current_host_ticks_100ns() }
+}
+
+/// THE ONE guest system-time derivation (FILETIME 100 ns since 1601),
+/// shared by the Win32 clock thunks (GetSystemTimeAsFileTime /
+/// GetSystemTimePreciseAsFileTime) and the Nt clock dispatch
+/// (NtQuerySystemTime / NtQuerySystemInformation(SystemTimeOfDay)).
+///
+/// Live runs report the host wall clock.  Deterministic runs derive from
+/// the canonical guest clock (`TimeState::ticks_ms` — the same clock
+/// GetTickCount64 / GetTickCount read), so the system time advances in
+/// lockstep with the tick counter after every guest sleep and the two
+/// surfaces can never disagree.
+fn guest_filetime_ticks(win32: &crate::win32::Win32Subsystem) -> u64 {
+    if win32.is_dtm() {
+        WINDOWS_EPOCH_OFFSET_100NS.saturating_add(win32.get_tick_count64().saturating_mul(10_000))
+    } else {
+        current_host_ticks_100ns()
+    }
 }
 
 /// The four guest-clock FILETIME values (creation, exit, kernel, user)
