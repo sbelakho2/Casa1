@@ -106,11 +106,12 @@ impl AppError {
             // ── Registry (1200) ────────────────────────────────────────
             ReasonCode::RcRegistryNotFound => ERROR_FILE_NOT_FOUND,
 
-            // ── Win32 / COM (1300–1306) ────────────────────────────────
+            // ── Win32 / COM (1300–1307) ────────────────────────────────
             ReasonCode::RcWin32InvalidHandle | ReasonCode::RcHandleStaleOrInvalid => {
                 ERROR_INVALID_HANDLE
             }
             ReasonCode::RcWin32Timeout => ERROR_TIMEOUT,
+            ReasonCode::RcWin32AccessDenied => ERROR_ACCESS_DENIED,
             ReasonCode::RcComClassNotRegistered => ERROR_INVALID_PARAMETER,
             ReasonCode::RcMemoryAccessViolation => ERROR_NOACCESS,
             ReasonCode::RcPipeBusy => ERROR_ACCESS_DENIED,

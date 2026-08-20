@@ -5485,6 +5485,18 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    /// Whether the thread has exited (an exit code is recorded).
+    ///
+    /// Used to route suspend/resume failures on terminated threads
+    /// (THREAD_SUSPEND_FAILED / STATUS_THREAD_IS_TERMINATING) and by the
+    /// scheduler pump to skip terminated records regardless of suspend
+    /// count.
+    pub(crate) fn thread_has_exited(&self, thread_id: u32) -> bool {
+        self.threads
+            .get(&thread_id)
+            .is_some_and(|state| state.exit_code.is_some())
+    }
+
     pub fn open_thread(
         &mut self,
         thread_id: u32,
@@ -5507,6 +5519,17 @@ impl Win32Subsystem {
         Self::require_access(&self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
+        if state.exit_code.is_some() {
+            // Windows: a terminated thread cannot be suspended — the
+            // suspension of a dead thread is meaningless.  The dispatch
+            // layers surface this as THREAD_SUSPEND_FAILED +
+            // ERROR_ACCESS_DENIED (Win32) / STATUS_THREAD_IS_TERMINATING
+            // (Nt).
+            return Err(AppError::new(
+                ReasonCode::RcWin32AccessDenied,
+                format!("cannot suspend terminated thread {thread_id}"),
+            ));
+        }
         let prev = state.suspend_count;
         state.suspend_count = state.suspend_count.saturating_add(1);
         Ok(prev)
@@ -5516,6 +5539,15 @@ impl Win32Subsystem {
         Self::require_access(&self.handle_entry(handle)?, THREAD_SUSPEND_RESUME)?;
         let thread_id = self.thread_id(handle)?;
         let state = self.thread_state_mut(thread_id)?;
+        if state.exit_code.is_some() {
+            // Windows: resuming a terminated thread fails with
+            // THREAD_SUSPEND_FAILED + ERROR_ACCESS_DENIED (Win32) /
+            // STATUS_THREAD_IS_TERMINATING (Nt).
+            return Err(AppError::new(
+                ReasonCode::RcWin32AccessDenied,
+                format!("cannot resume terminated thread {thread_id}"),
+            ));
+        }
         let prev = state.suspend_count;
         state.suspend_count = state.suspend_count.saturating_sub(1);
         Ok(prev)

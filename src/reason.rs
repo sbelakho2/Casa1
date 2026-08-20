@@ -35,6 +35,7 @@ pub enum ReasonCode {
     RcWin32NotOwner = 1310,
     RcComObjectError = 1305,
     RcHandleStaleOrInvalid = 1306,
+    RcWin32AccessDenied = 1307,
     RcPeParseInvalid = 2000,
     RcImportMissing = 2001,
     RcUnimplInsn = 2002,
@@ -385,6 +386,7 @@ impl ReasonCode {
             Self::RcOutOfMemoryHint => "RC_OUT_OF_MEMORY_HINT",
             Self::RcJitCodeAllocFailed => "RC_JIT_CODE_ALLOC_FAILED",
             Self::RcLockPoisoned => "RC_LOCK_POISONED",
+            Self::RcWin32AccessDenied => "RC_WIN32_ACCESS_DENIED",
         }
     }
 }

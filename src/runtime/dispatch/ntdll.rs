@@ -1902,7 +1902,22 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             Err(_) => {
-                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                // Windows: suspending a terminated thread reports
+                // STATUS_THREAD_IS_TERMINATING (0xC000004A); every other
+                // failure (invalid handle / access) reports
+                // STATUS_INVALID_HANDLE.
+                let terminated = self
+                    .win32
+                    .thread_id_for_handle(thread_handle)
+                    .is_ok_and(|thread_id| self.win32.thread_has_exited(thread_id));
+                state.set(
+                    Register::Rax,
+                    u64::from(if terminated {
+                        nt::STATUS_THREAD_IS_TERMINATING.raw()
+                    } else {
+                        nt::STATUS_INVALID_HANDLE.raw()
+                    }),
+                );
             }
         }
         self.last_error = 0;
@@ -1930,7 +1945,21 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             Err(_) => {
-                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                // Terminated threads report STATUS_THREAD_IS_TERMINATING
+                // (0xC000004A); every other failure reports
+                // STATUS_INVALID_HANDLE.
+                let terminated = self
+                    .win32
+                    .thread_id_for_handle(thread_handle)
+                    .is_ok_and(|thread_id| self.win32.thread_has_exited(thread_id));
+                state.set(
+                    Register::Rax,
+                    u64::from(if terminated {
+                        nt::STATUS_THREAD_IS_TERMINATING.raw()
+                    } else {
+                        nt::STATUS_INVALID_HANDLE.raw()
+                    }),
+                );
             }
         }
         self.last_error = 0;

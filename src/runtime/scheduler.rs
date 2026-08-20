@@ -564,9 +564,14 @@ impl PeHostRuntime {
         // `Waiting`/`AlertableWaiting` threads are only ready once their
         // wake_tick has expired; `Exiting` threads are mid-teardown inside
         // their own pump cycle (they never sit in the queue across cycles)
-        // and `Exited` threads are gone.
+        // and `Exited` threads are gone.  A thread whose subsystem state has
+        // already recorded an exit code is skipped REGARDLESS of its suspend
+        // count — a terminated thread must never start, even if its
+        // suspension was never released (and suspend/resume on it already
+        // fails, so the counters can only stay put).
         let Some(ready_index) = self.pending_guest_threads.iter().position(|thread| {
             thread.suspended == 0
+                && !self.win32.thread_has_exited(thread.thread_id)
                 && match thread.state_machine {
                     GuestThreadState::Waiting | GuestThreadState::AlertableWaiting => {
                         if thread.wait.is_some() {
