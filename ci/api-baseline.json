@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-19T22:51:39Z",
+  "generated_at": "2026-08-20T17:38:29Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -783,13 +783,13 @@
     },
     "kernel32.dll": {
       "total": 246,
-      "implemented": 190,
-      "partial": 14,
+      "implemented": 193,
+      "partial": 11,
       "stub": 27,
       "unsupported": 15,
       "differential_tested": 14,
       "conformance_tested": 0,
-      "transitional_partial": 14
+      "transitional_partial": 11
     },
     "kernelbase.dll": {
       "total": 7,
@@ -1242,11 +1242,11 @@
       "transitional_partial": 0
     },
     "ntdll.dll": {
-      "total": 42,
-      "implemented": 2,
+      "total": 69,
+      "implemented": 67,
       "partial": 0,
       "stub": 0,
-      "unsupported": 40,
+      "unsupported": 2,
       "differential_tested": 0,
       "conformance_tested": 0,
       "transitional_partial": 0
@@ -1653,13 +1653,13 @@
     },
     "user32.dll": {
       "total": 67,
-      "implemented": 49,
-      "partial": 5,
+      "implemented": 52,
+      "partial": 2,
       "stub": 7,
       "unsupported": 6,
       "differential_tested": 0,
       "conformance_tested": 0,
-      "transitional_partial": 5
+      "transitional_partial": 2
     },
     "userenv.dll": {
       "total": 9,
@@ -2410,6 +2410,18 @@
       },
       {
         "dll": "kernel32.dll",
+        "export": "GetDiskFreeSpaceA",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!GetDiskFreeSpaceA is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
+        "export": "GetDiskFreeSpaceExW",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!GetDiskFreeSpaceExW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
         "export": "GetDriveTypeW",
         "kind": "StubNotDeliberatelyUnsupported",
         "message": "kernel32.dll!GetDriveTypeW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
@@ -2989,6 +3001,12 @@
         "export": "SetCurrentDirectoryW",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!SetCurrentDirectoryW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
+        "export": "SetEndOfFile",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!SetEndOfFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -3658,6 +3676,18 @@
       },
       {
         "dll": "user32.dll",
+        "export": "SetClassLongW",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!SetClassLongW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "user32.dll",
+        "export": "SetClipboardData",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!SetClipboardData is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "user32.dll",
         "export": "SetDlgItemInt",
         "kind": "ImplementedWithoutCoverage",
         "message": "user32.dll!SetDlgItemInt is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -3715,6 +3745,12 @@
         "export": "UpdateWindow",
         "kind": "ImplementedWithoutCoverage",
         "message": "user32.dll!UpdateWindow is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "user32.dll",
+        "export": "wsprintfA",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!wsprintfA is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "winhttp.dll",
@@ -10060,6 +10096,396 @@
       },
       {
         "dll": "ntdll.dll",
+        "export": "NtAllocateVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtAllocateVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtFreeVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtFreeVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtProtectVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtProtectVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtReadVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtReadVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtWriteVirtualMemory",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtWriteVirtualMemory is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtClose",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtClose is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtDuplicateObject",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtDuplicateObject is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryObject",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryObject is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtCreateEvent",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtCreateEvent is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSetEvent",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSetEvent is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtClearEvent",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtClearEvent is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtWaitForSingleObject",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtWaitForSingleObject is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtWaitForMultipleObjects",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtWaitForMultipleObjects is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtDelayExecution",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtDelayExecution is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtCreateSection",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtCreateSection is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtMapViewOfSection",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtMapViewOfSection is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtUnmapViewOfSection",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtUnmapViewOfSection is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQuerySection",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQuerySection is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtCreateFile",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtCreateFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtDeviceIoControlFile",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtDeviceIoControlFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtCreateKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtCreateKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtOpenKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtOpenKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryValueKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryValueKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSetValueKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSetValueKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtDeleteKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtDeleteKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtDeleteValueKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtDeleteValueKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtEnumerateKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtEnumerateKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtEnumerateValueKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtEnumerateValueKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryKey",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryKey is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryInformationThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryInformationThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtGetContextThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtGetContextThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSetContextThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSetContextThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSuspendThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSuspendThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtResumeThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtResumeThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtTerminateProcess",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtTerminateProcess is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtTerminateThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtTerminateThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtCreateThreadEx",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtCreateThreadEx is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSetInformationThread",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSetInformationThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQuerySystemInformation",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQuerySystemInformation is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryPerformanceCounter",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryPerformanceCounter is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQueryTimerResolution",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQueryTimerResolution is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtSetTimerResolution",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtSetTimerResolution is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "NtQuerySystemTime",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!NtQuerySystemTime is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlInitUnicodeString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlInitUnicodeString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlInitAnsiString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlInitAnsiString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlFreeUnicodeString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlFreeUnicodeString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlFreeAnsiString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlFreeAnsiString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlCompareUnicodeString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlCompareUnicodeString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlEqualUnicodeString",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlEqualUnicodeString is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlGetVersion",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlGetVersion is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlCaptureContext",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlCaptureContext is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlLookupFunctionEntry",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlLookupFunctionEntry is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlRaiseException",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlRaiseException is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlAllocateHeap",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlAllocateHeap is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlFreeHeap",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlFreeHeap is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "RtlSizeHeap",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!RtlSizeHeap is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrLoadDll",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrLoadDll is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrUnloadDll",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrUnloadDll is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrGetDllHandle",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrGetDllHandle is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrGetProcedureAddress",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrGetProcedureAddress is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrLockLoaderLock",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrLockLoaderLock is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrUnlockLoaderLock",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrUnlockLoaderLock is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrAddRefDll",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrAddRefDll is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
+        "export": "LdrRemoveRefDll",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "ntdll.dll!LdrRemoveRefDll is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "ntdll.dll",
         "export": "RtlNtStatusToDosError",
         "kind": "ImplementedWithoutCoverage",
         "message": "ntdll.dll!RtlNtStatusToDosError is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -14925,7 +15351,7 @@
         "message": "mfplat.dll!IMFGetService is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       }
     ],
-    "shipping_violation_count": 2130,
+    "shipping_violation_count": 2201,
     "completeness_violations": [
       {
         "dll": "kernel32.dll",
@@ -14949,7 +15375,7 @@
         "dll": "kernel32.dll",
         "export": "CompareStringW",
         "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!CompareStringW is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: locale and flags are ignored; comparison is a case-insensitive ordinal compare (to_lowercase), not locale collation)"
+        "message": "kernel32.dll!CompareStringW is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: locale is ignored (the runtime has no collation tables); flags are ignored — comparison is always a case-insensitive ordinal compare (to_lowercase), while Windows applies locale collation and flag-dependent semantics (NORM_IGNORECASE, NORM_IGNORECASE_NONSPACE, ...))"
       },
       {
         "dll": "kernel32.dll",
@@ -15230,14 +15656,14 @@
       {
         "dll": "kernel32.dll",
         "export": "GetDiskFreeSpaceA",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GetDiskFreeSpaceA is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: reports plausible fixed disk geometry for the virtual filesystem, not host capacity)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!GetDiskFreeSpaceA is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
         "export": "GetDiskFreeSpaceExW",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GetDiskFreeSpaceExW is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: reports fixed virtual-filesystem figures (8 sectors/cluster, 512-byte sectors, 2 TB total); not host capacity)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!GetDiskFreeSpaceExW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15369,7 +15795,7 @@
         "dll": "kernel32.dll",
         "export": "GetProcessAffinityMask",
         "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GetProcessAffinityMask is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: returns a fixed 8-core affinity mask (0xFF), not the actual process/system affinity)"
+        "message": "kernel32.dll!GetProcessAffinityMask is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: returns the fixed 8-core affinity mask (0xFF) of the runtime's virtual topology — the same mask GetSystemInfo/GetNativeSystemInfo/NtQuerySystemInformation report; it is not the host's actual process/system affinity)"
       },
       {
         "dll": "kernel32.dll",
@@ -15908,8 +16334,8 @@
       {
         "dll": "kernel32.dll",
         "export": "SetEndOfFile",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!SetEndOfFile is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: cannot truly truncate the host file — truncation is simulated through file position tracking and treated as success)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!SetEndOfFile is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16622,14 +17048,14 @@
       {
         "dll": "user32.dll",
         "export": "SetClassLongW",
-        "kind": "PartialNotCompletenessReady",
-        "message": "user32.dll!SetClassLongW is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: returns 0 and records the call — the class long is not actually stored on the window class)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!SetClassLongW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
         "export": "SetClipboardData",
-        "kind": "PartialNotCompletenessReady",
-        "message": "user32.dll!SetClipboardData is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: simplified clipboard: reads up to 64 KB from the handle address; format negotiation is limited)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!SetClipboardData is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
@@ -16700,8 +17126,8 @@
       {
         "dll": "user32.dll",
         "export": "wsprintfA",
-        "kind": "PartialNotCompletenessReady",
-        "message": "user32.dll!wsprintfA is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: simple format subset only (%s/%d/%u/%x/%c/%%); unsupported specifiers are skipped)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!wsprintfA is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "winhttp.dll",
@@ -28573,14 +28999,14 @@
     {
       "dll": "kernel32.dll",
       "export": "GetDiskFreeSpaceA",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
     {
       "dll": "kernel32.dll",
       "export": "GetDiskFreeSpaceExW",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29392,7 +29818,7 @@
     {
       "dll": "kernel32.dll",
       "export": "SetEndOfFile",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30246,14 +30672,14 @@
     {
       "dll": "user32.dll",
       "export": "SetClassLongW",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
     {
       "dll": "user32.dll",
       "export": "SetClipboardData",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30337,7 +30763,7 @@
     {
       "dll": "user32.dll",
       "export": "wsprintfA",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -37994,6 +38420,461 @@
     },
     {
       "dll": "ntdll.dll",
+      "export": "NtAllocateVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtFreeVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtProtectVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtReadVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtWriteVirtualMemory",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtClose",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtDuplicateObject",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryObject",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtCreateEvent",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSetEvent",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtClearEvent",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtWaitForSingleObject",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtWaitForMultipleObjects",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtDelayExecution",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtCreateSection",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtMapViewOfSection",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtUnmapViewOfSection",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQuerySection",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtCreateFile",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtDeviceIoControlFile",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtCreateKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtOpenKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryValueKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSetValueKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtDeleteKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtDeleteValueKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtEnumerateKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtEnumerateValueKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryKey",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryInformationThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtGetContextThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSetContextThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSuspendThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtResumeThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtTerminateProcess",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtTerminateThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtCreateThreadEx",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSetInformationThread",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQuerySystemInformation",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryPerformanceCounter",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQueryTimerResolution",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtSetTimerResolution",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "NtQuerySystemTime",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlInitUnicodeString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlInitAnsiString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlFreeUnicodeString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlFreeAnsiString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlCompareUnicodeString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlEqualUnicodeString",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlGetVersion",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlCaptureContext",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlLookupFunctionEntry",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlRaiseException",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlAllocateHeap",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlFreeHeap",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "RtlSizeHeap",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrLoadDll",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrUnloadDll",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrGetDllHandle",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrGetProcedureAddress",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrLockLoaderLock",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrUnlockLoaderLock",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrAddRefDll",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
+      "export": "LdrRemoveRefDll",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "None",
+      "support_policy": "OutsideUserModeProfile"
+    },
+    {
+      "dll": "ntdll.dll",
       "export": "RtlNtStatusToDosError",
       "implementation": "Implemented",
       "semantic_test_coverage": "None",
@@ -43524,41 +44405,6 @@
     },
     {
       "dll": "ntdll.dll",
-      "export": "NtAllocateVirtualMemory",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtClearEvent",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtClose",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtCreateEvent",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtCreateFile",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
       "export": "NtCreateFileMapping",
       "implementation": "Unsupported",
       "semantic_test_coverage": "None",
@@ -43566,238 +44412,7 @@
     },
     {
       "dll": "ntdll.dll",
-      "export": "NtCreateKey",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
       "export": "NtCreateProcess",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtCreateSection",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtCreateThreadEx",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtDelayExecution",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtDeviceIoControlFile",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtDuplicateObject",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtFreeVirtualMemory",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtGetContextThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtMapViewOfSection",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtOpenKey",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtProtectVirtualMemory",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryInformationThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryObject",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryPerformanceCounter",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQuerySection",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQuerySystemInformation",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryTimerResolution",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryValueKey",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtQueryVirtualMemory",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtReadVirtualMemory",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtResumeThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSetContextThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSetEvent",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSetInformationThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSetTimerResolution",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSetValueKey",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtSuspendThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtTerminateProcess",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtTerminateThread",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtUnmapViewOfSection",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtWaitForMultipleObjects",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtWaitForSingleObject",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
-      "support_policy": "OutsideUserModeProfile"
-    },
-    {
-      "dll": "ntdll.dll",
-      "export": "NtWriteVirtualMemory",
       "implementation": "Unsupported",
       "semantic_test_coverage": "None",
       "support_policy": "OutsideUserModeProfile"

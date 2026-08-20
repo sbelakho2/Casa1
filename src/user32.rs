@@ -1357,6 +1357,10 @@ pub struct User32Subsystem {
     dialog_items: BTreeMap<(Hwnd, i32), Hwnd>,
     dialog_results: BTreeMap<Hwnd, i64>,
     window_longs: BTreeMap<(Hwnd, i32), u64>,
+    /// Class-long storage: (class_name, index) → value.  SetClassLongW stores
+    /// into the window CLASS (shared by every window of that class) and
+    /// returns the previous value.
+    class_longs: BTreeMap<(String, i32), u64>,
     message_queue: VecDeque<Message>,
     thread_message_queues: BTreeMap<u32, VecDeque<Message>>,
     /// Ring buffer of recently dispatched messages (capped to bound memory).
@@ -1598,6 +1602,7 @@ impl User32Subsystem {
             dialog_items: BTreeMap::new(),
             dialog_results: BTreeMap::new(),
             window_longs: BTreeMap::new(),
+            class_longs: BTreeMap::new(),
             message_queue: VecDeque::new(),
             thread_message_queues: BTreeMap::new(),
             message_log: VecDeque::new(),
@@ -2556,19 +2561,20 @@ impl User32Subsystem {
     }
 
     /// SetClipboardData — set clipboard data.
-    /// Stores a copy of the data. The handle is returned as-is (Windows returns
-    /// the handle for non-CF_LOCAL formats; for CF_LOCAL we'd need real allocation).
-    pub fn set_clipboard_data(&mut self, format: u32, data: Vec<u8>) -> u64 {
+    /// Stores a copy of the data. Returns `true` when the clipboard is open
+    /// and the data was stored; the caller returns the guest handle on
+    /// success (Windows returns the hData handle) and NULL +
+    /// ERROR_CLIPBOARD_NOT_OPEN otherwise.
+    pub fn set_clipboard_data(&mut self, format: u32, data: Vec<u8>) -> bool {
         if !self.clipboard_open {
-            return 0;
+            return false;
         }
         // Store locally for non-text formats and as a session cache
         self.clipboard_data.insert(format, data.clone());
         // Write to NSPasteboard for inter-process clipboard sharing
         // SAFETY: nspasteboard_set_data wraps AppKit FFI; falls back silently in headless mode
         mac_window::nspasteboard_set_data(format, &data);
-        // Return a synthetic handle (just use a small integer as pseudo-handle)
-        format as u64
+        true
     }
 
     /// EmptyClipboard — empty the clipboard and free handles to data.
@@ -3038,6 +3044,18 @@ impl User32Subsystem {
             return Some(self.get_parent(hwnd) as u64);
         }
         Some(*self.window_longs.get(&(hwnd, index)).unwrap_or(&0))
+    }
+
+    /// SetClassLongW — store a class long on the window CLASS of `hwnd` and
+    /// return the previous value (Windows semantics).  The value is shared by
+    /// every window of that class, keyed by the class name.
+    pub fn set_class_long_w(&mut self, hwnd: Hwnd, index: i32, value: u64) -> Option<u64> {
+        let class_name = self.windows.get(&hwnd)?.class_name.clone();
+        Some(
+            self.class_longs
+                .insert((class_name, index), value)
+                .unwrap_or(0),
+        )
     }
 
     pub fn post_message_w(
@@ -7490,12 +7508,10 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
 
-        let handle = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec());
-        // The handle returned is the format as a pseudo-handle
-        assert!(
-            handle != 0,
-            "set_clipboard_data should return non-zero handle"
-        );
+        let stored = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec());
+        // The data is stored and the caller (SetClipboardData thunk) returns
+        // the guest handle on success.
+        assert!(stored, "set_clipboard_data should report success");
 
         // Retrieve and verify
         let data = user32.get_clipboard_data(CF_TEXT);
@@ -7515,8 +7531,8 @@ mod tests {
     #[test]
     fn test_set_clipboard_data_not_open() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let handle = user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
-        assert_eq!(handle, 0, "set without open should return 0");
+        let stored = user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
+        assert!(!stored, "set without open should report failure");
     }
 
     #[test]
@@ -7563,6 +7579,85 @@ mod tests {
         assert!(
             !user32.is_clipboard_format_available(CF_TEXT),
             "not open, should return false"
+        );
+    }
+
+    #[test]
+    fn test_set_class_long_stores_and_returns_previous() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("class-long-test");
+        // Child-style windows avoid the AppKit NSWindow path (AppKit requires
+        // the main thread and is not available in the test harness).
+        let hwnd = user32
+            .create_window_ex_styled(
+                "class-long-test",
+                "title",
+                320,
+                200,
+                false,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create window");
+
+        const GCL_STYLE: i32 = -26;
+        // First set returns 0 (no previous value).
+        assert_eq!(
+            user32.set_class_long_w(hwnd, GCL_STYLE, 0x0A0A).unwrap(),
+            0,
+            "first set must return 0 as the previous value"
+        );
+        // Second set returns the stored previous value.
+        assert_eq!(
+            user32.set_class_long_w(hwnd, GCL_STYLE, 0x0B0B).unwrap(),
+            0x0A0A,
+            "subsequent set must return the previous class long"
+        );
+        // A second window of the SAME class shares the class long (the value
+        // is stored on the window class, not the window instance).
+        let hwnd2 = user32
+            .create_window_ex_styled(
+                "class-long-test",
+                "title2",
+                320,
+                200,
+                false,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create second window");
+        assert_eq!(
+            user32.set_class_long_w(hwnd2, GCL_STYLE, 0x0C0C).unwrap(),
+            0x0B0B,
+            "class longs are shared across windows of the same class"
+        );
+        // Different index keeps its own slot.
+        assert_eq!(
+            user32.set_class_long_w(hwnd, -24, 0x1234).unwrap(),
+            0,
+            "a fresh index returns 0"
+        );
+        assert_eq!(
+            user32.set_class_long_w(hwnd, -24, 0x5678).unwrap(),
+            0x1234,
+            "the fresh index tracks its own previous value"
+        );
+    }
+
+    #[test]
+    fn test_set_class_long_invalid_hwnd_fails() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(
+            user32.set_class_long_w(0xDEAD, -26, 1).is_none(),
+            "an unknown hwnd must fail (ERROR_INVALID_WINDOW_HANDLE)"
         );
     }
 
