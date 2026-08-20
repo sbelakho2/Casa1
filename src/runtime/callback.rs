@@ -61,6 +61,30 @@ impl PeHostRuntime {
             "DWM hwnd={hwnd:#x} msg=0x{message_id:04x} wp={wparam:#x} lp={lparam:#x} class={class_name:?} label={label}"
         ));
 
+        // Windows DispatchMessage semantics for WM_TIMER: when the message
+        // carries a TIMERPROC in lParam (SetTimer with a non-null callback),
+        // the timer proc is invoked instead of the window proc:
+        //   TIMERPROC(hwnd, WM_TIMER, idTimer, time)
+        if message_id == crate::user32::WM_TIMER && lparam != 0 {
+            let timer_proc = lparam as u64;
+            let id_timer = wparam as u64;
+            let time = self.win32.get_tick_count64();
+            emit_window_msg_debug(format!(
+                "DWM -> timer_proc={timer_proc:#x} hwnd={hwnd:#x} idTimer={id_timer} time={time}"
+            ));
+            let result = self.execute_guest_callback(
+                state,
+                memory,
+                timer_proc,
+                &[u64::from(hwnd), u64::from(message_id), id_timer, time],
+                label,
+            )? as i64;
+            if let Some(code) = self.process_exit_requested {
+                return Ok(code as i64);
+            }
+            return Ok(result);
+        }
+
         if let Some(dialog_proc) = self.dialog_procs.get(&hwnd).copied() {
             emit_window_msg_debug(format!(
                 "DWM -> dialog_proc={dialog_proc:#x} hwnd={hwnd:#x} msg=0x{message_id:04x}"

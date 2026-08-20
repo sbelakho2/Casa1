@@ -1409,7 +1409,12 @@ pub struct User32Subsystem {
     /// Active timers: (hwnd, timer_id) → (expiry, interval_ms). An interval
     /// of 0 marks a one-shot timer; positive intervals are periodic and are
     /// re-armed by poll_timers after each expiry (Win32 SetTimer semantics).
-    timers: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64)>,
+    /// Registered `SetTimer` timers: (hwnd, timer_id) → (expiry, period, callback).
+    ///
+    /// `callback == 0` delivers a plain WM_TIMER message (wParam = timer_id);
+    /// a non-zero callback is the guest TIMERPROC, delivered through the
+    /// WM_TIMER lParam exactly like Windows DispatchMessage semantics.
+    timers: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64, u64)>,
     /// Clipboard open state (OpenClipboard/CloseClipboard tracking).
     clipboard_open: bool,
     /// Window that currently owns the clipboard.
@@ -2454,10 +2459,21 @@ impl User32Subsystem {
     }
 
     /// Set a timer (called from the dispatch side for SetTimer).
-    pub fn set_timer(&mut self, hwnd: Hwnd, timer_id: usize, timeout_ms: u32) -> bool {
+    ///
+    /// `callback` is the guest TIMERPROC address (0 for WM_TIMER-style
+    /// timers); it is carried through the WM_TIMER lParam so
+    /// DispatchMessage can invoke it with Windows semantics.
+    pub fn set_timer(
+        &mut self,
+        hwnd: Hwnd,
+        timer_id: usize,
+        timeout_ms: u32,
+        callback: u64,
+    ) -> bool {
         let interval = timeout_ms as u64;
         let expiry = std::time::SystemTime::now() + std::time::Duration::from_millis(interval);
-        self.timers.insert((hwnd, timer_id), (expiry, interval));
+        self.timers
+            .insert((hwnd, timer_id), (expiry, interval, callback));
         true
     }
 
@@ -2465,23 +2481,33 @@ impl User32Subsystem {
     pub fn poll_timers(&mut self) -> Vec<(Hwnd, usize)> {
         let now = std::time::SystemTime::now();
         let mut expired = Vec::new();
-        let mut rearmed: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64)> = BTreeMap::new();
-        self.timers.retain(|&(hwnd, id), (expiry, period)| {
-            if *expiry <= now {
-                expired.push((hwnd, id));
-                // Periodic timers (interval > 0) re-arm themselves so
-                // animation/game timers keep firing until KillTimer.
-                if *period > 0 {
-                    let next = now + std::time::Duration::from_millis(*period);
-                    rearmed.insert((hwnd, id), (next, *period));
+        let mut rearmed: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64, u64)> =
+            BTreeMap::new();
+        self.timers
+            .retain(|&(hwnd, id), (expiry, period, callback)| {
+                if *expiry <= now {
+                    expired.push((hwnd, id));
+                    // Periodic timers (interval > 0) re-arm themselves so
+                    // animation/game timers keep firing until KillTimer.
+                    if *period > 0 {
+                        let next = now + std::time::Duration::from_millis(*period);
+                        rearmed.insert((hwnd, id), (next, *period, *callback));
+                    }
+                    false
+                } else {
+                    true
                 }
-                false
-            } else {
-                true
-            }
-        });
+            });
         self.timers.extend(rearmed);
         expired
+    }
+
+    /// The guest TIMERPROC registered for a (hwnd, timer_id) timer, if any.
+    pub fn timer_callback(&self, hwnd: Hwnd, timer_id: usize) -> u64 {
+        self.timers
+            .get(&(hwnd, timer_id))
+            .map(|(_, _, callback)| *callback)
+            .unwrap_or(0)
     }
 
     /// Return count of active timers.
@@ -3089,7 +3115,7 @@ impl User32Subsystem {
     }
 
     /// Post a WM_TIMER message for a due `SetTimer` timer to the owning
-    /// thread's message queue (wParam = timer_id, lParam = 0).
+    /// thread's message queue (wParam = timer_id, lParam = TIMERPROC).
     ///
     /// Win32 delivers timers as WM_TIMER messages to the queue of the
     /// thread that created the window (all Casa1 windows are created by
@@ -3097,12 +3123,17 @@ impl User32Subsystem {
     /// `post_message_w`, this does NOT require the window record to still
     /// exist: the timer has already fired and the window may have been
     /// destroyed between `poll_timers` and the post.
-    pub fn post_timer_message(&mut self, hwnd: Hwnd, timer_id: usize) -> AppResult<()> {
+    pub fn post_timer_message(
+        &mut self,
+        hwnd: Hwnd,
+        timer_id: usize,
+        callback: u64,
+    ) -> AppResult<()> {
         self.enqueue(Message {
             hwnd: Some(hwnd),
             kind: MessageKind::Other(WM_TIMER),
             wparam: timer_id as i64,
-            lparam: 0,
+            lparam: callback as i64,
             translated: false,
             device_id: None,
         })
@@ -5754,6 +5785,15 @@ impl User32Subsystem {
         })
     }
 
+    /// The tracked screen origin (x, y) of a window, or `(0, 0)` when the
+    /// window does not exist.
+    pub fn window_origin(&self, hwnd: Hwnd) -> (i32, i32) {
+        self.windows
+            .get(&hwnd)
+            .map(|window| (window.x, window.y))
+            .unwrap_or((0, 0))
+    }
+
     pub fn window_previews(&self) -> Vec<WindowPreview> {
         self.windows
             .values()
@@ -7235,7 +7275,7 @@ mod tests {
     #[test]
     fn test_set_and_kill_timer() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(user32.set_timer(1, 42, 1000), "set_timer should succeed");
+        assert!(user32.set_timer(1, 42, 1000, 0), "set_timer should succeed");
         assert_eq!(user32.timer_count(), 1, "should have 1 active timer");
         assert!(user32.kill_timer(1, 42), "kill_timer should return true");
         assert_eq!(
@@ -7249,17 +7289,46 @@ mod tests {
     fn test_timer_count() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         assert_eq!(user32.timer_count(), 0, "initially no timers");
-        user32.set_timer(1, 1, 1000);
-        user32.set_timer(1, 2, 2000);
-        user32.set_timer(2, 1, 500);
+        user32.set_timer(1, 1, 1000, 0);
+        user32.set_timer(1, 2, 2000, 0);
+        user32.set_timer(2, 1, 500, 0);
         assert_eq!(user32.timer_count(), 3, "three timers should be active");
+    }
+
+    #[test]
+    fn test_timer_proc_callback_is_stored_and_survives_rearm() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let callback = 0x77_000_u64;
+        assert_eq!(user32.timer_callback(1, 42), 0, "no timer — no callback");
+        assert!(
+            user32.set_timer(1, 42, 1000, callback),
+            "set_timer succeeds"
+        );
+        assert_eq!(
+            user32.timer_callback(1, 42),
+            callback,
+            "the guest TIMERPROC must be stored"
+        );
+        // Periodic rearm (poll_timers) preserves the callback.
+        user32.set_timer(1, 43, 0, callback);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let expired = user32.poll_timers();
+        assert!(expired.contains(&(1, 43)), "the 0ms timer must expire");
+        assert_eq!(
+            user32.timer_callback(1, 42),
+            callback,
+            "an unrelated timer keeps its callback"
+        );
+        // kill_timer removes the callback with the timer.
+        assert!(user32.kill_timer(1, 42));
+        assert_eq!(user32.timer_callback(1, 42), 0, "callback gone after kill");
     }
 
     #[test]
     fn test_poll_timers_expired() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // Set a timer with 0ms timeout so it should already be expired
-        user32.set_timer(1, 99, 0);
+        user32.set_timer(1, 99, 0, 0);
         // Give it a brief moment to pass
         std::thread::sleep(std::time::Duration::from_millis(1));
         let expired = user32.poll_timers();
@@ -7274,7 +7343,7 @@ mod tests {
     #[test]
     fn test_poll_timers_none_expired() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.set_timer(1, 1, 10_000); // 10 seconds — won't expire in test
+        user32.set_timer(1, 1, 10_000, 0); // 10 seconds — won't expire in test
         let expired = user32.poll_timers();
         assert!(
             expired.is_empty(),
@@ -7288,7 +7357,7 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // Positive intervals are periodic: after firing, the timer is
         // re-armed (Win32 SetTimer semantics) until KillTimer.
-        user32.set_timer(1, 7, 1);
+        user32.set_timer(1, 7, 1, 0);
         std::thread::sleep(std::time::Duration::from_millis(2));
         let fired = user32.poll_timers();
         assert!(fired.contains(&(1, 7)), "periodic timer should fire");
@@ -7890,7 +7959,7 @@ mod tests {
         while user32.get_message_w().is_some() {}
 
         // Set up a timer with 0ms (fires immediately).
-        assert!(user32.set_timer(hwnd, 42, 0), "set_timer should succeed");
+        assert!(user32.set_timer(hwnd, 42, 0, 0), "set_timer should succeed");
 
         // Poll timers to fire the timer.
         let fired = user32.poll_timers();
