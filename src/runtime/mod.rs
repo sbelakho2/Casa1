@@ -8224,16 +8224,18 @@ impl NtThunkSession {
         let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
         runtime.set_guest_arch(GuestArch::X64);
         let mut memory = MemoryImage::default();
-        memory.set_vm(&mut runtime.vm);
+        memory.set_vm(runtime.win32.address_space_mut());
         let stack = 0x10_000;
         memory.map_bytes(stack, &[0_u8; 0x1000]);
         // The scratch test arena (stack + guest buffers for in/out
         // parameters), registered in the canonical VM like a live loader
         // region so the checked accessors validate it.
-        runtime
-            .vm
-            .register(0x10_000, 0x60_000, crate::vm::VmRegionKind::Private);
-        runtime.vm.commit(
+        runtime.win32.address_space_mut().register(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmRegionKind::Private,
+        );
+        runtime.win32.address_space_mut().commit(
             0x10_000,
             0x60_000,
             crate::vm::VmProtection::READ_WRITE,
@@ -8301,10 +8303,11 @@ impl NtThunkSession {
         self.runtime.guest_pid
     }
 
-    /// The canonical virtual-memory layer.
+    /// The canonical virtual-memory layer (the subsystem's address
+    /// space — the one VirtualMemory interpreter/JIT/win32 share).
     #[doc(hidden)]
     pub fn vm(&self) -> &crate::vm::VirtualMemory {
-        &self.runtime.vm
+        self.runtime.win32.address_space()
     }
 
     /// The live Win32 subsystem (the one handle namespace).

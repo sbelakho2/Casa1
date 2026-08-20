@@ -151,7 +151,7 @@ impl PeHostRuntime {
             0
         };
         match nt::memory::nt_allocate_virtual_memory(
-            &mut self.vm,
+            self.win32.address_space_mut(),
             base_in,
             zero_bits,
             size_in,
@@ -201,7 +201,12 @@ impl PeHostRuntime {
         } else {
             0
         };
-        match nt::memory::nt_free_virtual_memory(&mut self.vm, base_in, size_in, free_type) {
+        match nt::memory::nt_free_virtual_memory(
+            self.win32.address_space_mut(),
+            base_in,
+            size_in,
+            free_type,
+        ) {
             Ok((_base, range)) => {
                 // Unmap the raw pages of the affected range (the canonical
                 // VM state is already updated by the layer).
@@ -248,7 +253,12 @@ impl PeHostRuntime {
         } else {
             0
         };
-        match nt::memory::nt_protect_virtual_memory(&mut self.vm, base_in, size_in, new_protect) {
+        match nt::memory::nt_protect_virtual_memory(
+            self.win32.address_space_mut(),
+            base_in,
+            size_in,
+            new_protect,
+        ) {
             Ok((_range, old_protection)) => {
                 if old_protect_ptr != 0 {
                     write_u32(memory, old_protect_ptr, old_protection);
@@ -295,7 +305,7 @@ impl PeHostRuntime {
             );
             return Ok(());
         }
-        let info = nt::memory::nt_query_virtual_memory(&self.vm, address);
+        let info = nt::memory::nt_query_virtual_memory(self.win32.address_space(), address);
         let bytes = info.serialize_x64();
         memory.map_bytes(buffer, &bytes);
         if return_length_ptr != 0 {
@@ -909,9 +919,14 @@ impl PeHostRuntime {
                 // space the interpreter/JIT validate against).
                 if base != 0 && actual_size > 0 {
                     let protection = nt::protection_from_page_flags(protect);
-                    self.vm
-                        .register(base, actual_size, crate::vm::VmRegionKind::Private);
-                    self.vm.commit(base, actual_size, protection, false);
+                    self.win32.address_space_mut().register(
+                        base,
+                        actual_size,
+                        crate::vm::VmRegionKind::Private,
+                    );
+                    self.win32
+                        .address_space_mut()
+                        .commit(base, actual_size, protection, false);
                 }
                 if base_address_ptr != 0 {
                     write_guest_pointer(memory, base_address_ptr, base, self.guest_arch)?;

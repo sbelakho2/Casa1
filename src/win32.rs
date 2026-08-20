@@ -1298,7 +1298,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Event(_) => {
-                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+                Self::require_access(&entry, EVENT_MODIFY_STATE)?;
             }
             _ => return invalid_handle("handle is not an event"),
         }
