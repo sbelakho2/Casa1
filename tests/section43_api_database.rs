@@ -120,8 +120,9 @@ fn database_seeds_nt_surface_matching_runtime() {
         ImplementationLevel::Implemented,
         "the runtime dispatches NtQueryInformationProcess"
     );
-    // Everything else in the Nt* skeleton is honestly unsupported.
-    for unsupported in [
+    // The Stage-4 NTDLL foundation implemented the native surface — every
+    // dispatched Nt* API carries its Implemented level from THUNK_METADATA.
+    for implemented in [
         "NtCreateFile",
         "NtAllocateVirtualMemory",
         "NtWaitForSingleObject",
@@ -133,6 +134,17 @@ fn database_seeds_nt_surface_matching_runtime() {
         "NtCreateSection",
         "NtMapViewOfSection",
     ] {
+        let entry = database
+            .lookup("ntdll.dll", implemented)
+            .unwrap_or_else(|| panic!("{implemented} must have an entry"));
+        assert_eq!(
+            entry.implementation,
+            ImplementationLevel::Implemented,
+            "{implemented} is dispatched by the runtime"
+        );
+    }
+    // The remaining Nt* skeletons are honestly unsupported.
+    for unsupported in ["NtCreateFileMapping", "NtCreateProcess"] {
         let entry = database
             .lookup("ntdll.dll", unsupported)
             .unwrap_or_else(|| panic!("{unsupported} must have a skeleton entry"));

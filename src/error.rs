@@ -279,6 +279,8 @@ pub fn ntstatus_to_dos_error(status: u32) -> u32 {
     match status {
         // Success
         0x0000_0000 => ERROR_SUCCESS,
+        0x0000_0102 => ERROR_TIMEOUT,           // STATUS_TIMEOUT
+        0x0000_0103 => ERROR_INVALID_PARAMETER, // STATUS_PENDING (no canonical DOS error)
 
         // Informational / Warning
         0x0000_0001 => ERROR_INVALID_PARAMETER, // STATUS_WAIT_1

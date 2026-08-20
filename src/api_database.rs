@@ -1147,52 +1147,12 @@ fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
 /// `OutsideUserModeProfile` (kernel-tier): exempt from the user-mode
 /// completeness tier.
 static NT_API_SURFACE: &[SkeletonEntry] = &[
-    kernel_skeleton("NtAllocateVirtualMemory", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtClearEvent", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtClose", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateEvent", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateFile", ImplementationLevel::Unsupported),
+    // The Stage-4 NTDLL foundation implemented the Nt* surface — every
+    // implemented Nt*/Rtl* API is covered by THUNK_METADATA (the registered
+    // ntdll surface carries its Implemented level); only the still-missing
+    // Nt* skeletons stay here to quantify the remaining native-API gap.
     kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateKey", ImplementationLevel::Unsupported),
     kernel_skeleton("NtCreateProcess", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateSection", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateThreadEx", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtDelayExecution", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtDeviceIoControlFile", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtDuplicateObject", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtFreeVirtualMemory", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtGetContextThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtMapViewOfSection", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtOpenKey", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtProtectVirtualMemory", ImplementationLevel::Unsupported),
-    // NtQueryInformationProcess is covered by THUNK_METADATA (the registered
-    // ntdll surface carries its Implemented level); no skeleton row here to
-    // avoid a duplicate full key.
-    kernel_skeleton("NtQueryInformationThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtQueryObject", ImplementationLevel::Unsupported),
-    kernel_skeleton(
-        "NtQueryPerformanceCounter",
-        ImplementationLevel::Unsupported,
-    ),
-    kernel_skeleton("NtQuerySection", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtQuerySystemInformation", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtQueryTimerResolution", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtQueryValueKey", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtQueryVirtualMemory", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtReadVirtualMemory", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtResumeThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSetContextThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSetEvent", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSetInformationThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSetTimerResolution", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSetValueKey", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtSuspendThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtTerminateProcess", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtTerminateThread", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtUnmapViewOfSection", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtWaitForMultipleObjects", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtWaitForSingleObject", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtWriteVirtualMemory", ImplementationLevel::Unsupported),
 ];
 
 /// The core COM interface surface, marked at the runtime's actual level.

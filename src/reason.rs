@@ -119,6 +119,46 @@ impl ReasonCode {
         self as u32
     }
 
+    /// The canonical NTSTATUS for a reason code — the Stage-4 NTDLL
+    /// boundary: the Nt* layer converts an `AppError` to NTSTATUS through
+    /// this single mapping (the Win32 wrapper converts back with
+    /// `ntdll::nt_status_to_dos_error`).
+    pub const fn nt_status(self) -> crate::ntdll::NtStatus {
+        match self {
+            Self::Success => crate::ntdll::STATUS_SUCCESS,
+            Self::RcWin32InvalidHandle | Self::RcHandleStaleOrInvalid => {
+                crate::ntdll::STATUS_INVALID_HANDLE
+            }
+            Self::RcWin32Timeout => crate::ntdll::STATUS_TIMEOUT,
+            Self::RcMemoryAccessViolation | Self::RcGuestPointerOutOfRange => {
+                crate::ntdll::STATUS_ACCESS_VIOLATION
+            }
+            Self::RcFsNotFound | Self::RcRegistryNotFound => {
+                crate::ntdll::STATUS_OBJECT_NAME_NOT_FOUND
+            }
+            Self::RcFsAlreadyExists => crate::ntdll::STATUS_OBJECT_NAME_COLLISION,
+            Self::RcFsPathInvalid
+            | Self::RcFsReservedName
+            | Self::RcFsPathTooLong
+            | Self::RcGuestStringInvalid => crate::ntdll::STATUS_OBJECT_NAME_INVALID,
+            Self::RcFsSharingViolation => crate::ntdll::STATUS_SHARING_VIOLATION,
+            Self::RcFsLockViolation => crate::ntdll::STATUS_LOCK_VIOLATION,
+            Self::RcFsSandboxEscape
+            | Self::RcSandboxPathViolation
+            | Self::RcHelperPermissionDenied => crate::ntdll::STATUS_ACCESS_DENIED,
+            Self::RcOutOfMemory | Self::RcOutOfMemoryHint => crate::ntdll::STATUS_NO_MEMORY,
+            Self::RcBufferLimitExceeded => crate::ntdll::STATUS_BUFFER_TOO_SMALL,
+            Self::RcUnimplInsn | Self::RcUnsupportedPlatformApi => {
+                crate::ntdll::STATUS_NOT_SUPPORTED
+            }
+            Self::RcPeParseInvalid | Self::RcInvalidGuestEnum => {
+                crate::ntdll::STATUS_INVALID_IMAGE_FORMAT
+            }
+            Self::RcImportMissing => crate::ntdll::STATUS_ENTRYPOINT_NOT_FOUND,
+            _ => crate::ntdll::STATUS_INVALID_PARAMETER,
+        }
+    }
+
     pub const fn from_u32(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::Success),

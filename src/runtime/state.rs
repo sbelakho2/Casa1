@@ -402,6 +402,13 @@ pub(crate) struct DllInfo {
 pub(crate) struct PeHostRuntime {
     pub(crate) audio: AudioSubsystem,
     pub(crate) win32: Win32Subsystem,
+    /// The GUEST process id of this runtime — from the canonical guest-PID
+    /// namespace ([`crate::runtime::process::allocate_guest_pid`]), NEVER
+    /// the host's POSIX pid.  The Nt* process-information surface reports
+    /// this identity; the Win32 `GetCurrentProcessId` thunk still reports
+    /// the legacy host-derived id (its guest-pid migration is the Stage-3
+    /// integration item tracked by tests/section45_canonical_state.rs).
+    pub(crate) guest_pid: u32,
     pub(crate) user32: User32Subsystem,
     /// Generic runtime-event observers (workloads like the Steam milestone
     /// observer).  Empty by default — the runtime works perfectly with no
@@ -1044,6 +1051,7 @@ impl PeHostRuntime {
         let mut runtime = Self {
             audio: AudioSubsystem::new(),
             win32: Win32Subsystem::new_with_live_pacing(ge, dtm, live_session.is_some()),
+            guest_pid: super::process::allocate_guest_pid(),
             user32,
             observers: observers.clone(),
             guest_arch: GuestArch::X64,
