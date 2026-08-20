@@ -865,39 +865,14 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
     ),
     (
         "kernel32.dll",
-        "GetCPInfo",
-        "only DEFAULT_ANSI/OEM code pages and 65001 (UTF-8) are recognized; other code \
-         pages fail with ERROR_INVALID_PARAMETER",
-    ),
-    (
-        "kernel32.dll",
         "GetDateFormatW",
         "formats only DATE_SHORTDATE or a fixed yyyy-MM-dd form using the current date — \
          no locale tables or custom format strings",
     ),
     (
         "kernel32.dll",
-        "GetProcessAffinityMask",
-        "returns the fixed 8-core affinity mask (0xFF) of the runtime's virtual topology — \
-         the same mask GetSystemInfo/GetNativeSystemInfo/NtQuerySystemInformation report; \
-         it is not the host's actual process/system affinity",
-    ),
-    (
-        "kernel32.dll",
         "GetTimeFormatW",
         "formats only HH:MM:SS; locale and format pointer are ignored",
-    ),
-    (
-        "kernel32.dll",
-        "GlobalMemoryStatusEx",
-        "writes plausible fixed memory figures (16 GB total / 8 GB available); not read \
-         from host state",
-    ),
-    (
-        "kernel32.dll",
-        "IsValidCodePage",
-        "recognizes only DEFAULT_ANSI/OEM code pages and 65001; every other code page is \
-         reported invalid",
     ),
     (
         "kernel32.dll",
@@ -924,11 +899,6 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
     ),
     (
         "gdi32.dll",
-        "CreateICW",
-        "returns a valid information-context HDC without driver/device setup",
-    ),
-    (
-        "gdi32.dll",
         "GetDeviceCaps",
         "fixed caps table (2560x1600 screen, 32-bit color, LOGPIXELS 144); unrecognized \
          indexes return 0",
@@ -944,12 +914,6 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
         "GetSystemMetrics",
         "fixed metrics table (1024x768 screen, 17px borders, 16px captions); unrecognized \
          indexes return 0",
-    ),
-    (
-        "user32.dll",
-        "SetTimer",
-        "only WM_TIMER-style timers (callback == 0) are registered; a non-null TIMERPROC \
-         cannot be invoked by the host and stays a no-op",
     ),
     (
         "ws2_32.dll",
@@ -1639,6 +1603,131 @@ static DELIBERATELY_UNSUPPORTED: &[DeliberatelyUnsupportedSeed] = &[
         "kernel32.dll",
         "SetConsoleMode",
         "No-op success (TRUE) — console mode is fixed; requests to change it are silently accepted.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "GetConsoleCP",
+        "Returns DEFAULT_OEM_CODE_PAGE (437) — the OEM codepage the runtime operates under.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "SetConsoleCtrlHandler",
+        "Returns TRUE — console control events are never delivered to the guest; handler registration is a no-op.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "SetStdHandle",
+        "Returns TRUE — the standard-handle table is fixed; the request is silently accepted.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "SetProcessAffinityMask",
+        "Returns TRUE — guest process affinity is the fixed virtual-topology mask (0xFF); the request is a no-op.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "SetThreadAffinityMask",
+        "Returns the previous affinity mask (1) — guest thread affinity is fixed to the virtual topology; the request is a no-op.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "HeapWalk",
+        "Returns FALSE — the runtime's bump-allocator guest heap exposes no walkable entries.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "HeapQueryInformation",
+        "Returns TRUE — heap information options are not applicable; success is the compatible answer.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "ReadConsoleA",
+        "Returns FALSE (no input read) — the guest has no interactive console; reads fail closed.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "ReadConsoleW",
+        "Returns FALSE (no input read) — the guest has no interactive console; reads fail closed.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "FindResourceA",
+        "Returns a fabricated resource handle over zeroed data — the module's actual .rsrc resource bytes are not parsed.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "LoadResource",
+        "Returns a fabricated 4 KB zeroed data pointer — the module's actual resource bytes are not loaded.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "LockResource",
+        "Returns the LoadResource pointer as-is — fabricated resource data, not the module's actual bytes.",
+    ),
+    deliberately_unsupported(
+        "kernel32.dll",
+        "SizeofResource",
+        "Returns the fixed fabricated size (4096) — not the module's actual resource size.",
+    ),
+    deliberately_unsupported(
+        "ole32.dll",
+        "CoTaskMemFree",
+        "No-op — the runtime's guest heap is a bump allocator that never reuses freed memory; the void call is legal.",
+    ),
+    deliberately_unsupported(
+        "gdi32.dll",
+        "AddFontMemResourceEx",
+        "Returns a non-zero fake handle — the font is not actually added to the GDI font table; text rendering is unaffected.",
+    ),
+    deliberately_unsupported(
+        "gdi32.dll",
+        "RemoveFontMemResourceEx",
+        "Returns TRUE — font removal is a no-op on the runtime's GDI font table.",
+    ),
+    deliberately_unsupported(
+        "gdi32.dll",
+        "ChoosePixelFormat",
+        "Returns pixel-format index 1 — every requested format matches the runtime's single fixed pixel format.",
+    ),
+    deliberately_unsupported(
+        "gdi32.dll",
+        "SetPixelFormat",
+        "Returns TRUE — the runtime's single fixed pixel format is always accepted.",
+    ),
+    deliberately_unsupported(
+        "gdi32.dll",
+        "SwapBuffers",
+        "Returns TRUE — the swap is a no-op on the runtime's composited output.",
+    ),
+    deliberately_unsupported(
+        "user32.dll",
+        "MessageBoxA",
+        "Returns IDOK (1) — the headless runtime displays no dialog and answers IDOK immediately.",
+    ),
+    deliberately_unsupported(
+        "user32.dll",
+        "AllowSetForegroundWindow",
+        "Returns TRUE — no foreground-window restrictions are enforced; the request is a no-op.",
+    ),
+    deliberately_unsupported(
+        "user32.dll",
+        "GetProcessWindowStation",
+        "Returns a synthetic window-station handle (1) — the runtime has no window-station object model.",
+    ),
+    deliberately_unsupported(
+        "user32.dll",
+        "GetUserObjectInformationW",
+        "Returns FALSE — no window-station object model exists to query.",
+    ),
+    deliberately_unsupported(
+        "shell32.dll",
+        "IsUserAnAdmin",
+        "Returns FALSE — the guest process is not elevated (the deliberate non-admin answer).",
+    ),
+    deliberately_unsupported(
+        "shell32.dll",
+        "SHGetFileInfoW",
+        "Returns 0 with the SHFILEINFOW struct zeroed — the runtime has no shell file-info/icon model.",
     ),
 ];
 

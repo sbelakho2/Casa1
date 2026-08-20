@@ -755,8 +755,132 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const DRIVE_FIXED: u32 = 3;
+const DRIVE_UNKNOWN: u32 = 0;
 const WIN32_FIND_DATAW_FILE_NAME_CHARS: usize = 260;
 const WIN32_FIND_DATAW_ALT_FILE_NAME_CHARS: usize = 14;
+
+/// Maximum character size (bytes per char) of a Windows code page the
+/// runtime recognizes, or `None` for unknown/invalid code pages.
+///
+/// The recognized set is the canonical Windows NLS code page table: the
+/// ANSI SBCS pages (1250–1258), the OEM SBCS pages, the East-Asian DBCS
+/// pages (932/936/949/950), and UTF-8 (65001).  The runtime's conversions
+/// (wide_char_to_multi_byte / multi_byte_to_wide_char) route every
+/// non-ACP/UTF-8 page through iconv, so a page recognized here can be
+/// converted.
+fn guest_code_page_max_char_size(code_page: u32) -> Option<u32> {
+    match code_page {
+        // ANSI single-byte pages.
+        1250..=1258 => Some(1),
+        // OEM single-byte pages (including Thai 874).
+        437 | 708 | 720 | 737 | 775 | 850 | 852 | 855 | 857 | 858 | 860 | 861 | 862 | 863 | 864
+        | 865 | 866 | 869 | 874 => Some(1),
+        // East-Asian double-byte pages.
+        932 | 936 | 949 | 950 => Some(2),
+        // UTF-8 (up to 4 bytes per code point).
+        65001 => Some(4),
+        _ => None,
+    }
+}
+
+/// Real host memory figures for `GlobalMemoryStatusEx`
+/// (total/available physical and page-file bytes).
+///
+/// Queried from the host via `sysctlbyname` (hw.memsize, hw.pagesize,
+/// vm.page_free_count, vm.swapusage); falls back to the previous fixed
+/// figures when the host cannot be queried.  Returns
+/// (total_phys, avail_phys, total_page, avail_page).
+fn host_memory_status() -> (u64, u64, u64, u64) {
+    // Defaults: the fixed figures previously reported.
+    let mut total_phys: u64 = 16 * 1024 * 1024 * 1024;
+    let mut avail_phys: u64 = 8 * 1024 * 1024 * 1024;
+
+    // SAFETY: sysctlbyname with a well-formed NUL-terminated name and a
+    // caller-sized output buffer; the kernel validates the MIB name.
+    let (total_page, avail_page) = unsafe {
+        let sysctl_u64 = |name: &str| -> Option<u64> {
+            let c_name = std::ffi::CString::new(name).ok()?;
+            let mut len: libc::size_t = 0;
+            if libc::sysctlbyname(
+                c_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+                || len == 0
+            {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            if libc::sysctlbyname(
+                c_name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
+                return None;
+            }
+            match buf.len() {
+                8 => Some(u64::from_le_bytes(buf.try_into().unwrap())),
+                4 => Some(u32::from_le_bytes(buf.try_into().unwrap()) as u64),
+                _ => None,
+            }
+        };
+
+        if let Some(memsize) = sysctl_u64("hw.memsize") {
+            total_phys = memsize.max(1);
+        }
+        let page_size = sysctl_u64("hw.pagesize").unwrap_or(4096).max(1);
+        if let Some(free_pages) = sysctl_u64("vm.page_free_count") {
+            avail_phys = free_pages.saturating_mul(page_size).min(total_phys);
+        }
+        // vm.swapusage is struct xsw_usage { xsu_total, xsu_avail, ... }
+        // — the first two u64 fields are total and available swap bytes.
+        match (|| {
+            let c_name = std::ffi::CString::new("vm.swapusage").ok()?;
+            let mut len: libc::size_t = 0;
+            if libc::sysctlbyname(
+                c_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+                || len < 16
+            {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            if libc::sysctlbyname(
+                c_name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
+                return None;
+            }
+            Some(buf)
+        })() {
+            Some(raw) => {
+                let swap_total = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+                let swap_avail = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+                let total = total_phys.saturating_add(swap_total).max(1);
+                let available = avail_phys.saturating_add(swap_avail).min(total);
+                (total, available)
+            }
+            None => {
+                let total = total_phys.saturating_mul(2).max(1);
+                (total, avail_phys.min(total))
+            }
+        }
+    };
+    (total_phys, avail_phys, total_page, avail_page)
+}
 
 /// How a PE execution ended.  The structured termination is authoritative;
 /// `exit_code` keeps its legacy meaning (-2 for harness cancellation).
@@ -21258,12 +21382,13 @@ impl PeHostRuntime {
                 let result = if timer_id == 0 { 1 } else { timer_id };
                 // Register the timer with user32 so the scheduler's
                 // poll_guest_timers (GetMessageW idle drain + block-dispatch
-                // safepoint) fires WM_TIMER for it.  user32's set_timer
-                // stores no guest timer proc, so only WM_TIMER-style timers
-                // (callback == 0) are registered — a non-null TIMERPROC
-                // cannot be invoked by the host and stays a no-op.
-                if self.user32.has_window(hwnd) && callback == 0 {
-                    self.user32.set_timer(hwnd, timer_id as usize, elapse);
+                // safepoint) fires WM_TIMER for it.  A non-null TIMERPROC is
+                // carried through the WM_TIMER lParam and invoked by
+                // DispatchMessage exactly like Windows (the timer proc takes
+                // precedence over the window proc for WM_TIMER).
+                if self.user32.has_window(hwnd) {
+                    self.user32
+                        .set_timer(hwnd, timer_id as usize, elapse, callback);
                 }
                 state.set(Register::Rax, result as u64);
                 self.last_error = if hwnd == 0 || self.user32.has_window(hwnd) { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
@@ -26091,18 +26216,14 @@ impl PeHostRuntime {
             }
             HostThunk::IsValidCodePage => {
                 let code_page = guest_call_arg_u32(state, memory, 0)?;
-                let valid = matches!(code_page, DEFAULT_ANSI_CODE_PAGE | DEFAULT_OEM_CODE_PAGE | 65001);
+                let valid = guest_code_page_max_char_size(code_page).is_some();
                 state.set(Register::Rax, if valid { 1 } else { 0 });
                 self.last_error = if valid { 0 } else { ERROR_INVALID_PARAMETER };
             }
             HostThunk::GetCPInfo => {
                 let code_page = guest_call_arg_u32(state, memory, 0)?;
                 let cp_info = guest_call_arg(state, memory, 1)?;
-                let max_char_size = match code_page {
-                    DEFAULT_ANSI_CODE_PAGE | DEFAULT_OEM_CODE_PAGE => Some(1_u32),
-                    65001 => Some(4_u32),
-                    _ => None,
-                };
+                let max_char_size = guest_code_page_max_char_size(code_page);
                 if let Some(max_char_size) = max_char_size {
                     if cp_info != 0 {
                         write_u32(memory, cp_info, max_char_size);
@@ -39872,8 +39993,16 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::GetDriveTypeW => {
-                // Return DRIVE_FIXED (3) for any path
-                state.set(Register::Rax, 3);
+                // GetDriveTypeW(root_path_name) — drive classification.
+                let root_path_ptr = arg(0);
+                let drive_type = if root_path_ptr == 0 {
+                    DRIVE_UNKNOWN
+                } else {
+                    let path = read_utf16_string(memory, root_path_ptr).unwrap_or_default();
+                    self.win32.drive_type_for_path(Some(&path))
+                };
+                state.set(Register::Rax, drive_type as u64);
+                self.last_error = 0;
             }
             HostThunk::CompareStringW => {
                 let _locale = arg(0);
@@ -39894,26 +40023,28 @@ impl PeHostRuntime {
             HostThunk::GlobalMemoryStatusEx => {
                 let buffer_ptr = arg(0);
                 if buffer_ptr != 0 {
-                    // Write a plausible MEMORYSTATUSEX struct (64 bytes for x86)
-                    let total_phys: u64 = 16 * 1024 * 1024 * 1024; // 16 GB
-                    let avail_phys: u64 = 8 * 1024 * 1024 * 1024;  // 8 GB
-                    let total_page: u64 = 32 * 1024 * 1024 * 1024;
-                    let avail_page: u64 = 16 * 1024 * 1024 * 1024;
+                    // Real host memory figures (falling back to fixed figures
+                    // when the host cannot be queried).
+                    let (total_phys, avail_phys, total_page, avail_page) = host_memory_status();
                     let total_virt: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB for x86
                     let avail_virt: u64 = 1024 * 1024 * 1024;
                     let memory_load = ((total_phys - avail_phys) * 100 / total_phys) as u32;
-                    let offset = if self.guest_arch == GuestArch::X86 { 4u64 } else { 8u64 };
+                    // MEMORYSTATUSEX layout: dwLength@0, dwMemoryLoad@4,
+                    // then the DWORDLONG fields 8-byte aligned at 8..56
+                    // (identical offsets on x86 and x64).  The DWORDLONG
+                    // fields are 8-byte writes regardless of guest arch.
                     write_u32(memory, buffer_ptr, 64); // dwLength
                     write_u32(memory, buffer_ptr + 4, memory_load);
-                    write_guest_pointer(memory, buffer_ptr + offset + 8, total_phys, self.guest_arch)?;
-                    write_guest_pointer(memory, buffer_ptr + offset + 16, avail_phys, self.guest_arch)?;
-                    write_guest_pointer(memory, buffer_ptr + offset + 24, total_page, self.guest_arch)?;
-                    write_guest_pointer(memory, buffer_ptr + offset + 32, avail_page, self.guest_arch)?;
-                    write_guest_pointer(memory, buffer_ptr + offset + 40, total_virt, self.guest_arch)?;
-                    write_guest_pointer(memory, buffer_ptr + offset + 48, avail_virt, self.guest_arch)?;
+                    memory.write_u64(buffer_ptr + 8, total_phys);
+                    memory.write_u64(buffer_ptr + 16, avail_phys);
+                    memory.write_u64(buffer_ptr + 24, total_page);
+                    memory.write_u64(buffer_ptr + 32, avail_page);
+                    memory.write_u64(buffer_ptr + 40, total_virt);
+                    memory.write_u64(buffer_ptr + 48, avail_virt);
                     state.set(Register::Rax, 1);
                 } else {
                     state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
                 }
             }
             HostThunk::HeapValidate => {
@@ -40099,16 +40230,34 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // previous affinity mask (non-zero = success)
             }
             HostThunk::GetProcessAffinityMask => {
-                let _process_handle = arg(0);
+                let process_handle = arg(0);
                 let affinity_ptr = arg(1);
                 let system_ptr = arg(2);
-                if affinity_ptr != 0 {
-                    write_u32(memory, affinity_ptr, 0xFF); // 8 cores
+                // The runtime's virtual topology is fixed at 8 cores, and
+                // every guest process defaults to the full mask — the SAME
+                // mask GetSystemInfo/GetNativeSystemInfo/NtQuerySystemInformation
+                // report.  The process handle must be valid (or the current
+                // process) or Windows semantics demand FALSE.
+                let valid_process = process_handle != 0
+                    && (process_handle == u64::from(self.win32.current_process_handle())
+                        || matches!(
+                            self.win32.handle_object_type(process_handle as u32),
+                            Ok(crate::win32::ObjectType::Process)
+                        ));
+                if !valid_process {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
                 }
-                if system_ptr != 0 {
-                    write_u32(memory, system_ptr, 0xFF);
+                if affinity_ptr == 0 || system_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
+                write_guest_pointer(memory, affinity_ptr, 0xFF, self.guest_arch)?; // 8 cores
+                write_guest_pointer(memory, system_ptr, 0xFF, self.guest_arch)?;
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::DebugBreak => {
                 // DebugBreak generates STATUS_BREAKPOINT (0x8000_0003).
@@ -40388,8 +40537,24 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::InterlockedPushEntrySList => {
-                // Stub — return the list head
-                state.set(Register::Rax, 0);
+                // InterlockedPushEntrySList(ListHead, ListEntry) — push an
+                // entry onto the singly-linked list and return the previous
+                // first entry.  The guest SLIST_HEADER's first pointer field
+                // is the list head; the entry's first field is its Next link.
+                // The cooperative guest model makes the update a plain
+                // store (no cross-thread CAS required).
+                let head_ptr = arg(0);
+                let entry_ptr = arg(1);
+                if head_ptr == 0 || entry_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let old_first = read_guest_pointer(memory, head_ptr, self.guest_arch)?;
+                write_guest_pointer(memory, entry_ptr, old_first, self.guest_arch)?;
+                write_guest_pointer(memory, head_ptr, entry_ptr, self.guest_arch)?;
+                state.set(Register::Rax, old_first);
+                self.last_error = 0;
             }
             HostThunk::FindResourceA => {
                 // FindResourceA(module, name, type) — look up resource in PE.
@@ -41493,12 +41658,38 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // fake handle
             }
             HostThunk::EnumWindows => {
-                let _callback = arg(0);
-                let _lparam = arg(1);
-                // Enumerate all known windows by invoking the callback for each.
-                // Since we can't call guest callbacks synchronously from here,
-                // we just return TRUE (enumeration complete).
+                // EnumWindows(lpEnumFunc, lParam) — enumerate all top-level
+                // windows, invoking the callback for each.  The callback is a
+                // real guest invocation (WNDENUMPROC(hwnd, lParam)); a FALSE
+                // return stops the enumeration.  Success is non-zero.
+                let callback = arg(0);
+                let lparam = arg(1);
+                if callback == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let top_level: Vec<u32> = self
+                    .user32
+                    .window_previews()
+                    .into_iter()
+                    .filter(|window| window.parent.is_none())
+                    .map(|window| window.hwnd)
+                    .collect();
+                for hwnd in top_level {
+                    let cont = self.execute_guest_callback(
+                        state,
+                        memory,
+                        callback,
+                        &[u64::from(hwnd), lparam],
+                        "EnumWindowsProc",
+                    )?;
+                    if cont == 0 {
+                        break; // callback returned FALSE — stop enumerating
+                    }
+                }
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::MonitorFromPoint => {
                 let x = arg(0) as i32;
@@ -41616,10 +41807,104 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::EnumChildWindows => {
-                state.set(Register::Rax, 1); // TRUE
+                // EnumChildWindows(hWndParent, lpEnumFunc, lParam) —
+                // enumerate all descendant child windows of the parent (the
+                // desktop window when NULL), invoking the callback for each.
+                let parent = arg(0) as u32;
+                let callback = arg(1);
+                let lparam = arg(2);
+                if callback == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                if parent != 0 && !self.user32.has_window(parent) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_WINDOW_HANDLE;
+                    return Ok(None);
+                }
+                let previews = self.user32.window_previews();
+                let mut children = Vec::new();
+                let mut frontier: Vec<u32> = previews
+                    .iter()
+                    .filter(|window| {
+                        if parent == 0 {
+                            window.parent.is_none()
+                        } else {
+                            window.parent == Some(parent)
+                        }
+                    })
+                    .map(|window| window.hwnd)
+                    .collect();
+                while let Some(hwnd) = frontier.pop() {
+                    children.push(hwnd);
+                    frontier.extend(
+                        previews
+                            .iter()
+                            .filter(|window| window.parent == Some(hwnd))
+                            .map(|window| window.hwnd),
+                    );
+                }
+                for hwnd in children {
+                    let cont = self.execute_guest_callback(
+                        state,
+                        memory,
+                        callback,
+                        &[u64::from(hwnd), lparam],
+                        "EnumChildWindowsProc",
+                    )?;
+                    if cont == 0 {
+                        break; // callback returned FALSE — stop enumerating
+                    }
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::MapWindowPoints => {
-                state.set(Register::Rax, 0);
+                // MapWindowPoints(hwndFrom, hwndTo, lpPoints, cPoints) —
+                // convert points between two windows' coordinate spaces
+                // (screen coordinates when a handle is NULL).  All runtime
+                // windows are positioned in the tracked window model, so the
+                // offset is the difference of the two windows' origins.
+                let hwnd_from = arg(0) as u32;
+                let hwnd_to = arg(1) as u32;
+                let points_ptr = arg(2);
+                let point_count = arg(3) as u32;
+                if (hwnd_from != 0 && !self.user32.has_window(hwnd_from))
+                    || (hwnd_to != 0 && !self.user32.has_window(hwnd_to))
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_WINDOW_HANDLE;
+                    return Ok(None);
+                }
+                if points_ptr == 0 || point_count == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let origin = |hwnd: u32| -> (i32, i32) {
+                    if hwnd == 0 {
+                        (0, 0)
+                    } else {
+                        self.user32.window_origin(hwnd)
+                    }
+                };
+                let (from_x, from_y) = origin(hwnd_from);
+                let (to_x, to_y) = origin(hwnd_to);
+                let dx = to_x - from_x;
+                let dy = to_y - from_y;
+                let point_bytes = if self.guest_arch == GuestArch::X86 { 8 } else { 16 };
+                for i in 0..u64::from(point_count) {
+                    let point = points_ptr + i * point_bytes;
+                    let x = memory.read_u32(point).unwrap_or(0) as i32;
+                    let y = memory.read_u32(point + 4).unwrap_or(0) as i32;
+                    write_u32(memory, point, x.wrapping_add(dx) as u32);
+                    write_u32(memory, point + 4, y.wrapping_add(dy) as u32);
+                }
+                // Return value: low word = pixels added to x, high word = y.
+                let offset = (dx as u32 & 0xFFFF) | ((dy as u32 & 0xFFFF) << 16);
+                state.set(Register::Rax, offset as u64);
+                self.last_error = 0;
             }
             HostThunk::GetUserObjectInformationW => {
                 state.set(Register::Rax, 0); // FALSE
@@ -42039,17 +42324,33 @@ impl PeHostRuntime {
                 state.set(Register::Rax, bitmap_handle);
             }
             HostThunk::DeleteDC => {
-                state.set(Register::Rax, 1); // TRUE
+                // DeleteDC(hdc) — release the device context.
+                // A tracked DC is removed from the device-context table;
+                // unknown handles fail like Windows (FALSE).
+                let hdc = guest_call_arg(state, memory, 0)?;
+                if hdc == 0 || !self.device_contexts.contains_key(&hdc) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                } else {
+                    self.device_contexts.remove(&hdc);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
             }
             HostThunk::CreateICW => {
-                // CreateICW(driver, device, port, pdm) — create an information context.
-                // Return a valid HDC handle.
+                // CreateICW(driver, device, port, pdm) — create an
+                // information context: a valid HDC with no device attached
+                // (the Windows semantics of an information context).
+                // Registered in `device_contexts` with no target window so
+                // SelectObject / DeleteDC / GDI operations treat it as a
+                // valid (information) DC.
                 let _driver = arg(0);
                 let _device = arg(1);
                 let _port = arg(2);
                 let _pdm = arg(3);
                 let dc_handle = self.next_gdi_handle;
                 self.next_gdi_handle += 1;
+                self.device_contexts.insert(dc_handle, None);
                 state.set(Register::Rax, dc_handle);
             }
             HostThunk::CreateCompatibleDC => {
@@ -42073,12 +42374,15 @@ impl PeHostRuntime {
             }
             // -- Phase 1.3.3: advapi32.dll implementations --------------------------------
             HostThunk::RegisterEventSourceW => {
-                // RegisterEventSourceW(server_name, source_name) — register as an event source.
-                // Return a fake handle; actual logging is captured via ReportEventW.
+                // RegisterEventSourceW(server_name, source_name) — register as
+                // an event source.  Returns a handle consumed by
+                // ReportEventW/DeregisterEventSource; a NULL source name
+                // registers the application source ("application").
                 let _server = arg(0);
                 let source_name_ptr = arg(1);
                 let source_name = if source_name_ptr != 0 {
-                    read_utf16_string(memory, source_name_ptr).unwrap_or_else(|_| "unknown".to_string())
+                    read_utf16_string(memory, source_name_ptr)
+                        .unwrap_or_else(|_| "unknown".to_string())
                 } else {
                     "application".to_string()
                 };
@@ -42091,11 +42395,16 @@ impl PeHostRuntime {
                 }
                 memory.write_u8(event_handle + max_name as u64, 0);
                 state.set(Register::Rax, event_handle);
+                self.last_error = 0;
             }
             HostThunk::DeregisterEventSource => {
-                // DeregisterEventSource(event_log_handle) — close the event log handle.
-                // Since we allocated the handle with alloc_heap, we just return TRUE.
+                // DeregisterEventSource(event_log_handle) — close the event
+                // log handle.  The handle is a guest-heap registration block
+                // (the bump allocator does not free); closing is a no-op
+                // success, exactly the Windows-visible contract.
+                let _handle = arg(0);
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::ReportEventW => {
                 // ReportEventW(handle, type, category, event_id, sid, num_strings, data_size, strings, raw_data)
@@ -50071,13 +50380,19 @@ impl PeHostRuntime {
     /// guest timers fire during message-loop idle, guest spins and other
     /// waits — not only at the wait sites the guest itself enters.
     ///
-    /// user32's `set_timer` stores no guest timer proc, so every timer
-    /// fires as a WM_TIMER message with wParam = timer_id (lParam = 0).
+    /// A timer registered with a guest TIMERPROC fires as a WM_TIMER
+    /// message whose lParam carries the proc; DispatchMessage invokes it
+    /// (Windows semantics).
     fn poll_guest_timers(&mut self) -> AppResult<bool> {
         let due = self.user32.poll_timers();
         let mut posted = false;
         for (hwnd, timer_id) in due {
-            if self.user32.post_timer_message(hwnd, timer_id).is_ok() {
+            let callback = self.user32.timer_callback(hwnd, timer_id);
+            if self
+                .user32
+                .post_timer_message(hwnd, timer_id, callback)
+                .is_ok()
+            {
                 posted = true;
             }
         }
@@ -76914,6 +77229,394 @@ mod tests {
             total_bytes, capacity.total_bytes,
             "thunk and subsystem total figures must agree (volume total is stable)"
         );
+    }
+
+    #[test]
+    fn get_cp_info_and_is_valid_code_page_cover_the_standard_code_pages() {
+        let (mut runtime, _temp) = test_runtime("cp-info");
+        let mut memory = MemoryImage::default();
+        let get_cp_info = runtime.alloc_host_thunk(HostThunk::GetCPInfo);
+        let is_valid = runtime.alloc_host_thunk(HostThunk::IsValidCodePage);
+        let cp_info_ptr = 0x41_000_u32;
+        memory.map_bytes(cp_info_ptr as u64, &[0; 16]);
+
+        // ANSI SBCS page 1252: 1 byte/char.
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_cp_info, &[1252, cp_info_ptr]);
+        assert_eq!(result, 1);
+        assert_eq!(
+            memory.read_u32(cp_info_ptr as u64).expect("max char size"),
+            1
+        );
+        // DBCS page 932 (Shift-JIS): 2 bytes/char.
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_cp_info, &[932, cp_info_ptr]);
+        assert_eq!(result, 1);
+        assert_eq!(
+            memory.read_u32(cp_info_ptr as u64).expect("max char size"),
+            2
+        );
+        // UTF-8: 4 bytes/char.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_cp_info,
+            &[65001, cp_info_ptr],
+        );
+        assert_eq!(result, 1);
+        assert_eq!(
+            memory.read_u32(cp_info_ptr as u64).expect("max char size"),
+            4
+        );
+        // Unknown code pages fail with ERROR_INVALID_PARAMETER.
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_cp_info, &[9999, cp_info_ptr]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+        // IsValidCodePage mirrors the same table.
+        for valid in [437, 850, 932, 936, 949, 950, 1250, 1252, 1258, 65001] {
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, is_valid, &[valid]);
+            assert_eq!(result, 1, "code page {valid} must be valid");
+            assert_eq!(runtime.last_error, 0);
+        }
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, is_valid, &[9999]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn global_memory_status_ex_reports_host_memory_invariants() {
+        let (mut runtime, _temp) = test_runtime("memory-status");
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GlobalMemoryStatusEx);
+        let status_ptr = 0x41_000_u32;
+        memory.map_bytes(status_ptr as u64, &[0; 64]);
+
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[status_ptr]);
+        assert_eq!(result, 1);
+        assert_eq!(memory.read_u32(status_ptr as u64).expect("dwLength"), 64);
+        let memory_load = memory
+            .read_u32((status_ptr + 4) as u64)
+            .expect("dwMemoryLoad");
+        assert!(
+            memory_load <= 100,
+            "memory load must be 0..=100, got {memory_load}"
+        );
+        let total_phys = memory
+            .read_u64((status_ptr + 8) as u64)
+            .expect("total phys");
+        let avail_phys = memory
+            .read_u64((status_ptr + 16) as u64)
+            .expect("avail phys");
+        assert!(total_phys > 0, "total physical memory must be non-zero");
+        assert!(avail_phys <= total_phys, "available must not exceed total");
+        let total_page = memory
+            .read_u64((status_ptr + 24) as u64)
+            .expect("total page");
+        let avail_page = memory
+            .read_u64((status_ptr + 32) as u64)
+            .expect("avail page");
+        assert!(
+            total_page >= total_phys,
+            "page-file total must include physical"
+        );
+        assert!(
+            avail_page <= total_page,
+            "available page must not exceed total"
+        );
+        // The virtual figures stay the guest VA-space bounds (2 GB x86).
+        let total_virt = memory
+            .read_u64((status_ptr + 40) as u64)
+            .expect("total virt");
+        assert_eq!(total_virt, 2 * 1024 * 1024 * 1024);
+        // NULL buffer fails with ERROR_INVALID_PARAMETER.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn get_process_affinity_mask_validates_the_process_handle() {
+        let (mut runtime, _temp) = test_runtime("affinity-mask");
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetProcessAffinityMask);
+        let affinity_ptr = 0x41_000_u32;
+        let system_ptr = 0x41_008_u32;
+        memory.map_bytes(affinity_ptr as u64, &[0; 16]);
+
+        // The current-process handle reports the fixed 8-core virtual
+        // topology mask (0xFF) for both the process and system mask.
+        let current = runtime.win32.current_process_handle();
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[current, affinity_ptr, system_ptr],
+        );
+        assert_eq!(result, 1);
+        assert_eq!(
+            memory.read_u32(affinity_ptr as u64).expect("process mask"),
+            0xFF
+        );
+        assert_eq!(
+            memory.read_u32(system_ptr as u64).expect("system mask"),
+            0xFF
+        );
+        assert_eq!(runtime.last_error, 0);
+
+        // An invalid handle fails with ERROR_INVALID_HANDLE.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0xDEAD, affinity_ptr, system_ptr],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+        // A NULL out pointer fails with ERROR_INVALID_PARAMETER.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[current, affinity_ptr, 0],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn get_drive_type_w_classifies_mapped_and_unmapped_paths() {
+        let (mut runtime, _temp) = test_runtime("drive-type");
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetDriveTypeW);
+
+        // NULL path: DRIVE_UNKNOWN (0).
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0]);
+        assert_eq!(result, 0);
+
+        // The mapped C: drive is a local fixed volume.
+        let root_path = runtime
+            .alloc_utf16_string(&mut memory, "C:\\")
+            .expect("root path");
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[root_path as u32]);
+        assert_eq!(result, 3, "mapped drive must be DRIVE_FIXED");
+
+        // An unmapped drive letter reports DRIVE_NO_ROOT_DIR (1).
+        let unmapped = runtime
+            .alloc_utf16_string(&mut memory, "Z:\\")
+            .expect("unmapped path");
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[unmapped as u32]);
+        assert_eq!(result, 1, "unmapped drive must be DRIVE_NO_ROOT_DIR");
+    }
+
+    #[test]
+    fn create_icw_tracks_an_information_context_and_delete_dc_frees_it() {
+        let (mut runtime, _temp) = test_runtime("create-ic");
+        let mut memory = MemoryImage::default();
+        let create_ic = runtime.alloc_host_thunk(HostThunk::CreateICW);
+        let delete_dc = runtime.alloc_host_thunk(HostThunk::DeleteDC);
+
+        let hdc = dispatch_x86_thunk(&mut runtime, &mut memory, create_ic, &[0, 0, 0, 0]);
+        assert_ne!(hdc, 0, "CreateICW must return a valid HDC");
+        assert!(
+            runtime.device_contexts.contains_key(&hdc),
+            "the information context must be a tracked device context"
+        );
+        // DeleteDC frees the tracked DC.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, delete_dc, &[hdc as u32]);
+        assert_eq!(result, 1);
+        assert!(!runtime.device_contexts.contains_key(&hdc));
+        // Deleting an unknown DC fails.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, delete_dc, &[hdc as u32]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn interlocked_push_entry_slist_writes_the_guest_list() {
+        let (mut runtime, _temp) = test_runtime("slist-push");
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::InterlockedPushEntrySList);
+        let head_ptr = 0x41_000_u32;
+        let entry_a = 0x41_100_u32;
+        let entry_b = 0x41_200_u32;
+        memory.map_bytes(head_ptr as u64, &[0; 16]);
+        memory.map_bytes(entry_a as u64, &[0; 16]);
+        memory.map_bytes(entry_b as u64, &[0; 16]);
+
+        // First push: the old head is NULL.
+        let old = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[head_ptr, entry_a]);
+        assert_eq!(old, 0);
+        assert_eq!(
+            read_guest_pointer(&memory, head_ptr as u64, GuestArch::X86).expect("head"),
+            entry_a as u64
+        );
+        // Second push returns the previous first entry.
+        let old = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[head_ptr, entry_b]);
+        assert_eq!(old, entry_a as u64);
+        assert_eq!(
+            read_guest_pointer(&memory, head_ptr as u64, GuestArch::X86).expect("head"),
+            entry_b as u64
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, entry_b as u64, GuestArch::X86).expect("entry_b next"),
+            entry_a as u64
+        );
+    }
+
+    #[test]
+    fn set_timer_reports_invalid_windows_and_dispatches_a_guest_timer_proc() {
+        let (mut runtime, _temp) = test_runtime("timer-proc");
+        let mut memory = MemoryImage::default();
+
+        let set_timer = runtime.alloc_host_thunk(HostThunk::SetTimer);
+        let timer_proc = 0x41_000_u32;
+        // A non-existent window: SetTimer returns the timer id but reports
+        // ERROR_INVALID_WINDOW_HANDLE (Windows semantics).
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_timer,
+            &[0x1234, 77, 1000, timer_proc],
+        );
+        assert_eq!(result, 77, "SetTimer returns the timer id");
+        assert_eq!(runtime.last_error, ERROR_INVALID_WINDOW_HANDLE);
+
+        // DispatchMessage semantics: WM_TIMER with a TIMERPROC in lParam
+        // invokes the proc instead of the window proc.
+        let invocation_log = 0x42_000_u32;
+        memory.map_bytes(invocation_log as u64, &[0; 16]);
+        // stdcall TIMERPROC(hwnd, WM_TIMER, idTimer, time): log arg3
+        // (idTimer) to invocation_log and return 0.
+        memory.map_bytes(
+            timer_proc as u64,
+            &[
+                0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+0x0C]
+                0xA3, 0x00, 0x00, 0x00, 0x00, // mov [invocation_log], eax
+                0x31, 0xC0, // xor eax, eax
+                0xC2, 0x10, 0x00, // ret 16
+            ],
+        );
+        write_u32(&mut memory, timer_proc as u64 + 5, invocation_log);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, 0x50_000);
+        memory.map_bytes(0x50_000, &[0_u8; 0x200]);
+        let dispatched = runtime
+            .dispatch_window_message(
+                &mut state,
+                &mut memory,
+                0x1234,
+                crate::user32::WM_TIMER,
+                77,
+                timer_proc as i64,
+                "test timer dispatch",
+            )
+            .expect("dispatch WM_TIMER with timer proc");
+        assert_eq!(dispatched, 0, "the timer proc returned 0");
+        assert_eq!(
+            read_u32(&memory, invocation_log as u64).expect("invocation log"),
+            77,
+            "the timer proc must receive idTimer = wParam"
+        );
+        // A WM_TIMER without a proc falls through to the window-proc path.
+        let dispatched = runtime
+            .dispatch_window_message(
+                &mut state,
+                &mut memory,
+                0x1234,
+                crate::user32::WM_TIMER,
+                77,
+                0,
+                "test timer dispatch",
+            )
+            .expect("dispatch WM_TIMER without timer proc");
+        assert_eq!(dispatched, 0, "no window proc — default result");
+    }
+
+    #[test]
+    fn enum_windows_requires_a_callback_and_succeeds_without_windows() {
+        let (mut runtime, _temp) = test_runtime("enum-windows");
+        let mut memory = MemoryImage::default();
+
+        let enum_windows = runtime.alloc_host_thunk(HostThunk::EnumWindows);
+        let enum_child = runtime.alloc_host_thunk(HostThunk::EnumChildWindows);
+        // A NULL callback fails with ERROR_INVALID_PARAMETER.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, enum_windows, &[0, 0]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, enum_child, &[0, 0, 0]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        // An unknown parent fails with ERROR_INVALID_WINDOW_HANDLE.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            enum_child,
+            &[0x1234, 0x41_000, 0],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_WINDOW_HANDLE);
+        // With no top-level windows the enumeration succeeds without
+        // invoking the callback.
+        let callback = 0x41_000_u32;
+        memory.map_bytes(callback as u64, &[0x31, 0xC0, 0xC2, 0x08, 0x00]);
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, enum_windows, &[callback, 0x1234]);
+        assert_eq!(result, 1, "EnumWindows succeeds");
+    }
+
+    #[test]
+    fn map_window_points_validates_handles_and_identity_maps_screen_space() {
+        let (mut runtime, _temp) = test_runtime("map-window-points");
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::MapWindowPoints);
+        let points_ptr = 0x41_000_u32;
+        memory.map_bytes(points_ptr as u64, &[0; 32]);
+        write_u32(&mut memory, points_ptr as u64, 10);
+        write_u32(&mut memory, points_ptr as u64 + 4, 20);
+
+        // Screen-to-screen mapping (both handles NULL) is the identity and
+        // returns the packed "pixels added" (0).
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, points_ptr, 1]);
+        assert_eq!(result, 0, "no pixels added between same-origin spaces");
+        assert_eq!(read_u32(&memory, points_ptr as u64).expect("x"), 10);
+        assert_eq!(read_u32(&memory, points_ptr as u64 + 4).expect("y"), 20);
+
+        // Unknown window handles fail with ERROR_INVALID_WINDOW_HANDLE.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, 0xDEAD, points_ptr, 1],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_WINDOW_HANDLE);
+        // NULL points fail with ERROR_INVALID_PARAMETER.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, 0, 1]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn register_event_source_w_returns_a_handle_deregister_closes() {
+        let (mut runtime, _temp) = test_runtime("event-source");
+        let mut memory = MemoryImage::default();
+        let register = runtime.alloc_host_thunk(HostThunk::RegisterEventSourceW);
+        let deregister = runtime.alloc_host_thunk(HostThunk::DeregisterEventSource);
+        let source = runtime
+            .alloc_utf16_string(&mut memory, "Casa1Source")
+            .expect("source name");
+
+        let handle = dispatch_x86_thunk(&mut runtime, &mut memory, register, &[0, source as u32]);
+        assert_ne!(handle, 0, "RegisterEventSourceW must return a handle");
+        assert_eq!(runtime.last_error, 0);
+        let name = read_c_string(&memory, handle).expect("source name");
+        assert_eq!(name, "Casa1Source");
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, deregister, &[handle as u32]);
+        assert_eq!(result, 1, "DeregisterEventSource succeeds");
     }
 
     #[test]

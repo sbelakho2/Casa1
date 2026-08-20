@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-20T17:38:29Z",
+  "generated_at": "2026-08-20T20:22:34Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -23,9 +23,9 @@
     },
     "advapi32.dll": {
       "total": 58,
-      "implemented": 17,
+      "implemented": 19,
       "partial": 0,
-      "stub": 2,
+      "stub": 0,
       "unsupported": 39,
       "differential_tested": 0,
       "conformance_tested": 0,
@@ -653,13 +653,13 @@
     },
     "gdi32.dll": {
       "total": 51,
-      "implemented": 22,
-      "partial": 3,
-      "stub": 6,
+      "implemented": 24,
+      "partial": 2,
+      "stub": 5,
       "unsupported": 20,
       "differential_tested": 0,
       "conformance_tested": 0,
-      "transitional_partial": 3
+      "transitional_partial": 2
     },
     "gdiplus.dll": {
       "total": 118,
@@ -782,14 +782,14 @@
       "transitional_partial": 0
     },
     "kernel32.dll": {
-      "total": 246,
-      "implemented": 193,
-      "partial": 11,
-      "stub": 27,
-      "unsupported": 15,
-      "differential_tested": 14,
+      "total": 247,
+      "implemented": 203,
+      "partial": 7,
+      "stub": 24,
+      "unsupported": 13,
+      "differential_tested": 39,
       "conformance_tested": 0,
-      "transitional_partial": 11
+      "transitional_partial": 7
     },
     "kernelbase.dll": {
       "total": 7,
@@ -1653,13 +1653,13 @@
     },
     "user32.dll": {
       "total": 67,
-      "implemented": 52,
-      "partial": 2,
-      "stub": 7,
+      "implemented": 56,
+      "partial": 1,
+      "stub": 4,
       "unsupported": 6,
       "differential_tested": 0,
       "conformance_tested": 0,
-      "transitional_partial": 2
+      "transitional_partial": 1
     },
     "userenv.dll": {
       "total": 9,
@@ -2212,12 +2212,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "CreateFileMappingW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!CreateFileMappingW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "CreateIoCompletionPort",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!CreateIoCompletionPort is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2308,33 +2302,9 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "FindClose",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!FindClose is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "FindFirstFileExW",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!FindFirstFileExW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "FindFirstFileW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!FindFirstFileW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "FindNextFileW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!FindNextFileW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "FindResourceA",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!FindResourceA is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -2356,6 +2326,12 @@
       },
       {
         "dll": "kernel32.dll",
+        "export": "GetCPInfo",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!GetCPInfo is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
         "export": "GetCommandLineA",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetCommandLineA is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2365,12 +2341,6 @@
         "export": "GetCommandLineW",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetCommandLineW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetConsoleCP",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!GetConsoleCP is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -2423,20 +2393,8 @@
       {
         "dll": "kernel32.dll",
         "export": "GetDriveTypeW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!GetDriveTypeW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetEnvironmentStringsW",
         "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetEnvironmentStringsW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetEnvironmentVariableW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetEnvironmentVariableW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+        "message": "kernel32.dll!GetDriveTypeW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2464,12 +2422,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetFileAttributesW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetFileAttributesW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetFileInformationByHandle",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetFileInformationByHandle is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2482,12 +2434,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetFileSizeEx",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetFileSizeEx is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetFileTime",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetFileTime is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2497,12 +2443,6 @@
         "export": "GetFileType",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetFileType is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetLastError",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetLastError is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2539,6 +2479,12 @@
         "export": "GetOverlappedResult",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetOverlappedResult is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
+        "export": "GetProcessAffinityMask",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!GetProcessAffinityMask is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2590,21 +2536,9 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetSystemTimeAsFileTime",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetSystemTimeAsFileTime is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetTickCount",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GetTickCount is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetTickCount64",
-        "kind": "UnsupportedNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!GetTickCount64 is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -2617,12 +2551,6 @@
         "export": "GetVersionExA",
         "kind": "UnsupportedNotDeliberatelyUnsupported",
         "message": "kernel32.dll!GetVersionExA is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetVersionExW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!GetVersionExW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2650,45 +2578,21 @@
       },
       {
         "dll": "kernel32.dll",
+        "export": "GlobalMemoryStatusEx",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!GlobalMemoryStatusEx is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
         "export": "GlobalUnlock",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!GlobalUnlock is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
-        "export": "HeapAlloc",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!HeapAlloc is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapFree",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!HeapFree is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapQueryInformation",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!HeapQueryInformation is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "HeapReAlloc",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!HeapReAlloc is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapSize",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!HeapSize is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapWalk",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!HeapWalk is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -2765,14 +2669,20 @@
       {
         "dll": "kernel32.dll",
         "export": "InterlockedPushEntrySList",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!InterlockedPushEntrySList is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!InterlockedPushEntrySList is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
         "export": "IsProcessorFeaturePresent",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!IsProcessorFeaturePresent is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "kernel32.dll",
+        "export": "IsValidCodePage",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!IsValidCodePage is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2812,12 +2722,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "LoadResource",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!LoadResource is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "LocalAlloc",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!LocalAlloc is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2827,18 +2731,6 @@
         "export": "LocalFree",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!LocalFree is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "LockResource",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!LockResource is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "MapViewOfFile",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!MapViewOfFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -2926,30 +2818,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "QueryPerformanceCounter",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!QueryPerformanceCounter is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "QueryPerformanceFrequency",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!QueryPerformanceFrequency is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "ReadConsoleA",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!ReadConsoleA is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "ReadConsoleW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!ReadConsoleW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "ReadFile",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!ReadFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -2989,12 +2857,6 @@
         "export": "ResumeThread",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!ResumeThread is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SetConsoleCtrlHandler",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetConsoleCtrlHandler is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -3040,12 +2902,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "SetFilePointerEx",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!SetFilePointerEx is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "SetFileTime",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!SetFileTime is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -3058,45 +2914,15 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "SetLastError",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!SetLastError is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SetProcessAffinityMask",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetProcessAffinityMask is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SetStdHandle",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetStdHandle is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SetThreadAffinityMask",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetThreadAffinityMask is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "SetThreadPriority",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetThreadPriority is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "kernel32.dll!SetThreadPriority is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
         "export": "SetUnhandledExceptionFilter",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!SetUnhandledExceptionFilter is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SizeofResource",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SizeofResource is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "kernel32.dll",
@@ -3175,12 +3001,6 @@
         "export": "UnhandledExceptionFilter",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!UnhandledExceptionFilter is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "UnmapViewOfFile",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!UnmapViewOfFile is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernel32.dll",
@@ -3268,18 +3088,6 @@
       },
       {
         "dll": "gdi32.dll",
-        "export": "AddFontMemResourceEx",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!AddFontMemResourceEx is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "gdi32.dll",
-        "export": "ChoosePixelFormat",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!ChoosePixelFormat is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "gdi32.dll",
         "export": "CreateCompatibleDC",
         "kind": "ImplementedWithoutCoverage",
         "message": "gdi32.dll!CreateCompatibleDC is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -3298,9 +3106,15 @@
       },
       {
         "dll": "gdi32.dll",
+        "export": "CreateICW",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "gdi32.dll!CreateICW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
+      },
+      {
+        "dll": "gdi32.dll",
         "export": "DeleteDC",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!DeleteDC is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "gdi32.dll!DeleteDC is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "gdi32.dll",
@@ -3322,12 +3136,6 @@
       },
       {
         "dll": "gdi32.dll",
-        "export": "RemoveFontMemResourceEx",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!RemoveFontMemResourceEx is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "gdi32.dll",
         "export": "SelectObject",
         "kind": "ImplementedWithoutCoverage",
         "message": "gdi32.dll!SelectObject is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -3346,27 +3154,9 @@
       },
       {
         "dll": "gdi32.dll",
-        "export": "SetPixelFormat",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!SetPixelFormat is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "gdi32.dll",
         "export": "SetTextColor",
         "kind": "ImplementedWithoutCoverage",
         "message": "gdi32.dll!SetTextColor is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "gdi32.dll",
-        "export": "SwapBuffers",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!SwapBuffers is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "user32.dll",
-        "export": "AllowSetForegroundWindow",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!AllowSetForegroundWindow is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "user32.dll",
@@ -3431,14 +3221,14 @@
       {
         "dll": "user32.dll",
         "export": "EnumChildWindows",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!EnumChildWindows is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!EnumChildWindows is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "user32.dll",
         "export": "EnumWindows",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!EnumWindows is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!EnumWindows is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "user32.dll",
@@ -3493,18 +3283,6 @@
         "export": "GetMonitorInfoW",
         "kind": "ImplementedWithoutCoverage",
         "message": "user32.dll!GetMonitorInfoW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "user32.dll",
-        "export": "GetProcessWindowStation",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!GetProcessWindowStation is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "user32.dll",
-        "export": "GetUserObjectInformationW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!GetUserObjectInformationW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "user32.dll",
@@ -3575,14 +3353,8 @@
       {
         "dll": "user32.dll",
         "export": "MapWindowPoints",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!MapWindowPoints is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "user32.dll",
-        "export": "MessageBoxA",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!MessageBoxA is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!MapWindowPoints is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "user32.dll",
@@ -3703,6 +3475,12 @@
         "export": "SetFocus",
         "kind": "UnsupportedNotDeliberatelyUnsupported",
         "message": "user32.dll!SetFocus is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+      },
+      {
+        "dll": "user32.dll",
+        "export": "SetTimer",
+        "kind": "ImplementedWithoutCoverage",
+        "message": "user32.dll!SetTimer is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "user32.dll",
@@ -3971,8 +3749,8 @@
       {
         "dll": "advapi32.dll",
         "export": "DeregisterEventSource",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "advapi32.dll!DeregisterEventSource is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "advapi32.dll!DeregisterEventSource is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "advapi32.dll",
@@ -4043,8 +3821,8 @@
       {
         "dll": "advapi32.dll",
         "export": "RegisterEventSourceW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "advapi32.dll!RegisterEventSourceW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
+        "kind": "ImplementedWithoutCoverage",
+        "message": "advapi32.dll!RegisterEventSourceW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "advapi32.dll",
@@ -4066,18 +3844,6 @@
       },
       {
         "dll": "shell32.dll",
-        "export": "IsUserAnAdmin",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "shell32.dll!IsUserAnAdmin is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "shell32.dll",
-        "export": "SHGetFileInfoW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "shell32.dll!SHGetFileInfoW is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "shell32.dll",
         "export": "SHGetKnownFolderPath",
         "kind": "ImplementedWithoutCoverage",
         "message": "shell32.dll!SHGetKnownFolderPath is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -4087,12 +3853,6 @@
         "export": "CoInitializeEx",
         "kind": "ImplementedWithoutCoverage",
         "message": "ole32.dll!CoInitializeEx is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "ole32.dll",
-        "export": "CoTaskMemFree",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "ole32.dll!CoTaskMemFree is a Stub but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       },
       {
         "dll": "ole32.dll",
@@ -7930,12 +7690,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "lstrcmpW",
-        "kind": "UnsupportedNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!lstrcmpW is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "lstrcmpiA",
         "kind": "UnsupportedNotDeliberatelyUnsupported",
         "message": "kernel32.dll!lstrcmpiA is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
@@ -7948,12 +7702,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "lstrcpyW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!lstrcpyW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "lstrcpynW",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!lstrcpynW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
@@ -7963,12 +7711,6 @@
         "export": "lstrlenA",
         "kind": "ImplementedWithoutCoverage",
         "message": "kernel32.dll!lstrlenA is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "lstrlenW",
-        "kind": "ImplementedWithoutCoverage",
-        "message": "kernel32.dll!lstrlenW is Implemented but has no semantic test coverage (CoverageLevel::None) — an Implemented API needs at least Unit coverage to pass the shipping gate"
       },
       {
         "dll": "kernelbase.dll",
@@ -15351,7 +15093,7 @@
         "message": "mfplat.dll!IMFGetService is Unsupported (no host thunk) but not declared deliberately unsupported — register it via deliberately_unsupported() with the compatibility error the guest sees, or implement it"
       }
     ],
-    "shipping_violation_count": 2201,
+    "shipping_violation_count": 2158,
     "completeness_violations": [
       {
         "dll": "kernel32.dll",
@@ -15424,12 +15166,6 @@
         "export": "CreateFileA",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!CreateFileA is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "CreateFileMappingW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!CreateFileMappingW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15529,27 +15265,9 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "FindClose",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!FindClose is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "FindFirstFileExW",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!FindFirstFileExW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "FindFirstFileW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!FindFirstFileW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "FindNextFileW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!FindNextFileW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15584,8 +15302,8 @@
       {
         "dll": "kernel32.dll",
         "export": "GetCPInfo",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GetCPInfo is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: only DEFAULT_ANSI/OEM code pages and 65001 (UTF-8) are recognized; other code pages fail with ERROR_INVALID_PARAMETER)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!GetCPInfo is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15668,20 +15386,8 @@
       {
         "dll": "kernel32.dll",
         "export": "GetDriveTypeW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!GetDriveTypeW is a Stub — the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetEnvironmentStringsW",
         "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetEnvironmentStringsW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetEnvironmentVariableW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetEnvironmentVariableW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
+        "message": "kernel32.dll!GetDriveTypeW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15709,12 +15415,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetFileAttributesW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetFileAttributesW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetFileInformationByHandle",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!GetFileInformationByHandle is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
@@ -15727,12 +15427,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetFileSizeEx",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetFileSizeEx is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetFileTime",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!GetFileTime is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
@@ -15742,12 +15436,6 @@
         "export": "GetFileType",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!GetFileType is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetLastError",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetLastError is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15794,8 +15482,8 @@
       {
         "dll": "kernel32.dll",
         "export": "GetProcessAffinityMask",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GetProcessAffinityMask is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: returns the fixed 8-core affinity mask (0xFF) of the runtime's virtual topology — the same mask GetSystemInfo/GetNativeSystemInfo/NtQuerySystemInformation report; it is not the host's actual process/system affinity)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!GetProcessAffinityMask is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15847,21 +15535,9 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "GetSystemTimeAsFileTime",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetSystemTimeAsFileTime is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "GetTickCount",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!GetTickCount is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetTickCount64",
-        "kind": "UnsupportedNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!GetTickCount64 is Unsupported (no host thunk) — the completeness gate requires a working, semantically proven implementation"
       },
       {
         "dll": "kernel32.dll",
@@ -15880,12 +15556,6 @@
         "export": "GetVersionExA",
         "kind": "UnsupportedNotDeliberatelyUnsupported",
         "message": "kernel32.dll!GetVersionExA is Unsupported (no host thunk) — the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "GetVersionExW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!GetVersionExW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15914,26 +15584,14 @@
       {
         "dll": "kernel32.dll",
         "export": "GlobalMemoryStatusEx",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!GlobalMemoryStatusEx is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: writes plausible fixed memory figures (16 GB total / 8 GB available); not read from host state)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!GlobalMemoryStatusEx is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
         "export": "GlobalUnlock",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!GlobalUnlock is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapAlloc",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!HeapAlloc is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapFree",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!HeapFree is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -15958,12 +15616,6 @@
         "export": "HeapSetInformation",
         "kind": "StubNotDeliberatelyUnsupported",
         "message": "kernel32.dll!HeapSetInformation is a Stub — the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "HeapSize",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!HeapSize is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16058,8 +15710,8 @@
       {
         "dll": "kernel32.dll",
         "export": "InterlockedPushEntrySList",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!InterlockedPushEntrySList is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!InterlockedPushEntrySList is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16082,8 +15734,8 @@
       {
         "dll": "kernel32.dll",
         "export": "IsValidCodePage",
-        "kind": "PartialNotCompletenessReady",
-        "message": "kernel32.dll!IsValidCodePage is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: recognizes only DEFAULT_ANSI/OEM code pages and 65001; every other code page is reported invalid)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!IsValidCodePage is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16144,12 +15796,6 @@
         "export": "LockResource",
         "kind": "StubNotDeliberatelyUnsupported",
         "message": "kernel32.dll!LockResource is a Stub — the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "MapViewOfFile",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!MapViewOfFile is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16234,18 +15880,6 @@
         "export": "ProcessIdToSessionId",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!ProcessIdToSessionId is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "QueryPerformanceCounter",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!QueryPerformanceCounter is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "QueryPerformanceFrequency",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!QueryPerformanceFrequency is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16369,12 +16003,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "SetFilePointerEx",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!SetFilePointerEx is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "SetFileTime",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!SetFileTime is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
@@ -16384,12 +16012,6 @@
         "export": "SetHandleInformation",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!SetHandleInformation is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "SetLastError",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!SetLastError is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16412,8 +16034,8 @@
       {
         "dll": "kernel32.dll",
         "export": "SetThreadPriority",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!SetThreadPriority is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "kernel32.dll!SetThreadPriority is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16516,12 +16138,6 @@
         "export": "UnhandledExceptionFilter",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!UnhandledExceptionFilter is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "UnmapViewOfFile",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!UnmapViewOfFile is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernel32.dll",
@@ -16646,14 +16262,14 @@
       {
         "dll": "gdi32.dll",
         "export": "CreateICW",
-        "kind": "PartialNotCompletenessReady",
-        "message": "gdi32.dll!CreateICW is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: returns a valid information-context HDC without driver/device setup)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "gdi32.dll!CreateICW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "gdi32.dll",
         "export": "DeleteDC",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "gdi32.dll!DeleteDC is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "gdi32.dll!DeleteDC is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "gdi32.dll",
@@ -16796,14 +16412,14 @@
       {
         "dll": "user32.dll",
         "export": "EnumChildWindows",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!EnumChildWindows is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!EnumChildWindows is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
         "export": "EnumWindows",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!EnumWindows is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!EnumWindows is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
@@ -16946,8 +16562,8 @@
       {
         "dll": "user32.dll",
         "export": "MapWindowPoints",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "user32.dll!MapWindowPoints is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!MapWindowPoints is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
@@ -17078,8 +16694,8 @@
       {
         "dll": "user32.dll",
         "export": "SetTimer",
-        "kind": "PartialNotCompletenessReady",
-        "message": "user32.dll!SetTimer is Partial and NEVER passes the completeness gate — complete the implementation and prove it with Differential or Conformance coverage (documented limitation: only WM_TIMER-style timers (callback == 0) are registered; a non-null TIMERPROC cannot be invoked by the host and stays a no-op)"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "user32.dll!SetTimer is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "user32.dll",
@@ -17372,8 +16988,8 @@
       {
         "dll": "advapi32.dll",
         "export": "DeregisterEventSource",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "advapi32.dll!DeregisterEventSource is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "advapi32.dll!DeregisterEventSource is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "advapi32.dll",
@@ -17444,8 +17060,8 @@
       {
         "dll": "advapi32.dll",
         "export": "RegisterEventSourceW",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "advapi32.dll!RegisterEventSourceW is a Stub — the completeness gate requires a working, semantically proven implementation"
+        "kind": "ImplementedWithoutSemanticCoverage",
+        "message": "advapi32.dll!RegisterEventSourceW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "advapi32.dll",
@@ -21349,12 +20965,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "lstrcmpW",
-        "kind": "UnsupportedNotDeliberatelyUnsupported",
-        "message": "kernel32.dll!lstrcmpW is Unsupported (no host thunk) — the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "lstrcmpiA",
         "kind": "UnsupportedNotDeliberatelyUnsupported",
         "message": "kernel32.dll!lstrcmpiA is Unsupported (no host thunk) — the completeness gate requires a working, semantically proven implementation"
@@ -21367,12 +20977,6 @@
       },
       {
         "dll": "kernel32.dll",
-        "export": "lstrcpyW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!lstrcpyW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
         "export": "lstrcpynW",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!lstrcpynW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
@@ -21382,12 +20986,6 @@
         "export": "lstrlenA",
         "kind": "ImplementedWithoutSemanticCoverage",
         "message": "kernel32.dll!lstrlenA is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
-      },
-      {
-        "dll": "kernel32.dll",
-        "export": "lstrlenW",
-        "kind": "ImplementedWithoutSemanticCoverage",
-        "message": "kernel32.dll!lstrlenW is Implemented but not semantically proven — the completeness gate requires Differential or Conformance coverage (currently None)"
       },
       {
         "dll": "kernelbase.dll",
@@ -28608,7 +28206,7 @@
         "message": "mfplat.dll!IMFGetService is Unsupported (no host thunk) — the completeness gate requires a working, semantically proven implementation"
       }
     ],
-    "completeness_violation_count": 2209
+    "completeness_violation_count": 2185
   },
   "registry": [
     {
@@ -28706,7 +28304,7 @@
       "dll": "kernel32.dll",
       "export": "CreateFileMappingW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -28853,7 +28451,7 @@
       "dll": "kernel32.dll",
       "export": "FindClose",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -28867,14 +28465,14 @@
       "dll": "kernel32.dll",
       "export": "FindFirstFileW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
       "dll": "kernel32.dll",
       "export": "FindNextFileW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -28915,7 +28513,7 @@
     {
       "dll": "kernel32.dll",
       "export": "GetCPInfo",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29013,7 +28611,7 @@
     {
       "dll": "kernel32.dll",
       "export": "GetDriveTypeW",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29021,14 +28619,14 @@
       "dll": "kernel32.dll",
       "export": "GetEnvironmentStringsW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
       "dll": "kernel32.dll",
       "export": "GetEnvironmentVariableW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29063,7 +28661,7 @@
       "dll": "kernel32.dll",
       "export": "GetFileAttributesW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29084,7 +28682,7 @@
       "dll": "kernel32.dll",
       "export": "GetFileSizeEx",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29112,7 +28710,7 @@
       "dll": "kernel32.dll",
       "export": "GetLastError",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29181,7 +28779,7 @@
     {
       "dll": "kernel32.dll",
       "export": "GetProcessAffinityMask",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29245,7 +28843,7 @@
       "dll": "kernel32.dll",
       "export": "GetSystemTimeAsFileTime",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29258,8 +28856,8 @@
     {
       "dll": "kernel32.dll",
       "export": "GetTickCount64",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29287,7 +28885,7 @@
       "dll": "kernel32.dll",
       "export": "GetVersionExW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29321,7 +28919,7 @@
     {
       "dll": "kernel32.dll",
       "export": "GlobalMemoryStatusEx",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29336,14 +28934,14 @@
       "dll": "kernel32.dll",
       "export": "HeapAlloc",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
       "dll": "kernel32.dll",
       "export": "HeapFree",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29378,7 +28976,7 @@
       "dll": "kernel32.dll",
       "export": "HeapSize",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29489,7 +29087,7 @@
     {
       "dll": "kernel32.dll",
       "export": "InterlockedPushEntrySList",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29517,7 +29115,7 @@
     {
       "dll": "kernel32.dll",
       "export": "IsValidCodePage",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -29595,7 +29193,7 @@
       "dll": "kernel32.dll",
       "export": "MapViewOfFile",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29700,14 +29298,14 @@
       "dll": "kernel32.dll",
       "export": "QueryPerformanceCounter",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
       "dll": "kernel32.dll",
       "export": "QueryPerformanceFrequency",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29861,7 +29459,7 @@
       "dll": "kernel32.dll",
       "export": "SetFilePointerEx",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29882,7 +29480,7 @@
       "dll": "kernel32.dll",
       "export": "SetLastError",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -29909,7 +29507,7 @@
     {
       "dll": "kernel32.dll",
       "export": "SetThreadPriority",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30043,7 +29641,7 @@
       "dll": "kernel32.dll",
       "export": "UnmapViewOfFile",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -30203,14 +29801,14 @@
     {
       "dll": "gdi32.dll",
       "export": "CreateICW",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
     {
       "dll": "gdi32.dll",
       "export": "DeleteDC",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30378,14 +29976,14 @@
     {
       "dll": "user32.dll",
       "export": "EnumChildWindows",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
     {
       "dll": "user32.dll",
       "export": "EnumWindows",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30553,7 +30151,7 @@
     {
       "dll": "user32.dll",
       "export": "MapWindowPoints",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -30707,7 +30305,7 @@
     {
       "dll": "user32.dll",
       "export": "SetTimer",
-      "implementation": "Partial",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -31050,7 +30648,7 @@
     {
       "dll": "advapi32.dll",
       "export": "DeregisterEventSource",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -31134,7 +30732,7 @@
     {
       "dll": "advapi32.dll",
       "export": "RegisterEventSourceW",
-      "implementation": "Stub",
+      "implementation": "Implemented",
       "semantic_test_coverage": "None",
       "support_policy": "Required"
     },
@@ -35823,9 +35421,16 @@
     },
     {
       "dll": "kernel32.dll",
+      "export": "CharUpperW",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Differential",
+      "support_policy": "Required"
+    },
+    {
+      "dll": "kernel32.dll",
       "export": "lstrcmpW",
-      "implementation": "Unsupported",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -35853,7 +35458,7 @@
       "dll": "kernel32.dll",
       "export": "lstrcpyW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {
@@ -35874,7 +35479,7 @@
       "dll": "kernel32.dll",
       "export": "lstrlenW",
       "implementation": "Implemented",
-      "semantic_test_coverage": "None",
+      "semantic_test_coverage": "Differential",
       "support_policy": "Required"
     },
     {

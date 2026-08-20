@@ -3092,6 +3092,42 @@ impl Win32Subsystem {
         })
     }
 
+    /// GetDriveTypeW semantics for a guest path.
+    ///
+    /// The runtime maps every drive letter to a local host directory (the GE
+    /// mapping), so any path that resolves to a mapped drive is DRIVE_FIXED;
+    /// a drive-letter path with no mapping is DRIVE_NO_ROOT_DIR; paths
+    /// without a resolvable root are DRIVE_UNKNOWN.
+    pub fn drive_type_for_path(&self, windows_path: Option<&str>) -> u32 {
+        const DRIVE_UNKNOWN: u32 = 0;
+        const DRIVE_NO_ROOT_DIR: u32 = 1;
+        const DRIVE_FIXED: u32 = 3;
+        let host_path = match windows_path {
+            Some(path) => match self.ge.host_path_for_windows_path(path) {
+                Ok(host) => host,
+                Err(_) => {
+                    let has_drive_prefix = path.len() >= 2 && path.as_bytes().get(1) == Some(&b':');
+                    return if has_drive_prefix {
+                        DRIVE_NO_ROOT_DIR
+                    } else {
+                        DRIVE_UNKNOWN
+                    };
+                }
+            },
+            None => self.ge.root.clone(),
+        };
+        let mut probe = host_path;
+        loop {
+            if statvfs(&probe).is_some() {
+                return DRIVE_FIXED;
+            }
+            match probe.parent() {
+                Some(parent) => probe = parent.to_path_buf(),
+                None => return DRIVE_UNKNOWN,
+            }
+        }
+    }
+
     /// Real volume capacity for the host directory backing a guest path.
     ///
     /// Windows `GetDiskFreeSpace*` report the volume containing the path; the
