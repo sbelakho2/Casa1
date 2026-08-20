@@ -124,7 +124,11 @@ impl PeHostRuntime {
         handle
     }
 
-    pub(crate) fn ensure_synthetic_module_image(&mut self, memory: &mut MemoryImage, module_handle: u64) {
+    pub(crate) fn ensure_synthetic_module_image(
+        &mut self,
+        memory: &mut MemoryImage,
+        module_handle: u64,
+    ) {
         if module_handle == 0
             || module_handle == self.mapped_image_base
             || !self.synthetic_module_handles.contains(&module_handle)
@@ -1451,7 +1455,11 @@ impl PeHostRuntime {
     /// Returns `true` if the timestamp matches or if the DLL cannot be found
     /// (conservative fallback — allowing normal resolution to proceed would be
     /// correct even if slower).
-    pub(crate) fn validate_bound_timestamp(&self, module_name: &str, expected_timestamp: u32) -> bool {
+    pub(crate) fn validate_bound_timestamp(
+        &self,
+        module_name: &str,
+        expected_timestamp: u32,
+    ) -> bool {
         // Look up the module handle to find its host path
         let handle = self.lookup_module_handle(module_name);
         let handle = match handle {
@@ -1484,4 +1492,3 @@ impl PeHostRuntime {
         }
     }
 }
-
