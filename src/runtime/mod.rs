@@ -7,9 +7,9 @@ pub(crate) use self::state::*;
 mod loader;
 mod thread;
 pub(crate) use self::thread::*;
-mod process;
-pub mod object_manager;
 pub mod handle_table;
+pub mod object_manager;
+mod process;
 mod scheduler;
 pub(crate) use self::scheduler::*;
 mod callback;
@@ -132,11 +132,11 @@ pub static DYNAMIC_IMPORT_LOG: std::sync::LazyLock<Mutex<Vec<DynamicImport>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Record a dynamically-resolved (DLL, name) import.
-    pub fn clear_dynamic_import_log_static() {
-        if let Ok(mut log) = DYNAMIC_IMPORT_LOG.lock() {
-            log.clear();
-        }
+pub fn clear_dynamic_import_log_static() {
+    if let Ok(mut log) = DYNAMIC_IMPORT_LOG.lock() {
+        log.clear();
     }
+}
 
 pub fn record_dynamic_import(dll: &str, name: &str) {
     if dll.is_empty() || name.is_empty() {
