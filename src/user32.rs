@@ -1416,6 +1416,9 @@ pub struct User32Subsystem {
     clipboard_owner: Option<Hwnd>,
     /// Clipboard data store: format → raw bytes.
     clipboard_data: BTreeMap<u32, Vec<u8>>,
+    /// Clipboard handles: format → the guest HGLOBAL passed to
+    /// SetClipboardData (returned by GetClipboardData, Windows semantics).
+    clipboard_handles: BTreeMap<u32, u64>,
     /// Next clipboard format to enumerate (for EnumClipboardFormats).
     clipboard_format_enum_cursor: Option<u32>,
     // ── Menu state ─────────────────────────────────────────────────────────────
@@ -1638,6 +1641,7 @@ impl User32Subsystem {
             clipboard_open: false,
             clipboard_owner: None,
             clipboard_data: BTreeMap::new(),
+            clipboard_handles: BTreeMap::new(),
             clipboard_format_enum_cursor: None,
             window_menus: BTreeMap::new(),
             menu_items: BTreeMap::new(),
@@ -2561,20 +2565,27 @@ impl User32Subsystem {
     }
 
     /// SetClipboardData — set clipboard data.
-    /// Stores a copy of the data. Returns `true` when the clipboard is open
-    /// and the data was stored; the caller returns the guest handle on
-    /// success (Windows returns the hData handle) and NULL +
-    /// ERROR_CLIPBOARD_NOT_OPEN otherwise.
-    pub fn set_clipboard_data(&mut self, format: u32, data: Vec<u8>) -> bool {
+    /// Stores a copy of the data together with the guest HGLOBAL handle.
+    /// Returns `true` when the clipboard is open and the data was stored; the
+    /// caller returns the guest handle on success (Windows returns the hData
+    /// handle) and NULL + ERROR_CLIPBOARD_NOT_OPEN otherwise.
+    pub fn set_clipboard_data(&mut self, format: u32, data: Vec<u8>, handle: u64) -> bool {
         if !self.clipboard_open {
             return false;
         }
-        // Store locally for non-text formats and as a session cache
-        self.clipboard_data.insert(format, data.clone());
         // Write to NSPasteboard for inter-process clipboard sharing
         // SAFETY: nspasteboard_set_data wraps AppKit FFI; falls back silently in headless mode
         mac_window::nspasteboard_set_data(format, &data);
+        // Store locally for non-text formats and as a session cache
+        self.clipboard_data.insert(format, data);
+        self.clipboard_handles.insert(format, handle);
         true
+    }
+
+    /// The guest HGLOBAL stored for a clipboard format (Windows
+    /// GetClipboardData returns the handle passed to SetClipboardData).
+    pub fn clipboard_handle(&self, format: u32) -> Option<u64> {
+        self.clipboard_handles.get(&format).copied()
     }
 
     /// EmptyClipboard — empty the clipboard and free handles to data.
@@ -2583,6 +2594,7 @@ impl User32Subsystem {
             return false;
         }
         self.clipboard_data.clear();
+        self.clipboard_handles.clear();
         self.clipboard_format_enum_cursor = None;
         // Clear NSPasteboard for inter-process clipboard sharing
         // SAFETY: nspasteboard_clear wraps AppKit FFI; falls back silently in headless mode
@@ -7491,7 +7503,7 @@ mod tests {
     fn test_empty_clipboard_clears_data() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec());
+        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec(), 1);
         assert!(
             user32.is_clipboard_format_available(CF_TEXT),
             "data should be available"
@@ -7508,10 +7520,15 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
 
-        let stored = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec());
+        let stored = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec(), 0x1234);
         // The data is stored and the caller (SetClipboardData thunk) returns
         // the guest handle on success.
         assert!(stored, "set_clipboard_data should report success");
+        assert_eq!(
+            user32.clipboard_handle(CF_TEXT),
+            Some(0x1234),
+            "the guest handle must be stored for GetClipboardData"
+        );
 
         // Retrieve and verify
         let data = user32.get_clipboard_data(CF_TEXT);
@@ -7531,7 +7548,7 @@ mod tests {
     #[test]
     fn test_set_clipboard_data_not_open() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        let stored = user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
+        let stored = user32.set_clipboard_data(CF_TEXT, b"data".to_vec(), 0x1234);
         assert!(!stored, "set without open should report failure");
     }
 
@@ -7540,15 +7557,16 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
 
-        user32.set_clipboard_data(CF_TEXT, b"text data".to_vec());
+        user32.set_clipboard_data(CF_TEXT, b"text data".to_vec(), 1);
         user32.set_clipboard_data(
             CF_UNICODETEXT,
             "unicode data\0"
                 .encode_utf16()
                 .flat_map(|c| c.to_le_bytes())
                 .collect::<Vec<_>>(),
+            4,
         );
-        user32.set_clipboard_data(CF_HDROP, vec![0u8; 100]);
+        user32.set_clipboard_data(CF_HDROP, vec![0u8; 100], 2);
 
         assert!(
             user32.is_clipboard_format_available(CF_TEXT),
@@ -7686,7 +7704,7 @@ mod tests {
     fn test_enum_clipboard_formats_single() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
+        user32.set_clipboard_data(CF_TEXT, b"data".to_vec(), 1);
 
         let first = user32.enum_clipboard_formats(0);
         assert_eq!(first, CF_TEXT, "first format should be CF_TEXT");
@@ -7703,9 +7721,9 @@ mod tests {
     fn test_enum_clipboard_formats_multiple() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"text".to_vec());
-        user32.set_clipboard_data(CF_UNICODETEXT, b"unicode\0".to_vec());
-        user32.set_clipboard_data(CF_HDROP, vec![0u8; 64]);
+        user32.set_clipboard_data(CF_TEXT, b"text".to_vec(), 1);
+        user32.set_clipboard_data(CF_UNICODETEXT, b"unicode\0".to_vec(), 2);
+        user32.set_clipboard_data(CF_HDROP, vec![0u8; 64], 3);
 
         // Enumerate all formats
         let mut formats = Vec::new();
@@ -7731,8 +7749,8 @@ mod tests {
     fn test_clipboard_preserves_data_across_formats() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
-        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec());
-        user32.set_clipboard_data(CF_UNICODETEXT, b"hello wide\0".to_vec());
+        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec(), 1);
+        user32.set_clipboard_data(CF_UNICODETEXT, b"hello wide\0".to_vec(), 2);
 
         // Reading one format shouldn't affect others
         assert_eq!(

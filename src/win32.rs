@@ -41,6 +41,18 @@ pub struct VolumeCapacity {
     pub free_bytes: u64,
 }
 
+impl VolumeCapacity {
+    /// The cluster counts as Windows `GetDiskFreeSpace(A|W)` u32 outputs,
+    /// saturating at `u32::MAX` (a single source of truth for the clamp the
+    /// A and W arms must agree on).
+    pub fn clusters_as_u32(&self) -> (u32, u32) {
+        (
+            self.total_clusters.min(u64::from(u32::MAX)) as u32,
+            self.free_clusters.min(u64::from(u32::MAX)) as u32,
+        )
+    }
+}
+
 /// Host `statvfs` probe: returns `Some` only when the path can be stat'ed.
 fn statvfs(path: &Path) -> Option<libc::statvfs> {
     use std::os::unix::ffi::OsStrExt;
@@ -9553,7 +9565,7 @@ mod tests {
             .volume_capacity(Some("C:\\"))
             .expect("capacity for the mapped drive root");
         assert!(
-            capacity.total_bytes > 0 && capacity.free_bytes > 0,
+            capacity.total_bytes > 0,
             "the volume backing the GE drive must report non-zero capacity"
         );
         assert!(

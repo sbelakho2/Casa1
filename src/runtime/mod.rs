@@ -469,7 +469,7 @@ const ERROR_PIPE_NOT_AVAILABLE: u32 = 231;
 const ERROR_SEM_TIMEOUT: u32 = 121;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
-const ERROR_CLIPBOARD_NOT_OPEN: u32 = 1_431;
+const ERROR_CLIPBOARD_NOT_OPEN: u32 = 1_418;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
@@ -23999,18 +23999,11 @@ impl PeHostRuntime {
                 // Real capacity of the host volume backing the mapped drive.
                 match self.win32.volume_capacity(root_path.as_deref()) {
                     Ok(capacity) => {
+                        let (total_clusters, free_clusters) = capacity.clusters_as_u32();
                         write_u32(memory, sectors_per_cluster_ptr, capacity.sectors_per_cluster);
                         write_u32(memory, bytes_per_sector_ptr, capacity.bytes_per_sector);
-                        write_u32(
-                            memory,
-                            free_clusters_ptr,
-                            capacity.free_clusters.min(u64::from(u32::MAX)) as u32,
-                        );
-                        write_u32(
-                            memory,
-                            total_clusters_ptr,
-                            capacity.total_clusters.min(u64::from(u32::MAX)) as u32,
-                        );
+                        write_u32(memory, free_clusters_ptr, free_clusters);
+                        write_u32(memory, total_clusters_ptr, total_clusters);
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -40707,18 +40700,11 @@ impl PeHostRuntime {
                 // Real capacity of the host volume backing the mapped drive.
                 match self.win32.volume_capacity(root_path.as_deref()) {
                     Ok(capacity) => {
+                        let (total_clusters, free_clusters) = capacity.clusters_as_u32();
                         write_u32(memory, sectors_per_cluster_ptr, capacity.sectors_per_cluster);
                         write_u32(memory, bytes_per_sector_ptr, capacity.bytes_per_sector);
-                        write_u32(
-                            memory,
-                            free_clusters_ptr,
-                            capacity.free_clusters.min(u64::from(u32::MAX)) as u32,
-                        );
-                        write_u32(
-                            memory,
-                            total_clusters_ptr,
-                            capacity.total_clusters.min(u64::from(u32::MAX)) as u32,
-                        );
+                        write_u32(memory, free_clusters_ptr, free_clusters);
+                        write_u32(memory, total_clusters_ptr, total_clusters);
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -41377,23 +41363,18 @@ impl PeHostRuntime {
                 let data_handle = arg(1);
                 // Read the guest clipboard block.  Windows takes an HGLOBAL:
                 // when the handle is a tracked guest heap allocation read
-                // EXACTLY the allocated block; otherwise read until unmapped
-                // guest memory (bounded by a safety cap for pathological
-                // mapped regions).
+                // EXACTLY the allocated block (bounded at 1 MiB — the block
+                // size is guest-controlled and an unbounded copy could
+                // exhaust the host); otherwise read until unmapped guest
+                // memory under the same bound.
+                const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
                 let data = if data_handle != 0 {
                     let exact_size = self.heap_allocations.get(&data_handle).copied();
                     match exact_size {
-                        Some(size) => {
-                            let mut buf = Vec::with_capacity(size);
-                            for i in 0..size {
-                                buf.push(memory.read_u8(data_handle + i as u64)?);
-                            }
-                            buf
-                        }
+                        Some(size) => memory.read_bytes(data_handle, size.min(MAX_CLIPBOARD_BYTES))?,
                         None => {
-                            let max_read = 1024 * 1024usize;
-                            let mut buf = Vec::with_capacity(max_read.min(4096));
-                            for i in 0..max_read {
+                            let mut buf = Vec::with_capacity(MAX_CLIPBOARD_BYTES.min(4096));
+                            for i in 0..MAX_CLIPBOARD_BYTES {
                                 match memory.read_u8(data_handle + i as u64) {
                                     Ok(byte) => buf.push(byte),
                                     Err(_) => break,
@@ -41407,7 +41388,7 @@ impl PeHostRuntime {
                 };
                 // Windows returns the handle itself on success and NULL +
                 // ERROR_CLIPBOARD_NOT_OPEN when the clipboard is not open.
-                if self.user32.set_clipboard_data(format, data) {
+                if self.user32.set_clipboard_data(format, data, data_handle) {
                     state.set(Register::Rax, data_handle);
                     self.last_error = 0;
                 } else {
@@ -41424,10 +41405,11 @@ impl PeHostRuntime {
                 let data = self.user32.get_clipboard_data(format);
                 match data {
                     Some(_bytes) => {
-                        // Return format as pseudo-handle. In a full implementation,
-                        // this would GlobalAlloc + copy data into guest memory,
-                        // but for Steam.exe compatibility the pseudo-handle suffices.
-                        state.set(Register::Rax, format as u64);
+                        // Windows returns the HGLOBAL that SetClipboardData
+                        // stored for the format; the guest can then
+                        // GlobalLock it.  Formats placed by other processes
+                        // (NSPasteboard) have no guest handle and return NULL.
+                        state.set(Register::Rax, self.user32.clipboard_handle(format).unwrap_or(0));
                     }
                     None => {
                         state.set(Register::Rax, 0); // NULL
@@ -76843,12 +76825,11 @@ mod tests {
             .read_u64(total_free_bytes_ptr as u64)
             .expect("total free bytes");
         // Real host volume capacity: the volume backing the GE drive target
-        // exists and reports sane invariants (never zero, free never exceeds
-        // total, and the free figures agree).  Free-space values are not
-        // compared across calls — parallel tests share the volume and free
-        // space legitimately fluctuates between two statvfs probes.
+        // exists and reports sane structural invariants.  Free-space values
+        // are not asserted absolutely and never compared across calls —
+        // parallel tests share the volume and free space legitimately
+        // fluctuates between two statvfs probes.
         assert!(total_bytes > 0, "total bytes must be non-zero");
-        assert!(free_bytes > 0, "free bytes must be non-zero");
         assert!(
             free_bytes <= total_bytes,
             "free bytes must not exceed total bytes"
@@ -76917,7 +76898,10 @@ mod tests {
         let wsprintf_a = runtime.alloc_host_thunk(HostThunk::WsprintfA);
         let dest_ptr = 0x30_000_u32;
         let format_ptr = runtime
-            .alloc_c_string(&mut memory, "%d|%05d|%-6d|%x|%#x|%o|%c|%s|%%|%S")
+            .alloc_c_string(
+                &mut memory,
+                "%d|%05d|%-6d|%x|%#x|%o|%c|%s|%%|%S|%#08x|%.0d|%.0x|%#.0o",
+            )
             .expect("format string");
         let ansi_str = runtime
             .alloc_c_string(&mut memory, "world")
@@ -76943,15 +76927,62 @@ mod tests {
                 b'A' as u32,     // %c
                 ansi_str as u32, // %s (ANSI)
                 wide_str as u32, // %S (wide in the ANSI variant)
+                0xABC,           // %#08x → "0x000abc" (zero-pad after the prefix)
+                0,               // %.0d → empty field
+                0,               // %.0x → empty field
+                0,               // %#.0o → "0" (leading zero per C99)
             ],
         );
 
         let output = read_c_string(&memory, dest_ptr as u64).expect("rendered output");
         assert_eq!(
-            output, "42|00007|123   |dead|0xabc|10|A|world|%|WIDE",
-            "wsprintfA must apply flags/width and use ANSI string semantics"
+            output, "42|00007|123   |dead|0xabc|10|A|world|%|WIDE|0x000abc|||0",
+            "wsprintfA must apply flags/width/precision with ANSI string semantics"
         );
         assert_eq!(result as usize, output.len());
+    }
+
+    #[test]
+    fn wsprintf_clamps_hostile_width_and_precision() {
+        let (mut runtime, _temp_dir) = test_runtime("wsprintf-clamp");
+        let mut memory = MemoryImage::default();
+
+        let wsprintf_a = runtime.alloc_host_thunk(HostThunk::WsprintfA);
+        let dest_ptr = 0x30_000_u32;
+        // A 32-digit width would previously wrap the width accumulator and
+        // force a multi-GB padding allocation; the parser clamps fields at
+        // MAX_FORMAT_FIELD_WIDTH so the call renders a bounded field.
+        let format_ptr = runtime
+            .alloc_c_string(
+                &mut memory,
+                "%099999999999999999999999999999999d|%.99999999999999999999s",
+            )
+            .expect("format string");
+        let ansi_str = runtime
+            .alloc_c_string(&mut memory, "x")
+            .expect("ansi string");
+        memory.map_bytes(dest_ptr as u64, &[0_u8; 16 * 1024]);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wsprintf_a,
+            &[dest_ptr, format_ptr as u32, 42, ansi_str as u32],
+        );
+        // The A arm caps the guest write at 1024 bytes; the rendered output
+        // is clamped well above that by the parser, so the dispatch must
+        // succeed without any huge allocation.
+        assert_eq!(
+            result, 1024,
+            "output is capped at the 1024-byte write limit"
+        );
+        let output = read_c_string(&memory, dest_ptr as u64).expect("rendered output");
+        assert_eq!(output.len(), 1024);
+        assert!(
+            output.chars().all(|c| c == '0'),
+            "the hostile width must be clamped, not allocated or wrapped: {:?}",
+            &output[..output.len().min(32)]
+        );
     }
 
     #[test]
@@ -77010,7 +77041,8 @@ mod tests {
             "SetClipboardData must return the passed handle on success"
         );
 
-        // The full 128 KB block must have been stored — no 64 KB truncation.
+        // The full 128 KB block must have been stored — no truncation within
+        // the 1 MiB bound.
         let stored = runtime
             .user32
             .get_clipboard_data(crate::user32::CF_TEXT)
@@ -77023,7 +77055,17 @@ mod tests {
             "last byte of the stored block"
         );
 
-        // Clipboard closed: SetClipboardData fails with ERROR_CLIPBOARD_NOT_OPEN.
+        // GetClipboardData returns the same guest handle (Windows hData
+        // contract), not a synthetic pseudo-handle.
+        let get_clipboard_data = runtime.alloc_host_thunk(HostThunk::GetClipboardData);
+        let got_handle = dispatch_x86_thunk(&mut runtime, &mut memory, get_clipboard_data, &[1]);
+        assert_eq!(
+            got_handle, block,
+            "GetClipboardData must return the handle SetClipboardData stored"
+        );
+
+        // Clipboard closed: SetClipboardData fails with NULL +
+        // ERROR_CLIPBOARD_NOT_OPEN (1418).
         let close_clipboard = runtime.alloc_host_thunk(HostThunk::CloseClipboard);
         dispatch_x86_thunk(&mut runtime, &mut memory, close_clipboard, &[]);
         let failed = dispatch_x86_thunk(
@@ -77035,6 +77077,10 @@ mod tests {
         assert_eq!(
             failed, 0,
             "SetClipboardData with a closed clipboard must fail"
+        );
+        assert_eq!(
+            runtime.last_error, ERROR_CLIPBOARD_NOT_OPEN,
+            "closed clipboard must set ERROR_CLIPBOARD_NOT_OPEN (1418)"
         );
     }
 
@@ -89966,6 +90012,15 @@ fn message_box_response(style: u32) -> i32 {
     }
 }
 
+/// Upper bound for a single parsed wsprintf field width or precision.
+///
+/// The format string is guest-controlled and the width/precision digits are
+/// unbounded in principle; the formatter materializes the field (zero/space
+/// padding), so an absurd width must not be able to force a huge host
+/// allocation.  Fields are clamped at parse time (saturating arithmetic), so
+/// a hostile `%9999999999d` renders a bounded field instead of aborting.
+const MAX_FORMAT_FIELD_WIDTH: usize = 4096;
+
 /// Shared `wsprintf` formatter used by both the W and A variants.
 ///
 /// Implements the documented wsprintf surface: `c d i o u x X s S p %` with
@@ -90007,7 +90062,10 @@ fn format_wsprintf(
         }
         let mut width = 0usize;
         while cursor < chars.len() && chars[cursor].is_ascii_digit() {
-            width = width * 10 + chars[cursor].to_digit(10).unwrap_or(0) as usize;
+            width = width
+                .saturating_mul(10)
+                .saturating_add(chars[cursor].to_digit(10).unwrap_or(0) as usize)
+                .min(MAX_FORMAT_FIELD_WIDTH);
             cursor += 1;
         }
         let mut precision: Option<usize> = None;
@@ -90015,7 +90073,10 @@ fn format_wsprintf(
             cursor += 1;
             let mut digits = 0usize;
             while cursor < chars.len() && chars[cursor].is_ascii_digit() {
-                digits = digits * 10 + chars[cursor].to_digit(10).unwrap_or(0) as usize;
+                digits = digits
+                    .saturating_mul(10)
+                    .saturating_add(chars[cursor].to_digit(10).unwrap_or(0) as usize)
+                    .min(MAX_FORMAT_FIELD_WIDTH);
                 cursor += 1;
             }
             precision = Some(digits);
@@ -90044,7 +90105,13 @@ fn format_wsprintf(
         match specifier {
             'd' | 'i' => {
                 let value = raw as u32 as i32;
-                let mut digits = format!("{}", value.unsigned_abs());
+                // C99 precision-zero semantics: a zero value with `.0`
+                // precision produces no digits.
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{}", value.unsigned_abs())
+                };
                 if let Some(precision) = precision {
                     digits = pad_zeros(&digits, precision);
                 }
@@ -90065,7 +90132,12 @@ fn format_wsprintf(
                 append_field(&mut rendered, format!("{sign}{body}"), &flags, width);
             }
             'u' => {
-                let mut digits = format!("{}", raw as u32);
+                let value = raw as u32;
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{value}")
+                };
                 if let Some(precision) = precision {
                     digits = pad_zeros(&digits, precision);
                 }
@@ -90078,12 +90150,22 @@ fn format_wsprintf(
             }
             'o' => {
                 let value = raw as u32;
-                let mut digits = format!("{value:o}");
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{value:o}")
+                };
                 if let Some(precision) = precision {
                     digits = pad_zeros(&digits, precision);
                 }
-                if flags.contains('#') && value != 0 {
-                    digits = format!("0{digits}");
+                // `#` gives octal output a leading zero (C99: the output
+                // always starts with 0 — including the empty `.0` zero case).
+                if flags.contains('#') && (value != 0 || digits.is_empty()) {
+                    if digits.is_empty() {
+                        digits = "0".to_string();
+                    } else {
+                        digits = format!("0{digits}");
+                    }
                 }
                 let mut body = digits;
                 if flags.contains('0') && !flags.contains('-') && precision.is_none() {
@@ -90094,7 +90176,9 @@ fn format_wsprintf(
             }
             'x' | 'X' => {
                 let value = raw as u32;
-                let mut digits = if specifier == 'x' {
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else if specifier == 'x' {
                     format!("{value:x}")
                 } else {
                     format!("{value:X}")
@@ -90107,13 +90191,11 @@ fn format_wsprintf(
                 } else {
                     ""
                 };
+                // The `0` flag zero-pads the digits AFTER the 0x/0X prefix
+                // (`%#08x` of 0xabc → "0x000abc", like Windows).
                 let mut body = digits;
-                if flags.contains('0')
-                    && !flags.contains('-')
-                    && precision.is_none()
-                    && prefix.is_empty()
-                {
-                    let needed = width.saturating_sub(body.len());
+                if flags.contains('0') && !flags.contains('-') && precision.is_none() {
+                    let needed = width.saturating_sub(prefix.len() + body.len());
                     body = format!("{}{}", "0".repeat(needed), body);
                 }
                 append_field(&mut rendered, format!("{prefix}{body}"), &flags, width);
