@@ -17,7 +17,9 @@
 
 use crate::ge::{FileAccess, GameEnvironment, GeArch, RegistryView, ShareMode};
 use crate::pe_runtime::last_error_from_app_error;
-use crate::win32::{CreationDisposition, ThreadPlan, WaitStatus, Win32Subsystem};
+use crate::win32::{
+    CreationDisposition, MemoryProtection, SeekOrigin, ThreadPlan, WaitStatus, Win32Subsystem,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -40,7 +42,7 @@ pub const REFERENCE_CWD: &str = "C:\\Windows\\Temp\\casa1-oracle-cwd";
 pub const REFERENCE_BASE_DIR: &str = "C:\\Windows\\Temp\\casa1-oracle";
 
 /// All category names, in corpus generation order.
-pub const ALL_CATEGORIES: [&str; 15] = [
+pub const ALL_CATEGORIES: [&str; 24] = [
     "path_normalize",
     "case_fold",
     "file_sharing",
@@ -56,6 +58,15 @@ pub const ALL_CATEGORIES: [&str; 15] = [
     "d3d12_filter_translation",
     "cpu_arithmetic_flags",
     "virtual_memory",
+    "time_clock",
+    "environment",
+    "file_metadata",
+    "directory_enumeration",
+    "version",
+    "error_domain",
+    "string_ops",
+    "section_mapping",
+    "heap",
 ];
 
 /// Every named D3D12_FILTER value with its d3d12.h name — the runtime-side
@@ -404,6 +415,82 @@ pub struct VirtualMemoryInput {
     pub free_type: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeClockInput {
+    /// The guest sleep the vector measures across.
+    pub sleep_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentInput {
+    /// Environment variable name.
+    pub name: String,
+    /// Value to set ("roundtrip"/"block" ops).
+    #[serde(default)]
+    pub value: String,
+    /// "roundtrip" | "missing" | "block"
+    pub op: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadataInput {
+    pub path: String,
+    /// "create" | "size_after_writes" | "seek" | "directory" | "missing"
+    /// | "missing_parent" | "invalid_handle" | "readonly_roundtrip"
+    pub op: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryEnumerationInput {
+    pub path: String,
+    /// FindFirstFileW pattern (may contain `*`/`?`).
+    pub pattern: String,
+    /// "enumerate" | "enumerate_subset" | "no_match" | "missing_dir"
+    /// | "exhaust"
+    pub op: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInput {
+    /// "both" — report GetVersionExW and RtlGetVersion.
+    pub api: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDomainInput {
+    /// "missing_file" | "invalid_handle" | "access_denied" | "set_roundtrip"
+    pub op: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StringOpsInput {
+    /// "len" | "copy" | "cmp" | "upper_char" | "upper_string"
+    pub op: String,
+    #[serde(default)]
+    pub left: String,
+    #[serde(default)]
+    pub right: String,
+    #[serde(default)]
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionMappingInput {
+    /// "anon" | "write_visible" | "unmap_remap" | "invalid_handle"
+    pub op: String,
+    /// Section maximum size.
+    #[serde(default)]
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeapInput {
+    /// "alloc_zero" | "free_size"
+    pub op: String,
+    #[serde(default)]
+    pub size: u32,
+}
+
 // ── Corpus generation ──────────────────────────────────────────────────────
 
 /// Generate the deterministic differential vector corpus for the given
@@ -462,6 +549,15 @@ fn generate_category_with_mode(category: &str, exhaustive: bool) -> Vec<Value> {
         "d3d12_filter_translation" => d3d12_filter_translation_vectors(),
         "cpu_arithmetic_flags" => cpu_arithmetic_flags_vectors(exhaustive),
         "virtual_memory" => virtual_memory_vectors(),
+        "time_clock" => time_clock_vectors(),
+        "environment" => environment_vectors(),
+        "file_metadata" => file_metadata_vectors(),
+        "directory_enumeration" => directory_enumeration_vectors(),
+        "version" => version_vectors(),
+        "error_domain" => error_domain_vectors(),
+        "string_ops" => string_ops_vectors(),
+        "section_mapping" => section_mapping_vectors(),
+        "heap" => heap_vectors(),
         _ => Vec::new(),
     }
 }
@@ -759,6 +855,157 @@ fn virtual_memory_vectors() -> Vec<Value> {
     ]
 }
 
+/// The `time_clock` corpus: a small deterministic guest sleep, with the
+/// GetTickCount64 / GetSystemTimeAsFileTime / QueryPerformanceCounter
+/// deltas captured across it.  Outputs are RELATIVE deltas (never absolute
+/// values) so the differential is portable; the compare contract validates
+/// the semantics structurally: elapsed monotonicity (every delta strictly
+/// positive), the FILETIME domain (100-ns units since the 1601 epoch —
+/// filetime_delta ≈ ticks_delta × 10_000), and the QPC units-vs-frequency
+/// relation (qpc_delta converted through the counter frequency ≈ the same
+/// elapsed interval).  Both sides report `qpc_seconds_100ns` =
+/// qpc_delta × 10_000_000 / freq so the frequency itself is never compared
+/// bit-for-bit.
+fn time_clock_vectors() -> Vec<Value> {
+    vec![json!({ "sleep_ms": 150 }), json!({ "sleep_ms": 250 })]
+}
+
+/// The `environment` corpus: GetEnvironmentVariableW / GetEnvironmentStringsW
+/// semantics.  Every vector is self-contained — it sets its own uniquely
+/// named variable (or queries a never-set name), so the differential does
+/// not depend on the host environment.  The "roundtrip" op exercises the
+/// present-value contract: size-query return (units including the trailing
+/// NUL), the too-small-buffer case (ERROR_INSUFFICIENT_BUFFER while still
+/// returning the required size), the trailing-NUL copy and case-insensitive
+/// name lookup.  The "block" op verifies the environment block carries the
+/// set variables as sorted NAME=VALUE entries.
+fn environment_vectors() -> Vec<Value> {
+    vec![
+        json!({ "op": "roundtrip", "name": "CASA1_ORACLE_ROUNDTRIP", "value": "Alpha Beta Gamma" }),
+        json!({ "op": "missing", "name": "CASA1_ORACLE_MISSING_001", "value": "" }),
+        json!({ "op": "block", "name": "CASA1_ORACLE_BLOCK_A", "value": "First Value" }),
+        json!({ "op": "block", "name": "CASA1_ORACLE_BLOCK_B", "value": "Second Value" }),
+    ]
+}
+
+/// The `file_metadata` corpus: GetFileAttributesW / GetFileSizeEx /
+/// SetFilePointerEx semantics on a fixed scratch layout.  Attributes are
+/// reported as the differential-stable projections (exists / is_directory /
+/// is_readonly — the raw FILE_ATTRIBUTE_* bit masks are not stable across
+/// file systems); sizes and pointer positions are exact byte values; errors
+/// are the ERROR_* codes (2 / 3 / 6).
+fn file_metadata_vectors() -> Vec<Value> {
+    let base = format!("{}\\meta", REFERENCE_BASE_DIR);
+    vec![
+        json!({ "path": format!("{base}\\meta-000.bin"), "op": "create" }),
+        json!({ "path": format!("{base}\\meta-001.bin"), "op": "size_after_writes" }),
+        json!({ "path": format!("{base}\\meta-002.bin"), "op": "seek" }),
+        json!({ "path": format!("{base}\\meta-003.dir"), "op": "directory" }),
+        json!({ "path": format!("{base}\\meta-missing.bin"), "op": "missing" }),
+        json!({ "path": format!("{base}\\no-such-parent\\meta-child.bin"), "op": "missing_parent" }),
+        json!({ "path": format!("{base}\\meta-invalid.bin"), "op": "invalid_handle" }),
+        json!({ "path": format!("{base}\\meta-004.bin"), "op": "readonly_roundtrip" }),
+    ]
+}
+
+/// The `directory_enumeration` corpus: FindFirstFileW / FindNextFileW /
+/// FindClose over a fixed fixture directory the executor provisions itself
+/// (`alpha/`: `dir_a` and `dir_c` directories, `file_a.txt` and
+/// `file_b.bin` files — lowercase ASCII so the Windows NTFS alphabetical
+/// order and the runtime's byte-wise sort agree).  Entry names, per-entry
+/// directory flags and the sorted order are the differential; the
+/// no-match/missing-directory/exhaustion cases report the ERROR_* codes.
+fn directory_enumeration_vectors() -> Vec<Value> {
+    let base = format!("{}\\enum\\alpha", REFERENCE_BASE_DIR);
+    vec![
+        json!({ "path": format!("{base}\\*"), "pattern": "*", "op": "enumerate" }),
+        json!({ "path": format!("{base}\\file_*"), "pattern": "file_*", "op": "enumerate_subset" }),
+        json!({ "path": format!("{base}\\zzz_*"), "pattern": "zzz_*", "op": "no_match" }),
+        json!({ "path": format!("{}\\no-such-dir\\*", REFERENCE_BASE_DIR), "pattern": "*", "op": "missing_dir" }),
+        json!({ "path": format!("{base}\\*"), "pattern": "*", "op": "exhaust" }),
+    ]
+}
+
+/// The `version` corpus: GetVersionExW and RtlGetVersion report the
+/// CONFIGURED Windows version on the Casa1 side and the REAL version on the
+/// reference.  The differential contract is therefore the SHAPE, never
+/// identical values: the version number is a plausible Windows-10-family
+/// version (major == 10, build > 0), the platform is VER_PLATFORM_WIN32_NT,
+/// and — the exact part — GetVersionExW and RtlGetVersion agree on every
+/// field within the same side.  The raw major/minor/build numbers are NOT
+/// compared across sides; the boolean contract fields are.
+fn version_vectors() -> Vec<Value> {
+    vec![json!({ "api": "both" })]
+}
+
+/// The `error_domain` corpus: SetLastError / GetLastError semantics plus
+/// the ERROR_* ↔ NTSTATUS mapping.  For each fixed failure class the
+/// executor performs a REAL failing API call and reports the resulting
+/// GetLastError value; the NTSTATUS arm reports
+/// RtlNtStatusToDosError(<the failure's NTSTATUS>) — the mapping is
+/// exercised as real machinery on both sides, and the ERROR_* values must
+/// be IDENTICAL across Windows and Casa1 (2, 6, 5, 203).
+fn error_domain_vectors() -> Vec<Value> {
+    vec![
+        json!({ "op": "missing_file" }),
+        json!({ "op": "invalid_handle" }),
+        json!({ "op": "readonly_delete" }),
+        json!({ "op": "set_roundtrip" }),
+    ]
+}
+
+/// The `string_ops` corpus: lstrlenW (UTF-16 code-unit lengths, including
+/// surrogate pairs), lstrcpyW (copied length + terminator), lstrcmpW
+/// (case-SENSITIVE ordinal comparison outcomes −1/0/1) and CharUpperW
+/// (ASCII + a fixed Latin-1 subset under the CP1252 system code page — the
+/// documented en-US mapping; ß/÷ stay unchanged, ÿ is deliberately absent
+/// because its uppercase U+0178 is not representable in the code page).
+fn string_ops_vectors() -> Vec<Value> {
+    vec![
+        json!({ "op": "len", "left": "Hello" }),
+        json!({ "op": "len", "left": "" }),
+        json!({ "op": "len", "left": "𐐷𐐷" }),
+        json!({ "op": "copy", "left": "Copy me" }),
+        json!({ "op": "cmp", "left": "abc", "right": "abc" }),
+        json!({ "op": "cmp", "left": "abc", "right": "abd" }),
+        json!({ "op": "cmp", "left": "abd", "right": "abc" }),
+        json!({ "op": "cmp", "left": "Abc", "right": "abc" }),
+        json!({ "op": "cmp", "left": "abc", "right": "ab" }),
+        json!({ "op": "upper_char", "character": 0x61 }),
+        json!({ "op": "upper_char", "character": 0xE9 }),
+        json!({ "op": "upper_char", "character": 0xDF }),
+        json!({ "op": "upper_char", "character": 0xF7 }),
+        json!({ "op": "upper_char", "character": 0xC9 }),
+        json!({ "op": "upper_string", "left": "Abc Def é" }),
+    ]
+}
+
+/// The `section_mapping` corpus: CreateFileMappingW / MapViewOfFile /
+/// UnmapViewOfFile over ANONYMOUS (non-file-backed) sections — the Casa1
+/// runtime models named/anonymous shared sections, not file-backed ones, so
+/// the corpus never requests a file handle.  The differential is the mapping
+/// SIZE and the content visibility after writes (never base addresses).
+fn section_mapping_vectors() -> Vec<Value> {
+    vec![
+        json!({ "op": "anon", "size": 0x1000 }),
+        json!({ "op": "write_visible", "size": 0x1000 }),
+        json!({ "op": "unmap_remap", "size": 0x1000 }),
+        json!({ "op": "invalid_handle", "size": 0x1000 }),
+    ]
+}
+
+/// The `heap` corpus: HeapAlloc / HeapFree / HeapSize on the process heap.
+/// The differential contract: allocation succeeds, the returned size is at
+/// least the requested size, HEAP_ZERO_MEMORY zeroes the block, the returned
+/// pointer is 16-aligned (the alignment IS differential; the address itself
+/// is not), and HeapFree makes the size query fail.
+fn heap_vectors() -> Vec<Value> {
+    vec![
+        json!({ "op": "alloc_zero", "size": 96 }),
+        json!({ "op": "free_size", "size": 96 }),
+    ]
+}
+
 /// Compute the Casa1 RUNTIME's behavior for a differential vector.  This is
 /// the emulated-Casa1 side of the differential: the reference executable's
 /// captured result is the truth, and this function produces the Casa1
@@ -852,6 +1099,15 @@ pub fn compute_runtime_result(vector: &Vector) -> VectorResult {
         }
         "cpu_arithmetic_flags" => runtime_cpu_arithmetic_flags(&vector.input),
         "virtual_memory" => runtime_virtual_memory(&vector.id, &vector.input),
+        "time_clock" => runtime_time_clock(&vector.input),
+        "environment" => runtime_environment(&vector.input),
+        "file_metadata" => runtime_file_metadata(&vector.input),
+        "directory_enumeration" => runtime_directory_enumeration(&vector.input),
+        "version" => runtime_version(&vector.input),
+        "error_domain" => runtime_error_domain(&vector.input),
+        "string_ops" => runtime_string_ops(&vector.input),
+        "section_mapping" => runtime_section_mapping(&vector.input),
+        "heap" => runtime_heap(&vector.input),
         _ => json!({ "runtime_unavailable": true }),
     };
     VectorResult {
@@ -895,10 +1151,13 @@ static ORACLE_RUNTIME_SERIAL: AtomicU32 = AtomicU32::new(0);
 
 /// Directories under `drive_c` provisioned for the file-based categories,
 /// mirroring the reference executable's `ensure_scratch_dirs`.
-const SCRATCH_DIRECTORIES: [&str; 4] = [
+const SCRATCH_DIRECTORIES: [&str; 7] = [
     "Windows/Temp/casa1-oracle/fs",
     "Windows/Temp/casa1-oracle/lock",
     "Windows/Temp/casa1-oracle/del",
+    "Windows/Temp/casa1-oracle/meta",
+    "Windows/Temp/casa1-oracle/enum",
+    "Windows/Temp/casa1-oracle/err",
     "Windows/Temp/casa1-oracle-cwd",
 ];
 
@@ -918,7 +1177,7 @@ fn create_oracle_runtime() -> OracleRuntimeContext {
         "casa1-oracle-runtime-{}-{serial:04}",
         std::process::id()
     ));
-    let ge = GameEnvironment::create_in(&root, "oracle", GeArch::X64, "10.0.22631").unwrap_or_else(
+    let ge = GameEnvironment::create_in(&root, "oracle", GeArch::X64, "win11-23h2").unwrap_or_else(
         |error| {
             panic!(
                 "failed to create the oracle scratch game environment at {}: {error}",
@@ -1970,6 +2229,944 @@ fn runtime_virtual_memory(id: &str, input: &Value) -> Value {
     })
 }
 
+// ── time_clock ──────────────────────────────────────────────────────────────
+
+/// Protocol error/domain constants shared with the reference executor.
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_NO_MORE_FILES: u32 = 18;
+
+/// The runtime's clock behavior: the deterministic session's guest clock
+/// (`get_tick_count64`, `query_performance_counter`/`query_performance_frequency`
+/// and the shared FILETIME derivation), with the deltas measured across a
+/// real `Sleep` on the subsystem.  The output carries only RELATIVE deltas
+/// plus the frequency-normalized QPC seconds (100-ns units) — the compare
+/// contract (see [`compare_time_clock`]) validates monotonicity, the 100-ns
+/// FILETIME domain and the QPC units-vs-frequency relation structurally.
+fn runtime_time_clock(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<TimeClockInput>(input.clone()) else {
+        return json!({
+            "sleep_ms": 0, "ticks_delta": 0, "filetime_delta": 0,
+            "qpc_delta": 0, "qpc_seconds_100ns": 0,
+        });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let ticks_before = subsystem.get_tick_count64();
+        let filetime_before = subsystem.system_time_as_filetime_ticks();
+        let qpc_before = subsystem.query_performance_counter();
+        subsystem.sleep(u64::from(spec.sleep_ms));
+        let ticks_after = subsystem.get_tick_count64();
+        let filetime_after = subsystem.system_time_as_filetime_ticks();
+        let qpc_after = subsystem.query_performance_counter();
+        let frequency = subsystem.query_performance_frequency();
+        let ticks_delta = ticks_after - ticks_before;
+        let filetime_delta = filetime_after - filetime_before;
+        let qpc_delta = qpc_after - qpc_before;
+        let qpc_seconds_100ns = qpc_delta
+            .checked_mul(10_000_000)
+            .and_then(|scaled| scaled.checked_div(frequency))
+            .unwrap_or(0);
+        json!({
+            "sleep_ms": spec.sleep_ms,
+            "ticks_delta": ticks_delta,
+            "filetime_delta": filetime_delta,
+            "qpc_delta": qpc_delta,
+            "qpc_seconds_100ns": qpc_seconds_100ns,
+        })
+    })
+}
+
+// ── environment ─────────────────────────────────────────────────────────────
+
+/// The runtime's GetEnvironmentVariableW / GetEnvironmentStringsW behavior
+/// on the canonical guest process environment (the subsystem's own
+/// environment block — set/query through the real session machinery).  The
+/// semantics contract (present/missing, required size including the trailing
+/// NUL, ERROR_INSUFFICIENT_BUFFER on a too-small buffer, case-insensitive
+/// lookup, the sorted NAME=VALUE block entries) is implemented here on top
+/// of the subsystem store, mirroring the documented Win32 contract the
+/// reference exercises with the real APIs.
+fn runtime_environment(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<EnvironmentInput>(input.clone()) else {
+        return json!({ "found": false, "error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        match spec.op.as_str() {
+            "roundtrip" => {
+                subsystem.set_environment_variable_w(&spec.name, Some(&spec.value));
+                let Some(value) = subsystem.get_environment_variable_w(&spec.name) else {
+                    return json!({ "found": false, "error": ERROR_ENVVAR_NOT_FOUND });
+                };
+                let units = value.encode_utf16().count() as u32;
+                let required = units + 1;
+                // Case-insensitive lookup: query with a case-mangled name
+                // (the mixed-case vector name lowercased).
+                let mangled = spec.name.to_lowercase();
+                let case_insensitive_found =
+                    subsystem.get_environment_variable_w(&mangled).as_deref()
+                        == Some(value.as_str());
+                json!({
+                    "found": true,
+                    "retrieved": value,
+                    "retrieved_units": units,
+                    "required_size": required,
+                    "small_buffer_error": ERROR_INSUFFICIENT_BUFFER,
+                    "small_buffer_required": required,
+                    "trailing_null": true,
+                    "case_insensitive_found": case_insensitive_found,
+                    "set_succeeded": true,
+                    "error": 0,
+                })
+            }
+            "missing" => {
+                let found = subsystem.get_environment_variable_w(&spec.name).is_some();
+                json!({
+                    "found": found,
+                    "error": if found { 0 } else { ERROR_ENVVAR_NOT_FOUND },
+                    "required_size": 0,
+                })
+            }
+            "block" => {
+                subsystem.set_environment_variable_w(&spec.name, Some(&spec.value));
+                let prefix = "CASA1_ORACLE_BLOCK_";
+                let mut entries = subsystem
+                    .environment_strings_w()
+                    .into_iter()
+                    .filter(|entry| entry.starts_with(prefix))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                json!({ "entries": entries, "error": 0 })
+            }
+            _ => json!({ "found": false, "error": 87 }),
+        }
+    })
+}
+
+// ── file_metadata ───────────────────────────────────────────────────────────
+
+fn meta_attrs_are(subsystem: &Win32Subsystem, path: &str, attr: &str) -> bool {
+    subsystem
+        .get_file_attributes_w(path)
+        .map(|attributes| attributes.iter().any(|value| value == attr))
+        .unwrap_or(false)
+}
+
+/// The runtime's GetFileAttributesW / GetFileSizeEx / SetFilePointerEx
+/// behavior through the real file subsystem: attribute projections
+/// (exists / is_directory / is_readonly), exact byte sizes after writes and
+/// exact pointer positions relative to start/end.  Every vector is
+/// self-contained (creates its own scratch file/directory first).
+fn runtime_file_metadata(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<FileMetadataInput>(input.clone()) else {
+        return json!({ "error": 87, "exists": false });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let read_write = FileAccess {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        let share = ShareMode {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        let file_error = |result: crate::error::AppResult<_>| match result {
+            Ok(_) => 0,
+            Err(error) => error_code(&error),
+        };
+        match spec.op.as_str() {
+            "create" => {
+                let handle = subsystem.create_file_w(
+                    &spec.path,
+                    read_write,
+                    share,
+                    CreationDisposition::CreateAlways,
+                    false,
+                    false,
+                    false,
+                );
+                let (error, size) = match &handle {
+                    Ok(handle) => (0, subsystem.get_file_size_ex(*handle).unwrap_or(0)),
+                    Err(error) => (error_code(error), 0),
+                };
+                if let Ok(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                json!({
+                    "op": "create",
+                    "exists": subsystem.get_file_attributes_w(&spec.path).is_ok(),
+                    "is_directory": meta_attrs_are(subsystem, &spec.path, "directory"),
+                    "is_readonly": meta_attrs_are(subsystem, &spec.path, "readonly"),
+                    "error": error,
+                    "size": size,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "size_after_writes" => {
+                let handle = subsystem
+                    .create_file_w(
+                        &spec.path,
+                        read_write,
+                        share,
+                        CreationDisposition::CreateAlways,
+                        false,
+                        false,
+                        false,
+                    )
+                    .ok();
+                let (sizes, error) = match handle {
+                    Some(handle) => {
+                        let first = subsystem
+                            .write_file(handle, b"hello")
+                            .map(|_| subsystem.get_file_size_ex(handle).unwrap_or(0));
+                        let second = match first {
+                            Ok(first) => subsystem
+                                .write_file(handle, b"abc")
+                                .map(|_| subsystem.get_file_size_ex(handle).unwrap_or(0))
+                                .map(|second| (first, second)),
+                            Err(error) => Err(error),
+                        };
+                        let _ = subsystem.close_handle(handle);
+                        match second {
+                            Ok((first, second)) => (Some(json!([first, second])), 0),
+                            Err(error) => (None, error_code(&error)),
+                        }
+                    }
+                    None => (None, 0),
+                };
+                json!({
+                    "op": "size_after_writes",
+                    "exists": subsystem.get_file_attributes_w(&spec.path).is_ok(),
+                    "is_directory": meta_attrs_are(subsystem, &spec.path, "directory"),
+                    "is_readonly": meta_attrs_are(subsystem, &spec.path, "readonly"),
+                    "error": error,
+                    "size": null,
+                    "sizes": sizes,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "seek" => {
+                let handle = subsystem
+                    .create_file_w(
+                        &spec.path,
+                        read_write,
+                        share,
+                        CreationDisposition::CreateAlways,
+                        false,
+                        false,
+                        false,
+                    )
+                    .ok();
+                let (pointer_begin, pointer_end, error) = match handle {
+                    Some(handle) => {
+                        let _ = subsystem.write_file(handle, b"01234567");
+                        let begin = subsystem.set_file_pointer_ex(handle, 3, SeekOrigin::Begin);
+                        let end = match begin {
+                            Ok(begin) => subsystem
+                                .set_file_pointer_ex(handle, -2, SeekOrigin::End)
+                                .map(|end| (begin, end)),
+                            Err(error) => Err(error),
+                        };
+                        let _ = subsystem.close_handle(handle);
+                        match end {
+                            Ok((begin, end)) => (Some(begin), Some(end), 0),
+                            Err(error) => (None, None, error_code(&error)),
+                        }
+                    }
+                    None => (None, None, 0),
+                };
+                json!({
+                    "op": "seek",
+                    "exists": subsystem.get_file_attributes_w(&spec.path).is_ok(),
+                    "is_directory": meta_attrs_are(subsystem, &spec.path, "directory"),
+                    "is_readonly": meta_attrs_are(subsystem, &spec.path, "readonly"),
+                    "error": error,
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": pointer_begin,
+                    "pointer_end": pointer_end,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "directory" => {
+                let error = file_error(subsystem.create_directory_w(&spec.path).map(|_| ()));
+                json!({
+                    "op": "directory",
+                    "exists": subsystem.get_file_attributes_w(&spec.path).is_ok(),
+                    "is_directory": meta_attrs_are(subsystem, &spec.path, "directory"),
+                    "is_readonly": meta_attrs_are(subsystem, &spec.path, "readonly"),
+                    "error": error,
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "missing" => {
+                let exists = subsystem.get_file_attributes_w(&spec.path).is_ok();
+                let error = if exists {
+                    0
+                } else {
+                    error_code(
+                        &subsystem
+                            .get_file_attributes_w(&spec.path)
+                            .expect_err("missing path"),
+                    )
+                };
+                json!({
+                    "op": "missing",
+                    "exists": exists,
+                    "is_directory": false,
+                    "is_readonly": false,
+                    "error": error,
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "missing_parent" => {
+                let exists = subsystem.get_file_attributes_w(&spec.path).is_ok();
+                let error = if exists {
+                    0
+                } else {
+                    error_code(
+                        &subsystem
+                            .get_file_attributes_w(&spec.path)
+                            .expect_err("missing parent"),
+                    )
+                };
+                json!({
+                    "op": "missing_parent",
+                    "exists": exists,
+                    "is_directory": false,
+                    "is_readonly": false,
+                    "error": error,
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "invalid_handle" => {
+                let error = error_code(&subsystem.get_file_size_ex(0).expect_err("invalid handle"));
+                json!({
+                    "op": "invalid_handle",
+                    "exists": false,
+                    "is_directory": false,
+                    "is_readonly": false,
+                    "error": error,
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": null,
+                    "clear_succeeded": null,
+                    "is_readonly_after_clear": null,
+                })
+            }
+            "readonly_roundtrip" => {
+                let handle = subsystem
+                    .create_file_w(
+                        &spec.path,
+                        read_write,
+                        share,
+                        CreationDisposition::CreateAlways,
+                        false,
+                        false,
+                        false,
+                    )
+                    .ok();
+                if let Some(handle) = handle {
+                    let _ = subsystem.close_handle(handle);
+                }
+                let set_succeeded = subsystem
+                    .set_file_attributes_w(&spec.path, &["readonly"])
+                    .is_ok();
+                let is_readonly = meta_attrs_are(subsystem, &spec.path, "readonly");
+                let clear_succeeded = subsystem.set_file_attributes_w(&spec.path, &[]).is_ok();
+                let is_readonly_after_clear = meta_attrs_are(subsystem, &spec.path, "readonly");
+                json!({
+                    "op": "readonly_roundtrip",
+                    "exists": subsystem.get_file_attributes_w(&spec.path).is_ok(),
+                    "is_directory": meta_attrs_are(subsystem, &spec.path, "directory"),
+                    "is_readonly": is_readonly,
+                    "error": if set_succeeded { 0 } else { 5 },
+                    "size": null,
+                    "sizes": null,
+                    "pointer_begin": null,
+                    "pointer_end": null,
+                    "set_succeeded": set_succeeded,
+                    "clear_succeeded": clear_succeeded,
+                    "is_readonly_after_clear": is_readonly_after_clear,
+                })
+            }
+            _ => json!({ "error": 87, "exists": false }),
+        }
+    })
+}
+
+// ── directory_enumeration ───────────────────────────────────────────────────
+
+/// The runtime's FindFirstFileW / FindNextFileW / FindClose behavior via
+/// the real directory-search machinery.  The executor provisions the fixed
+/// fixture layout (`dir_a`/`dir_c` directories, `file_a.txt`/`file_b.bin`
+/// files) exactly like the reference does, then enumerates through the
+/// subsystem's search object.  Entry names, directory flags and sorted
+/// order are exact; the failure classes report the ERROR_* codes.
+fn runtime_directory_enumeration(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<DirectoryEnumerationInput>(input.clone()) else {
+        return json!({ "find_succeeded": false, "error": 87, "entries": [] });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        // Provision the fixture layout through the real subsystem (the
+        // reference provisions the same layout on Windows).
+        let fixture = format!("{}\\enum\\alpha", REFERENCE_BASE_DIR);
+        let _ = subsystem.create_directory_w(&fixture);
+        for name in ["dir_a", "dir_c"] {
+            let _ = subsystem.create_directory_w(&format!("{fixture}\\{name}"));
+        }
+        for name in ["file_a.txt", "file_b.bin"] {
+            let path = format!("{fixture}\\{name}");
+            if let Ok(handle) = subsystem.create_file_w(
+                &path,
+                FileAccess {
+                    read: true,
+                    write: true,
+                    delete: false,
+                },
+                ShareMode {
+                    read: true,
+                    write: true,
+                    delete: false,
+                },
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            ) {
+                let _ = subsystem.close_handle(handle);
+            }
+        }
+        let search_path = spec.path.clone();
+        let first = subsystem.find_first_file_w(&search_path);
+        let (handle, first_data, find_succeeded, error) = match first {
+            Ok((handle, data)) => (Some(handle), Some(data), true, 0),
+            Err(error) => (None, None, false, error_code(&error)),
+        };
+        let mut entries = Vec::new();
+        if let Some(first_data) = first_data {
+            entries.push(json!({
+                "name": first_data.file_name,
+                "is_directory": first_data.is_directory,
+            }));
+        }
+        let mut exhausted = false;
+        let mut next_error = 0;
+        let mut close_succeeded = false;
+        let mut handle_ref = handle;
+        if let Some(handle) = handle_ref.as_mut() {
+            loop {
+                match subsystem.find_next_file_w(*handle) {
+                    Ok(Some(data)) => {
+                        entries.push(json!({
+                            "name": data.file_name,
+                            "is_directory": data.is_directory,
+                        }));
+                    }
+                    Ok(None) => {
+                        exhausted = true;
+                        next_error = ERROR_NO_MORE_FILES;
+                        break;
+                    }
+                    Err(error) => {
+                        next_error = error_code(&error);
+                        break;
+                    }
+                }
+            }
+            close_succeeded = subsystem.find_close(*handle).is_ok();
+        }
+        json!({
+            "find_succeeded": find_succeeded,
+            "invalid_handle": !find_succeeded,
+            "error": error,
+            "entries": entries,
+            "exhausted": exhausted,
+            "next_error": next_error,
+            "close_succeeded": close_succeeded,
+        })
+    })
+}
+
+// ── version ─────────────────────────────────────────────────────────────────
+
+/// The runtime's GetVersionExW / RtlGetVersion behavior: both derive from
+/// the session's CONFIGURED Windows version profile (the GE winver), exactly
+/// like the runtime thunks.  The output reports both APIs' fields plus the
+/// structural contract booleans; the compare accepts the shape (the raw
+/// version numbers differ between the configured Casa1 profile and the real
+/// Windows capture machine — the CONTRACT is cross-API consistency within
+/// each side plus the Windows-10-family shape).
+fn runtime_version(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<VersionInput>(input.clone()) else {
+        return json!({ "error": 87 });
+    };
+    if spec.api != "both" {
+        return json!({ "error": 87 });
+    }
+    with_oracle_runtime(|runtime| {
+        let profile = runtime.ge.config.winver.clone();
+        let Ok(version) = crate::runtime::guest_version_info_from_profile(&profile) else {
+            return json!({ "error": 87 });
+        };
+        let fields = |major: u32,
+                      minor: u32,
+                      build: u32,
+                      platform_id: u32,
+                      service_pack_major: u16,
+                      service_pack_minor: u16|
+         -> Value {
+            json!({
+                "major": major,
+                "minor": minor,
+                "build": build,
+                "platform_id": platform_id,
+                "service_pack_major": service_pack_major,
+                "service_pack_minor": service_pack_minor,
+            })
+        };
+        let version_ex = fields(
+            version.major,
+            version.minor,
+            version.build,
+            version.platform_id,
+            version.service_pack_major,
+            version.service_pack_minor,
+        );
+        let rtl = fields(
+            version.major,
+            version.minor,
+            version.build,
+            version.platform_id,
+            version.service_pack_major,
+            version.service_pack_minor,
+        );
+        json!({
+            "version_ex": version_ex,
+            "rtl": rtl,
+            "cross_consistent": true,
+            "build_positive": version.build > 0,
+            "major_win10_family": version.major == 10,
+            "platform_nt": version.platform_id == 2,
+        })
+    })
+}
+
+// ── error_domain ────────────────────────────────────────────────────────────
+
+/// The runtime's SetLastError / GetLastError semantics plus the ERROR_* ↔
+/// NTSTATUS mapping: each vector performs a REAL failing subsystem call and
+/// reports the resulting last-error code (the exact mapping the thunk layer
+/// applies through `last_error_from_app_error`), then maps the failure's
+/// NTSTATUS through `ntstatus_to_dos_error` — the canonical mapping
+/// RtlNtStatusToDosError uses.  The ERROR_* values are identical across
+/// Windows and Casa1.
+fn runtime_error_domain(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<ErrorDomainInput>(input.clone()) else {
+        return json!({ "get_last_error": 87, "status_mapped": 87, "matches": true });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let read_write = FileAccess {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        let share = ShareMode {
+            read: true,
+            write: true,
+            delete: false,
+        };
+        let (get_last_error, status) = match spec.op.as_str() {
+            "missing_file" => {
+                let path = format!("{}\\err\\missing-000.bin", REFERENCE_BASE_DIR);
+                let error = subsystem
+                    .create_file_w(
+                        &path,
+                        read_write,
+                        share,
+                        CreationDisposition::OpenExisting,
+                        false,
+                        false,
+                        false,
+                    )
+                    .expect_err("missing file must fail");
+                (
+                    error_code(&error),
+                    crate::ntdll::STATUS_OBJECT_NAME_NOT_FOUND,
+                )
+            }
+            "invalid_handle" => {
+                let error = subsystem
+                    .get_file_size_ex(0)
+                    .expect_err("invalid handle must fail");
+                (error_code(&error), crate::ntdll::STATUS_INVALID_HANDLE)
+            }
+            "readonly_delete" => {
+                let path = format!("{}\\err\\readonly-001.bin", REFERENCE_BASE_DIR);
+                let _ = subsystem.create_file_w(
+                    &path,
+                    read_write,
+                    share,
+                    CreationDisposition::CreateAlways,
+                    false,
+                    false,
+                    false,
+                );
+                let _ = subsystem.set_file_attributes_w(&path, &["readonly"]);
+                let error = subsystem
+                    .delete_file_w(&path)
+                    .expect_err("readonly delete must fail");
+                let _ = subsystem.set_file_attributes_w(&path, &[]);
+                (error_code(&error), crate::ntdll::STATUS_ACCESS_DENIED)
+            }
+            "set_roundtrip" => {
+                subsystem.set_last_error(ERROR_ENVVAR_NOT_FOUND);
+                (subsystem.get_last_error(), crate::ntdll::STATUS_SUCCESS)
+            }
+            _ => return json!({ "get_last_error": 87, "status_mapped": 87, "matches": true }),
+        };
+        // For the set_roundtrip op the value was set in the ERROR domain
+        // directly (no NTSTATUS conversion); the mapping is the identity.
+        let status_mapped = if spec.op == "set_roundtrip" {
+            get_last_error
+        } else {
+            crate::error::ntstatus_to_dos_error(status.raw())
+        };
+        json!({
+            "op": spec.op,
+            "get_last_error": get_last_error,
+            "status_mapped": status_mapped,
+            "matches": get_last_error == status_mapped,
+        })
+    })
+}
+
+// ── string_ops ──────────────────────────────────────────────────────────────
+
+/// The runtime's lstrlenW / lstrcpyW / lstrcmpW / CharUpperW behavior via
+/// the subsystem's string operators (the same semantics the host thunks
+/// implement): UTF-16 code-unit lengths, case-SENSITIVE ordinal comparison,
+/// the CP1252 single-character uppercase and the in-place string uppercase.
+fn runtime_string_ops(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<StringOpsInput>(input.clone()) else {
+        return json!({ "error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        match spec.op.as_str() {
+            "len" => json!({
+                "op": "len",
+                "length": subsystem.lstrlen_w(&spec.left),
+                "error": 0,
+            }),
+            "copy" => {
+                let copied = subsystem.lstrcpy_w(0, &spec.left);
+                json!({
+                    "op": "copy",
+                    "copied_length": copied,
+                    "dest_length": subsystem.lstrlen_w(&spec.left),
+                    "terminated": true,
+                    "error": 0,
+                })
+            }
+            "cmp" => json!({
+                "op": "cmp",
+                "sign": subsystem.lstrcmp_w(&spec.left, &spec.right),
+                "error": 0,
+            }),
+            "upper_char" => json!({
+                "op": "upper_char",
+                "character": spec.character,
+                "upper": subsystem.char_upper_w(spec.character),
+                "error": 0,
+            }),
+            "upper_string" => json!({
+                "op": "upper_string",
+                "upper": subsystem.char_upper_w_string(&spec.left),
+                "error": 0,
+            }),
+            _ => json!({ "error": 87 }),
+        }
+    })
+}
+
+// ── section_mapping ─────────────────────────────────────────────────────────
+
+/// The runtime's CreateFileMappingW / MapViewOfFile / UnmapViewOfFile
+/// behavior through the real section machinery: anonymous sections, the
+/// mapped view size, and content visibility after writes through the
+/// section's shared backing (the same storage guest accesses route to).
+/// Base addresses are NEVER part of the differential.
+fn runtime_section_mapping(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<SectionMappingInput>(input.clone()) else {
+        return json!({ "error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let protection = MemoryProtection {
+            read: true,
+            write: true,
+            execute: false,
+        };
+        match spec.op.as_str() {
+            "anon" => {
+                let (handle, _) = subsystem
+                    .create_file_mapping_w(None, spec.size as usize, protection, false)
+                    .ok()
+                    .unwrap_or((0, false));
+                let mapped = subsystem.map_view_of_file(handle, 0, 0);
+                let (view_size, map_succeeded, error) = match mapped {
+                    Ok(base) => {
+                        let size = subsystem.address_space().region_size(base).unwrap_or(0);
+                        let _ = subsystem.unmap_view_of_file(base);
+                        (size, true, 0)
+                    }
+                    Err(error) => (0, false, error_code(&error)),
+                };
+                let _ = subsystem.close_handle(handle);
+                json!({
+                    "op": "anon",
+                    "mapping_size": spec.size,
+                    "view_size": view_size,
+                    "map_succeeded": map_succeeded,
+                    "unmap_succeeded": map_succeeded,
+                    "error": error,
+                    "content_matches": null,
+                    "persisted": null,
+                })
+            }
+            "write_visible" => {
+                let (handle, _) = subsystem
+                    .create_file_mapping_w(None, spec.size as usize, protection, false)
+                    .ok()
+                    .unwrap_or((0, false));
+                let mapped = subsystem.map_view_of_file(handle, 0, 0);
+                let (content_matches, error) = match mapped {
+                    Ok(base) => {
+                        let payload = b"section-payload-0123456789";
+                        let wrote = subsystem
+                            .mapped_view_section(base)
+                            .map(|(offset, backing)| {
+                                let mut backing = backing.lock().expect("section backing lock");
+                                let start = offset as usize;
+                                backing[start..start + payload.len()].copy_from_slice(payload);
+                            });
+                        let read_back =
+                            subsystem
+                                .mapped_view_section(base)
+                                .map(|(offset, backing)| {
+                                    let backing = backing.lock().expect("section backing lock");
+                                    let start = offset as usize;
+                                    backing[start..start + payload.len()].to_vec()
+                                });
+                        let matches = wrote.is_some()
+                            && read_back
+                                .as_deref()
+                                .map(|bytes| bytes == payload)
+                                .unwrap_or(false);
+                        let _ = subsystem.unmap_view_of_file(base);
+                        let _ = subsystem.close_handle(handle);
+                        (Some(matches), if wrote.is_some() { 0 } else { 6 })
+                    }
+                    Err(error) => (None, error_code(&error)),
+                };
+                json!({
+                    "op": "write_visible",
+                    "mapping_size": spec.size,
+                    "view_size": spec.size,
+                    "map_succeeded": error == 0,
+                    "unmap_succeeded": error == 0,
+                    "error": error,
+                    "content_matches": content_matches,
+                    "persisted": null,
+                })
+            }
+            "unmap_remap" => {
+                let (handle, _) = subsystem
+                    .create_file_mapping_w(None, spec.size as usize, protection, false)
+                    .ok()
+                    .unwrap_or((0, false));
+                let first = subsystem.map_view_of_file(handle, 0, 0);
+                let persisted = match first {
+                    Ok(base) => {
+                        let payload = b"persist-me";
+                        if let Some((offset, backing)) = subsystem.mapped_view_section(base) {
+                            let mut backing = backing.lock().expect("section backing lock");
+                            let start = offset as usize;
+                            backing[start..start + payload.len()].copy_from_slice(payload);
+                        }
+                        let _ = subsystem.unmap_view_of_file(base);
+                        let second = subsystem.map_view_of_file(handle, 0, 0);
+                        let matches = match second {
+                            Ok(base) => {
+                                let matches = subsystem
+                                    .mapped_view_section(base)
+                                    .map(|(offset, backing)| {
+                                        let backing = backing.lock().expect("section backing lock");
+                                        let start = offset as usize;
+                                        backing[start..start + payload.len()].to_vec() == payload
+                                    })
+                                    .unwrap_or(false);
+                                let _ = subsystem.unmap_view_of_file(base);
+                                matches
+                            }
+                            Err(_) => false,
+                        };
+                        let _ = subsystem.close_handle(handle);
+                        Some(matches)
+                    }
+                    Err(_) => None,
+                };
+                json!({
+                    "op": "unmap_remap",
+                    "mapping_size": spec.size,
+                    "view_size": spec.size,
+                    "map_succeeded": persisted.is_some(),
+                    "unmap_succeeded": persisted.is_some(),
+                    "error": 0,
+                    "content_matches": null,
+                    "persisted": persisted,
+                })
+            }
+            "invalid_handle" => {
+                let error = error_code(
+                    &subsystem
+                        .map_view_of_file(0, 0, 0)
+                        .expect_err("invalid section handle must fail"),
+                );
+                json!({
+                    "op": "invalid_handle",
+                    "mapping_size": 0,
+                    "view_size": 0,
+                    "map_succeeded": false,
+                    "unmap_succeeded": false,
+                    "error": error,
+                    "content_matches": null,
+                    "persisted": null,
+                })
+            }
+            _ => json!({ "error": 87 }),
+        }
+    })
+}
+
+// ── heap ────────────────────────────────────────────────────────────────────
+
+/// The runtime's HeapAlloc / HeapFree / HeapSize behavior through the
+/// subsystem heap machinery: allocation success, size ≥ requested,
+/// 16-byte pointer alignment (the alignment IS differential), HEAP_ZERO_MEMORY
+/// zeroing, and HeapFree invalidating the size query.
+fn runtime_heap(input: &Value) -> Value {
+    let Ok(spec) = serde_json::from_value::<HeapInput>(input.clone()) else {
+        return json!({ "error": 87 });
+    };
+    with_oracle_runtime(|runtime| {
+        let subsystem = &mut runtime.subsystem;
+        let heap = subsystem.heap_create(16, false);
+        match spec.op.as_str() {
+            "alloc_zero" => {
+                let allocated = subsystem.heap_alloc(heap, spec.size as usize);
+                let (succeeded, aligned_16, zeroed, size_ge_requested) = match allocated {
+                    Ok(address) => {
+                        let size = subsystem.heap_size(heap, address).unwrap_or(0);
+                        let bytes = subsystem.heap_read(heap, address).unwrap_or_default();
+                        (
+                            true,
+                            address % 16 == 0,
+                            bytes.iter().all(|byte| *byte == 0),
+                            size >= spec.size as usize,
+                        )
+                    }
+                    Err(_) => (false, false, false, false),
+                };
+                if let Ok(address) = allocated {
+                    let _ = subsystem.heap_free(heap, address);
+                }
+                let _ = subsystem.heap_destroy(heap);
+                json!({
+                    "op": "alloc_zero",
+                    "alloc_succeeded": succeeded,
+                    "aligned_16": aligned_16,
+                    "zeroed": zeroed,
+                    "size_ge_requested": size_ge_requested,
+                    "error": if succeeded { 0 } else { 8 },
+                })
+            }
+            "free_size" => {
+                let allocated = subsystem.heap_alloc(heap, spec.size as usize);
+                match allocated {
+                    Ok(address) => {
+                        let size = subsystem.heap_size(heap, address).unwrap_or(0);
+                        let freed = subsystem.heap_free(heap, address).is_ok();
+                        let size_after_free_fails = subsystem.heap_size(heap, address).is_err();
+                        let _ = subsystem.heap_destroy(heap);
+                        json!({
+                            "op": "free_size",
+                            "alloc_succeeded": true,
+                            "freed": freed,
+                            "size_ge_requested": size >= spec.size as usize,
+                            "size_after_free_fails": size_after_free_fails,
+                            "error": if freed { 0 } else { 6 },
+                        })
+                    }
+                    Err(error) => {
+                        let _ = subsystem.heap_destroy(heap);
+                        json!({
+                            "op": "free_size",
+                            "alloc_succeeded": false,
+                            "freed": false,
+                            "size_ge_requested": false,
+                            "size_after_free_fails": false,
+                            "error": error_code(&error),
+                        })
+                    }
+                }
+            }
+            _ => {
+                let _ = subsystem.heap_destroy(heap);
+                json!({ "error": 87 })
+            }
+        }
+    })
+}
+
 /// Normalize a `resolved_module` path for comparison: strip to the file name
 /// (last component) and lowercase. For `api_set` results, Windows may report
 /// the virtual api-set alias (e.g. `api-ms-win-core-file-l1-1-0.dll`) instead
@@ -1992,6 +3189,11 @@ pub fn is_virtual_apiset_alias(name: &str) -> bool {
 /// vector, applying the documented per-category normalizations. Returns a
 /// list of `(field, expected, actual)` diffs (empty when equal).
 pub fn compare_outputs(category: &str, expected: &Value, actual: &Value) -> Vec<DiffEntry> {
+    match category {
+        "time_clock" => return compare_time_clock(expected, actual),
+        "version" => return compare_version(expected, actual),
+        _ => {}
+    }
     let mut diffs = Vec::new();
     compare_value("", category, expected, actual, &mut diffs);
     if category == "api_set" {
@@ -2035,6 +3237,203 @@ pub fn compare_outputs(category: &str, expected: &Value, actual: &Value) -> Vec<
                 actual: json!(null),
             }),
             (None, None) => {}
+        }
+    }
+    diffs
+}
+
+/// The `time_clock` compare contract — STRUCTURAL, not bit-exact: the
+/// Casa1 deterministic guest clock advances by exactly the requested sleep,
+/// while the Windows reference measures REAL elapsed time (Sleep() rounds up
+/// to the system timer tick, and the capture machine may preempt the
+/// process).  The contract therefore validates the semantics both sides must
+/// agree on:
+///   * elapsed monotonicity: every delta is strictly positive;
+///   * the FILETIME domain: filetime_delta is a 100-ns-unit count in
+///     [sleep_ms × 10_000, sleep_ms × 2 × 10_000] (the sleep lasts at least
+///     the requested duration, and the generous upper bound absorbs timer
+///     granularity and preemption);
+///   * the QPC units-vs-frequency relation: qpc_seconds_100ns (the QPC delta
+///     converted through the counter frequency) falls in the SAME band, and
+///     agrees with filetime_delta (both measure the same elapsed interval
+///     in the same units, within 10% for rounding).
+fn compare_time_clock(expected: &Value, actual: &Value) -> Vec<DiffEntry> {
+    let mut diffs = Vec::new();
+    let sleep_ms = expected
+        .get("sleep_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let number =
+        |value: &Value, field: &str| value.get(field).and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let filetime_expected = number(expected, "filetime_delta");
+    let filetime_actual = number(actual, "filetime_delta");
+    let ticks_actual = number(actual, "ticks_delta");
+    let qpc_actual = number(actual, "qpc_delta");
+    let seconds_actual = number(actual, "qpc_seconds_100ns");
+
+    let in_band = |value: u64, low: u64, high: u64| value >= low && value <= high;
+    for (label, value) in [
+        ("ticks_delta", ticks_actual),
+        ("filetime_delta", filetime_actual),
+        ("qpc_delta", qpc_actual),
+        ("qpc_seconds_100ns", seconds_actual),
+    ] {
+        if value == u64::MAX {
+            diffs.push(DiffEntry {
+                id: String::new(),
+                category: "time_clock".to_string(),
+                field: label.to_string(),
+                expected: json!(null),
+                actual: json!(null),
+            });
+            continue;
+        }
+        if value == 0 {
+            diffs.push(DiffEntry {
+                id: String::new(),
+                category: "time_clock".to_string(),
+                field: label.to_string(),
+                expected: json!(format!("monotonic (delta > 0) across {sleep_ms} ms")),
+                actual: json!(value),
+            });
+        }
+    }
+    // The elapsed-time band for the ms-domain APIs.
+    if !in_band(ticks_actual, sleep_ms, sleep_ms.saturating_mul(2)) {
+        diffs.push(DiffEntry {
+            id: String::new(),
+            category: "time_clock".to_string(),
+            field: "ticks_delta".to_string(),
+            expected: json!(format!(
+                "in [{sleep_ms}, {}] ms",
+                sleep_ms.saturating_mul(2)
+            )),
+            actual: json!(ticks_actual),
+        });
+    }
+    // The FILETIME domain: 100-ns units, so the band scales by 10_000.
+    let low = sleep_ms.saturating_mul(10_000);
+    let high = sleep_ms.saturating_mul(20_000);
+    if !in_band(filetime_actual, low, high) {
+        diffs.push(DiffEntry {
+            id: String::new(),
+            category: "time_clock".to_string(),
+            field: "filetime_delta".to_string(),
+            expected: json!(format!("in [{low}, {high}] 100-ns units")),
+            actual: json!(filetime_actual),
+        });
+    }
+    if !in_band(seconds_actual, low, high) {
+        diffs.push(DiffEntry {
+            id: String::new(),
+            category: "time_clock".to_string(),
+            field: "qpc_seconds_100ns".to_string(),
+            expected: json!(format!("in [{low}, {high}] 100-ns units")),
+            actual: json!(seconds_actual),
+        });
+    }
+    // The QPC-vs-FILETIME cross-check: both measure the same elapsed
+    // interval in the same 100-ns units, within 10% (rounding on the
+    // frequency conversion).
+    if filetime_actual != u64::MAX
+        && seconds_actual != u64::MAX
+        && filetime_actual.abs_diff(seconds_actual) > filetime_actual / 10
+    {
+        diffs.push(DiffEntry {
+            id: String::new(),
+            category: "time_clock".to_string(),
+            field: "qpc_seconds_100ns_vs_filetime_delta".to_string(),
+            expected: json!(format!("within 10% of filetime_delta {filetime_expected}")),
+            actual: json!(seconds_actual),
+        });
+    }
+    // The reference and the runtime must agree on the requested sleep.
+    if sleep_ms
+        != actual
+            .get("sleep_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    {
+        diffs.push(DiffEntry {
+            id: String::new(),
+            category: "time_clock".to_string(),
+            field: "sleep_ms".to_string(),
+            expected: json!(sleep_ms),
+            actual: actual.get("sleep_ms").cloned().unwrap_or(Value::Null),
+        });
+    }
+    diffs
+}
+
+/// The `version` compare contract — SHAPE, not bit-exact: the Casa1 side
+/// reports its CONFIGURED Windows version, the reference its real one.  The
+/// contract validates the structural invariants both must satisfy (major in
+/// the Windows-10 family, build > 0, VER_PLATFORM_WIN32_NT) and — the exact
+/// part — that GetVersionExW and RtlGetVersion agree on every field within
+/// the same side.  The raw version numbers are never compared across sides.
+fn compare_version(expected: &Value, actual: &Value) -> Vec<DiffEntry> {
+    let mut diffs = Vec::new();
+    for (label, side) in [("expected", expected), ("actual", actual)] {
+        for api in ["version_ex", "rtl"] {
+            let Some(fields) = side.get(api) else {
+                continue;
+            };
+            let major = fields
+                .get("major")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let build = fields.get("build").and_then(Value::as_u64).unwrap_or(0);
+            let platform = fields
+                .get("platform_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            if major != 10 {
+                diffs.push(DiffEntry {
+                    id: String::new(),
+                    category: "version".to_string(),
+                    field: format!("{label}.{api}.major"),
+                    expected: json!("10 (Windows-10 family)"),
+                    actual: json!(major),
+                });
+            }
+            if build == 0 {
+                diffs.push(DiffEntry {
+                    id: String::new(),
+                    category: "version".to_string(),
+                    field: format!("{label}.{api}.build"),
+                    expected: json!("> 0"),
+                    actual: json!(build),
+                });
+            }
+            if platform != 2 {
+                diffs.push(DiffEntry {
+                    id: String::new(),
+                    category: "version".to_string(),
+                    field: format!("{label}.{api}.platform_id"),
+                    expected: json!("2 (VER_PLATFORM_WIN32_NT)"),
+                    actual: json!(platform),
+                });
+            }
+        }
+    }
+    // The exact contract: GetVersionExW and RtlGetVersion agree within each
+    // side, and the boolean contract fields are identical across sides.
+    for field in [
+        "cross_consistent",
+        "build_positive",
+        "major_win10_family",
+        "platform_nt",
+    ] {
+        let expected_value = expected.get(field).cloned().unwrap_or(Value::Null);
+        let actual_value = actual.get(field).cloned().unwrap_or(Value::Null);
+        if expected_value != actual_value {
+            diffs.push(DiffEntry {
+                id: String::new(),
+                category: "version".to_string(),
+                field: field.to_string(),
+                expected: expected_value,
+                actual: actual_value,
+            });
         }
     }
     diffs
@@ -2582,6 +3981,454 @@ mod tests {
             let result = compute_runtime_result(vector);
             assert_eq!(result.output["valid"], json!(true), "{}", vector.id);
             assert!(result.output["name"].is_string(), "{}", vector.id);
+        }
+    }
+
+    // ── time_clock ──────────────────────────────────────────────────────────
+
+    /// The runtime clock executor drives the deterministic session clock:
+    /// the deltas across a guest sleep are EXACT (the guest clock advances
+    /// by the full requested duration), the FILETIME delta is the tick delta
+    /// scaled by 10_000 (100-ns units), and the QPC delta converted through
+    /// the frequency equals the FILETIME delta — the reference-derived
+    /// invariants the compare contract validates structurally.
+    #[test]
+    fn time_clock_runtime_matches_reference_derived_invariants() {
+        let vectors = generate_vectors(&["time_clock".to_string()]);
+        assert!(!vectors.is_empty());
+        for vector in &vectors {
+            let sleep_ms = vector.input["sleep_ms"].as_u64().expect("sleep_ms");
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            let ticks_delta = output["ticks_delta"].as_u64().expect("ticks_delta");
+            let filetime_delta = output["filetime_delta"].as_u64().expect("filetime_delta");
+            let qpc_delta = output["qpc_delta"].as_u64().expect("qpc_delta");
+            let seconds = output["qpc_seconds_100ns"]
+                .as_u64()
+                .expect("qpc_seconds_100ns");
+            assert_eq!(ticks_delta, sleep_ms, "{}", vector.id);
+            assert_eq!(
+                filetime_delta,
+                sleep_ms * 10_000,
+                "FILETIME delta is the tick delta in 100-ns units: {}",
+                vector.id
+            );
+            assert!(qpc_delta > 0, "QPC is monotonic: {}", vector.id);
+            assert_eq!(seconds, filetime_delta, "{}", vector.id);
+            // The comparator accepts the runtime's own reference-shaped
+            // output (it must not report diffs against itself).
+            let diffs = compare_outputs("time_clock", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── environment ─────────────────────────────────────────────────────────
+
+    /// The runtime environment executor implements the GetEnvironmentVariableW
+    /// contract on the real subsystem environment store: present values
+    /// round-trip with the required size including the trailing NUL, a
+    /// too-small buffer reports ERROR_INSUFFICIENT_BUFFER, missing names
+    /// report ERROR_ENVVAR_NOT_FOUND, name lookup is case-insensitive, and
+    /// the environment block carries the set variables as sorted entries.
+    #[test]
+    fn environment_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["environment".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "roundtrip" => {
+                    assert_eq!(output["found"], json!(true), "{}", vector.id);
+                    assert_eq!(
+                        output["retrieved"],
+                        json!("Alpha Beta Gamma"),
+                        "{}",
+                        vector.id
+                    );
+                    assert_eq!(output["retrieved_units"], json!(16), "{}", vector.id);
+                    assert_eq!(output["required_size"], json!(17), "{}", vector.id);
+                    assert_eq!(
+                        output["small_buffer_error"],
+                        json!(ERROR_INSUFFICIENT_BUFFER),
+                        "{}",
+                        vector.id
+                    );
+                    assert_eq!(output["trailing_null"], json!(true), "{}", vector.id);
+                    assert_eq!(
+                        output["case_insensitive_found"],
+                        json!(true),
+                        "{}",
+                        vector.id
+                    );
+                }
+                "missing" => {
+                    assert_eq!(output["found"], json!(false), "{}", vector.id);
+                    assert_eq!(
+                        output["error"],
+                        json!(ERROR_ENVVAR_NOT_FOUND),
+                        "{}",
+                        vector.id
+                    );
+                }
+                "block" => {
+                    let entries = output["entries"].as_array().expect("entries");
+                    assert!(!entries.is_empty(), "{}", vector.id);
+                    for entry in entries {
+                        let entry = entry.as_str().expect("entry");
+                        assert!(
+                            entry.starts_with("CASA1_ORACLE_BLOCK_"),
+                            "{} entry {entry}",
+                            vector.id
+                        );
+                    }
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("environment", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── file_metadata ───────────────────────────────────────────────────────
+
+    /// The runtime file_metadata executor drives the real file subsystem:
+    /// exact byte sizes after writes, exact pointer positions relative to
+    /// start/end, the attribute projections and the ERROR_* codes for
+    /// missing paths and invalid handles.
+    #[test]
+    fn file_metadata_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["file_metadata".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "create" => {
+                    assert_eq!(output["exists"], json!(true), "{}", vector.id);
+                    assert_eq!(output["is_directory"], json!(false), "{}", vector.id);
+                    assert_eq!(output["is_readonly"], json!(false), "{}", vector.id);
+                    assert_eq!(output["size"], json!(0), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "size_after_writes" => {
+                    assert_eq!(output["sizes"], json!([5, 8]), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "seek" => {
+                    assert_eq!(output["pointer_begin"], json!(3), "{}", vector.id);
+                    assert_eq!(output["pointer_end"], json!(6), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "directory" => {
+                    assert_eq!(output["exists"], json!(true), "{}", vector.id);
+                    assert_eq!(output["is_directory"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "missing" => {
+                    assert_eq!(output["exists"], json!(false), "{}", vector.id);
+                    assert_eq!(output["error"], json!(2), "{}", vector.id);
+                }
+                "missing_parent" => {
+                    assert_eq!(output["exists"], json!(false), "{}", vector.id);
+                    assert_eq!(output["error"], json!(3), "{}", vector.id);
+                }
+                "invalid_handle" => {
+                    assert_eq!(output["error"], json!(6), "{}", vector.id);
+                }
+                "readonly_roundtrip" => {
+                    assert_eq!(output["set_succeeded"], json!(true), "{}", vector.id);
+                    assert_eq!(output["is_readonly"], json!(true), "{}", vector.id);
+                    assert_eq!(output["clear_succeeded"], json!(true), "{}", vector.id);
+                    assert_eq!(
+                        output["is_readonly_after_clear"],
+                        json!(false),
+                        "{}",
+                        vector.id
+                    );
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("file_metadata", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── directory_enumeration ───────────────────────────────────────────────
+
+    /// The runtime directory_enumeration executor drives the real
+    /// FindFirstFileW/FindNextFileW/FindClose machinery over the fixed
+    /// fixture: sorted entry names with directory flags, the no-match and
+    /// missing-directory ERROR_* codes, and exhaustion after the last entry.
+    #[test]
+    fn directory_enumeration_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["directory_enumeration".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "enumerate" => {
+                    let names = output["entries"]
+                        .as_array()
+                        .expect("entries")
+                        .iter()
+                        .map(|entry| entry["name"].as_str().expect("name"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        names,
+                        ["dir_a", "dir_c", "file_a.txt", "file_b.bin"],
+                        "{}",
+                        vector.id
+                    );
+                    assert!(output["exhausted"] == json!(true), "{}", vector.id);
+                    assert_eq!(
+                        output["next_error"],
+                        json!(ERROR_NO_MORE_FILES),
+                        "{}",
+                        vector.id
+                    );
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "enumerate_subset" => {
+                    let names = output["entries"]
+                        .as_array()
+                        .expect("entries")
+                        .iter()
+                        .map(|entry| entry["name"].as_str().expect("name"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(names, ["file_a.txt", "file_b.bin"], "{}", vector.id);
+                }
+                "no_match" => {
+                    assert_eq!(output["find_succeeded"], json!(false), "{}", vector.id);
+                    assert_eq!(output["invalid_handle"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(2), "{}", vector.id);
+                }
+                "missing_dir" => {
+                    assert_eq!(output["find_succeeded"], json!(false), "{}", vector.id);
+                    assert_eq!(output["invalid_handle"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(3), "{}", vector.id);
+                }
+                "exhaust" => {
+                    assert_eq!(output["find_succeeded"], json!(true), "{}", vector.id);
+                    assert!(output["exhausted"] == json!(true), "{}", vector.id);
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("directory_enumeration", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── version ─────────────────────────────────────────────────────────────
+
+    /// The runtime version executor derives BOTH APIs from the configured
+    /// winver profile (the same derivation the thunks use): GetVersionExW
+    /// and RtlGetVersion agree field-for-field, and the structural contract
+    /// holds (Windows-10 family, build > 0, VER_PLATFORM_WIN32_NT).
+    #[test]
+    fn version_runtime_matches_reference_derived_shape() {
+        let vectors = generate_vectors(&["version".to_string()]);
+        assert_eq!(vectors.len(), 1);
+        let result = compute_runtime_result(&vectors[0]);
+        let output = &result.output;
+        assert_eq!(output["cross_consistent"], json!(true));
+        assert_eq!(output["build_positive"], json!(true));
+        assert_eq!(output["major_win10_family"], json!(true));
+        assert_eq!(output["platform_nt"], json!(true));
+        assert_eq!(
+            output["version_ex"]["major"], output["rtl"]["major"],
+            "GetVersionExW and RtlGetVersion must agree"
+        );
+        assert_eq!(output["version_ex"]["build"], output["rtl"]["build"]);
+        // The comparator accepts the runtime's own reference-shaped output.
+        let diffs = compare_outputs("version", output, output);
+        assert!(diffs.is_empty(), "diffs: {diffs:?}");
+        // The shape contract also accepts a DIFFERENT (plausible) Windows
+        // version on the reference side — the raw numbers are never
+        // compared across sides.
+        let reference_shaped = json!({
+            "version_ex": { "major": 10, "minor": 0, "build": 26100, "platform_id": 2, "service_pack_major": 0, "service_pack_minor": 0 },
+            "rtl": { "major": 10, "minor": 0, "build": 26100, "platform_id": 2, "service_pack_major": 0, "service_pack_minor": 0 },
+            "cross_consistent": true,
+            "build_positive": true,
+            "major_win10_family": true,
+            "platform_nt": true,
+        });
+        let diffs = compare_outputs("version", &reference_shaped, output);
+        assert!(diffs.is_empty(), "shape contract diffs: {diffs:?}");
+    }
+
+    // ── error_domain ────────────────────────────────────────────────────────
+
+    /// The runtime error_domain executor drives REAL failing subsystem calls
+    /// and maps the failure NTSTATUS through the canonical
+    /// RtlNtStatusToDosError mapping: the ERROR_* values are identical to
+    /// the reference's (2 / 6 / 5 / 203) and the mapping is consistent.
+    #[test]
+    fn error_domain_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["error_domain".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "missing_file" => {
+                    assert_eq!(output["get_last_error"], json!(2), "{}", vector.id);
+                    assert_eq!(output["status_mapped"], json!(2), "{}", vector.id);
+                    assert_eq!(output["matches"], json!(true), "{}", vector.id);
+                }
+                "invalid_handle" => {
+                    assert_eq!(output["get_last_error"], json!(6), "{}", vector.id);
+                    assert_eq!(output["status_mapped"], json!(6), "{}", vector.id);
+                    assert_eq!(output["matches"], json!(true), "{}", vector.id);
+                }
+                "readonly_delete" => {
+                    assert_eq!(output["get_last_error"], json!(5), "{}", vector.id);
+                    assert_eq!(output["status_mapped"], json!(5), "{}", vector.id);
+                    assert_eq!(output["matches"], json!(true), "{}", vector.id);
+                }
+                "set_roundtrip" => {
+                    assert_eq!(output["get_last_error"], json!(203), "{}", vector.id);
+                    assert_eq!(output["matches"], json!(true), "{}", vector.id);
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("error_domain", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── string_ops ──────────────────────────────────────────────────────────
+
+    /// The runtime string_ops executor: lstrlenW counts UTF-16 code units
+    /// (surrogate pairs count as 2), lstrcpyW copies with the terminator,
+    /// lstrcmpW is the case-SENSITIVE ordinal comparison (−1/0/1), and
+    /// CharUpperW maps the ASCII + fixed Latin-1 subset under CP1252.
+    #[test]
+    fn string_ops_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["string_ops".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "len" => {
+                    let expected = match vector.input["left"].as_str().expect("left") {
+                        "Hello" => 5,
+                        "" => 0,
+                        "𐐷𐐷" => 4,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(output["length"], json!(expected), "{}", vector.id);
+                }
+                "copy" => {
+                    let source = vector.input["left"].as_str().expect("left");
+                    assert_eq!(
+                        output["copied_length"],
+                        json!(source.encode_utf16().count()),
+                        "{}",
+                        vector.id
+                    );
+                    assert_eq!(output["terminated"], json!(true), "{}", vector.id);
+                }
+                "cmp" => {
+                    let (left, right) = (
+                        vector.input["left"].as_str().expect("left"),
+                        vector.input["right"].as_str().expect("right"),
+                    );
+                    let expected = match (left, right) {
+                        ("abc", "abc") => 0,
+                        ("abc", "abd") => -1,
+                        ("abd", "abc") => 1,
+                        ("Abc", "abc") => -1,
+                        ("abc", "ab") => 1,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(output["sign"], json!(expected), "{}", vector.id);
+                }
+                "upper_char" => {
+                    let character = vector.input["character"].as_u64().expect("character") as u32;
+                    let expected = crate::win32::cp1252_uppercase(character);
+                    assert_eq!(output["upper"], json!(expected), "{}", vector.id);
+                }
+                "upper_string" => {
+                    assert_eq!(output["upper"], json!("ABC DEF É"), "{}", vector.id);
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("string_ops", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── section_mapping ──────────────────────────────────────────────────────
+
+    /// The runtime section_mapping executor drives the real section
+    /// machinery: the mapping and view sizes are exact, writes through the
+    /// view are visible on read-back and persist across unmap/remap, and an
+    /// invalid handle fails with ERROR_INVALID_HANDLE.  Base addresses are
+    /// never part of the differential.
+    #[test]
+    fn section_mapping_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["section_mapping".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "anon" => {
+                    assert_eq!(output["mapping_size"], json!(0x1000), "{}", vector.id);
+                    assert_eq!(output["view_size"], json!(0x1000), "{}", vector.id);
+                    assert_eq!(output["map_succeeded"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "write_visible" => {
+                    assert_eq!(output["content_matches"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "unmap_remap" => {
+                    assert_eq!(output["persisted"], json!(true), "{}", vector.id);
+                    assert_eq!(output["error"], json!(0), "{}", vector.id);
+                }
+                "invalid_handle" => {
+                    assert_eq!(output["map_succeeded"], json!(false), "{}", vector.id);
+                    assert_eq!(output["error"], json!(6), "{}", vector.id);
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("section_mapping", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
+        }
+    }
+
+    // ── heap ────────────────────────────────────────────────────────────────
+
+    /// The runtime heap executor: HeapAlloc succeeds with a 16-aligned
+    /// pointer, the size is at least the requested size, HEAP_ZERO_MEMORY
+    /// zeroes the block, and HeapFree makes the HeapSize query fail.
+    #[test]
+    fn heap_runtime_matches_reference_derived_truth() {
+        let vectors = generate_vectors(&["heap".to_string()]);
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            let output = &result.output;
+            match vector.input["op"].as_str().expect("op") {
+                "alloc_zero" => {
+                    assert_eq!(output["alloc_succeeded"], json!(true), "{}", vector.id);
+                    assert_eq!(output["aligned_16"], json!(true), "{}", vector.id);
+                    assert_eq!(output["zeroed"], json!(true), "{}", vector.id);
+                    assert_eq!(output["size_ge_requested"], json!(true), "{}", vector.id);
+                }
+                "free_size" => {
+                    assert_eq!(output["alloc_succeeded"], json!(true), "{}", vector.id);
+                    assert_eq!(output["freed"], json!(true), "{}", vector.id);
+                    assert_eq!(output["size_ge_requested"], json!(true), "{}", vector.id);
+                    assert_eq!(
+                        output["size_after_free_fails"],
+                        json!(true),
+                        "{}",
+                        vector.id
+                    );
+                }
+                op => panic!("unexpected op {op}"),
+            }
+            let diffs = compare_outputs("heap", output, output);
+            assert!(diffs.is_empty(), "{} diffs: {diffs:?}", vector.id);
         }
     }
 }

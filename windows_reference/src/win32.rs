@@ -46,7 +46,12 @@ const CREATE_ALWAYS: DWORD = 2;
 const OPEN_EXISTING: DWORD = 3;
 const OPEN_ALWAYS: DWORD = 4;
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+const FILE_ATTRIBUTE_READONLY: DWORD = 0x1;
+const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
+const FILE_ATTRIBUTE_ARCHIVE: DWORD = 0x20;
 const INVALID_FILE_ATTRIBUTES: DWORD = 0xffff_ffff;
+const FILE_BEGIN: DWORD = 0;
+const FILE_END: DWORD = 2;
 const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
 const LOCKFILE_FAIL_IMMEDIATELY: DWORD = 0x1;
 const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 0x2;
@@ -78,6 +83,15 @@ const PAGE_READONLY: DWORD = 0x02;
 const PAGE_READWRITE: DWORD = 0x04;
 const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
 const ERROR_INVALID_ADDRESS: DWORD = 487;
+const HEAP_ZERO_MEMORY: DWORD = 0x8;
+const VER_PLATFORM_WIN32_NT: DWORD = 2;
+const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
+const ERROR_NO_MORE_FILES: DWORD = 18;
+const ERROR_ENVVAR_NOT_FOUND: DWORD = 203;
+const ERROR_PATH_NOT_FOUND: DWORD = 3;
+const ERROR_FILE_NOT_FOUND: DWORD = 2;
+const ERROR_ACCESS_DENIED: DWORD = 5;
+const ERROR_INVALID_HANDLE: DWORD = 6;
 
 /// MEMORY_BASIC_INFORMATION (WinNT.h).  The x64 layout is the 48-byte form;
 /// the x86 layout is the 28-byte form (used when a 32-bit runner is added).
@@ -130,6 +144,83 @@ impl Overlapped {
     }
 }
 
+/// WIN32_FIND_DATAW (WinBase.h) — the fields the differential consumes.
+#[repr(C)]
+struct Win32FindDataW {
+    attributes: DWORD,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    file_size_high: DWORD,
+    file_size_low: DWORD,
+    reserved0: DWORD,
+    reserved1: DWORD,
+    file_name: [u16; 260],
+    alternate_file_name: [u16; 14],
+}
+
+impl Default for Win32FindDataW {
+    fn default() -> Self {
+        Win32FindDataW {
+            attributes: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            file_size_high: 0,
+            file_size_low: 0,
+            reserved0: 0,
+            reserved1: 0,
+            file_name: [0; 260],
+            alternate_file_name: [0; 14],
+        }
+    }
+}
+
+/// OSVERSIONINFOEXW (WinNT.h, 156 bytes).
+#[repr(C)]
+struct OsVersionInfoExW {
+    size: DWORD,
+    major: DWORD,
+    minor: DWORD,
+    build: DWORD,
+    platform_id: DWORD,
+    csd_version: [u16; 128],
+    service_pack_major: u16,
+    service_pack_minor: u16,
+    suite_mask: u16,
+    product_type: u8,
+    reserved: u8,
+}
+
+impl Default for OsVersionInfoExW {
+    fn default() -> Self {
+        OsVersionInfoExW {
+            size: std::mem::size_of::<OsVersionInfoExW>() as DWORD,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform_id: 0,
+            csd_version: [0; 128],
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: 0,
+            reserved: 0,
+        }
+    }
+}
+
+/// RTL_OSVERSIONINFOW (ntdll).
+#[repr(C)]
+struct RtlOsVersionInfoW {
+    size: DWORD,
+    major: DWORD,
+    minor: DWORD,
+    build: DWORD,
+    platform_id: DWORD,
+    csd_version: [u16; 128],
+}
+
 // ── FFI declarations ────────────────────────────────────────────────────────
 
 #[link(name = "kernel32")]
@@ -142,6 +233,15 @@ unsafe extern "C" {
         buffer: LPWSTR,
         file_part: *mut LPWSTR,
     ) -> DWORD;
+    fn GetTickCount64() -> u64;
+    fn GetSystemTimeAsFileTime(file_time: *mut u64);
+    fn QueryPerformanceCounter(counter: *mut u64) -> BOOL;
+    fn QueryPerformanceFrequency(frequency: *mut u64) -> BOOL;
+    fn Sleep(milliseconds: DWORD);
+    fn GetEnvironmentVariableW(name: LPCWSTR, buffer: LPWSTR, buffer_length: DWORD) -> DWORD;
+    fn SetEnvironmentVariableW(name: LPCWSTR, value: LPCWSTR) -> BOOL;
+    fn GetEnvironmentStringsW() -> *mut u16;
+    fn FreeEnvironmentStringsW(strings: *mut u16) -> BOOL;
     fn CompareStringOrdinal(
         string1: LPCWSTR,
         count1: c_int,
@@ -168,6 +268,50 @@ unsafe extern "C" {
     fn DeleteFileW(file_name: LPCWSTR) -> BOOL;
     fn MoveFileExW(existing: LPCWSTR, new_name: LPCWSTR, flags: DWORD) -> BOOL;
     fn GetFileAttributesW(file_name: LPCWSTR) -> DWORD;
+    fn SetFileAttributesW(file_name: LPCWSTR, attributes: DWORD) -> BOOL;
+    fn GetFileSizeEx(file: HANDLE, size: *mut u64) -> BOOL;
+    fn SetFilePointerEx(
+        file: HANDLE,
+        distance: i64,
+        new_position: *mut u64,
+        move_method: DWORD,
+    ) -> BOOL;
+    fn FindFirstFileW(file_name: LPCWSTR, find_data: *mut Win32FindDataW) -> HANDLE;
+    fn FindNextFileW(find_file: HANDLE, find_data: *mut Win32FindDataW) -> BOOL;
+    fn FindClose(find_file: HANDLE) -> BOOL;
+    fn WriteFile(
+        file: HANDLE,
+        buffer: *const c_void,
+        bytes_to_write: DWORD,
+        bytes_written: *mut DWORD,
+        overlapped: *mut c_void,
+    ) -> BOOL;
+    fn GetVersionExW(version_information: *mut OsVersionInfoExW) -> BOOL;
+    fn lstrlenW(string: LPCWSTR) -> c_int;
+    fn lstrcmpW(left: LPCWSTR, right: LPCWSTR) -> c_int;
+    fn lstrcpyW(destination: LPWSTR, source: LPCWSTR) -> LPWSTR;
+    fn CharUpperW(string: LPWSTR) -> LPWSTR;
+    fn CreateFileMappingW(
+        file: HANDLE,
+        attributes: *mut c_void,
+        protect: DWORD,
+        maximum_size_high: DWORD,
+        maximum_size_low: DWORD,
+        name: LPCWSTR,
+    ) -> HANDLE;
+    fn MapViewOfFile(
+        file_mapping_handle: HANDLE,
+        desired_access: DWORD,
+        offset_high: DWORD,
+        offset_low: DWORD,
+        number_of_bytes_to_map: SIZE_T,
+    ) -> LPVOID;
+    fn UnmapViewOfFile(base_address: LPVOID) -> BOOL;
+    fn GetProcessHeap() -> HANDLE;
+    fn HeapAlloc(heap: HANDLE, flags: DWORD, bytes: SIZE_T) -> LPVOID;
+    fn HeapFree(heap: HANDLE, flags: DWORD, memory: LPVOID) -> BOOL;
+    fn HeapSize(heap: HANDLE, flags: DWORD, memory: *const c_void) -> SIZE_T;
+    fn RtlNtStatusToDosError(status: i32) -> DWORD;
     fn CreateDirectoryW(path: LPCWSTR, security_attributes: *mut c_void) -> BOOL;
     fn SetCurrentDirectoryW(path: LPCWSTR) -> BOOL;
     fn LockFileEx(
@@ -233,6 +377,11 @@ unsafe extern "C" {
         old_protect: *mut DWORD,
     ) -> BOOL;
     fn VirtualQuery(address: LPVOID, info: *mut MemoryBasicInformation, length: SIZE_T) -> SIZE_T;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "C" {
+    fn RtlGetVersion(info: *mut RtlOsVersionInfoW) -> i32;
 }
 
 type ThreadProc = unsafe extern "system" fn(LPVOID) -> DWORD;
@@ -418,6 +567,67 @@ struct VirtualMemoryInput {
     free_type: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct TimeClockInput {
+    sleep_ms: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvironmentInput {
+    name: String,
+    #[serde(default)]
+    value: String,
+    op: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileMetadataInput {
+    path: String,
+    op: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryEnumerationInput {
+    path: String,
+    pattern: String,
+    op: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionInput {
+    api: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorDomainInput {
+    op: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StringOpsInput {
+    op: String,
+    #[serde(default)]
+    left: String,
+    #[serde(default)]
+    right: String,
+    #[serde(default)]
+    character: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SectionMappingInput {
+    op: String,
+    #[serde(default)]
+    size: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeapInput {
+    op: String,
+    #[serde(default)]
+    size: u32,
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 fn to_wide(value: &str) -> Vec<u16> {
@@ -554,12 +764,24 @@ pub fn execute(category: &str, input: &Value) -> Value {
         "d3d12_texture_address_mode" => exec_d3d12_texture_address_mode(input),
         "d3d12_filter_reduction" => exec_d3d12_filter_reduction(input),
         "d3d12_filter_translation" => exec_d3d12_filter_translation(input),
+        "time_clock" => exec_time_clock(input),
+        "environment" => exec_environment(input),
+        "file_metadata" => exec_file_metadata(input),
+        "directory_enumeration" => exec_directory_enumeration(input),
+        "version" => exec_version(input),
+        "error_domain" => exec_error_domain(input),
+        "string_ops" => exec_string_ops(input),
+        "section_mapping" => exec_section_mapping(input),
+        "heap" => exec_heap(input),
         _ => json!({ "error": format!("unknown_category: {category}") }),
     }
 }
 
 /// One-time scratch-directory setup shared by file-based categories and the
-/// cwd-dependent path vectors.
+/// cwd-dependent path vectors.  Mirrors the Casa1 session's
+/// `SCRATCH_DIRECTORIES` so the file-based categories operate on the same
+/// fixed layout on both sides (a missing parent directory would otherwise
+/// turn every CreateFileW into ERROR_PATH_NOT_FOUND).
 fn ensure_scratch_dirs() {
     static SETUP: AtomicBool = AtomicBool::new(false);
     if SETUP.swap(true, Ordering::SeqCst) {
@@ -567,6 +789,12 @@ fn ensure_scratch_dirs() {
     }
     for directory in [
         "C:\\Windows\\Temp\\casa1-oracle",
+        "C:\\Windows\\Temp\\casa1-oracle\\fs",
+        "C:\\Windows\\Temp\\casa1-oracle\\lock",
+        "C:\\Windows\\Temp\\casa1-oracle\\del",
+        "C:\\Windows\\Temp\\casa1-oracle\\meta",
+        "C:\\Windows\\Temp\\casa1-oracle\\enum",
+        "C:\\Windows\\Temp\\casa1-oracle\\err",
         "C:\\Windows\\Temp\\casa1-oracle-cwd",
     ] {
         let wide = to_wide(directory);
@@ -2012,4 +2240,963 @@ fn exec_virtual_memory(input: &Value) -> Value {
         output["old_protection"] = json!(old);
     }
     output
+}
+
+// ── time_clock ──────────────────────────────────────────────────────────────
+//
+// REAL GetTickCount64 / GetSystemTimeAsFileTime / QueryPerformanceCounter
+// deltas across a real Sleep.  The output carries only RELATIVE deltas plus
+// the frequency-normalized QPC seconds (qpc_seconds_100ns =
+// qpc_delta × 10_000_000 / frequency) — the compare contract validates the
+// semantics structurally (monotonicity, the 100-ns FILETIME domain, the QPC
+// units-vs-frequency relation), so the corpus is portable across machines.
+
+fn exec_time_clock(input: &Value) -> Value {
+    let Some(spec) = parse::<TimeClockInput>(input) else {
+        return json!({
+            "sleep_ms": 0, "ticks_delta": 0, "filetime_delta": 0,
+            "qpc_delta": 0, "qpc_seconds_100ns": 0,
+        });
+    };
+    let ticks_before = unsafe { GetTickCount64() };
+    let mut filetime_before: u64 = 0;
+    unsafe {
+        GetSystemTimeAsFileTime(&mut filetime_before);
+    }
+    let mut qpc_before: u64 = 0;
+    let mut frequency: u64 = 0;
+    unsafe {
+        QueryPerformanceCounter(&mut qpc_before);
+        QueryPerformanceFrequency(&mut frequency);
+    }
+    unsafe {
+        Sleep(spec.sleep_ms);
+    }
+    let ticks_after = unsafe { GetTickCount64() };
+    let mut filetime_after: u64 = 0;
+    unsafe {
+        GetSystemTimeAsFileTime(&mut filetime_after);
+    }
+    let mut qpc_after: u64 = 0;
+    unsafe {
+        QueryPerformanceCounter(&mut qpc_after);
+    }
+    let ticks_delta = ticks_after - ticks_before;
+    let filetime_delta = filetime_after - filetime_before;
+    let qpc_delta = qpc_after - qpc_before;
+    let qpc_seconds_100ns = if frequency == 0 {
+        0
+    } else {
+        qpc_delta.saturating_mul(10_000_000) / frequency
+    };
+    json!({
+        "sleep_ms": spec.sleep_ms,
+        "ticks_delta": ticks_delta,
+        "filetime_delta": filetime_delta,
+        "qpc_delta": qpc_delta,
+        "qpc_seconds_100ns": qpc_seconds_100ns,
+    })
+}
+
+// ── environment ─────────────────────────────────────────────────────────────
+//
+// REAL GetEnvironmentVariableW / SetEnvironmentVariableW /
+// GetEnvironmentStringsW semantics: present/missing, the required-size
+// return (units including the trailing NUL), the too-small-buffer case
+// (ERROR_INSUFFICIENT_BUFFER while still returning the required size),
+// case-insensitive name lookup, and the sorted NAME=VALUE block entries
+// (normalized to sorted entries so the block order — process-dependent on
+// Windows — is never part of the differential).
+
+fn exec_environment(input: &Value) -> Value {
+    let Some(spec) = parse::<EnvironmentInput>(input) else {
+        return json!({ "found": false, "error": 87 });
+    };
+    match spec.op.as_str() {
+        "roundtrip" => {
+            let name = to_wide(&spec.name);
+            let value = to_wide(&spec.value);
+            let set_succeeded = unsafe { SetEnvironmentVariableW(name.as_ptr(), value.as_ptr()) };
+            let mangled = to_wide(&spec.name.to_lowercase());
+            let query = |name: &[u16]| unsafe {
+                let required = GetEnvironmentVariableW(name.as_ptr(), null_mut(), 0);
+                if required == 0 {
+                    return json!({ "found": false, "error": last_error() });
+                }
+                let mut buffer = vec![0u16; required as usize];
+                let copied = GetEnvironmentVariableW(
+                    name.as_ptr(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as DWORD,
+                );
+                let retrieved = from_wide(&buffer[..copied as usize]);
+                // Too-small buffer: report the required size and the
+                // ERROR_INSUFFICIENT_BUFFER error.
+                let mut small = vec![0u16; 4];
+                let small_copied = GetEnvironmentVariableW(
+                    name.as_ptr(),
+                    small.as_mut_ptr(),
+                    small.len() as DWORD,
+                );
+                let small_error = if small_copied == 0 { last_error() } else { 0 };
+                json!({
+                    "found": true,
+                    "retrieved": retrieved,
+                    "retrieved_units": copied,
+                    "required_size": required,
+                    "small_buffer_error": small_error,
+                    "small_buffer_required": small_copied,
+                    "trailing_null": buffer.get(copied as usize).copied() == Some(0),
+                    "error": 0,
+                })
+            };
+            let result = query(&name);
+            let mut output = result;
+            if output["found"] == json!(true) {
+                output["case_insensitive_found"] = json!(query(&mangled)["found"] == json!(true));
+            } else {
+                output["case_insensitive_found"] = json!(false);
+            }
+            output["set_succeeded"] = json!(set_succeeded != 0);
+            output
+        }
+        "missing" => {
+            let name = to_wide(&spec.name);
+            let required = unsafe { GetEnvironmentVariableW(name.as_ptr(), null_mut(), 0) };
+            let error = if required == 0 { last_error() } else { 0 };
+            json!({
+                "found": required != 0,
+                "error": error,
+                "required_size": required,
+            })
+        }
+        "block" => {
+            let name = to_wide(&spec.name);
+            let value = to_wide(&spec.value);
+            unsafe {
+                SetEnvironmentVariableW(name.as_ptr(), value.as_ptr());
+            }
+            let block = unsafe { GetEnvironmentStringsW() };
+            let mut entries = Vec::new();
+            if !block.is_null() {
+                let mut cursor = block;
+                loop {
+                    let mut units = Vec::new();
+                    let mut unit = unsafe { *cursor };
+                    while unit != 0 {
+                        units.push(unit);
+                        cursor = unsafe { cursor.add(1) };
+                        unit = unsafe { *cursor };
+                    }
+                    if units.is_empty() {
+                        break;
+                    }
+                    entries.push(from_wide(&units));
+                    cursor = unsafe { cursor.add(1) };
+                }
+                unsafe {
+                    FreeEnvironmentStringsW(block);
+                }
+            }
+            let prefix = "CASA1_ORACLE_BLOCK_";
+            let mut filtered = entries
+                .into_iter()
+                .filter(|entry| entry.starts_with(prefix))
+                .collect::<Vec<_>>();
+            filtered.sort();
+            json!({ "entries": filtered, "error": 0 })
+        }
+        _ => json!({ "found": false, "error": 87 }),
+    }
+}
+
+// ── file_metadata ───────────────────────────────────────────────────────────
+//
+// REAL GetFileAttributesW / GetFileSizeEx / SetFilePointerEx semantics.
+// Attributes are reported as the differential-stable projections (exists /
+// is_directory / is_readonly — the raw FILE_ATTRIBUTE_* bit masks are not
+// stable across file systems); sizes and pointer positions are exact byte
+// values; errors are the ERROR_* codes (2 / 3 / 6).
+
+fn file_attr_projection(path: &str) -> (bool, bool, bool, DWORD) {
+    let wide = to_wide(path);
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        (false, false, false, last_error())
+    } else {
+        (
+            true,
+            attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            attributes & FILE_ATTRIBUTE_READONLY != 0,
+            0,
+        )
+    }
+}
+
+fn exec_file_metadata(input: &Value) -> Value {
+    ensure_scratch_dirs();
+    let Some(spec) = parse::<FileMetadataInput>(input) else {
+        return json!({ "error": 87, "exists": false });
+    };
+    let read_write = GENERIC_READ | GENERIC_WRITE;
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    let (exists, is_directory, is_readonly, attr_error) = file_attr_projection(&spec.path);
+    let mut output = json!({
+        "op": spec.op,
+        "exists": exists,
+        "is_directory": is_directory,
+        "is_readonly": is_readonly,
+        "error": 0,
+        "size": null,
+        "sizes": null,
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "clear_succeeded": null,
+        "is_readonly_after_clear": null,
+    });
+    match spec.op.as_str() {
+        "create" => {
+            let handle = open_file(&spec.path, read_write, share, CREATE_ALWAYS);
+            if handle == INVALID_HANDLE_VALUE {
+                output["error"] = json!(last_error());
+                output["exists"] = json!(false);
+                return output;
+            }
+            let mut size: u64 = 0;
+            let size_ok = unsafe { GetFileSizeEx(handle, &mut size) };
+            output["size"] = json!(if size_ok != 0 { size } else { 0 });
+            output["error"] = json!(if size_ok != 0 { 0 } else { last_error() });
+            close_handle(handle);
+            output["exists"] = json!(file_attr_projection(&spec.path).0);
+            output
+        }
+        "size_after_writes" => {
+            let handle = open_file(&spec.path, read_write, share, CREATE_ALWAYS);
+            if handle == INVALID_HANDLE_VALUE {
+                output["error"] = json!(last_error());
+                return output;
+            }
+            let mut written: DWORD = 0;
+            let first_ok = unsafe {
+                WriteFile(
+                    handle,
+                    b"hello".as_ptr() as *const c_void,
+                    5,
+                    &mut written,
+                    null_mut(),
+                )
+            };
+            let mut first_size: u64 = 0;
+            let first = if first_ok != 0 {
+                unsafe { GetFileSizeEx(handle, &mut first_size) };
+                json!(first_size)
+            } else {
+                json!(null)
+            };
+            let mut second_size: u64 = 0;
+            let second = if first_ok != 0 {
+                let second_ok = unsafe {
+                    WriteFile(
+                        handle,
+                        b"abc".as_ptr() as *const c_void,
+                        3,
+                        &mut written,
+                        null_mut(),
+                    )
+                };
+                if second_ok != 0 {
+                    unsafe { GetFileSizeEx(handle, &mut second_size) };
+                    json!(second_size)
+                } else {
+                    json!(null)
+                }
+            } else {
+                json!(null)
+            };
+            close_handle(handle);
+            output["sizes"] = json!([first, second]);
+            output["error"] = json!(if first == json!(null) || second == json!(null) {
+                last_error()
+            } else {
+                0
+            });
+            output
+        }
+        "seek" => {
+            let handle = open_file(&spec.path, read_write, share, CREATE_ALWAYS);
+            if handle == INVALID_HANDLE_VALUE {
+                output["error"] = json!(last_error());
+                return output;
+            }
+            let mut written: DWORD = 0;
+            unsafe {
+                WriteFile(
+                    handle,
+                    b"01234567".as_ptr() as *const c_void,
+                    8,
+                    &mut written,
+                    null_mut(),
+                );
+            }
+            let mut begin: u64 = 0;
+            let begin_ok = unsafe { SetFilePointerEx(handle, 3, &mut begin, FILE_BEGIN) };
+            let mut end: u64 = 0;
+            let end_ok = unsafe { SetFilePointerEx(handle, -2, &mut end, FILE_END) };
+            close_handle(handle);
+            output["pointer_begin"] = json!(if begin_ok != 0 { begin } else { 0 });
+            output["pointer_end"] = json!(if end_ok != 0 { end } else { 0 });
+            output["error"] = json!(if begin_ok != 0 && end_ok != 0 { 0 } else { last_error() });
+            output
+        }
+        "directory" => {
+            let wide = to_wide(&spec.path);
+            let created = unsafe { CreateDirectoryW(wide.as_ptr(), null_mut()) };
+            output["error"] = json!(if created != 0 { 0 } else { last_error() });
+            let (exists, is_directory, is_readonly, _) = file_attr_projection(&spec.path);
+            output["exists"] = json!(exists);
+            output["is_directory"] = json!(is_directory);
+            output["is_readonly"] = json!(is_readonly);
+            output
+        }
+        "missing" => {
+            output["error"] = json!(if exists { 0 } else { attr_error });
+            output
+        }
+        "missing_parent" => {
+            output["error"] = json!(if exists { 0 } else { attr_error });
+            output
+        }
+        "invalid_handle" => {
+            let mut size: u64 = 0;
+            let ok = unsafe { GetFileSizeEx(INVALID_HANDLE_VALUE, &mut size) };
+            output["error"] = json!(if ok != 0 { 0 } else { last_error() });
+            output
+        }
+        "readonly_roundtrip" => {
+            let handle = open_file(&spec.path, read_write, share, CREATE_ALWAYS);
+            if handle != INVALID_HANDLE_VALUE {
+                close_handle(handle);
+            }
+            let wide = to_wide(&spec.path);
+            let set_succeeded = unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE)
+            };
+            output["set_succeeded"] = json!(set_succeeded != 0);
+            output["is_readonly"] = json!(file_attr_projection(&spec.path).2);
+            let clear_succeeded =
+                unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_ARCHIVE) };
+            output["clear_succeeded"] = json!(clear_succeeded != 0);
+            output["is_readonly_after_clear"] = json!(file_attr_projection(&spec.path).2);
+            output["error"] = json!(0);
+            output
+        }
+        _ => json!({ "error": 87, "exists": false }),
+    }
+}
+
+// ── directory_enumeration ───────────────────────────────────────────────────
+//
+// REAL FindFirstFileW / FindNextFileW / FindClose over the fixed fixture
+// layout the executor provisions itself (alpha/: dir_a + dir_c directories,
+// file_a.txt + file_b.bin files).  Entry names, per-entry directory flags
+// and the sorted order are the differential; the no-match /
+// missing-directory / exhaustion cases report the ERROR_* codes.
+
+fn provision_enum_fixture() {
+    let base = "C:\\Windows\\Temp\\casa1-oracle\\enum\\alpha";
+    let dirs = [base, "C:\\Windows\\Temp\\casa1-oracle\\enum"];
+    for directory in dirs {
+        let wide = to_wide(directory);
+        unsafe {
+            CreateDirectoryW(wide.as_ptr(), null_mut());
+        }
+    }
+    for name in ["dir_a", "dir_c"] {
+        let wide = to_wide(&format!("{base}\\{name}"));
+        unsafe {
+            CreateDirectoryW(wide.as_ptr(), null_mut());
+        }
+    }
+    for name in ["file_a.txt", "file_b.bin"] {
+        let handle = open_file(
+            &format!("{base}\\{name}"),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            CREATE_ALWAYS,
+        );
+        if handle != INVALID_HANDLE_VALUE {
+            close_handle(handle);
+        }
+    }
+}
+
+fn exec_directory_enumeration(input: &Value) -> Value {
+    ensure_scratch_dirs();
+    provision_enum_fixture();
+    let Some(spec) = parse::<DirectoryEnumerationInput>(input) else {
+        return json!({ "find_succeeded": false, "error": 87, "entries": [] });
+    };
+    let path = to_wide(&spec.path);
+    let mut find_data = Win32FindDataW::default();
+    let handle = unsafe { FindFirstFileW(path.as_ptr(), &mut find_data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return json!({
+            "find_succeeded": false,
+            "invalid_handle": true,
+            "error": last_error(),
+            "entries": [],
+            "exhausted": false,
+            "next_error": 0,
+            "close_succeeded": false,
+        });
+    }
+    let mut entries = vec![json!({
+        "name": from_wide(&find_data.file_name),
+        "is_directory": find_data.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+    })];
+    let mut exhausted = false;
+    let mut next_error = 0;
+    loop {
+        let mut next = Win32FindDataW::default();
+        let ok = unsafe { FindNextFileW(handle, &mut next) };
+        if ok == 0 {
+            next_error = last_error();
+            exhausted = true;
+            break;
+        }
+        entries.push(json!({
+            "name": from_wide(&next.file_name),
+            "is_directory": next.attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        }));
+    }
+    let close_succeeded = unsafe { FindClose(handle) } != 0;
+    json!({
+        "find_succeeded": true,
+        "invalid_handle": false,
+        "error": 0,
+        "entries": entries,
+        "exhausted": exhausted,
+        "next_error": next_error,
+        "close_succeeded": close_succeeded,
+    })
+}
+
+// ── version ─────────────────────────────────────────────────────────────────
+//
+// REAL GetVersionExW and RtlGetVersion.  The output reports both APIs'
+// fields plus the structural contract booleans; the compare accepts the
+// SHAPE (the raw version numbers differ between the reference machine and
+// the Casa1 configured profile — the CONTRACT is cross-API consistency
+// within each side plus the Windows-10-family shape).
+
+fn exec_version(input: &Value) -> Value {
+    let Some(spec) = parse::<VersionInput>(input) else {
+        return json!({ "error": 87 });
+    };
+    if spec.api != "both" {
+        return json!({ "error": 87 });
+    }
+    let fields = |major: u32,
+                  minor: u32,
+                  build: u32,
+                  platform_id: u32,
+                  service_pack_major: u16,
+                  service_pack_minor: u16|
+     -> Value {
+        json!({
+            "major": major,
+            "minor": minor,
+            "build": build,
+            "platform_id": platform_id,
+            "service_pack_major": service_pack_major,
+            "service_pack_minor": service_pack_minor,
+        })
+    };
+    let mut version_ex = OsVersionInfoExW::default();
+    let version_ex_ok = unsafe { GetVersionExW(&mut version_ex) };
+    let mut rtl = RtlOsVersionInfoW {
+        size: std::mem::size_of::<RtlOsVersionInfoW>() as DWORD,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        csd_version: [0; 128],
+    };
+    let rtl_ok = unsafe { RtlGetVersion(&mut rtl) };
+    let version_ex_fields = if version_ex_ok != 0 {
+        fields(
+            version_ex.major,
+            version_ex.minor,
+            version_ex.build,
+            version_ex.platform_id,
+            version_ex.service_pack_major,
+            version_ex.service_pack_minor,
+        )
+    } else {
+        json!({ "major": 0, "minor": 0, "build": 0, "platform_id": 0, "service_pack_major": 0, "service_pack_minor": 0 })
+    };
+    let rtl_fields = if rtl_ok == 0 {
+        fields(
+            rtl.major,
+            rtl.minor,
+            rtl.build,
+            rtl.platform_id,
+            0,
+            0,
+        )
+    } else {
+        json!({ "major": 0, "minor": 0, "build": 0, "platform_id": 0, "service_pack_major": 0, "service_pack_minor": 0 })
+    };
+    let cross_consistent = version_ex_ok != 0
+        && rtl_ok == 0
+        && version_ex_fields["major"] == rtl_fields["major"]
+        && version_ex_fields["minor"] == rtl_fields["minor"]
+        && version_ex_fields["build"] == rtl_fields["build"]
+        && version_ex_fields["platform_id"] == rtl_fields["platform_id"];
+    let shape_ok = version_ex_ok != 0
+        && rtl_ok == 0
+        && version_ex.major == 10
+        && version_ex.build > 0
+        && version_ex.platform_id == VER_PLATFORM_WIN32_NT;
+    json!({
+        "version_ex": version_ex_fields,
+        "rtl": rtl_fields,
+        "cross_consistent": cross_consistent,
+        "build_positive": shape_ok && version_ex.build > 0,
+        "major_win10_family": shape_ok && version_ex.major == 10,
+        "platform_nt": shape_ok && version_ex.platform_id == VER_PLATFORM_WIN32_NT,
+    })
+}
+
+// ── error_domain ────────────────────────────────────────────────────────────
+//
+// REAL SetLastError / GetLastError semantics plus the ERROR_* ↔ NTSTATUS
+// mapping (RtlNtStatusToDosError): for each fixed failure class the
+// executor performs a REAL failing API call and reports the resulting
+// GetLastError value; the ERROR_* values are identical across Windows and
+// Casa1 (2 / 6 / 5 / 203).
+
+fn exec_error_domain(input: &Value) -> Value {
+    ensure_scratch_dirs();
+    let Some(spec) = parse::<ErrorDomainInput>(input) else {
+        return json!({ "get_last_error": 87, "status_mapped": 87, "matches": true });
+    };
+    let (get_last_error, status) = match spec.op.as_str() {
+        "missing_file" => {
+            let path = format!("{}\\err\\missing-000.bin", "C:\\Windows\\Temp\\casa1-oracle");
+            let handle = open_file(&path, GENERIC_READ | GENERIC_WRITE, 0, OPEN_EXISTING);
+            let error = if handle == INVALID_HANDLE_VALUE {
+                last_error()
+            } else {
+                close_handle(handle);
+                0
+            };
+            (error, 0xC000_0034_u32) // STATUS_OBJECT_NAME_NOT_FOUND
+        }
+        "invalid_handle" => {
+            let mut size: u64 = 0;
+            let ok = unsafe { GetFileSizeEx(INVALID_HANDLE_VALUE, &mut size) };
+            (if ok != 0 { 0 } else { last_error() }, 0xC000_0008_u32) // STATUS_INVALID_HANDLE
+        }
+        "readonly_delete" => {
+            let base = "C:\\Windows\\Temp\\casa1-oracle\\err";
+            let path = format!("{base}\\readonly-001.bin");
+            let handle = open_file(
+                &path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                CREATE_ALWAYS,
+            );
+            if handle != INVALID_HANDLE_VALUE {
+                close_handle(handle);
+            }
+            let wide = to_wide(&path);
+            unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_READONLY);
+            }
+            let ok = unsafe { DeleteFileW(wide.as_ptr()) };
+            let error = if ok != 0 { 0 } else { last_error() };
+            unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+            }
+            (error, 0xC000_0022_u32) // STATUS_ACCESS_DENIED
+        }
+        "set_roundtrip" => {
+            unsafe {
+                SetLastError(ERROR_ENVVAR_NOT_FOUND);
+            }
+            (unsafe { GetLastError() }, 0)
+        }
+        _ => return json!({ "get_last_error": 87, "status_mapped": 87, "matches": true }),
+    };
+    let status_mapped = if spec.op == "set_roundtrip" {
+        get_last_error
+    } else {
+        unsafe { RtlNtStatusToDosError(status as i32) }
+    };
+    json!({
+        "op": spec.op,
+        "get_last_error": get_last_error,
+        "status_mapped": status_mapped,
+        "matches": get_last_error == status_mapped,
+    })
+}
+
+// ── string_ops ──────────────────────────────────────────────────────────────
+//
+// REAL lstrlenW / lstrcpyW / lstrcmpW / CharUpperW semantics.
+
+fn exec_string_ops(input: &Value) -> Value {
+    let Some(spec) = parse::<StringOpsInput>(input) else {
+        return json!({ "error": 87 });
+    };
+    match spec.op.as_str() {
+        "len" => {
+            let wide = to_wide(&spec.left);
+            let length = unsafe { lstrlenW(wide.as_ptr()) };
+            json!({ "op": "len", "length": length, "error": 0 })
+        }
+        "copy" => {
+            let source = to_wide(&spec.left);
+            let mut destination = vec![0u16; source.len()];
+            unsafe {
+                lstrcpyW(destination.as_mut_ptr(), source.as_ptr());
+            }
+            let dest_length = unsafe { lstrlenW(destination.as_ptr()) };
+            let terminated = destination.get(source.len() - 1).copied() == Some(0);
+            json!({
+                "op": "copy",
+                "copied_length": dest_length,
+                "dest_length": dest_length,
+                "terminated": terminated,
+                "error": 0,
+            })
+        }
+        "cmp" => {
+            let left = to_wide(&spec.left);
+            let right = to_wide(&spec.right);
+            let sign = unsafe { lstrcmpW(left.as_ptr(), right.as_ptr()) };
+            json!({ "op": "cmp", "sign": sign, "error": 0 })
+        }
+        "upper_char" => {
+            let mut value = [0u16; 2];
+            value[0] = (spec.character & 0xFFFF) as u16;
+            // Single-character form: the high word is zero, CharUpperW
+            // converts the low word and RETURNS the converted character.
+            let upper = if spec.character <= u16::MAX as u32 {
+                unsafe { CharUpperW(value.as_mut_ptr()) as usize as u32 }
+            } else {
+                spec.character
+            };
+            json!({
+                "op": "upper_char",
+                "character": spec.character,
+                "upper": upper,
+                "error": 0,
+            })
+        }
+        "upper_string" => {
+            let mut wide = to_wide(&spec.left);
+            unsafe {
+                CharUpperW(wide.as_mut_ptr());
+            }
+            json!({
+                "op": "upper_string",
+                "upper": from_wide(&wide),
+                "error": 0,
+            })
+        }
+        _ => json!({ "error": 87 }),
+    }
+}
+
+// ── section_mapping ─────────────────────────────────────────────────────────
+//
+// REAL CreateFileMappingW / MapViewOfFile / UnmapViewOfFile over ANONYMOUS
+// (non-file-backed) sections — the Casa1 runtime models named/anonymous
+// shared sections, not file-backed ones.  The differential is the mapping
+// SIZE and the content visibility after writes (never base addresses).
+
+fn exec_section_mapping(input: &Value) -> Value {
+    let Some(spec) = parse::<SectionMappingInput>(input) else {
+        return json!({ "error": 87 });
+    };
+    let create = |size: u32| unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            null_mut(),
+            PAGE_READWRITE,
+            0,
+            size,
+            null_mut(),
+        )
+    };
+    match spec.op.as_str() {
+        "anon" => {
+            let section = create(spec.size);
+            if section.is_null() {
+                return json!({
+                    "op": "anon", "mapping_size": 0, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": last_error(), "content_matches": null, "persisted": null,
+                });
+            }
+            let view = unsafe { MapViewOfFile(section, 0xF001F, 0, 0, 0) };
+            if view.is_null() {
+                let error = last_error();
+                unsafe {
+                    CloseHandle(section);
+                }
+                return json!({
+                    "op": "anon", "mapping_size": spec.size, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": error, "content_matches": null, "persisted": null,
+                });
+            }
+            let view_size = view_size_of(section, view, spec.size);
+            let unmapped = unsafe { UnmapViewOfFile(view) } != 0;
+            unsafe {
+                CloseHandle(section);
+            }
+            json!({
+                "op": "anon",
+                "mapping_size": spec.size,
+                "view_size": view_size,
+                "map_succeeded": true,
+                "unmap_succeeded": unmapped,
+                "error": 0,
+                "content_matches": null,
+                "persisted": null,
+            })
+        }
+        "write_visible" => {
+            let section = create(spec.size);
+            if section.is_null() {
+                return json!({
+                    "op": "write_visible", "mapping_size": 0, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": last_error(), "content_matches": null, "persisted": null,
+                });
+            }
+            let view = unsafe { MapViewOfFile(section, 0xF001F, 0, 0, 0) };
+            if view.is_null() {
+                let error = last_error();
+                unsafe {
+                    CloseHandle(section);
+                }
+                return json!({
+                    "op": "write_visible", "mapping_size": spec.size, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": error, "content_matches": null, "persisted": null,
+                });
+            }
+            let payload: &[u8] = b"section-payload-0123456789";
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    (view as *mut u8).add(0x10),
+                    payload.len(),
+                );
+            }
+            let mut read_back = vec![0u8; payload.len()];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (view as *const u8).add(0x10),
+                    read_back.as_mut_ptr(),
+                    payload.len(),
+                );
+            }
+            let matches = read_back == payload;
+            let unmapped = unsafe { UnmapViewOfFile(view) } != 0;
+            unsafe {
+                CloseHandle(section);
+            }
+            json!({
+                "op": "write_visible",
+                "mapping_size": spec.size,
+                "view_size": spec.size,
+                "map_succeeded": true,
+                "unmap_succeeded": unmapped,
+                "error": 0,
+                "content_matches": matches,
+                "persisted": null,
+            })
+        }
+        "unmap_remap" => {
+            let section = create(spec.size);
+            if section.is_null() {
+                return json!({
+                    "op": "unmap_remap", "mapping_size": 0, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": last_error(), "content_matches": null, "persisted": null,
+                });
+            }
+            let first = unsafe { MapViewOfFile(section, 0xF001F, 0, 0, 0) };
+            if first.is_null() {
+                let error = last_error();
+                unsafe {
+                    CloseHandle(section);
+                }
+                return json!({
+                    "op": "unmap_remap", "mapping_size": spec.size, "view_size": 0,
+                    "map_succeeded": false, "unmap_succeeded": false,
+                    "error": error, "content_matches": null, "persisted": null,
+                });
+            }
+            let payload: &[u8] = b"persist-me";
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    (first as *mut u8).add(0x10),
+                    payload.len(),
+                );
+                UnmapViewOfFile(first);
+            }
+            let second = unsafe { MapViewOfFile(section, 0xF001F, 0, 0, 0) };
+            let persisted = if second.is_null() {
+                false
+            } else {
+                let mut read_back = vec![0u8; payload.len()];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (second as *const u8).add(0x10),
+                        read_back.as_mut_ptr(),
+                        payload.len(),
+                    );
+                    UnmapViewOfFile(second);
+                }
+                read_back == payload
+            };
+            unsafe {
+                CloseHandle(section);
+            }
+            json!({
+                "op": "unmap_remap",
+                "mapping_size": spec.size,
+                "view_size": spec.size,
+                "map_succeeded": true,
+                "unmap_succeeded": true,
+                "error": 0,
+                "content_matches": null,
+                "persisted": persisted,
+            })
+        }
+        "invalid_handle" => {
+            let view = unsafe { MapViewOfFile(INVALID_HANDLE_VALUE, 0xF001F, 0, 0, 0) };
+            let error = if view.is_null() { last_error() } else { 0 };
+            if !view.is_null() {
+                unsafe {
+                    UnmapViewOfFile(view);
+                }
+            }
+            json!({
+                "op": "invalid_handle",
+                "mapping_size": 0,
+                "view_size": 0,
+                "map_succeeded": !view.is_null(),
+                "unmap_succeeded": false,
+                "error": error,
+                "content_matches": null,
+                "persisted": null,
+            })
+        }
+        _ => json!({ "error": 87 }),
+    }
+}
+
+/// The mapped view size: when MapViewOfFile maps the whole section (0), the
+/// view covers the full section; report the section's real size via
+/// VirtualQuery on the view base (the view is rounded up to page
+/// granularity, but the section size is the semantic contract).
+fn view_size_of(_section: HANDLE, view: LPVOID, requested: u32) -> u64 {
+    let mut mbi = MemoryBasicInformation::default();
+    let written = unsafe {
+        VirtualQuery(
+            view,
+            &mut mbi,
+            std::mem::size_of::<MemoryBasicInformation>() as SIZE_T,
+        )
+    };
+    if written != 0 {
+        return mbi.region_size as u64;
+    }
+    // The caller requested an explicit view size; report it.
+    u64::from(requested)
+}
+
+// ── heap ────────────────────────────────────────────────────────────────────
+//
+// REAL HeapAlloc / HeapFree / HeapSize on the process heap: allocation
+// success, size ≥ requested, 16-byte alignment (the alignment IS
+// differential), HEAP_ZERO_MEMORY zeroing, and HeapFree invalidating the
+// size query.
+
+fn exec_heap(input: &Value) -> Value {
+    let Some(spec) = parse::<HeapInput>(input) else {
+        return json!({ "error": 87 });
+    };
+    let heap = unsafe { GetProcessHeap() };
+    if heap.is_null() {
+        return json!({ "error": 87 });
+    }
+    match spec.op.as_str() {
+        "alloc_zero" => {
+            let pointer =
+                unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, spec.size as SIZE_T) };
+            if pointer.is_null() {
+                return json!({
+                    "op": "alloc_zero",
+                    "alloc_succeeded": false,
+                    "aligned_16": false,
+                    "zeroed": false,
+                    "size_ge_requested": false,
+                    "error": last_error(),
+                });
+            }
+            let size = unsafe { HeapSize(heap, 0, pointer) };
+            let aligned_16 = (pointer as usize) % 16 == 0;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(pointer as *const u8, spec.size as usize).to_vec()
+            };
+            let zeroed = bytes.iter().all(|byte| *byte == 0);
+            unsafe {
+                HeapFree(heap, 0, pointer);
+            }
+            json!({
+                "op": "alloc_zero",
+                "alloc_succeeded": true,
+                "aligned_16": aligned_16,
+                "zeroed": zeroed,
+                "size_ge_requested": size >= spec.size as SIZE_T,
+                "error": 0,
+            })
+        }
+        "free_size" => {
+            let pointer = unsafe { HeapAlloc(heap, 0, spec.size as SIZE_T) };
+            if pointer.is_null() {
+                return json!({
+                    "op": "free_size",
+                    "alloc_succeeded": false,
+                    "freed": false,
+                    "size_ge_requested": false,
+                    "size_after_free_fails": false,
+                    "error": last_error(),
+                });
+            }
+            let size = unsafe { HeapSize(heap, 0, pointer) };
+            let freed = unsafe { HeapFree(heap, 0, pointer) } != 0;
+            let size_after = unsafe { HeapSize(heap, 0, pointer) };
+            let size_after_free_fails = freed && size_after == SIZE_T::MAX;
+            json!({
+                "op": "free_size",
+                "alloc_succeeded": true,
+                "freed": freed,
+                "size_ge_requested": size >= spec.size as SIZE_T,
+                "size_after_free_fails": size_after_free_fails,
+                "error": if freed { 0 } else { last_error() },
+            })
+        }
+        _ => json!({ "error": 87 }),
+    }
 }

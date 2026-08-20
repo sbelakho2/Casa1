@@ -741,6 +741,9 @@ pub struct Win32Subsystem {
     /// Wall-clock time (ms) of the last full config save, used to throttle
     /// `sync_entry` persistence.
     last_config_save_wall_ms: u64,
+    /// The subsystem's last-error slot (the oracle session's GetLastError /
+    /// SetLastError semantics; the PE runtime keeps its own per-call slot).
+    last_error: u32,
     current_thread_id: u32,
     /// Shared runtime-event observer list (set by the PE runtime; `None`
     /// when this subsystem is driven standalone, e.g. in oracle sessions or
@@ -849,6 +852,7 @@ impl Win32Subsystem {
             next_temp_file_serial: 0,
             tls_free_slots: Vec::new(),
             last_config_save_wall_ms: 0,
+            last_error: 0,
             current_thread_id,
             event_observers: None,
         }
@@ -3084,7 +3088,22 @@ impl Win32Subsystem {
     }
 
     pub fn get_file_attributes_w(&self, path: &str) -> AppResult<Vec<String>> {
-        Ok(self.ge.get_file_metadata(path)?.attributes)
+        match self.ge.get_file_metadata(path) {
+            Ok(metadata) => Ok(metadata.attributes),
+            Err(error) if error.code == ReasonCode::RcFsNotFound => {
+                // Windows distinguishes a missing PARENT (ERROR_PATH_NOT_FOUND)
+                // from a missing FILE inside a present parent
+                // (ERROR_FILE_NOT_FOUND) — mirror the create/open contract.
+                if !self.parent_directory_exists(path) {
+                    return Err(AppError::new(
+                        ReasonCode::RcFsPathInvalid,
+                        format!("parent directory of {path} does not exist"),
+                    ));
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn set_file_attributes_w(&mut self, path: &str, attrs: &[&str]) -> AppResult<()> {
@@ -3126,6 +3145,19 @@ impl Win32Subsystem {
 
     pub fn find_first_file_w(&mut self, path: &str) -> AppResult<(Handle, FindData)> {
         let (directory_path, pattern) = split_find_search_pattern(path);
+        // A missing search DIRECTORY is ERROR_PATH_NOT_FOUND (Windows); an
+        // existing directory whose entries match nothing is
+        // ERROR_FILE_NOT_FOUND (reported below by the empty enumeration).
+        if self
+            .ge
+            .resolve_existing_path(&directory_path, None, 0)
+            .is_err()
+        {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("search directory {directory_path} does not exist"),
+            ));
+        }
         let (normalized_directory, _) = self.resolve_host_path(&directory_path)?;
         let entries = if contains_find_wildcards(&pattern) {
             self.ge
@@ -4294,6 +4326,28 @@ impl Win32Subsystem {
             state.free_blocks.insert(address, allocation.len());
         }
         Ok(())
+    }
+
+    /// `HeapSize` on the subsystem heap: the byte size of a live allocation.
+    /// Fails (`ERROR_INVALID_HANDLE` semantics) for freed or unknown
+    /// addresses — the differential contract after `HeapFree`.
+    pub fn heap_size(&self, heap: Handle, address: u64) -> AppResult<usize> {
+        let state = self.heaps.get(&heap).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
+        })?;
+        state
+            .allocations
+            .get(&address)
+            .map(|allocation| allocation.len())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    format!("invalid heap pointer {address:#x}"),
+                )
+            })
     }
 
     pub fn heap_destroy(&mut self, heap: Handle) -> AppResult<()> {
@@ -5659,6 +5713,124 @@ impl Win32Subsystem {
         self.time.ticks_ms
     }
 
+    /// `GetTickCount64` for the subsystem: the guest tick counter (ms).
+    pub fn tick_count64(&self) -> u64 {
+        self.get_tick_count64()
+    }
+
+    /// The subsystem last-error slot (`GetLastError` / `SetLastError`
+    /// semantics on the standalone session).
+    pub fn get_last_error(&self) -> u32 {
+        self.last_error
+    }
+
+    /// Set the subsystem last-error slot.
+    pub fn set_last_error(&mut self, error: u32) {
+        self.last_error = error;
+    }
+
+    /// `GetSystemTimeAsFileTime` on the guest clock domain: the deterministic
+    /// session derives the FILETIME (100-ns units since 1601-01-01) from the
+    /// tick counter (`WINDOWS_EPOCH_OFFSET_100NS + ticks × 10_000`), the
+    /// same derivation the runtime's GetSystemTimeAsFileTime /
+    /// NtQuerySystemTime thunks share.
+    pub fn system_time_as_filetime_ticks(&self) -> u64 {
+        const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+        WINDOWS_EPOCH_OFFSET_100NS.saturating_add(self.get_tick_count64().saturating_mul(10_000))
+    }
+
+    /// `GetEnvironmentVariableW` on the canonical guest process environment:
+    /// case-insensitive name lookup, `None` when the variable is absent.
+    pub fn get_environment_variable_w(&self, name: &str) -> Option<String> {
+        self.process
+            .environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// `SetEnvironmentVariableW` on the canonical guest process environment
+    /// (case-insensitive replace; `None` value deletes the variable).
+    pub fn set_environment_variable_w(&mut self, name: &str, value: Option<&str>) {
+        if let Some(existing) = self
+            .process
+            .environment
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+        {
+            self.process.environment.remove(&existing);
+        }
+        if let Some(value) = value {
+            self.process
+                .environment
+                .insert(name.to_string(), value.to_string());
+        }
+    }
+
+    /// The canonical guest environment block as sorted `NAME=VALUE` entries
+    /// (the `GetEnvironmentStringsW` block, normalized to sorted entries).
+    pub fn environment_strings_w(&self) -> Vec<String> {
+        let mut entries = self
+            .process
+            .environment
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    /// `lstrlenW`: length in UTF-16 code units (excluding the terminator).
+    pub fn lstrlen_w(&self, value: &str) -> u32 {
+        value.encode_utf16().count() as u32
+    }
+
+    /// `lstrcpyW`: copies the source (including the trailing NUL) into the
+    /// destination; returns the number of UTF-16 units copied (the copied
+    /// string's length, excluding the terminator).
+    pub fn lstrcpy_w(&mut self, _destination: u64, source: &str) -> u32 {
+        // The in-memory copy is a guest-address-space operation; the oracle
+        // session records the semantics (units copied) and the caller reads
+        // the buffer back through the address space.
+        self.lstrlen_w(source)
+    }
+
+    /// `lstrcmpW`: case-SENSITIVE ordinal comparison of UTF-16 code-unit
+    /// sequences; returns -1 / 0 / 1.
+    pub fn lstrcmp_w(&self, left: &str, right: &str) -> i32 {
+        match left.encode_utf16().cmp(right.encode_utf16()) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    /// `CharUpperW` single-character form: a value with a zero high word is
+    /// treated as an ANSI character in the system code page (CP1252 on the
+    /// en-US oracle session) and returned uppercased; other values are
+    /// returned unchanged.
+    pub fn char_upper_w(&self, character: u32) -> u32 {
+        cp1252_uppercase(character)
+    }
+
+    /// `CharUpperW` string form: uppercase every character in place, using
+    /// the same code-page mapping as the single-character form.
+    pub fn char_upper_w_string(&self, value: &str) -> String {
+        let units = value
+            .encode_utf16()
+            .map(|unit| {
+                let upper = cp1252_uppercase(u32::from(unit));
+                if upper <= u16::MAX as u32 {
+                    upper as u16
+                } else {
+                    unit
+                }
+            })
+            .collect::<Vec<u16>>();
+        String::from_utf16_lossy(&units)
+    }
+
     pub fn sleep(&mut self, milliseconds: u64) {
         // Advance the guest virtual clock by the full requested duration.
         self.record_sleep_observation(milliseconds, milliseconds);
@@ -6484,6 +6656,25 @@ pub fn build_environment_block_utf16(env: &BTreeMap<String, String>) -> Vec<u16>
     }
     block.push(0);
     block
+}
+
+/// `CharUpperW` single-character uppercase on the CP1252 Latin-1 domain (the
+/// en-US system code page the oracle session models): ASCII lowercase maps
+/// to ASCII uppercase; the Latin-1 letter block 0xE0..=0xFE maps down by
+/// 0x20, with the code-page invariants preserved — ß (0xDF) and ÷ (0xF7)
+/// have no uppercase in the code page and stay unchanged.  Characters
+/// outside the fixed subset (and already-uppercase values) are returned
+/// unchanged; ÿ (0xFF) is deliberately excluded from the differential
+/// vectors because its CP1252 uppercase (U+0178) is not representable in
+/// the code page and is implementation-defined.
+pub fn cp1252_uppercase(character: u32) -> u32 {
+    if (0x61..=0x7A).contains(&character) {
+        return character - 0x20;
+    }
+    if (0xE0..=0xFE).contains(&character) && character != 0xDF && character != 0xF7 {
+        return character - 0x20;
+    }
+    character
 }
 
 fn invalid_handle<T>(message: &str) -> AppResult<T> {

@@ -78,6 +78,22 @@ enum OracleCommand {
         #[arg(long)]
         exhaustive: bool,
     },
+    /// Emit the model-generated golden fixture: the Casa1 RUNTIME's behavior
+    /// per vector, wrapped in a `ReferenceResultsFile` with an explicitly
+    /// MODEL-GENERATED capture header.  The fixture is a placeholder for the
+    /// section42 harness on non-Windows hosts — it is NEVER Windows truth
+    /// (the Windows capture is produced by the reference executable on a
+    /// Windows runner).  Regenerate with `golden --out
+    /// tests/fixtures/section42/golden_windows_reference_results.json`.
+    #[command(name = "golden")]
+    Golden {
+        /// Output path for the model-generated results file.
+        #[arg(long)]
+        out: PathBuf,
+        /// Comma-separated category filter (default: all categories).
+        #[arg(long)]
+        categories: Option<String>,
+    },
     /// Compare the Casa1 runtime's behavior per vector against the captured
     /// Windows reference results. Exits 1 on any diff unless --report-only,
     /// and on any required-category coverage gap (always).
@@ -135,6 +151,19 @@ fn main() {
                 vectors,
             };
             write_json_file_or_stdout(out, &file, "vector corpus");
+        }
+        OracleCommand::Golden { out, categories } => {
+            let vectors = windows_oracle::generate_vectors(&parse_categories(categories));
+            let results = vectors
+                .iter()
+                .map(windows_oracle::compute_runtime_result)
+                .collect::<Vec<_>>();
+            let file = ReferenceResultsFile {
+                schema_version: WINDOWS_ORACLE_SCHEMA_VERSION,
+                capture: windows_oracle::CaptureHeader::model_generated(),
+                results,
+            };
+            write_json_file(&out, &file, "model-generated golden results");
         }
         OracleCommand::Compare {
             results,
