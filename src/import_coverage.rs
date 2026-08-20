@@ -2335,19 +2335,36 @@ mod tests {
             &[],
         )
         .expect("coverage report");
+        let seeded: Vec<(String, String)> = vec![
+            ("kernel32.dll".to_string(), "GetProcAddress".to_string()),
+            ("user32.dll".to_string(), "MessageBoxW".to_string()),
+        ];
         let dynamic: Vec<_> = report
             .entries
             .iter()
             .filter(|entry| entry.source == ImportSource::DynamicLookup)
             .map(|entry| (entry.dll.clone(), entry.import.lookup_name()))
             .collect();
+        // The shared log is process-wide and concurrent lib tests exercising
+        // the runtime's real resolution paths (GetProcAddress dispatch,
+        // delay-load, forwarders) legitimately append entries between the
+        // seed and the report drain.  The contract asserted here is
+        // deterministic: the seeded pairs are present in order (each exactly
+        // once — the duplicate seed is deduplicated), while the exact global
+        // contents depend on concurrent tests by design.
+        let filtered: Vec<_> = dynamic
+            .iter()
+            .filter(|pair| seeded.contains(pair))
+            .collect();
         assert_eq!(
-            dynamic,
-            vec![
-                ("kernel32.dll".to_string(), "GetProcAddress".to_string()),
-                ("user32.dll".to_string(), "MessageBoxW".to_string()),
-            ],
+            filtered,
+            vec![&seeded[0], &seeded[1]],
             "dynamic lookups are recorded by (DLL, name), deduplicated"
+        );
+        assert_eq!(
+            dynamic.iter().filter(|pair| **pair == seeded[0]).count(),
+            1,
+            "the duplicate seed records exactly one entry"
         );
         // Dynamic lookups are reached by construction.
         assert!(
