@@ -302,8 +302,8 @@ const E_INVALIDARG: u64 = 0x8007_0057;
 const CLASS_E_CLASSNOTAVAILABLE: u64 = 0x8004_0154;
 const DXGI_ERROR_NOT_FOUND: u64 = 0x887A_0002;
 const INVALID_HANDLE_VALUE: u64 = u64::MAX;
-const DLL_PROCESS_DETACH: u32 = 0;
-const DLL_PROCESS_ATTACH: u32 = 1;
+pub(crate) const DLL_PROCESS_DETACH: u32 = 0;
+pub(crate) const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_THREAD_ATTACH: u32 = 2;
 const DLL_THREAD_DETACH: u32 = 3;
 
@@ -3411,6 +3411,27 @@ pub enum HostThunk {
     RtlFreeHeap,
     /// `RtlSizeHeap` — ntdll!RtlSizeHeap
     RtlSizeHeap,
+    // -- Stage-4 Ldr loader chain: the native loader surface ----------------
+    // The Ldr layer is the NTDLL-native surface ABOVE the loader machinery
+    // (resolve_load_library_handle / lookup_module_handle /
+    // resolve_proc_address / load_real_dll + the pending-DllMain queue):
+    // ONE loader implementation, native NTSTATUS protocol on top.
+    /// `LdrLoadDll` — ntdll!LdrLoadDll
+    LdrLoadDll,
+    /// `LdrUnloadDll` — ntdll!LdrUnloadDll
+    LdrUnloadDll,
+    /// `LdrGetDllHandle` — ntdll!LdrGetDllHandle
+    LdrGetDllHandle,
+    /// `LdrGetProcedureAddress` — ntdll!LdrGetProcedureAddress
+    LdrGetProcedureAddress,
+    /// `LdrLockLoaderLock` — ntdll!LdrLockLoaderLock
+    LdrLockLoaderLock,
+    /// `LdrUnlockLoaderLock` — ntdll!LdrUnlockLoaderLock
+    LdrUnlockLoaderLock,
+    /// `LdrAddRefDll` — ntdll!LdrAddRefDll
+    LdrAddRefDll,
+    /// `LdrRemoveRefDll` — ntdll!LdrRemoveRefDll
+    LdrRemoveRefDll,
     // -- Phase M2: Delay-load import hooking ----------------------------------
     /// `DelayLoadResolve` — resolves a delay-loaded import on first call.
     /// Stores the DLL name, symbol, and IAT slot RVA so that on first invocation
@@ -8431,6 +8452,114 @@ impl NtThunkSession {
     #[doc(hidden)]
     pub fn mapped_image_base(&self) -> u64 {
         self.runtime.mapped_image_base
+    }
+
+    // ── Stage-4 Ldr loader-chain helpers (tests/section48_ldr.rs) ─────────
+
+    /// Drain the pending DllMain/TLS-callback queue through the real
+    /// `drain_pending_dll_main_calls` machinery (the same drain the main
+    /// execution loop runs after a host thunk returns).  Returns the number
+    /// of calls drained.
+    #[doc(hidden)]
+    pub fn drain_dll_main_calls(&mut self) -> usize {
+        let mut state = CpuState::new(GuestArch::X64);
+        // The callback ABI carves its frame below RSP (synthetic return
+        // address + shadow space); park RSP near the TOP of the mapped
+        // stack page so the frame stays inside it.
+        state.set(Register::Rsp, self.stack + 0xFF0);
+        let drained = self.runtime.pending_dll_main_calls.len();
+        let runtime = &mut self.runtime;
+        let memory = &mut self.memory;
+        let _ = runtime.drain_pending_dll_main_calls(&mut state, memory);
+        drained
+    }
+
+    /// The number of pending DllMain/TLS-callback calls queued by the
+    /// loader (the FIFO order they will be drained in).
+    #[doc(hidden)]
+    pub fn pending_dll_main_calls_len(&self) -> usize {
+        self.runtime.pending_dll_main_calls.len()
+    }
+
+    /// The pending DllMain queue snapshot: (image_base, entry_point_rva,
+    /// reason) in drain order.
+    #[doc(hidden)]
+    pub fn pending_dll_main_calls(&self) -> Vec<(u64, u32, u32)> {
+        self.runtime
+            .pending_dll_main_calls
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Register + commit a guest range in the canonical VM (so guest code
+    /// placed there — TLS callbacks, DllMain stubs — can execute).
+    #[doc(hidden)]
+    pub fn vm_register_commit(&mut self, base: u64, size: u64) {
+        let address_space = self.runtime.win32.address_space_mut();
+        address_space.register(base, size, crate::vm::VmRegionKind::Image);
+        address_space.commit(
+            base,
+            size,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
+        );
+    }
+
+    /// Install a main module (the pinned image LdrUnloadDll must refuse).
+    /// Mirrors the real bootstrap: `set_main_module` + the mapped image
+    /// base assignment `seed_process_state` performs.
+    #[doc(hidden)]
+    pub fn install_main_module(&mut self, image_base: u64, module_name: &str) {
+        self.runtime.mapped_image_base = image_base;
+        self.runtime
+            .set_main_module(module_name, image_base, &[], &[]);
+    }
+
+    /// Look up a loaded module handle by name (the LdrGetDllHandle view).
+    #[doc(hidden)]
+    pub fn module_handle(&self, name: &str) -> Option<u64> {
+        self.runtime.lookup_module_handle(name)
+    }
+
+    /// True when the module handle is still registered as loaded.
+    #[doc(hidden)]
+    pub fn is_module_loaded(&self, handle: u64) -> bool {
+        handle != 0
+            && (handle == self.runtime.mapped_image_base
+                || self.runtime.module_names_by_handle.contains_key(&handle))
+    }
+
+    /// The loader-lock reentrancy depth (0 = unlocked).
+    #[doc(hidden)]
+    pub fn loader_lock_depth(&self) -> u32 {
+        self.runtime.loader_lock.depth
+    }
+
+    /// The DllInfo load count of a module (u32::MAX = pinned).
+    #[doc(hidden)]
+    pub fn dll_info_load_count(&self, handle: u64) -> Option<u32> {
+        self.runtime
+            .dll_info_table
+            .get(&handle)
+            .map(|info| info.load_count)
+    }
+
+    /// The RealDllState refcount track of a loaded real DLL.
+    #[doc(hidden)]
+    pub fn real_dll_refcount(&self, name: &str) -> Option<u32> {
+        self.runtime
+            .loaded_real_dlls
+            .get(&crate::runtime::normalize_module_name(name))
+            .map(|state| state.refcount)
+    }
+
+    /// The number of real host-backed DLL states parked in the detach-only
+    /// list (unloaded guest modules whose libloading host library stays
+    /// alive).
+    #[doc(hidden)]
+    pub fn detached_real_dll_count(&self) -> usize {
+        self.runtime.detached_real_dlls.len()
     }
 }
 
@@ -43132,6 +43261,31 @@ impl PeHostRuntime {
             HostThunk::RtlSizeHeap => {
                 self.dispatch_rtl_size_heap(state, memory)?;
             }
+            // -- Stage-4 Ldr loader chain: the native loader surface ----------
+            HostThunk::LdrLoadDll => {
+                self.dispatch_ldr_load_dll(state, memory)?;
+            }
+            HostThunk::LdrUnloadDll => {
+                self.dispatch_ldr_unload_dll(state, memory)?;
+            }
+            HostThunk::LdrGetDllHandle => {
+                self.dispatch_ldr_get_dll_handle(state, memory)?;
+            }
+            HostThunk::LdrGetProcedureAddress => {
+                self.dispatch_ldr_get_procedure_address(state, memory)?;
+            }
+            HostThunk::LdrLockLoaderLock => {
+                self.dispatch_ldr_lock_loader_lock(state, memory)?;
+            }
+            HostThunk::LdrUnlockLoaderLock => {
+                self.dispatch_ldr_unlock_loader_lock(state, memory)?;
+            }
+            HostThunk::LdrAddRefDll => {
+                self.dispatch_ldr_add_ref_dll(state, memory)?;
+            }
+            HostThunk::LdrRemoveRefDll => {
+                self.dispatch_ldr_remove_ref_dll(state, memory)?;
+            }
             // -- Phase 2.1: libcef.dll CEF dispatch arms --------------------------
             HostThunk::CefInitialize => {
                 let _settings_ptr = arg(0);
@@ -65994,6 +66148,33 @@ impl HostThunk {
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlSizeHeap" => {
                 Self::RtlSizeHeap
             }
+            // -- Stage-4 Ldr loader chain: the native loader surface ----------
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrLoadDll" => {
+                Self::LdrLoadDll
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrUnloadDll" => {
+                Self::LdrUnloadDll
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrGetDllHandle" => {
+                Self::LdrGetDllHandle
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "LdrGetProcedureAddress" =>
+            {
+                Self::LdrGetProcedureAddress
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrLockLoaderLock" => {
+                Self::LdrLockLoaderLock
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrUnlockLoaderLock" => {
+                Self::LdrUnlockLoaderLock
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrAddRefDll" => {
+                Self::LdrAddRefDll
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "LdrRemoveRefDll" => {
+                Self::LdrRemoveRefDll
+            }
             // -- Phase O5: Credential guard simulation ------------------------------------
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CredIsProtected" => {
                 Self::CredIsProtected
@@ -68371,7 +68552,8 @@ impl HostThunk {
             | Self::RtlFreeAnsiString
             | Self::RtlGetVersion
             | Self::RtlCaptureContext
-            | Self::RtlRaiseException => 4,
+            | Self::RtlRaiseException
+            | Self::LdrUnloadDll => 4,
             Self::NtSetEvent
             | Self::NtDelayExecution
             | Self::NtUnmapViewOfSection
@@ -68385,7 +68567,10 @@ impl HostThunk {
             | Self::NtSetTimerResolution
             | Self::NtQueryTimerResolution
             | Self::RtlInitUnicodeString
-            | Self::RtlInitAnsiString => 8,
+            | Self::RtlInitAnsiString
+            | Self::LdrUnlockLoaderLock
+            | Self::LdrAddRefDll
+            | Self::LdrRemoveRefDll => 8,
             Self::NtWaitForSingleObject
             | Self::NtDeleteValueKey
             | Self::RtlCompareUnicodeString
@@ -68393,7 +68578,8 @@ impl HostThunk {
             | Self::RtlLookupFunctionEntry
             | Self::RtlAllocateHeap
             | Self::RtlFreeHeap
-            | Self::RtlSizeHeap => 12,
+            | Self::RtlSizeHeap
+            | Self::LdrLockLoaderLock => 12,
             Self::NtFreeVirtualMemory
             | Self::NtSetInformationThread
             | Self::NtQuerySystemInformation => 16,
@@ -68412,7 +68598,10 @@ impl HostThunk {
             | Self::NtSetValueKey
             | Self::NtEnumerateKey
             | Self::NtEnumerateValueKey
-            | Self::NtQueryValueKey => 24,
+            | Self::NtQueryValueKey
+            | Self::LdrLoadDll
+            | Self::LdrGetDllHandle
+            | Self::LdrGetProcedureAddress => 16,
             Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
             Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
             Self::NtCreateFile => 44,
@@ -89682,7 +89871,7 @@ fn windows_drive_prefix(path: &str) -> Option<&str> {
     }
 }
 
-fn normalize_module_name(module_name: &str) -> String {
+pub(crate) fn normalize_module_name(module_name: &str) -> String {
     let module_name = module_name.replace('\\', "/");
     let file_name = Path::new(&module_name)
         .file_name()
@@ -94916,6 +95105,46 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 59,
                     name: Some("RtlSizeHeap".to_string()),
                     target: ExportTarget::Rva(0x26A0),
+                },
+                ExportSymbol {
+                    ordinal: 60,
+                    name: Some("LdrLoadDll".to_string()),
+                    target: ExportTarget::Rva(0x26B0),
+                },
+                ExportSymbol {
+                    ordinal: 61,
+                    name: Some("LdrUnloadDll".to_string()),
+                    target: ExportTarget::Rva(0x26C0),
+                },
+                ExportSymbol {
+                    ordinal: 62,
+                    name: Some("LdrGetDllHandle".to_string()),
+                    target: ExportTarget::Rva(0x26D0),
+                },
+                ExportSymbol {
+                    ordinal: 63,
+                    name: Some("LdrGetProcedureAddress".to_string()),
+                    target: ExportTarget::Rva(0x26E0),
+                },
+                ExportSymbol {
+                    ordinal: 64,
+                    name: Some("LdrLockLoaderLock".to_string()),
+                    target: ExportTarget::Rva(0x26F0),
+                },
+                ExportSymbol {
+                    ordinal: 65,
+                    name: Some("LdrUnlockLoaderLock".to_string()),
+                    target: ExportTarget::Rva(0x2700),
+                },
+                ExportSymbol {
+                    ordinal: 66,
+                    name: Some("LdrAddRefDll".to_string()),
+                    target: ExportTarget::Rva(0x2710),
+                },
+                ExportSymbol {
+                    ordinal: 67,
+                    name: Some("LdrRemoveRefDll".to_string()),
+                    target: ExportTarget::Rva(0x2720),
                 },
             ],
         ),
