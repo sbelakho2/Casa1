@@ -188,6 +188,7 @@ pub mod metal_backend;
 pub mod metal_renderer;
 pub mod midi;
 pub mod network;
+pub mod ntdll;
 pub mod oracle_suites;
 pub mod pe;
 pub mod pe_runtime;

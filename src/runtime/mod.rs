@@ -14,6 +14,7 @@ mod scheduler;
 pub(crate) use self::scheduler::*;
 mod callback;
 pub(crate) use self::callback::*;
+pub(crate) mod dispatch;
 
 #[cfg(test)]
 use crate::api_database::WindowsVersion;
@@ -3290,6 +3291,124 @@ pub enum HostThunk {
     // -- Phase O3: Code integrity enforcement --------------------------------
     /// `NtQueryInformationProcess` — ntdll!NtQueryInformationProcess
     NtQueryInformationProcess,
+    // -- Stage-4 NTDLL foundation: the native Windows API layer --------------
+    // The Nt*/Rtl* dispatch arms build on the canonical layers (the single
+    // VirtualMemory, the live object/handle namespace, the guest scheduler);
+    // the implementations live in crate::ntdll + runtime::dispatch::ntdll.
+    /// `NtAllocateVirtualMemory` — ntdll!NtAllocateVirtualMemory
+    NtAllocateVirtualMemory,
+    /// `NtFreeVirtualMemory` — ntdll!NtFreeVirtualMemory
+    NtFreeVirtualMemory,
+    /// `NtProtectVirtualMemory` — ntdll!NtProtectVirtualMemory
+    NtProtectVirtualMemory,
+    /// `NtQueryVirtualMemory` — ntdll!NtQueryVirtualMemory
+    NtQueryVirtualMemory,
+    /// `NtReadVirtualMemory` — ntdll!NtReadVirtualMemory
+    NtReadVirtualMemory,
+    /// `NtWriteVirtualMemory` — ntdll!NtWriteVirtualMemory
+    NtWriteVirtualMemory,
+    /// `NtClose` — ntdll!NtClose
+    NtClose,
+    /// `NtDuplicateObject` — ntdll!NtDuplicateObject
+    NtDuplicateObject,
+    /// `NtQueryObject` — ntdll!NtQueryObject
+    NtQueryObject,
+    /// `NtCreateEvent` — ntdll!NtCreateEvent
+    NtCreateEvent,
+    /// `NtSetEvent` — ntdll!NtSetEvent
+    NtSetEvent,
+    /// `NtClearEvent` — ntdll!NtClearEvent
+    NtClearEvent,
+    /// `NtWaitForSingleObject` — ntdll!NtWaitForSingleObject
+    NtWaitForSingleObject,
+    /// `NtWaitForMultipleObjects` — ntdll!NtWaitForMultipleObjects
+    NtWaitForMultipleObjects,
+    /// `NtDelayExecution` — ntdll!NtDelayExecution
+    NtDelayExecution,
+    /// `NtCreateSection` — ntdll!NtCreateSection
+    NtCreateSection,
+    /// `NtMapViewOfSection` — ntdll!NtMapViewOfSection
+    NtMapViewOfSection,
+    /// `NtUnmapViewOfSection` — ntdll!NtUnmapViewOfSection
+    NtUnmapViewOfSection,
+    /// `NtQuerySection` — ntdll!NtQuerySection
+    NtQuerySection,
+    /// `NtCreateFile` — ntdll!NtCreateFile
+    NtCreateFile,
+    /// `NtDeviceIoControlFile` — ntdll!NtDeviceIoControlFile
+    NtDeviceIoControlFile,
+    /// `NtCreateKey` — ntdll!NtCreateKey
+    NtCreateKey,
+    /// `NtOpenKey` — ntdll!NtOpenKey
+    NtOpenKey,
+    /// `NtQueryValueKey` — ntdll!NtQueryValueKey
+    NtQueryValueKey,
+    /// `NtSetValueKey` — ntdll!NtSetValueKey
+    NtSetValueKey,
+    /// `NtDeleteKey` — ntdll!NtDeleteKey
+    NtDeleteKey,
+    /// `NtDeleteValueKey` — ntdll!NtDeleteValueKey
+    NtDeleteValueKey,
+    /// `NtEnumerateKey` — ntdll!NtEnumerateKey
+    NtEnumerateKey,
+    /// `NtEnumerateValueKey` — ntdll!NtEnumerateValueKey
+    NtEnumerateValueKey,
+    /// `NtQueryKey` — ntdll!NtQueryKey
+    NtQueryKey,
+    /// `NtQueryInformationThread` — ntdll!NtQueryInformationThread
+    NtQueryInformationThread,
+    /// `NtGetContextThread` — ntdll!NtGetContextThread
+    NtGetContextThread,
+    /// `NtSetContextThread` — ntdll!NtSetContextThread
+    NtSetContextThread,
+    /// `NtSuspendThread` — ntdll!NtSuspendThread
+    NtSuspendThread,
+    /// `NtResumeThread` — ntdll!NtResumeThread
+    NtResumeThread,
+    /// `NtTerminateProcess` — ntdll!NtTerminateProcess
+    NtTerminateProcess,
+    /// `NtTerminateThread` — ntdll!NtTerminateThread
+    NtTerminateThread,
+    /// `NtCreateThreadEx` — ntdll!NtCreateThreadEx
+    NtCreateThreadEx,
+    /// `NtSetInformationThread` — ntdll!NtSetInformationThread
+    NtSetInformationThread,
+    /// `NtQuerySystemInformation` — ntdll!NtQuerySystemInformation
+    NtQuerySystemInformation,
+    /// `NtQueryPerformanceCounter` — ntdll!NtQueryPerformanceCounter
+    NtQueryPerformanceCounter,
+    /// `NtQueryTimerResolution` — ntdll!NtQueryTimerResolution
+    NtQueryTimerResolution,
+    /// `NtSetTimerResolution` — ntdll!NtSetTimerResolution
+    NtSetTimerResolution,
+    /// `NtQuerySystemTime` — ntdll!NtQuerySystemTime
+    NtQuerySystemTime,
+    /// `RtlInitUnicodeString` — ntdll!RtlInitUnicodeString
+    RtlInitUnicodeString,
+    /// `RtlInitAnsiString` — ntdll!RtlInitAnsiString
+    RtlInitAnsiString,
+    /// `RtlFreeUnicodeString` — ntdll!RtlFreeUnicodeString
+    RtlFreeUnicodeString,
+    /// `RtlFreeAnsiString` — ntdll!RtlFreeAnsiString
+    RtlFreeAnsiString,
+    /// `RtlCompareUnicodeString` — ntdll!RtlCompareUnicodeString
+    RtlCompareUnicodeString,
+    /// `RtlEqualUnicodeString` — ntdll!RtlEqualUnicodeString
+    RtlEqualUnicodeString,
+    /// `RtlGetVersion` — ntdll!RtlGetVersion
+    RtlGetVersion,
+    /// `RtlCaptureContext` — ntdll!RtlCaptureContext
+    RtlCaptureContext,
+    /// `RtlLookupFunctionEntry` — ntdll!RtlLookupFunctionEntry
+    RtlLookupFunctionEntry,
+    /// `RtlRaiseException` — ntdll!RtlRaiseException
+    RtlRaiseException,
+    /// `RtlAllocateHeap` — ntdll!RtlAllocateHeap
+    RtlAllocateHeap,
+    /// `RtlFreeHeap` — ntdll!RtlFreeHeap
+    RtlFreeHeap,
+    /// `RtlSizeHeap` — ntdll!RtlSizeHeap
+    RtlSizeHeap,
     // -- Phase M2: Delay-load import hooking ----------------------------------
     /// `DelayLoadResolve` — resolves a delay-loaded import on first call.
     /// Stores the DLL name, symbol, and IAT slot RVA so that on first invocation
@@ -8076,6 +8195,177 @@ impl OracleVmSession {
             state: read_u32(&self.memory, self.mbi_buffer + 32).unwrap_or(0),
             protect: read_u32(&self.memory, self.mbi_buffer + 36).unwrap_or(0),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-4 NTDLL test driver — dispatch-level access for integration tests
+// ---------------------------------------------------------------------------
+
+/// A scratch X64 runtime that integration tests drive through the REAL
+/// `dispatch_import` path, with the canonical VM attached to the memory
+/// image exactly like a live run.  The Nt*/Rtl* thunks allocate their thunk
+/// addresses here (`alloc_thunk`) and are then invoked with the x64 calling
+/// convention; the session exposes the runtime state the Stage-4 tests
+/// assert against (the canonical VM, the live handle namespace, the guest
+/// pid, the scheduler wait queue).
+#[doc(hidden)]
+pub struct NtThunkSession {
+    runtime: PeHostRuntime,
+    memory: MemoryImage,
+    stack: u64,
+}
+
+impl NtThunkSession {
+    /// Create a fresh session on a scratch X64 runtime with the canonical
+    /// VM attached and a mapped test arena.
+    #[doc(hidden)]
+    pub fn new(ge: GameEnvironment) -> Self {
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.set_guest_arch(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.set_vm(&mut runtime.vm);
+        let stack = 0x10_000;
+        memory.map_bytes(stack, &[0_u8; 0x1000]);
+        // The scratch test arena (stack + guest buffers for in/out
+        // parameters), registered in the canonical VM like a live loader
+        // region so the checked accessors validate it.
+        runtime
+            .vm
+            .register(0x10_000, 0x60_000, crate::vm::VmRegionKind::Private);
+        runtime.vm.commit(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
+        for (address, size) in [
+            (0x10_000_u64, 0x1000_u64),
+            (0x30_000, 0x1000),
+            (0x40_000, 0x1000),
+            (0x50_000, 0x1000),
+        ] {
+            memory.map_bytes(address, &vec![0_u8; size as usize]);
+        }
+        NtThunkSession {
+            runtime,
+            memory,
+            stack,
+        }
+    }
+
+    /// Allocate a host thunk for a dispatch variant and return its guest
+    /// address.
+    #[doc(hidden)]
+    pub fn alloc_thunk(&mut self, thunk: HostThunk) -> u64 {
+        self.runtime.alloc_host_thunk(thunk)
+    }
+
+    /// Drive one host thunk with the x64 calling convention and return RAX.
+    #[doc(hidden)]
+    pub fn call(&mut self, thunk: u64, args: &[u64]) -> u64 {
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, self.stack);
+        write_u64(&mut self.memory, self.stack, 0xDEAD_BEEF_DEAD_BEEF);
+        for (index, arg) in args.iter().copied().enumerate() {
+            match index {
+                0 => state.set(Register::Rcx, arg),
+                1 => state.set(Register::Rdx, arg),
+                2 => state.set(Register::R8, arg),
+                3 => state.set(Register::R9, arg),
+                _ => {
+                    write_u64(
+                        &mut self.memory,
+                        self.stack + 0x28 + ((index - 4) as u64 * 8),
+                        arg,
+                    );
+                }
+            }
+        }
+        let runtime = &mut self.runtime;
+        let memory = &mut self.memory;
+        let _ = runtime.dispatch_import(thunk, &mut state, memory);
+        state.get(Register::Rax)
+    }
+
+    /// The runtime's `last_error` (Win32-visible state; the Nt layer does
+    /// not use it, but the session keeps it observable).
+    #[doc(hidden)]
+    pub fn last_error(&self) -> u32 {
+        self.runtime.last_error
+    }
+
+    /// The GUEST process id of this session (never the host pid).
+    #[doc(hidden)]
+    pub fn guest_pid(&self) -> u32 {
+        self.runtime.guest_pid
+    }
+
+    /// The canonical virtual-memory layer.
+    #[doc(hidden)]
+    pub fn vm(&self) -> &crate::vm::VirtualMemory {
+        &self.runtime.vm
+    }
+
+    /// The live Win32 subsystem (the one handle namespace).
+    #[doc(hidden)]
+    pub fn win32(&self) -> &Win32Subsystem {
+        &self.runtime.win32
+    }
+
+    /// The live Win32 subsystem, mutable.
+    #[doc(hidden)]
+    pub fn win32_mut(&mut self) -> &mut Win32Subsystem {
+        &mut self.runtime.win32
+    }
+
+    /// The guest memory image (raw page map + canonical-VM validation).
+    #[doc(hidden)]
+    pub fn memory(&self) -> &MemoryImage {
+        &self.memory
+    }
+
+    /// Map bytes into the guest arena.
+    #[doc(hidden)]
+    pub fn map_guest(&mut self, address: u64, bytes: &[u8]) {
+        self.memory.map_bytes(address, bytes);
+    }
+
+    /// Read bytes from guest memory.
+    #[doc(hidden)]
+    pub fn read_guest(&self, address: u64, len: usize) -> Vec<u8> {
+        self.memory.read_bytes(address, len).unwrap_or_default()
+    }
+
+    /// The number of threads parked in the scheduler wait queue.
+    #[doc(hidden)]
+    pub fn parked_waiter_count(&self) -> usize {
+        self.runtime.pending_guest_threads.len()
+    }
+
+    /// The scheduler readiness probe for the parked waiter: true when the
+    /// pump's readiness pass would resume it right now (the wait descriptor
+    /// became satisfiable — an event was signaled, an APC arrived or the
+    /// deadline expired).
+    #[doc(hidden)]
+    pub fn parked_waiter_satisfiable(&self) -> bool {
+        self.runtime
+            .pending_guest_threads
+            .iter()
+            .any(|thread| self.runtime.wait_satisfiable(thread))
+    }
+
+    /// Advance the guest clock by `milliseconds` (the same clock the
+    /// scheduler deadlines read).
+    #[doc(hidden)]
+    pub fn advance_guest_clock(&mut self, milliseconds: u64) {
+        self.runtime.win32.sleep(milliseconds);
+    }
+
+    /// The runtime's mapped-image base (0 in scratch sessions).
+    #[doc(hidden)]
+    pub fn mapped_image_base(&self) -> u64 {
+        self.runtime.mapped_image_base
     }
 }
 
@@ -39675,49 +39965,6 @@ impl PeHostRuntime {
                 }
                 state.set(Register::Rax, retval);
             }
-            HostThunk::RtlRestoreContext => {
-                // RtlRestoreContext(context_record, exception_record)
-                // Restores the exception context and resumes execution at
-                // the RIP stored in the context record.
-                let context_ptr = arg(0);
-                let _exception_record_ptr = arg(1);
-                // Read the X64Context-like structure from guest memory.
-                // The structure layout matches the X64Context fields:
-                // gpr[0..16] (rax–r15), rip, xmm[0..16] (each 2×u64)
-                // Total: 17 GP registers + 16 XMM registers × 2 u64 = 49 u64 = 392 bytes
-                const CONTEXT_SIZE: usize = 49 * 8;
-                if self.guest_arch == GuestArch::X64 && context_ptr != 0
-                    && let Ok(data) = memory.read_bytes(context_ptr, CONTEXT_SIZE) {
-                        let read_u64_at = |offset: usize| -> u64 {
-                            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
-                        };
-                        // General‑purpose registers (gpr[0..16])
-                        for reg in 0..16 {
-                            state.gpr[reg] = read_u64_at(reg * 8);
-                        }
-                        // RIP at offset 128 (16 × 8)
-                        state.rip = read_u64_at(128);
-                        // XMM registers at offset 136 (17 × 8)
-                        for i in 0..16usize {
-                            let xmm_offset = 136 + i * 16;
-                            if xmm_offset + 16 <= data.len() {
-                                state.xmm[i].low = read_u64_at(xmm_offset);
-                                state.xmm[i].high = read_u64_at(xmm_offset + 8);
-                            }
-                        }
-                    }
-                state.set(Register::Rax, 0); // RtlRestoreContext does not return
-                self.last_error = 0;
-                self.push_trace(
-                    "process",
-                    "RtlRestoreContext",
-                    BTreeMap::from([
-                        ("context_ptr".to_string(), json!(format!("{context_ptr:#x}"))),
-                        ("new_rip".to_string(), json!(format!("{:x}", state.rip))),
-                    ]),
-                    json!("0"),
-                );
-            }
             HostThunk::GetConsoleMode => {
                 let _handle = arg(0);
                 let mode_ptr = arg(1);
@@ -39765,82 +40012,24 @@ impl PeHostRuntime {
                 // DeviceIoControl(handle, io_control_code, in_buffer, in_size, out_buffer, out_size, bytes_returned, overlapped)
                 let handle = arg(0) as u32;
                 let io_code = arg(1) as u32;
-                let _in_buffer = arg(2);
-                let _in_size = arg(3) as u32;
+                let in_buffer = arg(2);
+                let in_size = arg(3) as u32;
                 let out_buffer = arg(4);
                 let out_size = arg(5) as u32;
                 let bytes_ret_ptr = arg(6);
-                // Common IOCTL codes used by applications in VM context
-                match io_code {
-                    // FSCTL_SET_SPARSE (mark file as sparse)
-                    0x000900C4 => {
-                        if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 0); }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // FSCTL_SET_ZERO_DATA (zero a range in sparse file)
-                    0x000980C8 => {
-                        if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 0); }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // IOCTL_DISK_GET_DRIVE_GEOMETRY
-                    0x00070000 => {
-                        // DISK_GEOMETRY: Cylinders(8), MediaType(4), TracksPerCylinder(4), SectorsPerTrack(4), BytesPerSector(4) = 24 bytes
-                        if out_buffer != 0 && out_size >= 24 {
-                            write_u64(memory, out_buffer, 1000); // Cylinders
-                            write_u32(memory, out_buffer + 8, 0x07); // FixedMedia = 7
-                            write_u32(memory, out_buffer + 12, 64); // TracksPerCylinder
-                            write_u32(memory, out_buffer + 16, 32); // SectorsPerTrack
-                            write_u32(memory, out_buffer + 20, 512); // BytesPerSector
-                            if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 24); }
-                        }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // IOCTL_CDROM_GET_DRIVE_GEOMETRY
-                    0x00070004 => {
-                        if out_buffer != 0 && out_size >= 24 {
-                            write_u64(memory, out_buffer, 0); // Cylinders
-                            write_u32(memory, out_buffer + 8, 0x02); // RemovableMedia = 2
-                            write_u32(memory, out_buffer + 12, 1); // TracksPerCylinder
-                            write_u32(memory, out_buffer + 16, 1); // SectorsPerTrack
-                            write_u32(memory, out_buffer + 20, 2048); // BytesPerSector (CD-ROM)
-                            if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 24); }
-                        }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // IOCTL_STORAGE_CHECK_VERIFY2 (check if media is present)
-                    0x00074000 => {
-                        if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 0); }
-                        state.set(Register::Rax, 1); // TRUE (media is present)
-                    }
-                    // IOCTL_STORAGE_GET_DEVICE_NUMBER
-                    0x002D0000 => {
-                        // STORAGE_DEVICE_NUMBER: DeviceType(4), DeviceNumber(4), PartitionNumber(4) = 12 bytes
-                        if out_buffer != 0 && out_size >= 12 {
-                            write_u32(memory, out_buffer, 0x07); // FILE_DEVICE_DISK
-                            write_u32(memory, out_buffer + 4, 0); // DeviceNumber
-                            write_u32(memory, out_buffer + 8, 1); // PartitionNumber
-                            if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 12); }
-                        }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // IOCTL_STORAGE_GET_MEDIA_TYPES_EX
-                    0x000D0004 => {
-                        // Return minimal DEVICE_MEDIA_INFO
-                        if out_buffer != 0 && out_size >= 8 {
-                            write_u32(memory, out_buffer, 0x0B); // StorageMediaType = FixedMedium
-                            write_u32(memory, out_buffer + 4, 0); // DeviceSpecific
-                            if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 8); }
-                        }
-                        state.set(Register::Rax, 1); // TRUE
-                    }
-                    // Unknown/unsupported IOCTL — return FALSE with ERROR_INVALID_FUNCTION
-                    _ => {
-                        emit_live_ui_debug(format!("DeviceIoControl: unhandled IOCTL {:#x} on handle {:#x}", io_code, handle));
-                        if bytes_ret_ptr != 0 { write_u32(memory, bytes_ret_ptr, 0); }
-                        self.last_error = ERROR_INVALID_FUNCTION;
-                        state.set(Register::Rax, 0); // FALSE
-                    }
-                }
+                // Shared device/IOCTL dispatch (NtDeviceIoControlFile routes
+                // through the same table).
+                self.dispatch_device_io_control_common(
+                    state,
+                    memory,
+                    handle,
+                    io_code,
+                    in_buffer,
+                    in_size,
+                    out_buffer,
+                    out_size,
+                    bytes_ret_ptr,
+                )?;
             }
             HostThunk::SetProcessAffinityMask => {
                 state.set(Register::Rax, 1); // TRUE
@@ -42660,125 +42849,188 @@ impl PeHostRuntime {
             }
             // -- Phase O3: Code integrity enforcement --------------------------------------------
             HostThunk::NtQueryInformationProcess => {
-                // NtQueryInformationProcess(
-                //   HANDLE ProcessHandle,
-                //   PROCESSINFOCLASS ProcessInformationClass,
-                //   PVOID ProcessInformation,
-                //   ULONG ProcessInformationLength,
-                //   PULONG ReturnLength
-                // )
-                // Returns NTSTATUS — reports code integrity policy and process protection info.
-                const STATUS_SUCCESS: u64 = 0;
-                const STATUS_INVALID_INFO_CLASS: u64 = 0xC000_0003;
-                const STATUS_INFO_LENGTH_MISMATCH: u64 = 0xC000_0004;
-
-                const ProcessBasicInformation: u32 = 0;
-                const ProcessDebugPort: u32 = 7;
-                const ProcessImageFileName: u32 = 30;
-                const ProcessProtectionInformation: u32 = 38;
-                const ProcessMitigationPolicy: u32 = 52;
-
-                let _process_handle = arg(0);
-                let info_class = arg(1) as u32;
-                let info_ptr = arg(2);
-                let info_length = arg(3);
-                let return_length_ptr = arg(4);
-
-                match info_class {
-                    ProcessBasicInformation => {
-                        // Return a minimal PROCESS_BASIC_INFORMATION (all zeros).
-                        // Real fields: ExitStatus, PebBaseAddress, AffinityMask, etc.
-                        // 24 bytes on x86, 40 bytes on x64.
-                        let required = if self.guest_arch == GuestArch::X64 { 40u64 } else { 24u64 };
-                        if info_length < required {
-                            state.set(Register::Rax, STATUS_INFO_LENGTH_MISMATCH);
-                        } else {
-                            // Zero-initialize the output buffer
-                            for i in 0..required {
-                                memory.map_bytes(info_ptr + i, &[0u8]);
-                            }
-                            if return_length_ptr != 0 {
-                                write_u32(memory, return_length_ptr, required as u32);
-                            }
-                            state.set(Register::Rax, STATUS_SUCCESS);
-                        }
-                    }
-                    ProcessDebugPort => {
-                        // Anti-debugging check: returning 0 means no debugger attached.
-                        if info_length >= 4 {
-                            write_u32(memory, info_ptr, 0);
-                        }
-                        if return_length_ptr != 0 {
-                            write_u32(memory, return_length_ptr, 4);
-                        }
-                        state.set(Register::Rax, STATUS_SUCCESS);
-                    }
-                    ProcessImageFileName => {
-                        // Return the current process image path as a UNICODE_STRING.
-                        let image_path = resolve_full_guest_path(
-                            &self.current_directory,
-                            &self.main_module_name,
-                        );
-                        let wide_bytes: Vec<u8> = image_path
-                            .encode_utf16()
-                            .flat_map(|c| c.to_le_bytes())
-                            .collect();
-                        let string_len = wide_bytes.len() as u16;
-                        // UNICODE_STRING: USHORT Length, USHORT MaximumLength, PWSTR Buffer
-                        let required = 8 + string_len as u64; // header + buffer
-                        if info_length < required {
-                            state.set(Register::Rax, STATUS_INFO_LENGTH_MISMATCH);
-                        } else {
-                            // Write UNICODE_STRING header
-                            write_u16(memory, info_ptr, string_len);
-                            write_u16(memory, info_ptr + 2, string_len); // MaximumLength
-                            let buffer_ptr = info_ptr + 8;
-                            let _ = write_guest_pointer(memory, info_ptr + 4, buffer_ptr, self.guest_arch);
-                            // Write the wide string buffer
-                            memory.map_bytes(buffer_ptr, &wide_bytes);
-                            if return_length_ptr != 0 {
-                                write_u32(memory, return_length_ptr, (8 + string_len as u64) as u32);
-                            }
-                            state.set(Register::Rax, STATUS_SUCCESS);
-                        }
-                    }
-                    ProcessProtectionInformation => {
-                        // Return PROCESS_PROTECTION_INFORMATION with Level = 0 (not protected).
-                        // Structure: { UCHAR Level; UCHAR Reserved1; ULONG Reserved2; }
-                        // Size: 8 bytes.
-                        const PROCESS_PROTECTION_INFO_SIZE: u64 = 8;
-                        if info_length < PROCESS_PROTECTION_INFO_SIZE {
-                            state.set(Register::Rax, STATUS_INFO_LENGTH_MISMATCH);
-                        } else {
-                            // Level = 0 means not a protected process
-                            write_u32(memory, info_ptr, 0); // Level + Reserved1
-                            write_u32(memory, info_ptr + 4, 0); // Reserved2
-                            if return_length_ptr != 0 {
-                                write_u32(memory, return_length_ptr, PROCESS_PROTECTION_INFO_SIZE as u32);
-                            }
-                            state.set(Register::Rax, STATUS_SUCCESS);
-                        }
-                    }
-                    ProcessMitigationPolicy => {
-                        // Return PROCESS_MITIGATION_CODE_INTEGRITY_POLICY.
-                        // This is a DWORD with bit 0 = EnableCodeIntegrityPolicy.
-                        // Structure size: 4 bytes.
-                        const MITIGATION_POLICY_SIZE: u64 = 4;
-                        if info_length < MITIGATION_POLICY_SIZE {
-                            state.set(Register::Rax, STATUS_INFO_LENGTH_MISMATCH);
-                        } else {
-                            // EnableCodeIntegrityPolicy = 1 (bit 0)
-                            write_u32(memory, info_ptr, 1);
-                            if return_length_ptr != 0 {
-                                write_u32(memory, return_length_ptr, MITIGATION_POLICY_SIZE as u32);
-                            }
-                            state.set(Register::Rax, STATUS_SUCCESS);
-                        }
-                    }
-                    _ => {
-                        state.set(Register::Rax, STATUS_INVALID_INFO_CLASS);
-                    }
+                self.dispatch_nt_query_information_process(state, memory)?;
+            }
+            // -- Stage-4 NTDLL foundation: the native Windows API layer --------
+            HostThunk::NtAllocateVirtualMemory => {
+                self.dispatch_nt_allocate_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtFreeVirtualMemory => {
+                self.dispatch_nt_free_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtProtectVirtualMemory => {
+                self.dispatch_nt_protect_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtQueryVirtualMemory => {
+                self.dispatch_nt_query_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtReadVirtualMemory => {
+                self.dispatch_nt_read_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtWriteVirtualMemory => {
+                self.dispatch_nt_write_virtual_memory(state, memory)?;
+            }
+            HostThunk::NtClose => {
+                self.dispatch_nt_close(state, memory)?;
+            }
+            HostThunk::NtDuplicateObject => {
+                self.dispatch_nt_duplicate_object(state, memory)?;
+            }
+            HostThunk::NtQueryObject => {
+                self.dispatch_nt_query_object(state, memory)?;
+            }
+            HostThunk::NtCreateEvent => {
+                self.dispatch_nt_create_event(state, memory)?;
+            }
+            HostThunk::NtSetEvent => {
+                self.dispatch_nt_set_event(state, memory)?;
+            }
+            HostThunk::NtClearEvent => {
+                self.dispatch_nt_clear_event(state, memory)?;
+            }
+            HostThunk::NtWaitForSingleObject => {
+                self.dispatch_nt_wait_for_single_object(state, memory)?;
+            }
+            HostThunk::NtWaitForMultipleObjects => {
+                self.dispatch_nt_wait_for_multiple_objects(state, memory)?;
+            }
+            HostThunk::NtDelayExecution => {
+                self.dispatch_nt_delay_execution(state, memory)?;
+            }
+            HostThunk::NtCreateSection => {
+                self.dispatch_nt_create_section(state, memory)?;
+            }
+            HostThunk::NtMapViewOfSection => {
+                self.dispatch_nt_map_view_of_section(state, memory)?;
+            }
+            HostThunk::NtUnmapViewOfSection => {
+                self.dispatch_nt_unmap_view_of_section(state, memory)?;
+            }
+            HostThunk::NtQuerySection => {
+                self.dispatch_nt_query_section(state, memory)?;
+            }
+            HostThunk::NtCreateFile => {
+                self.dispatch_nt_create_file(state, memory)?;
+            }
+            HostThunk::NtDeviceIoControlFile => {
+                self.dispatch_nt_device_io_control_file(state, memory)?;
+            }
+            HostThunk::NtCreateKey => {
+                self.dispatch_nt_create_key(state, memory)?;
+            }
+            HostThunk::NtOpenKey => {
+                self.dispatch_nt_open_key(state, memory)?;
+            }
+            HostThunk::NtQueryValueKey => {
+                self.dispatch_nt_query_value_key(state, memory)?;
+            }
+            HostThunk::NtSetValueKey => {
+                self.dispatch_nt_set_value_key(state, memory)?;
+            }
+            HostThunk::NtDeleteKey => {
+                self.dispatch_nt_delete_key(state, memory)?;
+            }
+            HostThunk::NtDeleteValueKey => {
+                self.dispatch_nt_delete_value_key(state, memory)?;
+            }
+            HostThunk::NtEnumerateKey => {
+                self.dispatch_nt_enumerate_key(state, memory)?;
+            }
+            HostThunk::NtEnumerateValueKey => {
+                self.dispatch_nt_enumerate_value_key(state, memory)?;
+            }
+            HostThunk::NtQueryKey => {
+                self.dispatch_nt_query_key(state, memory)?;
+            }
+            HostThunk::NtQueryInformationThread => {
+                self.dispatch_nt_query_information_thread(state, memory)?;
+            }
+            HostThunk::NtGetContextThread => {
+                self.dispatch_nt_get_context_thread(state, memory)?;
+            }
+            HostThunk::NtSetContextThread => {
+                self.dispatch_nt_set_context_thread(state, memory)?;
+            }
+            HostThunk::NtSuspendThread => {
+                self.dispatch_nt_suspend_thread(state, memory)?;
+            }
+            HostThunk::NtResumeThread => {
+                self.dispatch_nt_resume_thread(state, memory)?;
+            }
+            HostThunk::NtTerminateProcess => {
+                if let Some(code) = self.dispatch_nt_terminate_process(state, memory)? {
+                    return Ok(Some(code));
                 }
+            }
+            HostThunk::NtTerminateThread => {
+                if let Some(code) = self.dispatch_nt_terminate_thread(state, memory)? {
+                    return Ok(Some(code));
+                }
+            }
+            HostThunk::NtCreateThreadEx => {
+                self.dispatch_nt_create_thread_ex(state, memory)?;
+            }
+            HostThunk::NtSetInformationThread => {
+                self.dispatch_nt_set_information_thread(state, memory)?;
+            }
+            HostThunk::NtQuerySystemInformation => {
+                self.dispatch_nt_query_system_information(state, memory)?;
+            }
+            HostThunk::NtQueryPerformanceCounter => {
+                self.dispatch_nt_query_performance_counter(state, memory)?;
+            }
+            HostThunk::NtQueryTimerResolution => {
+                self.dispatch_nt_query_timer_resolution(state, memory)?;
+            }
+            HostThunk::NtSetTimerResolution => {
+                self.dispatch_nt_set_timer_resolution(state, memory)?;
+            }
+            HostThunk::NtQuerySystemTime => {
+                self.dispatch_nt_query_system_time(state, memory)?;
+            }
+            HostThunk::RtlInitUnicodeString => {
+                self.dispatch_rtl_init_unicode_string(state, memory)?;
+            }
+            HostThunk::RtlInitAnsiString => {
+                self.dispatch_rtl_init_ansi_string(state, memory)?;
+            }
+            HostThunk::RtlFreeUnicodeString => {
+                self.dispatch_rtl_free_unicode_string(state, memory)?;
+            }
+            HostThunk::RtlFreeAnsiString => {
+                self.dispatch_rtl_free_ansi_string(state, memory)?;
+            }
+            HostThunk::RtlCompareUnicodeString => {
+                self.dispatch_rtl_compare_unicode_string(state, memory)?;
+            }
+            HostThunk::RtlEqualUnicodeString => {
+                self.dispatch_rtl_equal_unicode_string(state, memory)?;
+            }
+            HostThunk::RtlGetVersion => {
+                self.dispatch_rtl_get_version(state, memory)?;
+            }
+            HostThunk::RtlCaptureContext => {
+                self.dispatch_rtl_capture_context(state, memory)?;
+            }
+            HostThunk::RtlRestoreContext => {
+                self.dispatch_rtl_restore_context(state, memory)?;
+            }
+            HostThunk::RtlLookupFunctionEntry => {
+                self.dispatch_rtl_lookup_function_entry(state, memory)?;
+            }
+            HostThunk::RtlRaiseException => {
+                if let Some(code) = self.dispatch_rtl_raise_exception(state, memory)? {
+                    return Ok(Some(code));
+                }
+            }
+            HostThunk::RtlAllocateHeap => {
+                self.dispatch_rtl_allocate_heap(state, memory)?;
+            }
+            HostThunk::RtlFreeHeap => {
+                self.dispatch_rtl_free_heap(state, memory)?;
+            }
+            HostThunk::RtlSizeHeap => {
+                self.dispatch_rtl_size_heap(state, memory)?;
             }
             // -- Phase 2.1: libcef.dll CEF dispatch arms --------------------------
             HostThunk::CefInitialize => {
@@ -65446,6 +65698,196 @@ impl HostThunk {
             {
                 Self::NtQueryInformationProcess
             }
+            // -- Stage-4 NTDLL foundation: the native Windows API layer --------------------
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtAllocateVirtualMemory" =>
+            {
+                Self::NtAllocateVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtFreeVirtualMemory" => {
+                Self::NtFreeVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtProtectVirtualMemory" =>
+            {
+                Self::NtProtectVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQueryVirtualMemory" => {
+                Self::NtQueryVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtReadVirtualMemory" => {
+                Self::NtReadVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtWriteVirtualMemory" => {
+                Self::NtWriteVirtualMemory
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtClose" => Self::NtClose,
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDuplicateObject" => {
+                Self::NtDuplicateObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQueryObject" => {
+                Self::NtQueryObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateEvent" => {
+                Self::NtCreateEvent
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtSetEvent" => {
+                Self::NtSetEvent
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtClearEvent" => {
+                Self::NtClearEvent
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtWaitForSingleObject" => {
+                Self::NtWaitForSingleObject
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtWaitForMultipleObjects" =>
+            {
+                Self::NtWaitForMultipleObjects
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDelayExecution" => {
+                Self::NtDelayExecution
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateSection" => {
+                Self::NtCreateSection
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtMapViewOfSection" => {
+                Self::NtMapViewOfSection
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtUnmapViewOfSection" => {
+                Self::NtUnmapViewOfSection
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQuerySection" => {
+                Self::NtQuerySection
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateFile" => {
+                Self::NtCreateFile
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDeviceIoControlFile" => {
+                Self::NtDeviceIoControlFile
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateKey" => {
+                Self::NtCreateKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtOpenKey" => {
+                Self::NtOpenKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQueryValueKey" => {
+                Self::NtQueryValueKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtSetValueKey" => {
+                Self::NtSetValueKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDeleteKey" => {
+                Self::NtDeleteKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtDeleteValueKey" => {
+                Self::NtDeleteValueKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtEnumerateKey" => {
+                Self::NtEnumerateKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtEnumerateValueKey" => {
+                Self::NtEnumerateValueKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQueryKey" => {
+                Self::NtQueryKey
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQueryInformationThread" =>
+            {
+                Self::NtQueryInformationThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtGetContextThread" => {
+                Self::NtGetContextThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtSetContextThread" => {
+                Self::NtSetContextThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtSuspendThread" => {
+                Self::NtSuspendThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtResumeThread" => {
+                Self::NtResumeThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtTerminateProcess" => {
+                Self::NtTerminateProcess
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtTerminateThread" => {
+                Self::NtTerminateThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateThreadEx" => {
+                Self::NtCreateThreadEx
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtSetInformationThread" =>
+            {
+                Self::NtSetInformationThread
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQuerySystemInformation" =>
+            {
+                Self::NtQuerySystemInformation
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQueryPerformanceCounter" =>
+            {
+                Self::NtQueryPerformanceCounter
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "NtQueryTimerResolution" =>
+            {
+                Self::NtQueryTimerResolution
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtSetTimerResolution" => {
+                Self::NtSetTimerResolution
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtQuerySystemTime" => {
+                Self::NtQuerySystemTime
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlInitUnicodeString" => {
+                Self::RtlInitUnicodeString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlInitAnsiString" => {
+                Self::RtlInitAnsiString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlFreeUnicodeString" => {
+                Self::RtlFreeUnicodeString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlFreeAnsiString" => {
+                Self::RtlFreeAnsiString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "RtlCompareUnicodeString" =>
+            {
+                Self::RtlCompareUnicodeString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlEqualUnicodeString" => {
+                Self::RtlEqualUnicodeString
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlGetVersion" => {
+                Self::RtlGetVersion
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlCaptureContext" => {
+                Self::RtlCaptureContext
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. })
+                if name == "RtlLookupFunctionEntry" =>
+            {
+                Self::RtlLookupFunctionEntry
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlRaiseException" => {
+                Self::RtlRaiseException
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlAllocateHeap" => {
+                Self::RtlAllocateHeap
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlFreeHeap" => {
+                Self::RtlFreeHeap
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlSizeHeap" => {
+                Self::RtlSizeHeap
+            }
             // -- Phase O5: Credential guard simulation ------------------------------------
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CredIsProtected" => {
                 Self::CredIsProtected
@@ -67813,6 +68255,60 @@ impl HostThunk {
             | Self::ScriptShape => 40,
             Self::CreateWindowExW => 48,
             Self::CreateFontW | Self::GdipDrawImageRectRect => 56,
+            // -- Stage-4 NTDLL foundation: Nt*/Rtl* x86 stack-arg sizes -------
+            Self::NtClose
+            | Self::NtClearEvent
+            | Self::NtDeleteKey
+            | Self::NtQuerySystemTime
+            | Self::RtlFreeUnicodeString
+            | Self::RtlFreeAnsiString
+            | Self::RtlGetVersion
+            | Self::RtlCaptureContext
+            | Self::RtlRaiseException => 4,
+            Self::NtSetEvent
+            | Self::NtDelayExecution
+            | Self::NtUnmapViewOfSection
+            | Self::NtGetContextThread
+            | Self::NtSetContextThread
+            | Self::NtTerminateProcess
+            | Self::NtTerminateThread
+            | Self::NtSuspendThread
+            | Self::NtResumeThread
+            | Self::NtQueryPerformanceCounter
+            | Self::NtSetTimerResolution
+            | Self::NtQueryTimerResolution
+            | Self::RtlInitUnicodeString
+            | Self::RtlInitAnsiString => 8,
+            Self::NtWaitForSingleObject
+            | Self::NtDeleteValueKey
+            | Self::RtlCompareUnicodeString
+            | Self::RtlEqualUnicodeString
+            | Self::RtlLookupFunctionEntry
+            | Self::RtlAllocateHeap
+            | Self::RtlFreeHeap
+            | Self::RtlSizeHeap => 12,
+            Self::NtFreeVirtualMemory
+            | Self::NtSetInformationThread
+            | Self::NtQuerySystemInformation => 16,
+            Self::NtProtectVirtualMemory
+            | Self::NtReadVirtualMemory
+            | Self::NtWriteVirtualMemory
+            | Self::NtQueryObject
+            | Self::NtCreateEvent
+            | Self::NtWaitForMultipleObjects
+            | Self::NtQuerySection
+            | Self::NtOpenKey
+            | Self::NtQueryKey
+            | Self::NtQueryInformationThread => 20,
+            Self::NtAllocateVirtualMemory
+            | Self::NtQueryVirtualMemory
+            | Self::NtSetValueKey
+            | Self::NtEnumerateKey
+            | Self::NtEnumerateValueKey
+            | Self::NtQueryValueKey => 24,
+            Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
+            Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
+            Self::NtCreateFile => 44,
             _ => 0,
         }
     }
@@ -94016,6 +94512,291 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 2,
                     name: Some("NtQueryInformationProcess".to_string()),
                     target: ExportTarget::Rva(0x2310),
+                },
+                ExportSymbol {
+                    ordinal: 3,
+                    name: Some("NtAllocateVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2320),
+                },
+                ExportSymbol {
+                    ordinal: 4,
+                    name: Some("NtFreeVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2330),
+                },
+                ExportSymbol {
+                    ordinal: 5,
+                    name: Some("NtProtectVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2340),
+                },
+                ExportSymbol {
+                    ordinal: 6,
+                    name: Some("NtQueryVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2350),
+                },
+                ExportSymbol {
+                    ordinal: 7,
+                    name: Some("NtReadVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2360),
+                },
+                ExportSymbol {
+                    ordinal: 8,
+                    name: Some("NtWriteVirtualMemory".to_string()),
+                    target: ExportTarget::Rva(0x2370),
+                },
+                ExportSymbol {
+                    ordinal: 9,
+                    name: Some("NtClose".to_string()),
+                    target: ExportTarget::Rva(0x2380),
+                },
+                ExportSymbol {
+                    ordinal: 10,
+                    name: Some("NtDuplicateObject".to_string()),
+                    target: ExportTarget::Rva(0x2390),
+                },
+                ExportSymbol {
+                    ordinal: 11,
+                    name: Some("NtQueryObject".to_string()),
+                    target: ExportTarget::Rva(0x23A0),
+                },
+                ExportSymbol {
+                    ordinal: 12,
+                    name: Some("NtCreateEvent".to_string()),
+                    target: ExportTarget::Rva(0x23B0),
+                },
+                ExportSymbol {
+                    ordinal: 13,
+                    name: Some("NtSetEvent".to_string()),
+                    target: ExportTarget::Rva(0x23C0),
+                },
+                ExportSymbol {
+                    ordinal: 14,
+                    name: Some("NtClearEvent".to_string()),
+                    target: ExportTarget::Rva(0x23D0),
+                },
+                ExportSymbol {
+                    ordinal: 15,
+                    name: Some("NtWaitForSingleObject".to_string()),
+                    target: ExportTarget::Rva(0x23E0),
+                },
+                ExportSymbol {
+                    ordinal: 16,
+                    name: Some("NtWaitForMultipleObjects".to_string()),
+                    target: ExportTarget::Rva(0x23F0),
+                },
+                ExportSymbol {
+                    ordinal: 17,
+                    name: Some("NtDelayExecution".to_string()),
+                    target: ExportTarget::Rva(0x2400),
+                },
+                ExportSymbol {
+                    ordinal: 18,
+                    name: Some("NtCreateSection".to_string()),
+                    target: ExportTarget::Rva(0x2410),
+                },
+                ExportSymbol {
+                    ordinal: 19,
+                    name: Some("NtMapViewOfSection".to_string()),
+                    target: ExportTarget::Rva(0x2420),
+                },
+                ExportSymbol {
+                    ordinal: 20,
+                    name: Some("NtUnmapViewOfSection".to_string()),
+                    target: ExportTarget::Rva(0x2430),
+                },
+                ExportSymbol {
+                    ordinal: 21,
+                    name: Some("NtQuerySection".to_string()),
+                    target: ExportTarget::Rva(0x2440),
+                },
+                ExportSymbol {
+                    ordinal: 22,
+                    name: Some("NtCreateFile".to_string()),
+                    target: ExportTarget::Rva(0x2450),
+                },
+                ExportSymbol {
+                    ordinal: 23,
+                    name: Some("NtDeviceIoControlFile".to_string()),
+                    target: ExportTarget::Rva(0x2460),
+                },
+                ExportSymbol {
+                    ordinal: 24,
+                    name: Some("NtCreateKey".to_string()),
+                    target: ExportTarget::Rva(0x2470),
+                },
+                ExportSymbol {
+                    ordinal: 25,
+                    name: Some("NtOpenKey".to_string()),
+                    target: ExportTarget::Rva(0x2480),
+                },
+                ExportSymbol {
+                    ordinal: 26,
+                    name: Some("NtQueryValueKey".to_string()),
+                    target: ExportTarget::Rva(0x2490),
+                },
+                ExportSymbol {
+                    ordinal: 27,
+                    name: Some("NtSetValueKey".to_string()),
+                    target: ExportTarget::Rva(0x24A0),
+                },
+                ExportSymbol {
+                    ordinal: 28,
+                    name: Some("NtDeleteKey".to_string()),
+                    target: ExportTarget::Rva(0x24B0),
+                },
+                ExportSymbol {
+                    ordinal: 29,
+                    name: Some("NtDeleteValueKey".to_string()),
+                    target: ExportTarget::Rva(0x24C0),
+                },
+                ExportSymbol {
+                    ordinal: 30,
+                    name: Some("NtEnumerateKey".to_string()),
+                    target: ExportTarget::Rva(0x24D0),
+                },
+                ExportSymbol {
+                    ordinal: 31,
+                    name: Some("NtEnumerateValueKey".to_string()),
+                    target: ExportTarget::Rva(0x24E0),
+                },
+                ExportSymbol {
+                    ordinal: 32,
+                    name: Some("NtQueryKey".to_string()),
+                    target: ExportTarget::Rva(0x24F0),
+                },
+                ExportSymbol {
+                    ordinal: 33,
+                    name: Some("NtQueryInformationThread".to_string()),
+                    target: ExportTarget::Rva(0x2500),
+                },
+                ExportSymbol {
+                    ordinal: 34,
+                    name: Some("NtGetContextThread".to_string()),
+                    target: ExportTarget::Rva(0x2510),
+                },
+                ExportSymbol {
+                    ordinal: 35,
+                    name: Some("NtSetContextThread".to_string()),
+                    target: ExportTarget::Rva(0x2520),
+                },
+                ExportSymbol {
+                    ordinal: 36,
+                    name: Some("NtSuspendThread".to_string()),
+                    target: ExportTarget::Rva(0x2530),
+                },
+                ExportSymbol {
+                    ordinal: 37,
+                    name: Some("NtResumeThread".to_string()),
+                    target: ExportTarget::Rva(0x2540),
+                },
+                ExportSymbol {
+                    ordinal: 38,
+                    name: Some("NtTerminateProcess".to_string()),
+                    target: ExportTarget::Rva(0x2550),
+                },
+                ExportSymbol {
+                    ordinal: 39,
+                    name: Some("NtTerminateThread".to_string()),
+                    target: ExportTarget::Rva(0x2560),
+                },
+                ExportSymbol {
+                    ordinal: 40,
+                    name: Some("NtCreateThreadEx".to_string()),
+                    target: ExportTarget::Rva(0x2570),
+                },
+                ExportSymbol {
+                    ordinal: 41,
+                    name: Some("NtSetInformationThread".to_string()),
+                    target: ExportTarget::Rva(0x2580),
+                },
+                ExportSymbol {
+                    ordinal: 42,
+                    name: Some("NtQuerySystemInformation".to_string()),
+                    target: ExportTarget::Rva(0x2590),
+                },
+                ExportSymbol {
+                    ordinal: 43,
+                    name: Some("NtQueryPerformanceCounter".to_string()),
+                    target: ExportTarget::Rva(0x25A0),
+                },
+                ExportSymbol {
+                    ordinal: 44,
+                    name: Some("NtQueryTimerResolution".to_string()),
+                    target: ExportTarget::Rva(0x25B0),
+                },
+                ExportSymbol {
+                    ordinal: 45,
+                    name: Some("NtSetTimerResolution".to_string()),
+                    target: ExportTarget::Rva(0x25C0),
+                },
+                ExportSymbol {
+                    ordinal: 46,
+                    name: Some("NtQuerySystemTime".to_string()),
+                    target: ExportTarget::Rva(0x25D0),
+                },
+                ExportSymbol {
+                    ordinal: 47,
+                    name: Some("RtlInitUnicodeString".to_string()),
+                    target: ExportTarget::Rva(0x25E0),
+                },
+                ExportSymbol {
+                    ordinal: 48,
+                    name: Some("RtlInitAnsiString".to_string()),
+                    target: ExportTarget::Rva(0x25F0),
+                },
+                ExportSymbol {
+                    ordinal: 49,
+                    name: Some("RtlFreeUnicodeString".to_string()),
+                    target: ExportTarget::Rva(0x2600),
+                },
+                ExportSymbol {
+                    ordinal: 50,
+                    name: Some("RtlFreeAnsiString".to_string()),
+                    target: ExportTarget::Rva(0x2610),
+                },
+                ExportSymbol {
+                    ordinal: 51,
+                    name: Some("RtlCompareUnicodeString".to_string()),
+                    target: ExportTarget::Rva(0x2620),
+                },
+                ExportSymbol {
+                    ordinal: 52,
+                    name: Some("RtlEqualUnicodeString".to_string()),
+                    target: ExportTarget::Rva(0x2630),
+                },
+                ExportSymbol {
+                    ordinal: 53,
+                    name: Some("RtlGetVersion".to_string()),
+                    target: ExportTarget::Rva(0x2640),
+                },
+                ExportSymbol {
+                    ordinal: 54,
+                    name: Some("RtlCaptureContext".to_string()),
+                    target: ExportTarget::Rva(0x2650),
+                },
+                ExportSymbol {
+                    ordinal: 55,
+                    name: Some("RtlLookupFunctionEntry".to_string()),
+                    target: ExportTarget::Rva(0x2660),
+                },
+                ExportSymbol {
+                    ordinal: 56,
+                    name: Some("RtlRaiseException".to_string()),
+                    target: ExportTarget::Rva(0x2670),
+                },
+                ExportSymbol {
+                    ordinal: 57,
+                    name: Some("RtlAllocateHeap".to_string()),
+                    target: ExportTarget::Rva(0x2680),
+                },
+                ExportSymbol {
+                    ordinal: 58,
+                    name: Some("RtlFreeHeap".to_string()),
+                    target: ExportTarget::Rva(0x2690),
+                },
+                ExportSymbol {
+                    ordinal: 59,
+                    name: Some("RtlSizeHeap".to_string()),
+                    target: ExportTarget::Rva(0x26A0),
                 },
             ],
         ),

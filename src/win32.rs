@@ -1291,6 +1291,23 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    /// The current signal state of an event handle (the previous state the
+    /// Nt* event thunks report before mutating).  Non-event handles fail
+    /// with an invalid-handle error; access is validated like `set_event`.
+    pub fn event_previous_state(&self, handle: Handle) -> AppResult<bool> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::Event(_) => {
+                Self::require_access(entry, EVENT_MODIFY_STATE)?;
+            }
+            _ => return invalid_handle("handle is not an event"),
+        }
+        match &entry.object {
+            KernelObject::Event(event) => Ok(event.borrow().signaled),
+            _ => invalid_handle("handle is not an event"),
+        }
+    }
+
     pub fn reset_event(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
