@@ -1880,6 +1880,12 @@ impl PeHostRuntime {
 
     /// `NtSuspendThread` — real suspend count at the scheduler level: the
     /// pump skips suspended threads until every suspension is released.
+    ///
+    /// The subsystem is the ONLY counter mutation (`win32.suspend_thread`
+    /// validates THREAD_SUSPEND_RESUME and returns the true previous
+    /// count); the scheduler record then syncs FROM the subsystem, so the
+    /// Win32 and Nt paths on the same thread are interchangeable and the
+    /// two counters can never disagree.
     pub(crate) fn dispatch_nt_suspend_thread(
         &mut self,
         state: &mut CpuState,
@@ -1889,13 +1895,7 @@ impl PeHostRuntime {
         let previous_count_ptr = guest_call_arg(state, memory, 1)?;
         match self.win32.suspend_thread(thread_handle) {
             Ok(previous) => {
-                if let Some(thread) = self
-                    .pending_guest_threads
-                    .iter_mut()
-                    .find(|thread| thread.handle == thread_handle)
-                {
-                    thread.suspended = thread.suspended.saturating_add(1);
-                }
+                self.sync_pending_thread_suspend_count(thread_handle);
                 if previous_count_ptr != 0 {
                     write_u32(memory, previous_count_ptr, previous);
                 }
@@ -1910,6 +1910,10 @@ impl PeHostRuntime {
     }
 
     /// `NtResumeThread` — decrement the scheduler suspend count.
+    ///
+    /// Same single-source-of-truth contract as `NtSuspendThread`: the
+    /// subsystem decrements and returns the previous count, and the
+    /// scheduler record syncs from it.
     pub(crate) fn dispatch_nt_resume_thread(
         &mut self,
         state: &mut CpuState,
@@ -1919,13 +1923,7 @@ impl PeHostRuntime {
         let previous_count_ptr = guest_call_arg(state, memory, 1)?;
         match self.win32.resume_thread(thread_handle) {
             Ok(previous) => {
-                if let Some(thread) = self
-                    .pending_guest_threads
-                    .iter_mut()
-                    .find(|thread| thread.handle == thread_handle)
-                {
-                    thread.suspended = thread.suspended.saturating_sub(1);
-                }
+                self.sync_pending_thread_suspend_count(thread_handle);
                 if previous_count_ptr != 0 {
                     write_u32(memory, previous_count_ptr, previous);
                 }
@@ -2043,7 +2041,11 @@ impl PeHostRuntime {
                 parameter,
             )?;
             if create_suspended {
+                // NtCreateThreadEx(create_suspended): the suspension is
+                // recorded in BOTH the subsystem ThreadState (the single
+                // source of truth) and the scheduler record.
                 pending_thread.suspended = 1;
+                let _ = self.win32.set_thread_suspend_count(thread_id, 1);
             }
             self.pending_guest_threads.push_back(pending_thread);
         }

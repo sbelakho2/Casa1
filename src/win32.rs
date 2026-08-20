@@ -5465,6 +5465,26 @@ impl Win32Subsystem {
         Ok(self.thread_state(thread_id)?.priority)
     }
 
+    /// The subsystem's current suspend count for `thread_id` (0 = running).
+    ///
+    /// THE single source of truth for suspension: `suspend_thread` /
+    /// `resume_thread` are the only counter mutations, and the scheduler
+    /// copies this value into its per-thread records whenever a
+    /// suspend/resume thunk dispatches, so the Win32 and Nt paths can
+    /// never drift.  Public so the Nt query surface (ThreadSuspendCount)
+    /// and the integration tests can read it.
+    pub fn thread_suspend_count(&self, thread_id: u32) -> AppResult<u32> {
+        Ok(self.thread_state(thread_id)?.suspend_count)
+    }
+
+    /// Overwrite the subsystem suspend count (used by the CREATE_SUSPENDED
+    /// creation paths, which must record the initial suspension in BOTH the
+    /// subsystem state and the scheduler record).
+    pub(crate) fn set_thread_suspend_count(&mut self, thread_id: u32, count: u32) -> AppResult<()> {
+        self.thread_state_mut(thread_id)?.suspend_count = count;
+        Ok(())
+    }
+
     pub fn open_thread(
         &mut self,
         thread_id: u32,

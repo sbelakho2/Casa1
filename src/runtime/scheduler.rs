@@ -532,6 +532,29 @@ pub(crate) struct PumpedThreadOutcome {
 }
 
 impl PeHostRuntime {
+    /// Copy the subsystem's suspend count (the single source of truth) into
+    /// the scheduler's pending-thread record for `thread_handle`.
+    ///
+    /// Called after every Win32/Nt suspend/resume mutation: the subsystem
+    /// counter (`Win32Subsystem::suspend_thread` / `resume_thread`) is the
+    /// ONLY place suspension is changed, and the per-thread scheduler record
+    /// mirrors it, so the pump gate (`thread.suspended == 0`) can never
+    /// disagree with the subsystem state.
+    pub(crate) fn sync_pending_thread_suspend_count(&mut self, thread_handle: u32) {
+        let Ok(thread_id) = self.win32.thread_id_for_handle(thread_handle) else {
+            return;
+        };
+        let Ok(count) = self.win32.thread_suspend_count(thread_id) else {
+            return;
+        };
+        for thread in &mut self.pending_guest_threads {
+            if thread.thread_id == thread_id {
+                thread.suspended = count;
+                return;
+            }
+        }
+    }
+
     pub(crate) fn pump_pending_guest_thread(
         &mut self,
         memory: &mut MemoryImage,

@@ -26476,11 +26476,14 @@ impl PeHostRuntime {
                 }
                 if can_queue_guest_thread {
                     // CREATE_SUSPENDED threads ARE queued with suspend count 1
-                    // and start once ResumeThread clears it.
+                    // and start once ResumeThread clears it.  The suspension is
+                    // recorded in BOTH the subsystem ThreadState (the single
+                    // source of truth) and the scheduler record.
                     let mut pending_thread =
                         self.prepare_guest_thread_entry(memory, thread_handle, stack_size, start_address, parameter)?;
                     if creation_flags & CREATE_SUSPENDED != 0 {
                         pending_thread.suspended = 1;
+                        let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
@@ -31225,7 +31228,9 @@ impl PeHostRuntime {
                     // CREATE_SUSPENDED threads ARE queued: they sit in the
                     // pending list with suspend count 1 and are skipped by the
                     // pump until ResumeThread clears the suspension (see
-                    // `pump_pending_guest_thread` / `ResumeThread`).
+                    // `pump_pending_guest_thread` / `ResumeThread`).  The
+                    // suspension is recorded in BOTH the subsystem ThreadState
+                    // (the single source of truth) and the scheduler record.
                     let mut pending_thread = self.prepare_guest_thread_entry(
                         memory,
                         thread_handle,
@@ -31235,6 +31240,7 @@ impl PeHostRuntime {
                     )?;
                     if creation_flags & CREATE_SUSPENDED != 0 {
                         pending_thread.suspended = 1;
+                        let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
@@ -39702,19 +39708,20 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                // A queued (not-yet-started) guest thread gets one more
-                // suspension; each one needs a matching ResumeThread.  Threads
-                // already running cannot be paused in this cooperative model,
-                // so their previous suspend count is 0 (Windows-compatible
-                // for an unsuspended thread).
-                let mut previous = 0_u32;
-                for thread in &mut self.pending_guest_threads {
-                    if thread.handle == handle {
-                        previous = thread.suspended;
-                        thread.suspended = thread.suspended.saturating_add(1);
-                        break;
+                // The subsystem is the ONLY counter mutation
+                // (win32.suspend_thread validates THREAD_SUSPEND_RESUME and
+                // returns the TRUE previous count); the scheduler record is
+                // then synced FROM the subsystem so the two can never drift
+                // and Win32/Nt suspend/resume thunks are interchangeable.
+                let previous = match self.win32.suspend_thread(handle) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED
+                        self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
                     }
-                }
+                };
+                self.sync_pending_thread_suspend_count(handle);
                 state.set(Register::Rax, previous as u64);
                 self.last_error = 0;
             }
@@ -39730,18 +39737,18 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                // Decrement the pending thread's suspend count (returning the
-                // previous count); once it reaches 0 the pump starts it.
-                let mut previous = 0_u32;
-                for thread in &mut self.pending_guest_threads {
-                    if thread.handle == handle {
-                        previous = thread.suspended;
-                        if thread.suspended > 0 {
-                            thread.suspended -= 1;
-                        }
-                        break;
+                // Same single-source-of-truth contract as SuspendThread: the
+                // subsystem decrements and returns the previous count; the
+                // scheduler record syncs from it.
+                let previous = match self.win32.resume_thread(handle) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED
+                        self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
                     }
-                }
+                };
+                self.sync_pending_thread_suspend_count(handle);
                 state.set(Register::Rax, previous as u64);
                 self.last_error = 0;
             }
