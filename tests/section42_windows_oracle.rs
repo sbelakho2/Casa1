@@ -87,6 +87,15 @@ fn vector_corpus_is_versioned_and_deterministic() {
                     | "d3d12_filter_translation"
                     | "cpu_arithmetic_flags"
                     | "virtual_memory"
+                    | "time_clock"
+                    | "environment"
+                    | "file_metadata"
+                    | "directory_enumeration"
+                    | "version"
+                    | "error_domain"
+                    | "string_ops"
+                    | "section_mapping"
+                    | "heap"
             ),
             "unexpected category {category}"
         );
@@ -1105,6 +1114,130 @@ fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
             diffs.is_empty(),
             "{} unexpected diffs: {diffs:?}",
             vector.id
+        );
+    }
+}
+
+// ── evidence-expansion categories ───────────────────────────────────────────
+
+/// The new categories' corpus is deterministic, versioned and unique, and
+/// the Casa1 runtime computes EVERY vector (no runtime_unavailable marker).
+#[test]
+fn evidence_expansion_corpus_is_deterministic_and_fully_computed() {
+    use casa1::windows_oracle::{ALL_CATEGORIES, compute_runtime_result, generate_vectors};
+    let categories = [
+        "time_clock",
+        "environment",
+        "file_metadata",
+        "directory_enumeration",
+        "version",
+        "error_domain",
+        "string_ops",
+        "section_mapping",
+        "heap",
+    ];
+    for category in categories {
+        assert!(
+            ALL_CATEGORIES.contains(&category),
+            "{category} must be part of the differential corpus"
+        );
+        let vectors = generate_vectors(&[category.to_string()]);
+        assert!(!vectors.is_empty(), "{category} corpus must exist");
+        for vector in &vectors {
+            let result = compute_runtime_result(vector);
+            assert_eq!(
+                result.output.get("runtime_unavailable"),
+                None,
+                "{} must be computed by the Casa1 runtime, not reported unavailable",
+                vector.id
+            );
+        }
+    }
+}
+
+/// The model-generated golden regeneration path for the new categories is
+/// clean end to end: `casa1-oracle golden` emits the Casa1 runtime's
+/// behavior wrapped in the MODEL-GENERATED header, and comparing the same
+/// corpus against it reports zero diffs with every category covered.  The
+/// authoritative validation remains the Windows reference capture (CI); the
+/// golden placeholder exists so the harness has a deterministic local
+/// reference shape.
+#[test]
+fn new_categories_golden_roundtrip_is_clean() {
+    let temp = TempDir::new().expect("temp dir");
+    let vectors_path = temp.path().join("vectors.json");
+    let golden_path = temp.path().join("golden.json");
+    let categories = "time_clock,environment,file_metadata,directory_enumeration,version,error_domain,string_ops,section_mapping,heap";
+    let (status, _) = run_oracle(&[
+        "vectors",
+        "--out",
+        vectors_path.to_str().expect("path"),
+        "--categories",
+        categories,
+    ]);
+    assert!(status.success());
+    let (status, _) = run_oracle(&[
+        "golden",
+        "--out",
+        golden_path.to_str().expect("path"),
+        "--categories",
+        categories,
+    ]);
+    assert!(status.success());
+    let golden: Value = serde_json::from_slice(&std::fs::read(&golden_path).expect("read golden"))
+        .expect("parse golden");
+    assert_eq!(golden["capture"]["capture_date"], "model-generated");
+    let (status, stdout) = run_oracle(&[
+        "compare",
+        "--vectors",
+        vectors_path.to_str().expect("path"),
+        "--results",
+        golden_path.to_str().expect("path"),
+    ]);
+    assert!(
+        status.success(),
+        "the golden roundtrip must be clean:\n{stdout}"
+    );
+    let report = compare_report(&stdout);
+    assert_eq!(report["diff_count"].as_u64(), Some(0));
+    assert!(
+        report["runtime_uncovered_categories"]
+            .as_array()
+            .expect("runtime_uncovered_categories")
+            .is_empty(),
+        "no category may be runtime-uncovered"
+    );
+}
+
+/// The checked-in golden fixture carries the new categories (model-generated
+/// placeholders by design) and the compare against it keeps the fail-loud
+/// contract: the stale model-era placeholder values still produce diffs, and
+/// the new categories contribute none.
+#[test]
+fn golden_fixture_covers_the_new_categories() {
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(golden_fixture()).expect("read golden"))
+            .expect("parse golden");
+    let categories: std::collections::BTreeSet<&str> = file["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter_map(|result| result["category"].as_str())
+        .collect();
+    for category in [
+        "time_clock",
+        "environment",
+        "file_metadata",
+        "directory_enumeration",
+        "version",
+        "error_domain",
+        "string_ops",
+        "section_mapping",
+        "heap",
+    ] {
+        assert!(
+            categories.contains(category),
+            "the golden fixture must cover {category}"
         );
     }
 }

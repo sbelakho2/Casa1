@@ -1908,11 +1908,13 @@ pub enum HostThunk {
     MultiByteToWideChar,
     WideCharToMultiByte,
     LstrcmpiW,
+    LstrcmpW,
     LstrlenW,
     LstrcpyA,
     LstrcpyW,
     LstrcpynW,
     LstrcatW,
+    CharUpperW,
     GetCommandLineA,
     GetCommandLineW,
     OutputDebugStringA,
@@ -2104,6 +2106,7 @@ pub enum HostThunk {
     GetFileType,
     GetFileInformationByHandle,
     GetTickCount,
+    GetTickCount64,
     InitializeCriticalSection,
     InitializeCriticalSectionAndSpinCount,
     InitializeCriticalSectionEx,
@@ -25748,6 +25751,30 @@ impl PeHostRuntime {
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
             }
+            HostThunk::LstrcmpW => {
+                let left_ptr = guest_call_arg(state, memory, 0)?;
+                let right_ptr = guest_call_arg(state, memory, 1)?;
+                let left = if left_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, left_ptr)?
+                };
+                let right = if right_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, right_ptr)?
+                };
+                // lstrcmpW is the CASE-SENSITIVE ordinal comparison of
+                // UTF-16 code-unit sequences (lstrcmpiW folds case; this one
+                // does not).
+                let result = match left.encode_utf16().cmp(right.encode_utf16()) {
+                    std::cmp::Ordering::Less => -1_i32,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
             HostThunk::LstrlenW => {
                 let string_ptr = guest_call_arg(state, memory, 0)?;
                 let length = if string_ptr == 0 {
@@ -26156,6 +26183,29 @@ impl PeHostRuntime {
                         self.last_error = ERROR_INVALID_PARAMETER;
                     }
                 }
+            }
+            HostThunk::CharUpperW => {
+                let value = guest_call_arg(state, memory, 0)?;
+                if value <= u16::MAX as u64 {
+                    // Single-character form (zero high word): the low word
+                    // is treated as an ANSI character in the system code
+                    // page and returned uppercased.
+                    let upper = crate::win32::cp1252_uppercase(value as u32);
+                    state.set(Register::Rax, u64::from(upper));
+                } else {
+                    // String form: uppercase the string in place and return
+                    // the pointer.
+                    let text = read_utf16_string(memory, value)?;
+                    let upper = self.win32.char_upper_w_string(&text);
+                    let mut bytes = Vec::new();
+                    for unit in upper.encode_utf16() {
+                        bytes.extend_from_slice(&unit.to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&0_u16.to_le_bytes());
+                    memory.map_bytes(value, &bytes);
+                    state.set(Register::Rax, value);
+                }
+                self.last_error = 0;
             }
             HostThunk::CharNextW => {
                 let current = guest_call_arg(state, memory, 0)?;
@@ -34548,6 +34598,12 @@ impl PeHostRuntime {
                 state.set(Register::Rax, milliseconds);
                 self.last_error = 0;
                 self.push_trace("time", "GetTickCount", BTreeMap::new(), json!(milliseconds));
+            }
+            HostThunk::GetTickCount64 => {
+                let milliseconds = self.win32.get_tick_count64();
+                state.set(Register::Rax, milliseconds);
+                self.last_error = 0;
+                self.push_trace("time", "GetTickCount64", BTreeMap::new(), json!(milliseconds));
             }
             HostThunk::InitializeCriticalSection => {
                 let critical_section = guest_call_arg(state, memory, 0)?;
@@ -63431,6 +63487,9 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrcmpiW" => {
                 Self::LstrcmpiW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrcmpW" => {
+                Self::LstrcmpW
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrlenW" => {
                 Self::LstrlenW
             }
@@ -63445,6 +63504,9 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrcatW" => {
                 Self::LstrcatW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CharUpperW" => {
+                Self::CharUpperW
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCommandLineA" => {
                 Self::GetCommandLineA
@@ -63862,6 +63924,9 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount" => {
                 Self::GetTickCount
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount64" => {
+                Self::GetTickCount64
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. })
                 if name == "GetCurrentPackageId" =>
             {
@@ -64158,6 +64223,9 @@ impl HostThunk {
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount" => {
                 Self::GetTickCount
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount64" => {
+                Self::GetTickCount64
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. })
                 if name == "GetCurrentPackageId" =>
@@ -67424,6 +67492,7 @@ impl HostThunk {
             | Self::GetCurrentProcess
             | Self::GetProcessHeap
             | Self::GetTickCount
+            | Self::GetTickCount64
             | Self::OleUninitialize
             | Self::GetCommandLineA
             | Self::GetCommandLineW
@@ -67531,6 +67600,7 @@ impl HostThunk {
             | Self::VariantClear
             | Self::LstrlenW
             | Self::CharNextW
+            | Self::CharUpperW
             | Self::GetDC
             | Self::CreateFontIndirectW
             | Self::DeleteObject
@@ -67781,6 +67851,7 @@ impl HostThunk {
             | Self::LocalAlloc
             | Self::GlobalAlloc
             | Self::LstrcmpiW
+            | Self::LstrcmpW
             | Self::CompareFileTime
             | Self::LstrcpyA
             | Self::LstrcpyW
@@ -71330,15 +71401,15 @@ fn apply_ver_condition_mask(existing_mask: u64, type_mask: u32, condition_mask: 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuestVersionInfo {
-    major: u32,
-    minor: u32,
-    build: u32,
-    platform_id: u32,
-    service_pack_major: u16,
-    service_pack_minor: u16,
-    suite_mask: u16,
-    product_type: u8,
+pub(crate) struct GuestVersionInfo {
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+    pub(crate) build: u32,
+    pub(crate) platform_id: u32,
+    pub(crate) service_pack_major: u16,
+    pub(crate) service_pack_minor: u16,
+    pub(crate) suite_mask: u16,
+    pub(crate) product_type: u8,
 }
 
 fn ver_condition_shift(type_bit: u32) -> Option<u32> {
@@ -71372,7 +71443,7 @@ fn ver_condition_for_type(condition_mask: u64, type_bit: u32) -> AppResult<u8> {
     Ok(condition)
 }
 
-fn guest_version_info_from_profile(profile: &str) -> AppResult<GuestVersionInfo> {
+pub(crate) fn guest_version_info_from_profile(profile: &str) -> AppResult<GuestVersionInfo> {
     match profile {
         "win7" => Ok(GuestVersionInfo {
             major: 6,
@@ -90495,6 +90566,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x1068),
         },
         ExportSymbol {
+            ordinal: 118,
+            name: Some("GetTickCount64".to_string()),
+            target: ExportTarget::Rva(0x1070),
+        },
+        ExportSymbol {
             ordinal: 107,
             name: Some("InitializeCriticalSection".to_string()),
             target: ExportTarget::Rva(0x1070),
@@ -90630,6 +90706,7 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             "lstrcpyW",
             "MoveFileExW",
             "lstrcatW",
+            "CharUpperW",
             "GetSystemDirectoryW",
             "GetProcAddress",
             "GetModuleHandleA",

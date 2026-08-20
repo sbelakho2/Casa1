@@ -66,6 +66,15 @@ Category coverage (all executed with real calls, never reimplemented):
 | `thread_tls` | `TlsAlloc`/`TlsSetValue`/`TlsGetValue`/`TlsFree`, thread isolation, `TLS_MINIMUM_AVAILABLE` |
 | `cpu_arithmetic_flags` | real x86 add/sub/cmp executed with stable inline assembly (`core::arch::asm!`), FLAGS captured via `lahf`/`seto` — REAL CPU truth, never a reimplementation |
 | `virtual_memory` | `VirtualAlloc`/`VirtualFree`/`VirtualProtect`/`VirtualQuery` sequences over a session address space (reserve, interior commit, partial protect/decommit, the mandated failures, unmapped-address queries) |
+| `time_clock` | `GetTickCount64`/`GetSystemTimeAsFileTime`/`QueryPerformanceCounter`/`QueryPerformanceFrequency` deltas across a real `Sleep` (relative deltas only) |
+| `environment` | `SetEnvironmentVariableW`/`GetEnvironmentVariableW`/`GetEnvironmentStringsW` (present/missing, required size incl. trailing NUL, `ERROR_INSUFFICIENT_BUFFER`, case-insensitive lookup, sorted block entries) |
+| `file_metadata` | `GetFileAttributesW`, `GetFileSizeEx`, `SetFilePointerEx` (attribute projections, exact sizes after writes, pointer movement relative to start/end) |
+| `directory_enumeration` | `FindFirstFileW`/`FindNextFileW`/`FindClose` over a fixed fixture (entry names + directory flags, sorted order, `ERROR_FILE_NOT_FOUND` no-match, `ERROR_PATH_NOT_FOUND` missing dir, exhaustion) |
+| `version` | `GetVersionExW` + `RtlGetVersion` — the reference exe embeds a Windows-10 compatibility manifest so `GetVersionExW` reports the REAL version; the compare accepts the SHAPE (see §3.2) |
+| `error_domain` | `SetLastError`/`GetLastError` round-trip plus real failing calls (missing file / invalid handle / readonly delete) with the `RtlNtStatusToDosError` mapping — the `ERROR_*` values are identical across sides |
+| `string_ops` | `lstrlenW`/`lstrcpyW`/`lstrcmpW`/`CharUpperW` (UTF-16 unit lengths incl. surrogate pairs, case-SENSITIVE ordinal comparison, CP1252 Latin-1 case mapping) |
+| `section_mapping` | `CreateFileMappingW`/`MapViewOfFile`/`UnmapViewOfFile` over ANONYMOUS sections — mapping size and content visibility after writes, never base addresses |
+| `heap` | `HeapAlloc`/`HeapFree`/`HeapSize` on the process heap (16-byte alignment, `HEAP_ZERO_MEMORY`, size ≥ requested, free invalidates the size query) |
 
 `cpu_arithmetic_flags` is a REAL Windows/CPU category: the reference
 executable runs natively on Windows x86/x64, so it executes the actual
@@ -171,6 +180,15 @@ category-specific JSON objects, so new categories need no wire-format change.
 | `synchronization` | `waits` (array of wait return codes), `releases` (`[{succeeded, error}]`), `abandoned` |
 | `crt_printf` | `handler_invoked`, `ret`, `errno`, `written`, `value`, `end_consumed`, `buffer` (nulls where N/A) |
 | `thread_tls` | per-kind fields (`index_valid`, `set_succeeded`, `get_matches`, `minimum_available`, `free_succeeded`, `new_index_valid`, `succeeded`, `error`, `value_is_null`, `other_thread_value_is_null`, `main_value_preserved`) |
+| `time_clock` | `sleep_ms`, `ticks_delta`, `filetime_delta`, `qpc_delta`, `qpc_seconds_100ns` (relatives; compare contract is structural, see below) |
+| `environment` | `found`, `error`, `required_size`, `retrieved`, `retrieved_units`, `small_buffer_error`, `small_buffer_required`, `trailing_null`, `case_insensitive_found`, `set_succeeded`, `entries` (block op) |
+| `file_metadata` | `op`, `exists`, `is_directory`, `is_readonly`, `error`, `size`, `sizes`, `pointer_begin`, `pointer_end`, `set_succeeded`, `clear_succeeded`, `is_readonly_after_clear` |
+| `directory_enumeration` | `find_succeeded`, `invalid_handle`, `error`, `entries` (`[{name, is_directory}]` in sorted order), `exhausted`, `next_error`, `close_succeeded` |
+| `version` | `version_ex`/`rtl` field groups, `cross_consistent`, `build_positive`, `major_win10_family`, `platform_nt` |
+| `error_domain` | `op`, `get_last_error`, `status_mapped`, `matches` |
+| `string_ops` | `op`, `length`/`copied_length`/`dest_length`/`terminated`/`sign`/`character`/`upper`, `error` |
+| `section_mapping` | `op`, `mapping_size`, `view_size`, `map_succeeded`, `unmap_succeeded`, `error`, `content_matches`, `persisted` |
+| `heap` | `op`, `alloc_succeeded`, `aligned_16`, `zeroed`, `size_ge_requested`, `freed`, `size_after_free_fails`, `error` |
 
 ### 3.2. Determinism scope (what the corpus may assume)
 
@@ -219,11 +237,54 @@ across Windows 10/11 x64 machines:
   thread releases, so the worker must acquire and terminate first).
 * `registry` operates on `HKCU\Software\Casa1\OracleRef` and the reference
   cleans up after the run.
+* `time_clock` deltas are RELATIVE and the compare contract is STRUCTURAL,
+  never bit-exact: the Casa1 deterministic guest clock advances by exactly
+  the requested sleep, while Windows `Sleep()` rounds up to the system timer
+  tick and the capture machine may preempt the process.  The contract
+  validates elapsed monotonicity (every delta > 0), the FILETIME domain
+  (`filetime_delta` is a 100-ns-unit count in `[sleep_ms × 10_000,
+  sleep_ms × 20_000]`), and the QPC units-vs-frequency relation
+  (`qpc_seconds_100ns` = `qpc_delta × 10_000_000 / frequency` falls in the
+  same band and agrees with `filetime_delta` within 10%).  The frequency
+  itself is never compared bit-for-bit.
+* `environment` vectors are self-contained (they set their own uniquely
+  named variables, so the differential never depends on the host
+  environment); the block op normalizes the environment block to sorted
+  entries filtered to the vector's own variable prefix (the process-wide
+  Windows block is not deterministic).
+* `file_metadata` reports attribute PROJECTIONS (`exists`/`is_directory`/
+  `is_readonly`) instead of the raw `FILE_ATTRIBUTE_*` bit mask — the mask
+  is not stable across file systems (e.g. the archive bit); sizes and
+  pointer positions are exact byte values and the errors are the `ERROR_*`
+  codes (2/3/6).
+* `directory_enumeration` fixture names are lowercase ASCII so the Windows
+  NTFS alphabetical order and the runtime's byte-wise sort agree; the
+  no-match case is `ERROR_FILE_NOT_FOUND`, the missing-directory case is
+  `ERROR_PATH_NOT_FOUND`, exhaustion reports `ERROR_NO_MORE_FILES`.
+* `version` is a SHAPE contract, never identical values: the Casa1 side
+  reports its CONFIGURED Windows version, the reference its real one.  The
+  raw major/minor/build numbers are NOT compared across sides; the contract
+  validates the structural invariants both must satisfy (major in the
+  Windows-10 family, build > 0, `VER_PLATFORM_WIN32_NT`) and — the exact
+  part — that GetVersionExW and RtlGetVersion agree within the same side.
+  The reference executable embeds a Windows-10 compatibility manifest so
+  GetVersionExW reports the real version (a manifestless process would be
+  shimmed to 6.2.9200).
+* `string_ops` CharUpperW vectors cover ASCII plus a fixed Latin-1 subset
+  under the CP1252 system code page (ß and ÷ stay unchanged; ÿ is absent
+  because its uppercase U+0178 is not representable in the code page); the
+  lstrcmpW vectors rely on the case-SENSITIVE ordinal comparison.
+* `section_mapping` uses ANONYMOUS sections only (the Casa1 runtime models
+  named/anonymous shared sections, not file-backed ones); base addresses
+  are never part of the differential.
+* `heap` reports `size_ge_requested` instead of the exact HeapSize value
+  (Windows may round allocations up); the 16-byte alignment IS exact.
 
 ## 4. Harness commands
 
 ```
 casa1-oracle vectors --out vectors.json [--categories a,b,c]
+casa1-oracle golden --out golden.json [--categories a,b,c]
 casa1-oracle compare --results r.json [--vectors v.json] [--categories ...]
                [--required-categories a,b,c] [--report-only]
 casa1-oracle api-report --out api-completeness.json
@@ -248,16 +309,24 @@ Environment-driven modes (ad-hoc use on a Windows host):
   existing reference results file.
 
 (There is no `model-results` command: the harness never computes expected
-values itself.)
+values itself.  The `golden` command is the MODEL-GENERATED placeholder
+emitter — it wraps the Casa1 runtime's own per-vector behavior in the
+`MODEL-GENERATED` capture header so the section42 harness has a
+deterministic local reference shape.  It is explicitly NOT Windows truth:
+the reference-results consumers refuse it, and the real capture replaces
+it.)
 
 ### 4.1. Golden fixture
 
 `tests/fixtures/section42/golden_windows_reference_results.json` is a
-checked-in reference-results file covering the `path_normalize`,
-`case_fold`, and `file_sharing` vectors. It carries the capture header
+checked-in reference-results file covering every advertised category (the
+new evidence-expansion categories as model-generated placeholders by
+design). It carries the capture header
 (`source: "windows"`, `captured_by: "casa1-windows-reference"`) and is
 currently **model-generated** — the first real Windows capture (CI artifact)
-is the authoritative replacement. `tests/section42_windows_oracle.rs` validates that the golden file fails
+is the authoritative replacement. Regenerate the placeholder with
+`casa1-oracle golden --out tests/fixtures/section42/golden_windows_reference_results.json`.
+`tests/section42_windows_oracle.rs` validates that the golden file fails
 loudly (placeholder values + the coverage gate) and that mutations are
 detected; the tests also prove the fail-loud non-Windows stub behavior and
 the required-categories gate.  The reference-results consumers
@@ -297,7 +366,7 @@ the differential tests skip until a real Windows capture is available.
    results artifact.
 3. **compare** (macos-latest): downloads the artifact, runs
    `casa1-oracle compare --vectors … --results … --required-categories
-   path_normalize,case_fold,file_sharing,file_lock,delete_semantics,api_set,registry,synchronization,crt_printf,thread_tls`;
+   path_normalize,case_fold,file_sharing,file_lock,delete_semantics,api_set,registry,synchronization,crt_printf,thread_tls,cpu_arithmetic_flags,virtual_memory,time_clock,environment,file_metadata,directory_enumeration,version,error_domain,string_ops,section_mapping,heap`;
    **the job fails on any diff**, and on any required category the runtime
    does not compute or the capture does not cover — the workflow cannot
    succeed with untested categories.

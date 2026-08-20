@@ -5,7 +5,7 @@
     "captured_by": "casa1-windows-reference",
     "captured_on": "windows-10-11",
     "capture_date": "model-generated",
-    "note": "MODEL-GENERATED placeholder — not captured from real Windows. Regenerate with the reference executable on Windows 10/11."
+    "note": "MODEL-GENERATED placeholder \u2014 not captured from real Windows. Regenerate with the reference executable on Windows 10/11."
   },
   "results": [
     {
@@ -375,6 +375,617 @@
       "output": {
         "second_error": 32,
         "second_open_succeeds": false
+      }
+    },
+    {
+      "id": "time_clock:000",
+      "category": "time_clock",
+      "output": {
+        "filetime_delta": 1500000,
+        "qpc_delta": 1500000,
+        "qpc_seconds_100ns": 1500000,
+        "sleep_ms": 150,
+        "ticks_delta": 150
+      }
+    },
+    {
+      "id": "time_clock:001",
+      "category": "time_clock",
+      "output": {
+        "filetime_delta": 2500000,
+        "qpc_delta": 2500000,
+        "qpc_seconds_100ns": 2500000,
+        "sleep_ms": 250,
+        "ticks_delta": 250
+      }
+    },
+    {
+      "id": "environment:000",
+      "category": "environment",
+      "output": {
+        "case_insensitive_found": true,
+        "error": 0,
+        "found": true,
+        "required_size": 17,
+        "retrieved": "Alpha Beta Gamma",
+        "retrieved_units": 16,
+        "set_succeeded": true,
+        "small_buffer_error": 122,
+        "small_buffer_required": 17,
+        "trailing_null": true
+      }
+    },
+    {
+      "id": "environment:001",
+      "category": "environment",
+      "output": {
+        "error": 203,
+        "found": false,
+        "required_size": 0
+      }
+    },
+    {
+      "id": "environment:002",
+      "category": "environment",
+      "output": {
+        "entries": [
+          "CASA1_ORACLE_BLOCK_A=First Value"
+        ],
+        "error": 0
+      }
+    },
+    {
+      "id": "environment:003",
+      "category": "environment",
+      "output": {
+        "entries": [
+          "CASA1_ORACLE_BLOCK_A=First Value",
+          "CASA1_ORACLE_BLOCK_B=Second Value"
+        ],
+        "error": 0
+      }
+    },
+    {
+      "id": "file_metadata:000",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 0,
+        "exists": true,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "create",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": 0,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:001",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 0,
+        "exists": true,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "size_after_writes",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": [
+          5,
+          8
+        ]
+      }
+    },
+    {
+      "id": "file_metadata:002",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 0,
+        "exists": true,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "seek",
+        "pointer_begin": 3,
+        "pointer_end": 6,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:003",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 0,
+        "exists": true,
+        "is_directory": true,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "directory",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:004",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 2,
+        "exists": false,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "missing",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:005",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 3,
+        "exists": false,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "missing_parent",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:006",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": null,
+        "error": 6,
+        "exists": false,
+        "is_directory": false,
+        "is_readonly": false,
+        "is_readonly_after_clear": null,
+        "op": "invalid_handle",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": null,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "file_metadata:007",
+      "category": "file_metadata",
+      "output": {
+        "clear_succeeded": true,
+        "error": 0,
+        "exists": true,
+        "is_directory": false,
+        "is_readonly": true,
+        "is_readonly_after_clear": false,
+        "op": "readonly_roundtrip",
+        "pointer_begin": null,
+        "pointer_end": null,
+        "set_succeeded": true,
+        "size": null,
+        "sizes": null
+      }
+    },
+    {
+      "id": "directory_enumeration:000",
+      "category": "directory_enumeration",
+      "output": {
+        "close_succeeded": true,
+        "entries": [
+          {
+            "is_directory": true,
+            "name": "dir_a"
+          },
+          {
+            "is_directory": true,
+            "name": "dir_c"
+          },
+          {
+            "is_directory": false,
+            "name": "file_a.txt"
+          },
+          {
+            "is_directory": false,
+            "name": "file_b.bin"
+          }
+        ],
+        "error": 0,
+        "exhausted": true,
+        "find_succeeded": true,
+        "invalid_handle": false,
+        "next_error": 18
+      }
+    },
+    {
+      "id": "directory_enumeration:001",
+      "category": "directory_enumeration",
+      "output": {
+        "close_succeeded": true,
+        "entries": [
+          {
+            "is_directory": false,
+            "name": "file_a.txt"
+          },
+          {
+            "is_directory": false,
+            "name": "file_b.bin"
+          }
+        ],
+        "error": 0,
+        "exhausted": true,
+        "find_succeeded": true,
+        "invalid_handle": false,
+        "next_error": 18
+      }
+    },
+    {
+      "id": "directory_enumeration:002",
+      "category": "directory_enumeration",
+      "output": {
+        "close_succeeded": false,
+        "entries": [],
+        "error": 2,
+        "exhausted": false,
+        "find_succeeded": false,
+        "invalid_handle": true,
+        "next_error": 0
+      }
+    },
+    {
+      "id": "directory_enumeration:003",
+      "category": "directory_enumeration",
+      "output": {
+        "close_succeeded": false,
+        "entries": [],
+        "error": 3,
+        "exhausted": false,
+        "find_succeeded": false,
+        "invalid_handle": true,
+        "next_error": 0
+      }
+    },
+    {
+      "id": "directory_enumeration:004",
+      "category": "directory_enumeration",
+      "output": {
+        "close_succeeded": true,
+        "entries": [
+          {
+            "is_directory": true,
+            "name": "dir_a"
+          },
+          {
+            "is_directory": true,
+            "name": "dir_c"
+          },
+          {
+            "is_directory": false,
+            "name": "file_a.txt"
+          },
+          {
+            "is_directory": false,
+            "name": "file_b.bin"
+          }
+        ],
+        "error": 0,
+        "exhausted": true,
+        "find_succeeded": true,
+        "invalid_handle": false,
+        "next_error": 18
+      }
+    },
+    {
+      "id": "version:000",
+      "category": "version",
+      "output": {
+        "build_positive": true,
+        "cross_consistent": true,
+        "major_win10_family": true,
+        "platform_nt": true,
+        "rtl": {
+          "build": 22631,
+          "major": 10,
+          "minor": 0,
+          "platform_id": 2,
+          "service_pack_major": 0,
+          "service_pack_minor": 0
+        },
+        "version_ex": {
+          "build": 22631,
+          "major": 10,
+          "minor": 0,
+          "platform_id": 2,
+          "service_pack_major": 0,
+          "service_pack_minor": 0
+        }
+      }
+    },
+    {
+      "id": "error_domain:000",
+      "category": "error_domain",
+      "output": {
+        "get_last_error": 2,
+        "matches": true,
+        "op": "missing_file",
+        "status_mapped": 2
+      }
+    },
+    {
+      "id": "error_domain:001",
+      "category": "error_domain",
+      "output": {
+        "get_last_error": 6,
+        "matches": true,
+        "op": "invalid_handle",
+        "status_mapped": 6
+      }
+    },
+    {
+      "id": "error_domain:002",
+      "category": "error_domain",
+      "output": {
+        "get_last_error": 5,
+        "matches": true,
+        "op": "readonly_delete",
+        "status_mapped": 5
+      }
+    },
+    {
+      "id": "error_domain:003",
+      "category": "error_domain",
+      "output": {
+        "get_last_error": 203,
+        "matches": true,
+        "op": "set_roundtrip",
+        "status_mapped": 203
+      }
+    },
+    {
+      "id": "string_ops:000",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "length": 5,
+        "op": "len"
+      }
+    },
+    {
+      "id": "string_ops:001",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "length": 0,
+        "op": "len"
+      }
+    },
+    {
+      "id": "string_ops:002",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "length": 4,
+        "op": "len"
+      }
+    },
+    {
+      "id": "string_ops:003",
+      "category": "string_ops",
+      "output": {
+        "copied_length": 7,
+        "dest_length": 7,
+        "error": 0,
+        "op": "copy",
+        "terminated": true
+      }
+    },
+    {
+      "id": "string_ops:004",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "cmp",
+        "sign": 0
+      }
+    },
+    {
+      "id": "string_ops:005",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "cmp",
+        "sign": -1
+      }
+    },
+    {
+      "id": "string_ops:006",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "cmp",
+        "sign": 1
+      }
+    },
+    {
+      "id": "string_ops:007",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "cmp",
+        "sign": -1
+      }
+    },
+    {
+      "id": "string_ops:008",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "cmp",
+        "sign": 1
+      }
+    },
+    {
+      "id": "string_ops:009",
+      "category": "string_ops",
+      "output": {
+        "character": 97,
+        "error": 0,
+        "op": "upper_char",
+        "upper": 65
+      }
+    },
+    {
+      "id": "string_ops:010",
+      "category": "string_ops",
+      "output": {
+        "character": 233,
+        "error": 0,
+        "op": "upper_char",
+        "upper": 201
+      }
+    },
+    {
+      "id": "string_ops:011",
+      "category": "string_ops",
+      "output": {
+        "character": 223,
+        "error": 0,
+        "op": "upper_char",
+        "upper": 223
+      }
+    },
+    {
+      "id": "string_ops:012",
+      "category": "string_ops",
+      "output": {
+        "character": 247,
+        "error": 0,
+        "op": "upper_char",
+        "upper": 247
+      }
+    },
+    {
+      "id": "string_ops:013",
+      "category": "string_ops",
+      "output": {
+        "character": 201,
+        "error": 0,
+        "op": "upper_char",
+        "upper": 201
+      }
+    },
+    {
+      "id": "string_ops:014",
+      "category": "string_ops",
+      "output": {
+        "error": 0,
+        "op": "upper_string",
+        "upper": "ABC DEF \u00c9"
+      }
+    },
+    {
+      "id": "section_mapping:000",
+      "category": "section_mapping",
+      "output": {
+        "content_matches": null,
+        "error": 0,
+        "map_succeeded": true,
+        "mapping_size": 4096,
+        "op": "anon",
+        "persisted": null,
+        "unmap_succeeded": true,
+        "view_size": 4096
+      }
+    },
+    {
+      "id": "section_mapping:001",
+      "category": "section_mapping",
+      "output": {
+        "content_matches": true,
+        "error": 0,
+        "map_succeeded": true,
+        "mapping_size": 4096,
+        "op": "write_visible",
+        "persisted": null,
+        "unmap_succeeded": true,
+        "view_size": 4096
+      }
+    },
+    {
+      "id": "section_mapping:002",
+      "category": "section_mapping",
+      "output": {
+        "content_matches": null,
+        "error": 0,
+        "map_succeeded": true,
+        "mapping_size": 4096,
+        "op": "unmap_remap",
+        "persisted": true,
+        "unmap_succeeded": true,
+        "view_size": 4096
+      }
+    },
+    {
+      "id": "section_mapping:003",
+      "category": "section_mapping",
+      "output": {
+        "content_matches": null,
+        "error": 6,
+        "map_succeeded": false,
+        "mapping_size": 0,
+        "op": "invalid_handle",
+        "persisted": null,
+        "unmap_succeeded": false,
+        "view_size": 0
+      }
+    },
+    {
+      "id": "heap:000",
+      "category": "heap",
+      "output": {
+        "aligned_16": true,
+        "alloc_succeeded": true,
+        "error": 0,
+        "op": "alloc_zero",
+        "size_ge_requested": true,
+        "zeroed": true
+      }
+    },
+    {
+      "id": "heap:001",
+      "category": "heap",
+      "output": {
+        "alloc_succeeded": true,
+        "error": 0,
+        "freed": true,
+        "op": "free_size",
+        "size_after_free_fails": true,
+        "size_ge_requested": true
       }
     }
   ]

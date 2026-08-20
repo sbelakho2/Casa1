@@ -107,6 +107,122 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     evidence("kernel32.dll", "GetModuleHandleW", "windows-oracle:api_set"),
     evidence("kernel32.dll", "GetProcAddress", "windows-oracle:api_set"),
+    // The clock domain: GetTickCount64 / GetSystemTimeAsFileTime /
+    // QueryPerformanceCounter(+Frequency) deltas across a guest sleep
+    // (windows-oracle:time_clock).
+    evidence(
+        "kernel32.dll",
+        "GetTickCount64",
+        "windows-oracle:time_clock",
+    ),
+    evidence(
+        "kernel32.dll",
+        "GetSystemTimeAsFileTime",
+        "windows-oracle:time_clock",
+    ),
+    evidence(
+        "kernel32.dll",
+        "QueryPerformanceCounter",
+        "windows-oracle:time_clock",
+    ),
+    evidence(
+        "kernel32.dll",
+        "QueryPerformanceFrequency",
+        "windows-oracle:time_clock",
+    ),
+    // The environment block: present/missing/length-prefix semantics of
+    // GetEnvironmentVariableW and the sorted block entries of
+    // GetEnvironmentStringsW (windows-oracle:environment).
+    evidence(
+        "kernel32.dll",
+        "GetEnvironmentVariableW",
+        "windows-oracle:environment",
+    ),
+    evidence(
+        "kernel32.dll",
+        "GetEnvironmentStringsW",
+        "windows-oracle:environment",
+    ),
+    // File metadata: attribute projections, exact sizes after writes and
+    // pointer movement relative to start/end (windows-oracle:file_metadata).
+    evidence(
+        "kernel32.dll",
+        "GetFileAttributesW",
+        "windows-oracle:file_metadata",
+    ),
+    evidence(
+        "kernel32.dll",
+        "GetFileSizeEx",
+        "windows-oracle:file_metadata",
+    ),
+    evidence(
+        "kernel32.dll",
+        "SetFilePointerEx",
+        "windows-oracle:file_metadata",
+    ),
+    // Directory enumeration: entry names + attributes over the fixture
+    // layout, sorted order, no-match/missing-dir failures and exhaustion
+    // (windows-oracle:directory_enumeration).
+    evidence(
+        "kernel32.dll",
+        "FindFirstFileW",
+        "windows-oracle:directory_enumeration",
+    ),
+    evidence(
+        "kernel32.dll",
+        "FindNextFileW",
+        "windows-oracle:directory_enumeration",
+    ),
+    evidence(
+        "kernel32.dll",
+        "FindClose",
+        "windows-oracle:directory_enumeration",
+    ),
+    // The version domain: GetVersionExW vs RtlGetVersion consistency and
+    // the Windows-10-family shape (windows-oracle:version).
+    evidence("kernel32.dll", "GetVersionExW", "windows-oracle:version"),
+    // The error domain: SetLastError/GetLastError round-trip plus the
+    // ERROR_* ↔ NTSTATUS mapping after real failures
+    // (windows-oracle:error_domain).
+    evidence(
+        "kernel32.dll",
+        "SetLastError",
+        "windows-oracle:error_domain",
+    ),
+    evidence(
+        "kernel32.dll",
+        "GetLastError",
+        "windows-oracle:error_domain",
+    ),
+    // String operators: lstrlenW/lstrcpyW lengths, the case-SENSITIVE
+    // lstrcmpW comparison and CharUpperW case mapping
+    // (windows-oracle:string_ops).
+    evidence("kernel32.dll", "lstrlenW", "windows-oracle:string_ops"),
+    evidence("kernel32.dll", "lstrcmpW", "windows-oracle:string_ops"),
+    evidence("kernel32.dll", "lstrcpyW", "windows-oracle:string_ops"),
+    evidence("kernel32.dll", "CharUpperW", "windows-oracle:string_ops"),
+    // Anonymous section mappings: mapping/view size and content visibility
+    // after writes (windows-oracle:section_mapping).
+    evidence(
+        "kernel32.dll",
+        "CreateFileMappingW",
+        "windows-oracle:section_mapping",
+    ),
+    evidence(
+        "kernel32.dll",
+        "MapViewOfFile",
+        "windows-oracle:section_mapping",
+    ),
+    evidence(
+        "kernel32.dll",
+        "UnmapViewOfFile",
+        "windows-oracle:section_mapping",
+    ),
+    // Process heap: allocation success, size ≥ requested, 16-byte alignment,
+    // HEAP_ZERO_MEMORY zeroing and free-invalidation (windows-oracle:heap).
+    evidence("kernel32.dll", "HeapAlloc", "windows-oracle:heap"),
+    evidence("kernel32.dll", "HeapFree", "windows-oracle:heap"),
+    evidence("kernel32.dll", "HeapSize", "windows-oracle:heap"),
     // The d3d12 enum categories are covered by the Windows reference's
     // d3d12_* differential vectors.
     evidence(

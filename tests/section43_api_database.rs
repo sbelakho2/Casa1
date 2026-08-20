@@ -80,12 +80,25 @@ fn database_seeds_from_thunk_metadata_with_levels() {
         .lookup("kernel32.dll", "FindResourceA")
         .expect("FindResourceA must be seeded");
     assert_eq!(find_resource.implementation, ImplementationLevel::Stub);
+    let version_ex_a = database
+        .lookup("kernel32.dll", "GetVersionExA")
+        .expect("GetVersionExA must be seeded");
+    assert_eq!(
+        version_ex_a.implementation,
+        ImplementationLevel::Unsupported
+    );
+    // GetTickCount64 is implemented and oracle-covered (windows-oracle:time_clock).
     let tick_count_64 = database
         .lookup("kernel32.dll", "GetTickCount64")
         .expect("GetTickCount64 must be seeded");
     assert_eq!(
         tick_count_64.implementation,
-        ImplementationLevel::Unsupported
+        ImplementationLevel::Implemented
+    );
+    assert_eq!(
+        tick_count_64.semantic_test_coverage,
+        CoverageLevel::Differential,
+        "GetTickCount64 is proven by the time_clock differential"
     );
 }
 
@@ -866,7 +879,7 @@ fn report_generator_emits_expected_json_shape() {
             .gate
             .shipping_violations
             .iter()
-            .any(|v| { v.dll == "kernel32.dll" && v.export == "GetTickCount64" }),
+            .any(|v| { v.dll == "kernel32.dll" && v.export == "GetVersionExA" }),
         "unregistered Unsupported entries are honest shipping violations"
     );
     assert!(
