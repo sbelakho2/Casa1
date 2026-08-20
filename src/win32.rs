@@ -24,6 +24,44 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Handle = u32;
 
+/// Real volume capacity of the host directory backing a guest drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeCapacity {
+    /// Sectors per cluster, derived from the host volume's allocation unit.
+    pub sectors_per_cluster: u32,
+    /// Bytes per sector (512 on the common APFS/NTFS-aligned layouts).
+    pub bytes_per_sector: u32,
+    /// Total clusters on the volume (real, from the host filesystem).
+    pub total_clusters: u64,
+    /// Free clusters on the volume (real, from the host filesystem).
+    pub free_clusters: u64,
+    /// Total bytes on the volume.
+    pub total_bytes: u64,
+    /// Free bytes on the volume.
+    pub free_bytes: u64,
+}
+
+impl VolumeCapacity {
+    /// The cluster counts as Windows `GetDiskFreeSpace(A|W)` u32 outputs,
+    /// saturating at `u32::MAX` (a single source of truth for the clamp the
+    /// A and W arms must agree on).
+    pub fn clusters_as_u32(&self) -> (u32, u32) {
+        (
+            self.total_clusters.min(u64::from(u32::MAX)) as u32,
+            self.free_clusters.min(u64::from(u32::MAX)) as u32,
+        )
+    }
+}
+
+/// Host `statvfs` probe: returns `Some` only when the path can be stat'ed.
+fn statvfs(path: &Path) -> Option<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc == 0 { Some(stat) } else { None }
+}
+
 /// Upper bound for a single allocation whose size is guest-controlled.
 /// Windows fails these gracefully (ERROR_NOT_ENOUGH_MEMORY); a Rust `Vec`
 /// allocation of an absurd size aborts the process, so refuse before
@@ -2987,6 +3025,118 @@ impl Win32Subsystem {
             }
             _ => invalid_handle("handle is not a file"),
         }
+    }
+
+    /// `SetEndOfFile` — truncate the file at the current file pointer
+    /// position.  Files are backed by real host files, so truncation is the
+    /// real `set_len` on the open descriptor (falling back to a write-open
+    /// when the handle carries no descriptor).  Requires `FILE_WRITE_DATA`.
+    pub fn set_end_of_file(&mut self, handle: Handle) -> AppResult<()> {
+        // Type-first: a non-file handle fails with ERROR_INVALID_HANDLE
+        // regardless of its access mask.
+        let entry = self.handle_entry(handle)?;
+        if !matches!(entry.object, KernelObject::File(_)) {
+            return invalid_handle("handle is not a file");
+        }
+        Self::require_access(&entry, FILE_WRITE_DATA)?;
+        let (position, host_path, normalized_path) = {
+            let mut entry = self.handle_entry_mut(handle)?;
+            match &mut entry.object {
+                KernelObject::File(file) => {
+                    let mut file = file.borrow_mut();
+                    let position = file.position;
+                    if let Some(host_file) = file.host_file.as_mut() {
+                        host_file.set_len(position).map_err(|error| {
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!(
+                                    "failed to truncate {} at offset {position}",
+                                    file.host_path.display()
+                                ),
+                                &error,
+                            )
+                        })?;
+                        return Ok(());
+                    }
+                    (
+                        position,
+                        file.host_path.clone(),
+                        file.normalized_path.clone(),
+                    )
+                }
+                _ => return invalid_handle("handle is not a file"),
+            }
+        };
+        // No open descriptor: reopen for writing and truncate.  A read-only
+        // open should have been refused by the FILE_WRITE_DATA access check
+        // above; the reopen failure surfaces the real host error.
+        let host_file = OpenOptions::new()
+            .write(true)
+            .open(&host_path)
+            .map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to open {} for truncation", host_path.display()),
+                    &error,
+                )
+            })?;
+        host_file.set_len(position).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!(
+                    "failed to truncate {normalized_path} ({} at offset {position})",
+                    host_path.display()
+                ),
+                &error,
+            )
+        })
+    }
+
+    /// Real volume capacity for the host directory backing a guest path.
+    ///
+    /// Windows `GetDiskFreeSpace*` report the volume containing the path; the
+    /// GE drives are host directories, so the volume is the host volume
+    /// holding the mapped drive target.  The probe walks up to the nearest
+    /// existing ancestor so syntactically-valid but not-yet-created paths
+    /// still resolve to their volume.
+    pub fn volume_capacity(&self, windows_path: Option<&str>) -> AppResult<VolumeCapacity> {
+        let host_path = match windows_path {
+            Some(path) => self.ge.host_path_for_windows_path(path)?,
+            None => self.ge.root.clone(),
+        };
+        let probe_display = host_path.display().to_string();
+        let mut probe = host_path;
+        let vfs = loop {
+            if let Some(stat) = statvfs(&probe) {
+                break stat;
+            }
+            match probe.parent() {
+                Some(parent) => probe = parent.to_path_buf(),
+                None => {
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("failed to stat the volume containing {probe_display}"),
+                    ));
+                }
+            }
+        };
+        let unit_size = vfs.f_frsize.max(vfs.f_bsize).max(512);
+        let (bytes_per_sector, sectors_per_cluster) = if unit_size % 512 == 0 {
+            (512, (unit_size / 512) as u32)
+        } else {
+            (unit_size as u32, 1)
+        };
+        let cluster_size = u64::from(bytes_per_sector) * u64::from(sectors_per_cluster);
+        let total_bytes = u64::from(vfs.f_blocks).saturating_mul(vfs.f_frsize);
+        let free_bytes = u64::from(vfs.f_bavail).saturating_mul(vfs.f_frsize);
+        Ok(VolumeCapacity {
+            sectors_per_cluster,
+            bytes_per_sector,
+            total_clusters: total_bytes / cluster_size,
+            free_clusters: free_bytes / cluster_size,
+            total_bytes,
+            free_bytes,
+        })
     }
 
     pub fn get_file_information_by_handle_ex(
@@ -9472,5 +9622,165 @@ mod tests {
             "unsignalled event must time out after a finite wait"
         );
         win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn set_end_of_file_truncates_the_real_host_file_at_the_pointer() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "seof", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\truncate-me.bin";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32
+            .write_file(h, b"0123456789abcdef")
+            .expect("write content");
+
+        // Seek to offset 5, then SetEndOfFile must truncate the host file to
+        // exactly 5 bytes (the real backing file, not a simulated position).
+        win32
+            .set_file_pointer_ex(h, 5, SeekOrigin::Begin)
+            .expect("seek");
+        win32.set_end_of_file(h).expect("truncate");
+
+        let host_path = win32.guest_path_to_host_path(path).expect("resolve");
+        assert_eq!(
+            fs::metadata(&host_path).expect("stat").len(),
+            5,
+            "host file must be truly truncated at the file pointer"
+        );
+        assert_eq!(
+            win32.get_file_size_ex(h).expect("size"),
+            5,
+            "subsystem size view must agree with the real truncation"
+        );
+
+        // Reads after the truncation see the real shorter content.
+        win32
+            .set_file_pointer_ex(h, 0, SeekOrigin::Begin)
+            .expect("seek");
+        assert_eq!(
+            win32.read_file(h, 64).expect("read"),
+            b"01234",
+            "content after truncation must be the first five bytes"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn set_end_of_file_requires_write_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "seof-ro", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\truncate-ro.bin";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"0123456789").expect("write content");
+        win32.close_handle(h).expect("close");
+
+        // Reopen read-only: SetEndOfFile must fail (FILE_WRITE_DATA absent).
+        let read_only = win32
+            .create_file_w(
+                path,
+                FileAccess::read_only(),
+                ShareMode::none(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("reopen read-only");
+        assert_eq!(
+            win32
+                .set_end_of_file(read_only)
+                .expect_err("must fail")
+                .code,
+            ReasonCode::RcHelperPermissionDenied,
+            "SetEndOfFile on a read-only handle must be ERROR_ACCESS_DENIED"
+        );
+        win32.close_handle(read_only).expect("close");
+
+        let host_path = win32.guest_path_to_host_path(path).expect("resolve");
+        assert_eq!(
+            fs::metadata(&host_path).expect("stat").len(),
+            10,
+            "failed truncation must leave the file untouched"
+        );
+    }
+
+    #[test]
+    fn set_end_of_file_rejects_non_file_handles() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "seof-hnd", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h, _) = win32.create_event(true, false, false, None);
+        assert_eq!(
+            win32.set_end_of_file(h).expect_err("must fail").code,
+            ReasonCode::RcWin32InvalidHandle,
+            "SetEndOfFile on a non-file handle must be ERROR_INVALID_HANDLE"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn volume_capacity_reports_the_real_host_volume() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cap", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let win32 = Win32Subsystem::new(ge, false);
+
+        let capacity = win32
+            .volume_capacity(Some("C:\\"))
+            .expect("capacity for the mapped drive root");
+        assert!(
+            capacity.total_bytes > 0,
+            "the volume backing the GE drive must report non-zero capacity"
+        );
+        assert!(
+            capacity.free_bytes <= capacity.total_bytes,
+            "free bytes must never exceed total bytes"
+        );
+        assert!(
+            capacity.bytes_per_sector >= 1 && capacity.sectors_per_cluster >= 1,
+            "geometry must be well-formed"
+        );
+        let cluster_size =
+            u64::from(capacity.bytes_per_sector) * u64::from(capacity.sectors_per_cluster);
+        assert!(
+            capacity.total_bytes >= capacity.total_clusters.saturating_mul(cluster_size),
+            "cluster geometry must be consistent with the reported bytes"
+        );
+
+        // A syntactically-valid but nonexistent path resolves to its volume.
+        let missing = win32
+            .volume_capacity(Some("C:\\No\\Such\\Directory"))
+            .expect("capacity for a nonexistent path");
+        assert_eq!(
+            missing.total_bytes, capacity.total_bytes,
+            "nonexistent paths report the same volume"
+        );
     }
 }

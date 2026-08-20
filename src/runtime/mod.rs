@@ -469,6 +469,7 @@ const ERROR_PIPE_NOT_AVAILABLE: u32 = 231;
 const ERROR_SEM_TIMEOUT: u32 = 121;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
+const ERROR_CLIPBOARD_NOT_OPEN: u32 = 1_418;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
@@ -19772,10 +19773,17 @@ impl PeHostRuntime {
             HostThunk::SetClassLongW => {
                 let hwnd = guest_call_arg(state, memory, 0)? as u32;
                 let index = guest_call_arg(state, memory, 1)? as i32;
-                let new_long = guest_call_arg(state, memory, 2)? as u32;
-                let existed = self.user32.has_window(hwnd);
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
+                let new_long = guest_call_arg(state, memory, 2)?;
+                // Store the class long on the window class and return the
+                // previous value (Windows: 0 on failure, previous value on
+                // success; an invalid hwnd fails with
+                // ERROR_INVALID_WINDOW_HANDLE).
+                let (previous, error) = match self.user32.set_class_long_w(hwnd, index, new_long) {
+                    Some(previous) => (previous, 0),
+                    None => (0, ERROR_INVALID_WINDOW_HANDLE),
+                };
+                state.set(Register::Rax, previous);
+                self.last_error = error;
                 self.push_trace(
                     "input",
                     "SetClassLongW",
@@ -19784,7 +19792,7 @@ impl PeHostRuntime {
                         ("index".to_string(), json!(index)),
                         ("value".to_string(), json!(new_long)),
                     ]),
-                    json!(existed),
+                    json!(previous),
                 );
             }
             HostThunk::CreateWindowExW => {
@@ -23989,29 +23997,41 @@ impl PeHostRuntime {
                 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
-                } else {
-                    let sectors_per_cluster = 8_u32;
-                    let bytes_per_sector = 512_u32;
-                    let total_clusters = 4_194_304_u32;
-                    let free_clusters = 3_145_728_u32;
-                    write_u32(memory, sectors_per_cluster_ptr, sectors_per_cluster);
-                    write_u32(memory, bytes_per_sector_ptr, bytes_per_sector);
-                    write_u32(memory, free_clusters_ptr, free_clusters);
-                    write_u32(memory, total_clusters_ptr, total_clusters);
-                    state.set(Register::Rax, 1);
-                    self.last_error = 0;
-                    self.push_trace(
-                        "file",
-                        "GetDiskFreeSpaceW",
-                        BTreeMap::from([
-                            ("root_path".to_string(), json!(root_path)),
-                            ("sectors_per_cluster".to_string(), json!(sectors_per_cluster)),
-                            ("bytes_per_sector".to_string(), json!(bytes_per_sector)),
-                            ("free_clusters".to_string(), json!(free_clusters)),
-                            ("total_clusters".to_string(), json!(total_clusters)),
-                        ]),
-                        json!(1),
-                    );
+                    return Ok(None);
+                }
+                // Real capacity of the host volume backing the mapped drive.
+                match self.win32.volume_capacity(root_path.as_deref()) {
+                    Ok(capacity) => {
+                        let (total_clusters, free_clusters) = capacity.clusters_as_u32();
+                        write_u32(memory, sectors_per_cluster_ptr, capacity.sectors_per_cluster);
+                        write_u32(memory, bytes_per_sector_ptr, capacity.bytes_per_sector);
+                        write_u32(memory, free_clusters_ptr, free_clusters);
+                        write_u32(memory, total_clusters_ptr, total_clusters);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "GetDiskFreeSpaceW",
+                            BTreeMap::from([
+                                ("root_path".to_string(), json!(root_path)),
+                                (
+                                    "sectors_per_cluster".to_string(),
+                                    json!(capacity.sectors_per_cluster),
+                                ),
+                                (
+                                    "bytes_per_sector".to_string(),
+                                    json!(capacity.bytes_per_sector),
+                                ),
+                                ("free_clusters".to_string(), json!(capacity.free_clusters)),
+                                ("total_clusters".to_string(), json!(capacity.total_clusters)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
                 }
             }
             HostThunk::GetDiskFreeSpaceExW => {
@@ -24030,29 +24050,36 @@ impl PeHostRuntime {
                 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
-                } else {
-                    let sectors_per_cluster = 8_u64;
-                    let bytes_per_sector = 512_u64;
-                    let total_clusters = 4_194_304_u64;
-                    let free_clusters = 3_145_728_u64;
-                    let total_bytes = sectors_per_cluster * bytes_per_sector * total_clusters;
-                    let free_bytes = sectors_per_cluster * bytes_per_sector * free_clusters;
-                    write_u64(memory, free_bytes_available_ptr, free_bytes);
-                    write_u64(memory, total_number_of_bytes_ptr, total_bytes);
-                    write_u64(memory, total_number_of_free_bytes_ptr, free_bytes);
-                    state.set(Register::Rax, 1);
-                    self.last_error = 0;
-                    self.push_trace(
-                        "file",
-                        "GetDiskFreeSpaceExW",
-                        BTreeMap::from([
-                            ("directory_name".to_string(), json!(directory_name)),
-                            ("free_bytes_available".to_string(), json!(free_bytes)),
-                            ("total_bytes".to_string(), json!(total_bytes)),
-                            ("total_free_bytes".to_string(), json!(free_bytes)),
-                        ]),
-                        json!(1),
-                    );
+                    return Ok(None);
+                }
+                // Real capacity of the host volume backing the mapped drive
+                // (Windows reports the volume containing the path).
+                match self.win32.volume_capacity(directory_name.as_deref()) {
+                    Ok(capacity) => {
+                        write_u64(memory, free_bytes_available_ptr, capacity.free_bytes);
+                        write_u64(memory, total_number_of_bytes_ptr, capacity.total_bytes);
+                        write_u64(memory, total_number_of_free_bytes_ptr, capacity.free_bytes);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "GetDiskFreeSpaceExW",
+                            BTreeMap::from([
+                                ("directory_name".to_string(), json!(directory_name)),
+                                (
+                                    "free_bytes_available".to_string(),
+                                    json!(capacity.free_bytes),
+                                ),
+                                ("total_bytes".to_string(), json!(capacity.total_bytes)),
+                                ("total_free_bytes".to_string(), json!(capacity.free_bytes)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
                 }
             }
             HostThunk::GetFileSize => {
@@ -32598,7 +32625,7 @@ impl PeHostRuntime {
                 let buffer = guest_call_arg(state, memory, 0)?;
                 let format_ptr = guest_call_arg(state, memory, 1)?;
                 let format_string = read_utf16_string(memory, format_ptr)?;
-                let rendered = format_wsprintf_w(state, memory, &format_string, 2)?;
+                let rendered = format_wsprintf(state, memory, &format_string, 2, false)?;
                 let mut bytes = Vec::with_capacity((rendered.encode_utf16().count() + 1) * 2);
                 for unit in rendered.encode_utf16() {
                     bytes.extend_from_slice(&unit.to_le_bytes());
@@ -39519,16 +39546,14 @@ impl PeHostRuntime {
             }
             HostThunk::SetEndOfFile => {
                 let handle = arg(0) as u32;
-                // Truncate the file at the current file pointer position.
-                // We read the current position via SetFilePointerEx(handle, 0, Current) then
-                // write an empty range to that offset to effectively truncate.
-                match self.win32.get_file_size_ex(handle) {
-                    Ok(_size) => {
-                        // The win32 subsystem manages file positions internally.
-                        // For truncation, we set the file size to the current position.
-                        // Since we can't directly truncate, we treat this as success —
-                        // the file position tracking in the handle state ensures consistency.
+                // Real truncation: files are backed by host files, so the
+                // subsystem truncates the host file at the current file
+                // pointer (SetFilePointerEx position tracking stays the
+                // single source of truth for the position).
+                match self.win32.set_end_of_file(handle) {
+                    Ok(()) => {
                         state.set(Register::Rax, 1);
+                        self.last_error = 0;
                     }
                     Err(error) => {
                         state.set(Register::Rax, 0);
@@ -40709,25 +40734,59 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::GetDiskFreeSpaceA => {
-                let _path_ptr = arg(0);
+                let path_ptr = arg(0);
                 let sectors_per_cluster_ptr = arg(1);
                 let bytes_per_sector_ptr = arg(2);
                 let free_clusters_ptr = arg(3);
                 let total_clusters_ptr = arg(4);
-                // Report plausible disk geometry for the virtual filesystem
-                if sectors_per_cluster_ptr != 0 {
-                    write_u32(memory, sectors_per_cluster_ptr, 8);
+                let root_path = if path_ptr != 0 {
+                    Some(read_c_string(memory, path_ptr).unwrap_or_default())
+                } else {
+                    None
+                };
+                if sectors_per_cluster_ptr == 0
+                    || bytes_per_sector_ptr == 0
+                    || free_clusters_ptr == 0
+                    || total_clusters_ptr == 0
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
-                if bytes_per_sector_ptr != 0 {
-                    write_u32(memory, bytes_per_sector_ptr, 512);
+                // Real capacity of the host volume backing the mapped drive.
+                match self.win32.volume_capacity(root_path.as_deref()) {
+                    Ok(capacity) => {
+                        let (total_clusters, free_clusters) = capacity.clusters_as_u32();
+                        write_u32(memory, sectors_per_cluster_ptr, capacity.sectors_per_cluster);
+                        write_u32(memory, bytes_per_sector_ptr, capacity.bytes_per_sector);
+                        write_u32(memory, free_clusters_ptr, free_clusters);
+                        write_u32(memory, total_clusters_ptr, total_clusters);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "GetDiskFreeSpaceA",
+                            BTreeMap::from([
+                                ("root_path".to_string(), json!(root_path)),
+                                (
+                                    "sectors_per_cluster".to_string(),
+                                    json!(capacity.sectors_per_cluster),
+                                ),
+                                (
+                                    "bytes_per_sector".to_string(),
+                                    json!(capacity.bytes_per_sector),
+                                ),
+                                ("free_clusters".to_string(), json!(capacity.free_clusters)),
+                                ("total_clusters".to_string(), json!(capacity.total_clusters)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
                 }
-                if free_clusters_ptr != 0 {
-                    write_u32(memory, free_clusters_ptr, 0x00FF_FFFF);
-                }
-                if total_clusters_ptr != 0 {
-                    write_u32(memory, total_clusters_ptr, 0x01FF_FFFF);
-                }
-                state.set(Register::Rax, 1);
             }
             HostThunk::SetConsoleCtrlHandler => {
                 state.set(Register::Rax, 1); // TRUE
@@ -41100,80 +41159,34 @@ impl PeHostRuntime {
             HostThunk::WsprintfA => {
                 let dest_ptr = arg(0);
                 let format_ptr = arg(1);
-                // Read format string
+                // Read format string (ANSI variant)
                 let format = read_c_string(memory, format_ptr).unwrap_or_default();
-                // Simple sprintf: support %s, %d, %u, %x, %c, %%
-                let mut result = String::new();
-                let mut fmt_chars = format.chars().peekable();
-                let mut arg_index = 2;
-                while let Some(ch) = fmt_chars.next() {
-                    if ch == '%' {
-                        match fmt_chars.next() {
-                            Some('s') => {
-                                let str_ptr = arg(arg_index);
-                                arg_index += 1;
-                                let s = if str_ptr != 0 { read_c_string(memory, str_ptr).unwrap_or_default() } else { String::new() };
-                                result.push_str(&s);
-                            }
-                            Some('d') => {
-                                let val = arg(arg_index) as i32;
-                                arg_index += 1;
-                                result.push_str(&format!("{val}"));
-                            }
-                            Some('u') => {
-                                let val = arg(arg_index) as u32;
-                                arg_index += 1;
-                                result.push_str(&format!("{val}"));
-                            }
-                            Some('x') => {
-                                let val = arg(arg_index) as u32;
-                                arg_index += 1;
-                                result.push_str(&format!("{val:x}"));
-                            }
-                            Some('X') => {
-                                let val = arg(arg_index) as u32;
-                                arg_index += 1;
-                                result.push_str(&format!("{val:X}"));
-                            }
-                            Some('c') => {
-                                let val = arg(arg_index) as u8;
-                                arg_index += 1;
-                                result.push(val as char);
-                            }
-                            Some('%') => result.push('%'),
-                            Some('l') => {
-                                // %ld, %lu, %lx
-                                match fmt_chars.next() {
-                                    Some('d') => {
-                                        let val = arg(arg_index) as i32;
-                                        arg_index += 1;
-                                        result.push_str(&format!("{val}"));
-                                    }
-                                    Some('u') => {
-                                        let val = arg(arg_index) as u32;
-                                        arg_index += 1;
-                                        result.push_str(&format!("{val}"));
-                                    }
-                                    Some('x') => {
-                                        let val = arg(arg_index) as u32;
-                                        arg_index += 1;
-                                        result.push_str(&format!("{val:x}"));
-                                    }
-                                    _ => result.push_str("%l"),
-                                }
-                            }
-                            Some('0'..='9') => {
-                                // Width specifier — simplified handling
-                                result.push('%');
-                                result.push(ch);
-                            }
-                            _ => result.push('%'),
-                        }
-                    } else {
-                        result.push(ch);
+                // Full wsprintf contract via the shared formatter: flags,
+                // width, precision, and the c/d/i/o/u/x/X/s/S/p/% specifiers
+                // with ANSI %s semantics.
+                let rendered = match format_wsprintf(state, memory, &format, 2, true) {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        self.push_trace(
+                            "file",
+                            "wsprintfA(format-error)",
+                            BTreeMap::from([("format".to_string(), json!(format))]),
+                            json!(error.to_string()),
+                        );
+                        return Ok(None);
                     }
-                }
-                let bytes = result.as_bytes();
+                };
+                // Encode the ANSI output through the subsystem's code-page
+                // encoder so non-ASCII characters match the ACP bytes.
+                let bytes = self
+                    .win32
+                    .wide_char_to_multi_byte(
+                        DEFAULT_ANSI_CODE_PAGE,
+                        &rendered.encode_utf16().collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|_| rendered.as_bytes().to_vec());
                 let write_len = bytes.len().min(1024); // safety limit
                 if dest_ptr != 0 {
                     for (i, &b) in bytes.iter().take(write_len).enumerate() {
@@ -41182,6 +41195,16 @@ impl PeHostRuntime {
                     memory.write_u8(dest_ptr + write_len as u64, 0);
                 }
                 state.set(Register::Rax, write_len as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "file",
+                    "wsprintfA",
+                    BTreeMap::from([
+                        ("format".to_string(), json!(format)),
+                        ("rendered".to_string(), json!(rendered)),
+                    ]),
+                    json!(write_len),
+                );
             }
             HostThunk::DialogBoxParamA => {
                 let instance = guest_call_arg(state, memory, 0)?; // HINSTANCE
@@ -41394,23 +41417,40 @@ impl PeHostRuntime {
             HostThunk::SetClipboardData => {
                 let format = arg(0) as u32;
                 let data_handle = arg(1);
-                // Read clipboard data from guest memory (max 1MB for safety)
+                // Read the guest clipboard block.  Windows takes an HGLOBAL:
+                // when the handle is a tracked guest heap allocation read
+                // EXACTLY the allocated block (bounded at 1 MiB — the block
+                // size is guest-controlled and an unbounded copy could
+                // exhaust the host); otherwise read until unmapped guest
+                // memory under the same bound.
+                const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
                 let data = if data_handle != 0 {
-                    // For simplicity, read up to 64KB from the handle address
-                    let max_read = 65536usize;
-                    let mut buf = Vec::with_capacity(max_read);
-                    for i in 0..max_read {
-                        match memory.read_u8(data_handle + i as u64) {
-                            Ok(byte) => buf.push(byte),
-                            Err(_) => break,
+                    let exact_size = self.heap_allocations.get(&data_handle).copied();
+                    match exact_size {
+                        Some(size) => memory.read_bytes(data_handle, size.min(MAX_CLIPBOARD_BYTES))?,
+                        None => {
+                            let mut buf = Vec::with_capacity(MAX_CLIPBOARD_BYTES.min(4096));
+                            for i in 0..MAX_CLIPBOARD_BYTES {
+                                match memory.read_u8(data_handle + i as u64) {
+                                    Ok(byte) => buf.push(byte),
+                                    Err(_) => break,
+                                }
+                            }
+                            buf
                         }
                     }
-                    buf
                 } else {
                     Vec::new()
                 };
-                let result = self.user32.set_clipboard_data(format, data);
-                state.set(Register::Rax, result);
+                // Windows returns the handle itself on success and NULL +
+                // ERROR_CLIPBOARD_NOT_OPEN when the clipboard is not open.
+                if self.user32.set_clipboard_data(format, data, data_handle) {
+                    state.set(Register::Rax, data_handle);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_CLIPBOARD_NOT_OPEN;
+                }
             }
             HostThunk::EmptyClipboard => {
                 let result = self.user32.empty_clipboard();
@@ -41421,10 +41461,11 @@ impl PeHostRuntime {
                 let data = self.user32.get_clipboard_data(format);
                 match data {
                     Some(_bytes) => {
-                        // Return format as pseudo-handle. In a full implementation,
-                        // this would GlobalAlloc + copy data into guest memory,
-                        // but for Steam.exe compatibility the pseudo-handle suffices.
-                        state.set(Register::Rax, format as u64);
+                        // Windows returns the HGLOBAL that SetClipboardData
+                        // stored for the format; the guest can then
+                        // GlobalLock it.  Formats placed by other processes
+                        // (NSPasteboard) have no guest handle and return NULL.
+                        state.set(Register::Rax, self.user32.clipboard_handle(format).unwrap_or(0));
                     }
                     None => {
                         state.set(Register::Rax, 0); // NULL
@@ -72010,10 +72051,19 @@ fn read_xaudio2_buffer(
 mod tests {
     use super::*;
     use crate::cpu::Operand;
-    use crate::ge::{GameEnvironment, GeArch};
+    use crate::ge::{FileAccess, GameEnvironment, GeArch, ShareMode};
     use crate::gfx::{GraphicsBackend, host_gpu_profile_from_name};
     use crate::pe::{ExportSymbol, ExportTarget};
     use tempfile::TempDir;
+
+    fn test_runtime(name: &str) -> (PeHostRuntime, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        (runtime, temp_dir)
+    }
 
     fn build_root_signature(
         root_constants: u32,
@@ -76803,7 +76853,7 @@ mod tests {
     }
 
     #[test]
-    fn get_disk_free_space_ex_w_returns_synthetic_capacity() {
+    fn get_disk_free_space_ex_w_returns_real_volume_capacity() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(
             temp_dir.path(),
@@ -76837,24 +76887,340 @@ mod tests {
             ],
         );
 
-        let total_bytes = 8_u64 * 512 * 4_194_304;
-        let free_bytes = 8_u64 * 512 * 3_145_728;
         assert_eq!(result, 1);
+        let free_bytes = memory.read_u64(free_bytes_ptr as u64).expect("free bytes");
+        let total_bytes = memory
+            .read_u64(total_bytes_ptr as u64)
+            .expect("total bytes");
+        let total_free = memory
+            .read_u64(total_free_bytes_ptr as u64)
+            .expect("total free bytes");
+        // Real host volume capacity: the volume backing the GE drive target
+        // exists and reports sane structural invariants.  Free-space values
+        // are not asserted absolutely and never compared across calls —
+        // parallel tests share the volume and free space legitimately
+        // fluctuates between two statvfs probes.
+        assert!(total_bytes > 0, "total bytes must be non-zero");
+        assert!(
+            free_bytes <= total_bytes,
+            "free bytes must not exceed total bytes"
+        );
+        assert_eq!(total_free, free_bytes);
+        let capacity = runtime
+            .win32
+            .volume_capacity(Some("C:\\"))
+            .expect("volume capacity");
         assert_eq!(
-            memory.read_u64(free_bytes_ptr as u64).expect("free bytes"),
-            free_bytes
+            total_bytes, capacity.total_bytes,
+            "thunk and subsystem total figures must agree (volume total is stable)"
+        );
+    }
+
+    #[test]
+    fn set_end_of_file_dispatch_truncates_the_host_file() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "seof-dispatch", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let handle = runtime
+            .win32
+            .create_file_w(
+                "C:\\dispatch-truncate.bin",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        runtime
+            .win32
+            .write_file(handle, b"0123456789ABCDEF")
+            .expect("write content");
+        runtime
+            .win32
+            .set_file_pointer_ex(handle, 6, SeekOrigin::Begin)
+            .expect("seek");
+
+        let set_end_of_file = runtime.alloc_host_thunk(HostThunk::SetEndOfFile);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, set_end_of_file, &[handle]);
+        assert_eq!(result, 1, "SetEndOfFile must succeed");
+        let host_path = runtime
+            .win32
+            .guest_path_to_host_path("C:\\dispatch-truncate.bin")
+            .expect("resolve host path");
+        assert_eq!(
+            std::fs::metadata(&host_path).expect("stat").len(),
+            6,
+            "dispatch must truncate the real backing file at the pointer"
+        );
+    }
+
+    #[test]
+    fn wsprintf_a_formats_flags_width_and_specifiers() {
+        let (mut runtime, _temp_dir) = test_runtime("wsprintf-a");
+        let mut memory = MemoryImage::default();
+
+        let wsprintf_a = runtime.alloc_host_thunk(HostThunk::WsprintfA);
+        let dest_ptr = 0x30_000_u32;
+        let format_ptr = runtime
+            .alloc_c_string(
+                &mut memory,
+                "%d|%05d|%-6d|%x|%#x|%o|%c|%s|%%|%S|%#08x|%.0d|%.0x|%#.0o",
+            )
+            .expect("format string");
+        let ansi_str = runtime
+            .alloc_c_string(&mut memory, "world")
+            .expect("ansi string");
+        let wide_str = runtime
+            .alloc_utf16_string(&mut memory, "WIDE")
+            .expect("wide string");
+        memory.map_bytes(dest_ptr as u64, &[0_u8; 128]);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wsprintf_a,
+            &[
+                dest_ptr,
+                format_ptr as u32,
+                42,              // %d
+                7,               // %05d
+                123,             // %-6d
+                0xDEAD,          // %x
+                0x0ABC,          // %#x
+                8,               // %o
+                b'A' as u32,     // %c
+                ansi_str as u32, // %s (ANSI)
+                wide_str as u32, // %S (wide in the ANSI variant)
+                0xABC,           // %#08x → "0x000abc" (zero-pad after the prefix)
+                0,               // %.0d → empty field
+                0,               // %.0x → empty field
+                0,               // %#.0o → "0" (leading zero per C99)
+            ],
+        );
+
+        let output = read_c_string(&memory, dest_ptr as u64).expect("rendered output");
+        assert_eq!(
+            output, "42|00007|123   |dead|0xabc|10|A|world|%|WIDE|0x000abc|||0",
+            "wsprintfA must apply flags/width/precision with ANSI string semantics"
+        );
+        assert_eq!(result as usize, output.len());
+    }
+
+    #[test]
+    fn wsprintf_clamps_hostile_width_and_precision() {
+        let (mut runtime, _temp_dir) = test_runtime("wsprintf-clamp");
+        let mut memory = MemoryImage::default();
+
+        let wsprintf_a = runtime.alloc_host_thunk(HostThunk::WsprintfA);
+        let dest_ptr = 0x30_000_u32;
+        // A 32-digit width would previously wrap the width accumulator and
+        // force a multi-GB padding allocation; the parser clamps fields at
+        // MAX_FORMAT_FIELD_WIDTH so the call renders a bounded field.
+        let format_ptr = runtime
+            .alloc_c_string(
+                &mut memory,
+                "%099999999999999999999999999999999d|%.99999999999999999999s",
+            )
+            .expect("format string");
+        let ansi_str = runtime
+            .alloc_c_string(&mut memory, "x")
+            .expect("ansi string");
+        memory.map_bytes(dest_ptr as u64, &[0_u8; 16 * 1024]);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wsprintf_a,
+            &[dest_ptr, format_ptr as u32, 42, ansi_str as u32],
+        );
+        // The A arm caps the guest write at 1024 bytes; the rendered output
+        // is clamped well above that by the parser, so the dispatch must
+        // succeed without any huge allocation.
+        assert_eq!(
+            result, 1024,
+            "output is capped at the 1024-byte write limit"
+        );
+        let output = read_c_string(&memory, dest_ptr as u64).expect("rendered output");
+        assert_eq!(output.len(), 1024);
+        assert!(
+            output.chars().all(|c| c == '0'),
+            "the hostile width must be clamped, not allocated or wrapped: {:?}",
+            &output[..output.len().min(32)]
+        );
+    }
+
+    #[test]
+    fn wsprintf_w_applies_flags_and_width() {
+        let (mut runtime, _temp_dir) = test_runtime("wsprintf-w");
+        let mut memory = MemoryImage::default();
+
+        let wsprintf_w = runtime.alloc_host_thunk(HostThunk::WsprintfW);
+        let dest_ptr = 0x30_000_u32;
+        let format_ptr = runtime
+            .alloc_utf16_string(&mut memory, "%+d|%08X|%u")
+            .expect("format string");
+        memory.map_bytes(dest_ptr as u64, &[0_u8; 128]);
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wsprintf_w,
+            &[dest_ptr, format_ptr as u32, 42, 0xABC, 7],
+        );
+
+        let output = read_utf16_string(&memory, dest_ptr as u64).expect("rendered output");
+        assert_eq!(output, "+42|00000ABC|7");
+        assert_eq!(result, output.encode_utf16().count() as u64);
+    }
+
+    #[test]
+    fn set_clipboard_data_reads_exact_block_and_returns_handle() {
+        let (mut runtime, _temp_dir) = test_runtime("clipboard-exact");
+        let mut memory = MemoryImage::default();
+
+        // Open the clipboard first (OpenClipboard(0)).
+        let open_clipboard = runtime.alloc_host_thunk(HostThunk::OpenClipboard);
+        let opened = dispatch_x86_thunk(&mut runtime, &mut memory, open_clipboard, &[0]);
+        assert_eq!(opened, 1, "OpenClipboard must succeed");
+
+        // Allocate a guest heap block larger than the old 64 KB cap and fill
+        // it with a recognizable pattern.
+        let block_size = 128 * 1024usize;
+        let block = runtime
+            .alloc_heap(&mut memory, block_size, true)
+            .expect("heap block");
+        for i in 0..block_size {
+            memory.write_u8(block + i as u64, (i % 251) as u8);
+        }
+
+        let set_clipboard_data = runtime.alloc_host_thunk(HostThunk::SetClipboardData);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_clipboard_data,
+            &[1 /* CF_TEXT */, block as u32],
         );
         assert_eq!(
-            memory
-                .read_u64(total_bytes_ptr as u64)
-                .expect("total bytes"),
-            total_bytes
+            result, block,
+            "SetClipboardData must return the passed handle on success"
+        );
+
+        // The full 128 KB block must have been stored — no truncation within
+        // the 1 MiB bound.
+        let stored = runtime
+            .user32
+            .get_clipboard_data(crate::user32::CF_TEXT)
+            .expect("stored clipboard data");
+        assert_eq!(stored.len(), block_size, "no data may be truncated");
+        assert_eq!(stored[0], 0, "first byte of the stored block");
+        assert_eq!(
+            stored[block_size - 1],
+            ((block_size - 1) % 251) as u8,
+            "last byte of the stored block"
+        );
+
+        // GetClipboardData returns the same guest handle (Windows hData
+        // contract), not a synthetic pseudo-handle.
+        let get_clipboard_data = runtime.alloc_host_thunk(HostThunk::GetClipboardData);
+        let got_handle = dispatch_x86_thunk(&mut runtime, &mut memory, get_clipboard_data, &[1]);
+        assert_eq!(
+            got_handle, block,
+            "GetClipboardData must return the handle SetClipboardData stored"
+        );
+
+        // Clipboard closed: SetClipboardData fails with NULL +
+        // ERROR_CLIPBOARD_NOT_OPEN (1418).
+        let close_clipboard = runtime.alloc_host_thunk(HostThunk::CloseClipboard);
+        dispatch_x86_thunk(&mut runtime, &mut memory, close_clipboard, &[]);
+        let failed = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_clipboard_data,
+            &[1, block as u32],
         );
         assert_eq!(
-            memory
-                .read_u64(total_free_bytes_ptr as u64)
-                .expect("total free bytes"),
-            free_bytes
+            failed, 0,
+            "SetClipboardData with a closed clipboard must fail"
+        );
+        assert_eq!(
+            runtime.last_error, ERROR_CLIPBOARD_NOT_OPEN,
+            "closed clipboard must set ERROR_CLIPBOARD_NOT_OPEN (1418)"
+        );
+    }
+
+    #[test]
+    fn set_class_long_w_dispatch_returns_previous_value() {
+        let (mut runtime, _temp_dir) = test_runtime("class-long");
+        let mut memory = MemoryImage::default();
+
+        let class_name = runtime
+            .alloc_utf16_string(&mut memory, "class-long-dispatch")
+            .expect("class name");
+        let title = runtime
+            .alloc_utf16_string(&mut memory, "title")
+            .expect("title");
+        runtime.user32.register_class_ex_w("class-long-dispatch");
+
+        // CreateWindowExW(class, title, style, x, y, w, h, parent, menu, instance, param).
+        // WS_CHILD (0x4000_0000) avoids the AppKit NSWindow path so the test
+        // runs without a main-thread NSApplication.
+        let create_window = runtime.alloc_host_thunk(HostThunk::CreateWindowExW);
+        let hwnd = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_window,
+            &[
+                0,
+                class_name as u32,
+                title as u32,
+                0x4000_0000,
+                0,
+                0,
+                320,
+                200,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(hwnd, 0, "window must be created");
+
+        const GCL_STYLE: i32 = -26;
+        let set_class_long = runtime.alloc_host_thunk(HostThunk::SetClassLongW);
+        let first = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_class_long,
+            &[hwnd as u32, GCL_STYLE as u32, 0x1111],
+        );
+        assert_eq!(first, 0, "first set returns 0");
+        let second = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_class_long,
+            &[hwnd as u32, GCL_STYLE as u32, 0x2222],
+        );
+        assert_eq!(second, 0x1111, "second set returns the previous value");
+
+        // Invalid hwnd: 0 + ERROR_INVALID_WINDOW_HANDLE.
+        let invalid = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_class_long,
+            &[0xDEAD, GCL_STYLE as u32, 1],
+        );
+        assert_eq!(invalid, 0);
+        assert_eq!(
+            runtime.last_error, ERROR_INVALID_WINDOW_HANDLE,
+            "invalid hwnd must set ERROR_INVALID_WINDOW_HANDLE"
         );
     }
 
@@ -89717,11 +90083,32 @@ fn message_box_response(style: u32) -> i32 {
     }
 }
 
-fn format_wsprintf_w(
+/// Upper bound for a single parsed wsprintf field width or precision.
+///
+/// The format string is guest-controlled and the width/precision digits are
+/// unbounded in principle; the formatter materializes the field (zero/space
+/// padding), so an absurd width must not be able to force a huge host
+/// allocation.  Fields are clamped at parse time (saturating arithmetic), so
+/// a hostile `%9999999999d` renders a bounded field instead of aborting.
+const MAX_FORMAT_FIELD_WIDTH: usize = 4096;
+
+/// Shared `wsprintf` formatter used by both the W and A variants.
+///
+/// Implements the documented wsprintf surface: `c d i o u x X s S p %` with
+/// the `- + # 0 space` flags, field width, `.precision`, and the `l`/`w`
+/// (wide) and `h` (narrow) length modifiers.  Floating point is NOT part of
+/// the wsprintf contract (Windows leaves it undefined); an unsupported
+/// specifier fails loudly instead of silently corrupting the output.
+///
+/// `ansi_strings` selects the default string convention for `%s` (ANSI bytes
+/// for the A variant, UTF-16 for the W variant; `%S` is the opposite, and an
+/// explicit `l`/`w`/`h` modifier always wins).
+fn format_wsprintf(
     state: &CpuState,
     memory: &MemoryImage,
     format_string: &str,
     first_arg_index: usize,
+    ansi_strings: bool,
 ) -> AppResult<String> {
     let chars = format_string.chars().collect::<Vec<_>>();
     let mut rendered = String::new();
@@ -89739,67 +90126,216 @@ fn format_wsprintf_w(
             cursor += 1;
             continue;
         }
+        let mut flags = String::new();
         while cursor < chars.len() && matches!(chars[cursor], '-' | '+' | ' ' | '#' | '0') {
+            flags.push(chars[cursor]);
             cursor += 1;
         }
+        let mut width = 0usize;
         while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+            width = width
+                .saturating_mul(10)
+                .saturating_add(chars[cursor].to_digit(10).unwrap_or(0) as usize)
+                .min(MAX_FORMAT_FIELD_WIDTH);
             cursor += 1;
         }
+        let mut precision: Option<usize> = None;
         if cursor < chars.len() && chars[cursor] == '.' {
             cursor += 1;
+            let mut digits = 0usize;
             while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+                digits = digits
+                    .saturating_mul(10)
+                    .saturating_add(chars[cursor].to_digit(10).unwrap_or(0) as usize)
+                    .min(MAX_FORMAT_FIELD_WIDTH);
                 cursor += 1;
             }
+            precision = Some(digits);
         }
         let mut wide_modifier = false;
-        if cursor < chars.len() && matches!(chars[cursor], 'l' | 'w') {
-            wide_modifier = true;
+        let mut narrow_modifier = false;
+        if cursor < chars.len() && matches!(chars[cursor], 'l' | 'w' | 'h') {
+            wide_modifier = matches!(chars[cursor], 'l' | 'w');
+            narrow_modifier = chars[cursor] == 'h';
             cursor += 1;
-            if cursor < chars.len() && chars[cursor] == 'l' {
+            if cursor < chars.len() && matches!(chars[cursor], 'l' | 'w') {
+                wide_modifier = true;
+                narrow_modifier = false;
                 cursor += 1;
             }
         }
         let specifier = *chars.get(cursor).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcUnimplInsn,
-                "unterminated wsprintfW format specifier",
+                "unterminated wsprintf format specifier",
             )
         })?;
         cursor += 1;
         let raw = guest_call_arg(state, memory, arg_index)?;
         arg_index += 1;
         match specifier {
-            'd' | 'i' => rendered.push_str(&(raw as u32 as i32).to_string()),
-            'u' => rendered.push_str(&(raw as u32).to_string()),
-            'x' => rendered.push_str(&format!("{:x}", raw as u32)),
-            'X' => rendered.push_str(&format!("{:X}", raw as u32)),
-            'p' => rendered.push_str(&format!("{raw:#x}")),
-            'c' | 'C' => {
-                rendered.push(char::from_u32((raw as u32) & 0xffff).unwrap_or('?'));
-            }
-            's' => {
-                if raw != 0 {
-                    rendered.push_str(&read_utf16_string(memory, raw)?);
+            'd' | 'i' => {
+                let value = raw as u32 as i32;
+                // C99 precision-zero semantics: a zero value with `.0`
+                // precision produces no digits.
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{}", value.unsigned_abs())
+                };
+                if let Some(precision) = precision {
+                    digits = pad_zeros(&digits, precision);
                 }
+                let sign = if value < 0 {
+                    "-"
+                } else if flags.contains('+') {
+                    "+"
+                } else if flags.contains(' ') {
+                    " "
+                } else {
+                    ""
+                };
+                let mut body = digits;
+                if flags.contains('0') && !flags.contains('-') && precision.is_none() {
+                    let needed = width.saturating_sub(sign.len() + body.len());
+                    body = format!("{}{}", "0".repeat(needed), body);
+                }
+                append_field(&mut rendered, format!("{sign}{body}"), &flags, width);
             }
-            'S' => {
-                if raw != 0 {
-                    if wide_modifier {
-                        rendered.push_str(&read_utf16_string(memory, raw)?);
+            'u' => {
+                let value = raw as u32;
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{value}")
+                };
+                if let Some(precision) = precision {
+                    digits = pad_zeros(&digits, precision);
+                }
+                let mut body = digits;
+                if flags.contains('0') && !flags.contains('-') && precision.is_none() {
+                    let needed = width.saturating_sub(body.len());
+                    body = format!("{}{}", "0".repeat(needed), body);
+                }
+                append_field(&mut rendered, body, &flags, width);
+            }
+            'o' => {
+                let value = raw as u32;
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else {
+                    format!("{value:o}")
+                };
+                if let Some(precision) = precision {
+                    digits = pad_zeros(&digits, precision);
+                }
+                // `#` gives octal output a leading zero (C99: the output
+                // always starts with 0 — including the empty `.0` zero case).
+                if flags.contains('#') && (value != 0 || digits.is_empty()) {
+                    if digits.is_empty() {
+                        digits = "0".to_string();
                     } else {
-                        rendered.push_str(&read_c_string(memory, raw)?);
+                        digits = format!("0{digits}");
                     }
                 }
+                let mut body = digits;
+                if flags.contains('0') && !flags.contains('-') && precision.is_none() {
+                    let needed = width.saturating_sub(body.len());
+                    body = format!("{}{}", "0".repeat(needed), body);
+                }
+                append_field(&mut rendered, body, &flags, width);
+            }
+            'x' | 'X' => {
+                let value = raw as u32;
+                let mut digits = if value == 0 && precision == Some(0) {
+                    String::new()
+                } else if specifier == 'x' {
+                    format!("{value:x}")
+                } else {
+                    format!("{value:X}")
+                };
+                if let Some(precision) = precision {
+                    digits = pad_zeros(&digits, precision);
+                }
+                let prefix = if flags.contains('#') && value != 0 {
+                    if specifier == 'x' { "0x" } else { "0X" }
+                } else {
+                    ""
+                };
+                // The `0` flag zero-pads the digits AFTER the 0x/0X prefix
+                // (`%#08x` of 0xabc → "0x000abc", like Windows).
+                let mut body = digits;
+                if flags.contains('0') && !flags.contains('-') && precision.is_none() {
+                    let needed = width.saturating_sub(prefix.len() + body.len());
+                    body = format!("{}{}", "0".repeat(needed), body);
+                }
+                append_field(&mut rendered, format!("{prefix}{body}"), &flags, width);
+            }
+            'p' => rendered.push_str(&format!("{raw:#x}")),
+            'c' | 'C' => {
+                let ch = char::from_u32((raw as u32) & 0xffff).unwrap_or('?');
+                append_field(&mut rendered, ch.to_string(), &flags, width);
+            }
+            's' | 'S' => {
+                let string = if raw != 0 {
+                    let prefer_wide = if specifier == 's' {
+                        wide_modifier || (!ansi_strings && !narrow_modifier)
+                    } else {
+                        wide_modifier || (ansi_strings && !narrow_modifier)
+                    };
+                    if prefer_wide {
+                        read_utf16_string(memory, raw)?
+                    } else {
+                        read_c_string(memory, raw)?
+                    }
+                } else {
+                    String::new()
+                };
+                let truncated = match precision {
+                    Some(precision) => string.chars().take(precision).collect(),
+                    None => string,
+                };
+                append_field(&mut rendered, truncated, &flags, width);
             }
             other => {
                 return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
-                    format!("unsupported wsprintfW format specifier %{other}"),
+                    format!("unsupported wsprintf format specifier %{other}"),
                 ));
             }
         }
     }
     Ok(rendered)
+}
+
+/// Zero-pad `digits` to at least `precision` characters.
+fn pad_zeros(digits: &str, precision: usize) -> String {
+    if digits.len() < precision {
+        format!("{}{}", "0".repeat(precision - digits.len()), digits)
+    } else {
+        digits.to_string()
+    }
+}
+
+/// Append `content` to `rendered`, applying the field width (left-aligned
+/// with the `-` flag, right-aligned otherwise, space-padded).
+fn append_field(rendered: &mut String, content: String, flags: &str, width: usize) {
+    let padding = width.saturating_sub(content.len());
+    if padding == 0 {
+        rendered.push_str(&content);
+        return;
+    }
+    if flags.contains('-') {
+        rendered.push_str(&content);
+        for _ in 0..padding {
+            rendered.push(' ');
+        }
+    } else {
+        for _ in 0..padding {
+            rendered.push(' ');
+        }
+        rendered.push_str(&content);
+    }
 }
 
 fn resolve_full_guest_path(current_directory: &str, path: &str) -> String {

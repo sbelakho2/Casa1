@@ -852,8 +852,10 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
     (
         "kernel32.dll",
         "CompareStringW",
-        "locale and flags are ignored; comparison is a case-insensitive ordinal compare \
-         (to_lowercase), not locale collation",
+        "locale is ignored (the runtime has no collation tables); flags are ignored — \
+         comparison is always a case-insensitive ordinal compare (to_lowercase), while \
+         Windows applies locale collation and flag-dependent semantics (NORM_IGNORECASE, \
+         NORM_IGNORECASE_NONSPACE, ...)",
     ),
     (
         "kernel32.dll",
@@ -875,21 +877,10 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
     ),
     (
         "kernel32.dll",
-        "GetDiskFreeSpaceA",
-        "reports plausible fixed disk geometry for the virtual filesystem, not host \
-         capacity",
-    ),
-    (
-        "kernel32.dll",
-        "GetDiskFreeSpaceExW",
-        "reports fixed virtual-filesystem figures (8 sectors/cluster, 512-byte sectors, \
-         2 TB total); not host capacity",
-    ),
-    (
-        "kernel32.dll",
         "GetProcessAffinityMask",
-        "returns a fixed 8-core affinity mask (0xFF), not the actual process/system \
-         affinity",
+        "returns the fixed 8-core affinity mask (0xFF) of the runtime's virtual topology — \
+         the same mask GetSystemInfo/GetNativeSystemInfo/NtQuerySystemInformation report; \
+         it is not the host's actual process/system affinity",
     ),
     (
         "kernel32.dll",
@@ -919,12 +910,6 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
         "RtlUnwind",
         "simulates the unwind by adjusting RIP to the target; no full SEH frame-walk of \
          the guest stack",
-    ),
-    (
-        "kernel32.dll",
-        "SetEndOfFile",
-        "cannot truly truncate the host file — truncation is simulated through file \
-         position tracking and treated as success",
     ),
     (
         "kernel32.dll",
@@ -962,27 +947,9 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
     ),
     (
         "user32.dll",
-        "SetClassLongW",
-        "returns 0 and records the call — the class long is not actually stored on the \
-         window class",
-    ),
-    (
-        "user32.dll",
-        "SetClipboardData",
-        "simplified clipboard: reads up to 64 KB from the handle address; format \
-         negotiation is limited",
-    ),
-    (
-        "user32.dll",
         "SetTimer",
         "only WM_TIMER-style timers (callback == 0) are registered; a non-null TIMERPROC \
          cannot be invoked by the host and stays a no-op",
-    ),
-    (
-        "user32.dll",
-        "wsprintfA",
-        "simple format subset only (%s/%d/%u/%x/%c/%%); unsupported specifiers are \
-         skipped",
     ),
     (
         "ws2_32.dll",
