@@ -1,4 +1,3 @@
-// Stage-3 canonical-state surface: the Win32Subsystem integration that consumes these types is the next work item; removing this allowance is part of that integration.
 //! Canonical guest process model.
 //!
 //! The GUEST PID is a Casa1 guest identity: a runtime-side counter starting

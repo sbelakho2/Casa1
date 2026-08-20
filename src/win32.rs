@@ -1350,24 +1350,16 @@ impl Win32Subsystem {
             .entry(handle)
             .expect("checked live")
             .object_id;
-        match self.objects.object_mut(object_id) {
-            KernelObject::Mutex(mutex) => {
-                if mutex.owner_thread_id != Some(current_thread_id) {
-                    return Err(AppError::new(
-                        ReasonCode::RcWin32NotOwner,
-                        "ReleaseMutex failed: caller does not own the mutex",
-                    ));
-                }
-                if mutex.recursion > 1 {
-                    mutex.recursion -= 1;
-                    return Ok(());
-                }
-                mutex.recursion = 0;
-                mutex.owner_thread_id = None;
-                mutex.abandoned = false;
-                Ok(())
-            }
-            _ => invalid_handle("handle is not a mutex"),
+        // The state transition is the object manager's canonical
+        // `release_mutex` (recursion, ownership, abandoned flag); the
+        // subsystem layer already validated type and access above.
+        if !self.objects.release_mutex(object_id, current_thread_id) {
+            Err(AppError::new(
+                ReasonCode::RcWin32NotOwner,
+                "ReleaseMutex failed: caller does not own the mutex",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -1905,17 +1897,25 @@ impl Win32Subsystem {
                 ));
             }
         }
+        // The canonical `object_is_signaled` probes the object manager's
+        // waitable state (Event / Mutex / Semaphore / Timer).  Thread /
+        // Process signal state is subsystem-side (the threads map and the
+        // process-object exit code), so those branches stay here.
         Ok(match &entry.object {
-            KernelObject::Event(event) => event.borrow().signaled,
-            KernelObject::Mutex(mutex) => mutex.abandoned || mutex.owner_thread_id.is_none(),
-            KernelObject::Semaphore(semaphore) => semaphore.count > 0,
             KernelObject::Thread(thread) => self
                 .threads
                 .get(&thread.thread_id)
                 .is_some_and(|state| state.exit_code.is_some()),
             KernelObject::Process(process) => process.exit_code.is_some(),
-            KernelObject::Timer(timer) => timer.signaled || self.time.ticks_ms >= timer.due_tick,
-            _ => unreachable!("non-waitable types rejected above"),
+            _ => self.objects.object_is_signaled(
+                self.process
+                    .handle_table
+                    .entry(handle)
+                    .expect("checked live")
+                    .object_id,
+                self.current_thread_id,
+                self.time.ticks_ms,
+            ),
         })
     }
 

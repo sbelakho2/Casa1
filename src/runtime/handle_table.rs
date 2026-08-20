@@ -1,4 +1,3 @@
-// Stage-3 canonical-state surface: the Win32Subsystem integration that consumes these types is the next work item; removing this allowance is part of that integration.
 //! Canonical handle table.
 //!
 //! ONE generation-protected handle table backs the `Win32Subsystem`: handle
@@ -70,9 +69,7 @@ impl Default for HandleTable {
     }
 }
 
-#[allow(dead_code)] // Stage-3 integration pending
 impl HandleTable {
-    #[allow(dead_code)] // Stage-3 integration pending
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
