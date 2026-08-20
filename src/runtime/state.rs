@@ -1346,3 +1346,127 @@ impl PeHostRuntime {
         runtime
     }
 }
+impl PeHostRuntime {
+    pub(crate) fn write_guest_unicode_string(
+        &self,
+        memory: &mut MemoryImage,
+        address: u64,
+        value_ptr: u64,
+        value: &str,
+    ) -> AppResult<()> {
+        let byte_len = value.encode_utf16().count().checked_mul(2).ok_or_else(|| {
+            AppError::new(ReasonCode::RcUnimplInsn, "unicode string length overflow")
+        })?;
+        let byte_len = u16::try_from(byte_len).map_err(|_| {
+            AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("unicode string is too large for a guest UNICODE_STRING: {value:?}"),
+            )
+        })?;
+        let maximum_length = byte_len.checked_add(2).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("unicode string maximum length overflow for {value:?}"),
+            )
+        })?;
+        memory.map_bytes(address, &byte_len.to_le_bytes());
+        memory.map_bytes(address + 2, &maximum_length.to_le_bytes());
+        match self.guest_arch {
+            GuestArch::X86 => write_guest_pointer(memory, address + 4, value_ptr, self.guest_arch)?,
+            GuestArch::X64 => {
+                memory.map_bytes(address + 4, &[0; 4]);
+                write_guest_pointer(memory, address + 8, value_ptr, self.guest_arch)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_process_parameters(
+        &mut self,
+        memory: &mut MemoryImage,
+        image_path: &str,
+    ) -> AppResult<()> {
+        if self.guest_arch != GuestArch::X86 || self.peb_base == 0 {
+            return Ok(());
+        }
+
+        let command_line = self.command_line.clone();
+        if self.command_line_wide_ptr == 0 {
+            self.command_line_wide_ptr = self.alloc_utf16_string(memory, &command_line)?;
+        }
+
+        let current_directory = self.current_directory.clone();
+        let process_environment = self.process_environment.clone();
+        let dll_path = "C:\\Windows\\System32";
+        let current_directory_ptr = self.alloc_utf16_string(memory, &current_directory)?;
+        let dll_path_ptr = self.alloc_utf16_string(memory, dll_path)?;
+        let image_path_ptr = self.alloc_utf16_string(memory, image_path)?;
+        let environment_ptr = self.alloc_utf16_environment_block(memory, &process_environment)?;
+        let process_parameters_ptr = self.alloc_zeroed(memory, 0x80, 16)?;
+
+        write_u32(memory, process_parameters_ptr, 0x80);
+        write_u32(memory, process_parameters_ptr + 4, 0x80);
+        write_u32(
+            memory,
+            process_parameters_ptr + 8,
+            RTL_USER_PROCESS_PARAMETERS_NORMALIZED,
+        );
+        write_guest_pointer(
+            memory,
+            process_parameters_ptr + 0x18,
+            u64::from(STD_INPUT_HANDLE),
+            self.guest_arch,
+        )?;
+        write_guest_pointer(
+            memory,
+            process_parameters_ptr + 0x1c,
+            u64::from(STD_OUTPUT_HANDLE),
+            self.guest_arch,
+        )?;
+        write_guest_pointer(
+            memory,
+            process_parameters_ptr + 0x20,
+            u64::from(STD_ERROR_HANDLE),
+            self.guest_arch,
+        )?;
+        self.write_guest_unicode_string(
+            memory,
+            process_parameters_ptr + 0x24,
+            current_directory_ptr,
+            &current_directory,
+        )?;
+        self.write_guest_unicode_string(
+            memory,
+            process_parameters_ptr + 0x30,
+            dll_path_ptr,
+            dll_path,
+        )?;
+        self.write_guest_unicode_string(
+            memory,
+            process_parameters_ptr + 0x38,
+            image_path_ptr,
+            image_path,
+        )?;
+        self.write_guest_unicode_string(
+            memory,
+            process_parameters_ptr + 0x40,
+            self.command_line_wide_ptr,
+            &command_line,
+        )?;
+        write_guest_pointer(
+            memory,
+            process_parameters_ptr + 0x48,
+            environment_ptr,
+            self.guest_arch,
+        )?;
+        write_guest_pointer(
+            memory,
+            self.peb_base + 0x10,
+            process_parameters_ptr,
+            self.guest_arch,
+        )?;
+        self.process_parameters_ptr = process_parameters_ptr;
+        Ok(())
+    }
+}
+
