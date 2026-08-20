@@ -87133,6 +87133,1470 @@ mod tests {
             );
         })
     }
+
+    // ── Evidence-ui-mm: user32 window-class round trip (WS_CHILD path) ──────
+
+    #[test]
+    fn register_class_w_create_window_roundtrip_dispatch() {
+        // Drives the guest-facing RegisterClassW / RegisterClassExW →
+        // CreateWindowExW → SetWindowLongW/GetWindowLongW → ShowWindow →
+        // IsWindowVisible → GetWindowRect → MoveWindow → SetWindowPos →
+        // SetWindowTextW/GetWindowTextW/GetWindowTextLengthA → DestroyWindow
+        // → UnregisterClassW chain through the actual host thunks on an x86
+        // guest.  WS_CHILD windows never touch AppKit, so the chain runs
+        // headless.
+        const WS_CHILD: u32 = 0x4000_0000;
+        const GWL_STYLE: i32 = -16;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "class-register",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // WNDCLASSW (x86, 40 bytes): style, lpfnWndProc, cbClsExtra,
+        // cbWndExtra, hInstance, hIcon, hCursor, hbrBackground,
+        // lpszMenuName, lpszClassName.
+        let class_name_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Casa1EvidenceWin")
+            .expect("class name");
+        let class_ptr = 0x41_000_u64;
+        let mut class_bytes = vec![0_u8; 40];
+        class_bytes[0..4].copy_from_slice(&0x0003_u32.to_le_bytes()); // style
+        class_bytes[4..8].copy_from_slice(&0x0040_1000_u32.to_le_bytes()); // lpfnWndProc
+        class_bytes[16..20].copy_from_slice(&0x4000_0000_u32.to_le_bytes()); // hInstance
+        class_bytes[20..24].copy_from_slice(&0x5000_0000_u32.to_le_bytes()); // hIcon
+        class_bytes[24..28].copy_from_slice(&0x6000_0000_u32.to_le_bytes()); // hCursor
+        class_bytes[28..32].copy_from_slice(&0x7000_0000_u32.to_le_bytes()); // hbrBackground
+        class_bytes[36..40].copy_from_slice(&(class_name_ptr as u32).to_le_bytes());
+        memory.map_bytes(class_ptr, &class_bytes);
+
+        let register_class = runtime.alloc_host_thunk(HostThunk::RegisterClassW);
+        let atom = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            register_class,
+            &[class_ptr as u32],
+        );
+        assert_ne!(atom, 0, "RegisterClassW must return a nonzero atom");
+
+        // RegisterClassExW: WNDCLASSEXW (x86, 48 bytes) adds cbSize and
+        // hIconSm around the same 40-byte core.
+        let ex_class_name_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Casa1EvidenceEx")
+            .expect("ex class name");
+        let ex_class_ptr = 0x41_080_u64;
+        let mut ex_bytes = vec![0_u8; 48];
+        ex_bytes[0..4].copy_from_slice(&48_u32.to_le_bytes()); // cbSize
+        ex_bytes[4..8].copy_from_slice(&0x0003_u32.to_le_bytes()); // style
+        ex_bytes[20..24].copy_from_slice(&0x4000_0000_u32.to_le_bytes()); // hInstance
+        ex_bytes[24..28].copy_from_slice(&0x5000_0000_u32.to_le_bytes()); // hIcon
+        ex_bytes[28..32].copy_from_slice(&0x6000_0000_u32.to_le_bytes()); // hCursor
+        ex_bytes[32..36].copy_from_slice(&0x7000_0000_u32.to_le_bytes()); // hbrBackground
+        ex_bytes[40..44].copy_from_slice(&(ex_class_name_ptr as u32).to_le_bytes());
+        ex_bytes[44..48].copy_from_slice(&0x8000_0000_u32.to_le_bytes()); // hIconSm
+        memory.map_bytes(ex_class_ptr, &ex_bytes);
+        let register_ex = runtime.alloc_host_thunk(HostThunk::RegisterClassExW);
+        let ex_atom = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            register_ex,
+            &[ex_class_ptr as u32],
+        );
+        assert_ne!(ex_atom, 0, "RegisterClassExW must return a nonzero atom");
+
+        // CreateWindowExW on the plain WNDCLASS (WS_CHILD → no AppKit).
+        let title_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Evidence Window")
+            .expect("title");
+        let create_window = runtime.alloc_host_thunk(HostThunk::CreateWindowExW);
+        let hwnd = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_window,
+            &[
+                0,
+                class_name_ptr as u32,
+                title_ptr as u32,
+                WS_CHILD,
+                10,
+                20,
+                320,
+                200,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(hwnd, 0, "CreateWindowExW must create the window");
+
+        // SetWindowLongW/GetWindowLongW round trip.
+        let set_long = runtime.alloc_host_thunk(HostThunk::SetWindowLongW);
+        let previous = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_long,
+            &[hwnd as u32, GWL_STYLE as u32, WS_CHILD | 0x0001],
+        );
+        assert_eq!(previous, 0, "first SetWindowLongW returns 0");
+        let get_long = runtime.alloc_host_thunk(HostThunk::GetWindowLongW);
+        let style = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_long,
+            &[hwnd as u32, GWL_STYLE as u32],
+        );
+        assert_eq!(style, WS_CHILD as u64 | 1);
+
+        // ShowWindow → IsWindowVisible.
+        let show = runtime.alloc_host_thunk(HostThunk::ShowWindow);
+        let was_visible = dispatch_x86_thunk(&mut runtime, &mut memory, show, &[hwnd as u32, 1]);
+        assert_eq!(was_visible, 0, "window starts hidden");
+        let is_visible = runtime.alloc_host_thunk(HostThunk::IsWindowVisible);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, is_visible, &[hwnd as u32]),
+            1,
+            "ShowWindow(SW_SHOW) must make the window visible"
+        );
+
+        // GetWindowRect reflects the created size.
+        let rect_ptr = 0x41_100_u64;
+        memory.map_bytes(rect_ptr, &[0; 16]);
+        let get_rect = runtime.alloc_host_thunk(HostThunk::GetWindowRect);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rect,
+                &[hwnd as u32, rect_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(read_u32(&memory, rect_ptr).expect("left"), 0);
+        assert_eq!(read_u32(&memory, rect_ptr + 8).expect("right"), 320);
+        assert_eq!(read_u32(&memory, rect_ptr + 12).expect("bottom"), 200);
+
+        // MoveWindow resizes the record.
+        let move_window = runtime.alloc_host_thunk(HostThunk::MoveWindow);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                move_window,
+                &[hwnd as u32, 30, 40, 400, 300, 1]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rect,
+                &[hwnd as u32, rect_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(read_u32(&memory, rect_ptr + 8).expect("right"), 400);
+        assert_eq!(read_u32(&memory, rect_ptr + 12).expect("bottom"), 300);
+
+        // SetWindowPos resizes via SWP flags.
+        const SWP_NOZORDER: u32 = 0x0004;
+        let set_window_pos = runtime.alloc_host_thunk(HostThunk::SetWindowPos);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_window_pos,
+                &[hwnd as u32, 0, 0, 0, 500, 250, SWP_NOZORDER]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rect,
+                &[hwnd as u32, rect_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(read_u32(&memory, rect_ptr + 8).expect("right"), 500);
+        assert_eq!(read_u32(&memory, rect_ptr + 12).expect("bottom"), 250);
+
+        // SetWindowTextW → GetWindowTextW / GetWindowTextLengthA.
+        let new_title_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Renamed Evidence")
+            .expect("new title");
+        let set_text = runtime.alloc_host_thunk(HostThunk::SetWindowTextW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_text,
+                &[hwnd as u32, new_title_ptr as u32]
+            ),
+            1
+        );
+        let text_out = 0x41_200_u64;
+        memory.map_bytes(text_out, &[0; 64]);
+        let get_text = runtime.alloc_host_thunk(HostThunk::GetWindowTextW);
+        let copied = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_text,
+            &[hwnd as u32, text_out as u32, 32],
+        );
+        assert_eq!(copied, 16, "GetWindowTextW copies 16 wide chars");
+        assert_eq!(
+            read_guest_utf16_string(&memory, text_out, 32),
+            "Renamed Evidence"
+        );
+        let get_text_len_a = runtime.alloc_host_thunk(HostThunk::GetWindowTextLengthA);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_text_len_a, &[hwnd as u32]),
+            "Renamed Evidence".len() as u64
+        );
+
+        // DestroyWindow tears the window down; IsWindowVisible then fails.
+        let destroy = runtime.alloc_host_thunk(HostThunk::DestroyWindow);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, destroy, &[hwnd as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, is_visible, &[hwnd as u32]),
+            0
+        );
+
+        // UnregisterClassW: the class is gone and can be re-registered.
+        let unregister = runtime.alloc_host_thunk(HostThunk::UnregisterClassW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                unregister,
+                &[class_name_ptr as u32]
+            ),
+            1
+        );
+        let atom2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            register_class,
+            &[class_ptr as u32],
+        );
+        assert_ne!(atom2, 0, "class can be registered again after unregister");
+    }
+
+    #[test]
+    fn message_pump_peek_get_dispatch_send_and_def_window_proc() {
+        // The UI message pump through the real thunks: PostThreadMessageW →
+        // GetMessageW → PeekMessageW → DispatchMessageW, plus SendMessageW,
+        // DefWindowProcW and EndDialog against a live WS_CHILD window.
+        const WS_CHILD: u32 = 0x4000_0000;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "message-pump", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime.user32.register_class_ex_w("pump-window");
+        let hwnd = runtime
+            .user32
+            .create_window_ex_styled(
+                "pump-window",
+                "pump",
+                320,
+                200,
+                false,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create pump window");
+        while runtime.user32.get_message_w().is_some() {}
+
+        let msg_ptr = 0x41_300_u64;
+        memory.map_bytes(msg_ptr, &[0; 28]);
+        let post = runtime.alloc_host_thunk(HostThunk::PostThreadMessageW);
+        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+
+        // GetMessageW with a queued PostThreadMessageW round trip.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, post, &[1, 0x0400, 11, 22]),
+            1
+        );
+        let got = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_message,
+            &[msg_ptr as u32, 0, 0, 0],
+        );
+        assert_eq!(got, 1, "GetMessageW returns 1 for a non-quit message");
+        let message = read_win32_msg(&memory, msg_ptr).expect("read msg");
+        assert_eq!(message_id(message.kind), 0x0400);
+        assert_eq!(message.wparam, 11);
+        assert_eq!(message.lparam, 22);
+
+        // PeekMessageW: empty queue → 0; queued message → 1.
+        let peek = runtime.alloc_host_thunk(HostThunk::PeekMessageW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                peek,
+                &[msg_ptr as u32, 0, 0, 0, 0]
+            ),
+            0,
+            "PeekMessageW with an empty queue returns 0"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, post, &[1, 0x0401, 7, 8]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                peek,
+                &[msg_ptr as u32, 0, 0, 0, 1]
+            ),
+            1,
+            "PeekMessageW with PM_REMOVE returns 1"
+        );
+        let peeked = read_win32_msg(&memory, msg_ptr).expect("peeked msg");
+        assert_eq!(message_id(peeked.kind), 0x0401);
+        assert_eq!(peeked.wparam, 7);
+
+        // DispatchMessageW runs the message through the window proc path
+        // (no guest wnd proc → default handling, observable result).
+        let dispatch = runtime.alloc_host_thunk(HostThunk::DispatchMessageW);
+        let dispatched = dispatch_x86_thunk(&mut runtime, &mut memory, dispatch, &[msg_ptr as u32]);
+        assert_eq!(dispatched, 0, "default dispatch result for WM_USER+1");
+
+        // SendMessageW delivers into the message log of a live window.
+        let send = runtime.alloc_host_thunk(HostThunk::SendMessageW);
+        let sent = dispatch_x86_thunk(&mut runtime, &mut memory, send, &[hwnd, 0x0402, 3, 4]);
+        assert_eq!(sent, 0);
+        let log = runtime.user32.message_log();
+        assert_eq!(
+            log.last().expect("log tail").kind,
+            MessageKind::Other(0x0402)
+        );
+        assert_eq!(log.last().expect("log tail").wparam, 3);
+
+        // DefWindowProcW: WM_PAINT (0x000F) on the live window.
+        let def = runtime.alloc_host_thunk(HostThunk::DefWindowProcW);
+        let def_result = dispatch_x86_thunk(&mut runtime, &mut memory, def, &[hwnd, 0x000F, 0, 0]);
+        assert_eq!(def_result, 0);
+
+        // EndDialog destroys the window and records the dialog result.
+        let end_dialog = runtime.alloc_host_thunk(HostThunk::EndDialog);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, end_dialog, &[hwnd, 7]),
+            1,
+            "EndDialog must close the dialog window"
+        );
+        assert!(
+            !runtime
+                .user32
+                .window_state(hwnd)
+                .map(|_| true)
+                .unwrap_or(false),
+            "EndDialog destroys the window record"
+        );
+    }
+
+    #[test]
+    fn paint_dc_monitor_and_timer_dispatch() {
+        // BeginPaint/EndPaint, GetDC/ReleaseDC, InvalidateRect/UpdateWindow/
+        // RedrawWindow, MonitorFromPoint/MonitorFromWindow/GetMonitorInfoW,
+        // MsgWaitForMultipleObjects and LoadCursorW/LoadIconW through the
+        // host thunks on a headless WS_CHILD window.
+        const WS_CHILD: u32 = 0x4000_0000;
+        const QS_POSTMESSAGE: u32 = 0x0008;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "paint-dc", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime.user32.register_class_ex_w("paint-window");
+        let hwnd = runtime
+            .user32
+            .create_window_ex_styled(
+                "paint-window",
+                "paint",
+                320,
+                200,
+                true,
+                false,
+                None,
+                2,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create paint window");
+        while runtime.user32.get_message_w().is_some() {}
+
+        // BeginPaint writes the PAINTSTRUCT (x86: hdc at offset 0) and
+        // returns a live HDC; EndPaint releases it.
+        let paint_ptr = 0x41_400_u64;
+        memory.map_bytes(paint_ptr, &[0; 64]);
+        let begin_paint = runtime.alloc_host_thunk(HostThunk::BeginPaint);
+        let hdc = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            begin_paint,
+            &[hwnd, paint_ptr as u32],
+        );
+        assert_ne!(hdc, 0, "BeginPaint must return an HDC");
+        assert_eq!(
+            read_u32(&memory, paint_ptr).expect("paintstruct hdc"),
+            hdc as u32
+        );
+        let end_paint = runtime.alloc_host_thunk(HostThunk::EndPaint);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                end_paint,
+                &[hwnd, paint_ptr as u32]
+            ),
+            1
+        );
+
+        // GetDC/ReleaseDC lifecycle.
+        let get_dc = runtime.alloc_host_thunk(HostThunk::GetDC);
+        let dc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc, &[hwnd]);
+        assert_ne!(dc, 0, "GetDC must return an HDC");
+        let release_dc = runtime.alloc_host_thunk(HostThunk::ReleaseDC);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_dc, &[hwnd, dc as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_dc, &[hwnd, dc as u32]),
+            0,
+            "releasing a freed DC returns 0"
+        );
+
+        // InvalidateRect queues a WM_PAINT.
+        let invalidate = runtime.alloc_host_thunk(HostThunk::InvalidateRect);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, invalidate, &[hwnd, 0, 1]),
+            1
+        );
+        let kinds = std::iter::from_fn(|| runtime.user32.get_message_w().map(|m| m.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&MessageKind::Paint));
+
+        // UpdateWindow paints even without a prior invalidate.
+        let update = runtime.alloc_host_thunk(HostThunk::UpdateWindow);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, update, &[hwnd]),
+            1
+        );
+        assert!(
+            std::iter::from_fn(|| runtime.user32.get_message_w().map(|m| m.kind))
+                .any(|kind| kind == MessageKind::Paint)
+        );
+
+        // RedrawWindow (RDW_INVALIDATE) queues another paint.
+        let redraw = runtime.alloc_host_thunk(HostThunk::RedrawWindow);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, redraw, &[hwnd, 0, 0, 0x0001]),
+            1
+        );
+
+        // MonitorFromWindow reports the window's monitor; GetMonitorInfoW
+        // fills the MONITORINFO for the secondary (test-layout) monitor.
+        let monitor_from_window = runtime.alloc_host_thunk(HostThunk::MonitorFromWindow);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, monitor_from_window, &[hwnd, 0]),
+            2,
+            "MonitorFromWindow must report the window's monitor"
+        );
+        let monitor_info_ptr = 0x41_500_u64;
+        memory.map_bytes(monitor_info_ptr, &40_u32.to_le_bytes());
+        let get_monitor_info = runtime.alloc_host_thunk(HostThunk::GetMonitorInfoW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_monitor_info,
+                &[2, monitor_info_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            read_u32(&memory, monitor_info_ptr + 36).expect("dwFlags"),
+            0,
+            "monitor 2 is not the primary monitor"
+        );
+        assert_eq!(
+            read_u32(&memory, monitor_info_ptr + 4).expect("left"),
+            2560,
+            "monitor 2's bounds are reported (test monitor layout)"
+        );
+
+        let monitor_from_point = runtime.alloc_host_thunk(HostThunk::MonitorFromPoint);
+        // Point (0,0) inside the primary monitor → primary id; a point far
+        // outside all monitors with MONITOR_DEFAULTTONULL → 0.
+        let primary = dispatch_x86_thunk(&mut runtime, &mut memory, monitor_from_point, &[0, 0, 1]);
+        assert_ne!(primary, 0, "MonitorFromPoint(0,0) resolves to a monitor");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                monitor_from_point,
+                &[100_000, 100_000, 0]
+            ),
+            0,
+            "MonitorFromPoint far outside returns 0 with MONITOR_DEFAULTTONULL"
+        );
+
+        // MsgWaitForMultipleObjects: queue-wake behavior with no handles.
+        let msg_wait = runtime.alloc_host_thunk(HostThunk::MsgWaitForMultipleObjects);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                msg_wait,
+                &[0, 0, 0, 0, QS_POSTMESSAGE]
+            ),
+            0xFFFF_FFFF,
+            "no queued message → WAIT_TIMEOUT"
+        );
+        runtime
+            .user32
+            .post_message_w(hwnd, MessageKind::Other(0x0400), 0, 0)
+            .expect("post window message");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                msg_wait,
+                &[0, 0, 0, 0, QS_POSTMESSAGE]
+            ),
+            0,
+            "queued message → WAIT_OBJECT_0"
+        );
+
+        // LoadCursorW/LoadIconW allocate distinct handles.
+        let load_cursor = runtime.alloc_host_thunk(HostThunk::LoadCursorW);
+        let cursor_a = dispatch_x86_thunk(&mut runtime, &mut memory, load_cursor, &[0, 0x7F00]);
+        let cursor_b = dispatch_x86_thunk(&mut runtime, &mut memory, load_cursor, &[0, 0x7F00]);
+        assert_ne!(cursor_a, cursor_b, "LoadCursorW allocates fresh handles");
+        let load_icon = runtime.alloc_host_thunk(HostThunk::LoadIconW);
+        let icon = dispatch_x86_thunk(&mut runtime, &mut memory, load_icon, &[0, 0x7F00]);
+        assert_ne!(icon, cursor_b, "LoadIconW uses its own handle space");
+    }
+
+    #[test]
+    fn dialog_item_set_get_dispatch() {
+        // GetDlgItem materializes the item; SetDlgItemTextA/SetDlgItemInt
+        // store text; GetDlgItemInt parses it back — the dialog control
+        // contract through the host thunks.
+        const WS_CHILD: u32 = 0x4000_0000;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "dialog-items", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime.user32.register_class_ex_w("dlg-parent");
+        let parent = runtime
+            .user32
+            .create_window_ex_styled(
+                "dlg-parent",
+                "dlg",
+                320,
+                200,
+                false,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create dialog parent");
+        while runtime.user32.get_message_w().is_some() {}
+
+        // GetDlgItem(parent, 101) materializes the control.
+        let get_dlg_item = runtime.alloc_host_thunk(HostThunk::GetDlgItem);
+        let control = dispatch_x86_thunk(&mut runtime, &mut memory, get_dlg_item, &[parent, 101]);
+        assert_ne!(control, 0, "GetDlgItem must materialize the control");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_dlg_item, &[parent, 101]),
+            control,
+            "GetDlgItem is stable for the same item id"
+        );
+        let other = dispatch_x86_thunk(&mut runtime, &mut memory, get_dlg_item, &[parent, 999]);
+        assert_ne!(other, 0, "GetDlgItem materializes each requested item");
+        assert_ne!(other, control, "different item ids get distinct windows");
+
+        // SetDlgItemTextA → GetDlgItemInt (unsigned).
+        let ansi_text = 0x41_600_u64;
+        memory.map_bytes(ansi_text, b"12345\0");
+        let set_text = runtime.alloc_host_thunk(HostThunk::SetDlgItemTextA);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_text,
+                &[parent, 101, ansi_text as u32]
+            ),
+            1
+        );
+        let translated = 0x41_700_u64;
+        memory.map_bytes(translated, &[0; 4]);
+        let get_int = runtime.alloc_host_thunk(HostThunk::GetDlgItemInt);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_int,
+                &[parent, 101, translated as u32, 0]
+            ),
+            12345,
+            "GetDlgItemInt parses the control text"
+        );
+        assert_eq!(
+            read_u32(&memory, translated).expect("translated"),
+            1,
+            "GetDlgItemInt reports successful translation"
+        );
+
+        // SetDlgItemInt (signed) → GetDlgItemInt (signed) round trip.
+        let set_int = runtime.alloc_host_thunk(HostThunk::SetDlgItemInt);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_int,
+                &[parent, 101, 0xFFFF_FF38, 1]
+            ),
+            1,
+            "SetDlgItemInt stores -200 as text"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_int,
+                &[parent, 101, translated as u32, 1]
+            ),
+            0xFFFF_FF38,
+            "GetDlgItemInt parses the signed value back"
+        );
+    }
+
+    // ── Evidence-ui-mm: gdi32 bitmap-draw dispatch ─────────────────────────
+
+    #[test]
+    fn gdi_bitmap_draw_dispatch() {
+        // The gdi32 drawing surface through the host thunks: memory DC,
+        // DIB section, object selection, BitBlt/StretchBlt into a window
+        // DC, brush/pen/region/font creation, stock objects, text metrics
+        // and DC text state — all headless on a WS_CHILD target window.
+        const WS_CHILD: u32 = 0x4000_0000;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdi-dispatch", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime.user32.register_class_ex_w("GdiTarget");
+        let hwnd = runtime
+            .user32
+            .create_window_ex_styled(
+                "GdiTarget",
+                "gdi",
+                64,
+                32,
+                true,
+                false,
+                None,
+                1,
+                WS_CHILD,
+                0,
+                None,
+            )
+            .expect("create gdi target");
+        while runtime.user32.get_message_w().is_some() {}
+
+        // CreateCompatibleDC → memory DC.
+        let create_compatible_dc = runtime.alloc_host_thunk(HostThunk::CreateCompatibleDC);
+        let mem_dc = dispatch_x86_thunk(&mut runtime, &mut memory, create_compatible_dc, &[0]);
+        assert_ne!(mem_dc, 0, "CreateCompatibleDC must return an HDC");
+
+        // CreateDIBSection (64x32x32bpp) with a guest pixel pointer.
+        let bmi_ptr = 0x42_000_u64;
+        let mut bmi = vec![0_u8; 40];
+        bmi[0..4].copy_from_slice(&40_u32.to_le_bytes()); // biSize
+        bmi[4..8].copy_from_slice(&64_u32.to_le_bytes()); // biWidth
+        bmi[8..12].copy_from_slice(&32_u32.to_le_bytes()); // biHeight
+        bmi[14..16].copy_from_slice(&32_u16.to_le_bytes()); // biBitCount
+        memory.map_bytes(bmi_ptr, &bmi);
+        let bits_ptr = 0x42_100_u64;
+        memory.map_bytes(bits_ptr, &[0; 4]);
+        let create_dib = runtime.alloc_host_thunk(HostThunk::CreateDIBSection);
+        let dib = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_dib,
+            &[0, bmi_ptr as u32, 0, bits_ptr as u32, 0, 0],
+        );
+        assert_ne!(dib, 0, "CreateDIBSection must return an HBITMAP");
+        let pixel_ptr = read_u32(&memory, bits_ptr).expect("bits out") as u64;
+        assert_ne!(
+            pixel_ptr, 0,
+            "CreateDIBSection must expose the pixel pointer"
+        );
+
+        // Seed the DIB pixels so the blit has real content.
+        for offset in 0..512u64 {
+            memory.write_u8(pixel_ptr + offset, 0xE1);
+        }
+
+        // SelectObject the DIB into the memory DC.
+        let select_object = runtime.alloc_host_thunk(HostThunk::SelectObject);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select_object,
+                &[mem_dc as u32, dib as u32]
+            ),
+            0,
+            "first SelectObject returns NULL"
+        );
+
+        // BitBlt SRCCOPY from the DIB-backed DC into the window DC: the
+        // window surface must receive real pixels.
+        let get_dc = runtime.alloc_host_thunk(HostThunk::GetDC);
+        let win_dc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc, &[hwnd]);
+        assert_ne!(win_dc, 0);
+        let bit_blt = runtime.alloc_host_thunk(HostThunk::BitBlt);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                bit_blt,
+                &[win_dc as u32, 0, 0, 64, 32, mem_dc as u32, 0, 0, 0x00CC0020]
+            ),
+            1
+        );
+        let surface = runtime
+            .window_surfaces
+            .get(&hwnd)
+            .expect("window surface after BitBlt");
+        assert!(
+            surface.bytes.iter().any(|byte| *byte != 0),
+            "BitBlt must copy the DIB pixels into the window surface"
+        );
+
+        // StretchBlt (scaled copy) keeps working.
+        let stretch_blt = runtime.alloc_host_thunk(HostThunk::StretchBlt);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                stretch_blt,
+                &[
+                    win_dc as u32,
+                    0,
+                    0,
+                    32,
+                    16,
+                    mem_dc as u32,
+                    0,
+                    0,
+                    64,
+                    32,
+                    0x00CC0020
+                ]
+            ),
+            1
+        );
+
+        // Brush/pen/region creation + stock objects.
+        let create_solid_brush = runtime.alloc_host_thunk(HostThunk::CreateSolidBrush);
+        let brush =
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_solid_brush, &[0x00FF0000]);
+        assert_ne!(brush, 0);
+        let create_pen = runtime.alloc_host_thunk(HostThunk::CreatePen);
+        let pen = dispatch_x86_thunk(&mut runtime, &mut memory, create_pen, &[0, 1, 0x0000FF00]);
+        assert_ne!(pen, 0);
+        let create_rect_rgn = runtime.alloc_host_thunk(HostThunk::CreateRectRgn);
+        let rgn = dispatch_x86_thunk(&mut runtime, &mut memory, create_rect_rgn, &[0, 0, 10, 10]);
+        assert_ne!(rgn, 0);
+        let create_round_rect_rgn = runtime.alloc_host_thunk(HostThunk::CreateRoundRectRgn);
+        let rnd = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_round_rect_rgn,
+            &[0, 0, 10, 10, 2, 2],
+        );
+        assert_ne!(rnd, 0);
+        let get_stock_object = runtime.alloc_host_thunk(HostThunk::GetStockObject);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_stock_object, &[0]),
+            0x8000_0001,
+            "WHITE_BRUSH stock handle"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_stock_object, &[4]),
+            0x8000_0005,
+            "BLACK_BRUSH stock handle"
+        );
+
+        // FrameRect/Rectangle/MoveToEx/LineTo paint the window DC.
+        let rect_ptr = 0x42_200_u64;
+        memory.map_bytes(rect_ptr, &[0; 16]);
+        write_u32(&mut memory, rect_ptr, 0);
+        write_u32(&mut memory, rect_ptr + 4, 0);
+        write_u32(&mut memory, rect_ptr + 8, 8);
+        write_u32(&mut memory, rect_ptr + 12, 8);
+        let frame_rect = runtime.alloc_host_thunk(HostThunk::FrameRect);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                frame_rect,
+                &[win_dc as u32, rect_ptr as u32, brush as u32]
+            ),
+            1
+        );
+        let rectangle = runtime.alloc_host_thunk(HostThunk::Rectangle);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                rectangle,
+                &[win_dc as u32, 0, 0, 4, 4]
+            ),
+            1
+        );
+        let move_to_ex = runtime.alloc_host_thunk(HostThunk::MoveToEx);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                move_to_ex,
+                &[win_dc as u32, 0, 0, 0]
+            ),
+            1
+        );
+        let line_to = runtime.alloc_host_thunk(HostThunk::LineTo);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, line_to, &[win_dc as u32, 4, 4]),
+            1
+        );
+
+        // Fonts: CreateFontW / CreateFontIndirectW allocate; GetTextMetricsW
+        // and GetTextExtentPoint32W report sizes.
+        let face_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Tahoma")
+            .expect("face name");
+        let create_font = runtime.alloc_host_thunk(HostThunk::CreateFontW);
+        let font = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_font,
+            &[16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, face_ptr as u32],
+        );
+        assert_ne!(font, 0, "CreateFontW must allocate a font handle");
+        let logfont_ptr = 0x42_300_u64;
+        memory.map_bytes(logfont_ptr, &[0; 92]);
+        write_u32(&mut memory, logfont_ptr, -13_i32 as u32);
+        for (index, unit) in "Arial".encode_utf16().enumerate() {
+            memory.write_u16(logfont_ptr + 28 + index as u64 * 2, unit);
+        }
+        memory.write_u16(logfont_ptr + 28 + 5 * 2, 0);
+        let create_font_indirect = runtime.alloc_host_thunk(HostThunk::CreateFontIndirectW);
+        let font2 = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_font_indirect,
+            &[logfont_ptr as u32],
+        );
+        assert_ne!(font2, 0, "CreateFontIndirectW must allocate a font handle");
+
+        let get_text_metrics = runtime.alloc_host_thunk(HostThunk::GetTextMetricsW);
+        let metrics_ptr = 0x42_400_u64;
+        memory.map_bytes(metrics_ptr, &[0; 60]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_text_metrics,
+                &[mem_dc as u32, metrics_ptr as u32]
+            ),
+            1
+        );
+        assert!(
+            read_guest_u32(&memory, metrics_ptr).expect("tmHeight") > 0,
+            "GetTextMetricsW must report a nonzero tmHeight"
+        );
+        let get_text_extent = runtime.alloc_host_thunk(HostThunk::GetTextExtentPoint32W);
+        let text_ptr = runtime
+            .alloc_utf16_string(&mut memory, "Hello")
+            .expect("text");
+        let size_ptr = 0x42_500_u64;
+        memory.map_bytes(size_ptr, &[0; 8]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_text_extent,
+                &[mem_dc as u32, text_ptr as u32, 5, size_ptr as u32]
+            ),
+            1
+        );
+        assert!(
+            read_guest_u32(&memory, size_ptr).expect("text width") > 0,
+            "GetTextExtentPoint32W must report a nonzero width"
+        );
+
+        // DC text state round trips.
+        let set_bk_mode = runtime.alloc_host_thunk(HostThunk::SetBkMode);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_bk_mode, &[mem_dc as u32, 1]),
+            2,
+            "SetBkMode returns the TRANSPARENT default first"
+        );
+        let set_text_color = runtime.alloc_host_thunk(HostThunk::SetTextColor);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_text_color,
+                &[mem_dc as u32, 0x00FF0000]
+            ),
+            0
+        );
+        let set_bk_color = runtime.alloc_host_thunk(HostThunk::SetBkColor);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_bk_color,
+                &[mem_dc as u32, 0x00000000]
+            ),
+            0x00FF_FFFF,
+            "SetBkColor returns the WHITE default first"
+        );
+
+        // DeleteObject reclaims every created object.
+        let delete_object = runtime.alloc_host_thunk(HostThunk::DeleteObject);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_object, &[brush as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_object, &[brush as u32]),
+            0,
+            "deleting an already-deleted object returns 0"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_object, &[pen as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_object, &[rgn as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_object, &[rnd as u32]),
+            1
+        );
+    }
+
+    // ── Evidence-ui-mm: shell32 PIDL/folder/drag dispatch ──────────────────
+
+    #[test]
+    fn shell32_pidl_folder_and_drag_dispatch() {
+        // The shell32 surface through the host thunks: special-folder paths,
+        // PIDL create/parse/round-trip, shell-item creation, ShellExecuteExW
+        // and the drag-and-drop API family.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "shell32", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let path_buf = 0x43_000_u64;
+        memory.map_bytes(path_buf, &[0; 520]);
+
+        // SHGetFolderPathW / SHGetSpecialFolderPathW: CSIDL_PROGRAM_FILES.
+        let sh_get_folder = runtime.alloc_host_thunk(HostThunk::SHGetFolderPathW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_get_folder,
+                &[0, 0x0026, 0, 0, path_buf as u32]
+            ),
+            0,
+            "SHGetFolderPathW succeeds"
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, path_buf, 260),
+            "C:\\Program Files (x86)"
+        );
+        let sh_get_special = runtime.alloc_host_thunk(HostThunk::SHGetSpecialFolderPathW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_get_special,
+                &[0, path_buf as u32, 0x0026, 0]
+            ),
+            1
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, path_buf, 260),
+            "C:\\Program Files (x86)"
+        );
+
+        // ILCreateFromPathW → SHGetPathFromIDListW round trip + ILFree.
+        let dir_ptr = runtime
+            .alloc_utf16_string(&mut memory, "C:\\Steam")
+            .expect("dir path");
+        let il_create = runtime.alloc_host_thunk(HostThunk::ILCreateFromPathW);
+        let pidl = dispatch_x86_thunk(&mut runtime, &mut memory, il_create, &[dir_ptr as u32]);
+        assert_ne!(pidl, 0, "ILCreateFromPathW must allocate a PIDL");
+        memory.map_bytes(path_buf, &[0; 520]);
+        let sh_get_path = runtime.alloc_host_thunk(HostThunk::SHGetPathFromIDListW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_get_path,
+                &[pidl as u32, path_buf as u32]
+            ),
+            1
+        );
+        assert_eq!(read_guest_utf16_string(&memory, path_buf, 260), "C:\\Steam");
+        let il_free = runtime.alloc_host_thunk(HostThunk::ILFree);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, il_free, &[pidl as u32]),
+            0
+        );
+
+        // SHSimpleIDListFromPath, SHParseDisplayName, SHCreateItemFromParsingName,
+        // SHCreateItemFromIDList, SHBindToParent, SHGetDataFromIDListW.
+        let sh_simple = runtime.alloc_host_thunk(HostThunk::SHSimpleIDListFromPath);
+        let pidl2 = dispatch_x86_thunk(&mut runtime, &mut memory, sh_simple, &[dir_ptr as u32]);
+        assert_ne!(pidl2, 0, "SHSimpleIDListFromPath must allocate a PIDL");
+        let pidl_out = 0x43_100_u64;
+        memory.map_bytes(pidl_out, &[0; 4]);
+        let sh_parse = runtime.alloc_host_thunk(HostThunk::SHParseDisplayName);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_parse,
+                &[dir_ptr as u32, 0, pidl_out as u32, 0]
+            ),
+            0
+        );
+        assert_ne!(
+            read_u32(&memory, pidl_out).expect("pidl out"),
+            0,
+            "SHParseDisplayName must write the parsed PIDL"
+        );
+        let item_out = 0x43_110_u64;
+        memory.map_bytes(item_out, &[0; 4]);
+        let sh_create_item = runtime.alloc_host_thunk(HostThunk::SHCreateItemFromParsingName);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_create_item,
+                &[dir_ptr as u32, 0, 0, item_out as u32]
+            ),
+            0
+        );
+        assert_ne!(
+            read_u32(&memory, item_out).expect("item out"),
+            0,
+            "SHCreateItemFromParsingName must write the item"
+        );
+        let item_out2 = 0x43_120_u64;
+        memory.map_bytes(item_out2, &[0; 4]);
+        let sh_create_idlist = runtime.alloc_host_thunk(HostThunk::SHCreateItemFromIDList);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_create_idlist,
+                &[pidl as u32, 0, item_out2 as u32]
+            ),
+            0
+        );
+        assert_ne!(
+            read_u32(&memory, item_out2).expect("item out 2"),
+            0,
+            "SHCreateItemFromIDList must write the item"
+        );
+        let parent_out = 0x43_130_u64;
+        let child_out = 0x43_140_u64;
+        memory.map_bytes(parent_out, &[0; 4]);
+        memory.map_bytes(child_out, &[0; 4]);
+        let sh_bind_parent = runtime.alloc_host_thunk(HostThunk::SHBindToParent);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_bind_parent,
+                &[pidl as u32, 0, parent_out as u32, child_out as u32]
+            ),
+            0
+        );
+        assert_ne!(
+            read_u32(&memory, parent_out).expect("parent out"),
+            0,
+            "SHBindToParent must write the parent folder"
+        );
+        let data_buf = 0x43_150_u64;
+        memory.map_bytes(data_buf, &[0; 16]);
+        let sh_get_data = runtime.alloc_host_thunk(HostThunk::SHGetDataFromIDListW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_get_data,
+                &[pidl as u32, 0, 0, data_buf as u32, 16]
+            ),
+            0
+        );
+        let desktop_out = 0x43_160_u64;
+        memory.map_bytes(desktop_out, &[0; 4]);
+        let sh_desktop = runtime.alloc_host_thunk(HostThunk::SHGetDesktopFolder);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, sh_desktop, &[desktop_out as u32]),
+            0
+        );
+        assert_ne!(
+            read_u32(&memory, desktop_out).expect("desktop pidl"),
+            0,
+            "SHGetDesktopFolder must write a desktop PIDL"
+        );
+
+        // SHGetKnownFolderPath: FOLDERID_ProgramFilesX86 → the x86 path.
+        let guid_ptr = 0x43_180_u64;
+        write_u32(&mut memory, guid_ptr, 0x7C5A_40EF);
+        memory.map_bytes(guid_ptr + 4, &0xA0FB_u16.to_le_bytes());
+        memory.map_bytes(guid_ptr + 6, &0x4BFC_u16.to_le_bytes());
+        memory.map_bytes(
+            guid_ptr + 8,
+            &[0xB7, 0x4B, 0xC3, 0xF8, 0xE2, 0xF4, 0x4B, 0x6E],
+        );
+        let known_out = 0x43_190_u64;
+        memory.map_bytes(known_out, &[0; 4]);
+        let sh_known = runtime.alloc_host_thunk(HostThunk::SHGetKnownFolderPath);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sh_known,
+                &[guid_ptr as u32, 0, 0, known_out as u32]
+            ),
+            0,
+            "SHGetKnownFolderPath succeeds for a known folder"
+        );
+        let known_path_ptr = read_u32(&memory, known_out).expect("known path ptr") as u64;
+        assert_ne!(known_path_ptr, 0, "SHGetKnownFolderPath must write a path");
+        assert_eq!(
+            read_guest_utf16_string(&memory, known_path_ptr, 260),
+            "C:\\Program Files (x86)"
+        );
+
+        // ShellExecuteExW: valid SHELLEXECUTEINFOW (x86 cbSize=60) with an
+        // empty file — success without spawning a host app; undersized
+        // struct → ERROR_ACCESS_DENIED.
+        let exec_info = 0x43_200_u64;
+        let mut info = vec![0_u8; 60];
+        info[0..4].copy_from_slice(&60_u32.to_le_bytes()); // cbSize
+        memory.map_bytes(exec_info, &info);
+        let shell_execute = runtime.alloc_host_thunk(HostThunk::ShellExecuteExW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                shell_execute,
+                &[exec_info as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            read_u32(&memory, exec_info + 0x20).expect("hInstApp"),
+            42,
+            "ShellExecuteExW must write hInstApp > 32 on success"
+        );
+        let tiny = 0x43_210_u64;
+        let mut tiny_bytes = vec![0_u8; 8];
+        tiny_bytes[0..4].copy_from_slice(&8_u32.to_le_bytes());
+        memory.map_bytes(tiny, &tiny_bytes);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, shell_execute, &[tiny as u32]),
+            0,
+            "undersized SHELLEXECUTEINFOW must fail"
+        );
+        assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+
+        // Drag-and-drop family.
+        runtime.user32.register_class_ex_w("drop-window");
+        let hwnd = runtime
+            .user32
+            .create_window_ex_styled(
+                "drop-window",
+                "drop",
+                64,
+                16,
+                false,
+                false,
+                None,
+                1,
+                0x4000_0000,
+                0,
+                None,
+            )
+            .expect("create drop window");
+        let register_drag_drop = runtime.alloc_host_thunk(HostThunk::RegisterDragDrop);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, register_drag_drop, &[hwnd, 1]),
+            0,
+            "RegisterDragDrop returns S_OK"
+        );
+        let effect_out = 0x43_300_u64;
+        memory.map_bytes(effect_out, &[0; 4]);
+        let do_drag_drop = runtime.alloc_host_thunk(HostThunk::DoDragDrop);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                do_drag_drop,
+                &[0, 0, 1, effect_out as u32]
+            ),
+            0,
+            "DoDragDrop returns S_OK"
+        );
+        assert_eq!(
+            read_u32(&memory, effect_out).expect("effect"),
+            1,
+            "DoDragDrop writes DROPEFFECT_COPY"
+        );
+        let drag_accept = runtime.alloc_host_thunk(HostThunk::DragAcceptFiles);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, drag_accept, &[hwnd, 1]),
+            0
+        );
+        let drag_buf = 0x43_310_u64;
+        memory.map_bytes(drag_buf, &[0; 520]);
+        let drag_query = runtime.alloc_host_thunk(HostThunk::DragQueryFileW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                drag_query,
+                &[0, 0, drag_buf as u32, 260]
+            ),
+            0,
+            "DragQueryFileW with a null HDROP returns 0"
+        );
+        let drag_finish = runtime.alloc_host_thunk(HostThunk::DragFinish);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, drag_finish, &[0]),
+            0
+        );
+    }
+
+    // ── Evidence-ui-mm: comctl32 image-list dispatch ───────────────────────
+
+    #[test]
+    fn comctl32_imagelist_dispatch() {
+        // InitCommonControlsEx plus the full ImageList_* family through the
+        // host thunks: create/add/replace/remove/count, drag state machine
+        // and draw entry points.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "comctl32", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // InitCommonControlsEx(ICC_WIN95_CLASSES) → TRUE + classes registered.
+        let icc = 0x44_000_u64;
+        memory.map_bytes(icc, &[0; 8]);
+        write_u32(&mut memory, icc, 8); // dwSize
+        write_u32(&mut memory, icc + 4, 0x0FFF); // dwICC
+        let init_common = runtime.alloc_host_thunk(HostThunk::InitCommonControlsEx);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init_common, &[icc as u32]),
+            1
+        );
+        assert!(
+            runtime.common_controls_initialized,
+            "InitCommonControlsEx must flag the runtime"
+        );
+
+        // ImageList_Create → Add → GetImageCount → ReplaceIcon.
+        let create = runtime.alloc_host_thunk(HostThunk::ImageList_Create);
+        let himl = dispatch_x86_thunk(&mut runtime, &mut memory, create, &[16, 16, 0x0020, 4, 4]);
+        assert_ne!(himl, 0, "ImageList_Create must allocate an image list");
+        let add = runtime.alloc_host_thunk(HostThunk::ImageList_Add);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, add, &[himl as u32, 0x1000, 0]),
+            0,
+            "first ImageList_Add returns index 0"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, add, &[himl as u32, 0x1001, 0]),
+            1,
+            "second ImageList_Add returns index 1"
+        );
+        let get_count = runtime.alloc_host_thunk(HostThunk::ImageList_GetImageCount);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_count, &[himl as u32]),
+            2
+        );
+        let replace_icon = runtime.alloc_host_thunk(HostThunk::ImageList_ReplaceIcon);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                replace_icon,
+                &[himl as u32, 0xFFFF_FFFF, 0x2000]
+            ),
+            2,
+            "ImageList_ReplaceIcon(-1) appends"
+        );
+
+        // SetImageCount/Remove are observable through GetImageCount.
+        let set_count = runtime.alloc_host_thunk(HostThunk::ImageList_SetImageCount);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_count, &[himl as u32, 5]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_count, &[himl as u32]),
+            5
+        );
+        let remove = runtime.alloc_host_thunk(HostThunk::ImageList_Remove);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                remove,
+                &[himl as u32, 0xFFFF_FFFF]
+            ),
+            1,
+            "ImageList_Remove(-1) clears the list"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_count, &[himl as u32]),
+            0
+        );
+
+        // Drag state machine.
+        let begin_drag = runtime.alloc_host_thunk(HostThunk::ImageList_BeginDrag);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                begin_drag,
+                &[himl as u32, 0, 0, 0]
+            ),
+            1
+        );
+        let drag_enter = runtime.alloc_host_thunk(HostThunk::ImageList_DragEnter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, drag_enter, &[0, 1, 1]),
+            1
+        );
+        let drag_move = runtime.alloc_host_thunk(HostThunk::ImageList_DragMove);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, drag_move, &[2, 3]),
+            1
+        );
+        let drag_leave = runtime.alloc_host_thunk(HostThunk::ImageList_DragLeave);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, drag_leave, &[0]),
+            1
+        );
+        let end_drag = runtime.alloc_host_thunk(HostThunk::ImageList_EndDrag);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, end_drag, &[]),
+            0
+        );
+        let set_drag_cursor = runtime.alloc_host_thunk(HostThunk::ImageList_SetDragCursorImage);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_drag_cursor,
+                &[himl as u32, 0, 0, 0]
+            ),
+            0
+        );
+
+        // Draw entry points.
+        let draw = runtime.alloc_host_thunk(HostThunk::ImageList_Draw);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw,
+                &[himl as u32, 0, 0, 0, 0, 0]
+            ),
+            1
+        );
+        let draw_ex = runtime.alloc_host_thunk(HostThunk::ImageList_DrawEx);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_ex,
+                &[himl as u32, 0, 0, 0, 0, 16, 16, 0, 0, 0]
+            ),
+            1
+        );
+
+        // Destroy tears the list down.
+        let destroy = runtime.alloc_host_thunk(HostThunk::ImageList_Destroy);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, destroy, &[himl as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_count, &[himl as u32]),
+            0,
+            "ImageList_GetImageCount on a destroyed list returns 0"
+        );
+    }
 }
 
 fn read_d3d12_command_queue_desc(
