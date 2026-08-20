@@ -1764,13 +1764,36 @@ impl PeHostRuntime {
                     );
                     return Ok(());
                 }
-                // CreationTime/ExitTime/KernelTime/UserTime — the guest
-                // clock domain; the process has no modelled creation time,
-                // so times report the clock delta (0 in deterministic mode).
-                let ticks = current_guest_filetime_ticks(self.dtm);
+                // CreationTime/ExitTime/KernelTime/UserTime — derived from
+                // the SAME guest-clock domain as GetThreadTimes (they share
+                // the helper, so the two APIs always agree).
+                let times = crate::runtime::guest_thread_times_filetimes(self.dtm);
                 memory.map_bytes(info_ptr, &vec![0_u8; REQUIRED as usize]);
-                write_u64(memory, info_ptr + 16, ticks);
-                write_u64(memory, info_ptr + 24, ticks);
+                write_u64(memory, info_ptr, times[0]);
+                write_u64(memory, info_ptr + 8, times[1]);
+                write_u64(memory, info_ptr + 16, times[2]);
+                write_u64(memory, info_ptr + 24, times[3]);
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_IS_TERMINATED_CLASS => {
+                const REQUIRED: u64 = 4;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // BOOLEAN as ULONG (Windows: "q: ULONG"): 1 once the thread
+                // has terminated, 0 while it is alive.  Consistent with
+                // GetExitCodeThread (STILL_ACTIVE until an exit code is
+                // recorded).
+                let thread_id = self.win32.thread_id_for_handle(thread_handle);
+                let terminated = thread_id.is_ok_and(|id| self.win32.thread_has_exited(id));
+                write_u32(memory, info_ptr, u32::from(terminated));
                 if return_length_ptr != 0 {
                     write_u32(memory, return_length_ptr, REQUIRED as u32);
                 }
@@ -1802,6 +1825,142 @@ impl PeHostRuntime {
                 }
                 let priority = self.win32.get_thread_priority(thread_handle).unwrap_or(0);
                 write_i32(memory, info_ptr, priority);
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_BASE_PRIORITY_CLASS => {
+                const REQUIRED: u64 = 4;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // The process base priority — consistent with the value
+                // reported by ThreadBasicInformation (no process-priority
+                // model exists, so it is 0).
+                write_i32(memory, info_ptr, 0);
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS => {
+                const REQUIRED_X64: u64 = 8;
+                const REQUIRED_X86: u64 = 4;
+                let required = if self.guest_arch == GuestArch::X64 {
+                    REQUIRED_X64
+                } else {
+                    REQUIRED_X86
+                };
+                if info_length < required {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // The queued guest thread's start routine; 0 for threads
+                // with no scheduler record (e.g. the main thread).
+                let start_address = self
+                    .pending_guest_threads
+                    .iter()
+                    .find(|thread| thread.handle == thread_handle)
+                    .map(|thread| thread.start_address)
+                    .unwrap_or(0);
+                write_guest_pointer(memory, info_ptr, start_address, self.guest_arch)?;
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, required as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_AM_I_LAST_THREAD_CLASS => {
+                const REQUIRED: u64 = 4;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // 1 when the queried thread is the only live thread in the
+                // process (the main thread plus every queued guest thread
+                // make up the live set).
+                let thread_id = self.win32.thread_id_for_handle(thread_handle);
+                let is_last = match thread_id {
+                    Ok(thread_id) => {
+                        !self
+                            .pending_guest_threads
+                            .iter()
+                            .any(|thread| thread.thread_id != thread_id)
+                            && (self.win32.current_thread_id() == thread_id
+                                || !self
+                                    .pending_guest_threads
+                                    .iter()
+                                    .any(|thread| thread.thread_id == thread_id))
+                    }
+                    Err(_) => false,
+                };
+                write_u32(memory, info_ptr, u32::from(is_last));
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_PRIORITY_BOOST_CLASS => {
+                const REQUIRED: u64 = 4;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // Windows default: dynamic priority boost enabled (1).
+                write_u32(memory, info_ptr, 1);
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_HIDE_FROM_DEBUGGER_CLASS => {
+                const REQUIRED: u64 = 1;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // BOOLEAN: the thread is not hidden from debuggers.
+                memory.map_bytes(info_ptr, &[0_u8; 1]);
+                if return_length_ptr != 0 {
+                    write_u32(memory, return_length_ptr, REQUIRED as u32);
+                }
+                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+            }
+            nt::THREAD_SUSPEND_COUNT_CLASS => {
+                const REQUIRED: u64 = 4;
+                if info_length < REQUIRED {
+                    state.set(
+                        Register::Rax,
+                        u64::from(nt::STATUS_INFO_LENGTH_MISMATCH.raw()),
+                    );
+                    return Ok(());
+                }
+                // The subsystem suspend count — the single source of truth
+                // the scheduler mirrors, so this always agrees with the
+                // pump gate.
+                let count = self
+                    .win32
+                    .thread_id_for_handle(thread_handle)
+                    .ok()
+                    .and_then(|thread_id| self.win32.thread_suspend_count(thread_id).ok())
+                    .unwrap_or(0);
+                write_u32(memory, info_ptr, count);
                 if return_length_ptr != 0 {
                     write_u32(memory, return_length_ptr, REQUIRED as u32);
                 }
@@ -1880,6 +2039,12 @@ impl PeHostRuntime {
 
     /// `NtSuspendThread` — real suspend count at the scheduler level: the
     /// pump skips suspended threads until every suspension is released.
+    ///
+    /// The subsystem is the ONLY counter mutation (`win32.suspend_thread`
+    /// validates THREAD_SUSPEND_RESUME and returns the true previous
+    /// count); the scheduler record then syncs FROM the subsystem, so the
+    /// Win32 and Nt paths on the same thread are interchangeable and the
+    /// two counters can never disagree.
     pub(crate) fn dispatch_nt_suspend_thread(
         &mut self,
         state: &mut CpuState,
@@ -1889,20 +2054,29 @@ impl PeHostRuntime {
         let previous_count_ptr = guest_call_arg(state, memory, 1)?;
         match self.win32.suspend_thread(thread_handle) {
             Ok(previous) => {
-                if let Some(thread) = self
-                    .pending_guest_threads
-                    .iter_mut()
-                    .find(|thread| thread.handle == thread_handle)
-                {
-                    thread.suspended = thread.suspended.saturating_add(1);
-                }
+                self.sync_pending_thread_suspend_count(thread_handle);
                 if previous_count_ptr != 0 {
                     write_u32(memory, previous_count_ptr, previous);
                 }
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             Err(_) => {
-                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                // Windows: suspending a terminated thread reports
+                // STATUS_THREAD_IS_TERMINATING (0xC000004A); every other
+                // failure (invalid handle / access) reports
+                // STATUS_INVALID_HANDLE.
+                let terminated = self
+                    .win32
+                    .thread_id_for_handle(thread_handle)
+                    .is_ok_and(|thread_id| self.win32.thread_has_exited(thread_id));
+                state.set(
+                    Register::Rax,
+                    u64::from(if terminated {
+                        nt::STATUS_THREAD_IS_TERMINATING.raw()
+                    } else {
+                        nt::STATUS_INVALID_HANDLE.raw()
+                    }),
+                );
             }
         }
         self.last_error = 0;
@@ -1910,6 +2084,10 @@ impl PeHostRuntime {
     }
 
     /// `NtResumeThread` — decrement the scheduler suspend count.
+    ///
+    /// Same single-source-of-truth contract as `NtSuspendThread`: the
+    /// subsystem decrements and returns the previous count, and the
+    /// scheduler record syncs from it.
     pub(crate) fn dispatch_nt_resume_thread(
         &mut self,
         state: &mut CpuState,
@@ -1919,20 +2097,28 @@ impl PeHostRuntime {
         let previous_count_ptr = guest_call_arg(state, memory, 1)?;
         match self.win32.resume_thread(thread_handle) {
             Ok(previous) => {
-                if let Some(thread) = self
-                    .pending_guest_threads
-                    .iter_mut()
-                    .find(|thread| thread.handle == thread_handle)
-                {
-                    thread.suspended = thread.suspended.saturating_sub(1);
-                }
+                self.sync_pending_thread_suspend_count(thread_handle);
                 if previous_count_ptr != 0 {
                     write_u32(memory, previous_count_ptr, previous);
                 }
                 state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
             }
             Err(_) => {
-                state.set(Register::Rax, u64::from(nt::STATUS_INVALID_HANDLE.raw()));
+                // Terminated threads report STATUS_THREAD_IS_TERMINATING
+                // (0xC000004A); every other failure reports
+                // STATUS_INVALID_HANDLE.
+                let terminated = self
+                    .win32
+                    .thread_id_for_handle(thread_handle)
+                    .is_ok_and(|thread_id| self.win32.thread_has_exited(thread_id));
+                state.set(
+                    Register::Rax,
+                    u64::from(if terminated {
+                        nt::STATUS_THREAD_IS_TERMINATING.raw()
+                    } else {
+                        nt::STATUS_INVALID_HANDLE.raw()
+                    }),
+                );
             }
         }
         self.last_error = 0;
@@ -2043,7 +2229,11 @@ impl PeHostRuntime {
                 parameter,
             )?;
             if create_suspended {
+                // NtCreateThreadEx(create_suspended): the suspension is
+                // recorded in BOTH the subsystem ThreadState (the single
+                // source of truth) and the scheduler record.
                 pending_thread.suspended = 1;
+                let _ = self.win32.set_thread_suspend_count(thread_id, 1);
             }
             self.pending_guest_threads.push_back(pending_thread);
         }

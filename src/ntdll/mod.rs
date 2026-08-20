@@ -392,11 +392,42 @@ pub const PROCESS_PROTECTION_INFORMATION_CLASS: u32 = 38;
 pub const PROCESS_MITIGATION_POLICY_CLASS: u32 = 52;
 
 // THREADINFOCLASS (NtQueryInformationThread / NtSetInformationThread).
+//
+// Every value below was VERIFIED against the current Windows numbering
+// (webfetch of authoritative headers, Aug 2026): Wine `winternl.h`
+// (master), mingw-w64 `winternl.h` (master) and ProcessHacker's `phnt`
+// `ntpsapi.h` ALL agree:
+//
+//   ThreadBasicInformation = 0    ThreadTimes = 1    ThreadPriority = 2
+//   ThreadBasePriority = 3        ThreadAffinityMask = 4
+//   ThreadImpersonationToken = 5  ThreadDescriptorTableEntry = 6
+//   ThreadEnableAlignmentFaultFixup = 7  ThreadEventPair = 8
+//   ThreadQuerySetWin32StartAddress = 9  ThreadZeroTlsCell = 10
+//   ThreadPerformanceCount = 11   ThreadAmILastThread = 12
+//   ThreadIdealProcessor = 13     ThreadPriorityBoost = 14
+//   ThreadSetTlsArrayAddress = 15 ThreadIsIoPending = 16
+//   ThreadHideFromDebugger = 17   ThreadBreakOnTermination = 18
+//   ThreadSwitchLegacyState = 19  ThreadIsTerminated = 20
+//   ThreadLastSystemCall = 21 ... ThreadSuspendCount = 35
+//
+// NOTE on a circulating variant: some third-party references list a SHIFTED
+// layout with `ThreadIsTerminated = 2`, `ThreadPriority = 3`,
+// `ThreadAffinityMask = 5`, `ThreadHideFromDebugger = 18` and
+// `ThreadSuspendCount = 36`.  NO authoritative current header supports it
+// (wine/mingw-w64/phnt agree on the unshifted values above), so per the
+// "use the CURRENT Windows value" rule the unshifted numbering is what the
+// query surface implements.
 pub const THREAD_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const THREAD_TIMES_CLASS: u32 = 1;
-pub const THREAD_AFFINITY_MASK_CLASS: u32 = 3;
-pub const THREAD_PRIORITY_CLASS: u32 = 16;
-pub const THREAD_BASE_PRIORITY_CLASS: u32 = 17;
+pub const THREAD_IS_TERMINATED_CLASS: u32 = 20;
+pub const THREAD_PRIORITY_CLASS: u32 = 2;
+pub const THREAD_BASE_PRIORITY_CLASS: u32 = 3;
+pub const THREAD_AFFINITY_MASK_CLASS: u32 = 4;
+pub const THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS: u32 = 9;
+pub const THREAD_AM_I_LAST_THREAD_CLASS: u32 = 12;
+pub const THREAD_PRIORITY_BOOST_CLASS: u32 = 14;
+pub const THREAD_HIDE_FROM_DEBUGGER_CLASS: u32 = 17;
+pub const THREAD_SUSPEND_COUNT_CLASS: u32 = 35;
 
 // SYSTEM_INFORMATION_CLASS (NtQuerySystemInformation).
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;

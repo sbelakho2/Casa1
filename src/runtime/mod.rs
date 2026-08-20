@@ -2760,6 +2760,8 @@ pub enum HostThunk {
     WakeConditionVariable,
     /// `GetThreadPriority` — returns the priority of a thread.
     GetThreadPriority,
+    /// `GetThreadTimes` — returns creation/exit/kernel/user times for a thread.
+    GetThreadTimes,
     /// `CreateRemoteThread` — creates a thread in another process.
     CreateRemoteThread,
     /// `QueueUserAPC` — queues an APC to a thread's APC queue.
@@ -8344,6 +8346,66 @@ impl NtThunkSession {
     #[doc(hidden)]
     pub fn parked_waiter_count(&self) -> usize {
         self.runtime.pending_guest_threads.len()
+    }
+
+    /// The scheduler's suspend count for a pending guest thread handle
+    /// (the record the pump gate reads).
+    #[doc(hidden)]
+    pub fn pending_thread_suspend_count(&self, thread_handle: u32) -> Option<u32> {
+        self.runtime
+            .pending_guest_threads
+            .iter()
+            .find(|thread| thread.handle == thread_handle)
+            .map(|thread| thread.suspended)
+    }
+
+    /// Switch the guest architecture of this session.  Thread creation only
+    /// queues scheduler records for x86 guests, so suspend/wait tests run
+    /// with `GuestArch::X86`.  The arch switch rebuilds the canonical VM,
+    /// so the scratch arena is re-registered and the image re-wired exactly
+    /// as the constructor does.
+    #[doc(hidden)]
+    pub fn set_guest_arch(&mut self, guest_arch: GuestArch) {
+        self.runtime.set_guest_arch(guest_arch);
+        self.runtime.win32.address_space_mut().register(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmRegionKind::Private,
+        );
+        self.runtime.win32.address_space_mut().commit(
+            0x10_000,
+            0x60_000,
+            crate::vm::VmProtection::READ_WRITE,
+            false,
+        );
+        self.memory.set_vm(self.runtime.win32.address_space_mut());
+    }
+
+    /// Drive one host thunk with the x86 stack calling convention (return
+    /// address at `[esp]`, args below it) and return EAX.
+    #[doc(hidden)]
+    pub fn call_x86(&mut self, thunk: u64, args: &[u32]) -> u32 {
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, self.stack);
+        write_u32(&mut self.memory, self.stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().copied().enumerate() {
+            write_u32(&mut self.memory, self.stack + 4 + (index as u64 * 4), arg);
+        }
+        let _ = self
+            .runtime
+            .dispatch_import(thunk, &mut state, &mut self.memory);
+        state.get(Register::Rax) as u32
+    }
+
+    /// Run one scheduler pump cycle: runs a ready guest thread, or reports
+    /// false when nothing was runnable (suspended / parked threads are not
+    /// runnable).
+    #[doc(hidden)]
+    pub fn pump_pending_guest_thread(&mut self) -> bool {
+        self.runtime
+            .pump_pending_guest_thread(&mut self.memory)
+            .map(|outcome| outcome.did_work)
+            .unwrap_or(false)
     }
 
     /// The scheduler readiness probe for the parked waiter: true when the
@@ -26476,11 +26538,14 @@ impl PeHostRuntime {
                 }
                 if can_queue_guest_thread {
                     // CREATE_SUSPENDED threads ARE queued with suspend count 1
-                    // and start once ResumeThread clears it.
+                    // and start once ResumeThread clears it.  The suspension is
+                    // recorded in BOTH the subsystem ThreadState (the single
+                    // source of truth) and the scheduler record.
                     let mut pending_thread =
                         self.prepare_guest_thread_entry(memory, thread_handle, stack_size, start_address, parameter)?;
                     if creation_flags & CREATE_SUSPENDED != 0 {
                         pending_thread.suspended = 1;
+                        let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
@@ -27218,6 +27283,34 @@ impl PeHostRuntime {
                         self.last_error = last_error_from_app_error(&error);
                     }
                 }
+            }
+            HostThunk::GetThreadTimes => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let creation_ptr = guest_call_arg(state, memory, 1)?;
+                let exit_ptr = guest_call_arg(state, memory, 2)?;
+                let kernel_ptr = guest_call_arg(state, memory, 3)?;
+                let user_ptr = guest_call_arg(state, memory, 4)?;
+                if handle == 0
+                    || !matches!(
+                        self.win32.handle_object_type(handle),
+                        Ok(crate::win32::ObjectType::Thread)
+                    )
+                {
+                    state.set(Register::Rax, 0); // FALSE
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                // Four FILETIMEs derived from the SAME guest-clock domain as
+                // the ThreadTimes information class (they share the helper,
+                // so the Win32 and Nt queries always agree).
+                let times = guest_thread_times_filetimes(self.dtm);
+                for (ptr, value) in [(creation_ptr, times[0]), (exit_ptr, times[1]), (kernel_ptr, times[2]), (user_ptr, times[3])] {
+                    if ptr != 0 {
+                        write_u64(memory, ptr, value);
+                    }
+                }
+                state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::GetExitCodeProcess => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
@@ -31225,7 +31318,9 @@ impl PeHostRuntime {
                     // CREATE_SUSPENDED threads ARE queued: they sit in the
                     // pending list with suspend count 1 and are skipped by the
                     // pump until ResumeThread clears the suspension (see
-                    // `pump_pending_guest_thread` / `ResumeThread`).
+                    // `pump_pending_guest_thread` / `ResumeThread`).  The
+                    // suspension is recorded in BOTH the subsystem ThreadState
+                    // (the single source of truth) and the scheduler record.
                     let mut pending_thread = self.prepare_guest_thread_entry(
                         memory,
                         thread_handle,
@@ -31235,6 +31330,7 @@ impl PeHostRuntime {
                     )?;
                     if creation_flags & CREATE_SUSPENDED != 0 {
                         pending_thread.suspended = 1;
+                        let _ = self.win32.set_thread_suspend_count(thread_id, 1);
                     }
                     self.pending_guest_threads.push_back(pending_thread);
                 }
@@ -39702,19 +39798,20 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                // A queued (not-yet-started) guest thread gets one more
-                // suspension; each one needs a matching ResumeThread.  Threads
-                // already running cannot be paused in this cooperative model,
-                // so their previous suspend count is 0 (Windows-compatible
-                // for an unsuspended thread).
-                let mut previous = 0_u32;
-                for thread in &mut self.pending_guest_threads {
-                    if thread.handle == handle {
-                        previous = thread.suspended;
-                        thread.suspended = thread.suspended.saturating_add(1);
-                        break;
+                // The subsystem is the ONLY counter mutation
+                // (win32.suspend_thread validates THREAD_SUSPEND_RESUME and
+                // returns the TRUE previous count); the scheduler record is
+                // then synced FROM the subsystem so the two can never drift
+                // and Win32/Nt suspend/resume thunks are interchangeable.
+                let previous = match self.win32.suspend_thread(handle) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED
+                        self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
                     }
-                }
+                };
+                self.sync_pending_thread_suspend_count(handle);
                 state.set(Register::Rax, previous as u64);
                 self.last_error = 0;
             }
@@ -39730,18 +39827,18 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                // Decrement the pending thread's suspend count (returning the
-                // previous count); once it reaches 0 the pump starts it.
-                let mut previous = 0_u32;
-                for thread in &mut self.pending_guest_threads {
-                    if thread.handle == handle {
-                        previous = thread.suspended;
-                        if thread.suspended > 0 {
-                            thread.suspended -= 1;
-                        }
-                        break;
+                // Same single-source-of-truth contract as SuspendThread: the
+                // subsystem decrements and returns the previous count; the
+                // scheduler record syncs from it.
+                let previous = match self.win32.resume_thread(handle) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        state.set(Register::Rax, u32::MAX as u64); // THREAD_SUSPEND_FAILED
+                        self.last_error = last_error_from_app_error(&error);
+                        return Ok(None);
                     }
-                }
+                };
+                self.sync_pending_thread_suspend_count(handle);
                 state.set(Register::Rax, previous as u64);
                 self.last_error = 0;
             }
@@ -64922,6 +65019,9 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadPriority" => {
                 Self::GetThreadPriority
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadTimes" => {
+                Self::GetThreadTimes
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateRemoteThread" => {
                 Self::CreateRemoteThread
             }
@@ -65257,6 +65357,9 @@ impl HostThunk {
                 if name == "GetThreadPriority" =>
             {
                 Self::GetThreadPriority
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadTimes" => {
+                Self::GetThreadTimes
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. })
                 if name == "CreateRemoteThread" =>
@@ -68151,7 +68254,8 @@ impl HostThunk {
             | Self::ModifyMenuW
             | Self::GetMenuStringW
             | Self::SHParseDisplayName
-            | Self::SHGetDataFromIDListW => 20,
+            | Self::SHGetDataFromIDListW
+            | Self::GetThreadTimes => 20,
             Self::LCMapStringW
             | Self::WsaSocketA
             | Self::GetQueuedCompletionStatusEx
@@ -88473,6 +88577,18 @@ fn is_shell_link_interface_iid(iid: &str) -> bool {
 
 fn current_guest_filetime_ticks(dtm: bool) -> u64 {
     if dtm { 0 } else { current_host_ticks_100ns() }
+}
+
+/// The four guest-clock FILETIME values (creation, exit, kernel, user)
+/// reported by GetThreadTimes and the ThreadTimes information class.
+///
+/// BOTH APIs derive from the SAME guest-clock domain through this helper so
+/// they always agree (the process has no modelled creation/exit timestamps,
+/// so those report 0; kernel and user time report the clock delta — 0 in
+/// deterministic mode).
+pub(crate) fn guest_thread_times_filetimes(dtm: bool) -> [u64; 4] {
+    let ticks = current_guest_filetime_ticks(dtm);
+    [0, 0, ticks, ticks]
 }
 
 struct HostTimeZoneInformation {

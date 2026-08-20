@@ -532,6 +532,29 @@ pub(crate) struct PumpedThreadOutcome {
 }
 
 impl PeHostRuntime {
+    /// Copy the subsystem's suspend count (the single source of truth) into
+    /// the scheduler's pending-thread record for `thread_handle`.
+    ///
+    /// Called after every Win32/Nt suspend/resume mutation: the subsystem
+    /// counter (`Win32Subsystem::suspend_thread` / `resume_thread`) is the
+    /// ONLY place suspension is changed, and the per-thread scheduler record
+    /// mirrors it, so the pump gate (`thread.suspended == 0`) can never
+    /// disagree with the subsystem state.
+    pub(crate) fn sync_pending_thread_suspend_count(&mut self, thread_handle: u32) {
+        let Ok(thread_id) = self.win32.thread_id_for_handle(thread_handle) else {
+            return;
+        };
+        let Ok(count) = self.win32.thread_suspend_count(thread_id) else {
+            return;
+        };
+        for thread in &mut self.pending_guest_threads {
+            if thread.thread_id == thread_id {
+                thread.suspended = count;
+                return;
+            }
+        }
+    }
+
     pub(crate) fn pump_pending_guest_thread(
         &mut self,
         memory: &mut MemoryImage,
@@ -541,9 +564,14 @@ impl PeHostRuntime {
         // `Waiting`/`AlertableWaiting` threads are only ready once their
         // wake_tick has expired; `Exiting` threads are mid-teardown inside
         // their own pump cycle (they never sit in the queue across cycles)
-        // and `Exited` threads are gone.
+        // and `Exited` threads are gone.  A thread whose subsystem state has
+        // already recorded an exit code is skipped REGARDLESS of its suspend
+        // count — a terminated thread must never start, even if its
+        // suspension was never released (and suspend/resume on it already
+        // fails, so the counters can only stay put).
         let Some(ready_index) = self.pending_guest_threads.iter().position(|thread| {
             thread.suspended == 0
+                && !self.win32.thread_has_exited(thread.thread_id)
                 && match thread.state_machine {
                     GuestThreadState::Waiting | GuestThreadState::AlertableWaiting => {
                         if thread.wait.is_some() {
