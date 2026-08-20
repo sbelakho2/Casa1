@@ -26,6 +26,10 @@ use std::fmt;
 
 /// The Nt* file surface (NtCreateFile).
 pub mod file;
+/// The Ldr loader surface (LdrLoadDll, LdrUnloadDll, LdrGetDllHandle,
+/// LdrGetProcedureAddress, the loader-lock protocol, LdrAddRefDll /
+/// LdrRemoveRefDll).
+pub mod ldr;
 /// The Nt* section / mapping surface.
 pub mod loader;
 /// The Nt* virtual-memory surface.
@@ -408,6 +412,41 @@ pub const SYSTEM_PERFORMANCE_INFORMATION_CLASS: u32 = 2;
 pub const OBJECT_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const OBJECT_NAME_INFORMATION_CLASS: u32 = 1;
 pub const OBJECT_TYPE_INFORMATION_CLASS: u32 = 2;
+
+// ── Ldr loader-lock protocol (ntldr.h LDR_LOCK_LOADER_LOCK_*) ───────────────
+
+/// LdrLockLoaderLock flag: raise (as an exception) on errors.  Accepted;
+/// the cooperative model has no raising path.
+pub const LDR_LOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS: u32 = 0x0000_0001;
+/// LdrLockLoaderLock flag: try-only acquire (no blocking).  The runtime
+/// models the loader lock as always acquirable (single-threaded guest
+/// context pump), so a try-only acquire succeeds like a blocking one.
+pub const LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY: u32 = 0x0000_0002;
+/// Valid flag mask for LdrLockLoaderLock.
+pub const LDR_LOCK_LOADER_LOCK_FLAG_MASK: u32 = 0x0000_0003;
+
+/// LdrUnlockLoaderLock flag: raise (as an exception) on errors.  Accepted;
+/// the cooperative model has no raising path.
+pub const LDR_UNLOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS: u32 = 0x0000_0001;
+/// Valid flag mask for LdrUnlockLoaderLock.
+pub const LDR_UNLOCK_LOADER_LOCK_FLAG_MASK: u32 = 0x0000_0001;
+
+/// LdrLockLoaderLock disposition: invalid / not yet determined.
+pub const LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID: u32 = 0;
+/// LdrLockLoaderLock disposition: the lock was acquired by this call.
+pub const LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED: u32 = 1;
+/// LdrLockLoaderLock disposition: the lock is already held (try-only).
+pub const LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_NOT_ACQUIRED: u32 = 2;
+
+/// LdrAddRefDll flag: pin the module (it is never unloaded).
+pub const LDR_ADDREF_DLL_PIN: u32 = 0x0000_0001;
+/// Valid flag mask for LdrAddRefDll.
+pub const LDR_ADDREF_DLL_FLAG_MASK: u32 = 0x0000_0001;
+
+/// LdrRemoveRefDll flag: unpin the module (restores a normal load count).
+pub const LDR_REMOVE_REF_DLL_PIN: u32 = 0x0000_0001;
+/// Valid flag mask for LdrRemoveRefDll.
+pub const LDR_REMOVE_REF_DLL_FLAG_MASK: u32 = 0x0000_0001;
 
 // PROCESS_INFORMATION_CLASS helpers are consumed by the runtime dispatch
 // layer; the x64 structure layouts live in the module that serializes them.

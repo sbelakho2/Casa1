@@ -121,6 +121,41 @@ pub fn read_ansi_string(memory: &MemoryImage, ptr: u64) -> Result<String, NtStat
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Read an ANSI_STRING structure (`{ Length: u16 @0, MaximumLength: u16 @2,
+/// Buffer: uptr @8 (x64) / @4 (x86) }`).  Length is in BYTES for ANSI
+/// strings; the buffer bytes are decoded lossily like
+/// [`read_ansi_string`].
+pub fn read_ansi_string_struct(
+    memory: &MemoryImage,
+    string_ptr: u64,
+    arch: GuestArch,
+) -> Result<String, NtStatus> {
+    if string_ptr == 0 {
+        return Ok(String::new());
+    }
+    let length = memory
+        .read_u16(string_ptr)
+        .map_err(|_| STATUS_ACCESS_VIOLATION_RTL)?;
+    let buffer_ptr = match arch {
+        GuestArch::X64 => memory
+            .read_u64(string_ptr + 8)
+            .map_err(|_| STATUS_ACCESS_VIOLATION_RTL)?,
+        GuestArch::X86 => u64::from(
+            memory
+                .read_u32(string_ptr + 4)
+                .map_err(|_| STATUS_ACCESS_VIOLATION_RTL)?,
+        ),
+    };
+    if buffer_ptr == 0 || length == 0 {
+        return Ok(String::new());
+    }
+    let mut bytes = vec![0_u8; length as usize];
+    memory
+        .read_into(buffer_ptr, &mut bytes)
+        .map_err(|_| STATUS_ACCESS_VIOLATION_RTL)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// `RtlInitUnicodeString` — initialize the destination header from a
 /// NUL-terminated wide source (Buffer aliases the source; Length excludes
 /// the terminator, MaximumLength includes it).

@@ -14,6 +14,7 @@
 
 use super::super::*;
 use crate::ntdll as nt;
+use crate::pe::ImportSymbol;
 
 impl PeHostRuntime {
     /// The SHARED device/IOCTL dispatch: the Win32 `DeviceIoControl` thunk
@@ -2664,6 +2665,289 @@ impl PeHostRuntime {
             u64::MAX
         };
         state.set(Register::Rax, size);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    // ── Ldr loader surface (crate::ntdll::ldr) ─────────────────────────────
+    // The Ldr layer is the NTDLL-native surface ABOVE the loader machinery:
+    // the dispatch arms below read the guest protocol (UNICODE_STRING /
+    // ANSI_STRING names, out-pointers, NTSTATUS results) and delegate to
+    // the ONE loader implementation in crate::ntdll::ldr.
+
+    /// `LdrLoadDll` — resolve through the shared loader machinery
+    /// (synthetic + real-dll paths); a newly loaded module's
+    /// `DLL_PROCESS_ATTACH` + TLS callbacks queue in load order (FIFO);
+    /// an already loaded module returns the same handle with only a
+    /// refcount increment.
+    pub(crate) fn dispatch_ldr_load_dll(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _search_path = guest_call_arg(state, memory, 0)?;
+        let _dll_characteristics = guest_call_arg(state, memory, 1)?;
+        let dll_name = guest_call_arg(state, memory, 2)?;
+        let module_handle_ptr = guest_call_arg(state, memory, 3)?;
+
+        let name = match crate::ntdll::rtl::read_unicode_string(memory, dll_name, self.guest_arch) {
+            Ok(name) => name,
+            Err(status) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                }
+                state.set(Register::Rax, u64::from(status.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let status = match self.ldr_load_dll(&name) {
+            Ok(handle) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, handle, self.guest_arch)?;
+                }
+                nt::STATUS_SUCCESS
+            }
+            Err(status) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                }
+                status
+            }
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrUnloadDll` — refcount--; at 0 queue `DLL_PROCESS_DETACH`
+    /// (+ TLS callbacks) and remove the module.  The main module is never
+    /// unloaded.
+    pub(crate) fn dispatch_ldr_unload_dll(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let module_handle = guest_call_arg(state, memory, 0)?;
+        let status = match self.ldr_unload_dll(module_handle) {
+            Ok(()) => nt::STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrGetDllHandle` — lookup only; NEVER loads.  Not-found is
+    /// `STATUS_DLL_NOT_FOUND`.
+    pub(crate) fn dispatch_ldr_get_dll_handle(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _search_path = guest_call_arg(state, memory, 0)?;
+        let _dll_characteristics = guest_call_arg(state, memory, 1)?;
+        let dll_name = guest_call_arg(state, memory, 2)?;
+        let module_handle_ptr = guest_call_arg(state, memory, 3)?;
+
+        let name = match crate::ntdll::rtl::read_unicode_string(memory, dll_name, self.guest_arch) {
+            Ok(name) => name,
+            Err(status) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                }
+                state.set(Register::Rax, u64::from(status.raw()));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let status = match self.ldr_get_dll_handle(&name) {
+            Ok(handle) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, handle, self.guest_arch)?;
+                }
+                nt::STATUS_SUCCESS
+            }
+            Err(status) => {
+                if module_handle_ptr != 0 {
+                    write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                }
+                status
+            }
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrGetProcedureAddress` — resolve by name (`ANSI_STRING`) or by
+    /// ordinal through the shared `resolve_proc_address` machinery; unknown
+    /// exports are `STATUS_ENTRYPOINT_NOT_FOUND`.
+    pub(crate) fn dispatch_ldr_get_procedure_address(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let module_handle = guest_call_arg(state, memory, 0)?;
+        let procedure_name = guest_call_arg(state, memory, 1)?;
+        let ordinal = guest_call_arg_u32(state, memory, 2)?;
+        let procedure_address_ptr = guest_call_arg(state, memory, 3)?;
+
+        let symbol = if ordinal != 0 {
+            if ordinal > u16::MAX as u32 {
+                // Windows ordinals are 16-bit; anything larger cannot exist.
+                if procedure_address_ptr != 0 {
+                    write_guest_pointer(memory, procedure_address_ptr, 0, self.guest_arch)?;
+                }
+                state.set(
+                    Register::Rax,
+                    u64::from(nt::STATUS_ENTRYPOINT_NOT_FOUND.raw()),
+                );
+                self.last_error = 0;
+                return Ok(());
+            }
+            ImportSymbol::ByOrdinal {
+                ordinal: ordinal as u16,
+            }
+        } else {
+            match crate::ntdll::rtl::read_ansi_string_struct(
+                memory,
+                procedure_name,
+                self.guest_arch,
+            ) {
+                Ok(name) if !name.is_empty() => ImportSymbol::ByName { hint: 0, name },
+                _ => {
+                    // Both the name pointer and the ordinal are missing.
+                    if procedure_address_ptr != 0 {
+                        write_guest_pointer(memory, procedure_address_ptr, 0, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+                    self.last_error = 0;
+                    return Ok(());
+                }
+            }
+        };
+
+        // Dynamic-import instrumentation: LdrGetProcedureAddress is a
+        // canonical runtime import-resolution path — record the resolved
+        // (DLL, name) pair so import coverage accounts for it.
+        let symbol_name = match &symbol {
+            ImportSymbol::ByName { name, .. } => name.clone(),
+            ImportSymbol::ByOrdinal { ordinal } => format!("ordinal#{ordinal}"),
+        };
+        let module_name = self
+            .module_names_by_handle
+            .get(&module_handle)
+            .cloned()
+            .or_else(|| {
+                (module_handle == self.mapped_image_base && !self.main_module_name.is_empty())
+                    .then(|| self.main_module_name.clone())
+            })
+            .unwrap_or_default();
+        record_dynamic_import(&module_name, &symbol_name);
+
+        let (status, address) = match self.ldr_get_procedure_address(module_handle, symbol) {
+            Ok(address) => (nt::STATUS_SUCCESS, address),
+            Err(status) => (status, 0),
+        };
+        if procedure_address_ptr != 0 {
+            write_guest_pointer(memory, procedure_address_ptr, address, self.guest_arch)?;
+        }
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrLockLoaderLock` — the loader-lock protocol: flag/cookie
+    /// validation, then the reentrant acquire (the cooperative model is
+    /// always acquirable).
+    pub(crate) fn dispatch_ldr_lock_loader_lock(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let flags = guest_call_arg_u32(state, memory, 0)?;
+        let disposition_ptr = guest_call_arg(state, memory, 1)?;
+        let cookie_ptr = guest_call_arg(state, memory, 2)?;
+
+        if flags & !nt::LDR_LOCK_LOADER_LOCK_FLAG_MASK != 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        if cookie_ptr == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        if flags & nt::LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY != 0 && disposition_ptr == 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let (cookie, disposition) = self.ldr_lock_loader_lock();
+        if disposition_ptr != 0 {
+            write_u32(memory, disposition_ptr, disposition);
+        }
+        write_guest_pointer(memory, cookie_ptr, cookie, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrUnlockLoaderLock` — release one reentrancy level of the loader
+    /// lock (cookie validated; NULL cookie is a no-op success).
+    pub(crate) fn dispatch_ldr_unlock_loader_lock(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let flags = guest_call_arg_u32(state, memory, 0)?;
+        let cookie = guest_call_arg(state, memory, 1)?;
+        if flags & !nt::LDR_UNLOCK_LOADER_LOCK_FLAG_MASK != 0 {
+            state.set(Register::Rax, u64::from(nt::STATUS_INVALID_PARAMETER.raw()));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let status = match self.ldr_unlock_loader_lock(cookie) {
+            Ok(()) => nt::STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrAddRefDll` — the refcount primitive (PIN pins the module).
+    pub(crate) fn dispatch_ldr_add_ref_dll(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let flags = guest_call_arg_u32(state, memory, 0)?;
+        let module_handle = guest_call_arg(state, memory, 1)?;
+        let status = match self.ldr_add_ref_dll(flags, module_handle) {
+            Ok(()) => nt::STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `LdrRemoveRefDll` — the refcount primitive mirror (PIN unpins).
+    pub(crate) fn dispatch_ldr_remove_ref_dll(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let flags = guest_call_arg_u32(state, memory, 0)?;
+        let module_handle = guest_call_arg(state, memory, 1)?;
+        let status = match self.ldr_remove_ref_dll(flags, module_handle) {
+            Ok(()) => nt::STATUS_SUCCESS,
+            Err(status) => status,
+        };
+        state.set(Register::Rax, u64::from(status.raw()));
         self.last_error = 0;
         Ok(())
     }

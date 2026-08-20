@@ -376,6 +376,27 @@ pub(crate) struct RealDllState {
     pub(crate) native_library: Option<libloading::Library>,
 }
 
+/// The Ldr loader-lock protocol state (LdrLockLoaderLock /
+/// LdrUnlockLoaderLock).
+///
+/// The runtime models the loader lock as a cooperative protocol boundary:
+/// the guest context pump is single-threaded, so the lock is always
+/// acquirable; the state only tracks the synthetic owner cookie and the
+/// reentrancy depth (real LdrLockLoaderLock is reentrant — recursive
+/// acquires by the same thread succeed and must be released the same
+/// number of times).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LoaderLockState {
+    /// The synthetic lock-owner cookie; 0 while the lock is not held.
+    pub(crate) cookie: u64,
+    /// Reentrancy depth (0 = unlocked).
+    pub(crate) depth: u32,
+    /// Monotonic sequence so successive acquisitions mint distinct
+    /// cookies (the low bits of the cookie encode it, like ReactOS's
+    /// `LdrpMakeCookie`).
+    pub(crate) sequence: u64,
+}
+
 /// Tracks metadata for a loaded DLL (both synthetic and real PE).
 /// Used for HMODULE-based lookup and DllMain notification dispatch.
 #[derive(Debug, Clone)]
@@ -587,6 +608,15 @@ pub(crate) struct PeHostRuntime {
     /// Real (on-disk) DLLs that have been loaded via `load_real_dll`.
     /// Keyed by normalised DLL name (lowercase, e.g. "mydll.dll").
     pub(crate) loaded_real_dlls: HashMap<String, RealDllState>,
+    /// Real host-backed DLLs whose guest module was unloaded
+    /// (`LdrUnloadDll` at refcount 0) but whose `libloading` host library
+    /// must stay alive: the runtime never closes libloading handles, so the
+    /// unloaded states are parked here (detach-only list) instead of being
+    /// dropped.  The guest module is fully gone (no handle, no lookup); the
+    /// host library simply outlives the guest view of it.
+    pub(crate) detached_real_dlls: Vec<RealDllState>,
+    /// The Ldr loader-lock protocol state (cookie + reentrancy depth).
+    pub(crate) loader_lock: LoaderLockState,
     /// Cache for forwarded export resolutions.
     /// Key is the forwarder string (e.g. "KERNEL32.CreateFileW"),
     /// value is the resolved address or None if unresolvable.
@@ -1183,6 +1213,8 @@ impl PeHostRuntime {
             synthetic_module_handles: BTreeSet::new(),
             materialized_synthetic_modules: BTreeSet::new(),
             loaded_real_dlls: HashMap::new(),
+            detached_real_dlls: Vec::new(),
+            loader_lock: LoaderLockState::default(),
             forwarder_export_cache: BTreeMap::new(),
             dll_info_table: HashMap::new(),
             synthetic_dll_init_callbacks: Vec::new(),

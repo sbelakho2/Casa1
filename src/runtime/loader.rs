@@ -175,16 +175,25 @@ impl PeHostRuntime {
         }
         let normalized = normalize_module_name(module_name);
 
-        // 1. Already loaded as a real DLL?
-        if let Some(state) = self.loaded_real_dlls.get(&normalized) {
-            // Increment refcount
+        // 1. Already loaded as a real DLL?  Increment BOTH refcount tracks
+        // (RealDllState::refcount AND DllInfo::load_count) — the Win32
+        // FreeLibrary and LdrRemoveRefDll paths decrement both, so repeat
+        // loads must have bumped both.
+        if let Some(state) = self.loaded_real_dlls.get_mut(&normalized) {
+            state.refcount += 1;
+            if let Some(info) = self.dll_info_table.get_mut(&state.handle) {
+                info.load_count = info.load_count.saturating_add(1);
+            }
             let handle = state.handle;
             return (handle, 0);
         }
 
-        // 2. Already loaded as a synthetic module?
-        if let Some(handle) = self.lookup_module_handle(module_name) {
-            return (handle, 0);
+        // 2. Already loaded as a synthetic module?  Route through
+        // get_or_create_module_handle so the load count increments exactly
+        // like the first load did (refcount symmetry with the Win32
+        // FreeLibrary / LdrRemoveRefDll decrement paths).
+        if self.lookup_module_handle(module_name).is_some() {
+            return (self.get_or_create_module_handle(module_name), 0);
         }
 
         // 3. Can synthesize a module from built-in export tables?
@@ -560,6 +569,12 @@ impl PeHostRuntime {
         // Already loaded?
         if let Some(state) = self.loaded_real_dlls.get_mut(&normalized) {
             state.refcount += 1;
+            // Keep the DllInfo load-count track in step with the
+            // RealDllState refcount track (FreeLibrary / LdrRemoveRefDll
+            // decrement BOTH; a second LoadLibrary must have bumped both).
+            if let Some(info) = self.dll_info_table.get_mut(&state.handle) {
+                info.load_count = info.load_count.saturating_add(1);
+            }
             return (state.handle, 0);
         }
 
