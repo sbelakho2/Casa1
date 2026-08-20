@@ -65358,9 +65358,7 @@ impl HostThunk {
             {
                 Self::GetThreadPriority
             }
-            ("kernelbase.dll", ImportSymbol::ByName { name, .. })
-                if name == "GetThreadTimes" =>
-            {
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetThreadTimes" => {
                 Self::GetThreadTimes
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. })
