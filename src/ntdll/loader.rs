@@ -98,7 +98,12 @@ pub fn nt_create_section(
 }
 
 /// Convert PAGE_* flags to the win32 `MemoryProtection` used by the shared
-/// section layer (None for invalid combinations).
+/// section layer (None for invalid combinations).  THE shared conversion:
+/// the Win32 CreateFileMappingW thunk and the NtCreateSection dispatch both
+/// call this, so a section created on either surface records the identical
+/// protection in the shared `SectionObject`.  The accepted PAGE_* set is
+/// the same one `protection_from_page_flags` handles (PAGE_WRITECOPY maps
+/// to read-write like the memory surface).
 pub fn protection_from_nt_flags(flags: u32) -> Option<crate::win32::MemoryProtection> {
     match flags & !crate::ntdll::PAGE_GUARD & !crate::ntdll::PAGE_NOCACHE {
         crate::ntdll::PAGE_NOACCESS => Some(crate::win32::MemoryProtection {
@@ -111,11 +116,13 @@ pub fn protection_from_nt_flags(flags: u32) -> Option<crate::win32::MemoryProtec
             write: false,
             execute: false,
         }),
-        crate::ntdll::PAGE_READWRITE => Some(crate::win32::MemoryProtection {
-            read: true,
-            write: true,
-            execute: false,
-        }),
+        crate::ntdll::PAGE_READWRITE | crate::ntdll::PAGE_WRITECOPY => {
+            Some(crate::win32::MemoryProtection {
+                read: true,
+                write: true,
+                execute: false,
+            })
+        }
         crate::ntdll::PAGE_EXECUTE => Some(crate::win32::MemoryProtection {
             read: false,
             write: false,

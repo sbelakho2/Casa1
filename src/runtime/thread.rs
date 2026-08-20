@@ -145,7 +145,15 @@ impl PeHostRuntime {
         let current_tls_slots = self.tls_slots.clone();
         let current_fls_slots = self.fls_slots.clone();
         let stack_bytes = align_up_u64(stack_size.max(STACK_SIZE as u64), 0x1000) as usize;
-        let stack_limit = self.alloc_private_pages(memory, 0, stack_bytes)?;
+        // The guest stack pages keep the historical RWX protection (the
+        // VirtualAlloc thunk now passes the requested protection through
+        // this same helper).
+        let stack_limit = self.alloc_private_pages(
+            memory,
+            0,
+            stack_bytes,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+        )?;
         let stack_base = stack_limit + stack_bytes as u64;
         let teb_base = self.alloc_zeroed(memory, 0x100, 16)?;
         let tls_vector_ptr =
