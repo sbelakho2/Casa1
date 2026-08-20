@@ -2950,4 +2950,143 @@ mod tests {
         mm.mmio_close(handle, 0);
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── Evidence-ui-mm: waveIn capture, mmioRead, timer periods, PlaySound ──
+
+    #[test]
+    fn test_wave_in_record_roundtrip() {
+        // The waveIn capture contract: open → prepare → add buffer → start
+        // → stop → unprepare → close, with device enumeration and caps.
+        let mut mm = WinMmSubsystem::new();
+        assert_eq!(mm.wave_in_get_num_devs(), 1, "at least 1 input device");
+        let mut caps = WaveInCapsW::default();
+        assert_eq!(
+            mm.wave_in_get_dev_caps(WAVE_MAPPER, &mut caps),
+            MMSYSERR_NOERROR
+        );
+
+        let fmt = WaveFormatEx::pcm(1, 8000, 16);
+        let (rc, handle) = mm.wave_in_open(WAVE_MAPPER, &fmt, None);
+        assert_eq!(rc, MMSYSERR_NOERROR, "waveInOpen should succeed");
+        assert!(handle > 0, "should get a nonzero handle");
+
+        assert_eq!(
+            mm.wave_in_prepare_header(handle, 0x1000, 32, 0x2000, 1024),
+            MMSYSERR_NOERROR
+        );
+        assert_eq!(mm.wave_in_add_buffer(handle, 0x1000, 32), MMSYSERR_NOERROR);
+        assert_eq!(mm.wave_in_start(handle), MMSYSERR_NOERROR);
+        assert_eq!(mm.wave_in_stop(handle), MMSYSERR_NOERROR);
+        assert_eq!(
+            mm.wave_in_unprepare_header(handle, 0x1000, 32),
+            MMSYSERR_NOERROR
+        );
+        assert_eq!(mm.wave_in_close(handle), MMSYSERR_NOERROR);
+        assert_eq!(
+            mm.wave_in_close(handle),
+            MMSYSERR_NOERROR,
+            "closing an already-closed device is idempotent"
+        );
+    }
+
+    #[test]
+    fn test_wave_out_prepare_unprepare_header() {
+        let mut mm = WinMmSubsystem::new();
+        let fmt = WaveFormatEx::pcm(2, 44100, 16);
+        let (rc, handle) = mm.wave_out_open(WAVE_MAPPER, &fmt, None);
+        assert_eq!(rc, MMSYSERR_NOERROR);
+
+        let hdr = WaveHdr {
+            lp_data: 0,
+            dw_buffer_length: 0,
+            dw_bytes_recorded: 0,
+            dw_user: 0,
+            dw_flags: 0,
+            dw_loops: 0,
+            lp_next: 0,
+            reserved: 0,
+        };
+        assert_eq!(mm.wave_out_prepare_header(handle, &hdr), MMSYSERR_NOERROR);
+        assert_eq!(mm.wave_out_unprepare_header(handle, &hdr), MMSYSERR_NOERROR);
+        // Invalid handle is rejected by both paths.
+        assert_eq!(
+            mm.wave_out_prepare_header(0xFFFF_FFFF, &hdr),
+            MMSYSERR_INVALHANDLE
+        );
+        assert_eq!(
+            mm.wave_out_unprepare_header(0xFFFF_FFFF, &hdr),
+            MMSYSERR_INVALHANDLE
+        );
+        mm.wave_out_close(handle);
+    }
+
+    #[test]
+    fn test_mmio_read_roundtrip_and_fourcc() {
+        let mut mm = WinMmSubsystem::new();
+        let path = std::env::temp_dir().join(format!("casa1-mmio-read-{}.bin", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        let handle = mm.mmio_open_w(path_str.clone(), MMIO_WRITE | MMIO_CREATE);
+        assert_ne!(handle, 0, "mmioOpen for writing should succeed");
+
+        assert_eq!(mm.mmio_write(handle, b"hello mmio", 10), 10);
+        assert_eq!(mm.mmio_seek(handle, 0, 0), 0);
+        let mut buf = [0_u8; 16];
+        assert_eq!(mm.mmio_read(handle, &mut buf, 10), 10);
+        assert_eq!(&buf[..10], b"hello mmio");
+        assert_eq!(mm.mmio_close(handle, 0), MMSYSERR_NOERROR);
+        assert_eq!(mm.mmio_read(handle, &mut buf, 1), 0, "closed handle fails");
+
+        assert_eq!(
+            mm.mmio_string_to_fourcc_w("WAVE".to_string(), 0),
+            mmio_fourcc(b'W', b'A', b'V', b'E')
+        );
+        assert_eq!(
+            mm.mmio_string_to_fourcc_w("AB".to_string(), 0),
+            mmio_fourcc(b'A', b'B', b' ', b' ')
+        );
+        assert_eq!(
+            mm.mmio_string_to_fourcc_w(String::new(), 0),
+            mmio_fourcc(b' ', b' ', b' ', b' ')
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_time_periods_and_play_sound() {
+        let mut mm = WinMmSubsystem::new();
+
+        // timeBeginPeriod/timeEndPeriod are the 1 ms timer domain.
+        assert_eq!(WinMmSubsystem::time_begin_period(1), MMSYSERR_NOERROR);
+        let t1 = mm.time_get_time();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t2 = mm.time_get_time();
+        assert!(t2 >= t1, "timeGetTime must increase monotonically");
+        assert_eq!(WinMmSubsystem::time_end_period(1), MMSYSERR_NOERROR);
+
+        // PlaySoundW failure domain: SND_MEMORY is rejected, missing
+        // sounds with SND_NODEFAULT return FALSE without touching the real
+        // audio backend, and unknown SND_ALIAS names are rejected.
+        assert_eq!(
+            mm.play_sound_w(Some("anything".to_string()), 0, SND_MEMORY),
+            0,
+            "SND_MEMORY is not dereferenceable"
+        );
+        assert_eq!(mm.play_sound_w(None, 0, SND_NODEFAULT), 0);
+        assert_eq!(
+            mm.play_sound_w(Some("systembogus".to_string()), 0, SND_ALIAS),
+            0,
+            "unknown system alias must fail"
+        );
+        let missing = std::env::temp_dir().join("casa1-no-such-sound.wav");
+        assert_eq!(
+            mm.play_sound_w(
+                Some(missing.to_string_lossy().to_string()),
+                0,
+                SND_FILENAME | SND_NODEFAULT
+            ),
+            0,
+            "missing file with SND_NODEFAULT must fail"
+        );
+    }
 }

@@ -89695,8 +89695,8 @@ mod tests {
     #[test]
     fn message_pump_peek_get_dispatch_send_and_def_window_proc() {
         // The UI message pump through the real thunks: PostThreadMessageW →
-        // GetMessageW → PeekMessageW → DispatchMessageW, plus SendMessageW
-        // and DefWindowProcW against a live WS_CHILD window.
+        // GetMessageW → PeekMessageW → DispatchMessageW, plus SendMessageW,
+        // DefWindowProcW and EndDialog against a live WS_CHILD window.
         const WS_CHILD: u32 = 0x4000_0000;
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -89921,7 +89921,7 @@ mod tests {
         );
 
         // MonitorFromWindow reports the window's monitor; GetMonitorInfoW
-        // fills the primary MONITORINFO.
+        // fills the MONITORINFO for the secondary (test-layout) monitor.
         let monitor_from_window = runtime.alloc_host_thunk(HostThunk::MonitorFromWindow);
         assert_eq!(
             dispatch_x86_thunk(&mut runtime, &mut memory, monitor_from_window, &[hwnd, 0]),
@@ -90006,7 +90006,7 @@ mod tests {
 
     #[test]
     fn dialog_item_set_get_dispatch() {
-        // GetDlgItem auto-creates the item; SetDlgItemTextA/SetDlgItemInt
+        // GetDlgItem materializes the item; SetDlgItemTextA/SetDlgItemInt
         // store text; GetDlgItemInt parses it back — the dialog control
         // contract through the host thunks.
         const WS_CHILD: u32 = 0x4000_0000;
@@ -90685,7 +90685,7 @@ mod tests {
             .expect("create drop window");
         let register_drag_drop = runtime.alloc_host_thunk(HostThunk::RegisterDragDrop);
         assert_eq!(
-            dispatch_x86_thunk(&mut runtime, &mut memory, register_drag_drop, &[hwnd, 0]),
+            dispatch_x86_thunk(&mut runtime, &mut memory, register_drag_drop, &[hwnd, 1]),
             0,
             "RegisterDragDrop returns S_OK"
         );
