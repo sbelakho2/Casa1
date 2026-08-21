@@ -1897,7 +1897,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "PFXIsPFXBlob",
         "casa1-conformance:runtime-unit-tests",
     ),
-
     // == evidence-gfx-tail ==
     //
     // Remaining implemented families (gdiplus/libcef/oleaut32/wininet/
@@ -3288,7 +3287,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetModuleInformation",
         "casa1-conformance:runtime-dispatch-tests",
     ),
-
 ];
 
 /// Evidence-ui-mm: conformance-backed rows (additive; the differential
