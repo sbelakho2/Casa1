@@ -1101,7 +1101,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "waveOutWrite",
         "casa1-conformance:winmm-unit-tests",
     ),
-
     // == evidence-crt-net ==
     // CRT + network/crypto families (msvcrt, ucrtbase, ws2_32, winhttp,
     // advapi32, bcrypt, crypt32).  Rows below this marker are owned by the
@@ -1898,7 +1897,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "PFXIsPFXBlob",
         "casa1-conformance:runtime-unit-tests",
     ),
-
 ];
 
 /// Evidence-ui-mm: conformance-backed rows (additive; the differential
