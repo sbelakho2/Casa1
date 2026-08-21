@@ -3826,6 +3826,87 @@ pub enum HostThunk {
     Chsize,
     Isatty,
     Commit,
+    // ── Patch 6c: msvcrt math / stdio surface ────────────────────────────────
+    /// `atan2(y, x)` — arc tangent of y/x (two double args, double result).
+    CrtAtan2,
+    /// `ceil(x)` — smallest integral value >= x.
+    CrtCeil,
+    /// `cos(x)` — cosine.
+    CrtCos,
+    /// `exp(x)` — base-e exponential.
+    CrtExp,
+    /// `fabs(x)` — absolute value of a double.
+    CrtFabs,
+    /// `floor(x)` — largest integral value <= x.
+    CrtFloor,
+    /// `log(x)` — natural logarithm.
+    CrtLog,
+    /// `pow(x, y)` — x raised to the power y (two double args, double result).
+    CrtPow,
+    /// `sin(x)` — sine.
+    CrtSin,
+    /// `sqrt(x)` — square root.
+    CrtSqrt,
+    /// `tan(x)` — tangent.
+    CrtTan,
+    /// `printf(format, ...)` — narrow-format printf to the guest stdout.
+    CrtPrintf,
+    /// `sprintf(buffer, format, ...)` — narrow-format formatted string write.
+    CrtSprintf,
+    /// `vsprintf(buffer, format, va_list)` — narrow-format with a caller va_list.
+    CrtVsprintf,
+    /// `sscanf(buffer, format, ...)` — narrow-format scan into out-params.
+    CrtSscanf,
+    /// `strrchr(str, ch)` — pointer to the last occurrence of a char.
+    Strrchr,
+    /// `wcsncmp(a, b, count)` — compare up to count wide chars.
+    Wcsncmp,
+    // ── Patch 6c: msvcp140.dll C++ runtime surface ───────────────────────────
+    /// `_Cnd_init(cnd)` — initialize a C11 condition variable (allocates the
+    /// internal block and writes the opaque handle through `cnd`).
+    MsvcpCndInit,
+    /// `_Cnd_destroy(cnd)` — release a C11 condition variable.
+    MsvcpCndDestroy,
+    /// `_Cnd_signal(cnd)` — wake one waiter.
+    MsvcpCndSignal,
+    /// `_Cnd_broadcast(cnd)` — wake all waiters.
+    MsvcpCndBroadcast,
+    /// `_Cnd_wait(cnd, mtx)` — atomically release `mtx` and wait; re-acquire
+    /// before returning.
+    MsvcpCndWait,
+    /// `_Mtx_init(mtx, type)` — allocate and initialize a mutex (plain /
+    /// recursive / timed per `_Mtx_plain` / `_Mtx_recursive` / `_Mtx_timed`).
+    MsvcpMtxInit,
+    /// `_Mtx_destroy(mtx)` — release a mutex.
+    MsvcpMtxDestroy,
+    /// `_Mtx_lock(mtx)` — block until the mutex is acquired.
+    MsvcpMtxLock,
+    /// `_Mtx_unlock(mtx)` — release the mutex.
+    MsvcpMtxUnlock,
+    /// `_Mtx_current(mtx)` — the owning thread id, or 0 when not owned.
+    MsvcpMtxCurrent,
+    /// `_Mtx_reset(mtx)` — reset a recursive mutex (owner died while held).
+    MsvcpMtxReset,
+    /// `_Xbad_alloc` — throw `std::bad_alloc` (MSVC C++ exception 0xE06D7363).
+    MsvcpXbadAlloc,
+    /// `_Xinvalid_argument(message)` — throw `std::invalid_argument`.
+    MsvcpXinvalidArgument,
+    /// `_Xlength_error(message)` — throw `std::length_error`.
+    MsvcpXlengthError,
+    /// `_Xout_of_range(message)` — throw `std::out_of_range`.
+    MsvcpXoutOfRange,
+    /// `_Xoverflow_error(message)` — throw `std::overflow_error`.
+    MsvcpXoverflowError,
+    /// `_Xruntime_error(message)` — throw `std::runtime_error`.
+    MsvcpXruntimeError,
+    /// `std::_Throw_C_error(errc)` — throw `std::system_error` for a C errc.
+    MsvcpThrowCError,
+    /// `std::_Throw_Cpp_error(errc)` — throw `std::system_error` for a C++ errc.
+    MsvcpThrowCppError,
+    /// `std::random_device::_Get()` — one `unsigned int` of entropy.
+    MsvcpRandomDeviceGet,
+    /// `std::random_device::_Init()` — initialize the entropy source.
+    MsvcpRandomDeviceInit,
     // ── WinINet network status ──────────────────────────────────────────────
     /// InternetGetConnectedState — returns whether the system has network connectivity.
     InternetGetConnectedState,
@@ -30147,6 +30228,57 @@ impl PeHostRuntime {
                 }
                 self.last_error = 0;
             }
+            // ── Patch 6c: msvcrt narrow printf / sprintf / vsprintf / sscanf ─
+            HostThunk::CrtPrintf => {
+                // int printf(const char* format, ...) — narrow format, written
+                // to the guest stdout via the shared delivery path.
+                let format_ptr = guest_call_arg(state, memory, 0)?;
+                let argptr = state.get(Register::Rsp)
+                    + if self.guest_arch == GuestArch::X64 { 8 } else { 4 };
+                let bytes = self.crt_vfprintf_render_narrow(state, memory, format_ptr, argptr)?;
+                let written = self.crt_vfprintf_deliver(memory, 0, &bytes)?;
+                state.set(Register::Rax, written);
+                self.last_error = 0;
+            }
+            HostThunk::CrtSprintf => {
+                // int sprintf(char* buffer, const char* format, ...) — the
+                // rendered bytes are NUL-terminated in the guest buffer; the
+                // return value is the length EXCLUDING the NUL.
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let format_ptr = guest_call_arg(state, memory, 1)?;
+                let argptr = state.get(Register::Rsp)
+                    + if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
+                let bytes = self.crt_vfprintf_render_narrow(state, memory, format_ptr, argptr)?;
+                if buffer != 0 {
+                    memory.map_bytes(buffer, &bytes);
+                    memory.write_u8(buffer + bytes.len() as u64, 0);
+                }
+                state.set(Register::Rax, bytes.len() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::CrtVsprintf => {
+                // int vsprintf(char* buffer, const char* format, va_list ap).
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let format_ptr = guest_call_arg(state, memory, 1)?;
+                let argptr = guest_call_arg(state, memory, 2)?;
+                let bytes = self.crt_vfprintf_render_narrow(state, memory, format_ptr, argptr)?;
+                if buffer != 0 {
+                    memory.map_bytes(buffer, &bytes);
+                    memory.write_u8(buffer + bytes.len() as u64, 0);
+                }
+                state.set(Register::Rax, bytes.len() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::CrtSscanf => {
+                // int sscanf(const char* buffer, const char* format, ...).
+                let input = guest_call_arg(state, memory, 0)?;
+                let format_ptr = guest_call_arg(state, memory, 1)?;
+                let argptr = state.get(Register::Rsp)
+                    + if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
+                let result = self.crt_sscanf_impl(memory, input, format_ptr, argptr)?;
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+            }
             // ── Patch 6b: errno / doserrno ────────────────────────────────────
             HostThunk::CrtErrno => {
                 let errno_ptr = self.crt_errno_ptr(memory)?;
@@ -30340,6 +30472,22 @@ impl PeHostRuntime {
                     Some(bytes.len())
                 } else {
                     bytes.iter().position(|byte| *byte == value)
+                };
+                state.set(
+                    Register::Rax,
+                    found.map(|index| string_ptr + index as u64).unwrap_or(0),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::Strrchr => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)? as u8;
+                let bytes = read_c_string_limit(memory, string_ptr, usize::MAX)?;
+                // strrchr(s, 0) returns a pointer to the terminating NUL.
+                let found = if value == 0 {
+                    Some(bytes.len())
+                } else {
+                    bytes.iter().rposition(|byte| *byte == value)
                 };
                 state.set(
                     Register::Rax,
@@ -30607,6 +30755,26 @@ impl PeHostRuntime {
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
             }
+            HostThunk::Wcsncmp => {
+                // wcsncmp compares up to `count` UTF-16 units WITHOUT stopping
+                // at a NUL (the NUL-vs-char case is a real difference).
+                let count = guest_call_arg(state, memory, 2)? as usize;
+                let left = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
+                let right = read_utf16_string(memory, guest_call_arg(state, memory, 1)?)?;
+                let left_units = left.encode_utf16().collect::<Vec<_>>();
+                let right_units = right.encode_utf16().collect::<Vec<_>>();
+                let mut result = 0_i32;
+                for index in 0..count {
+                    let a = left_units.get(index).copied().unwrap_or(0);
+                    let b = right_units.get(index).copied().unwrap_or(0);
+                    if a != b {
+                        result = i32::from(a) - i32::from(b);
+                        break;
+                    }
+                }
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
+            }
             HostThunk::PEnviron => {
                 state.set(Register::Rax, self.globals.environ_ptr_ptr);
                 self.last_error = 0;
@@ -30847,6 +31015,270 @@ impl PeHostRuntime {
                 }
                 self.last_error = 0;
             }
+            // ── Patch 6c: msvcp140.dll C++ runtime helpers ───────────────────
+            HostThunk::MsvcpCndInit => {
+                // void _Cnd_init(_Cnd_t* cnd) — allocate the internal
+                // condition-variable block and write the opaque handle through
+                // the out-param (the STL stores it and never dereferences).
+                let out = guest_call_arg(state, memory, 0)?;
+                if out == 0 {
+                    state.set(Register::Rax, 2); // thrd_error
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let handle = self.alloc_heap(memory, 16, true)?;
+                self.msvcp_cnds
+                    .insert(handle, Arc::new(GuestConditionVariable::new()));
+                write_guest_pointer(memory, out, handle, self.guest_arch)?;
+                state.set(Register::Rax, 0); // thrd_success
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpCndDestroy => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                self.msvcp_cnds.remove(&handle);
+                if handle != 0 {
+                    self.heap_allocations.remove(&handle);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpCndSignal => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                if let Some(cnd) = self.msvcp_cnds.get(&handle) {
+                    cnd.wake();
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpCndBroadcast => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                if let Some(cnd) = self.msvcp_cnds.get(&handle) {
+                    cnd.wake_all();
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpCndWait => {
+                // int _Cnd_wait(_Cnd_t cnd, _Mtx_t mtx) — atomically release
+                // `mtx`, wait for a wake, then re-acquire `mtx`.  The runtime
+                // is a cooperative pump: with pending guest threads the wait
+                // pumps them until the generation changes; with none (nothing
+                // can possibly signal), the wait returns immediately — a
+                // spurious wakeup, which the C standard explicitly permits.
+                let cnd_handle = guest_call_arg(state, memory, 0)?;
+                let mtx_handle = guest_call_arg(state, memory, 1)?;
+                let Some(cnd) = self.msvcp_cnds.get(&cnd_handle).cloned() else {
+                    state.set(Register::Rax, 2); // thrd_error
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                // Release the mutex before waiting.
+                let current = self.win32.current_thread_id();
+                if let Some(mtx) = self.msvcp_mtxes.get_mut(&mtx_handle) {
+                    mtx.owner = 0;
+                    mtx.depth = 0;
+                }
+                if !self.pending_guest_threads.is_empty() {
+                    let generation = cnd.generation();
+                    while cnd.generation() == generation {
+                        let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                        if let Some(code) = pump_outcome.process_exit {
+                            return Ok(Some(code));
+                        }
+                        if self.pending_guest_threads.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                // Re-acquire the mutex.
+                if let Some(mtx) = self.msvcp_mtxes.get_mut(&mtx_handle) {
+                    mtx.owner = current;
+                    mtx.depth = 1;
+                }
+                state.set(Register::Rax, 0); // thrd_success
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxInit => {
+                // int _Mtx_init(_Mtx_t* mtx, int type) — allocate the internal
+                // block, remember the kind (_Mtx_plain 0x10000 / _Mtx_recursive
+                // 0x10001 / _Mtx_timed 0x10002), and write the opaque handle
+                // through the out-param.
+                let out = guest_call_arg(state, memory, 0)?;
+                let kind = guest_call_arg_u32(state, memory, 1)?;
+                if out == 0 {
+                    state.set(Register::Rax, 2); // thrd_error
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let handle = self.alloc_heap(memory, 16, true)?;
+                self.msvcp_mtxes.insert(handle, MsvcpMtxState::new(kind));
+                write_guest_pointer(memory, out, handle, self.guest_arch)?;
+                state.set(Register::Rax, 0); // thrd_success
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxDestroy => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                self.msvcp_mtxes.remove(&handle);
+                if handle != 0 {
+                    self.heap_allocations.remove(&handle);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxLock => {
+                // int _Mtx_lock(_Mtx_t mtx) — block until acquired.  A
+                // recursive mutex re-entered by its owner only bumps the
+                // depth.  A mutex owned by another (pumped) thread waits
+                // cooperatively; with no pending threads the runtime's
+                // single-pump model acquires after the pump cycle.
+                let handle = guest_call_arg(state, memory, 0)?;
+                let current = self.win32.current_thread_id();
+                let mut acquired = false;
+                while !acquired {
+                    let entry = self.msvcp_mtxes.get(&handle).cloned();
+                    match entry {
+                        Some(mtx) if mtx.owner == 0 => {
+                            let slot = self.msvcp_mtxes.get_mut(&handle).expect("mtx");
+                            slot.owner = current;
+                            slot.depth = 1;
+                            acquired = true;
+                        }
+                        Some(mtx) if mtx.kind & 0xFFFF == 0x0001 && mtx.owner == current => {
+                            let slot = self.msvcp_mtxes.get_mut(&handle).expect("mtx");
+                            slot.depth = slot.depth.saturating_add(1);
+                            acquired = true;
+                        }
+                        None => {
+                            // Lock on an uninitialized handle: treat as error.
+                            state.set(Register::Rax, 2); // thrd_error
+                            self.last_error = 0;
+                            return Ok(None);
+                        }
+                        Some(_) => {
+                            if self.pending_guest_threads.is_empty() {
+                                acquired = true; // pump-free model: bounded progress
+                            } else {
+                                let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                                if let Some(code) = pump_outcome.process_exit {
+                                    return Ok(Some(code));
+                                }
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, 0); // thrd_success
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxUnlock => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                let current = self.win32.current_thread_id();
+                if let Some(mtx) = self.msvcp_mtxes.get_mut(&handle)
+                    && mtx.owner == current
+                {
+                    if mtx.depth <= 1 {
+                        mtx.owner = 0;
+                        mtx.depth = 0;
+                    } else {
+                        mtx.depth -= 1;
+                    }
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxCurrent => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                let owner = self
+                    .msvcp_mtxes
+                    .get(&handle)
+                    .map(|mtx| u64::from(mtx.owner))
+                    .unwrap_or(0);
+                state.set(Register::Rax, owner);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpMtxReset => {
+                // _Mtx_reset: reinitialize a recursive mutex whose owner died
+                // while holding it (the STL calls this from the atexit path).
+                let handle = guest_call_arg(state, memory, 0)?;
+                if let Some(mtx) = self.msvcp_mtxes.get_mut(&handle) {
+                    mtx.owner = 0;
+                    mtx.depth = 0;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpXbadAlloc
+            | HostThunk::MsvcpXinvalidArgument
+            | HostThunk::MsvcpXlengthError
+            | HostThunk::MsvcpXoutOfRange
+            | HostThunk::MsvcpXoverflowError
+            | HostThunk::MsvcpXruntimeError
+            | HostThunk::MsvcpThrowCError
+            | HostThunk::MsvcpThrowCppError => {
+                // The _X* helpers throw their C++ exception type (MSVC C++
+                // exception code 0xE06D7363) through the guest SEH chain —
+                // exactly like `_CxxThrowException`.  The message pointer
+                // (when present) and the errc are recorded in the throw-info
+                // slot so the unhandled-exception report is observable.
+                let message = if matches!(
+                    thunk,
+                    HostThunk::MsvcpXbadAlloc
+                        | HostThunk::MsvcpThrowCError
+                        | HostThunk::MsvcpThrowCppError
+                ) {
+                    0
+                } else {
+                    guest_call_arg(state, memory, 0)?
+                };
+                let throw_info = match thunk {
+                    HostThunk::MsvcpThrowCError | HostThunk::MsvcpThrowCppError => {
+                        guest_call_arg(state, memory, 0)?
+                    }
+                    _ => message,
+                };
+                let name = match thunk {
+                    HostThunk::MsvcpXbadAlloc => "_Xbad_alloc",
+                    HostThunk::MsvcpXinvalidArgument => "_Xinvalid_argument",
+                    HostThunk::MsvcpXlengthError => "_Xlength_error",
+                    HostThunk::MsvcpXoutOfRange => "_Xout_of_range",
+                    HostThunk::MsvcpXoverflowError => "_Xoverflow_error",
+                    HostThunk::MsvcpXruntimeError => "_Xruntime_error",
+                    HostThunk::MsvcpThrowCError => "std::_Throw_C_error",
+                    _ => "std::_Throw_Cpp_error",
+                };
+                // The throw either terminates the process (unhandled → the
+                // exit code must propagate) or resumes the caller (handled).
+                if let Some(code) = self.crt_raise_cpp_exception(state, memory, name, throw_info)? {
+                    return Ok(Some(code));
+                }
+            }
+            HostThunk::MsvcpRandomDeviceInit => {
+                // std::random_device::_Init() — no observable state in this
+                // model (the entropy source is the host RNG).
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::MsvcpRandomDeviceGet => {
+                // std::random_device::_Get() — one unsigned int of entropy
+                // from the host RNG (real non-determinism, like RtlGenRandom).
+                let mut bytes = [0_u8; 4];
+                getrandom::getrandom(&mut bytes).unwrap_or_else(|_| {
+                    let seed = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                        ^ (std::process::id() as u64)
+                        ^ (self.win32.current_thread_id() as u64);
+                    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    for byte in bytes.iter_mut() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *byte = state as u8;
+                    }
+                });
+                state.set(Register::Rax, u64::from(u32::from_le_bytes(bytes)));
+                self.last_error = 0;
+            }
             // ── Patch 6b: character classes (locale "C", ASCII) ──────────────
             HostThunk::Isalpha
             | HostThunk::Isdigit
@@ -31073,6 +31505,87 @@ impl PeHostRuntime {
                         );
                     }
                 }
+                self.last_error = 0;
+            }
+            // ── Patch 6c: msvcrt math (double args in XMM0+ on x64 / on the
+            // x86 stack; double results in XMM0 on x64 and ST(0) on x86) ─────
+            HostThunk::CrtSin => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.sin());
+                self.last_error = 0;
+            }
+            HostThunk::CrtCos => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.cos());
+                self.last_error = 0;
+            }
+            HostThunk::CrtTan => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.tan());
+                self.last_error = 0;
+            }
+            HostThunk::CrtExp => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                let result = value.exp();
+                // C semantics: ERANGE when the result overflows to ±inf.
+                if result.is_infinite() {
+                    self.set_crt_errno(memory, ERANGE);
+                }
+                set_guest_f64_return(state, result);
+                self.last_error = 0;
+            }
+            HostThunk::CrtLog => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                let result = value.ln();
+                // C semantics: log(0) → -inf + ERANGE; log(negative) → NaN + EDOM.
+                if value == 0.0 {
+                    self.set_crt_errno(memory, ERANGE);
+                } else if value < 0.0 {
+                    self.set_crt_errno(memory, EDOM);
+                }
+                set_guest_f64_return(state, result);
+                self.last_error = 0;
+            }
+            HostThunk::CrtSqrt => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                let result = value.sqrt();
+                // C semantics: sqrt(negative) → NaN + EDOM.
+                if value < 0.0 {
+                    self.set_crt_errno(memory, EDOM);
+                }
+                set_guest_f64_return(state, result);
+                self.last_error = 0;
+            }
+            HostThunk::CrtFabs => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.abs());
+                self.last_error = 0;
+            }
+            HostThunk::CrtCeil => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.ceil());
+                self.last_error = 0;
+            }
+            HostThunk::CrtFloor => {
+                let value = guest_call_arg_f64(state, memory, 0)?;
+                set_guest_f64_return(state, value.floor());
+                self.last_error = 0;
+            }
+            HostThunk::CrtAtan2 => {
+                let y = guest_call_arg_f64(state, memory, 0)?;
+                let x = guest_call_arg_f64(state, memory, 1)?;
+                set_guest_f64_return(state, y.atan2(x));
+                self.last_error = 0;
+            }
+            HostThunk::CrtPow => {
+                let base = guest_call_arg_f64(state, memory, 0)?;
+                let exponent = guest_call_arg_f64(state, memory, 1)?;
+                let result = base.powf(exponent);
+                // C semantics: pow(negative, fractional) → NaN + EDOM.
+                if base < 0.0 && exponent.fract() != 0.0 {
+                    self.set_crt_errno(memory, EDOM);
+                }
+                set_guest_f64_return(state, result);
                 self.last_error = 0;
             }
             // ── Patch 6b: qsort / bsearch ────────────────────────────────────
@@ -51577,6 +52090,91 @@ impl PeHostRuntime {
         Ok(None)
     }
 
+    /// Patch 6c: raise the MSVC C++ exception (0xE06D7363) through the guest
+    /// SEH chain — the `_CxxThrowException` shape the `_X*` / `std::_Throw_*`
+    /// helpers use.  A handler claiming the exception resumes the caller with
+    /// the code as the result; an unhandled throw terminates the process with
+    /// the exception code (Windows semantics), recording the throw-info token
+    /// for the report.
+    fn crt_raise_cpp_exception(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        api_name: &str,
+        throw_info: u64,
+    ) -> AppResult<Option<i32>> {
+        let code = 0xE06D_7363;
+        let handled = if self.guest_arch == GuestArch::X86 {
+            self.dispatch_x86_exception(state, memory, code, throw_info, api_name)?
+        } else if self.guest_arch == GuestArch::X64 {
+            let ctx = crate::seh::X64Context {
+                rax: state.gpr[0],
+                rcx: state.gpr[1],
+                rdx: state.gpr[2],
+                rbx: state.gpr[3],
+                rsp: state.gpr[4],
+                rbp: state.gpr[5],
+                rsi: state.gpr[6],
+                rdi: state.gpr[7],
+                r8: state.gpr[8],
+                r9: state.gpr[9],
+                r10: state.gpr[10],
+                r11: state.gpr[11],
+                r12: state.gpr[12],
+                r13: state.gpr[13],
+                r14: state.gpr[14],
+                r15: state.gpr[15],
+                rip: state.rip,
+                xmm: {
+                    let mut xmm = [crate::seh::Xmm128::default(); 16];
+                    for (i, slot) in xmm.iter_mut().enumerate() {
+                        *slot = crate::seh::Xmm128 {
+                            low: state.xmm[i].low,
+                            high: state.xmm[i].high,
+                        };
+                    }
+                    xmm
+                },
+            };
+            let mem_ref: &MemoryImage = memory;
+            let stack_reader =
+                |addr: u64, buf: &mut [u8]| -> bool { mem_ref.read_into(addr, buf).is_ok() };
+            self.seh
+                .dispatch(code, 0, &ctx, self.mapped_image_base, &stack_reader)
+                .is_ok()
+        } else {
+            false
+        };
+        if handled {
+            // A handler claimed the throw: the caller resumes with the code.
+            state.set(Register::Rax, u64::from(code));
+            self.last_error = 0;
+            Ok(None)
+        } else {
+            // Unhandled C++ throw: terminate the process with the exception
+            // code (the structured termination is GuestException).
+            self.unhandled_guest_exception = Some(code);
+            self.emit_event(crate::runtime_events::RuntimeEvent::GuestException {
+                code,
+                guest_pc: state.rip,
+                thread_id: self.win32.current_thread_id(),
+            });
+            crate::steam_milestones::record_first_failure(
+                crate::steam_milestones::FailureCategory::Crt,
+                state.rip as u32,
+                self.win32.current_thread_id(),
+                Some(api_name.to_string()),
+                Some(code),
+                format!("unhandled C++ exception from {api_name}"),
+                None,
+                Some(format!("{{\"throw_info\":{throw_info:#x}}}")),
+            );
+            state.set(Register::Rax, u64::from(code));
+            self.process_exit_requested = Some(code);
+            Ok(Some(code as i32))
+        }
+    }
+
     // ── Patch 6b: CRT FILE* model ─────────────────────────────────────────────
     /// Allocate a guest FILE block (zeroed 0x80 bytes, mirroring the
     /// `__acrt_iob_func` blocks) and register host state for it.  The fd is
@@ -52164,6 +52762,401 @@ impl PeHostRuntime {
         } else {
             self.set_crt_errno(memory, EBADF);
             Ok((EOF as i64) as u64)
+        }
+    }
+
+    // ── Patch 6c: msvcrt narrow printf / sprintf / sscanf ───────────────────
+    /// Render a NARROW (ANSI) printf format through the shared UCRT format
+    /// engine: the narrow format is widened to UTF-16 units and rendered with
+    /// the exact same conversion machinery as `crt_vfprintf_render` (the C
+    /// locale is ASCII-compatible, so byte-widening is faithful).
+    fn crt_vfprintf_render_narrow(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        format_ptr: u64,
+        argptr: u64,
+    ) -> AppResult<Vec<u8>> {
+        if format_ptr == 0 {
+            self.set_crt_errno(memory, EINVAL);
+            return Ok(Vec::new());
+        }
+        let bytes = read_c_string_limit(memory, format_ptr, usize::MAX)?;
+        let format_units = bytes
+            .iter()
+            .map(|byte| u16::from(*byte))
+            .collect::<Vec<_>>();
+        let mut va = CrtVaReader::new(argptr, self.guest_arch);
+        let mut out = Vec::new();
+        let mut index = 0_usize;
+        while index < format_units.len() {
+            if format_units[index] == 0x25 {
+                self.crt_render_conversion(
+                    &mut *memory,
+                    state,
+                    &format_units,
+                    &mut index,
+                    &mut va,
+                    &mut out,
+                    self.guest_arch,
+                )?;
+            } else {
+                let mut encoded = [0_u8; 4];
+                if let Some(ch) = char::from_u32(u32::from(format_units[index])) {
+                    out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+                }
+                index += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `sscanf` core: scan the NARROW input per the NARROW format, assigning
+    /// through the vararg out-params (the shared `CrtVaReader`).  Returns the
+    /// number of assigned items, or -1 (EOF) when an input failure occurs
+    /// before the first assignment.  Integer conversions reuse
+    /// `crt_parse_strtol_full`; float conversions reuse `crt_parse_strtod`.
+    fn crt_sscanf_impl(
+        &mut self,
+        memory: &mut MemoryImage,
+        input_ptr: u64,
+        format_ptr: u64,
+        argptr: u64,
+    ) -> AppResult<i32> {
+        if input_ptr == 0 || format_ptr == 0 {
+            self.set_crt_errno(memory, EINVAL);
+            return Ok(-1);
+        }
+        let input = read_c_string_limit(memory, input_ptr, usize::MAX)?;
+        let format = read_c_string_limit(memory, format_ptr, usize::MAX)?;
+        let mut va = CrtVaReader::new(argptr, self.guest_arch);
+        let mut pos = 0_usize;
+        let mut f = 0_usize;
+        let mut assigned = 0_i32;
+        let mut input_failure = false;
+        let skip_ws = |input: &[u8], pos: usize| -> usize {
+            let mut pos = pos;
+            while pos < input.len() && input[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            pos
+        };
+        while f < format.len() {
+            let directive = format[f];
+            match directive {
+                b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C => {
+                    pos = skip_ws(&input, pos);
+                    f += 1;
+                }
+                b'%' => {
+                    let mut f2 = f + 1;
+                    let suppress = f2 < format.len() && format[f2] == b'*';
+                    if suppress {
+                        f2 += 1;
+                    }
+                    let mut width: Option<usize> = None;
+                    while f2 < format.len() && format[f2].is_ascii_digit() {
+                        width = Some(
+                            width
+                                .unwrap_or(0)
+                                .saturating_mul(10)
+                                .saturating_add(usize::from(format[f2] - b'0')),
+                        );
+                        f2 += 1;
+                    }
+                    let mut length = CrtLengthModifier::None;
+                    if f2 < format.len() {
+                        match format[f2] {
+                            b'h' => {
+                                f2 += 1;
+                                if f2 < format.len() && format[f2] == b'h' {
+                                    length = CrtLengthModifier::Hh;
+                                    f2 += 1;
+                                } else {
+                                    length = CrtLengthModifier::H;
+                                }
+                            }
+                            b'l' => {
+                                f2 += 1;
+                                if f2 < format.len() && format[f2] == b'l' {
+                                    length = CrtLengthModifier::Ll;
+                                    f2 += 1;
+                                } else {
+                                    length = CrtLengthModifier::L;
+                                }
+                            }
+                            b'L' => {
+                                // long double: scanned as double (the runtime
+                                // has no extended-precision model).
+                                length = CrtLengthModifier::L;
+                                f2 += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(&conv) = format.get(f2) else {
+                        break;
+                    };
+                    f2 += 1;
+                    let max = width.unwrap_or(usize::MAX);
+                    match conv {
+                        b'%' => {
+                            if pos < input.len() && input[pos] == b'%' {
+                                pos += 1;
+                            } else {
+                                input_failure = true;
+                                break;
+                            }
+                        }
+                        b'n' => {
+                            // %n stores the count of characters consumed so
+                            // far; it never counts as an assignment.
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    match length {
+                                        CrtLengthModifier::Hh => memory.write_u8(target, pos as u8),
+                                        CrtLengthModifier::H => {
+                                            memory.write_u16(target, pos as u16)
+                                        }
+                                        CrtLengthModifier::L | CrtLengthModifier::Ll => {
+                                            memory.write_u64(target, pos as u64)
+                                        }
+                                        CrtLengthModifier::None => {
+                                            write_u32(memory, target, pos as u32)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        b'c' => {
+                            // %c matches exactly `width` (default 1) chars
+                            // INCLUDING whitespace; no NUL is appended.
+                            let take = max.min(input.len().saturating_sub(pos));
+                            if take == 0 {
+                                input_failure = true;
+                                break;
+                            }
+                            let start = pos;
+                            pos += take;
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    memory.map_bytes(target, &input[start..pos]);
+                                }
+                                assigned += 1;
+                            }
+                        }
+                        b's' => {
+                            // %s skips whitespace, matches non-whitespace up
+                            // to `width`, and appends a NUL.
+                            pos = skip_ws(&input, pos);
+                            if pos >= input.len() {
+                                input_failure = true;
+                                break;
+                            }
+                            let start = pos;
+                            let mut end = pos;
+                            while end < input.len()
+                                && end - start < max
+                                && !input[end].is_ascii_whitespace()
+                            {
+                                end += 1;
+                            }
+                            if end == start {
+                                input_failure = true;
+                                break;
+                            }
+                            pos = end;
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    memory.map_bytes(target, &input[start..end]);
+                                    memory.write_u8(target + (end - start) as u64, 0);
+                                }
+                                assigned += 1;
+                            }
+                        }
+                        b'[' => {
+                            // Scanset: %[...] (or %[^...]).  A leading ']' is
+                            // part of the set; '-' between two chars is a
+                            // range ("a-z"); a leading or trailing '-' is
+                            // literal; unterminated sets stop the scan.
+                            let negated = f2 < format.len() && format[f2] == b'^';
+                            if negated {
+                                f2 += 1;
+                            }
+                            let set_start = f2;
+                            let mut set_end = f2;
+                            if set_end < format.len() && format[set_end] == b']' {
+                                set_end += 1;
+                            }
+                            while set_end < format.len() && format[set_end] != b']' {
+                                set_end += 1;
+                            }
+                            if set_end >= format.len() {
+                                break;
+                            }
+                            let set = &format[set_start..set_end];
+                            let mut member = [false; 256];
+                            let mut set_i = 0_usize;
+                            while set_i < set.len() {
+                                if set[set_i] == b'-' && set_i > 0 && set_i + 1 < set.len() {
+                                    let lo = set[set_i - 1];
+                                    let hi = set[set_i + 1];
+                                    for byte in lo..=hi {
+                                        member[byte as usize] = true;
+                                    }
+                                    set_i += 2;
+                                } else {
+                                    member[set[set_i] as usize] = true;
+                                    set_i += 1;
+                                }
+                            }
+                            pos = skip_ws(&input, pos);
+                            if pos >= input.len() {
+                                input_failure = true;
+                                break;
+                            }
+                            let start = pos;
+                            let mut end = pos;
+                            while end < input.len()
+                                && end - start < max
+                                && member[input[end] as usize] != negated
+                            {
+                                end += 1;
+                            }
+                            if end == start {
+                                input_failure = true;
+                                break;
+                            }
+                            pos = end;
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    memory.map_bytes(target, &input[start..end]);
+                                    memory.write_u8(target + (end - start) as u64, 0);
+                                }
+                                assigned += 1;
+                            }
+                            f2 = set_end + 1;
+                        }
+                        b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
+                            pos = skip_ws(&input, pos);
+                            if pos >= input.len() {
+                                input_failure = true;
+                                break;
+                            }
+                            let end = pos.saturating_add(max).min(input.len());
+                            let base = match conv {
+                                b'x' | b'X' => 16,
+                                b'o' => 8,
+                                b'i' => 0,
+                                _ => 10,
+                            };
+                            let text = String::from_utf8_lossy(&input[pos..end]);
+                            let (value, consumed, _overflow) = crt_parse_strtol_full(&text, base);
+                            if consumed == 0 {
+                                // Matching failure (chars remain but none
+                                // convert) vs input failure (input ended).
+                                if pos >= input.len() {
+                                    input_failure = true;
+                                }
+                                break;
+                            }
+                            pos += consumed;
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    match conv {
+                                        b'u' | b'x' | b'X' | b'o' => {
+                                            let bits = value as u32;
+                                            match length {
+                                                CrtLengthModifier::Hh => {
+                                                    memory.write_u8(target, bits as u8)
+                                                }
+                                                CrtLengthModifier::H => {
+                                                    memory.write_u16(target, bits as u16)
+                                                }
+                                                CrtLengthModifier::L | CrtLengthModifier::Ll => {
+                                                    memory.write_u64(target, value as u64)
+                                                }
+                                                CrtLengthModifier::None => {
+                                                    write_u32(memory, target, bits)
+                                                }
+                                            }
+                                        }
+                                        _ => match length {
+                                            CrtLengthModifier::Hh => {
+                                                memory.write_u8(target, value as u8)
+                                            }
+                                            CrtLengthModifier::H => {
+                                                memory.write_u16(target, value as u16)
+                                            }
+                                            CrtLengthModifier::L | CrtLengthModifier::Ll => {
+                                                memory.write_u64(target, value as u64)
+                                            }
+                                            CrtLengthModifier::None => {
+                                                write_u32(memory, target, value as u32)
+                                            }
+                                        },
+                                    }
+                                }
+                                assigned += 1;
+                            }
+                        }
+                        b'f' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                            pos = skip_ws(&input, pos);
+                            if pos >= input.len() {
+                                input_failure = true;
+                                break;
+                            }
+                            let end = pos.saturating_add(max).min(input.len());
+                            let consumed = crt_scan_float_consumed(&input[pos..end]);
+                            if consumed == 0 {
+                                if pos >= input.len() {
+                                    input_failure = true;
+                                }
+                                break;
+                            }
+                            let text = String::from_utf8_lossy(&input[pos..pos + consumed]);
+                            let value = crt_parse_strtod(&text);
+                            pos += consumed;
+                            if !suppress {
+                                let target = va.read_pointer(memory)?;
+                                if target != 0 {
+                                    match length {
+                                        // %lf / %Lf write a double (8 bytes).
+                                        CrtLengthModifier::L => {
+                                            memory.write_u64(target, value.to_bits())
+                                        }
+                                        // %f / %e / %g write a float (4 bytes).
+                                        _ => write_u32(memory, target, (value as f32).to_bits()),
+                                    }
+                                }
+                                assigned += 1;
+                            }
+                        }
+                        _ => break,
+                    }
+                    f = f2;
+                }
+                _ => {
+                    // Literal directive: must match exactly one input char.
+                    if pos < input.len() && input[pos] == directive {
+                        pos += 1;
+                    } else {
+                        input_failure = true;
+                        break;
+                    }
+                    f += 1;
+                }
+            }
+        }
+        if input_failure && assigned == 0 {
+            Ok(-1)
+        } else {
+            Ok(assigned)
         }
     }
 
@@ -62781,11 +63774,15 @@ impl HostThunk {
             "memchr" => Memchr,
             "strcpy" => Strcpy,
             "strncpy" => Strncpy,
+            "strlen" => Strlen,
             "strcat" => Strcat,
             "strncat" => Strncat,
             "strcmp" => Strcmp,
+            "strncmp" => Strncmp,
             "strchr" => Strchr,
             "strstr" => Strstr,
+            "strrchr" => Strrchr,
+            "wcsncmp" => Wcsncmp,
             "_stricmp" => Stricmp,
             "_strnicmp" => Strnicmp,
             "strerror" => Strerror,
@@ -62825,6 +63822,21 @@ impl HostThunk {
             "atoi" => Atoi,
             "atol" => Atol,
             "atof" => Atof,
+            "atan2" => CrtAtan2,
+            "ceil" => CrtCeil,
+            "cos" => CrtCos,
+            "exp" => CrtExp,
+            "fabs" => CrtFabs,
+            "floor" => CrtFloor,
+            "log" => CrtLog,
+            "pow" => CrtPow,
+            "sin" => CrtSin,
+            "sqrt" => CrtSqrt,
+            "tan" => CrtTan,
+            "printf" => CrtPrintf,
+            "sprintf" => CrtSprintf,
+            "vsprintf" => CrtVsprintf,
+            "sscanf" => CrtSscanf,
             "strtol" => Strtol,
             "strtoul" => Strtoul,
             "_strtoi64" => Strtoi64,
@@ -62902,6 +63914,53 @@ impl HostThunk {
             "_chsize" => Chsize,
             "_isatty" => Isatty,
             "_commit" => Commit,
+            _ => return None,
+        })
+    }
+
+    /// Patch 6c: name → thunk table for the vcruntime140.dll family.  The
+    /// exports are the CRT string/memory primitives (identical semantics to
+    /// the ucrtbase/msvcrt names), so the shared CRT table covers them.
+    pub(crate) fn vcrt_thunk_from_name(name: &str) -> Option<Self> {
+        let thunk = Self::crt_thunk_from_name(name)?;
+        // Only the exports the runtime actually registers for vcruntime140.dll
+        // belong to this table (the shared table covers many more names that
+        // vcruntime140.dll does not export).
+        match name {
+            "memcpy" | "memmove" | "memset" | "strchr" | "strlen" | "strncmp" | "strncpy"
+            | "strrchr" | "strstr" | "wcschr" | "wcslen" | "wcsncmp" | "wcsncpy" | "wcsrchr"
+            | "wcsstr" => Some(thunk),
+            _ => None,
+        }
+    }
+
+    /// Patch 6c: name → thunk table for msvcp140.dll (the MSVC C++ runtime
+    /// helper surface: C11 threads wrappers, STL throw helpers and the
+    /// random_device entropy pair).
+    pub(crate) fn msvcp_thunk_from_name(name: &str) -> Option<Self> {
+        use HostThunk::*;
+        Some(match name {
+            "_Cnd_broadcast" => MsvcpCndBroadcast,
+            "_Cnd_destroy" => MsvcpCndDestroy,
+            "_Cnd_init" => MsvcpCndInit,
+            "_Cnd_signal" => MsvcpCndSignal,
+            "_Cnd_wait" => MsvcpCndWait,
+            "_Mtx_current" => MsvcpMtxCurrent,
+            "_Mtx_destroy" => MsvcpMtxDestroy,
+            "_Mtx_init" => MsvcpMtxInit,
+            "_Mtx_lock" => MsvcpMtxLock,
+            "_Mtx_reset" => MsvcpMtxReset,
+            "_Mtx_unlock" => MsvcpMtxUnlock,
+            "_Xbad_alloc" => MsvcpXbadAlloc,
+            "_Xinvalid_argument" => MsvcpXinvalidArgument,
+            "_Xlength_error" => MsvcpXlengthError,
+            "_Xout_of_range" => MsvcpXoutOfRange,
+            "_Xoverflow_error" => MsvcpXoverflowError,
+            "_Xruntime_error" => MsvcpXruntimeError,
+            "std::_Throw_C_error" => MsvcpThrowCError,
+            "std::_Throw_Cpp_error" => MsvcpThrowCppError,
+            "std::random_device::_Get" => MsvcpRandomDeviceGet,
+            "std::random_device::_Init" => MsvcpRandomDeviceInit,
             _ => return None,
         })
     }
@@ -65054,6 +66113,17 @@ impl HostThunk {
             // -- Patch 6b: CRT / UCRT surface (shared name table) --
             ("ucrtbase.dll" | "msvcrt.dll", ImportSymbol::ByName { name, .. })
                 if let Some(thunk) = Self::crt_thunk_from_name(name) =>
+            {
+                thunk
+            }
+            // -- Patch 6c: vcruntime140.dll / msvcp140.dll surfaces --
+            ("vcruntime140.dll", ImportSymbol::ByName { name, .. })
+                if let Some(thunk) = Self::vcrt_thunk_from_name(name) =>
+            {
+                thunk
+            }
+            ("msvcp140.dll", ImportSymbol::ByName { name, .. })
+                if let Some(thunk) = Self::msvcp_thunk_from_name(name) =>
             {
                 thunk
             }
@@ -71242,6 +72312,93 @@ fn crt_parse_strtod(bytes: &str) -> f64 {
     }
     let token = format!("{}{}", &bytes[..mantissa_end], exponent);
     token.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Number of bytes a scanf float conversion consumes (C locale): optional
+/// whitespace, sign, digits, '.', digits, exponent, the "inf"/"nan"
+/// spellings and C99 hex floats ("0x1p4").  Returns 0 when the slice does
+/// not start with a convertible float item.
+fn crt_scan_float_consumed(bytes: &[u8]) -> usize {
+    let mut index = 0_usize;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        index += 1;
+    }
+    let tail = &bytes[index..];
+    let lower = tail
+        .iter()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for word in ["infinity", "inf", "nan"] {
+        if lower.starts_with(word.as_bytes()) {
+            return index + word.len();
+        }
+    }
+    // C99 hex float: "0x" + hex digits ['.' hex digits] ['p' sign digits].
+    if bytes.get(index) == Some(&b'0') && matches!(bytes.get(index + 1), Some(b'x') | Some(b'X')) {
+        let mut h = index + 2;
+        let mut hex_digits = 0_usize;
+        while h < bytes.len() && bytes[h].is_ascii_hexdigit() {
+            h += 1;
+            hex_digits += 1;
+        }
+        if h < bytes.len() && bytes[h] == b'.' {
+            h += 1;
+            while h < bytes.len() && bytes[h].is_ascii_hexdigit() {
+                h += 1;
+                hex_digits += 1;
+            }
+        }
+        if hex_digits == 0 {
+            return 0;
+        }
+        if h < bytes.len() && (bytes[h] == b'p' || bytes[h] == b'P') {
+            let mut p = h + 1;
+            if p < bytes.len() && (bytes[p] == b'+' || bytes[p] == b'-') {
+                p += 1;
+            }
+            let mut exp_digits = 0_usize;
+            while p < bytes.len() && bytes[p].is_ascii_digit() {
+                p += 1;
+                exp_digits += 1;
+            }
+            if exp_digits > 0 {
+                h = p;
+            }
+        }
+        return h;
+    }
+    // Decimal: digits ['.' digits] [('e'|'E') sign digits].
+    let start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    let mut has_dot = false;
+    if index < bytes.len() && bytes[index] == b'.' {
+        has_dot = true;
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    if index == start && !has_dot {
+        return 0;
+    }
+    if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
+        let mut exp = index + 1;
+        if exp < bytes.len() && (bytes[exp] == b'+' || bytes[exp] == b'-') {
+            exp += 1;
+        }
+        if exp < bytes.len() && bytes[exp].is_ascii_digit() {
+            index = exp;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    index
 }
 
 /// Parse a C99 hex float ("0x1p4" → 16.0, "0x1.8p-3" → 0.1875).  Returns
@@ -86942,6 +88099,736 @@ mod tests {
         assert_eq!(runtime.crt_errno_get(&mut memory), EINVAL);
     }
 
+    // ── evidence-math-crt: the msvcrt math surface ──────────────────────────
+
+    /// Dispatch an x86 math thunk with `double` args written on the guest
+    /// stack (8 bytes each, cdecl) and return the ST(0) result.
+    fn dispatch_math_x86(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[f64],
+    ) -> f64 {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            memory.map_bytes(stack + 4 + (index as u64 * 8), &arg.to_bits().to_le_bytes());
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch math thunk");
+        state.x87.stack.last().copied().unwrap_or(f64::NAN)
+    }
+
+    /// Dispatch an x64 math thunk with `double` args in XMM0+ and read the
+    /// XMM0 result.
+    fn dispatch_math_x64(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[f64],
+    ) -> f64 {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u64(memory, stack, 0xDEAD_BEEF);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, stack);
+        for (index, arg) in args.iter().enumerate() {
+            state.xmm[index].low = arg.to_bits();
+        }
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch math thunk x64");
+        f64::from_bits(state.xmm[0].low)
+    }
+
+    #[test]
+    fn evidence_math_crt_math() {
+        // Every msvcrt math export round-trips against host f64 math on both
+        // guest ABIs: x86 cdecl (doubles on the stack, result in ST(0)) and
+        // x64 (XMM0+ args, XMM0 result).
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let cos = runtime.alloc_host_thunk(HostThunk::CrtCos);
+        let sin = runtime.alloc_host_thunk(HostThunk::CrtSin);
+        let tan = runtime.alloc_host_thunk(HostThunk::CrtTan);
+        let exp = runtime.alloc_host_thunk(HostThunk::CrtExp);
+        let log = runtime.alloc_host_thunk(HostThunk::CrtLog);
+        let sqrt = runtime.alloc_host_thunk(HostThunk::CrtSqrt);
+        let fabs = runtime.alloc_host_thunk(HostThunk::CrtFabs);
+        let ceil = runtime.alloc_host_thunk(HostThunk::CrtCeil);
+        let floor = runtime.alloc_host_thunk(HostThunk::CrtFloor);
+        let atan2 = runtime.alloc_host_thunk(HostThunk::CrtAtan2);
+        let pow = runtime.alloc_host_thunk(HostThunk::CrtPow);
+
+        let close = |actual: f64, expected: f64| {
+            let ok = actual == expected
+                || (actual.is_nan() && expected.is_nan())
+                || (actual - expected).abs() <= expected.abs().max(1.0) * 1e-12;
+            assert!(ok, "expected {expected}, got {actual}");
+        };
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, cos, &[0.0]),
+            1.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, sin, &[0.0]),
+            0.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, tan, &[0.0]),
+            0.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, exp, &[1.0]),
+            std::f64::consts::E,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, log, &[std::f64::consts::E]),
+            1.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, sqrt, &[4.0]),
+            2.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, fabs, &[-3.5]),
+            3.5,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, ceil, &[2.3]),
+            3.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, floor, &[2.7]),
+            2.0,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, atan2, &[1.0, 1.0]),
+            std::f64::consts::FRAC_PI_4,
+        );
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, pow, &[2.0, 10.0]),
+            1024.0,
+        );
+
+        // C domain/range plumbing: sqrt(-1) → NaN + EDOM; log(0) → -inf +
+        // ERANGE; log(-1) → NaN + EDOM; pow(negative, fractional) → NaN + EDOM.
+        assert!(dispatch_math_x86(&mut runtime, &mut memory, sqrt, &[-1.0]).is_nan());
+        assert_eq!(runtime.crt_errno_get(&mut memory), EDOM);
+        close(
+            dispatch_math_x86(&mut runtime, &mut memory, log, &[0.0]),
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+        assert!(dispatch_math_x86(&mut runtime, &mut memory, log, &[-1.0]).is_nan());
+        assert_eq!(runtime.crt_errno_get(&mut memory), EDOM);
+        assert!(dispatch_math_x86(&mut runtime, &mut memory, pow, &[-2.0, 0.5]).is_nan());
+        assert_eq!(runtime.crt_errno_get(&mut memory), EDOM);
+        // exp overflow → +inf + ERANGE.
+        assert_eq!(
+            dispatch_math_x86(&mut runtime, &mut memory, exp, &[1000.0]),
+            f64::INFINITY
+        );
+        assert_eq!(runtime.crt_errno_get(&mut memory), ERANGE);
+
+        // x64 ABI: same values through XMM0.
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        close(
+            dispatch_math_x64(&mut runtime, &mut memory, cos, &[0.0]),
+            1.0,
+        );
+        close(
+            dispatch_math_x64(&mut runtime, &mut memory, sqrt, &[16.0]),
+            4.0,
+        );
+        close(
+            dispatch_math_x64(&mut runtime, &mut memory, fabs, &[-2.5]),
+            2.5,
+        );
+        close(
+            dispatch_math_x64(&mut runtime, &mut memory, atan2, &[1.0, 1.0]),
+            std::f64::consts::FRAC_PI_4,
+        );
+        close(
+            dispatch_math_x64(&mut runtime, &mut memory, pow, &[2.0, 10.0]),
+            1024.0,
+        );
+    }
+
+    #[test]
+    fn evidence_math_crt_stdio() {
+        // printf/sprintf/vsprintf render through the shared UCRT format
+        // engine (narrow formats widened); sscanf scans back through the
+        // shared strtol/strtod cores.  printf delivers to the guest stdout.
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let printf = runtime.alloc_host_thunk(HostThunk::CrtPrintf);
+        let sprintf = runtime.alloc_host_thunk(HostThunk::CrtSprintf);
+        let vsprintf = runtime.alloc_host_thunk(HostThunk::CrtVsprintf);
+        let sscanf = runtime.alloc_host_thunk(HostThunk::CrtSscanf);
+
+        // printf("count=%d name=%s pi=%.2f\n", ...) → guest stdout.
+        let format = runtime
+            .alloc_c_string(&mut memory, "count=%d name=%s pi=%.2f\n")
+            .expect("format");
+        let name = runtime.alloc_c_string(&mut memory, "casa1").expect("name");
+        let pi_bits = std::f64::consts::PI.to_bits();
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            printf,
+            &[
+                format as u32,
+                42,
+                name as u32,
+                pi_bits as u32,
+                (pi_bits >> 32) as u32,
+            ],
+        );
+        assert_eq!(runtime.stdout, "count=42 name=casa1 pi=3.14\n");
+
+        // sprintf(buffer, "%x-%d-%s", ...) → NUL-terminated bytes; the return
+        // value is the length excluding the NUL.
+        let buffer = 0x61_000;
+        memory.map_bytes(buffer, &[0_u8; 64]);
+        let fmt = runtime
+            .alloc_c_string(&mut memory, "%x-%d-%s")
+            .expect("fmt");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sprintf,
+            &[buffer as u32, fmt as u32, 0xCAFE, 7, name as u32],
+        );
+        assert_eq!(ret, b"cafe-7-casa1".len() as u64);
+        let mut rendered = memory
+            .read_bytes(buffer, b"cafe-7-casa1".len() + 1)
+            .expect("read buffer");
+        let nul = rendered.pop().expect("nul");
+        assert_eq!(nul, 0);
+        assert_eq!(rendered, b"cafe-7-casa1");
+
+        // vsprintf(buffer, format, va_list) with a caller-built va list.
+        let va_area = 0x62_000;
+        memory.map_bytes(va_area, &[0_u8; 64]);
+        let long_value = 1_000_000_000_i64;
+        let long_bits = long_value as u64;
+        write_u32(&mut memory, va_area, long_bits as u32);
+        write_u32(&mut memory, va_area + 4, (long_bits >> 32) as u32);
+        let fmt = runtime.alloc_c_string(&mut memory, "%lld").expect("fmt");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            vsprintf,
+            &[buffer as u32, fmt as u32, va_area as u32],
+        );
+        assert_eq!(ret, b"1000000000".len() as u64);
+        let rendered = memory
+            .read_bytes(buffer, b"1000000000".len())
+            .expect("read buffer");
+        assert_eq!(rendered, b"1000000000");
+
+        // sscanf("42 casa1 3.5", "%d %s %f", &i, str, &f) → 3 assignments.
+        let input = runtime
+            .alloc_c_string(&mut memory, "42 casa1 3.5")
+            .expect("input");
+        let fmt = runtime
+            .alloc_c_string(&mut memory, "%d %s %f")
+            .expect("fmt");
+        let i_out = 0x63_000;
+        let s_out = 0x63_004;
+        let f_out = 0x63_100;
+        memory.map_bytes(i_out, &[0_u8; 4]);
+        memory.map_bytes(s_out, &[0_u8; 32]);
+        memory.map_bytes(f_out, &[0_u8; 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sscanf,
+            &[
+                input as u32,
+                fmt as u32,
+                i_out as u32,
+                s_out as u32,
+                f_out as u32,
+            ],
+        );
+        assert_eq!(ret, 3);
+        assert_eq!(read_u32(&memory, i_out).expect("int"), 42);
+        assert_eq!(read_c_string(&memory, s_out).expect("str"), "casa1");
+        let f_bits = read_u32(&memory, f_out).expect("float");
+        assert_eq!(f32::from_bits(f_bits), 3.5);
+
+        // sscanf width/hex/%n: "ff 9" with "%2x %d %n" → 2 assignments and the
+        // consumed count through %n.
+        let input = runtime.alloc_c_string(&mut memory, "ff 9").expect("input");
+        let fmt = runtime
+            .alloc_c_string(&mut memory, "%2x %d %n")
+            .expect("fmt");
+        let x_out = 0x63_200;
+        let d_out = 0x63_204;
+        let n_out = 0x63_208;
+        memory.map_bytes(x_out, &[0_u8; 12]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sscanf,
+            &[
+                input as u32,
+                fmt as u32,
+                x_out as u32,
+                d_out as u32,
+                n_out as u32,
+            ],
+        );
+        assert_eq!(ret, 2);
+        assert_eq!(read_u32(&memory, x_out).expect("hex"), 0xFF);
+        assert_eq!(read_u32(&memory, d_out).expect("dec"), 9);
+        // %n reports the characters consumed so far ("ff" + space + "9" = 4).
+        assert_eq!(read_u32(&memory, n_out).expect("n"), 4);
+
+        // sscanf scanset + literal: "alice;x" with "%[a-z];%c" → 2.
+        let input = runtime
+            .alloc_c_string(&mut memory, "alice;x")
+            .expect("input");
+        let fmt = runtime
+            .alloc_c_string(&mut memory, "%[a-z];%c")
+            .expect("fmt");
+        let str_out = 0x63_210;
+        let c_out = 0x63_230;
+        memory.map_bytes(str_out, &[0_u8; 16]);
+        memory.map_bytes(c_out, &[0_u8; 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sscanf,
+            &[input as u32, fmt as u32, str_out as u32, c_out as u32],
+        );
+        assert_eq!(ret, 2);
+        assert_eq!(read_c_string(&memory, str_out).expect("str"), "alice");
+        assert_eq!(read_u32(&memory, c_out).expect("char"), u32::from(b'x'));
+
+        // Matching failure: "%d" against "abc" → 0; empty input → EOF (-1).
+        let abc = runtime.alloc_c_string(&mut memory, "abc").expect("abc");
+        let fmt = runtime.alloc_c_string(&mut memory, "%d").expect("fmt");
+        let d_out = 0x63_220;
+        memory.map_bytes(d_out, &[0_u8; 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sscanf,
+            &[abc as u32, fmt as u32, d_out as u32],
+        );
+        assert_eq!(ret, 0);
+        let empty = runtime.alloc_c_string(&mut memory, "").expect("empty");
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            sscanf,
+            &[empty as u32, fmt as u32, d_out as u32],
+        );
+        // EOF is -1; on x86 RAX carries the truncated 32-bit value.
+        assert_eq!(ret, u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn evidence_math_crt_vcruntime() {
+        // Every vcruntime140.dll export resolves through the import-name
+        // tables to a concrete thunk and behaves like its CRT counterpart.
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let import = |name: &str| ResolvedImport {
+            requested_module: "vcruntime140.dll".to_string(),
+            resolved_module: "vcruntime140.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: name.to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 1,
+                name: Some(name.to_string()),
+                target: ExportTarget::Rva(0x2000),
+            },
+        };
+        for name in [
+            "memcpy", "memmove", "memset", "strchr", "strlen", "strncmp", "strncpy", "strrchr",
+            "strstr", "wcschr", "wcslen", "wcsncmp", "wcsncpy", "wcsrchr", "wcsstr",
+        ] {
+            assert!(
+                !matches!(
+                    HostThunk::from_import(&import(name)),
+                    HostThunk::Unsupported { .. }
+                ),
+                "vcruntime140.dll!{name} must map to a concrete thunk"
+            );
+        }
+
+        // strlen / strchr / strrchr / strstr / strncmp / strncpy.
+        let strlen = runtime.alloc_host_thunk(HostThunk::from_import(&import("strlen")));
+        let s = runtime.alloc_c_string(&mut memory, "hello").expect("s");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, strlen, &[s as u32]),
+            5
+        );
+        let strchr = runtime.alloc_host_thunk(HostThunk::from_import(&import("strchr")));
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, strchr, &[s as u32, b'l' as u32]);
+        assert_eq!(found, s + 2);
+        let strrchr = runtime.alloc_host_thunk(HostThunk::from_import(&import("strrchr")));
+        let found =
+            dispatch_x86_thunk(&mut runtime, &mut memory, strrchr, &[s as u32, b'l' as u32]);
+        assert_eq!(found, s + 3);
+        let strstr = runtime.alloc_host_thunk(HostThunk::from_import(&import("strstr")));
+        let needle = runtime.alloc_c_string(&mut memory, "ll").expect("needle");
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strstr,
+            &[s as u32, needle as u32],
+        );
+        assert_eq!(found, s + 2);
+        let strncmp = runtime.alloc_host_thunk(HostThunk::from_import(&import("strncmp")));
+        let other = runtime.alloc_c_string(&mut memory, "help").expect("other");
+        let cmp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncmp,
+            &[s as u32, other as u32, 4],
+        );
+        assert_eq!(cmp as i32, i32::from(b'l' as i8) - i32::from(b'p' as i8));
+        let strncpy = runtime.alloc_host_thunk(HostThunk::from_import(&import("strncpy")));
+        let dest = 0x61_000;
+        memory.map_bytes(dest, &[0_u8; 16]);
+        let copied = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            strncpy,
+            &[dest as u32, s as u32, 8],
+        );
+        assert_eq!(copied, dest);
+        let bytes = memory.read_bytes(dest, 8).expect("copy");
+        assert_eq!(&bytes[..5], b"hello");
+        assert_eq!(&bytes[5..], &[0, 0, 0]);
+
+        // memcpy / memmove / memset.
+        let memcpy = runtime.alloc_host_thunk(HostThunk::from_import(&import("memcpy")));
+        let src = 0x61_100;
+        memory.map_bytes(src, &[1, 2, 3, 4]);
+        let dst = 0x61_110;
+        memory.map_bytes(dst, &[0_u8; 4]);
+        let ret = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            memcpy,
+            &[dst as u32, src as u32, 4],
+        );
+        assert_eq!(ret, dst);
+        assert_eq!(memory.read_bytes(dst, 4).expect("memcpy"), vec![1, 2, 3, 4]);
+        let memmove = runtime.alloc_host_thunk(HostThunk::from_import(&import("memmove")));
+        let overlap = 0x61_200;
+        memory.map_bytes(overlap, &[1, 2, 3, 4, 5]);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            memmove,
+            &[(overlap + 1) as u32, overlap as u32, 4],
+        );
+        assert_eq!(
+            memory.read_bytes(overlap, 5).expect("memmove"),
+            vec![1, 1, 2, 3, 4]
+        );
+        let memset = runtime.alloc_host_thunk(HostThunk::from_import(&import("memset")));
+        let area = 0x61_300;
+        memory.map_bytes(area, &[0_u8; 4]);
+        dispatch_x86_thunk(&mut runtime, &mut memory, memset, &[area as u32, 0xAB, 4]);
+        assert_eq!(
+            memory.read_bytes(area, 4).expect("memset"),
+            vec![0xAB, 0xAB, 0xAB, 0xAB]
+        );
+
+        // Wide family: wcslen / wcschr / wcsrchr / wcsstr / wcsncmp / wcsncpy.
+        let wcslen = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcslen")));
+        let wide = runtime
+            .alloc_utf16_string(&mut memory, "abba")
+            .expect("wide");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, wcslen, &[wide as u32]),
+            4
+        );
+        let wcschr = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcschr")));
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcschr,
+            &[wide as u32, b'b' as u32],
+        );
+        assert_eq!(found, wide + 2);
+        let wcsrchr = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcsrchr")));
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsrchr,
+            &[wide as u32, b'b' as u32],
+        );
+        assert_eq!(found, wide + 4);
+        let wcsstr = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcsstr")));
+        let wneedle = runtime
+            .alloc_utf16_string(&mut memory, "bb")
+            .expect("wneedle");
+        let found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsstr,
+            &[wide as u32, wneedle as u32],
+        );
+        assert_eq!(found, wide + 2);
+        let wcsncmp = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcsncmp")));
+        let wother = runtime
+            .alloc_utf16_string(&mut memory, "abca")
+            .expect("wother");
+        let cmp = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsncmp,
+            &[wide as u32, wother as u32, 4],
+        );
+        assert_eq!(cmp as i32, i32::from(b'b') - i32::from(b'c'));
+        let wcsncpy = runtime.alloc_host_thunk(HostThunk::from_import(&import("wcsncpy")));
+        let wdest = 0x61_400;
+        memory.map_bytes(wdest, &[0_u8; 16]);
+        let copied = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wcsncpy,
+            &[wdest as u32, wide as u32, 3],
+        );
+        assert_eq!(copied, wdest);
+        assert_eq!(read_guest_utf16_string(&memory, wdest, 4), "abb");
+    }
+
+    #[test]
+    fn evidence_math_crt_msvcp() {
+        // msvcp140.dll: the _Mtx_* / _Cnd_* C11-threads wrappers, the _X*
+        // throw helpers and the random_device entropy pair.
+        let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
+        let mtx_init = runtime.alloc_host_thunk(HostThunk::MsvcpMtxInit);
+        let mtx_lock = runtime.alloc_host_thunk(HostThunk::MsvcpMtxLock);
+        let mtx_unlock = runtime.alloc_host_thunk(HostThunk::MsvcpMtxUnlock);
+        let mtx_current = runtime.alloc_host_thunk(HostThunk::MsvcpMtxCurrent);
+        let mtx_reset = runtime.alloc_host_thunk(HostThunk::MsvcpMtxReset);
+        let mtx_destroy = runtime.alloc_host_thunk(HostThunk::MsvcpMtxDestroy);
+        let cnd_init = runtime.alloc_host_thunk(HostThunk::MsvcpCndInit);
+        let cnd_signal = runtime.alloc_host_thunk(HostThunk::MsvcpCndSignal);
+        let cnd_broadcast = runtime.alloc_host_thunk(HostThunk::MsvcpCndBroadcast);
+        let cnd_wait = runtime.alloc_host_thunk(HostThunk::MsvcpCndWait);
+        let cnd_destroy = runtime.alloc_host_thunk(HostThunk::MsvcpCndDestroy);
+        let rd_get = runtime.alloc_host_thunk(HostThunk::MsvcpRandomDeviceGet);
+        let rd_init = runtime.alloc_host_thunk(HostThunk::MsvcpRandomDeviceInit);
+
+        // _Mtx_init writes an opaque handle through the out-param.
+        let mtx_slot = 0x61_000;
+        memory.map_bytes(mtx_slot, &[0_u8; 8]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            mtx_init,
+            &[mtx_slot as u32, 0x10000],
+        );
+        assert_eq!(status, 0);
+        let handle = read_guest_pointer(&memory, mtx_slot, GuestArch::X86).expect("mtx handle");
+        assert_ne!(handle, 0);
+
+        // Unlocked: _Mtx_current → 0; lock → owner is the current thread.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mtx_current, &[handle as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mtx_lock, &[handle as u32]),
+            0
+        );
+        let tid = u64::from(runtime.win32.current_thread_id());
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mtx_current, &[handle as u32]),
+            tid
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mtx_unlock, &[handle as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mtx_current, &[handle as u32]),
+            0
+        );
+
+        // Recursive mutex: double-lock bumps the depth; reset clears it.
+        let rec_slot = 0x61_008;
+        memory.map_bytes(rec_slot, &[0_u8; 8]);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            mtx_init,
+            &[rec_slot as u32, 0x10001],
+        );
+        let rec_handle = read_guest_pointer(&memory, rec_slot, GuestArch::X86).expect("rec handle");
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_lock, &[rec_handle as u32]);
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_lock, &[rec_handle as u32]);
+        assert_eq!(
+            runtime.msvcp_mtxes.get(&rec_handle).expect("rec mtx").depth,
+            2
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_unlock, &[rec_handle as u32]);
+        assert_eq!(
+            runtime.msvcp_mtxes.get(&rec_handle).expect("rec mtx").depth,
+            1
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_reset, &[rec_handle as u32]);
+        let rec = runtime.msvcp_mtxes.get(&rec_handle).expect("rec mtx");
+        assert_eq!(rec.owner, 0);
+        assert_eq!(rec.depth, 0);
+
+        // _Mtx_destroy removes the host state.
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_destroy, &[handle as u32]);
+        assert!(!runtime.msvcp_mtxes.contains_key(&handle));
+
+        // _Cnd_init writes an opaque handle; wait without pending threads is a
+        // legal spurious wakeup that re-acquires the mutex; signal/broadcast
+        // are no-ops without waiters; destroy removes the state.
+        let cnd_slot = 0x61_010;
+        memory.map_bytes(cnd_slot, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, cnd_init, &[cnd_slot as u32]),
+            0
+        );
+        let cnd_handle = read_guest_pointer(&memory, cnd_slot, GuestArch::X86).expect("cnd handle");
+        assert_ne!(cnd_handle, 0);
+        dispatch_x86_thunk(&mut runtime, &mut memory, mtx_lock, &[rec_handle as u32]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                cnd_wait,
+                &[cnd_handle as u32, rec_handle as u32],
+            ),
+            0
+        );
+        assert_eq!(
+            runtime.msvcp_mtxes.get(&rec_handle).expect("rec mtx").owner,
+            runtime.win32.current_thread_id()
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, cnd_signal, &[cnd_handle as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                cnd_broadcast,
+                &[cnd_handle as u32]
+            ),
+            0
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, cnd_destroy, &[cnd_handle as u32]);
+        assert!(!runtime.msvcp_cnds.contains_key(&cnd_handle));
+
+        // std::random_device::_Init returns 0; _Get returns real entropy
+        // (16 draws are never all equal — a 2^-480 failure bound).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, rd_init, &[]),
+            0
+        );
+        let draws: Vec<u64> = (0..16)
+            .map(|_| dispatch_x86_thunk(&mut runtime, &mut memory, rd_get, &[]))
+            .collect();
+        assert!(
+            draws.iter().any(|draw| *draw != draws[0]),
+            "random_device::_Get must produce varying entropy"
+        );
+
+        // The _X* throw helpers raise the MSVC C++ exception and terminate
+        // the process when nothing catches (Windows semantics).
+        let xout = runtime.alloc_host_thunk(HostThunk::MsvcpXoutOfRange);
+        let msg = runtime
+            .alloc_c_string(&mut memory, "vector::_M_range_check")
+            .expect("msg");
+        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, xout, &[msg as u32]);
+        assert_eq!(result, Some(-0x1F92_8C9D));
+        assert_eq!(runtime.unhandled_guest_exception, Some(0xE06D_7363));
+        let xbad = runtime.alloc_host_thunk(HostThunk::MsvcpXbadAlloc);
+        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, xbad, &[]);
+        assert_eq!(result, Some(-0x1F92_8C9D));
+        let throw_c = runtime.alloc_host_thunk(HostThunk::MsvcpThrowCError);
+        let result = dispatch_x86_thunk_result(&mut runtime, &mut memory, throw_c, &[1]);
+        assert_eq!(result, Some(-0x1F92_8C9D));
+    }
+
+    #[test]
+    fn evidence_math_crt_msvcp_throw_seh() {
+        // A guest SEH handler may claim the _X* C++ throw (0xE06D7363), just
+        // like RaiseException: the caller resumes with the code as the result
+        // and the process stays alive.
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge =
+                GameEnvironment::create_in(temp_dir.path(), "throw-seh", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime
+                .seed_process_state(&mut memory, "C:\\throw-seh.exe", &[], 0x400000, 0x1000)
+                .expect("seed process state");
+
+            let xout = runtime.alloc_host_thunk(HostThunk::MsvcpXlengthError);
+            let fs_base = runtime.teb_base;
+            let handler = 0x42_000_u64;
+            let resume_stub = 0x42_100_u64;
+            let mut handler_bytes = vec![0x90; 0x30];
+            handler_bytes[..17].copy_from_slice(&[
+                0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12] (context_record)
+                0xC7, 0x80, 0xB8, 0x00, 0x00, 0x00, 0x20, 0x01, 0x42,
+                0x00, // mov [eax+0xb8], resume_stub
+                0x31, 0xC0, // xor eax, eax (EXCEPTION_CONTINUE_EXECUTION)
+                0xC3, // ret
+            ]);
+            memory.map_bytes(handler, &handler_bytes);
+            let mut stub_bytes = vec![0x90; 0x10];
+            stub_bytes[..4].copy_from_slice(&[0x31, 0xC0, 0xC3, 0x90]);
+            memory.map_bytes(resume_stub, &stub_bytes);
+
+            let registration = 0x44_000_u64;
+            write_u32(&mut memory, fs_base, registration as u32);
+            write_u32(&mut memory, registration, X86_EXCEPTION_CHAIN_END as u32);
+            write_u32(&mut memory, registration + 4, handler as u32);
+
+            let stack = 0x50_000_u64;
+            memory.map_bytes(stack, &[0_u8; 0x200]);
+            write_u32(&mut memory, stack, 0xDEAD_BEEF);
+            write_u32(&mut memory, stack + 4, 0);
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, stack);
+            state.segment_bases.fs = fs_base;
+            let dispatch_result = runtime
+                .dispatch_import(xout, &mut state, &mut memory)
+                .expect("dispatch _Xlength_error");
+            assert_eq!(
+                dispatch_result, None,
+                "a claimed throw continues the caller"
+            );
+            assert_eq!(
+                state.get(Register::Rax),
+                0xE06D_7363,
+                "the claimed throw returns the code to the caller"
+            );
+            assert_eq!(
+                runtime.unhandled_guest_exception, None,
+                "a claimed throw must not terminate the process"
+            );
+        });
+    }
+
     #[test]
     fn crt_strchr_and_wide_find_nul() {
         let (_temp, mut runtime, mut memory) = setup_crt_test_runtime();
@@ -101316,6 +103203,31 @@ fn guest_call_arg(state: &CpuState, memory: &MemoryImage, index: usize) -> AppRe
             GuestArch::X86,
         ),
     }
+}
+
+/// Read a `double` thunk argument: Win64 passes floating-point arguments in
+/// XMM0-XMM3; x86 cdecl passes them on the stack (8 bytes per double).
+fn guest_call_arg_f64(state: &CpuState, memory: &MemoryImage, index: usize) -> AppResult<f64> {
+    match state.arch {
+        GuestArch::X64 => Ok(f64::from_bits(state.xmm[index].low)),
+        GuestArch::X86 => {
+            let bits = memory.read_u64(state.get(Register::Rsp) + (index as u64 * 8))?;
+            Ok(f64::from_bits(bits))
+        }
+    }
+}
+
+/// Store a `double` return value following the guest ABI: XMM0 on x64 and
+/// ST(0) (the emulated x87 stack) on x86, mirroring the `Atof` arm which
+/// additionally leaves the bits in RAX for host-side inspection.
+fn set_guest_f64_return(state: &mut CpuState, value: f64) {
+    if state.arch == GuestArch::X64 {
+        state.xmm[0].low = value.to_bits();
+        state.xmm[0].high = 0;
+    } else {
+        state.x87.stack.push(value);
+    }
+    state.set(Register::Rax, value.to_bits());
 }
 
 fn guest_call_arg_u32(state: &CpuState, memory: &MemoryImage, index: usize) -> AppResult<u32> {

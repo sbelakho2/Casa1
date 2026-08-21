@@ -1553,6 +1553,275 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "_set_new_mode",
         "casa1-conformance:runtime-unit-tests",
     ),
+    // == evidence-math-crt ==
+    // The msvcrt math + narrow stdio surface, the vcruntime140 string/memory
+    // exports and the msvcp140 C++ runtime helpers.  Rows below this marker
+    // are owned by the evidence-math-crt pass; each names a
+    // `casa1-conformance:<suite>` row backed by a REAL unit suite in
+    // src/runtime/mod.rs tests:
+    //   - evidence_math_crt_math      -> double round-trips vs host f64 math
+    //   - evidence_math_crt_stdio     -> printf/sprintf/vsprintf/sscanf
+    //   - evidence_math_crt_vcruntime -> vcruntime140 string/memory exports
+    //   - evidence_math_crt_msvcp     -> msvcp140 _Cnd/_Mtx/_X*/random_device
+    // -- msvcrt.dll math --
+    conformance(
+        "msvcrt.dll",
+        "atan2",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "ceil",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "cos",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "exp",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "fabs",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "floor",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "log",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "pow",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "sin",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "sqrt",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "tan",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    // -- msvcrt.dll narrow stdio --
+    conformance(
+        "msvcrt.dll",
+        "printf",
+        "casa1-conformance:evidence_math_crt_stdio",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "sprintf",
+        "casa1-conformance:evidence_math_crt_stdio",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "sscanf",
+        "casa1-conformance:evidence_math_crt_stdio",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "vsprintf",
+        "casa1-conformance:evidence_math_crt_stdio",
+    ),
+    // -- vcruntime140.dll string/memory surface --
+    conformance(
+        "vcruntime140.dll",
+        "memcpy",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "memmove",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "memset",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strchr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strlen",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strncmp",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strncpy",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strrchr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "strstr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcschr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcslen",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcsncmp",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcsncpy",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcsrchr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    conformance(
+        "vcruntime140.dll",
+        "wcsstr",
+        "casa1-conformance:evidence_math_crt_vcruntime",
+    ),
+    // -- msvcp140.dll C++ runtime surface --
+    conformance(
+        "msvcp140.dll",
+        "_Cnd_broadcast",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Cnd_destroy",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Cnd_init",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Cnd_signal",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Cnd_wait",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_current",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_destroy",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_init",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_lock",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_reset",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Mtx_unlock",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xbad_alloc",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xinvalid_argument",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xlength_error",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xout_of_range",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xoverflow_error",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "_Xruntime_error",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "std::_Throw_C_error",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "std::_Throw_Cpp_error",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "std::random_device::_Get",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
+    conformance(
+        "msvcp140.dll",
+        "std::random_device::_Init",
+        "casa1-conformance:evidence_math_crt_msvcp",
+    ),
     // -- ws2_32.dll --
     // The socket semantics live in the network stack (src/network.rs) that
     // the winsock thunks dispatch into; section11 drives the stack against
@@ -4426,6 +4695,10 @@ mod tests {
         "evidence_core_nt_rtl_and_io_thunks",
         "evidence_core_fiber_manager_create_switch_delete",
         "evidence_core_nt_enumerate_value_key_lists_values_in_order",
+        "evidence_math_crt_math",
+        "evidence_math_crt_stdio",
+        "evidence_math_crt_vcruntime",
+        "evidence_math_crt_msvcp",
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",
