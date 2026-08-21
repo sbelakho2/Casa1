@@ -5394,8 +5394,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "setupapi.dll",
         "SetupDiUninstallDevice",
         "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
-
-
     ),
     // == evidence-mid ==
     //
@@ -5876,7 +5874,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "winmmbase.dll",
         "waveOutWrite",
         "casa1-conformance:evidence_mid_winmmbase_device_thunks",
-
     ),
 ];
 
@@ -6005,8 +6002,6 @@ mod tests {
         "evidence_ui_gdi_draw_region_and_blend_thunks",
         "evidence_ui_gdi_psapi_guest_process_thunks",
         "evidence_ui_gdi_setupapi_device_info_sets",
-
-
         "evidence_mid_advapi32_token_thunks",
         "evidence_mid_advapi32_scm_thunks",
         "evidence_mid_advapi32_crypto_thunks",
@@ -6016,7 +6011,6 @@ mod tests {
         "evidence_mid_shell32_extract_icon_resource_thunks",
         "evidence_mid_shell_link_persist_file_thunks",
         "evidence_mid_winmmbase_device_thunks",
-
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",

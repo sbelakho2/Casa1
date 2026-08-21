@@ -105654,7 +105654,6 @@ mod tests {
                 &[0, 0 /* main module */, name_buf as u32, 128],
             );
 
-
             assert_eq!(
                 written, 28,
                 "GetModuleFileNameExW returns the full char count when the buffer fits"
@@ -115677,8 +115676,6 @@ mod tests {
             );
             assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
         })
-
-
     }
 
     // ── evidence-mid: advapi32 token machinery ─────────────────────────────
@@ -117871,7 +117868,6 @@ mod tests {
         pe.resize(RSRC_RAW as usize, 0);
         pe.extend_from_slice(&rsrc_bytes);
         pe
-
     }
 }
 

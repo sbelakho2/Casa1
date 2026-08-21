@@ -19,7 +19,7 @@ roxmltree = "0.20"
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
 walkdir = "2.5"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
-aes = "0.8"
+aes = { version = "0.8", features = ["block-padding"] }
 aes-gcm = { version = "0.10", features = ["aes"] }
 cbc = "0.1"
 cipher = { version = "0.4", features = ["block-padding"] }
