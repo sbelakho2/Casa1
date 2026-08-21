@@ -90895,6 +90895,5141 @@ mod tests {
             "ImageList_GetImageCount on a destroyed list returns 0"
         );
     }
+    // == evidence-gfx-tail dispatch tests ==
+    // Guest-API dispatch coverage for the evidence-gfx-tail pass:
+    // gdiplus/cef/oleaut32/wininet/steam/usp10/dwmapi/winspool/version/psapi
+    // families.  Each test drives the HostThunk arms (the exact code the
+    // exported thunk dispatches into) and asserts observable behavior.
+    //
+    // -- steam_api / steam_api64: remaining flat exports ---------------------
+
+    #[test]
+    fn steam_api_get_steam_install_path_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-install-path",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_GetSteamInstallPath);
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch GetSteamInstallPath");
+
+        let path_ptr = state.get(Register::Rax);
+        assert_ne!(path_ptr, 0, "install path pointer must be non-null");
+        let path = read_c_string(&memory, path_ptr).expect("read install path");
+        assert_eq!(path, "C:\\Program Files (x86)\\Steam");
+    }
+
+    #[test]
+    fn steam_api_register_unregister_call_result_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-call-result",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let register = runtime.alloc_host_thunk(HostThunk::SteamAPI_RegisterCallResult);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 0x7f00_2000);
+        state.set(Register::Rdx, 77);
+        runtime
+            .dispatch_import(register, &mut state, &mut memory)
+            .expect("dispatch RegisterCallResult");
+        assert_eq!(
+            runtime.steam_call_results.get(&77),
+            Some(&0x7f00_2000),
+            "call result 77 should be registered"
+        );
+
+        let unregister = runtime.alloc_host_thunk(HostThunk::SteamAPI_UnregisterCallResult);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 0x7f00_2000);
+        state.set(Register::Rdx, 78);
+        runtime
+            .dispatch_import(unregister, &mut state, &mut memory)
+            .expect("dispatch UnregisterCallResult (wrong id)");
+        assert_eq!(
+            runtime.steam_call_results.get(&77),
+            Some(&0x7f00_2000),
+            "mismatched id must not remove the registration"
+        );
+
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 0x7f00_2000);
+        state.set(Register::Rdx, 77);
+        runtime
+            .dispatch_import(unregister, &mut state, &mut memory)
+            .expect("dispatch UnregisterCallResult (matching id)");
+        assert!(
+            runtime.steam_call_results.is_empty(),
+            "matching func+id removes the registration"
+        );
+    }
+
+    #[test]
+    fn steam_api_restart_app_if_necessary_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-restart-app",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_RestartAppIfNecessary);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 480);
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch RestartAppIfNecessary");
+
+        assert_eq!(
+            state.get(Register::Rax),
+            0,
+            "the app is already running under Casa1 — no restart requested"
+        );
+    }
+
+    #[test]
+    fn steam_api_run_callbacks_and_minidump_comment_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-run-callbacks",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        runtime.steam_callbacks.insert(42, 0x7f00_1000);
+        runtime.steam_call_results.insert(77, 0x7f00_2000);
+
+        let run = runtime.alloc_host_thunk(HostThunk::SteamAPI_RunCallbacks);
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime
+            .dispatch_import(run, &mut state, &mut memory)
+            .expect("dispatch RunCallbacks");
+        assert_eq!(state.get(Register::Rax), 0, "RunCallbacks is void");
+        assert_eq!(
+            runtime.steam_callbacks.get(&42),
+            Some(&0x7f00_1000),
+            "RunCallbacks must not drop registrations"
+        );
+        assert_eq!(
+            runtime.steam_call_results.get(&77),
+            Some(&0x7f00_2000),
+            "RunCallbacks must not drop call results"
+        );
+
+        let comment = runtime.alloc_host_thunk(HostThunk::SteamAPI_SetMiniDumpComment);
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime
+            .dispatch_import(comment, &mut state, &mut memory)
+            .expect("dispatch SetMiniDumpComment");
+        assert_eq!(state.get(Register::Rax), 0, "SetMiniDumpComment is void");
+    }
+
+    #[test]
+    fn steam_api_write_mini_dump_writes_dump_file_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-write-minidump",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        runtime.current_directory = temp_dir.path().to_string_lossy().to_string();
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_WriteMiniDump);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 0xC0000005); // EXCEPTION_ACCESS_VIOLATION
+        state.set(Register::Rdx, 0); // exception info
+        state.set(Register::R8, 480); // build id
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch WriteMiniDump");
+
+        assert_eq!(state.get(Register::Rax), 0, "WriteMiniDump is void");
+        let dumps: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("read dump dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("steam_crash_")
+                    && entry.file_name().to_string_lossy().ends_with(".mdmp")
+            })
+            .collect();
+        assert!(
+            !dumps.is_empty(),
+            "WriteMiniDump must produce a steam_crash_*.mdmp file"
+        );
+        let data = std::fs::read(dumps[0].path()).expect("read dump");
+        assert!(
+            data.starts_with(b"MDMP"),
+            "the dump file must be a valid minidump (MDMP magic)"
+        );
+    }
+
+    #[test]
+    fn steam_internal_find_or_create_user_interface_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-user-iface",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let version_ptr = runtime
+            .alloc_c_string(&mut memory, "STEAMUSERSTATS_INTERFACE_VERSION001")
+            .expect("alloc version string");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamInternal_FindOrCreateUserInterface);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 1); // hSteamUser
+        state.set(Register::Rdx, version_ptr);
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch FindOrCreateUserInterface");
+
+        let result = state.get(Register::Rax);
+        assert_ne!(result, 0, "user interface pointer must be non-null");
+
+        let mut state2 = CpuState::new(GuestArch::X64);
+        state2.set(Register::Rcx, 1);
+        state2.set(Register::Rdx, version_ptr);
+        runtime
+            .dispatch_import(thunk, &mut state2, &mut memory)
+            .expect("dispatch FindOrCreateUserInterface again");
+        assert_eq!(
+            state2.get(Register::Rax),
+            result,
+            "same version must resolve to the same interface pointer"
+        );
+    }
+
+    #[test]
+    fn steam_internal_find_or_create_game_interface_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-game-iface",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let version_ptr = runtime
+            .alloc_c_string(&mut memory, "SteamClient020")
+            .expect("alloc version string");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamInternal_FindOrCreateGameInterface);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 1); // hSteamUser
+        state.set(Register::Rdx, version_ptr);
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch FindOrCreateGameInterface");
+
+        let result = state.get(Register::Rax);
+        assert_ne!(result, 0, "game interface pointer must be non-null");
+
+        let mut state2 = CpuState::new(GuestArch::X64);
+        state2.set(Register::Rcx, 1);
+        state2.set(Register::Rdx, version_ptr);
+        runtime
+            .dispatch_import(thunk, &mut state2, &mut memory)
+            .expect("dispatch FindOrCreateGameInterface again");
+        assert_eq!(
+            state2.get(Register::Rax),
+            result,
+            "same version must resolve to the same interface pointer"
+        );
+    }
+
+    // -- ole32: OleInitialize / OleUninitialize / CoCreateInstanceEx ---------
+
+    #[test]
+    fn ole32_ole_initialize_uninitialize_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "ole-init", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Register a COM class so apartment state is observable through the
+        // public Win32Subsystem activation API.
+        runtime
+            .win32
+            .register_com_class(
+                SHELL_LINK_CLSID,
+                "C:\\shell32.dll",
+                crate::win32::ComThreadingModel::Sta,
+            )
+            .expect("register com class");
+        let thread_handle = runtime.win32.current_thread_handle();
+        assert!(
+            runtime
+                .win32
+                .co_create_instance(thread_handle, SHELL_LINK_CLSID)
+                .is_err(),
+            "before OleInitialize the thread has no apartment"
+        );
+
+        let init = runtime.alloc_host_thunk(HostThunk::OleInitialize);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init, &[0, 0]),
+            0,
+            "OleInitialize returns S_OK"
+        );
+        assert!(
+            runtime
+                .win32
+                .co_create_instance(thread_handle, SHELL_LINK_CLSID)
+                .is_ok(),
+            "after OleInitialize the thread runs an STA apartment"
+        );
+
+        let uninit = runtime.alloc_host_thunk(HostThunk::OleUninitialize);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, uninit, &[0]),
+            0,
+            "OleUninitialize returns S_OK"
+        );
+        assert!(
+            runtime
+                .win32
+                .co_create_instance(thread_handle, SHELL_LINK_CLSID)
+                .is_err(),
+            "after OleUninitialize the apartment is gone"
+        );
+    }
+
+    #[test]
+    fn ole32_co_create_instance_ex_dispatch_fills_multi_qi() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "ole-create-ex", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let clsid_ptr = 0x30_000_u64;
+        write_test_guid(&mut memory, clsid_ptr, 0x0002_1401); // CLSID_ShellLink
+        let results_ptr = 0x30_100_u64;
+        memory.map_bytes(results_ptr, &[0_u8; 16]);
+        write_guest_pointer(&mut memory, results_ptr, 0, GuestArch::X86).expect("zero results");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::CoCreateInstanceEx);
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                clsid_ptr as u32,
+                0,    // outer unknown
+                0x10, // CLSCTX_INPROC_SERVER
+                0,    // server info
+                1,    // cMQIs
+                results_ptr as u32,
+            ],
+        );
+        assert_eq!(rax, 0, "CoCreateInstanceEx returns S_OK");
+        let object = read_guest_pointer(&memory, results_ptr, GuestArch::X86).expect("result");
+        assert_ne!(object, 0, "the MULTI_QI pItf slot receives the object");
+    }
+
+    // -- oleaut32: BSTR / Variant / SafeArray dispatch round trips -----------
+
+    #[test]
+    fn oleaut32_bstr_dispatch_roundtrip() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "oleaut-bstr", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let src = runtime
+            .alloc_utf16_string(&mut memory, "Hello")
+            .expect("src string");
+        let alloc = runtime.alloc_host_thunk(HostThunk::SysAllocString);
+        let bstr = dispatch_x86_thunk(&mut runtime, &mut memory, alloc, &[src as u32]);
+        assert_ne!(bstr, 0, "SysAllocString returns a BSTR");
+        assert_eq!(
+            runtime.last_error, 0,
+            "SysAllocString leaves the error domain clean"
+        );
+
+        let len = runtime.alloc_host_thunk(HostThunk::SysStringLen);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, len, &[bstr as u32]),
+            5,
+            "SysStringLen reads the byte-length prefix"
+        );
+
+        let realloc = runtime.alloc_host_thunk(HostThunk::SysReAllocString);
+        let slot_ptr = 0x30_000_u64;
+        write_guest_pointer(&mut memory, slot_ptr, bstr, GuestArch::X86).expect("bstr slot");
+        let new_src = runtime
+            .alloc_utf16_string(&mut memory, "World")
+            .expect("new src");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                realloc,
+                &[slot_ptr as u32, new_src as u32]
+            ),
+            1,
+            "SysReAllocString returns TRUE"
+        );
+        let new_bstr = read_guest_pointer(&memory, slot_ptr, GuestArch::X86).expect("new bstr");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, len, &[new_bstr as u32]),
+            5,
+            "reallocated BSTR carries the new length"
+        );
+
+        let len_limited = runtime.alloc_host_thunk(HostThunk::SysAllocStringLen);
+        let two = dispatch_x86_thunk(&mut runtime, &mut memory, len_limited, &[src as u32, 2]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, len, &[two as u32]),
+            2,
+            "SysAllocStringLen truncates to the requested length"
+        );
+
+        let free = runtime.alloc_host_thunk(HostThunk::SysFreeString);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free, &[new_bstr as u32]),
+            0,
+            "SysFreeString returns S_OK"
+        );
+    }
+
+    #[test]
+    fn oleaut32_variant_dispatch_roundtrip() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "oleaut-variant",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let variant_a = 0x30_000_u64;
+        let variant_b = 0x30_100_u64;
+        memory.map_bytes(variant_a, &[0xFF_u8; 16]);
+        memory.map_bytes(variant_b, &[0xFF_u8; 16]);
+
+        let init = runtime.alloc_host_thunk(HostThunk::VariantInit);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init, &[variant_a as u32]),
+            0,
+            "VariantInit returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u16(variant_a).expect("vt"),
+            0,
+            "VariantInit zeroes the vt"
+        );
+
+        // VT_I4 = 3, lVal at offset 8 (16-byte x86 VARIANT).
+        write_u16(&mut memory, variant_a, 3);
+        write_u32(&mut memory, variant_a + 8, 0xCAFE);
+
+        let copy = runtime.alloc_host_thunk(HostThunk::VariantCopy);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                copy,
+                &[variant_b as u32, variant_a as u32]
+            ),
+            0,
+            "VariantCopy returns S_OK"
+        );
+        assert_eq!(memory.read_u16(variant_b).expect("dst vt"), 3);
+        assert_eq!(
+            memory.read_u32(variant_b + 8).expect("dst value"),
+            0xCAFE,
+            "VariantCopy copies the payload"
+        );
+
+        let change = runtime.alloc_host_thunk(HostThunk::VariantChangeType);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                change,
+                &[variant_b as u32, variant_a as u32, 0, 8] // VT_BSTR = 8
+            ),
+            0,
+            "VariantChangeType returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u16(variant_b).expect("changed vt"),
+            8,
+            "VariantChangeType overwrites the destination vt"
+        );
+
+        let clear = runtime.alloc_host_thunk(HostThunk::VariantClear);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, clear, &[variant_b as u32]),
+            0,
+            "VariantClear returns S_OK"
+        );
+        assert_eq!(memory.read_u16(variant_b).expect("cleared vt"), 0);
+        assert_eq!(
+            memory.read_u32(variant_b + 8).expect("cleared value"),
+            0,
+            "VariantClear zeroes the payload"
+        );
+    }
+
+    #[test]
+    fn oleaut32_safe_array_dispatch_roundtrip() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "oleaut-safearray",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // One dimension, 64 elements of VT_I4, lbound 0.  The dispatch
+        // arms read a fixed 256-byte window of the descriptor, so the
+        // array must be at least that large.
+        let bounds_ptr = 0x30_000_u64;
+        write_u32(&mut memory, bounds_ptr, 64);
+        write_u32(&mut memory, bounds_ptr + 4, 0);
+
+        let create = runtime.alloc_host_thunk(HostThunk::SafeArrayCreate);
+        let sa = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create,
+            &[3 /* VT_I4 */, 1, bounds_ptr as u32],
+        );
+        assert_ne!(sa, 0, "SafeArrayCreate returns a descriptor");
+
+        let lbound = runtime.alloc_host_thunk(HostThunk::SafeArrayGetLBound);
+        let lb = 0x30_100_u64;
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lbound,
+                &[sa as u32, 1, lb as u32]
+            ),
+            0,
+            "SafeArrayGetLBound returns S_OK"
+        );
+        assert_eq!(read_i32_from_memory(&memory, lb).expect("lbound"), 0);
+
+        let ubound = runtime.alloc_host_thunk(HostThunk::SafeArrayGetUBound);
+        let ub = 0x30_104_u64;
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                ubound,
+                &[sa as u32, 1, ub as u32]
+            ),
+            0,
+            "SafeArrayGetUBound returns S_OK"
+        );
+        assert_eq!(read_i32_from_memory(&memory, ub).expect("ubound"), 63);
+
+        let put = runtime.alloc_host_thunk(HostThunk::SafeArrayPutElement);
+        let indices = 0x30_200_u64;
+        let value = 0x30_300_u64;
+        write_u32(&mut memory, indices, 1);
+        write_u32(&mut memory, value, 0x1111);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                put,
+                &[sa as u32, indices as u32, value as u32]
+            ),
+            0,
+            "SafeArrayPutElement returns S_OK"
+        );
+
+        let get = runtime.alloc_host_thunk(HostThunk::SafeArrayGetElement);
+        let out = 0x30_400_u64;
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[sa as u32, indices as u32, out as u32]
+            ),
+            0,
+            "SafeArrayGetElement returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(out).expect("element"),
+            0x1111,
+            "element written via PutElement reads back via GetElement"
+        );
+
+        let access = runtime.alloc_host_thunk(HostThunk::SafeArrayAccessData);
+        let data_ptr = 0x30_500_u64;
+        write_guest_pointer(&mut memory, data_ptr, 0, GuestArch::X86).expect("data slot");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                access,
+                &[sa as u32, data_ptr as u32]
+            ),
+            0,
+            "SafeArrayAccessData returns S_OK"
+        );
+        let data = read_guest_pointer(&memory, data_ptr, GuestArch::X86).expect("data addr");
+        assert!(data > sa, "the data pointer lies inside the descriptor");
+
+        let unaccess = runtime.alloc_host_thunk(HostThunk::SafeArrayUnaccessData);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, unaccess, &[sa as u32]),
+            0,
+            "SafeArrayUnaccessData returns S_OK"
+        );
+
+        let destroy = runtime.alloc_host_thunk(HostThunk::SafeArrayDestroy);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, destroy, &[sa as u32]),
+            0,
+            "SafeArrayDestroy returns S_OK"
+        );
+    }
+
+    #[test]
+    fn oleaut32_null_arguments_report_e_invalidarg_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "oleaut-invalid",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let clear = runtime.alloc_host_thunk(HostThunk::VariantClear);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, clear, &[0]),
+            0x8007_0057,
+            "VariantClear(NULL) reports E_INVALIDARG"
+        );
+
+        let init = runtime.alloc_host_thunk(HostThunk::VariantInit);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init, &[0]),
+            0x8007_0057,
+            "VariantInit(NULL) reports E_INVALIDARG"
+        );
+    }
+
+    // -- usp10: Uniscribe dispatch -------------------------------------------
+
+    #[test]
+    fn usp10_script_string_analyse_size_out_free_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "usp10-ssa", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let text = runtime
+            .alloc_utf16_string(&mut memory, "Casa1")
+            .expect("text");
+        let analyse = runtime.alloc_host_thunk(HostThunk::ScriptStringAnalyse);
+        let ssa = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            analyse,
+            &[0, text as u32, 5, 5, 0, 0, 0],
+        );
+        assert_ne!(ssa, 0, "ScriptStringAnalyse returns an SSA handle");
+
+        let p_size = runtime.alloc_host_thunk(HostThunk::ScriptString_pSize);
+        let size_ptr = dispatch_x86_thunk(&mut runtime, &mut memory, p_size, &[ssa as u32]);
+        assert_ne!(size_ptr, 0, "ScriptString_pSize returns a SIZE pointer");
+        assert_eq!(
+            memory.read_u32(size_ptr).expect("cx"),
+            40,
+            "cx is 8 pixels per character"
+        );
+        assert_eq!(
+            memory.read_u32(size_ptr + 4).expect("cy"),
+            16,
+            "cy is the default height"
+        );
+
+        let out = runtime.alloc_host_thunk(HostThunk::ScriptStringOut);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                out,
+                &[ssa as u32, 0, 0, 0, 0, 0, 0, 1]
+            ),
+            0,
+            "ScriptStringOut returns S_OK"
+        );
+
+        let free = runtime.alloc_host_thunk(HostThunk::ScriptStringFree);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free, &[ssa as u32]),
+            0,
+            "ScriptStringFree returns S_OK"
+        );
+    }
+
+    #[test]
+    fn usp10_script_itemize_shape_place_layout_break_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "usp10-shaping", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let text = runtime.alloc_utf16_string(&mut memory, "ab").expect("text");
+        let items = 0x30_000_u64;
+        let item_count = 0x30_100_u64;
+        memory.map_bytes(items, &[0_u8; 32]);
+        write_u32(&mut memory, item_count, 0);
+
+        let itemize = runtime.alloc_host_thunk(HostThunk::ScriptItemize);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                itemize,
+                &[text as u32, 2, 4, 0, 0, items as u32, item_count as u32]
+            ),
+            0,
+            "ScriptItemize returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(items).expect("iCharPos"),
+            0,
+            "the single item starts at char 0"
+        );
+        assert_eq!(
+            memory.read_u16(items + 4).expect("script"),
+            0,
+            "the item is Latin script"
+        );
+        assert_eq!(
+            memory.read_u32(item_count).expect("cItems"),
+            1,
+            "one item was produced"
+        );
+
+        let glyphs = 0x30_200_u64;
+        let log_clust = 0x30_300_u64;
+        let glyph_count = 0x30_400_u64;
+        memory.map_bytes(glyphs, &[0_u8; 16]);
+        memory.map_bytes(log_clust, &[0_u8; 16]);
+        write_u32(&mut memory, glyph_count, 0);
+
+        let shape = runtime.alloc_host_thunk(HostThunk::ScriptShape);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                shape,
+                &[
+                    0,
+                    0,
+                    text as u32,
+                    2,
+                    8,
+                    0,
+                    glyphs as u32,
+                    log_clust as u32,
+                    0,
+                    glyph_count as u32,
+                ]
+            ),
+            0,
+            "ScriptShape returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u16(glyphs).expect("glyph 0"),
+            b'a' as u16,
+            "Latin chars map 1:1 to glyphs"
+        );
+        assert_eq!(
+            memory.read_u16(log_clust).expect("cluster 0"),
+            0,
+            "logical cluster tracks the char index"
+        );
+        assert_eq!(
+            memory.read_u32(glyph_count).expect("cGlyphs"),
+            2,
+            "two glyphs were produced"
+        );
+
+        let advances = 0x30_500_u64;
+        memory.map_bytes(advances, &[0_u8; 16]);
+        let place = runtime.alloc_host_thunk(HostThunk::ScriptPlace);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                place,
+                &[0, 0, glyphs as u32, 2, 0, advances as u32, 0, 0]
+            ),
+            0,
+            "ScriptPlace returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(advances).expect("advance 0"),
+            8,
+            "each glyph advances 8 pixels"
+        );
+
+        let visual = 0x30_600_u64;
+        let logical = 0x30_700_u64;
+        memory.map_bytes(visual, &[0_u8; 16]);
+        memory.map_bytes(logical, &[0_u8; 16]);
+        let layout = runtime.alloc_host_thunk(HostThunk::ScriptLayout);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                layout,
+                &[2, 0, visual as u32, logical as u32]
+            ),
+            0,
+            "ScriptLayout returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(visual).expect("visual 0"),
+            0,
+            "LTR text maps visual to logical identically"
+        );
+
+        let log_attrs = 0x30_800_u64;
+        memory.map_bytes(log_attrs, &[0_u8; 8]);
+        let break_thunk = runtime.alloc_host_thunk(HostThunk::ScriptBreak);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                break_thunk,
+                &[text as u32, 2, 0, log_attrs as u32]
+            ),
+            0,
+            "ScriptBreak returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u8(log_attrs).expect("logattr 0"),
+            0x02,
+            "each char carries fCharStop"
+        );
+    }
+
+    #[test]
+    fn usp10_script_properties_digit_substitution_and_cache_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "usp10-misc", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let num_scripts = 0x30_000_u64;
+        let props_ptr = 0x30_100_u64;
+        write_u32(&mut memory, num_scripts, 0);
+        write_guest_pointer(&mut memory, props_ptr, 0xDEAD, GuestArch::X86).expect("props slot");
+
+        let properties = runtime.alloc_host_thunk(HostThunk::ScriptGetProperties);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                properties,
+                &[props_ptr as u32, num_scripts as u32]
+            ),
+            0,
+            "ScriptGetProperties returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(num_scripts).expect("num scripts"),
+            1,
+            "one script (Latin) is reported"
+        );
+
+        let digit_sub = 0x30_200_u64;
+        memory.map_bytes(digit_sub, &[0_u8; 16]);
+        let record = runtime.alloc_host_thunk(HostThunk::ScriptRecordDigitSubstitution);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                record,
+                &[0x0409, digit_sub as u32]
+            ),
+            0,
+            "ScriptRecordDigitSubstitution returns S_OK"
+        );
+
+        let analysis = 0x30_300_u64;
+        memory.map_bytes(analysis, &[0_u8; 16]);
+        let apply = runtime.alloc_host_thunk(HostThunk::ScriptApplyDigitSubstitution);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                apply,
+                &[digit_sub as u32, analysis as u32, 0, 0]
+            ),
+            0,
+            "ScriptApplyDigitSubstitution returns S_OK"
+        );
+
+        let height = 0x30_400_u64;
+        write_u32(&mut memory, height, 0);
+        let cache_height = runtime.alloc_host_thunk(HostThunk::ScriptCacheGetHeight);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                cache_height,
+                &[0, 0, height as u32]
+            ),
+            0,
+            "ScriptCacheGetHeight returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(height).expect("font height"),
+            16,
+            "the default font height is 16"
+        );
+
+        let free_cache = runtime.alloc_host_thunk(HostThunk::ScriptFreeCache);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free_cache, &[0]),
+            0,
+            "ScriptFreeCache returns S_OK"
+        );
+    }
+
+    // -- dwmapi dispatch ------------------------------------------------------
+
+    #[test]
+    fn dwm_composition_state_and_flush_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "dwm-composition",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let enabled_ptr = 0x30_000_u64;
+        write_u32(&mut memory, enabled_ptr, 0);
+        let is_enabled = runtime.alloc_host_thunk(HostThunk::DwmIsCompositionEnabled);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, is_enabled, &[enabled_ptr as u32]),
+            0,
+            "DwmIsCompositionEnabled returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(enabled_ptr).expect("enabled"),
+            1,
+            "composition is enabled on macOS"
+        );
+
+        let enable = runtime.alloc_host_thunk(HostThunk::DwmEnableComposition);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, enable, &[1]),
+            0,
+            "DwmEnableComposition returns S_OK"
+        );
+
+        let flush = runtime.alloc_host_thunk(HostThunk::DwmFlush);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, flush, &[]),
+            0,
+            "DwmFlush returns S_OK"
+        );
+    }
+
+    #[test]
+    fn dwm_window_attribute_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "dwm-attrs", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let get = runtime.alloc_host_thunk(HostThunk::DwmGetWindowAttribute);
+        let value = 0x30_000_u64;
+        write_u32(&mut memory, value, 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[
+                    0x10_000,
+                    0, /* DWMWA_NCRENDERING_ENABLED */
+                    value as u32,
+                    4
+                ]
+            ),
+            0,
+            "DwmGetWindowAttribute(DWMWA_NCRENDERING_ENABLED) returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(value).expect("nc rendering"),
+            1,
+            "non-client rendering is enabled"
+        );
+
+        let policy = 0x30_100_u64;
+        write_u32(&mut memory, policy, 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[
+                    0x10_000,
+                    1, /* DWMWA_NCRENDERING_POLICY */
+                    policy as u32,
+                    4
+                ]
+            ),
+            0,
+            "DwmGetWindowAttribute(DWMWA_NCRENDERING_POLICY) returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(policy).expect("policy"),
+            2,
+            "the non-client rendering policy is DWMNCRP_ENABLED"
+        );
+
+        let bounds = 0x30_200_u64;
+        memory.map_bytes(bounds, &[0xFF_u8; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[
+                    0x10_000,
+                    4, /* DWMWA_CAPTION_BUTTON_BOUNDS */
+                    bounds as u32,
+                    16
+                ]
+            ),
+            0,
+            "DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS) returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(bounds).expect("rect left"),
+            0,
+            "the caption bounds rect is written"
+        );
+
+        let cloaked = 0x30_300_u64;
+        write_u32(&mut memory, cloaked, 0xFF);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[0x10_000, 14 /* DWMWA_CLOAKED */, cloaked as u32, 4]
+            ),
+            0,
+            "DwmGetWindowAttribute(DWMWA_CLOAKED) returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(cloaked).expect("cloaked"),
+            0,
+            "the window is not cloaked"
+        );
+
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get,
+                &[0x10_000, 99 /* unknown */, value as u32, 4]
+            ),
+            0x8007_0057,
+            "unknown attributes report E_INVALIDARG"
+        );
+
+        let set = runtime.alloc_host_thunk(HostThunk::DwmSetWindowAttribute);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set,
+                &[
+                    0x10_000,
+                    1, /* DWMWA_NCRENDERING_POLICY */
+                    value as u32,
+                    4
+                ]
+            ),
+            0,
+            "DwmSetWindowAttribute with a known attribute returns S_OK"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set,
+                &[0x10_000, 99 /* unknown */, value as u32, 4]
+            ),
+            0x8007_0057,
+            "DwmSetWindowAttribute with an unknown attribute reports E_INVALIDARG"
+        );
+    }
+
+    #[test]
+    fn dwm_blur_margins_colorization_and_thumbnail_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "dwm-thumbnail", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let hwnd = 0x10_000_u32;
+
+        // DWM_BLURBEHIND { dwFlags: u32, fEnable: u32, hRgnBlur: ptr, fTransitionOnMaximized: u32 }
+        let blur = 0x30_000_u64;
+        memory.map_bytes(blur, &[0_u8; 24]);
+        write_u32(&mut memory, blur, 0x1); // DWM_BB_ENABLE
+        write_u32(&mut memory, blur + 4, 1); // fEnable = TRUE
+        write_guest_pointer(&mut memory, blur + 8, 0x22, GuestArch::X86).expect("region");
+        write_u32(&mut memory, blur + 16, 0); // fTransitionOnMaximized
+
+        let enable_blur = runtime.alloc_host_thunk(HostThunk::DwmEnableBlurBehindWindow);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, enable_blur, &[hwnd, blur as u32]),
+            0,
+            "DwmEnableBlurBehindWindow returns S_OK"
+        );
+        assert_eq!(
+            runtime.dwm_blur_states.get(&hwnd),
+            Some(&(true, 0x22, false)),
+            "the blur-behind state is stored per window"
+        );
+
+        // MARGINS { cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight }
+        let margins = 0x30_100_u64;
+        memory.map_bytes(margins, &[0_u8; 16]);
+        write_u32(&mut memory, margins, 1);
+        write_u32(&mut memory, margins + 4, 2);
+        write_u32(&mut memory, margins + 8, 3);
+        write_u32(&mut memory, margins + 12, 4);
+        let extend = runtime.alloc_host_thunk(HostThunk::DwmExtendFrameIntoClientArea);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, extend, &[hwnd, margins as u32]),
+            0,
+            "DwmExtendFrameIntoClientArea returns S_OK"
+        );
+        assert_eq!(
+            runtime.dwm_margins.get(&hwnd),
+            Some(&(1, 2, 3, 4)),
+            "the frame margins are stored per window"
+        );
+
+        let color = 0x30_200_u64;
+        let opaque = 0x30_204_u64;
+        write_u32(&mut memory, color, 0);
+        write_u32(&mut memory, opaque, 0);
+        let get_color = runtime.alloc_host_thunk(HostThunk::DwmGetColorizationColor);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_color,
+                &[color as u32, opaque as u32]
+            ),
+            0,
+            "DwmGetColorizationColor returns S_OK"
+        );
+        assert_eq!(memory.read_u32(color).expect("color"), 0x00CC_0000);
+        assert_eq!(memory.read_u32(opaque).expect("opaque"), 1);
+
+        let thumb = 0x30_300_u64;
+        write_u32(&mut memory, thumb, 0);
+        let register = runtime.alloc_host_thunk(HostThunk::DwmRegisterThumbnail);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                register,
+                &[0x20_000, hwnd, thumb as u32]
+            ),
+            0,
+            "DwmRegisterThumbnail returns S_OK"
+        );
+        assert_eq!(
+            memory.read_u32(thumb).expect("thumbnail"),
+            0x1001,
+            "a dummy thumbnail handle is returned"
+        );
+
+        let props = 0x30_400_u64;
+        memory.map_bytes(props, &[0_u8; 16]);
+        let update = runtime.alloc_host_thunk(HostThunk::DwmUpdateThumbnailProperties);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, update, &[0x1001, props as u32]),
+            0,
+            "DwmUpdateThumbnailProperties returns S_OK"
+        );
+        let unregister = runtime.alloc_host_thunk(HostThunk::DwmUnregisterThumbnail);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, unregister, &[0x1001]),
+            0,
+            "DwmUnregisterThumbnail returns S_OK"
+        );
+
+        let iconic = runtime.alloc_host_thunk(HostThunk::DwmSetIconicThumbnail);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, iconic, &[hwnd, 0x33]),
+            0,
+            "DwmSetIconicThumbnail returns S_OK"
+        );
+        let preview = runtime.alloc_host_thunk(HostThunk::DwmSetIconicLivePreviewBitmap);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, preview, &[hwnd, 0x33, 0, 0]),
+            0,
+            "DwmSetIconicLivePreviewBitmap returns S_OK"
+        );
+    }
+
+    // -- psapi dispatch -------------------------------------------------------
+
+    #[test]
+    fn psapi_module_file_name_and_information_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "psapi-module", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime.main_module_path = "C:\\Games\\SampleGame\\game.exe".to_string();
+        runtime.mapped_image_base = 0x40_0000;
+
+        let name_buf = 0x30_000_u64;
+        memory.map_bytes(name_buf, &[0_u8; 128]);
+        let get_name = runtime.alloc_host_thunk(HostThunk::GetModuleFileNameExW);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_name,
+            &[0, 0 /* main module */, name_buf as u32, 128],
+        );
+        assert!(written > 0, "GetModuleFileNameExW returns the char count");
+        let name = read_utf16_string(&memory, name_buf).expect("module path");
+        assert_eq!(
+            name, "C:\\Games\\SampleGame\\game.ex",
+            "the module path is written up to the buffer's NUL slot"
+        );
+
+        let info = 0x30_100_u64;
+        memory.map_bytes(info, &[0_u8; 24]);
+        let get_info = runtime.alloc_host_thunk(HostThunk::GetModuleInformation);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_info,
+                &[0, 0 /* main module */, info as u32, 24]
+            ),
+            1,
+            "GetModuleInformation returns TRUE"
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, info, GuestArch::X86).expect("base"),
+            runtime.mapped_image_base,
+            "MODULEINFO.lpBaseOfDll is the mapped image base"
+        );
+        assert_eq!(
+            memory.read_u32(info + 4).expect("size"),
+            0x1_0000,
+            "MODULEINFO.SizeOfImage is written"
+        );
+        assert_eq!(
+            read_guest_pointer(&memory, info + 8, GuestArch::X86).expect("entry"),
+            runtime.mapped_image_base + 0x1000,
+            "MODULEINFO.EntryPoint defaults to base+0x1000"
+        );
+    }
+    // -- winspool.drv dispatch ------------------------------------------------
+
+    fn write_guest_utf16(memory: &mut MemoryImage, address: u64, value: &str) {
+        let mut bytes = Vec::new();
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        memory.map_bytes(address, &bytes);
+    }
+
+    #[test]
+    fn winspool_open_close_and_enum_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "winspool-enum", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let handle_out = 0x30_000_u64;
+        write_guest_pointer(&mut memory, handle_out, 0, GuestArch::X86).expect("handle slot");
+        let open = runtime.alloc_host_thunk(HostThunk::OpenPrinterW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, open, &[0, handle_out as u32, 0]),
+            1,
+            "OpenPrinterW(NULL name) opens the default printer"
+        );
+        let handle = read_guest_pointer(&memory, handle_out, GuestArch::X86).expect("handle");
+        assert_ne!(handle, 0, "OpenPrinterW writes a printer handle");
+
+        let needed = 0x30_100_u64;
+        let returned = 0x30_104_u64;
+        let enum_thunk = runtime.alloc_host_thunk(HostThunk::EnumPrintersW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                enum_thunk,
+                &[0, 0, 2, 0, 0, needed as u32, returned as u32]
+            ),
+            0,
+            "EnumPrintersW with no buffer reports the needed size"
+        );
+        assert_eq!(runtime.last_error, 122, "ERROR_INSUFFICIENT_BUFFER");
+        let total_needed = memory.read_u32(needed).expect("needed");
+        let count = memory.read_u32(returned).expect("returned");
+        assert!(count >= 1, "at least the default printer is enumerated");
+        assert!(total_needed > 0);
+
+        let buffer = 0x40_000_u64;
+        memory.map_bytes(buffer, &[0_u8; 8192]);
+        write_u32(&mut memory, needed, 0);
+        write_u32(&mut memory, returned, 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                enum_thunk,
+                &[0, 0, 2, buffer as u32, 8192, needed as u32, returned as u32]
+            ),
+            1,
+            "EnumPrintersW fills the PRINTER_INFO_2W buffer"
+        );
+        assert_eq!(memory.read_u32(returned).expect("returned"), count);
+        assert_eq!(
+            memory.read_u32(buffer + 64).expect("attributes"),
+            runtime
+                .print_subsystem
+                .get_printer(handle)
+                .expect("printer")
+                .attributes,
+            "the first PRINTER_INFO_2W carries the printer attributes"
+        );
+
+        // A too-small buffer reports ERROR_INSUFFICIENT_BUFFER.
+        let small = 0x40_800_u64;
+        memory.map_bytes(small, &[0_u8; 64]);
+        write_u32(&mut memory, needed, 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                enum_thunk,
+                &[0, 0, 2, small as u32, 64, needed as u32, returned as u32]
+            ),
+            0,
+            "EnumPrintersW fails on a small buffer"
+        );
+        assert_eq!(runtime.last_error, 122, "ERROR_INSUFFICIENT_BUFFER");
+
+        let close = runtime.alloc_host_thunk(HostThunk::ClosePrinter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[handle as u32]),
+            1,
+            "ClosePrinter returns TRUE"
+        );
+    }
+
+    #[test]
+    fn winspool_doc_page_write_read_end_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "winspool-doc", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let handle_out = 0x30_000_u64;
+        let open = runtime.alloc_host_thunk(HostThunk::OpenPrinterW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, open, &[0, handle_out as u32, 0]),
+            1,
+            "OpenPrinterW opens the default printer"
+        );
+        let handle = read_guest_pointer(&memory, handle_out, GuestArch::X86).expect("handle");
+
+        // DOCINFOW { pDocName, pOutputFile, pDatatype } — x86 pointers.
+        let doc_name = 0x30_100_u64;
+        write_guest_utf16(&mut memory, doc_name, "DispatchJob");
+        let doc_info = 0x30_200_u64;
+        memory.map_bytes(doc_info, &[0_u8; 12]);
+        write_u32(&mut memory, doc_info, doc_name as u32);
+        let start_doc = runtime.alloc_host_thunk(HostThunk::StartDocPrinterW);
+        let job_id = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            start_doc,
+            &[handle as u32, 1, doc_info as u32],
+        );
+        assert_ne!(job_id, 0, "StartDocPrinterW returns a job id");
+        assert_eq!(
+            runtime.print_subsystem.active_job_for_printer(handle),
+            Some(job_id as u32),
+            "the job is active on the printer"
+        );
+
+        let start_page = runtime.alloc_host_thunk(HostThunk::StartPagePrinter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, start_page, &[handle as u32]),
+            1,
+            "StartPagePrinter returns TRUE"
+        );
+
+        let payload = 0x30_300_u64;
+        memory.map_bytes(payload, b"PDF-ish bytes");
+        let written = 0x30_400_u64;
+        write_u32(&mut memory, written, 0);
+        let write_printer = runtime.alloc_host_thunk(HostThunk::WritePrinter);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                write_printer,
+                &[handle as u32, payload as u32, 12, written as u32]
+            ),
+            1,
+            "WritePrinter returns TRUE"
+        );
+        assert_eq!(
+            memory.read_u32(written).expect("written"),
+            12,
+            "WritePrinter reports the spooled byte count"
+        );
+
+        let read_buf = 0x30_500_u64;
+        memory.map_bytes(read_buf, &[0_u8; 16]);
+        let read_count = 0x30_600_u64;
+        let read_printer = runtime.alloc_host_thunk(HostThunk::ReadPrinter);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                read_printer,
+                &[handle as u32, read_buf as u32, 16, read_count as u32]
+            ),
+            1,
+            "ReadPrinter returns TRUE (no back-channel data)"
+        );
+        assert_eq!(memory.read_u32(read_count).expect("read"), 0);
+
+        let end_page = runtime.alloc_host_thunk(HostThunk::EndPagePrinter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, end_page, &[handle as u32]),
+            1,
+            "EndPagePrinter returns TRUE"
+        );
+
+        let end_doc = runtime.alloc_host_thunk(HostThunk::EndDocPrinter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, end_doc, &[handle as u32]),
+            1,
+            "EndDocPrinter returns TRUE"
+        );
+        assert_eq!(
+            runtime.print_subsystem.active_job_for_printer(handle),
+            None,
+            "EndDocPrinter clears the active job"
+        );
+    }
+
+    #[test]
+    fn winspool_get_set_printer_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "winspool-getset",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let handle_out = 0x30_000_u64;
+        let open = runtime.alloc_host_thunk(HostThunk::OpenPrinterW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, open, &[0, handle_out as u32, 0]),
+            1,
+            "OpenPrinterW opens the default printer"
+        );
+        let handle = read_guest_pointer(&memory, handle_out, GuestArch::X86).expect("handle");
+
+        let needed = 0x30_100_u64;
+        let get_printer = runtime.alloc_host_thunk(HostThunk::GetPrinterW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_printer,
+                &[handle as u32, 2, 0, 0, needed as u32]
+            ),
+            0,
+            "GetPrinterW with no buffer reports the needed size"
+        );
+        let total_needed = memory.read_u32(needed).expect("needed");
+        assert!(total_needed > 0);
+
+        let buffer = 0x40_000_u64;
+        memory.map_bytes(buffer, &[0_u8; 8192]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_printer,
+                &[handle as u32, 2, buffer as u32, 8192, needed as u32]
+            ),
+            1,
+            "GetPrinterW fills the PRINTER_INFO_2W buffer"
+        );
+        let info = runtime
+            .print_subsystem
+            .get_printer(handle)
+            .expect("printer");
+        assert_eq!(
+            memory.read_u32(buffer + 64).expect("attributes"),
+            info.attributes,
+            "GetPrinterW writes the printer attributes"
+        );
+        assert_eq!(
+            memory.read_u32(buffer + 68).expect("status"),
+            info.status,
+            "GetPrinterW writes the printer status"
+        );
+
+        // SetPrinterW(level 2) with a new comment + port updates the printer.
+        let port = 0x30_200_u64;
+        let driver = 0x30_300_u64;
+        let comment = 0x30_400_u64;
+        let location = 0x30_500_u64;
+        write_guest_utf16(&mut memory, port, "LPT1:");
+        write_guest_utf16(&mut memory, driver, "Casa1 Driver");
+        write_guest_utf16(&mut memory, comment, "set via dispatch");
+        write_guest_utf16(&mut memory, location, "Desk");
+        let printer_info = 0x30_600_u64;
+        memory.map_bytes(printer_info, &[0_u8; 128]);
+        // x86 PRINTER_INFO_2W pointer fields (server, name, share, port,
+        // driver, comment, location, devmode, security) are 4-byte.
+        write_u32(&mut memory, printer_info + 24, port as u32);
+        write_u32(&mut memory, printer_info + 32, driver as u32);
+        write_u32(&mut memory, printer_info + 40, comment as u32);
+        write_u32(&mut memory, printer_info + 48, location as u32);
+        write_u32(&mut memory, printer_info + 72, 0x4); // attributes
+
+        let set_printer = runtime.alloc_host_thunk(HostThunk::SetPrinterW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_printer,
+                &[handle as u32, 2, printer_info as u32, 0]
+            ),
+            1,
+            "SetPrinterW returns TRUE"
+        );
+        let updated = runtime
+            .print_subsystem
+            .get_printer(handle)
+            .expect("updated printer");
+        assert_eq!(updated.comment, "set via dispatch");
+        assert_eq!(updated.port, "LPT1:");
+        assert_eq!(updated.driver, "Casa1 Driver");
+        assert_eq!(updated.location, "Desk");
+    }
+
+    #[test]
+    fn winspool_add_delete_printer_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "winspool-add", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // The AddPrinterW arm reads 8-byte pointer slots at fixed offsets
+        // (0x08 pPrinterName, 0x18 pPortName, 0x20 pDriverName, 0x28
+        // pComment, 0x30 pLocation).
+        let name = 0x30_000_u64;
+        let port = 0x30_100_u64;
+        let driver = 0x30_200_u64;
+        let comment = 0x30_300_u64;
+        let location = 0x30_400_u64;
+        write_guest_utf16(&mut memory, name, "EvidencePrinter");
+        write_guest_utf16(&mut memory, port, "PORTPROMPT:");
+        write_guest_utf16(&mut memory, driver, "Virtual Printer");
+        write_guest_utf16(&mut memory, comment, "added via dispatch");
+        write_guest_utf16(&mut memory, location, "Room 42");
+        let printer_info = 0x30_500_u64;
+        memory.map_bytes(printer_info, &[0_u8; 128]);
+        memory.write_u64(printer_info + 0x08, name);
+        memory.write_u64(printer_info + 0x18, port);
+        memory.write_u64(printer_info + 0x20, driver);
+        memory.write_u64(printer_info + 0x28, comment);
+        memory.write_u64(printer_info + 0x30, location);
+
+        let add = runtime.alloc_host_thunk(HostThunk::AddPrinterW);
+        let handle =
+            dispatch_x86_thunk(&mut runtime, &mut memory, add, &[0, 2, printer_info as u32]);
+        assert_ne!(handle, 0, "AddPrinterW returns a printer handle");
+        let added = runtime
+            .print_subsystem
+            .get_printer(handle)
+            .expect("added printer");
+        assert_eq!(added.name, "EvidencePrinter");
+        assert_eq!(added.comment, "added via dispatch");
+        assert_eq!(added.location, "Room 42");
+
+        let delete = runtime.alloc_host_thunk(HostThunk::DeletePrinter);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[handle as u32]),
+            1,
+            "DeletePrinter returns TRUE"
+        );
+        assert!(
+            runtime.print_subsystem.get_printer(handle).is_none(),
+            "the printer is gone after DeletePrinter"
+        );
+    }
+
+    // -- version.dll dispatch ------------------------------------------------
+
+    fn utf16z_bytes_for_test(value: &str) -> Vec<u8> {
+        let mut bytes = value
+            .encode_utf16()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    fn align4_for_test(bytes: &mut Vec<u8>) {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+    }
+
+    fn version_block_for_test(
+        key: &str,
+        ty: u16,
+        value: &[u8],
+        value_length: u16,
+        children: Vec<Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 6];
+        bytes.extend_from_slice(&utf16z_bytes_for_test(key));
+        align4_for_test(&mut bytes);
+        bytes.extend_from_slice(value);
+        align4_for_test(&mut bytes);
+        for child in children {
+            bytes.extend_from_slice(&child);
+            align4_for_test(&mut bytes);
+        }
+        let length = bytes.len() as u16;
+        bytes[0..2].copy_from_slice(&length.to_le_bytes());
+        bytes[2..4].copy_from_slice(&value_length.to_le_bytes());
+        bytes[4..6].copy_from_slice(&ty.to_le_bytes());
+        bytes
+    }
+
+    fn version_fixed_info_for_test(version: &str) -> Vec<u8> {
+        let mut parts = version
+            .split('.')
+            .map(|part| part.parse::<u16>().expect("version part"))
+            .collect::<Vec<_>>();
+        while parts.len() < 4 {
+            parts.push(0);
+        }
+        let ms = ((parts[0] as u32) << 16) | parts[1] as u32;
+        let ls = ((parts[2] as u32) << 16) | parts[3] as u32;
+        let mut bytes = Vec::new();
+        for value in [
+            0xfeef04bd,
+            0x0001_0000,
+            ms,
+            ls,
+            ms,
+            ls,
+            0x0000_003f,
+            0,
+            0x0004_0004,
+            1,
+            0,
+            0,
+            0,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn version_resource_blob_for_test() -> Vec<u8> {
+        let fixed_info = version_fixed_info_for_test("1.2.3.4");
+        let string_table = version_block_for_test(
+            "040904b0",
+            1,
+            &[],
+            0,
+            vec![
+                version_block_for_test(
+                    "ProductName",
+                    1,
+                    &utf16z_bytes_for_test("Casa1"),
+                    ("Casa1".encode_utf16().count() + 1) as u16,
+                    Vec::new(),
+                ),
+                version_block_for_test(
+                    "FileVersion",
+                    1,
+                    &utf16z_bytes_for_test("1.2.3.4"),
+                    ("1.2.3.4".encode_utf16().count() + 1) as u16,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let string_file_info =
+            version_block_for_test("StringFileInfo", 1, &[], 0, vec![string_table]);
+        version_block_for_test(
+            "VS_VERSION_INFO",
+            0,
+            &fixed_info,
+            fixed_info.len() as u16,
+            vec![string_file_info],
+        )
+    }
+
+    fn version_pe_for_test() -> Vec<u8> {
+        let blob = version_resource_blob_for_test();
+        let section_rva = 0x1000_u32;
+        let root_size = 16 + 8; // one id entry
+        let tree_size = root_size + 64;
+        let mut rsrc = vec![0_u8; tree_size];
+        let mut blob_offset = tree_size;
+        while !blob_offset.is_multiple_of(4) {
+            blob_offset += 1;
+        }
+        rsrc.resize(blob_offset, 0);
+        let type_dir_offset = root_size;
+        let name_dir_offset = type_dir_offset + 24;
+        let data_entry_offset = type_dir_offset + 48;
+
+        let write_u16 = |bytes: &mut Vec<u8>, offset: usize, value: u16| {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let write_u32 = |bytes: &mut Vec<u8>, offset: usize, value: u32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+
+        // Resource directory header: NumberOfNamedEntries @12, NumberOfIdEntries @14.
+        write_u16(&mut rsrc, 12, 0); // named entries
+        write_u16(&mut rsrc, 14, 1); // id entries
+        write_u32(&mut rsrc, 16, 16); // RT_VERSION
+        write_u32(&mut rsrc, 20, 0x8000_0000 | type_dir_offset as u32);
+
+        // Type directory: name = 1.
+        write_u16(&mut rsrc, type_dir_offset + 12, 0);
+        write_u16(&mut rsrc, type_dir_offset + 14, 1);
+        write_u32(&mut rsrc, type_dir_offset + 16, 1);
+        write_u32(
+            &mut rsrc,
+            type_dir_offset + 20,
+            0x8000_0000 | name_dir_offset as u32,
+        );
+
+        // Name directory: language = 1033.
+        write_u16(&mut rsrc, name_dir_offset + 12, 0);
+        write_u16(&mut rsrc, name_dir_offset + 14, 1);
+        write_u32(&mut rsrc, name_dir_offset + 16, 1033);
+        write_u32(&mut rsrc, name_dir_offset + 20, data_entry_offset as u32);
+
+        // Data entry → blob payload.
+        let data_rva = section_rva + blob_offset as u32;
+        write_u32(&mut rsrc, data_entry_offset, data_rva);
+        write_u32(&mut rsrc, data_entry_offset + 4, blob.len() as u32);
+        write_u32(&mut rsrc, data_entry_offset + 8, 1200);
+        rsrc.extend_from_slice(&blob);
+
+        let raw_size = rsrc.len().div_ceil(0x200) * 0x200;
+        rsrc.resize(raw_size, 0);
+
+        let dos_stub_size = 0x80;
+        let pe_offset = dos_stub_size;
+        let optional_header_size = 0xE0;
+        let section_table_offset = pe_offset + 24 + optional_header_size;
+        let size_of_headers = 0x200;
+        let mut bytes = vec![0_u8; size_of_headers];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        write_u32(&mut bytes, 0x3C, dos_stub_size as u32);
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        write_u16(&mut bytes, pe_offset + 4, 0x014C); // I386
+        write_u16(&mut bytes, pe_offset + 6, 1); // one section
+        write_u16(&mut bytes, pe_offset + 20, optional_header_size as u16);
+        write_u16(&mut bytes, pe_offset + 22, 0x0102); // EXECUTABLE_IMAGE
+
+        let optional = pe_offset + 24;
+        write_u16(&mut bytes, optional, 0x010B); // PE32
+        write_u32(&mut bytes, optional + 16, 0); // entry point
+        write_u32(&mut bytes, optional + 20, 0x0040_0000); // image base
+        write_u32(&mut bytes, optional + 32, 0x1000); // section alignment
+        write_u32(&mut bytes, optional + 36, 0x200); // file alignment
+        write_u32(&mut bytes, optional + 56, 0x3000); // size of image
+        write_u32(&mut bytes, optional + 60, size_of_headers as u32); // size of headers
+        write_u16(&mut bytes, optional + 68, 3); // console subsystem
+        write_u32(&mut bytes, optional + 92, 16); // number of rva+sizes
+        // Resource directory (index 2).
+        write_u32(&mut bytes, optional + 96 + 2 * 8, section_rva);
+        write_u32(&mut bytes, optional + 96 + 2 * 8 + 4, rsrc.len() as u32);
+
+        // Section header: .rsrc
+        bytes[section_table_offset..section_table_offset + 8].copy_from_slice(b".rsrc\0\0\0");
+        write_u32(&mut bytes, section_table_offset + 8, 0x2000); // virtual size
+        write_u32(&mut bytes, section_table_offset + 12, section_rva);
+        write_u32(&mut bytes, section_table_offset + 16, rsrc.len() as u32); // raw size
+        write_u32(&mut bytes, section_table_offset + 20, 0x200); // raw ptr
+        write_u32(&mut bytes, section_table_offset + 36, 0x4000_0040); // readable data
+
+        bytes.extend_from_slice(&rsrc);
+        bytes
+    }
+
+    #[test]
+    fn version_dll_query_roundtrip_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "version-dll", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Stage a PE with an RT_VERSION resource into the guest filesystem.
+        let pe_bytes = version_pe_for_test();
+        let host_src = temp_dir.path().join("versioned.exe");
+        std::fs::write(&host_src, &pe_bytes).expect("write host pe");
+        runtime
+            .win32
+            .stage_host_file_w(&host_src, "C:\\versioned.exe")
+            .expect("stage guest pe");
+
+        let filename = runtime
+            .alloc_utf16_string(&mut memory, "C:\\versioned.exe")
+            .expect("filename");
+        let handle_slot = 0x30_000_u64;
+        write_u32(&mut memory, handle_slot, 0xFF);
+
+        let size_thunk = runtime.alloc_host_thunk(HostThunk::GetFileVersionInfoSizeW);
+        let blob_len = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            size_thunk,
+            &[filename as u32, handle_slot as u32],
+        );
+        assert!(
+            blob_len > 0,
+            "GetFileVersionInfoSizeW returns the blob size"
+        );
+        assert_eq!(
+            memory.read_u32(handle_slot).expect("reserved handle"),
+            0,
+            "the reserved handle slot is zeroed"
+        );
+
+        let data_ptr = 0x40_000_u64;
+        memory.map_bytes(data_ptr, &[0_u8; 4096]);
+        let info_thunk = runtime.alloc_host_thunk(HostThunk::GetFileVersionInfoW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                info_thunk,
+                &[filename as u32, 0, blob_len as u32, data_ptr as u32]
+            ),
+            1,
+            "GetFileVersionInfoW copies the version blob"
+        );
+        let copied = memory
+            .read_bytes(data_ptr, blob_len as usize)
+            .expect("blob bytes");
+        let expected = version_resource_blob_for_test();
+        assert_eq!(copied, expected, "the blob bytes are intact");
+
+        // VerQueryValueW("\\") → VS_FIXEDFILEINFO.
+        let buffer_ptr = 0x30_100_u64;
+        let len_ptr = 0x30_104_u64;
+        let fixed_sub = runtime
+            .alloc_utf16_string(&mut memory, "\\")
+            .expect("fixed subblock");
+        let query = runtime.alloc_host_thunk(HostThunk::VerQueryValueW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                query,
+                &[
+                    data_ptr as u32,
+                    fixed_sub as u32,
+                    buffer_ptr as u32,
+                    len_ptr as u32
+                ]
+            ),
+            1,
+            "VerQueryValueW(\\) finds the fixed file info"
+        );
+        assert_eq!(
+            memory.read_u32(len_ptr).expect("fixed len"),
+            52,
+            "sizeof(VS_FIXEDFILEINFO)"
+        );
+        let fixed_addr =
+            read_guest_pointer(&memory, buffer_ptr, GuestArch::X86).expect("fixed addr");
+        let signature = memory.read_u32(fixed_addr).expect("signature");
+        assert_eq!(signature, 0xfeef_04bd, "VS_FIXEDFILEINFO signature");
+        let file_version_ms = memory.read_u32(fixed_addr + 8).expect("ms");
+        assert_eq!(
+            file_version_ms,
+            (1 << 16) | 2,
+            "dwFileVersionMS encodes 1.2"
+        );
+
+        // VerQueryValueW("\StringFileInfo\040904b0\FileVersion") → "1.2.3.4".
+        let string_sub = runtime
+            .alloc_utf16_string(&mut memory, "\\StringFileInfo\\040904b0\\FileVersion")
+            .expect("string subblock");
+        let value_ptr = 0x30_200_u64;
+        let value_len_ptr = 0x30_204_u64;
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                query,
+                &[
+                    data_ptr as u32,
+                    string_sub as u32,
+                    value_ptr as u32,
+                    value_len_ptr as u32
+                ]
+            ),
+            1,
+            "VerQueryValueW(StringFileInfo) finds the string value"
+        );
+        let value_addr =
+            read_guest_pointer(&memory, value_ptr, GuestArch::X86).expect("value addr");
+        let value_bytes = memory
+            .read_bytes(
+                value_addr,
+                memory.read_u32(value_len_ptr).expect("len") as usize,
+            )
+            .expect("value bytes");
+        let value = String::from_utf16_lossy(
+            &value_bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            value.trim_end_matches('\0'),
+            "1.2.3.4",
+            "the StringFileInfo value is the file version"
+        );
+
+        // Unknown sub-blocks fail with ERROR_INVALID_PARAMETER.
+        let unknown_sub = runtime
+            .alloc_utf16_string(&mut memory, "\\NoSuchBlock")
+            .expect("unknown subblock");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                query,
+                &[
+                    data_ptr as u32,
+                    unknown_sub as u32,
+                    value_ptr as u32,
+                    value_len_ptr as u32
+                ]
+            ),
+            0,
+            "unknown sub-blocks fail"
+        );
+        assert_eq!(runtime.last_error, 87, "ERROR_INVALID_PARAMETER");
+    }
+
+    // -- wininet dispatch -----------------------------------------------------
+
+    #[test]
+    fn wininet_http_roundtrip_dispatch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("listener addr");
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept guest request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let body = b"hello-from-casa1";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        });
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "wininet-dispatch",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let user_agent = runtime
+            .alloc_utf16_string(&mut memory, "Casa1/1.0")
+            .expect("user agent");
+        let open = runtime.alloc_host_thunk(HostThunk::InternetOpenW);
+        let session = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open,
+            &[user_agent as u32, 0, 0, 0],
+        );
+        assert_ne!(session, 0, "InternetOpenW returns a session handle");
+
+        let server = runtime
+            .alloc_utf16_string(&mut memory, "127.0.0.1")
+            .expect("server");
+        let connect = runtime.alloc_host_thunk(HostThunk::InternetConnectW);
+        let conn = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            connect,
+            &[
+                session as u32,
+                server as u32,
+                addr.port() as u32,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(conn, 0, "InternetConnectW returns a connection handle");
+
+        let verb = runtime
+            .alloc_utf16_string(&mut memory, "GET")
+            .expect("verb");
+        let object = runtime
+            .alloc_utf16_string(&mut memory, "/probe")
+            .expect("object");
+        let open_request = runtime.alloc_host_thunk(HostThunk::HttpOpenRequestW);
+        let req = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_request,
+            &[conn as u32, verb as u32, object as u32, 0, 0, 0, 0, 0],
+        );
+        assert_ne!(req, 0, "HttpOpenRequestW returns a request handle");
+
+        let send = runtime.alloc_host_thunk(HostThunk::HttpSendRequestW);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, send, &[req as u32, 0, 0, 0, 0]),
+            1,
+            "HttpSendRequestW completes the round trip"
+        );
+        assert_eq!(
+            runtime.winhttp.request_status_code(req),
+            200,
+            "the response status is 200"
+        );
+
+        let body_buf = 0x30_000_u64;
+        memory.map_bytes(body_buf, &[0_u8; 128]);
+        let read_file = runtime.alloc_host_thunk(HostThunk::InternetReadFile);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                read_file,
+                &[req as u32, body_buf as u32, 128]
+            ),
+            1,
+            "InternetReadFile returns TRUE"
+        );
+        let body = memory.read_bytes(body_buf, 16).expect("response body");
+        assert_eq!(body, b"hello-from-casa1");
+
+        let close = runtime.alloc_host_thunk(HostThunk::InternetCloseHandle);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[req as u32]),
+            1,
+            "InternetCloseHandle(request) returns TRUE"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[conn as u32]),
+            1,
+            "InternetCloseHandle(connection) returns TRUE"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, close, &[session as u32]),
+            1,
+            "InternetCloseHandle(session) returns TRUE"
+        );
+
+        worker.join().expect("join local server");
+    }
+
+    #[test]
+    fn wininet_url_and_option_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "wininet-url", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // InternetGetConnectedState → TRUE, flags 0.
+        let flags = 0x30_000_u64;
+        write_u32(&mut memory, flags, 0xFF);
+        let connected = runtime.alloc_host_thunk(HostThunk::InternetGetConnectedState);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, connected, &[flags as u32, 0]),
+            1,
+            "InternetGetConnectedState reports connected"
+        );
+        assert_eq!(
+            memory.read_u32(flags).expect("flags"),
+            0,
+            "the flags out-parameter is zeroed"
+        );
+
+        // InternetCrackUrlW → success marker in URL_COMPONENTS.
+        let url = runtime
+            .alloc_utf16_string(&mut memory, "https://example.com/path")
+            .expect("url");
+        let url_info = 0x30_100_u64;
+        write_u32(&mut memory, url_info, 0);
+        let crack = runtime.alloc_host_thunk(HostThunk::InternetCrackUrlW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                crack,
+                &[url as u32, 24, 0, url_info as u32]
+            ),
+            1,
+            "InternetCrackUrlW succeeds"
+        );
+        assert_eq!(
+            memory.read_u32(url_info).expect("url status"),
+            1,
+            "the URL_COMPONENTS status is written"
+        );
+
+        // InternetCanonicalizeUrlW percent-encodes.
+        let raw_url = runtime
+            .alloc_utf16_string(&mut memory, "https://example.com/a b")
+            .expect("raw url");
+        let canonical_buf = 0x30_200_u64;
+        memory.map_bytes(canonical_buf, &[0_u8; 128]);
+        let canonical_len = 0x30_300_u64;
+        write_u32(&mut memory, canonical_len, 128);
+        let canonicalize = runtime.alloc_host_thunk(HostThunk::InternetCanonicalizeUrlW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                canonicalize,
+                &[
+                    raw_url as u32,
+                    25,
+                    canonical_buf as u32,
+                    canonical_len as u32,
+                    0
+                ]
+            ),
+            1,
+            "InternetCanonicalizeUrlW succeeds"
+        );
+        let canonical = read_utf16_string(&memory, canonical_buf).expect("canonical");
+        assert_eq!(canonical, "https://example.com/a%20b");
+
+        // InternetSetOptionW (WINHTTP_OPTION_PROXY, no proxy) on a session.
+        let user_agent = runtime
+            .alloc_utf16_string(&mut memory, "Casa1/1.0")
+            .expect("user agent");
+        let open = runtime.alloc_host_thunk(HostThunk::InternetOpenW);
+        let session = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open,
+            &[user_agent as u32, 0, 0, 0],
+        );
+        assert_ne!(session, 0, "InternetOpenW returns a session handle");
+        let option_buf = 0x30_400_u64;
+        memory.map_bytes(option_buf, &[0_u8; 16]); // access type NO_PROXY
+        let set_option = runtime.alloc_host_thunk(HostThunk::InternetSetOptionW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_option,
+                &[session as u32, 0, option_buf as u32, 4]
+            ),
+            1,
+            "InternetSetOptionW accepts the proxy option"
+        );
+
+        // InternetSetStatusCallback installs a callback on a request.
+        let server = runtime
+            .alloc_utf16_string(&mut memory, "127.0.0.1")
+            .expect("server");
+        let connect = runtime.alloc_host_thunk(HostThunk::InternetConnectW);
+        let conn = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            connect,
+            &[session as u32, server as u32, 80, 0, 0, 0, 0, 0],
+        );
+        assert_ne!(conn, 0, "InternetConnectW returns a connection handle");
+        let verb = runtime
+            .alloc_utf16_string(&mut memory, "GET")
+            .expect("verb");
+        let object = runtime
+            .alloc_utf16_string(&mut memory, "/")
+            .expect("object");
+        let open_request = runtime.alloc_host_thunk(HostThunk::HttpOpenRequestW);
+        let req = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_request,
+            &[conn as u32, verb as u32, object as u32, 0, 0, 0, 0, 0],
+        );
+        assert_ne!(req, 0, "HttpOpenRequestW returns a request handle");
+        let set_callback = runtime.alloc_host_thunk(HostThunk::InternetSetStatusCallback);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_callback,
+                &[req as u32, 0x7f00_3000, 0xFF]
+            ),
+            1,
+            "InternetSetStatusCallback accepts the callback"
+        );
+    }
+
+    #[test]
+    fn wininet_ftp_failure_domain_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "wininet-ftp", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let file = runtime
+            .alloc_utf16_string(&mut memory, "file.bin")
+            .expect("file name");
+
+        // No control connection exists for the bogus handle, so every FTP
+        // operation reports its documented failure domain.
+        let open_file = runtime.alloc_host_thunk(HostThunk::FtpOpenFileW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_file,
+                &[0x1234, file as u32, 0, 0]
+            ),
+            0,
+            "FtpOpenFileW fails without a control connection"
+        );
+
+        let get_file = runtime.alloc_host_thunk(HostThunk::FtpGetFileW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_file,
+                &[0x1234, file as u32, 0, 0, 0]
+            ),
+            0,
+            "FtpGetFileW fails without a control connection"
+        );
+        assert_eq!(
+            runtime.last_error, 12003,
+            "ERROR_INTERNET_OPERATION_CANCELLED"
+        );
+
+        let put_file = runtime.alloc_host_thunk(HostThunk::FtpPutFileW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                put_file,
+                &[0x1234, 0, file as u32, 0]
+            ),
+            0,
+            "FtpPutFileW fails without a control connection"
+        );
+        assert_eq!(
+            runtime.last_error, 12003,
+            "ERROR_INTERNET_OPERATION_CANCELLED"
+        );
+
+        let find_first = runtime.alloc_host_thunk(HostThunk::FtpFindFirstFileW);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                find_first,
+                &[0x1234, file as u32, 0, 0]
+            ),
+            0,
+            "FtpFindFirstFileW fails without a control connection"
+        );
+        assert_eq!(runtime.last_error, 12018, "ERROR_INTERNET_NO_FILES");
+    }
+
+    // -- libcef inline thunk dispatch -----------------------------------------
+
+    #[test]
+    fn cef_string_conversion_thunks_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "cef-strings", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // cef_string_utf8_to_utf16("Café", 6, out)
+        let utf8_ptr = 0x30_000_u64;
+        memory.map_bytes(utf8_ptr, b"Caf\xC3\xA9");
+        let out = 0x30_100_u64;
+        memory.map_bytes(out, &[0_u8; 24]);
+        let utf8_to_16 = runtime.alloc_host_thunk(HostThunk::CefStringUtf8ToUtf16);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                utf8_to_16,
+                &[utf8_ptr as u32, 5, out as u32]
+            ),
+            1,
+            "cef_string_utf8_to_utf16 returns TRUE"
+        );
+        let str_addr = memory.read_u64(out).expect("str");
+        let str_len = memory.read_u64(out + 8).expect("len");
+        assert_eq!(str_len, 4, "Café is 4 UTF-16 units");
+        let wide = read_utf16_string(&memory, str_addr).expect("utf16");
+        assert_eq!(wide, "Caf\u{e9}");
+
+        // cef_string_utf16_to_utf8(src, 5, out)
+        let utf16_ptr = 0x30_200_u64;
+        write_guest_utf16(&mut memory, utf16_ptr, "Caf\u{e9}");
+        let out2 = 0x30_300_u64;
+        memory.map_bytes(out2, &[0_u8; 24]);
+        let utf16_to_8 = runtime.alloc_host_thunk(HostThunk::CefStringUtf16ToUtf8);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                utf16_to_8,
+                &[utf16_ptr as u32, 4, out2 as u32]
+            ),
+            1,
+            "cef_string_utf16_to_utf8 returns TRUE"
+        );
+        let str_addr = memory.read_u64(out2).expect("str");
+        let str_len = memory.read_u64(out2 + 8).expect("len");
+        assert_eq!(str_len, 5, "Café is 5 UTF-8 bytes");
+        let utf8 = read_c_string(&memory, str_addr).expect("utf8");
+        assert_eq!(utf8, "Caf\u{e9}");
+
+        // cef_string_utf8_to_wide mirrors utf8→utf16.
+        let out3 = 0x30_400_u64;
+        memory.map_bytes(out3, &[0_u8; 24]);
+        let utf8_wide = runtime.alloc_host_thunk(HostThunk::CefStringUtf8ToWide);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                utf8_wide,
+                &[utf8_ptr as u32, 5, out3 as u32]
+            ),
+            1,
+            "cef_string_utf8_to_wide returns TRUE"
+        );
+        let str_addr = memory.read_u64(out3).expect("str");
+        assert_eq!(
+            read_utf16_string(&memory, str_addr).expect("wide"),
+            "Caf\u{e9}"
+        );
+
+        // cef_string_wide_to_utf8 mirrors utf16→utf8.
+        let out4 = 0x30_500_u64;
+        memory.map_bytes(out4, &[0_u8; 24]);
+        let wide_utf8 = runtime.alloc_host_thunk(HostThunk::CefStringWideToUtf8);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wide_utf8,
+                &[utf16_ptr as u32, 4, out4 as u32]
+            ),
+            1,
+            "cef_string_wide_to_utf8 returns TRUE"
+        );
+        let str_addr = memory.read_u64(out4).expect("str");
+        assert_eq!(read_c_string(&memory, str_addr).expect("utf8"), "Caf\u{e9}");
+    }
+
+    #[test]
+    fn cef_cross_origin_whitelist_thunks_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "cef-whitelist", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let origin = 0x30_000_u64;
+        let protocol = 0x30_100_u64;
+        let domain = 0x30_200_u64;
+        write_guest_utf16(&mut memory, origin, "https://game.example");
+        write_guest_utf16(&mut memory, protocol, "https");
+        write_guest_utf16(&mut memory, domain, "api.example.com");
+
+        let add = runtime.alloc_host_thunk(HostThunk::CefAddCrossOriginWhitelistEntry);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add,
+                &[origin as u32, protocol as u32, domain as u32, 0]
+            ),
+            1,
+            "cef_add_cross_origin_whitelist_entry returns TRUE"
+        );
+        assert!(
+            runtime
+                .cef_cross_origin_whitelist
+                .contains("https://game.example|https|api.example.com"),
+            "the whitelist entry is stored"
+        );
+
+        let remove = runtime.alloc_host_thunk(HostThunk::CefRemoveCrossOriginWhitelistEntry);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                remove,
+                &[origin as u32, protocol as u32, domain as u32, 0]
+            ),
+            1,
+            "cef_remove_cross_origin_whitelist_entry returns TRUE"
+        );
+        assert!(
+            runtime.cef_cross_origin_whitelist.is_empty(),
+            "the whitelist entry is removed"
+        );
+
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add,
+                &[origin as u32, protocol as u32, domain as u32, 0]
+            ),
+            1,
+            "re-add returns TRUE"
+        );
+        let clear = runtime.alloc_host_thunk(HostThunk::CefClearCrossOriginWhitelist);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, clear, &[]),
+            0,
+            "cef_clear_cross_origin_whitelist is void"
+        );
+        assert!(
+            runtime.cef_cross_origin_whitelist.is_empty(),
+            "clear empties the whitelist"
+        );
+    }
+
+    #[test]
+    fn cef_url_parts_thunks_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cef-url", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let url = 0x30_000_u64;
+        write_guest_utf16(&mut memory, url, "https://game.example/start");
+        let parts = 0x30_100_u64;
+        memory.map_bytes(parts, &[0_u8; 96]);
+
+        let parse = runtime.alloc_host_thunk(HostThunk::CefParseUrl);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                parse,
+                &[url as u32, parts as u32]
+            ),
+            1,
+            "cef_parse_url returns TRUE"
+        );
+        let spec_addr = memory.read_u64(parts).expect("spec str");
+        let spec_len = memory.read_u64(parts + 8).expect("spec len");
+        assert_eq!(spec_len, 26, "the spec length is the URL's UTF-16 length");
+        assert_eq!(
+            read_utf16_string(&memory, spec_addr).expect("spec"),
+            "https://game.example/start"
+        );
+
+        let url_out = 0x30_200_u64;
+        memory.map_bytes(url_out, &[0_u8; 24]);
+        let create = runtime.alloc_host_thunk(HostThunk::CefCreateUrl);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create,
+                &[parts as u32, url_out as u32]
+            ),
+            1,
+            "cef_create_url returns TRUE"
+        );
+        let out_addr = memory.read_u64(url_out).expect("out str");
+        let out_len = memory.read_u64(url_out + 8).expect("out len");
+        assert_eq!(out_len, 26);
+        assert_eq!(
+            read_utf16_string(&memory, out_addr).expect("out url"),
+            "https://game.example/start",
+            "cef_create_url round-trips the parsed spec"
+        );
+    }
+
+    #[test]
+    fn cef_cookie_and_misc_thunks_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "cef-cookie", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let get_global = runtime.alloc_host_thunk(HostThunk::CefCookieManagerGetGlobal);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_global, &[0]),
+            1,
+            "cef_cookie_manager_get_global returns a cookie-manager handle"
+        );
+
+        let schemes = runtime.alloc_host_thunk(HostThunk::CefCookieManagerSetSupportedSchemes);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, schemes, &[0, 0]),
+            1,
+            "cef_cookie_manager_set_supported_schemes returns TRUE"
+        );
+
+        let set_cookie = runtime.alloc_host_thunk(HostThunk::CefCookieManagerSetCookie);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_cookie, &[0, 0, 0]),
+            1,
+            "cef_cookie_manager_set_cookie returns TRUE"
+        );
+
+        let visit = runtime.alloc_host_thunk(HostThunk::CefCookieManagerVisitAllCookies);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, visit, &[0]),
+            1,
+            "cef_cookie_manager_visit_all_cookies returns TRUE"
+        );
+
+        let delete = runtime.alloc_host_thunk(HostThunk::CefCookieManagerDeleteCookies);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[0, 0, 0]),
+            1,
+            "cef_cookie_manager_delete_cookies returns TRUE"
+        );
+
+        let flush = runtime.alloc_host_thunk(HostThunk::CefCookieManagerFlushStore);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, flush, &[0]),
+            1,
+            "cef_cookie_manager_flush_store returns TRUE"
+        );
+
+        let minimal = runtime.alloc_host_thunk(HostThunk::CefGetMinimalLibcefVersion);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, minimal, &[]),
+            0,
+            "cef_get_minimal_libcef_version returns NULL on the WKWebView path"
+        );
+
+        let window_info = runtime.alloc_host_thunk(HostThunk::CefWindowInfoCreate);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, window_info, &[]),
+            0,
+            "cef_window_info_create returns NULL (defaults)"
+        );
+
+        let settings = runtime.alloc_host_thunk(HostThunk::CefBrowserSettingsCreate);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, settings, &[]),
+            0,
+            "cef_browser_settings_create returns NULL (defaults)"
+        );
+
+        let load_string = runtime.alloc_host_thunk(HostThunk::CefFrameLoadString);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, load_string, &[0, 0, 0, 0]),
+            1,
+            "cef_frame_load_string returns TRUE"
+        );
+
+        let stop_load = runtime.alloc_host_thunk(HostThunk::CefBrowserStopLoad);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, stop_load, &[0]),
+            1,
+            "cef_browser_stop_load returns TRUE"
+        );
+
+        let quit_loop = runtime.alloc_host_thunk(HostThunk::CefQuitMessageLoop);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, quit_loop, &[]),
+            0,
+            "cef_quit_message_loop is void"
+        );
+
+        let do_work = runtime.alloc_host_thunk(HostThunk::CefDoMessageLoopWork);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, do_work, &[]),
+            0,
+            "cef_do_message_loop_work is void"
+        );
+
+        let run_loop = runtime.alloc_host_thunk(HostThunk::CefRunMessageLoop);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, run_loop, &[]),
+            0,
+            "cef_run_message_loop returns after one pump"
+        );
+
+        let register_ext = runtime.alloc_host_thunk(HostThunk::CefRegisterExtension);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, register_ext, &[0, 0, 0]),
+            1,
+            "cef_register_extension returns TRUE"
+        );
+    }
+    // -- gdiplus dispatch -----------------------------------------------------
+
+    fn gdiplus_bitmap_pixels(runtime: &PeHostRuntime, bmp_handle: u64) -> Vec<u8> {
+        match runtime.user32.gdiplus_state.get(bmp_handle) {
+            Some(GdiplusObject::Image(img)) => match &**img {
+                GdiplusImage::Bitmap(bmp) => bmp.pixels.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn gdiplus_pixel(runtime: &PeHostRuntime, bmp_handle: u64, x: u32, y: u32) -> u32 {
+        let pixels = gdiplus_bitmap_pixels(runtime, bmp_handle);
+        let stride = match runtime.user32.gdiplus_state.get(bmp_handle) {
+            Some(GdiplusObject::Image(img)) => match &**img {
+                GdiplusImage::Bitmap(bmp) => bmp.stride,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let idx = (y as i32 * stride + x as i32 * 4) as usize;
+        u32::from_le_bytes([
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        ])
+    }
+
+    fn f32_bits(value: f32) -> u32 {
+        value.to_bits()
+    }
+
+    #[test]
+    fn gdiplus_startup_shutdown_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-startup",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let token_slot = 0x30_000_u64;
+        write_u64(&mut memory, token_slot, 0);
+        let startup = runtime.alloc_host_thunk(HostThunk::GdiplusStartup);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                startup,
+                &[token_slot as u32, 0, 0]
+            ),
+            0,
+            "GdiplusStartup returns Ok"
+        );
+        let token = memory.read_u64(token_slot).expect("token");
+        assert_eq!(token, 0xABCD_0001, "the GDI+ token is written");
+        assert!(
+            runtime.user32.gdiplus_state.initialized,
+            "the GDI+ state is initialized"
+        );
+
+        let shutdown = runtime.alloc_host_thunk(HostThunk::GdiplusShutdown);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, shutdown, &[token as u32]),
+            0,
+            "GdiplusShutdown returns Ok"
+        );
+        assert!(
+            !runtime.user32.gdiplus_state.initialized,
+            "shutdown clears the initialized flag"
+        );
+        assert!(
+            runtime.user32.gdiplus_state.objects.is_empty(),
+            "shutdown clears the object table"
+        );
+    }
+
+    #[test]
+    fn gdiplus_graphics_brushes_pens_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-objects",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, graphics_out as u32]
+            ),
+            0,
+            "GdipCreateFromHDC returns Ok"
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics handle");
+        assert_ne!(graphics, 0, "a graphics handle is allocated");
+
+        let brush_out = 0x30_100_u64;
+        let solid = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                solid,
+                &[0xFF00_1122, brush_out as u32]
+            ),
+            0,
+            "GdipCreateSolidFill returns Ok"
+        );
+        let solid_brush = read_u64(&memory, brush_out).expect("solid brush");
+        assert_ne!(solid_brush, 0);
+
+        let line_brush_out = 0x30_110_u64;
+        let line = runtime.alloc_host_thunk(HostThunk::GdipCreateLineBrush);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                line,
+                &[
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(10.0),
+                    f32_bits(10.0),
+                    0xFF11_1111,
+                    0xFF22_2222,
+                    0,
+                    line_brush_out as u32,
+                ]
+            ),
+            0,
+            "GdipCreateLineBrush returns Ok"
+        );
+        assert_ne!(read_u64(&memory, line_brush_out).expect("line brush"), 0);
+
+        // A texture brush needs an image handle first.
+        let bmp_out = 0x30_120_u64;
+        let scan0 = 0x40_000_u64;
+        memory.map_bytes(scan0, &[0xFF_u8; 16]);
+        let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_scan0,
+                &[2, 2, 8, 0x0026_2009, scan0 as u32, bmp_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromScan0 returns Ok"
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+        let texture_out = 0x30_130_u64;
+        let texture = runtime.alloc_host_thunk(HostThunk::GdipCreateTextureBrush);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                texture,
+                &[bmp as u32, 0, texture_out as u32]
+            ),
+            0,
+            "GdipCreateTextureBrush returns Ok"
+        );
+        assert_ne!(read_u64(&memory, texture_out).expect("texture brush"), 0);
+
+        let delete_brush = runtime.alloc_host_thunk(HostThunk::GdipDeleteBrush);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                delete_brush,
+                &[solid_brush as u32]
+            ),
+            0,
+            "GdipDeleteBrush returns Ok"
+        );
+
+        let pen1_out = 0x30_200_u64;
+        let pen1 = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                pen1,
+                &[0xFF00_FF00, f32_bits(2.5), 0, pen1_out as u32]
+            ),
+            0,
+            "GdipCreatePen1 returns Ok"
+        );
+        let pen_handle = read_u64(&memory, pen1_out).expect("pen 1");
+
+        let pen2_out = 0x30_210_u64;
+        let pen2 = runtime.alloc_host_thunk(HostThunk::GdipCreatePen2);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                pen2,
+                &[solid_brush as u32, f32_bits(1.0), 0, pen2_out as u32]
+            ),
+            0,
+            "GdipCreatePen2 returns Ok (brush-backed pen)"
+        );
+        let pen2_handle = read_u64(&memory, pen2_out).expect("pen 2");
+        assert_ne!(pen2_handle, 0);
+
+        let delete_pen = runtime.alloc_host_thunk(HostThunk::GdipDeletePen);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_pen, &[pen2_handle as u32]),
+            0,
+            "GdipDeletePen returns Ok"
+        );
+
+        let delete_gfx = runtime.alloc_host_thunk(HostThunk::GdipDeleteGraphics);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_gfx, &[graphics as u32]),
+            0,
+            "GdipDeleteGraphics returns Ok"
+        );
+        assert!(
+            runtime.user32.gdiplus_state.get(graphics).is_none(),
+            "the graphics handle is gone after delete"
+        );
+        let _ = pen_handle; // pen deleted by the pen-properties test
+    }
+
+    #[test]
+    fn gdiplus_bitmap_pixels_and_lockbits_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-bitmap",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let scan0 = 0x40_000_u64;
+        memory.map_bytes(scan0, &[0_u8; 16]);
+        let bmp_out = 0x30_000_u64;
+        let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_scan0,
+                &[2, 2, 8, 0x0026_2009, scan0 as u32, bmp_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromScan0 returns Ok"
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+        let set_pixel = runtime.alloc_host_thunk(HostThunk::GdipBitmapSetPixel);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[bmp as u32, 1, 1, 0xFF12_3456]
+            ),
+            0,
+            "GdipBitmapSetPixel returns Ok"
+        );
+        assert_eq!(
+            gdiplus_pixel(&runtime, bmp, 1, 1),
+            0xFF12_3456,
+            "SetPixel writes into the bitmap pixel buffer"
+        );
+
+        let color_out = 0x30_100_u64;
+        let get_pixel = runtime.alloc_host_thunk(HostThunk::GdipBitmapGetPixel);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_pixel,
+                &[bmp as u32, 1, 1, color_out as u32]
+            ),
+            0,
+            "GdipBitmapGetPixel returns Ok"
+        );
+        assert_eq!(
+            memory.read_u32(color_out).expect("color"),
+            0xFF12_3456,
+            "GetPixel round-trips SetPixel"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_pixel,
+                &[bmp as u32, 99, 99, color_out as u32]
+            ),
+            2,
+            "out-of-bounds GetPixel reports InvalidParameter"
+        );
+
+        let locked = 0x30_200_u64;
+        memory.map_bytes(locked, &[0_u8; 32]);
+        let lock = runtime.alloc_host_thunk(HostThunk::GdipBitmapLockBits);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lock,
+                &[bmp as u32, 0, 0, 0, locked as u32]
+            ),
+            0,
+            "GdipBitmapLockBits returns Ok"
+        );
+        assert_eq!(memory.read_u32(locked).expect("width"), 2);
+        assert_eq!(memory.read_u32(locked + 4).expect("height"), 2);
+        assert_eq!(memory.read_u32(locked + 8).expect("stride"), 8);
+        assert_eq!(memory.read_u32(locked + 12).expect("format"), 0x0026_2009);
+        assert_ne!(
+            memory.read_u64(locked + 16).expect("scan0"),
+            0,
+            "BitmapData.scan0 is the pixel buffer"
+        );
+
+        let unlock = runtime.alloc_host_thunk(HostThunk::GdipBitmapUnlockBits);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                unlock,
+                &[bmp as u32, locked as u32]
+            ),
+            0,
+            "GdipBitmapUnlockBits returns Ok"
+        );
+
+        let dispose = runtime.alloc_host_thunk(HostThunk::GdipDisposeImage);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, dispose, &[bmp as u32]),
+            0,
+            "GdipDisposeImage returns Ok"
+        );
+        assert!(
+            runtime.user32.gdiplus_state.get(bmp).is_none(),
+            "the bitmap is gone after dispose"
+        );
+    }
+
+    #[test]
+    fn gdiplus_bitmap_factories_and_queries_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-factories",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let mut created = Vec::new();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let bmp_out = 0x30_100_u64;
+        let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[4, 4, graphics as u32, bmp_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromGraphics returns Ok"
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+        created.push(bmp);
+
+        let width_out = 0x30_200_u64;
+        let get_width = runtime.alloc_host_thunk(HostThunk::GdipGetImageWidth);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_width,
+                &[bmp as u32, width_out as u32]
+            ),
+            0,
+            "GdipGetImageWidth returns Ok"
+        );
+        assert_eq!(memory.read_u32(width_out).expect("width"), 4);
+
+        let height_out = 0x30_204_u64;
+        let get_height = runtime.alloc_host_thunk(HostThunk::GdipGetImageHeight);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_height,
+                &[bmp as u32, height_out as u32]
+            ),
+            0,
+            "GdipGetImageHeight returns Ok"
+        );
+        assert_eq!(memory.read_u32(height_out).expect("height"), 4);
+
+        let format_out = 0x30_208_u64;
+        let get_format = runtime.alloc_host_thunk(HostThunk::GdipGetImagePixelFormat);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_format,
+                &[bmp as u32, format_out as u32]
+            ),
+            0,
+            "GdipGetImagePixelFormat returns Ok"
+        );
+        assert_eq!(memory.read_u32(format_out).expect("format"), 0x0026_2009);
+
+        let type_out = 0x30_20c_u64;
+        let get_type = runtime.alloc_host_thunk(HostThunk::GdipGetImageType);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_type,
+                &[bmp as u32, type_out as u32]
+            ),
+            0,
+            "GdipGetImageType returns Ok"
+        );
+        assert_eq!(
+            memory.read_u32(type_out).expect("type"),
+            1,
+            "ImageTypeBitmap"
+        );
+
+        let raw_format = runtime.alloc_host_thunk(HostThunk::GdipGetImageRawFormat);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, raw_format, &[bmp as u32, 0]),
+            0,
+            "GdipGetImageRawFormat returns Ok"
+        );
+
+        let clone_out = 0x30_300_u64;
+        let clone = runtime.alloc_host_thunk(HostThunk::GdipCloneImage);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                clone,
+                &[bmp as u32, clone_out as u32]
+            ),
+            0,
+            "GdipCloneImage returns Ok"
+        );
+        assert_eq!(
+            read_u64(&memory, clone_out).expect("clone"),
+            bmp,
+            "the shallow clone reuses the image handle"
+        );
+
+        let placeholder_out = 0x30_400_u64;
+        let from_hbitmap = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromHBITMAP);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_hbitmap,
+                &[0, 0, placeholder_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromHBITMAP returns Ok"
+        );
+        let placeholder = read_u64(&memory, placeholder_out).expect("placeholder");
+        created.push(placeholder);
+
+        let from_file_out = 0x30_410_u64;
+        let from_file = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromFile);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_file,
+                &[0, from_file_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromFile returns Ok"
+        );
+        created.push(read_u64(&memory, from_file_out).expect("from file"));
+
+        let from_stream_out = 0x30_420_u64;
+        let from_stream = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromStream);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_stream,
+                &[0, from_stream_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromStream returns Ok"
+        );
+        created.push(read_u64(&memory, from_stream_out).expect("from stream"));
+
+        let from_dib_out = 0x30_430_u64;
+        let from_dib = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGdiDib);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_dib,
+                &[0, 0, from_dib_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromGdiDib returns Ok"
+        );
+        created.push(read_u64(&memory, from_dib_out).expect("from dib"));
+
+        let image_out = 0x30_440_u64;
+        let from_file_image = runtime.alloc_host_thunk(HostThunk::GdipCreateImageFromFile);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_file_image,
+                &[0, image_out as u32]
+            ),
+            0,
+            "GdipCreateImageFromFile returns Ok"
+        );
+        created.push(read_u64(&memory, image_out).expect("image from file"));
+
+        let validate = runtime.alloc_host_thunk(HostThunk::GdipImageForceValidation);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, validate, &[bmp as u32]),
+            0,
+            "GdipImageForceValidation returns Ok"
+        );
+
+        let dispose = runtime.alloc_host_thunk(HostThunk::GdipDisposeImage);
+        for handle in created {
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, dispose, &[handle as u32]),
+                0,
+                "GdipDisposeImage returns Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn gdiplus_path_build_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-path", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let path_out = 0x30_000_u64;
+        let create = runtime.alloc_host_thunk(HostThunk::GdipCreatePath);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[0, path_out as u32]),
+            0,
+            "GdipCreatePath returns Ok"
+        );
+        let path = read_u64(&memory, path_out).expect("path");
+        assert_ne!(path, 0);
+
+        let add_line = runtime.alloc_host_thunk(HostThunk::GdipAddPathLine);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_line,
+                &[
+                    path as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0)
+                ]
+            ),
+            0,
+            "GdipAddPathLine returns Ok"
+        );
+        let add_rect = runtime.alloc_host_thunk(HostThunk::GdipAddPathRectangle);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_rect,
+                &[
+                    path as u32,
+                    f32_bits(1.0),
+                    f32_bits(1.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0)
+                ]
+            ),
+            0,
+            "GdipAddPathRectangle returns Ok"
+        );
+        let add_ellipse = runtime.alloc_host_thunk(HostThunk::GdipAddPathEllipse);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_ellipse,
+                &[
+                    path as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0)
+                ]
+            ),
+            0,
+            "GdipAddPathEllipse returns Ok"
+        );
+        let add_arc = runtime.alloc_host_thunk(HostThunk::GdipAddPathArc);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_arc,
+                &[
+                    path as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                    f32_bits(0.0),
+                    f32_bits(90.0),
+                ]
+            ),
+            0,
+            "GdipAddPathArc returns Ok"
+        );
+        let add_bezier = runtime.alloc_host_thunk(HostThunk::GdipAddPathBezier);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_bezier,
+                &[
+                    path as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(1.0),
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(1.0),
+                    f32_bits(1.0),
+                    f32_bits(1.0),
+                ]
+            ),
+            0,
+            "GdipAddPathBezier returns Ok"
+        );
+        let start_figure = runtime.alloc_host_thunk(HostThunk::GdipStartPathFigure);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, start_figure, &[path as u32]),
+            0,
+            "GdipStartPathFigure returns Ok"
+        );
+        let close_figure = runtime.alloc_host_thunk(HostThunk::GdipClosePathFigure);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, close_figure, &[path as u32]),
+            0,
+            "GdipClosePathFigure returns Ok"
+        );
+
+        let set_fill = runtime.alloc_host_thunk(HostThunk::GdipSetPathFillMode);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_fill,
+                &[path as u32, 1 /* WINDING */]
+            ),
+            0,
+            "GdipSetPathFillMode returns Ok"
+        );
+
+        let stored = match runtime.user32.gdiplus_state.get(path) {
+            Some(GdiplusObject::Path(p)) => p,
+            _ => panic!("path handle must resolve"),
+        };
+        assert_eq!(stored.fill_mode, 1, "the fill mode is updated");
+        assert_eq!(
+            stored.elements.len(),
+            7,
+            "all seven path elements are appended in order"
+        );
+        assert!(matches!(
+            stored.elements[0],
+            GdiplusPathElement::Line { .. }
+        ));
+        assert!(matches!(
+            stored.elements[1],
+            GdiplusPathElement::Rectangle { .. }
+        ));
+        assert!(matches!(
+            stored.elements[2],
+            GdiplusPathElement::Ellipse { .. }
+        ));
+        assert!(matches!(stored.elements[3], GdiplusPathElement::Arc { .. }));
+        assert!(matches!(
+            stored.elements[4],
+            GdiplusPathElement::Bezier { .. }
+        ));
+        assert!(matches!(
+            stored.elements[5],
+            GdiplusPathElement::StartFigure
+        ));
+        assert!(matches!(
+            stored.elements[6],
+            GdiplusPathElement::CloseFigure
+        ));
+
+        let delete = runtime.alloc_host_thunk(HostThunk::GdipDeletePath);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[path as u32]),
+            0,
+            "GdipDeletePath returns Ok"
+        );
+        assert!(
+            runtime.user32.gdiplus_state.get(path).is_none(),
+            "the path is gone after delete"
+        );
+    }
+
+    #[test]
+    fn gdiplus_matrix_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-matrix",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let matrix_out = 0x30_000_u64;
+        let create = runtime.alloc_host_thunk(HostThunk::GdipCreateMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[matrix_out as u32]),
+            0,
+            "GdipCreateMatrix returns Ok"
+        );
+        let matrix = read_u64(&memory, matrix_out).expect("matrix");
+        assert_ne!(matrix, 0);
+
+        let elements = 0x30_100_u64;
+        memory.map_bytes(elements, &[0_u8; 24]);
+        let get_elements = runtime.alloc_host_thunk(HostThunk::GdipGetMatrixElements);
+        let read_elements =
+            |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, ptr: u64| -> Vec<f32> {
+                assert_eq!(
+                    dispatch_x86_thunk(runtime, memory, get_elements, &[matrix as u32, ptr as u32]),
+                    0,
+                    "GdipGetMatrixElements returns Ok"
+                );
+                (0..6)
+                    .map(|i| f32::from_bits(memory.read_u32(ptr + i * 4).expect("element")))
+                    .collect()
+            };
+        assert_eq!(
+            read_elements(&mut runtime, &mut memory, elements),
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "a fresh matrix is the identity"
+        );
+
+        let set_elements = runtime.alloc_host_thunk(HostThunk::GdipSetMatrixElements);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_elements,
+                &[
+                    matrix as u32,
+                    f32_bits(2.0),
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                ]
+            ),
+            0,
+            "GdipSetMatrixElements returns Ok"
+        );
+        assert_eq!(
+            read_elements(&mut runtime, &mut memory, elements),
+            vec![2.0, 0.0, 0.0, 4.0, 0.0, 0.0],
+            "the elements round-trip through the store"
+        );
+
+        let invert = runtime.alloc_host_thunk(HostThunk::GdipInvertMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, invert, &[matrix as u32]),
+            0,
+            "GdipInvertMatrix returns Ok"
+        );
+        let inverted = read_elements(&mut runtime, &mut memory, elements);
+        assert!((inverted[0] - 0.5).abs() < 1e-6, "inverse m11 = 0.5");
+        assert!((inverted[3] - 0.25).abs() < 1e-6, "inverse m22 = 0.25");
+
+        let translate = runtime.alloc_host_thunk(HostThunk::GdipTranslateMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                translate,
+                &[matrix as u32, f32_bits(10.0), f32_bits(20.0), 0]
+            ),
+            0,
+            "GdipTranslateMatrix returns Ok"
+        );
+        let translated = read_elements(&mut runtime, &mut memory, elements);
+        assert!((translated[4] - 10.0).abs() < 1e-6, "dx = 10");
+        assert!((translated[5] - 20.0).abs() < 1e-6, "dy = 20");
+
+        let scale = runtime.alloc_host_thunk(HostThunk::GdipScaleMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                scale,
+                &[matrix as u32, f32_bits(3.0), f32_bits(5.0), 0]
+            ),
+            0,
+            "GdipScaleMatrix returns Ok"
+        );
+        let scaled = read_elements(&mut runtime, &mut memory, elements);
+        assert!((scaled[0] - 1.5).abs() < 1e-6, "m11 scales by sx");
+        assert!((scaled[3] - 1.25).abs() < 1e-6, "m22 scales by sy");
+
+        let rotate = runtime.alloc_host_thunk(HostThunk::GdipRotateMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                rotate,
+                &[matrix as u32, f32_bits(90.0), 0]
+            ),
+            0,
+            "GdipRotateMatrix returns Ok"
+        );
+
+        let multiply = runtime.alloc_host_thunk(HostThunk::GdipMultiplyMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                multiply,
+                &[matrix as u32, matrix as u32, 0]
+            ),
+            0,
+            "GdipMultiplyMatrix returns Ok"
+        );
+
+        let delete = runtime.alloc_host_thunk(HostThunk::GdipDeleteMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[matrix as u32]),
+            0,
+            "GdipDeleteMatrix returns Ok"
+        );
+    }
+
+    #[test]
+    fn gdiplus_world_transform_and_clip_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-transform",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let matrix_out = 0x30_100_u64;
+        let create = runtime.alloc_host_thunk(HostThunk::GdipCreateMatrix);
+        dispatch_x86_thunk(&mut runtime, &mut memory, create, &[matrix_out as u32]);
+        let matrix = read_u64(&memory, matrix_out).expect("matrix");
+
+        let set_world = runtime.alloc_host_thunk(HostThunk::GdipSetWorldTransform);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_world,
+                &[graphics as u32, matrix as u32]
+            ),
+            0,
+            "GdipSetWorldTransform returns Ok"
+        );
+
+        let world_out = 0x30_200_u64;
+        let get_world = runtime.alloc_host_thunk(HostThunk::GdipGetWorldTransform);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_world,
+                &[graphics as u32, world_out as u32]
+            ),
+            0,
+            "GdipGetWorldTransform returns Ok"
+        );
+        assert_eq!(
+            read_u64(&memory, world_out).expect("world matrix"),
+            matrix,
+            "the set world transform is returned"
+        );
+
+        let reset_world = runtime.alloc_host_thunk(HostThunk::GdipResetWorldTransform);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_world, &[graphics as u32]),
+            0,
+            "GdipResetWorldTransform returns Ok"
+        );
+
+        let set_clip = runtime.alloc_host_thunk(HostThunk::GdipSetClipRect);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_clip,
+                &[
+                    graphics as u32,
+                    f32_bits(10.0),
+                    f32_bits(20.0),
+                    f32_bits(30.0),
+                    f32_bits(40.0),
+                    0,
+                ]
+            ),
+            0,
+            "GdipSetClipRect returns Ok"
+        );
+
+        let clip_bounds = 0x30_300_u64;
+        memory.map_bytes(clip_bounds, &[0_u8; 16]);
+        let get_bounds = runtime.alloc_host_thunk(HostThunk::GdipGetClipBounds);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_bounds,
+                &[graphics as u32, clip_bounds as u32]
+            ),
+            0,
+            "GdipGetClipBounds returns Ok"
+        );
+        assert_eq!(memory.read_u32(clip_bounds).expect("x"), f32_bits(10.0));
+        assert_eq!(memory.read_u32(clip_bounds + 4).expect("y"), f32_bits(20.0));
+        assert_eq!(memory.read_u32(clip_bounds + 8).expect("w"), f32_bits(30.0));
+        assert_eq!(
+            memory.read_u32(clip_bounds + 12).expect("h"),
+            f32_bits(40.0)
+        );
+
+        let region = 0x30_400_u64;
+        memory.map_bytes(region, &[0_u8; 24]);
+        let get_clip = runtime.alloc_host_thunk(HostThunk::GdipGetClip);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_clip,
+                &[graphics as u32, region as u32]
+            ),
+            0,
+            "GdipGetClip returns Ok"
+        );
+        assert_eq!(
+            memory.read_u32(region).expect("region type"),
+            1,
+            "RegionDataTypeRect"
+        );
+        assert_eq!(memory.read_u32(region + 4).expect("rx"), 10);
+
+        let path_out = 0x30_500_u64;
+        let create_path = runtime.alloc_host_thunk(HostThunk::GdipCreatePath);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_path,
+            &[0, path_out as u32],
+        );
+        let path = read_u64(&memory, path_out).expect("path");
+        let set_clip_path = runtime.alloc_host_thunk(HostThunk::GdipSetClipPath);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_clip_path,
+                &[graphics as u32, path as u32, 0]
+            ),
+            0,
+            "GdipSetClipPath returns Ok"
+        );
+        let set_clip_region = runtime.alloc_host_thunk(HostThunk::GdipSetClipRegion);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_clip_region,
+                &[graphics as u32, 0, 0]
+            ),
+            0,
+            "GdipSetClipRegion returns Ok"
+        );
+
+        let reset_clip = runtime.alloc_host_thunk(HostThunk::GdipResetClip);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_clip, &[graphics as u32]),
+            0,
+            "GdipResetClip returns Ok"
+        );
+    }
+
+    #[test]
+    fn gdiplus_save_restore_containers_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "gdiplus-containers",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let state_out = 0x30_100_u64;
+        let save = runtime.alloc_host_thunk(HostThunk::GdipSaveGraphics);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                save,
+                &[graphics as u32, state_out as u32]
+            ),
+            0,
+            "GdipSaveGraphics returns Ok"
+        );
+        let saved_state = memory.read_u32(state_out).expect("state id");
+        assert_eq!(saved_state, 1, "the first state id is 1");
+
+        let set_smoothing = runtime.alloc_host_thunk(HostThunk::GdipSetSmoothingMode);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_smoothing,
+                &[graphics as u32, 2]
+            ),
+            0,
+            "GdipSetSmoothingMode returns Ok"
+        );
+        let mode_out = 0x30_200_u64;
+        let get_smoothing = runtime.alloc_host_thunk(HostThunk::GdipGetSmoothingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_smoothing,
+            &[graphics as u32, mode_out as u32],
+        );
+        assert_eq!(memory.read_u32(mode_out).expect("mode"), 2);
+
+        let restore = runtime.alloc_host_thunk(HostThunk::GdipRestoreGraphics);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                restore,
+                &[graphics as u32, saved_state]
+            ),
+            0,
+            "GdipRestoreGraphics returns Ok"
+        );
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_smoothing,
+            &[graphics as u32, mode_out as u32],
+        );
+        assert_eq!(
+            memory.read_u32(mode_out).expect("restored mode"),
+            0,
+            "restore reverts the smoothing mode"
+        );
+
+        let container_state = 0x30_300_u64;
+        let begin = runtime.alloc_host_thunk(HostThunk::GdipBeginContainer);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                begin,
+                &[graphics as u32, 0, 0, 0, container_state as u32]
+            ),
+            0,
+            "GdipBeginContainer returns Ok"
+        );
+        let container_id = memory.read_u32(container_state).expect("container id");
+        let end = runtime.alloc_host_thunk(HostThunk::GdipEndContainer);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                end,
+                &[graphics as u32, container_id]
+            ),
+            0,
+            "GdipEndContainer returns Ok"
+        );
+    }
+
+    #[test]
+    fn gdiplus_draw_primitives_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-draw", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let bmp_out = 0x30_100_u64;
+        let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[16, 16, graphics as u32, bmp_out as u32]
+            ),
+            0,
+            "GdipCreateBitmapFromGraphics returns Ok"
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+        let pen_out = 0x30_120_u64;
+        let pen1 = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            pen1,
+            &[0xFF00_FF00, f32_bits(1.0), 0, pen_out as u32],
+        );
+        let pen = read_u64(&memory, pen_out).expect("pen");
+
+        let set_mode = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_mode,
+            &[graphics as u32, 1 /* SOURCE_COPY */],
+        );
+
+        // DrawLine (0,4)-(15,4): the whole row y=4 is green.
+        let draw_line = runtime.alloc_host_thunk(HostThunk::GdipDrawLine);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_line,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(15.0),
+                    f32_bits(4.0),
+                ]
+            ),
+            0,
+            "GdipDrawLine returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 7, 4), 0xFF00_FF00);
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 0, 0), 0);
+
+        // DrawRectangle (1,6,4,4): the border is green.
+        let draw_rect = runtime.alloc_host_thunk(HostThunk::GdipDrawRectangle);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_rect,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(1.0),
+                    f32_bits(6.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                ]
+            ),
+            0,
+            "GdipDrawRectangle returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 1, 6), 0xFF00_FF00);
+
+        let mut snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        // DrawEllipse / DrawArc / DrawPie / DrawPolygon / DrawCurve /
+        // DrawClosedCurve / DrawLines / DrawPath all rasterize into the
+        // target bitmap.
+        let draw_ellipse = runtime.alloc_host_thunk(HostThunk::GdipDrawEllipse);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_ellipse,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ]
+            ),
+            0,
+            "GdipDrawEllipse returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "ellipse outline rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let draw_arc = runtime.alloc_host_thunk(HostThunk::GdipDrawArc);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_arc,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                    f32_bits(0.0),
+                    f32_bits(360.0),
+                ]
+            ),
+            0,
+            "GdipDrawArc returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "arc rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let draw_pie = runtime.alloc_host_thunk(HostThunk::GdipDrawPie);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_pie,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                    f32_bits(0.0),
+                    f32_bits(360.0),
+                ]
+            ),
+            0,
+            "GdipDrawPie returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "pie outline rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let points = 0x40_000_u64;
+        memory.map_bytes(points, &[0_u8; 64]);
+        let write_points = |memory: &mut MemoryImage, ptr: u64, pts: &[(f32, f32)]| {
+            for (index, (x, y)) in pts.iter().copied().enumerate() {
+                write_u32(memory, ptr + (index as u64 * 8), f32_bits(x));
+                write_u32(memory, ptr + (index as u64 * 8) + 4, f32_bits(y));
+            }
+        };
+        write_points(&mut memory, points, &[(2.0, 2.0), (12.0, 2.0), (2.0, 12.0)]);
+
+        let draw_polygon = runtime.alloc_host_thunk(HostThunk::GdipDrawPolygon);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_polygon,
+                &[graphics as u32, pen as u32, points as u32, 3]
+            ),
+            0,
+            "GdipDrawPolygon returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "polygon outline rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let curve_points = 0x41_000_u64;
+        memory.map_bytes(curve_points, &[0_u8; 32]);
+        write_points(
+            &mut memory,
+            curve_points,
+            &[(0.0, 8.0), (8.0, 0.0), (15.0, 8.0)],
+        );
+
+        let draw_curve = runtime.alloc_host_thunk(HostThunk::GdipDrawCurve);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_curve,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    curve_points as u32,
+                    3,
+                    f32_bits(0.5)
+                ]
+            ),
+            0,
+            "GdipDrawCurve returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "curve rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let draw_closed_curve = runtime.alloc_host_thunk(HostThunk::GdipDrawClosedCurve);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_closed_curve,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    curve_points as u32,
+                    3,
+                    f32_bits(0.5)
+                ]
+            ),
+            0,
+            "GdipDrawClosedCurve returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "closed curve rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let line_points = 0x42_000_u64;
+        memory.map_bytes(line_points, &[0_u8; 32]);
+        write_points(
+            &mut memory,
+            line_points,
+            &[(0.0, 0.0), (15.0, 0.0), (15.0, 15.0)],
+        );
+
+        let draw_lines = runtime.alloc_host_thunk(HostThunk::GdipDrawLines);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_lines,
+                &[graphics as u32, pen as u32, line_points as u32, 3]
+            ),
+            0,
+            "GdipDrawLines returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "polyline rasterized"
+        );
+        snapshot = gdiplus_bitmap_pixels(&runtime, bmp);
+
+        let path_out = 0x30_130_u64;
+        let create_path = runtime.alloc_host_thunk(HostThunk::GdipCreatePath);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_path,
+            &[0, path_out as u32],
+        );
+        let path = read_u64(&memory, path_out).expect("path");
+        let add_rect = runtime.alloc_host_thunk(HostThunk::GdipAddPathRectangle);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            add_rect,
+            &[
+                path as u32,
+                f32_bits(2.0),
+                f32_bits(2.0),
+                f32_bits(12.0),
+                f32_bits(12.0),
+            ],
+        );
+        let draw_path = runtime.alloc_host_thunk(HostThunk::GdipDrawPath);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_path,
+                &[graphics as u32, pen as u32, path as u32]
+            ),
+            0,
+            "GdipDrawPath returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            snapshot,
+            "path outline rasterized"
+        );
+    }
+
+    #[test]
+    fn gdiplus_fill_primitives_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-fill", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let bmp_out = 0x30_100_u64;
+        let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            from_gfx,
+            &[16, 16, graphics as u32, bmp_out as u32],
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+        let brush_out = 0x30_110_u64;
+        let solid = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            solid,
+            &[0xFFFF_0000, brush_out as u32],
+        );
+        let brush = read_u64(&memory, brush_out).expect("brush");
+
+        let set_mode = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_mode,
+            &[graphics as u32, 1 /* SOURCE_COPY */],
+        );
+
+        // Each fill op targets a distinct region so its rasterization is
+        // independently observable.
+        let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    brush as u32,
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                ]
+            ),
+            0,
+            "GdipFillRectangle returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 4, 4), 0xFFFF_0000);
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 0, 0), 0);
+
+        let fill_ellipse = runtime.alloc_host_thunk(HostThunk::GdipFillEllipse);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_ellipse,
+                &[
+                    graphics as u32,
+                    brush as u32,
+                    f32_bits(10.0),
+                    f32_bits(10.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                ]
+            ),
+            0,
+            "GdipFillEllipse returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 12, 12), 0xFFFF_0000);
+
+        let fill_pie = runtime.alloc_host_thunk(HostThunk::GdipFillPie);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_pie,
+                &[
+                    graphics as u32,
+                    brush as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(10.0),
+                    f32_bits(10.0),
+                    f32_bits(0.0),
+                    f32_bits(360.0),
+                ]
+            ),
+            0,
+            "GdipFillPie returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 5, 5), 0xFFFF_0000);
+
+        let points = 0x40_000_u64;
+        memory.map_bytes(points, &[0_u8; 64]);
+        for (index, (x, y)) in [(2.0, 10.0), (12.0, 10.0), (12.0, 15.0), (2.0, 15.0)]
+            .into_iter()
+            .enumerate()
+        {
+            write_u32(&mut memory, points + (index as u64 * 8), f32_bits(x));
+            write_u32(&mut memory, points + (index as u64 * 8) + 4, f32_bits(y));
+        }
+        let fill_polygon = runtime.alloc_host_thunk(HostThunk::GdipFillPolygon);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_polygon,
+                &[graphics as u32, brush as u32, points as u32, 4, 0]
+            ),
+            0,
+            "GdipFillPolygon returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 7, 12), 0xFFFF_0000);
+
+        let path_out = 0x30_120_u64;
+        let create_path = runtime.alloc_host_thunk(HostThunk::GdipCreatePath);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_path,
+            &[0, path_out as u32],
+        );
+        let path = read_u64(&memory, path_out).expect("path");
+        let add_rect = runtime.alloc_host_thunk(HostThunk::GdipAddPathRectangle);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            add_rect,
+            &[
+                path as u32,
+                f32_bits(10.0),
+                f32_bits(2.0),
+                f32_bits(4.0),
+                f32_bits(4.0),
+            ],
+        );
+        let fill_path = runtime.alloc_host_thunk(HostThunk::GdipFillPath);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_path,
+                &[graphics as u32, brush as u32, path as u32]
+            ),
+            0,
+            "GdipFillPath returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 12, 4), 0xFFFF_0000);
+
+        // FillRegion without a clip rect fills the whole bitmap.
+        let fill_region = runtime.alloc_host_thunk(HostThunk::GdipFillRegion);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_region,
+                &[graphics as u32, brush as u32, 0]
+            ),
+            0,
+            "GdipFillRegion returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, bmp, 15, 15), 0xFFFF_0000);
+    }
+
+    #[test]
+    fn gdiplus_draw_image_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-image", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let dst_out = 0x30_100_u64;
+        let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            from_gfx,
+            &[16, 16, graphics as u32, dst_out as u32],
+        );
+        let dst = read_u64(&memory, dst_out).expect("dst bitmap");
+
+        // 4x4 source with a red pixel at (2,2).
+        let scan0 = 0x40_000_u64;
+        memory.map_bytes(scan0, &[0_u8; 64]);
+        write_u32(&mut memory, scan0 + 40, 0xFFFF_0000);
+        let src_out = 0x30_110_u64;
+        let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            from_scan0,
+            &[4, 4, 16, 0x0026_2009, scan0 as u32, src_out as u32],
+        );
+        let src = read_u64(&memory, src_out).expect("src bitmap");
+
+        let set_mode = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            set_mode,
+            &[graphics as u32, 1 /* SOURCE_COPY */],
+        );
+
+        let draw_image = runtime.alloc_host_thunk(HostThunk::GdipDrawImage);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_image,
+                &[graphics as u32, src as u32, f32_bits(1.0), f32_bits(1.0)]
+            ),
+            0,
+            "GdipDrawImage returns Ok"
+        );
+        assert_eq!(
+            gdiplus_pixel(&runtime, dst, 3, 3),
+            0xFFFF_0000,
+            "the source pixel lands at (2+1, 2+1)"
+        );
+
+        let draw_image_rect = runtime.alloc_host_thunk(HostThunk::GdipDrawImageRect);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_image_rect,
+                &[
+                    graphics as u32,
+                    src as u32,
+                    f32_bits(0.0),
+                    f32_bits(8.0),
+                    f32_bits(16.0),
+                    f32_bits(8.0),
+                ]
+            ),
+            0,
+            "GdipDrawImageRect returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, dst, 8, 12), 0xFFFF_0000);
+
+        let draw_image_rect_rect = runtime.alloc_host_thunk(HostThunk::GdipDrawImageRectRect);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_image_rect_rect,
+                &[
+                    graphics as u32,
+                    src as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(8.0),
+                    f32_bits(8.0),
+                    2,
+                    0,
+                    0,
+                    0,
+                ]
+            ),
+            0,
+            "GdipDrawImageRectRect returns Ok"
+        );
+        assert_eq!(gdiplus_pixel(&runtime, dst, 4, 4), 0xFFFF_0000);
+    }
+
+    #[test]
+    fn gdiplus_text_font_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-text", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let family_out = 0x30_000_u64;
+        let family = runtime.alloc_host_thunk(HostThunk::GdipCreateFontFamilyFromName);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                family,
+                &[0, 0, family_out as u32]
+            ),
+            0,
+            "GdipCreateFontFamilyFromName returns Ok"
+        );
+        let family_handle = read_u64(&memory, family_out).expect("family");
+
+        let font_out = 0x30_100_u64;
+        let font = runtime.alloc_host_thunk(HostThunk::GdipCreateFont);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                font,
+                &[family_handle as u32, f32_bits(16.0), 0, 0, font_out as u32]
+            ),
+            0,
+            "GdipCreateFont returns Ok"
+        );
+        let font_handle = read_u64(&memory, font_out).expect("font");
+
+        let height_out = 0x30_200_u64;
+        let get_height = runtime.alloc_host_thunk(HostThunk::GdipGetFontHeight);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_height,
+                &[font_handle as u32, 0, height_out as u32]
+            ),
+            0,
+            "GdipGetFontHeight returns Ok"
+        );
+        assert_eq!(
+            f32::from_bits(memory.read_u32(height_out).expect("height")),
+            16.0,
+            "the default font height is 16"
+        );
+
+        let graphics_out = 0x30_300_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let bmp_out = 0x30_310_u64;
+        let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            from_gfx,
+            &[16, 16, graphics as u32, bmp_out as u32],
+        );
+        let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+        let brush_out = 0x30_320_u64;
+        let solid = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            solid,
+            &[0xFFFF_0000, brush_out as u32],
+        );
+        let brush = read_u64(&memory, brush_out).expect("brush");
+
+        let text = runtime
+            .alloc_utf16_string(&mut memory, "Test")
+            .expect("text");
+        let layout = 0x30_400_u64;
+        memory.map_bytes(layout, &[0_u8; 16]);
+        write_u32(&mut memory, layout, f32_bits(0.0));
+        write_u32(&mut memory, layout + 4, f32_bits(0.0));
+        write_u32(&mut memory, layout + 8, f32_bits(100.0));
+        write_u32(&mut memory, layout + 12, f32_bits(20.0));
+
+        let before = gdiplus_bitmap_pixels(&runtime, bmp);
+        let draw_string = runtime.alloc_host_thunk(HostThunk::GdipDrawString);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_string,
+                &[
+                    graphics as u32,
+                    text as u32,
+                    4,
+                    font_handle as u32,
+                    layout as u32,
+                    0,
+                    brush as u32,
+                ]
+            ),
+            0,
+            "GdipDrawString returns Ok"
+        );
+        assert_ne!(
+            gdiplus_bitmap_pixels(&runtime, bmp),
+            before,
+            "the string rasterizes into the bitmap"
+        );
+
+        let bounds = 0x30_500_u64;
+        memory.map_bytes(bounds, &[0_u8; 16]);
+        let measure = runtime.alloc_host_thunk(HostThunk::GdipMeasureString);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                measure,
+                &[
+                    graphics as u32,
+                    text as u32,
+                    4,
+                    font_handle as u32,
+                    layout as u32,
+                    0,
+                    bounds as u32,
+                    0,
+                ]
+            ),
+            0,
+            "GdipMeasureString returns Ok"
+        );
+        let width = f32::from_bits(memory.read_u32(bounds + 8).expect("width"));
+        let height = f32::from_bits(memory.read_u32(bounds + 12).expect("height"));
+        assert!(
+            (width - 38.4).abs() < 0.01,
+            "4 chars at 16pt measure ~38.4 wide, got {width}"
+        );
+        assert!(
+            (height - 20.8).abs() < 0.01,
+            "16pt text measures ~20.8 tall, got {height}"
+        );
+
+        let measure_ranges = runtime.alloc_host_thunk(HostThunk::GdipMeasureCharacterRanges);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                measure_ranges,
+                &[
+                    graphics as u32,
+                    text as u32,
+                    4,
+                    font_handle as u32,
+                    layout as u32,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            0,
+            "GdipMeasureCharacterRanges returns Ok"
+        );
+
+        let delete_font = runtime.alloc_host_thunk(HostThunk::GdipDeleteFont);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                delete_font,
+                &[font_handle as u32]
+            ),
+            0,
+            "GdipDeleteFont returns Ok"
+        );
+        let delete_family = runtime.alloc_host_thunk(HostThunk::GdipDeleteFontFamily);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                delete_family,
+                &[family_handle as u32]
+            ),
+            0,
+            "GdipDeleteFontFamily returns Ok"
+        );
+    }
+
+    #[test]
+    fn gdiplus_pen_and_quality_state_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-state", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let graphics_out = 0x30_000_u64;
+        let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_gfx,
+            &[0x21, graphics_out as u32],
+        );
+        let graphics = read_u64(&memory, graphics_out).expect("graphics");
+
+        let pen_out = 0x30_100_u64;
+        let pen1 = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            pen1,
+            &[0xFF00_FF00, f32_bits(2.5), 0, pen_out as u32],
+        );
+        let pen = read_u64(&memory, pen_out).expect("pen");
+
+        let width_out = 0x30_200_u64;
+        let get_width = runtime.alloc_host_thunk(HostThunk::GdipGetPenWidth);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_width,
+            &[pen as u32, width_out as u32],
+        );
+        assert_eq!(
+            f32::from_bits(memory.read_u32(width_out).expect("width")),
+            2.5,
+            "the pen starts at the created width"
+        );
+        let set_width = runtime.alloc_host_thunk(HostThunk::GdipSetPenWidth);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_width,
+                &[pen as u32, f32_bits(5.0)]
+            ),
+            0,
+            "GdipSetPenWidth returns Ok"
+        );
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_width,
+            &[pen as u32, width_out as u32],
+        );
+        assert_eq!(
+            f32::from_bits(memory.read_u32(width_out).expect("width")),
+            5.0,
+            "the width round-trips"
+        );
+
+        let color_out = 0x30_210_u64;
+        let get_color = runtime.alloc_host_thunk(HostThunk::GdipGetPenColor);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_color,
+            &[pen as u32, color_out as u32],
+        );
+        assert_eq!(
+            memory.read_u32(color_out).expect("color"),
+            0xFF00_FF00,
+            "the pen starts with the created color"
+        );
+        let set_color = runtime.alloc_host_thunk(HostThunk::GdipSetPenColor);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_color,
+                &[pen as u32, 0xFFAA_BBCC]
+            ),
+            0,
+            "GdipSetPenColor returns Ok"
+        );
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_color,
+            &[pen as u32, color_out as u32],
+        );
+        assert_eq!(
+            memory.read_u32(color_out).expect("color"),
+            0xFFAA_BBCC,
+            "the color round-trips"
+        );
+
+        let dash_out = 0x30_220_u64;
+        let get_dash = runtime.alloc_host_thunk(HostThunk::GdipGetPenDashStyle);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_dash,
+            &[pen as u32, dash_out as u32],
+        );
+        assert_eq!(
+            memory.read_u32(dash_out).expect("dash"),
+            0,
+            "solid by default"
+        );
+        let set_dash = runtime.alloc_host_thunk(HostThunk::GdipSetPenDashStyle);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_dash,
+                &[pen as u32, 2 /* DOT */]
+            ),
+            0,
+            "GdipSetPenDashStyle returns Ok"
+        );
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_dash,
+            &[pen as u32, dash_out as u32],
+        );
+        assert_eq!(memory.read_u32(dash_out).expect("dash"), 2);
+
+        let set_join = runtime.alloc_host_thunk(HostThunk::GdipSetPenLineJoin);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_join,
+                &[pen as u32, 2 /* ROUND */]
+            ),
+            0,
+            "GdipSetPenLineJoin returns Ok"
+        );
+        let set_start_cap = runtime.alloc_host_thunk(HostThunk::GdipSetPenStartCap);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_start_cap,
+                &[pen as u32, 2 /* ROUND */]
+            ),
+            0,
+            "GdipSetPenStartCap returns Ok"
+        );
+        let set_end_cap = runtime.alloc_host_thunk(HostThunk::GdipSetPenEndCap);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_end_cap,
+                &[pen as u32, 2 /* ROUND */]
+            ),
+            0,
+            "GdipSetPenEndCap returns Ok"
+        );
+
+        let mode_out = 0x30_300_u64;
+        let set_compositing = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingMode);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_compositing,
+                &[graphics as u32, 1]
+            ),
+            0,
+            "GdipSetCompositingMode returns Ok"
+        );
+        let get_compositing = runtime.alloc_host_thunk(HostThunk::GdipGetCompositingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_compositing,
+            &[graphics as u32, mode_out as u32],
+        );
+        assert_eq!(memory.read_u32(mode_out).expect("mode"), 1);
+
+        let quality_out = 0x30_304_u64;
+        let set_quality = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingQuality);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_quality,
+                &[graphics as u32, 2]
+            ),
+            0,
+            "GdipSetCompositingQuality returns Ok"
+        );
+        let get_quality = runtime.alloc_host_thunk(HostThunk::GdipGetCompositingQuality);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_quality,
+            &[graphics as u32, quality_out as u32],
+        );
+        assert_eq!(memory.read_u32(quality_out).expect("quality"), 2);
+
+        let interpolation_out = 0x30_308_u64;
+        let set_interpolation = runtime.alloc_host_thunk(HostThunk::GdipSetInterpolationMode);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_interpolation,
+                &[graphics as u32, 5]
+            ),
+            0,
+            "GdipSetInterpolationMode returns Ok"
+        );
+        let get_interpolation = runtime.alloc_host_thunk(HostThunk::GdipGetInterpolationMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_interpolation,
+            &[graphics as u32, interpolation_out as u32],
+        );
+        assert_eq!(
+            memory.read_u32(interpolation_out).expect("interpolation"),
+            5
+        );
+
+        let offset_out = 0x30_30c_u64;
+        let set_offset = runtime.alloc_host_thunk(HostThunk::GdipSetPixelOffsetMode);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_offset, &[graphics as u32, 2]),
+            0,
+            "GdipSetPixelOffsetMode returns Ok"
+        );
+        let get_offset = runtime.alloc_host_thunk(HostThunk::GdipGetPixelOffsetMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_offset,
+            &[graphics as u32, offset_out as u32],
+        );
+        assert_eq!(memory.read_u32(offset_out).expect("offset"), 2);
+
+        let smoothing_out = 0x30_310_u64;
+        let set_smoothing = runtime.alloc_host_thunk(HostThunk::GdipSetSmoothingMode);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_smoothing,
+                &[graphics as u32, 4]
+            ),
+            0,
+            "GdipSetSmoothingMode returns Ok"
+        );
+        let get_smoothing = runtime.alloc_host_thunk(HostThunk::GdipGetSmoothingMode);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_smoothing,
+            &[graphics as u32, smoothing_out as u32],
+        );
+        assert_eq!(memory.read_u32(smoothing_out).expect("smoothing"), 4);
+
+        let set_hint = runtime.alloc_host_thunk(HostThunk::GdipSetTextRenderingHint);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_hint, &[graphics as u32, 4]),
+            0,
+            "GdipSetTextRenderingHint returns Ok"
+        );
+        let stored = match runtime.user32.gdiplus_state.get(graphics) {
+            Some(GdiplusObject::Graphics(gfx)) => gfx.text_rendering_hint,
+            _ => panic!("graphics handle must resolve"),
+        };
+        assert_eq!(stored, 4, "the text rendering hint is stored");
+
+        // Invalid handles report InvalidParameter.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_width,
+                &[0xDEAD, f32_bits(1.0)]
+            ),
+            2,
+            "GdipSetPenWidth on an invalid pen reports InvalidParameter"
+        );
+    }
+
+    #[test]
+    fn gdiplus_image_attributes_and_stub_ops_dispatch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gdiplus-attrs", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let attrs_out = 0x30_000_u64;
+        let create_attrs = runtime.alloc_host_thunk(HostThunk::GdipCreateImageAttributes);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_attrs, &[attrs_out as u32]),
+            0,
+            "GdipCreateImageAttributes returns Ok"
+        );
+        let attrs = read_u64(&memory, attrs_out).expect("attributes");
+        assert_ne!(attrs, 0);
+
+        let set_keys = runtime.alloc_host_thunk(HostThunk::GdipSetImageAttributesColorKeys);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_keys,
+                &[attrs as u32, 0, 1, 0x0000_0000, 0x00FF_FFFF]
+            ),
+            0,
+            "GdipSetImageAttributesColorKeys returns Ok"
+        );
+
+        let matrix = 0x30_100_u64;
+        memory.map_bytes(matrix, &[0_u8; 100]);
+        let set_matrix = runtime.alloc_host_thunk(HostThunk::GdipSetImageAttributesColorMatrix);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_matrix,
+                &[attrs as u32, 0, 1, matrix as u32, 0, 0]
+            ),
+            0,
+            "GdipSetImageAttributesColorMatrix returns Ok"
+        );
+
+        let dispose_attrs = runtime.alloc_host_thunk(HostThunk::GdipDisposeImageAttributes);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, dispose_attrs, &[attrs as u32]),
+            0,
+            "GdipDisposeImageAttributes returns Ok"
+        );
+
+        // Documented no-op / placeholder operations still report Ok and
+        // must not corrupt the object table.
+        let hicon = runtime.alloc_host_thunk(HostThunk::GdipCreateHICONFromBitmap);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[0, 0]),
+            0,
+            "GdipCreateHICONFromBitmap returns Ok"
+        );
+        let hbitmap = runtime.alloc_host_thunk(HostThunk::GdipCreateHBITMAPFromBitmap);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, hbitmap, &[0, 0, 0]),
+            0,
+            "GdipCreateHBITMAPFromBitmap returns Ok"
+        );
+        let save_file = runtime.alloc_host_thunk(HostThunk::GdipSaveImageToFile);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, save_file, &[0, 0, 0, 0]),
+            0,
+            "GdipSaveImageToFile returns Ok"
+        );
+        let save_stream = runtime.alloc_host_thunk(HostThunk::GdipSaveImageToStream);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, save_stream, &[0, 0, 0, 0]),
+            0,
+            "GdipSaveImageToStream returns Ok"
+        );
+    }
 }
 
 fn read_d3d12_command_queue_desc(
