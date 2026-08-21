@@ -667,6 +667,15 @@ pub(crate) struct PeHostRuntime {
     pub(crate) network: NetworkStack,
     /// WinHTTP/WinINet stack for HTTP/TLS operations
     pub(crate) winhttp: WinHttpStack,
+    /// secur32.dll SSPI state: credentials, security contexts and the
+    /// NTLM/Negotiate handshake envelopes.
+    pub(crate) sspi: crate::sspi::SspiSubsystem,
+    /// Pending MIB change-notification registrations (NotifyAddrChange /
+    /// NotifyRouteChange).  The guest network is static, so the
+    /// registrations never complete; CancelMibChangeNotify2 removes them.
+    pub(crate) mib_change_notifications: BTreeMap<u64, u8>,
+    /// Next MIB change-notification handle value.
+    pub(crate) next_mib_change_notify_handle: u64,
     pub(crate) device_contexts: BTreeMap<u64, Option<u32>>,
     pub(crate) dialog_procs: BTreeMap<u32, u64>,
     pub(crate) window_surfaces: BTreeMap<u32, WindowSurface>,
@@ -1262,6 +1271,9 @@ impl PeHostRuntime {
             synthetic_dll_init_callbacks: Vec::new(),
             network: NetworkStack::new(),
             winhttp: WinHttpStack::new(),
+            sspi: crate::sspi::SspiSubsystem::new(),
+            mib_change_notifications: BTreeMap::new(),
+            next_mib_change_notify_handle: 0x4000_0000,
             device_contexts: BTreeMap::new(),
             dialog_procs: BTreeMap::new(),
             window_surfaces: BTreeMap::new(),

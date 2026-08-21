@@ -223,6 +223,55 @@ const WSAEAFNOSUPPORT: i32 = 10047;
 const WSAEFAULT: i32 = 10014;
 const WSAEINVAL: i32 = 10022;
 const WSAENOTSOCK: i32 = 10038;
+const WSAEWOULDBLOCK: i32 = 10035;
+const WSAENOPROTOOPT: i32 = 10042;
+const WSAECONNREFUSED: i32 = 10061;
+const WSAHOST_NOT_FOUND: i32 = 11001;
+const WSANO_RECOVERY: i32 = 11003;
+// Winsock level/option identifiers used by the getsockopt surface.
+const SOL_SOCKET: i32 = 0xFFFF;
+const SO_DEBUG: i32 = 0x0001;
+const SO_ACCEPTCONN: i32 = 0x0002;
+const SO_REUSEADDR: i32 = 0x0004;
+const SO_KEEPALIVE: i32 = 0x0008;
+const SO_DONTROUTE: i32 = 0x0010;
+const SO_BROADCAST: i32 = 0x0020;
+const SO_SNDBUF: i32 = 0x1001;
+const SO_RCVBUF: i32 = 0x1002;
+const SO_ERROR: i32 = 0x1007;
+const SO_TYPE: i32 = 0x1008;
+const TCP_NODELAY: i32 = 0x0001;
+const IPPROTO_IP: i32 = 0;
+const IP_TTL: i32 = 4;
+// WSAPoll revents/events flags.
+const POLLRDNORM: u16 = 0x0100;
+const POLLWRNORM: u16 = 0x0010;
+const POLLERR: u16 = 0x0001;
+const POLLNVAL: u16 = 0x0020;
+// getnameinfo flags and EAI_* error codes (ws2tcpip.h).
+const NI_NUMERICHOST: u32 = 0x02;
+const NI_NAMEREQD: u32 = 0x04;
+const NI_NUMERICSERV: u32 = 0x08;
+const NI_DGRAM: u32 = 0x10;
+const EAI_NONAME: i32 = WSAHOST_NOT_FOUND;
+const EAI_FAIL: i32 = WSANO_RECOVERY;
+const EAI_FAMILY: i32 = WSAEAFNOSUPPORT;
+// iphlpapi / netapi32 documented codes.
+const NO_ERROR: u32 = 0;
+const ERROR_INVALID_LEVEL: u32 = 124;
+const ERROR_NOT_SUPPORTED: u32 = 50;
+const NERR_UserNotFound: u32 = 2221;
+const NERR_InvalidComputer: u32 = 2351;
+// MIB interface / route constants.
+const MIB_IF_ADMIN_STATUS_UP: u32 = 1;
+const MIB_IPROUTE_TYPE_DIRECT: u32 = 3;
+const MIB_IPPROTO_NETMGMT: u32 = 3;
+// IP_ADAPTER_* flags (iphlpapi.h).
+const IP_ADAPTER_DDNS_ENABLED: u32 = 0x0000_0001;
+const IP_ADAPTER_REGISTER_ADAPTER_SUFFIX: u32 = 0x0000_0002;
+const IP_ADAPTER_DHCP_ENABLED: u32 = 0x0000_0004;
+const IP_ADAPTER_IPV4_ENABLED: u32 = 0x0000_0080;
+const IP_ADAPTER_IPV6_ENABLED: u32 = 0x0000_0100;
 const DESCRIPTOR_HANDLE_BASE: u64 = 0x0000_7fff_8300_0000;
 const DESCRIPTOR_HANDLE_STRIDE: u64 = 0x20;
 const MEMORY_BASIC_INFORMATION32_SIZE: u64 = 28;
@@ -2197,6 +2246,110 @@ pub enum HostThunk {
     WsaFdIsSet,
     WsaIoctl,
     WsaSocketA,
+    // -- ws2_32.dll: socket lifecycle + DNS/service helpers (net-sys) -------
+    /// `accept` — accepts a pending connection off a listening socket,
+    /// minting a win32-table socket handle for the accepted side.
+    Accept,
+    /// `WSAAccept` — `accept` with the documented condition callback
+    /// (CF_ACCEPT / CF_REJECT / CF_DEFER).
+    WsaAccept,
+    /// `listen` — transitions a bound socket to the listening state.
+    Listen,
+    /// `getsockopt` — the documented socket-option queries (SO_ERROR,
+    /// SO_TYPE, SO_ACCEPTCONN, buffers, TCP_NODELAY, IP_TTL).
+    Getsockopt,
+    /// `WSAConnect` — `connect` with caller/callee data buffers.
+    WsaConnect,
+    /// `WSAPoll` — WSAPOLLFD readiness polling over the select core.
+    WsaPoll,
+    /// `WSASocketW` — wide variant of WSASocketA (protocol info struct).
+    WsaSocketW,
+    /// `WSADuplicateSocketW` — fills a WSAPROTOCOL_INFOW for the socket.
+    WsaDuplicateSocketW,
+    /// `gethostbyname` — classic HOSTENT resolution from the guest DNS
+    /// records.
+    Gethostbyname,
+    /// `gethostbyaddr` — reverse HOSTENT lookup.
+    Gethostbyaddr,
+    /// `gethostname` — the configured guest host name.
+    Gethostname,
+    /// `getnameinfo` — sockaddr → host/service strings.
+    Getnameinfo,
+    /// `getprotobyname` — protocol-name conversion.
+    Getprotobyname,
+    /// `getservbyname` — service-name conversion.
+    Getservbyname,
+    /// `inet_addr` — dotted-quad → network-order address.
+    InetAddr,
+    /// `inet_ntoa` — network-order address → dotted-quad string.
+    InetNtoa,
+    // -- secur32.dll SSPI (net-sys) ----------------------------------------
+    /// `AcquireCredentialsHandleW` — mints a credential handle.
+    AcquireCredentialsHandleW,
+    /// `FreeCredentialsHandle` — releases a credential handle.
+    FreeCredentialsHandle,
+    /// `InitializeSecurityContextW` — client NTLM/Negotiate handshake.
+    InitializeSecurityContextW,
+    /// `AcceptSecurityContext` — server NTLM/Negotiate handshake.
+    AcceptSecurityContext,
+    /// `CompleteAuthToken` — parks an out-of-band handshake token.
+    CompleteAuthToken,
+    /// `DeleteSecurityContext` — destroys a security context.
+    DeleteSecurityContext,
+    /// `ImpersonateSecurityContext` — the guest already runs as the user.
+    ImpersonateSecurityContext,
+    /// `RevertSecurityContext` — no-op counterpart of impersonation.
+    RevertSecurityContext,
+    /// `QueryContextAttributesW` — sizes/names/session-key/package-info.
+    QueryContextAttributesW,
+    /// `MakeSignature` — signs a message (NTLMSSP_MESSAGE_SIGNATURE).
+    MakeSignature,
+    /// `VerifySignature` — verifies a signed message envelope.
+    VerifySignature,
+    /// `EncryptMessage` — seals a message (signature + PRF keystream).
+    EncryptMessage,
+    /// `DecryptMessage` — unseals and verifies an encrypted message.
+    DecryptMessage,
+    /// `EnumerateSecurityPackagesW` — the guest-visible package table.
+    EnumerateSecurityPackagesW,
+    /// `GetUserNameExW` — extended user-name formats from the guest env.
+    GetUserNameExW,
+    // -- netapi32.dll (net-sys) --------------------------------------------
+    /// `NetApiBufferFree` — frees netapi buffers via the guest heap.
+    NetApiBufferFree,
+    /// `NetServerEnum` — the empty guest server enumeration.
+    NetServerEnum,
+    /// `NetWkstaGetInfo` — workstation info from the guest environment.
+    NetWkstaGetInfo,
+    /// `NetUserGetInfo` — guest user info structures.
+    NetUserGetInfo,
+    // -- iphlpapi.dll (net-sys) --------------------------------------------
+    /// `GetAdaptersInfo` — the classic adapter chain from the guest config.
+    GetAdaptersInfo,
+    /// `GetAdaptersAddresses` — the Vista adapter structures.
+    GetAdaptersAddresses,
+    /// `GetIfTable` — the interface table.
+    GetIfTable,
+    /// `GetIfEntry` — one interface row.
+    GetIfEntry,
+    /// `GetIpAddrTable` — the IPv4 address table.
+    GetIpAddrTable,
+    /// `GetIpForwardTable` — the IPv4 route table.
+    GetIpForwardTable,
+    /// `GetNetworkParams` — host/domain/DNS fixed info.
+    GetNetworkParams,
+    /// `GetBestInterface` — the interface for a destination.
+    GetBestInterface,
+    /// `GetBestRoute` — the route for a destination.
+    GetBestRoute,
+    /// `GetRTTAndHopCount` — the guest-modeled reachability probe.
+    GetRTTAndHopCount,
+    /// `NotifyAddrChange` — pending address-change notification.
+    NotifyAddrChange,
+    /// `NotifyRouteChange` — pending route-change notification.
+    NotifyRouteChange,
+    /// `CancelMibChangeNotify2` — cancels a pending change notification.
+    CancelMibChangeNotify2,
     GetCurrentThread,
     GetCurrentThreadId,
     GetCurrentProcessId,
@@ -34789,11 +34942,2031 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
+            HostThunk::WsaSocketW => {
+                let family_arg = guest_call_arg(state, memory, 0)? as i32;
+                let _socket_type = guest_call_arg(state, memory, 1)?;
+                let _protocol = guest_call_arg(state, memory, 2)?;
+                let protocol_info = guest_call_arg(state, memory, 3)?;
+                let _group = guest_call_arg(state, memory, 4)?;
+                let _flags = guest_call_arg(state, memory, 5)?;
+                // With a WSAPROTOCOL_INFOW, the family comes from the
+                // structure (iAddressFamily at offset 76) and the address
+                // family parameters are ignored, exactly like WinSock.
+                let family = if protocol_info != 0 {
+                    read_guest_i32(memory, protocol_info + 76).unwrap_or(family_arg)
+                } else {
+                    family_arg
+                };
+                let handle = match winsock_address_family(family) {
+                    Some(family) => {
+                        let handle = self.win32.insert_socket();
+                        match self.network.socket_register(u64::from(handle), family) {
+                            Ok(()) => handle,
+                            Err(_) => {
+                                let _ = self.win32.close_socket(handle);
+                                self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                                INVALID_HANDLE_VALUE as u32
+                            }
+                        }
+                    }
+                    None => {
+                        self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                        INVALID_HANDLE_VALUE as u32
+                    }
+                };
+                state.set(Register::Rax, u64::from(handle));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "WSASocketW",
+                    BTreeMap::from([("family".to_string(), json!(family))]),
+                    json!(handle),
+                );
+            }
+            HostThunk::Listen => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let backlog = guest_call_arg(state, memory, 1)? as i32;
+                let result = (|| -> AppResult<u32> {
+                    if backlog < 0 {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    self.network.listen(socket, backlog as usize)?;
+                    Ok(0)
+                })();
+                match result {
+                    Ok(value) => {
+                        state.set(Register::Rax, u64::from(value));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "listen",
+                            BTreeMap::from([("socket".to_string(), json!(socket))]),
+                            json!(value),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Accept => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let addr_ptr = guest_call_arg(state, memory, 1)?;
+                let addr_len_ptr = guest_call_arg(state, memory, 2)?;
+                let result = (|| -> AppResult<u64> {
+                    self.win32.socket_id(socket as u32)?;
+                    if addr_ptr != 0 && addr_len_ptr == 0 {
+                        self.network.wsa_set_last_error(WSAEFAULT);
+                        return Ok(INVALID_HANDLE_VALUE);
+                    }
+                    let handle = self.win32.insert_socket();
+                    let peer = match self.network.accept_with_id(socket, u64::from(handle)) {
+                        Ok(peer) => peer,
+                        Err(_) => {
+                            let _ = self.win32.close_socket(handle);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                    };
+                    if addr_ptr != 0 && addr_len_ptr != 0 {
+                        let available = read_guest_i32(memory, addr_len_ptr)?;
+                        let required = u32::from(guest_sockaddr_len(peer.family));
+                        if available < 0 || (available as u32) < required {
+                            write_u32(memory, addr_len_ptr, required);
+                            self.network.wsa_set_last_error(WSAEFAULT);
+                            let _ = self.win32.close_socket(handle);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                        write_guest_sockaddr(memory, addr_ptr, &peer)?;
+                        write_u32(memory, addr_len_ptr, required);
+                    }
+                    Ok(u64::from(handle))
+                })();
+                match result {
+                    Ok(handle) => {
+                        state.set(Register::Rax, handle);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "accept",
+                            BTreeMap::from([("socket".to_string(), json!(socket))]),
+                            json!(handle),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::WsaAccept => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let addr_ptr = guest_call_arg(state, memory, 1)?;
+                let addr_len_ptr = guest_call_arg(state, memory, 2)?;
+                let condition = guest_call_arg(state, memory, 3)?;
+                let callback_data = guest_call_arg(state, memory, 4)?;
+                let result = (|| -> AppResult<u64> {
+                    self.win32.socket_id(socket as u32)?;
+                    if addr_ptr != 0 && addr_len_ptr == 0 {
+                        self.network.wsa_set_last_error(WSAEFAULT);
+                        return Ok(INVALID_HANDLE_VALUE);
+                    }
+                    let handle = self.win32.insert_socket();
+                    let peer = match self.network.accept_with_id(socket, u64::from(handle)) {
+                        Ok(peer) => peer,
+                        Err(_) => {
+                            let _ = self.win32.close_socket(handle);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                    };
+                    // The documented condition callback: invoked with the
+                    // caller id / caller data / QoS / callee id WSABUFs and
+                    // the callback data; CF_ACCEPT (0) accepts, CF_REJECT
+                    // (1) refuses with WSAECONNREFUSED, CF_DEFER (2)
+                    // defers with WSAEWOULDBLOCK.
+                    if condition != 0 {
+                        let wsabuf_size = wsabuf_stride(self.guest_arch) as usize;
+                        let caller_id = self.alloc_heap(memory, wsabuf_size, true)?;
+                        let caller_id_addr = self.alloc_heap(memory, 16, true)?;
+                        write_guest_sockaddr(memory, caller_id_addr, &peer)?;
+                        write_u32(memory, caller_id, 16);
+                        write_guest_pointer(memory, caller_id + wsabuf_buffer_offset(self.guest_arch), caller_id_addr, self.guest_arch)?;
+                        let callee_id = self.alloc_heap(memory, wsabuf_size, true)?;
+                        let callee_id_addr = self.alloc_heap(memory, 16, true)?;
+                        let local = self.network.getsockname(socket).unwrap_or_else(|_| peer.clone());
+                        write_guest_sockaddr(memory, callee_id_addr, &local)?;
+                        write_u32(memory, callee_id, 16);
+                        write_guest_pointer(memory, callee_id + wsabuf_buffer_offset(self.guest_arch), callee_id_addr, self.guest_arch)?;
+                        let caller_data = self.alloc_heap(memory, wsabuf_size, true)?;
+                        let callee_data = self.alloc_heap(memory, wsabuf_size, true)?;
+                        let decision = self.execute_guest_callback(
+                            state,
+                            memory,
+                            condition,
+                            &[caller_id, caller_data, 0, 0, callee_id, callee_data, 0, callback_data],
+                            "WSAAccept condition",
+                        )?;
+                        if decision == 1 {
+                            // CF_REJECT
+                            let _ = self.win32.close_socket(handle);
+                            self.network.wsa_set_last_error(WSAECONNREFUSED);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                        if decision == 2 {
+                            // CF_DEFER — the connection stays queued.
+                            let _ = self.win32.close_socket(handle);
+                            self.network.wsa_set_last_error(WSAEWOULDBLOCK);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                    }
+                    if addr_ptr != 0 && addr_len_ptr != 0 {
+                        let available = read_guest_i32(memory, addr_len_ptr)?;
+                        let required = u32::from(guest_sockaddr_len(peer.family));
+                        if available < 0 || (available as u32) < required {
+                            write_u32(memory, addr_len_ptr, required);
+                            self.network.wsa_set_last_error(WSAEFAULT);
+                            let _ = self.win32.close_socket(handle);
+                            return Ok(INVALID_HANDLE_VALUE);
+                        }
+                        write_guest_sockaddr(memory, addr_ptr, &peer)?;
+                        write_u32(memory, addr_len_ptr, required);
+                    }
+                    Ok(u64::from(handle))
+                })();
+                match result {
+                    Ok(handle) => {
+                        state.set(Register::Rax, handle);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "WSAAccept",
+                            BTreeMap::from([("socket".to_string(), json!(socket))]),
+                            json!(handle),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::WsaConnect => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let sockaddr_ptr = guest_call_arg(state, memory, 1)?;
+                let sockaddr_len = guest_call_arg_u32(state, memory, 2)?;
+                let caller_data = guest_call_arg(state, memory, 3)?;
+                let callee_data = guest_call_arg(state, memory, 4)?;
+                let _sqos = guest_call_arg(state, memory, 5)?;
+                let _gqos = guest_call_arg(state, memory, 6)?;
+                let result = (|| -> AppResult<u32> {
+                    let addr = read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)?;
+                    self.network.connect(socket, addr.clone())?;
+                    // lpCallerData: initial client data sent right after the
+                    // connect, mirroring ConnectEx's send-buffer behavior.
+                    if caller_data != 0 {
+                        let (buffer, len) = read_wsabuf_entry(memory, caller_data, self.guest_arch)?;
+                        if len != 0 && buffer != 0 {
+                            let payload = read_guest_bytes(memory, buffer, len as usize)?;
+                            self.network.send(socket, &payload)?;
+                        }
+                    }
+                    // lpCalleeData: server→client initial data — the guest
+                    // model has none, so the WSABUF length is zeroed.
+                    if callee_data != 0 {
+                        write_u32(memory, callee_data, 0);
+                    }
+                    self.emit_event(crate::runtime_events::RuntimeEvent::SocketConnected {
+                        host: addr.host.clone(),
+                        port: addr.port,
+                    });
+                    self.push_trace(
+                        "network",
+                        "WSAConnect",
+                        BTreeMap::from([
+                            ("socket".to_string(), json!(socket)),
+                            ("host".to_string(), json!(addr.host)),
+                            ("port".to_string(), json!(addr.port)),
+                        ]),
+                        json!(0),
+                    );
+                    Ok(0)
+                })();
+                match result {
+                    Ok(value) => {
+                        state.set(Register::Rax, u64::from(value));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Getsockopt => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let level = guest_call_arg(state, memory, 1)? as i32;
+                let option_name = guest_call_arg(state, memory, 2)? as i32;
+                let option_value = guest_call_arg(state, memory, 3)?;
+                let option_len = guest_call_arg(state, memory, 4)?;
+                let result = (|| -> AppResult<u32> {
+                    if option_value == 0 || option_len == 0 {
+                        self.network.wsa_set_last_error(WSAEFAULT);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    let len = read_guest_i32(memory, option_len)?;
+                    if len < 4 {
+                        self.network.wsa_set_last_error(WSAEFAULT);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    // Type-check the handle first: a non-socket → WSAENOTSOCK.
+                    self.win32.socket_id(socket as u32)?;
+                    let value = match (level, option_name) {
+                        (SOL_SOCKET, SO_ERROR) => self.network.take_pending_error(socket)?,
+                        (SOL_SOCKET, SO_TYPE) => SOCK_STREAM,
+                        (SOL_SOCKET, SO_ACCEPTCONN) => {
+                            i32::from(self.network.socket_is_listening(socket)?)
+                        }
+                        (SOL_SOCKET, SO_RCVBUF) => 16_384,
+                        (SOL_SOCKET, SO_SNDBUF) => 16_384,
+                        (SOL_SOCKET, SO_KEEPALIVE | SO_REUSEADDR | SO_DONTROUTE | SO_BROADCAST | SO_DEBUG) => 0,
+                        (IPPROTO_TCP, TCP_NODELAY) => 0,
+                        (IPPROTO_IP, IP_TTL) => 128,
+                        _ => {
+                            self.network.wsa_set_last_error(WSAENOPROTOOPT);
+                            return Ok(INVALID_HANDLE_VALUE as u32);
+                        }
+                    };
+                    write_u32(memory, option_value, value as u32);
+                    write_u32(memory, option_len, 4);
+                    self.push_trace(
+                        "network",
+                        "getsockopt",
+                        BTreeMap::from([
+                            ("socket".to_string(), json!(socket)),
+                            ("level".to_string(), json!(level)),
+                            ("option_name".to_string(), json!(option_name)),
+                        ]),
+                        json!(value),
+                    );
+                    Ok(0)
+                })();
+                match result {
+                    Ok(value) => {
+                        state.set(Register::Rax, u64::from(value));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::WsaPoll => {
+                let fds_ptr = guest_call_arg(state, memory, 0)?;
+                let nfds = guest_call_arg_u32(state, memory, 1)?;
+                let _timeout = guest_call_arg(state, memory, 2)? as i32;
+                let result = (|| -> AppResult<i32> {
+                    if fds_ptr == 0 && nfds != 0 {
+                        self.network.wsa_set_last_error(WSAEFAULT);
+                        return Ok(-1);
+                    }
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                    let stride = wsabuf_stride(self.guest_arch);
+                    let mut ready = 0_i32;
+                    for index in 0..nfds {
+                        let entry = fds_ptr + u64::from(index) * stride;
+                        let fd = read_guest_pointer(memory, entry, self.guest_arch)?;
+                        let events = read_guest_u16(memory, entry + pointer_bytes)?;
+                        let mut revents = 0_u16;
+                        match self.network.select(&[fd]) {
+                            Ok((readable, writable)) => {
+                                if events != 0 {
+                                    if readable.contains(&fd) {
+                                        revents |= POLLRDNORM;
+                                    }
+                                    if writable.contains(&fd) {
+                                        revents |= POLLWRNORM;
+                                    }
+                                }
+                                if self
+                                    .network
+                                    .peek_pending_error(fd)
+                                    .map(|error| error != 0)
+                                    .unwrap_or(false)
+                                {
+                                    revents |= POLLERR;
+                                }
+                            }
+                            Err(_) => {
+                                // Not a socket in the guest namespace.
+                                revents = POLLNVAL;
+                            }
+                        }
+                        memory.map_bytes(entry + pointer_bytes, &events.to_le_bytes());
+                        memory.map_bytes(entry + pointer_bytes + 2, &revents.to_le_bytes());
+                        if revents != 0 {
+                            ready += 1;
+                        }
+                    }
+                    Ok(ready)
+                })();
+                match result {
+                    Ok(ready) => {
+                        state.set(Register::Rax, ready as i64 as u64);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "WSAPoll",
+                            BTreeMap::from([("nfds".to_string(), json!(nfds))]),
+                            json!(ready),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::WsaDuplicateSocketW => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let _process_id = guest_call_arg_u32(state, memory, 1)?;
+                let info_ptr = guest_call_arg(state, memory, 2)?;
+                let result = (|| -> AppResult<u32> {
+                    if info_ptr == 0 {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    self.win32.socket_id(socket as u32)?;
+                    let family = self.network.socket_family(socket)?;
+                    // WSAPROTOCOL_INFOW — a fixed 626-byte structure on both
+                    // guest ABIs (no pointer members).
+                    let family_value = winsock_family_value(family) as u32;
+                    let sockaddr_len = u32::from(guest_sockaddr_len(family));
+                    memory.map_bytes(info_ptr, &[0_u8; 626]);
+                    write_u32(memory, info_ptr, 0x0002_0026); // XP1_GUARANTEED_DELIVERY|ORDER|GRACEFUL_CLOSE|IFS_HANDLES
+                    write_u32(memory, info_ptr + 16, 0x2); // PFL_MULTIPLE_PROTO_ENTRIES
+                    // ProviderId: MSAFD Tcpip [TCP/IP]
+                    write_u32(memory, info_ptr + 20, 0xABAF_1AA0);
+                    memory.map_bytes(info_ptr + 24, &0x11CF_u16.to_le_bytes());
+                    memory.map_bytes(info_ptr + 26, &0x8C13_u16.to_le_bytes());
+                    memory.map_bytes(
+                        info_ptr + 28,
+                        &[0x00, 0xC0, 0x4F, 0xD9, 0xA8, 0xA0, 0xE7, 0x0F],
+                    );
+                    write_u32(memory, info_ptr + 36, 1001); // dwCatalogEntryId
+                    // ProtocolChain: ChainLen = 0 at offset 40.
+                    write_u32(memory, info_ptr + 72, 1); // iVersion
+                    write_u32(memory, info_ptr + 76, family_value); // iAddressFamily
+                    write_u32(memory, info_ptr + 80, sockaddr_len); // iMaxSockAddr
+                    write_u32(memory, info_ptr + 84, sockaddr_len); // iMinSockAddr
+                    write_u32(memory, info_ptr + 88, SOCK_STREAM as u32); // iSocketType
+                    write_u32(memory, info_ptr + 92, IPPROTO_TCP as u32); // iProtocol
+                    write_u32(memory, info_ptr + 100, 0); // iNetworkByteOrder: BIGENDIAN
+                    write_u32(memory, info_ptr + 108, 0); // dwMessageSize (stream)
+                    let proto_w = "MSAFD Tcpip [TCP/IP]";
+                    let mut proto_bytes = Vec::new();
+                    for unit in proto_w.encode_utf16() {
+                        proto_bytes.extend_from_slice(&unit.to_le_bytes());
+                    }
+                    proto_bytes.extend_from_slice(&0_u16.to_le_bytes());
+                    memory.map_bytes(info_ptr + 116, &proto_bytes);
+                    self.push_trace(
+                        "network",
+                        "WSADuplicateSocketW",
+                        BTreeMap::from([("socket".to_string(), json!(socket))]),
+                        json!(0),
+                    );
+                    Ok(0)
+                })();
+                match result {
+                    Ok(value) => {
+                        state.set(Register::Rax, u64::from(value));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Gethostname => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let name_len = guest_call_arg_u32(state, memory, 1)?;
+                let config = crate::network::guest_network_config(&self.win32.ge().config.user_name);
+                let hostname = config.hostname;
+                let required = hostname.len() as u32 + 1;
+                if name_ptr == 0 || name_len < required {
+                    self.network.wsa_set_last_error(WSAEFAULT);
+                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                    self.last_error = 0;
+                } else {
+                    let mut bytes = hostname.as_bytes().to_vec();
+                    bytes.push(0);
+                    memory.map_bytes(name_ptr, &bytes);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "network",
+                        "gethostname",
+                        BTreeMap::from([("length".to_string(), json!(name_len))]),
+                        json!(hostname),
+                    );
+                }
+            }
+            HostThunk::Gethostbyname => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let result = (|| -> AppResult<u64> {
+                    let name = read_c_string(memory, name_ptr)?;
+                    if name.is_empty() {
+                        self.network.wsa_set_last_error(WSAHOST_NOT_FOUND);
+                        return Ok(0);
+                    }
+                    let resolved = self.network.getaddrinfo(&name, 0)?;
+                    let Some(first) = resolved.first() else {
+                        self.network.wsa_set_last_error(WSAHOST_NOT_FOUND);
+                        return Ok(0);
+                    };
+                    let host = first.host.clone();
+                    // h_name is the queried (official) name; the address
+                    // list carries the resolved addresses.
+                    let official_name = name.clone();
+                    let h_addrtype = winsock_family_value(first.family);
+                    let h_length = match first.family {
+                        AddressFamily::Ipv4 => 4,
+                        AddressFamily::Ipv6 => 16,
+                    };
+                    let address_bytes = if h_length == 4 {
+                        host.parse::<Ipv4Addr>()
+                            .map(|addr| addr.octets().to_vec())
+                            .map_err(|error| {
+                                AppError::new(ReasonCode::RcCliInvalid, "invalid IPv4 address")
+                                    .with_hint(error.to_string())
+                            })?
+                    } else {
+                        host.parse::<Ipv6Addr>()
+                            .map(|addr| addr.octets().to_vec())
+                            .map_err(|error| {
+                                AppError::new(ReasonCode::RcCliInvalid, "invalid IPv6 address")
+                                    .with_hint(error.to_string())
+                            })?
+                    };
+                    // struct hostent { h_name; h_aliases; h_addrtype i16;
+                    // h_length i16; h_addr_list; } — x86 16 bytes, x64 32.
+                    let struct_size = if self.guest_arch == GuestArch::X86 { 16 } else { 32 };
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                    let base = self.alloc_heap(memory, struct_size, true)?;
+                    let name_addr = self.alloc_c_string(memory, &official_name)?;
+                    let aliases = self.alloc_heap(memory, pointer_bytes as usize, true)?;
+                    let addr_bytes = self.alloc_heap(memory, address_bytes.len(), false)?;
+                    memory.map_bytes(addr_bytes, &address_bytes);
+                    let addr_list = self.alloc_heap(memory, pointer_bytes as usize * 2, true)?;
+                    write_guest_pointer(memory, addr_list, addr_bytes, self.guest_arch)?;
+                    write_guest_pointer(memory, addr_list + pointer_bytes, 0, self.guest_arch)?;
+                    write_guest_pointer(memory, base, name_addr, self.guest_arch)?;
+                    write_guest_pointer(memory, base + pointer_bytes, aliases, self.guest_arch)?;
+                    memory.map_bytes(base + pointer_bytes * 2, &(h_addrtype as i16).to_le_bytes());
+                    memory.map_bytes(base + pointer_bytes * 2 + 2, &(h_length as i16).to_le_bytes());
+                    write_guest_pointer(memory, base + pointer_bytes * 3, addr_list, self.guest_arch)?;
+                    self.push_trace(
+                        "network",
+                        "gethostbyname",
+                        BTreeMap::from([("name".to_string(), json!(name))]),
+                        json!(host),
+                    );
+                    Ok(base)
+                })();
+                match result {
+                    Ok(hostent) => {
+                        state.set(Register::Rax, hostent);
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Gethostbyaddr => {
+                let addr_ptr = guest_call_arg(state, memory, 0)?;
+                let length = guest_call_arg_u32(state, memory, 1)?;
+                let family = guest_call_arg(state, memory, 2)? as i32;
+                let result = (|| -> AppResult<u64> {
+                    let address_bytes = match (family, length) {
+                        (AF_INET, len) if len >= 4 => read_guest_bytes(memory, addr_ptr, 4)?,
+                        (AF_INET6, len) if len >= 16 => read_guest_bytes(memory, addr_ptr, 16)?,
+                        (AF_INET | AF_INET6, _) => {
+                            self.network.wsa_set_last_error(WSAEFAULT);
+                            return Ok(0);
+                        }
+                        _ => {
+                            self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                            return Ok(0);
+                        }
+                    };
+                    let host = if family == AF_INET {
+                        Ipv4Addr::from([
+                            address_bytes[0],
+                            address_bytes[1],
+                            address_bytes[2],
+                            address_bytes[3],
+                        ])
+                        .to_string()
+                    } else {
+                        let mut octets = [0_u8; 16];
+                        octets.copy_from_slice(&address_bytes);
+                        Ipv6Addr::from(octets).to_string()
+                    };
+                    // Reverse lookup against the guest DNS records; the
+                    // numeric form is the fallback name, like Windows.
+                    let name = self
+                        .network
+                        .reverse_dns(&host)
+                        .unwrap_or_else(|| host.clone());
+                    let h_length = address_bytes.len() as i16;
+                    let struct_size = if self.guest_arch == GuestArch::X86 { 16 } else { 32 };
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                    let base = self.alloc_heap(memory, struct_size, true)?;
+                    let name_addr = self.alloc_c_string(memory, &name)?;
+                    let aliases = self.alloc_heap(memory, pointer_bytes as usize, true)?;
+                    let addr_bytes = self.alloc_heap(memory, address_bytes.len(), false)?;
+                    memory.map_bytes(addr_bytes, &address_bytes);
+                    let addr_list = self.alloc_heap(memory, pointer_bytes as usize * 2, true)?;
+                    write_guest_pointer(memory, addr_list, addr_bytes, self.guest_arch)?;
+                    write_guest_pointer(memory, addr_list + pointer_bytes, 0, self.guest_arch)?;
+                    write_guest_pointer(memory, base, name_addr, self.guest_arch)?;
+                    write_guest_pointer(memory, base + pointer_bytes, aliases, self.guest_arch)?;
+                    memory.map_bytes(base + pointer_bytes * 2, &(family as i16).to_le_bytes());
+                    memory.map_bytes(base + pointer_bytes * 2 + 2, &h_length.to_le_bytes());
+                    write_guest_pointer(memory, base + pointer_bytes * 3, addr_list, self.guest_arch)?;
+                    self.push_trace(
+                        "network",
+                        "gethostbyaddr",
+                        BTreeMap::from([("host".to_string(), json!(host))]),
+                        json!(name),
+                    );
+                    Ok(base)
+                })();
+                match result {
+                    Ok(hostent) => {
+                        state.set(Register::Rax, hostent);
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Getnameinfo => {
+                let sockaddr_ptr = guest_call_arg(state, memory, 0)?;
+                let sockaddr_len = guest_call_arg_u32(state, memory, 1)?;
+                let host_ptr = guest_call_arg(state, memory, 2)?;
+                let host_len = guest_call_arg_u32(state, memory, 3)?;
+                let serv_ptr = guest_call_arg(state, memory, 4)?;
+                let serv_len = guest_call_arg_u32(state, memory, 5)?;
+                let flags = guest_call_arg_u32(state, memory, 6)?;
+                let result = (|| -> AppResult<i32> {
+                    if sockaddr_ptr == 0 {
+                        return Ok(EAI_FAMILY);
+                    }
+                    let addr = read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)?;
+                    if host_ptr != 0 && host_len != 0 {
+                        let resolved = if flags & NI_NUMERICHOST != 0 {
+                            Some(addr.host.clone())
+                        } else {
+                            self.network.reverse_dns(&addr.host)
+                        };
+                        match resolved {
+                            Some(name) => {
+                                let written = write_ansi_api_string(memory, host_ptr, host_len, &name)?;
+                                if written > host_len {
+                                    return Ok(EAI_FAIL);
+                                }
+                            }
+                            None => {
+                                if flags & NI_NAMEREQD != 0 {
+                                    return Ok(EAI_NONAME);
+                                }
+                                let written = write_ansi_api_string(memory, host_ptr, host_len, &addr.host)?;
+                                if written > host_len {
+                                    return Ok(EAI_FAIL);
+                                }
+                            }
+                        }
+                    }
+                    if serv_ptr != 0 && serv_len != 0 {
+                        let service = if flags & NI_NUMERICSERV != 0 {
+                            Some(addr.port.to_string())
+                        } else {
+                            let dgram = flags & NI_DGRAM != 0;
+                            GUEST_SERVICES
+                                .iter()
+                                .find(|(port, tcp_name, udp_name)| {
+                                    *port == addr.port
+                                        && (!dgram && !tcp_name.is_empty() || dgram && !udp_name.is_empty())
+                                })
+                                .map(|(_, tcp_name, udp_name)| {
+                                    if dgram { udp_name } else { tcp_name }.to_string()
+                                })
+                        };
+                        match service {
+                            Some(name) => {
+                                let written = write_ansi_api_string(memory, serv_ptr, serv_len, &name)?;
+                                if written > serv_len {
+                                    return Ok(EAI_FAIL);
+                                }
+                            }
+                            None => return Ok(EAI_NONAME),
+                        }
+                    }
+                    self.push_trace(
+                        "network",
+                        "getnameinfo",
+                        BTreeMap::from([("host".to_string(), json!(addr.host))]),
+                        json!(0),
+                    );
+                    Ok(0)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, code as i64 as u64);
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, EAI_FAIL as u64);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Getprotobyname => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let result = (|| -> AppResult<u64> {
+                    let name = read_c_string(memory, name_ptr)?;
+                    let Some((proto_name, proto)) = GUEST_PROTOCOLS
+                        .iter()
+                        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&name))
+                    else {
+                        return Ok(0);
+                    };
+                    // struct protoent { p_name; p_aliases; p_proto i16; }
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                    let struct_size = if self.guest_arch == GuestArch::X86 { 12 } else { 24 };
+                    let base = self.alloc_heap(memory, struct_size, true)?;
+                    let name_addr = self.alloc_c_string(memory, proto_name)?;
+                    let aliases = self.alloc_heap(memory, pointer_bytes as usize, true)?;
+                    write_guest_pointer(memory, base, name_addr, self.guest_arch)?;
+                    write_guest_pointer(memory, base + pointer_bytes, aliases, self.guest_arch)?;
+                    memory.map_bytes(base + pointer_bytes * 2, &(*proto).to_le_bytes());
+                    self.push_trace(
+                        "network",
+                        "getprotobyname",
+                        BTreeMap::from([("name".to_string(), json!(name))]),
+                        json!(proto_name),
+                    );
+                    Ok(base)
+                })();
+                match result {
+                    Ok(protoent) => {
+                        state.set(Register::Rax, protoent);
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Getservbyname => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let proto_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u64> {
+                    let name = read_c_string(memory, name_ptr)?;
+                    let proto = if proto_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, proto_ptr)?
+                    };
+                    let Some((service_name, port, service_proto)) = GUEST_SERVICES
+                        .iter()
+                        .find(|(_, tcp_name, udp_name)| {
+                            (tcp_name.eq_ignore_ascii_case(&name)
+                                && (proto.is_empty() || proto.eq_ignore_ascii_case("tcp")))
+                                || (udp_name.eq_ignore_ascii_case(&name)
+                                    && (proto.is_empty() || proto.eq_ignore_ascii_case("udp")))
+                        })
+                        .map(|(port, tcp_name, udp_name)| {
+                            if tcp_name.eq_ignore_ascii_case(&name) {
+                                (*tcp_name, *port, "tcp")
+                            } else {
+                                (*udp_name, *port, "udp")
+                            }
+                        })
+                    else {
+                        return Ok(0);
+                    };
+                    // struct servent { s_name; s_aliases; s_port i16
+                    // (network order); s_proto; }
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+                    let struct_size = if self.guest_arch == GuestArch::X86 { 16 } else { 32 };
+                    let base = self.alloc_heap(memory, struct_size, true)?;
+                    let name_addr = self.alloc_c_string(memory, service_name)?;
+                    let aliases = self.alloc_heap(memory, pointer_bytes as usize, true)?;
+                    let proto_addr = self.alloc_c_string(memory, service_proto)?;
+                    write_guest_pointer(memory, base, name_addr, self.guest_arch)?;
+                    write_guest_pointer(memory, base + pointer_bytes, aliases, self.guest_arch)?;
+                    memory.map_bytes(base + pointer_bytes * 2, &port.to_be_bytes());
+                    // s_proto follows the i16 s_port with alignment: 12 on
+                    // x86, 24 on x64.
+                    let s_proto_offset = if self.guest_arch == GuestArch::X86 { 12 } else { 24 };
+                    write_guest_pointer(
+                        memory,
+                        base + s_proto_offset,
+                        proto_addr,
+                        self.guest_arch,
+                    )?;
+                    self.push_trace(
+                        "network",
+                        "getservbyname",
+                        BTreeMap::from([("name".to_string(), json!(name))]),
+                        json!(service_name),
+                    );
+                    Ok(base)
+                })();
+                match result {
+                    Ok(servent) => {
+                        state.set(Register::Rax, servent);
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::InetAddr => {
+                let cp_ptr = guest_call_arg(state, memory, 0)?;
+                let result = (|| -> AppResult<u32> {
+                    let s = read_c_string(memory, cp_ptr)?;
+                    match parse_guest_inet_addr(&s) {
+                        Some(address) => Ok(address),
+                        None => {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Ok(u32::MAX)
+                        }
+                    }
+                })();
+                match result {
+                    Ok(address) => {
+                        state.set(Register::Rax, u64::from(address));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "inet_addr",
+                            BTreeMap::from([("string".to_string(), json!(read_c_string(memory, cp_ptr).unwrap_or_default()))]),
+                            json!(format!("{address:#010x}")),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u32::MAX as u64);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::InetNtoa => {
+                let in_value = guest_call_arg_u32(state, memory, 0)?;
+                let bytes = in_value.to_ne_bytes();
+                let rendered = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+                match self.alloc_c_string(memory, &rendered) {
+                    Ok(ptr) => {
+                        state.set(Register::Rax, ptr);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "inet_ntoa",
+                            BTreeMap::from([("in".to_string(), json!(format!("{in_value:#010x}")))]),
+                            json!(rendered),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
             HostThunk::GetCurrentThreadId => {
                 let thread_id = self.win32.current_thread_id();
                 state.set(Register::Rax, u64::from(thread_id));
                 self.last_error = 0;
                 self.push_trace("thread", "GetCurrentThreadId", BTreeMap::new(), json!(thread_id));
+            }
+            HostThunk::AcquireCredentialsHandleW => {
+                use crate::sspi::{SEC_E_OK, SEC_E_INVALID_HANDLE, SspiIdentity};
+                let package_ptr = guest_call_arg(state, memory, 1)?;
+                let credential_use = guest_call_arg_u32(state, memory, 2)?;
+                let auth_data = guest_call_arg(state, memory, 4)?;
+                let cred_ptr = guest_call_arg(state, memory, 7)?;
+                let expiry_ptr = guest_call_arg(state, memory, 8)?;
+                let status = (|| -> AppResult<u32> {
+                    if credential_use == 0 || package_ptr == 0 || cred_ptr == 0 {
+                        return Ok(SEC_E_INVALID_HANDLE);
+                    }
+                    let package = read_utf16_string(memory, package_ptr)?;
+                    if package.is_empty() {
+                        return Ok(SEC_E_INVALID_HANDLE);
+                    }
+                    let identity = if auth_data != 0 {
+                        read_guest_auth_identity(memory, auth_data, self.guest_arch)?
+                    } else {
+                        SspiIdentity {
+                            user: self.win32.ge().config.user_name.clone(),
+                            domain: "WORKGROUP".to_string(),
+                            // Documented internal credential: the guest
+                            // identity's password is a fixed runtime secret —
+                            // the NTLM envelope the guest observes carries
+                            // the response; the plaintext never matters to
+                            // the in-process server side.
+                            password: "casa1-guest".to_string(),
+                        }
+                    };
+                    let handle = self.sspi.acquire_credentials(&package, identity);
+                    write_guest_sec_handle(memory, cred_ptr, handle, self.guest_arch)?;
+                    if expiry_ptr != 0 {
+                        write_u64(memory, expiry_ptr, 0x7FFF_FFFF_FFFF_FFFF);
+                    }
+                    self.push_trace(
+                        "security",
+                        "AcquireCredentialsHandleW",
+                        BTreeMap::from([("package".to_string(), json!(package))]),
+                        json!(SEC_E_OK),
+                    );
+                    Ok(SEC_E_OK)
+                })();
+                match status {
+                    Ok(status) => {
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::FreeCredentialsHandle => {
+                let cred_ptr = guest_call_arg(state, memory, 0)?;
+                let handle = read_guest_sec_handle(memory, cred_ptr, self.guest_arch)?;
+                let freed = self.sspi.free_credentials(handle);
+                state.set(
+                    Register::Rax,
+                    u64::from(if freed {
+                        crate::sspi::SEC_E_OK
+                    } else {
+                        crate::sspi::SEC_E_INVALID_HANDLE
+                    }),
+                );
+                self.last_error = 0;
+                self.push_trace(
+                    "security",
+                    "FreeCredentialsHandle",
+                    BTreeMap::from([("handle".to_string(), json!(format!("{handle:#x}")))]),
+                    json!(freed),
+                );
+            }
+            HostThunk::InitializeSecurityContextW => {
+                use crate::sspi::{
+                    SEC_E_BUFFER_TOO_SMALL, SEC_E_INVALID_HANDLE, SEC_I_CONTINUE_NEEDED, SEC_E_OK,
+                };
+                let cred_ptr = guest_call_arg(state, memory, 0)?;
+                let ctx_ptr = guest_call_arg(state, memory, 1)?;
+                let target_ptr = guest_call_arg(state, memory, 2)?;
+                let context_req = guest_call_arg_u32(state, memory, 3)?;
+                let input_desc = guest_call_arg(state, memory, 6)?;
+                let new_ctx_ptr = guest_call_arg(state, memory, 8)?;
+                let output_desc = guest_call_arg(state, memory, 9)?;
+                let attrs_ptr = guest_call_arg(state, memory, 10)?;
+                let expiry_ptr = guest_call_arg(state, memory, 11)?;
+                let result = (|| -> AppResult<(u32, u64, Vec<u8>)> {
+                    let cred = read_guest_sec_handle(memory, cred_ptr, self.guest_arch)?;
+                    let existing = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let target = read_utf16_string(memory, target_ptr)?;
+                    let input = read_sec_buffer_desc_token(memory, input_desc, self.guest_arch)?;
+                    let (status, handle, token) = self.sspi.initialize_security_context(
+                        cred,
+                        (existing != 0).then_some(existing),
+                        &target,
+                        input,
+                    );
+                    if status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED {
+                        write_guest_sec_handle(memory, new_ctx_ptr, handle, self.guest_arch)?;
+                        let written =
+                            write_sec_buffer_desc_token(memory, output_desc, self.guest_arch, &token)?;
+                        if !written {
+                            return Ok((SEC_E_BUFFER_TOO_SMALL, handle, token));
+                        }
+                        if attrs_ptr != 0 {
+                            write_u32(memory, attrs_ptr, context_req);
+                        }
+                        if expiry_ptr != 0 {
+                            write_u64(memory, expiry_ptr, 0x7FFF_FFFF_FFFF_FFFF);
+                        }
+                    }
+                    Ok((status, handle, token))
+                })();
+                match result {
+                    Ok((status, _handle, token)) => {
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "security",
+                            "InitializeSecurityContextW",
+                            BTreeMap::from([
+                                ("status".to_string(), json!(format!("{status:#010x}"))),
+                                ("token_len".to_string(), json!(token.len())),
+                            ]),
+                            json!(format!("{status:#010x}")),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::AcceptSecurityContext => {
+                use crate::sspi::{
+                    SEC_E_BUFFER_TOO_SMALL, SEC_E_INVALID_HANDLE, SEC_E_INVALID_TOKEN,
+                    SEC_I_CONTINUE_NEEDED, SEC_E_OK,
+                };
+                let cred_ptr = guest_call_arg(state, memory, 0)?;
+                let ctx_ptr = guest_call_arg(state, memory, 1)?;
+                let input_desc = guest_call_arg(state, memory, 2)?;
+                let context_req = guest_call_arg_u32(state, memory, 3)?;
+                let new_ctx_ptr = guest_call_arg(state, memory, 5)?;
+                let output_desc = guest_call_arg(state, memory, 6)?;
+                let attrs_ptr = guest_call_arg(state, memory, 7)?;
+                let result = (|| -> AppResult<(u32, u64, Vec<u8>)> {
+                    let cred = read_guest_sec_handle(memory, cred_ptr, self.guest_arch)?;
+                    let existing = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let Some(input) = read_sec_buffer_desc_token(memory, input_desc, self.guest_arch)?
+                    else {
+                        return Ok((SEC_E_INVALID_TOKEN, 0, Vec::new()));
+                    };
+                    let (status, handle, token) = self.sspi.accept_security_context(
+                        cred,
+                        (existing != 0).then_some(existing),
+                        input,
+                    );
+                    if status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED {
+                        write_guest_sec_handle(memory, new_ctx_ptr, handle, self.guest_arch)?;
+                        let written =
+                            write_sec_buffer_desc_token(memory, output_desc, self.guest_arch, &token)?;
+                        if !written {
+                            return Ok((SEC_E_BUFFER_TOO_SMALL, handle, token));
+                        }
+                        if attrs_ptr != 0 {
+                            write_u32(memory, attrs_ptr, context_req);
+                        }
+                    }
+                    Ok((status, handle, token))
+                })();
+                match result {
+                    Ok((status, _handle, token)) => {
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "security",
+                            "AcceptSecurityContext",
+                            BTreeMap::from([
+                                ("status".to_string(), json!(format!("{status:#010x}"))),
+                                ("token_len".to_string(), json!(token.len())),
+                            ]),
+                            json!(format!("{status:#010x}")),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::CompleteAuthToken => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let input_desc = guest_call_arg(state, memory, 1)?;
+                let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                let token = read_sec_buffer_desc_token(memory, input_desc, self.guest_arch)?
+                    .unwrap_or_default();
+                let completed = self.sspi.complete_auth_token(handle, token);
+                state.set(
+                    Register::Rax,
+                    u64::from(if completed {
+                        crate::sspi::SEC_E_OK
+                    } else {
+                        crate::sspi::SEC_E_INVALID_HANDLE
+                    }),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::DeleteSecurityContext => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                let deleted = self.sspi.delete_security_context(handle);
+                state.set(
+                    Register::Rax,
+                    u64::from(if deleted {
+                        crate::sspi::SEC_E_OK
+                    } else {
+                        crate::sspi::SEC_E_INVALID_HANDLE
+                    }),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::ImpersonateSecurityContext => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                let ok = self.sspi.impersonate(handle);
+                state.set(
+                    Register::Rax,
+                    u64::from(if ok {
+                        crate::sspi::SEC_E_OK
+                    } else {
+                        crate::sspi::SEC_E_INVALID_HANDLE
+                    }),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::RevertSecurityContext => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                let ok = self.sspi.impersonate(handle);
+                state.set(
+                    Register::Rax,
+                    u64::from(if ok {
+                        crate::sspi::SEC_E_OK
+                    } else {
+                        crate::sspi::SEC_E_INVALID_HANDLE
+                    }),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::QueryContextAttributesW => {
+                use crate::sspi::{
+                    SEC_E_INVALID_HANDLE, SEC_E_OK, SEC_E_UNSUPPORTED_FUNCTION,
+                    SECPKG_ATTR_NAMES, SECPKG_ATTR_PACKAGE_INFO, SECPKG_ATTR_SESSION_KEY,
+                    SECPKG_ATTR_SIZES,
+                };
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let attribute = guest_call_arg_u32(state, memory, 1)?;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let status = (|| -> AppResult<u32> {
+                    let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    match attribute {
+                        SECPKG_ATTR_SIZES => {
+                            let Some((max_token, max_signature, block_size, trailer)) =
+                                self.sspi.query_sizes(handle)
+                            else {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            };
+                            if buffer == 0 {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            }
+                            write_u32(memory, buffer, max_token);
+                            write_u32(memory, buffer + 4, max_signature);
+                            write_u32(memory, buffer + 8, block_size);
+                            write_u32(memory, buffer + 12, trailer);
+                        }
+                        SECPKG_ATTR_NAMES => {
+                            let Some(user) = self.sspi.context_user(handle) else {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            };
+                            if buffer == 0 {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            }
+                            let name_ptr = self.alloc_utf16_string(memory, &user)?;
+                            write_guest_pointer(memory, buffer, name_ptr, self.guest_arch)?;
+                        }
+                        SECPKG_ATTR_SESSION_KEY => {
+                            let Some(key) = self.sspi.query_session_key(handle) else {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            };
+                            if buffer == 0 {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            }
+                            let capacity = read_guest_u32(memory, buffer)?;
+                            let written = (capacity as usize).min(key.len());
+                            memory.map_bytes(buffer + 4, &key[..written]);
+                            write_u32(memory, buffer, key.len() as u32);
+                        }
+                        SECPKG_ATTR_PACKAGE_INFO => {
+                            let Some(package) = self.sspi.context_package(handle) else {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            };
+                            if buffer == 0 {
+                                return Ok(SEC_E_INVALID_HANDLE);
+                            }
+                            let info = self.alloc_sec_pkg_info(memory, &package)?;
+                            write_guest_pointer(memory, buffer, info, self.guest_arch)?;
+                        }
+                        _ => return Ok(SEC_E_UNSUPPORTED_FUNCTION),
+                    }
+                    Ok(SEC_E_OK)
+                })();
+                match status {
+                    Ok(status) => {
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "security",
+                            "QueryContextAttributesW",
+                            BTreeMap::from([("attribute".to_string(), json!(attribute))]),
+                            json!(format!("{status:#010x}")),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::MakeSignature => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let _qop = guest_call_arg_u32(state, memory, 1)?;
+                let desc = guest_call_arg(state, memory, 2)?;
+                let _seq = guest_call_arg_u32(state, memory, 3)?;
+                let result = (|| -> AppResult<(u32, Vec<u8>)> {
+                    let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let data = read_sec_buffer_desc_data(memory, desc, self.guest_arch)?;
+                    self.sspi.make_signature(handle, &data)
+                })();
+                match result {
+                    Ok((status, signature)) => {
+                        if status == crate::sspi::SEC_E_OK {
+                            let _ = write_sec_buffer_desc_token(memory, desc, self.guest_arch, &signature);
+                        }
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(crate::sspi::SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::VerifySignature => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let desc = guest_call_arg(state, memory, 1)?;
+                let _seq = guest_call_arg_u32(state, memory, 2)?;
+                let qop_ptr = guest_call_arg(state, memory, 3)?;
+                let result = (|| -> AppResult<(u32, u32)> {
+                    let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let data = read_sec_buffer_desc_data(memory, desc, self.guest_arch)?;
+                    let signature = read_sec_buffer_desc_token(memory, desc, self.guest_arch)?
+                        .unwrap_or_default();
+                    self.sspi.verify_signature(handle, &signature, &data)
+                })();
+                match result {
+                    Ok((status, qop)) => {
+                        if qop_ptr != 0 {
+                            write_u32(memory, qop_ptr, qop);
+                        }
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(crate::sspi::SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::EncryptMessage => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let _qop = guest_call_arg_u32(state, memory, 1)?;
+                let desc = guest_call_arg(state, memory, 2)?;
+                let _seq = guest_call_arg_u32(state, memory, 3)?;
+                let result = (|| -> AppResult<(u32, Vec<u8>, Vec<u8>)> {
+                    let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let plaintext = read_sec_buffer_desc_data(memory, desc, self.guest_arch)?;
+                    self.sspi.encrypt_message(handle, &plaintext)
+                })();
+                match result {
+                    Ok((status, signature, ciphertext)) => {
+                        if status == crate::sspi::SEC_E_OK {
+                            let _ = write_sec_buffer_desc_token(memory, desc, self.guest_arch, &signature);
+                            let _ = write_sec_buffer_desc_data(memory, desc, self.guest_arch, &ciphertext);
+                        }
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(crate::sspi::SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::DecryptMessage => {
+                let ctx_ptr = guest_call_arg(state, memory, 0)?;
+                let desc = guest_call_arg(state, memory, 1)?;
+                let _seq = guest_call_arg_u32(state, memory, 2)?;
+                let qop_ptr = guest_call_arg(state, memory, 3)?;
+                let result = (|| -> AppResult<(u32, Vec<u8>, u32)> {
+                    let handle = read_guest_sec_handle(memory, ctx_ptr, self.guest_arch)?;
+                    let ciphertext = read_sec_buffer_desc_data(memory, desc, self.guest_arch)?;
+                    let signature = read_sec_buffer_desc_token(memory, desc, self.guest_arch)?
+                        .unwrap_or_default();
+                    self.sspi.decrypt_message(handle, &signature, &ciphertext)
+                })();
+                match result {
+                    Ok((status, plaintext, qop)) => {
+                        if status == crate::sspi::SEC_E_OK {
+                            let _ = write_sec_buffer_desc_data(memory, desc, self.guest_arch, &plaintext);
+                        }
+                        if qop_ptr != 0 {
+                            write_u32(memory, qop_ptr, qop);
+                        }
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(crate::sspi::SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::EnumerateSecurityPackagesW => {
+                use crate::sspi::{SEC_E_INVALID_HANDLE, SEC_E_OK};
+                let count_ptr = guest_call_arg(state, memory, 0)?;
+                let info_ptr = guest_call_arg(state, memory, 1)?;
+                let status = (|| -> AppResult<u32> {
+                    if count_ptr == 0 || info_ptr == 0 {
+                        return Ok(SEC_E_INVALID_HANDLE);
+                    }
+                    let packages = self.sspi.enumerate_packages();
+                    let stride = if self.guest_arch == GuestArch::X86 { 20 } else { 32 };
+                    let array = self.alloc_heap(memory, stride * packages.len(), true)?;
+                    for (index, (name, comment, max_token)) in packages.iter().enumerate() {
+                        let entry = array + (index as u64 * stride as u64);
+                        write_u32(memory, entry, 0x7); // SECPKG_FLAG_INTEGRITY|PRIVACY|TOKEN_ONLY
+                        memory.map_bytes(entry + 4, &0_u16.to_le_bytes()); // wVersion
+                        memory.map_bytes(entry + 6, &10_u16.to_le_bytes()); // wRpcid
+                        write_u32(memory, entry + 8, *max_token);
+                        let name_addr = self.alloc_utf16_string(memory, name)?;
+                        let comment_addr = self.alloc_utf16_string(memory, comment)?;
+                        if self.guest_arch == GuestArch::X86 {
+                            write_guest_pointer(memory, entry + 12, name_addr, self.guest_arch)?;
+                            write_guest_pointer(memory, entry + 16, comment_addr, self.guest_arch)?;
+                        } else {
+                            write_guest_pointer(memory, entry + 16, name_addr, self.guest_arch)?;
+                            write_guest_pointer(memory, entry + 24, comment_addr, self.guest_arch)?;
+                        }
+                    }
+                    write_u32(memory, count_ptr, packages.len() as u32);
+                    write_guest_pointer(memory, info_ptr, array, self.guest_arch)?;
+                    Ok(SEC_E_OK)
+                })();
+                match status {
+                    Ok(status) => {
+                        state.set(Register::Rax, u64::from(status));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(SEC_E_INVALID_HANDLE));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetUserNameExW => {
+                let format = guest_call_arg_u32(state, memory, 0)?;
+                let buffer_ptr = guest_call_arg(state, memory, 1)?;
+                let size_ptr = guest_call_arg(state, memory, 2)?;
+                let user = self.win32.ge().config.user_name.clone();
+                let domain = "WORKGROUP".to_string();
+                let rendered = match format {
+                    2 => Some(format!("{domain}\\{user}")), // NameSamCompatible
+                    3 => Some(user.clone()),                // NameDisplay
+                    8 => Some(format!("{user}@{domain}")),  // NameUserPrincipal
+                    12 => Some(domain),                     // NameDnsDomain
+                    _ => None,
+                };
+                if let Some(rendered) = rendered {
+                    if size_ptr == 0 {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    } else {
+                        let buffer_size = read_u32(memory, size_ptr)?;
+                        let result = write_utf16_api_string(memory, buffer_ptr, buffer_size, &rendered)?;
+                        write_u32(memory, size_ptr, result + 1);
+                        if buffer_size > 0 && result >= buffer_size {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_MORE_DATA;
+                        } else {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        self.push_trace(
+                            "security",
+                            "GetUserNameExW",
+                            BTreeMap::from([("format".to_string(), json!(format))]),
+                            json!(rendered),
+                        );
+                    }
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "security",
+                        "GetUserNameExW",
+                        BTreeMap::from([("format".to_string(), json!(format))]),
+                        json!(0),
+                    );
+                }
+            }
+            HostThunk::NetApiBufferFree => {
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let freed = self.heap_allocations.remove(&buffer).is_some();
+                state.set(Register::Rax, u64::from(if freed { NO_ERROR } else { ERROR_INVALID_PARAMETER }));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "NetApiBufferFree",
+                    BTreeMap::from([("buffer".to_string(), json!(format!("{buffer:#x}")))]),
+                    json!(freed),
+                );
+            }
+            HostThunk::NetServerEnum => {
+                let servername = guest_call_arg(state, memory, 0)?;
+                let level = guest_call_arg_u32(state, memory, 1)?;
+                let bufptr = guest_call_arg(state, memory, 2)?;
+                let entriesread = guest_call_arg(state, memory, 4)?;
+                let totalentries = guest_call_arg(state, memory, 5)?;
+                let result = (|| -> AppResult<u32> {
+                    if servername != 0 {
+                        let name = read_utf16_string(memory, servername)?;
+                        if !name.is_empty() {
+                            // The guest model is local-only.
+                            return Ok(NERR_InvalidComputer);
+                        }
+                    }
+                    if bufptr == 0 || entriesread == 0 || totalentries == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    if level > 1 {
+                        return Ok(ERROR_INVALID_LEVEL);
+                    }
+                    // The guest network model has no servers: the empty
+                    // enumeration is fully materialized (entries_read = 0,
+                    // total = 0, no buffer) and the documented
+                    // ERROR_NO_MORE_ITEMS code terminates the caller's
+                    // enumeration loop.  A guest model with servers would
+                    // fill the list and return ERROR_SUCCESS instead.
+                    write_guest_pointer(memory, bufptr, 0, self.guest_arch)?;
+                    write_u32(memory, entriesread, 0);
+                    write_u32(memory, totalentries, 0);
+                    self.push_trace(
+                        "network",
+                        "NetServerEnum",
+                        BTreeMap::from([("level".to_string(), json!(level))]),
+                        json!(ERROR_NO_MORE_ITEMS),
+                    );
+                    Ok(ERROR_NO_MORE_ITEMS)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::NetWkstaGetInfo => {
+                let servername = guest_call_arg(state, memory, 0)?;
+                let level = guest_call_arg_u32(state, memory, 1)?;
+                let bufptr = guest_call_arg(state, memory, 2)?;
+                let result = (|| -> AppResult<u32> {
+                    if servername != 0 {
+                        let name = read_utf16_string(memory, servername)?;
+                        if !name.is_empty() {
+                            return Ok(NERR_InvalidComputer);
+                        }
+                    }
+                    if bufptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let hostname = config.hostname;
+                    let domain = config.domain;
+                    // WKSTA_INFO_100 / WKSTA_INFO_101 (per-arch layout: the
+                    // pointer fields widen on x64).
+                    let (struct_size, lanroot) = match (level, self.guest_arch) {
+                        (100, GuestArch::X86) => (20, None),
+                        (101, GuestArch::X86) => (36, Some("C:\\WINDOWS")),
+                        (100, GuestArch::X64) => (32, None),
+                        (101, GuestArch::X64) => (56, Some("C:\\WINDOWS")),
+                        _ => return Ok(ERROR_INVALID_LEVEL),
+                    };
+                    let mut strings = vec![hostname.as_str(), domain.as_str()];
+                    if let Some(root) = lanroot {
+                        strings.push(root);
+                    }
+                    let (base, pointers) = alloc_packed_string_block(self, memory, struct_size, &strings)?;
+                    let ptr = self.guest_arch.pointer_bytes() as u64;
+                    write_u32(memory, base, 400); // PLATFORM_ID_NT
+                    write_guest_pointer(memory, base + ptr, pointers[0], self.guest_arch)?;
+                    write_guest_pointer(memory, base + ptr * 2, pointers[1], self.guest_arch)?;
+                    write_u32(memory, base + ptr * 3, 10); // ver_major
+                    write_u32(memory, base + ptr * 3 + 4, 0); // ver_minor
+                    if let Some(root) = lanroot {
+                        let _ = root;
+                        // WKSTA_INFO_101: lanroot, logged_on_users, opus,
+                        // processor follow the 100 fields (20 on x86, 32 on
+                        // x64) — the pointer-width arithmetic does NOT
+                        // generalize, so the offsets are explicit.
+                        let (lanroot_off, logged_off) = match self.guest_arch {
+                            GuestArch::X86 => (20, 24),
+                            GuestArch::X64 => (32, 40),
+                        };
+                        write_guest_pointer(memory, base + lanroot_off, pointers[2], self.guest_arch)?;
+                        write_u32(memory, base + logged_off, 1); // logged_on_users
+                        write_u32(memory, base + logged_off + 4, 0); // opus
+                        write_u32(memory, base + logged_off + 8, 0); // processor
+                    }
+                    write_guest_pointer(memory, bufptr, base, self.guest_arch)?;
+                    self.push_trace(
+                        "network",
+                        "NetWkstaGetInfo",
+                        BTreeMap::from([("level".to_string(), json!(level))]),
+                        json!(NO_ERROR),
+                    );
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::NetUserGetInfo => {
+                let servername = guest_call_arg(state, memory, 0)?;
+                let username = guest_call_arg(state, memory, 1)?;
+                let level = guest_call_arg_u32(state, memory, 2)?;
+                let bufptr = guest_call_arg(state, memory, 3)?;
+                let result = (|| -> AppResult<u32> {
+                    if servername != 0 {
+                        let name = read_utf16_string(memory, servername)?;
+                        if !name.is_empty() {
+                            return Ok(NERR_InvalidComputer);
+                        }
+                    }
+                    if bufptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let guest_user = self.win32.ge().config.user_name.clone();
+                    let requested = if username == 0 {
+                        guest_user.clone()
+                    } else {
+                        read_utf16_string(memory, username)?
+                    };
+                    if !requested.eq_ignore_ascii_case(&guest_user) {
+                        return Ok(NERR_UserNotFound);
+                    }
+                    let home_dir = format!("C:\\Users\\{guest_user}");
+                    let (struct_size, fields) = match (level, self.guest_arch) {
+                        // USER_INFO_0: { LPWSTR usri0_name; }
+                        (0, GuestArch::X86) => (4, 1_usize),
+                        (0, GuestArch::X64) => (8, 1),
+                        // USER_INFO_1: name, password, age, priv, home_dir,
+                        // comment, flags, script_path.
+                        (1, GuestArch::X86) => (32, 2),
+                        (1, GuestArch::X64) => (56, 2),
+                        _ => return Ok(ERROR_INVALID_LEVEL),
+                    };
+                    let strings = if fields == 1 {
+                        vec![guest_user.as_str()]
+                    } else {
+                        vec![guest_user.as_str(), "", home_dir.as_str(), "", ""]
+                    };
+                    let (base, pointers) = alloc_packed_string_block(self, memory, struct_size, &strings)?;
+                    write_guest_pointer(memory, base, pointers[0], self.guest_arch)?;
+                    if fields == 2 {
+                        // USER_INFO_1 field offsets (per-arch: the pointer
+                        // fields widen on x64, the u32 fields stay at the
+                        // same relative positions after them).
+                        let (password_off, home_off, comment_off, flags_off, script_off) =
+                            match self.guest_arch {
+                                GuestArch::X86 => (4, 16, 20, 24, 28),
+                                GuestArch::X64 => (8, 24, 32, 40, 48),
+                            };
+                        write_guest_pointer(memory, base + password_off, pointers[1], self.guest_arch)?;
+                        write_u32(memory, base + password_off + 4, 0); // password_age
+                        write_u32(memory, base + password_off + 8, 1); // USER_PRIV_USER
+                        write_guest_pointer(memory, base + home_off, pointers[2], self.guest_arch)?;
+                        write_guest_pointer(memory, base + comment_off, pointers[3], self.guest_arch)?;
+                        write_u32(memory, base + flags_off, 0x0200); // UF_NORMAL_ACCOUNT
+                        write_guest_pointer(memory, base + script_off, pointers[4], self.guest_arch)?;
+                    }
+                    write_guest_pointer(memory, bufptr, base, self.guest_arch)?;
+                    self.push_trace(
+                        "network",
+                        "NetUserGetInfo",
+                        BTreeMap::from([
+                            ("user".to_string(), json!(requested)),
+                            ("level".to_string(), json!(level)),
+                        ]),
+                        json!(NO_ERROR),
+                    );
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetAdaptersInfo => {
+                let info_ptr = guest_call_arg(state, memory, 0)?;
+                let len_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if len_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let required = guest_adapter_info_total_size(self.guest_arch, config.adapters.len());
+                    let available = read_guest_u32(memory, len_ptr)?;
+                    if info_ptr == 0 || available < required {
+                        write_u32(memory, len_ptr, required);
+                        return Ok(ERROR_BUFFER_OVERFLOW);
+                    }
+                    let mut cursor = info_ptr;
+                    for adapter in &config.adapters {
+                        cursor = write_guest_ip_adapter_info(
+                            self,
+                            memory,
+                            cursor,
+                            self.guest_arch,
+                            adapter,
+                        )?;
+                    }
+                    write_u32(memory, len_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "GetAdaptersInfo",
+                            BTreeMap::from([("out_len".to_string(), json!(read_guest_u32(memory, len_ptr).unwrap_or(0)))]),
+                            json!(code),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetAdaptersAddresses => {
+                let family = guest_call_arg_u32(state, memory, 0)?;
+                let info_ptr = guest_call_arg(state, memory, 3)?;
+                let len_ptr = guest_call_arg(state, memory, 4)?;
+                let result = (|| -> AppResult<u32> {
+                    if len_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    if family != AF_UNSPEC as u32 && family != AF_INET as u32 && family != AF_INET6 as u32 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let required =
+                        guest_adapters_addresses_total_size(self.guest_arch, config.adapters.len());
+                    let available = read_guest_u32(memory, len_ptr)?;
+                    if info_ptr == 0 || available < required {
+                        write_u32(memory, len_ptr, required);
+                        return Ok(ERROR_BUFFER_OVERFLOW);
+                    }
+                    let mut cursor = info_ptr;
+                    for adapter in &config.adapters {
+                        cursor = write_guest_ip_adapter_addresses(
+                            self,
+                            memory,
+                            cursor,
+                            self.guest_arch,
+                            adapter,
+                            family,
+                        )?;
+                    }
+                    write_u32(memory, len_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "GetAdaptersAddresses",
+                            BTreeMap::from([("family".to_string(), json!(family))]),
+                            json!(code),
+                        );
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetIfTable => {
+                let table_ptr = guest_call_arg(state, memory, 0)?;
+                let size_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if size_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let required = 4 + MIB_IFROW_SIZE * config.adapters.len() as u32;
+                    let available = read_guest_u32(memory, size_ptr)?;
+                    if table_ptr == 0 || available < required {
+                        write_u32(memory, size_ptr, required);
+                        return Ok(ERROR_INSUFFICIENT_BUFFER);
+                    }
+                    write_u32(memory, table_ptr, config.adapters.len() as u32);
+                    let mut cursor = table_ptr + 4;
+                    for adapter in &config.adapters {
+                        cursor = write_guest_mib_ifrow(memory, cursor, adapter)?;
+                    }
+                    write_u32(memory, size_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetIfEntry => {
+                let row_ptr = guest_call_arg(state, memory, 0)?;
+                let result = (|| -> AppResult<u32> {
+                    if row_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let index = read_guest_u32(memory, row_ptr + 512)?;
+                    let config = guest_net_config(self);
+                    let Some(adapter) = config.adapters.iter().find(|a| a.index == index) else {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    };
+                    write_guest_mib_ifrow(memory, row_ptr, adapter)?;
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetIpAddrTable => {
+                let table_ptr = guest_call_arg(state, memory, 0)?;
+                let size_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if size_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let row_count = config
+                        .adapters
+                        .iter()
+                        .filter(|a| a.ipv4.is_some())
+                        .count() as u32;
+                    let required = 4 + 20 * row_count;
+                    let available = read_guest_u32(memory, size_ptr)?;
+                    if table_ptr == 0 || available < required {
+                        write_u32(memory, size_ptr, required);
+                        return Ok(ERROR_INSUFFICIENT_BUFFER);
+                    }
+                    write_u32(memory, table_ptr, row_count);
+                    let mut cursor = table_ptr + 4;
+                    for adapter in &config.adapters {
+                        let Some(ipv4) = &adapter.ipv4 else {
+                            continue;
+                        };
+                        write_u32(memory, cursor, u32::from_ne_bytes(ipv4.address.octets()));
+                        write_u32(memory, cursor + 4, adapter.index);
+                        write_u32(memory, cursor + 8, u32::from_ne_bytes(ipv4.mask.octets()));
+                        write_u32(memory, cursor + 12, 1); // dwBCastAddr
+                        write_u32(memory, cursor + 16, 0); // dwReasmSize
+                        cursor += 20;
+                    }
+                    write_u32(memory, size_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetIpForwardTable => {
+                let table_ptr = guest_call_arg(state, memory, 0)?;
+                let size_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if size_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let required = 4 + MIB_IPFORWARDROW_SIZE * config.routes.len() as u32;
+                    let available = read_guest_u32(memory, size_ptr)?;
+                    if table_ptr == 0 || available < required {
+                        write_u32(memory, size_ptr, required);
+                        return Ok(ERROR_INSUFFICIENT_BUFFER);
+                    }
+                    write_u32(memory, table_ptr, config.routes.len() as u32);
+                    let mut cursor = table_ptr + 4;
+                    for route in &config.routes {
+                        write_guest_mib_ipforwardrow(memory, cursor, route)?;
+                        cursor += MIB_IPFORWARDROW_SIZE as u64;
+                    }
+                    write_u32(memory, size_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetNetworkParams => {
+                let info_ptr = guest_call_arg(state, memory, 0)?;
+                let len_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if len_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let required = guest_fixed_info_size(self.guest_arch);
+                    let available = read_guest_u32(memory, len_ptr)?;
+                    if info_ptr == 0 || available < required {
+                        write_u32(memory, len_ptr, required);
+                        return Ok(ERROR_BUFFER_OVERFLOW);
+                    }
+                    write_guest_fixed_info(memory, info_ptr, self.guest_arch, &config)?;
+                    write_u32(memory, len_ptr, required);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetBestInterface => {
+                let dest = guest_call_arg_u32(state, memory, 0)?;
+                let index_ptr = guest_call_arg(state, memory, 1)?;
+                let result = (|| -> AppResult<u32> {
+                    if index_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let route = best_guest_route(&config, dest);
+                    write_u32(memory, index_ptr, route.if_index);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetBestRoute => {
+                let dest = guest_call_arg_u32(state, memory, 0)?;
+                let _source = guest_call_arg_u32(state, memory, 1)?;
+                let route_ptr = guest_call_arg(state, memory, 2)?;
+                let result = (|| -> AppResult<u32> {
+                    if route_ptr == 0 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let route = best_guest_route(&config, dest);
+                    write_guest_mib_ipforwardrow(memory, route_ptr, route)?;
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::GetRTTAndHopCount => {
+                let dest = guest_call_arg_u32(state, memory, 0)?;
+                let hop_ptr = guest_call_arg(state, memory, 1)?;
+                let max_hops = guest_call_arg_u32(state, memory, 2)?;
+                let rtt_ptr = guest_call_arg(state, memory, 3)?;
+                let result = (|| -> AppResult<u32> {
+                    if hop_ptr == 0 || rtt_ptr == 0 || max_hops < 1 {
+                        return Ok(ERROR_INVALID_PARAMETER);
+                    }
+                    let config = guest_net_config(self);
+                    let route = best_guest_route(&config, dest);
+                    // The guest model does not measure real round trips
+                    // (documented): hop count comes from the route, RTT is 0.
+                    let hops = if route.dest == Ipv4Addr::LOCALHOST || route.route_type == MIB_IPROUTE_TYPE_DIRECT {
+                        1
+                    } else {
+                        2
+                    };
+                    if hops > max_hops {
+                        return Ok(ERROR_NOT_SUPPORTED);
+                    }
+                    write_u32(memory, hop_ptr, hops);
+                    write_u32(memory, rtt_ptr, 0);
+                    Ok(NO_ERROR)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::NotifyAddrChange => {
+                let overlapped = guest_call_arg(state, memory, 0)?;
+                let handle_ptr = guest_call_arg(state, memory, 1)?;
+                let handle = self.mint_mib_change_notification();
+                if handle_ptr != 0 {
+                    write_guest_pointer(memory, handle_ptr, handle, self.guest_arch)?;
+                }
+                let _ = overlapped;
+                // The guest network is static: the documented pending code is
+                // the honest completion for both the asynchronous
+                // (OVERLAPPED) and the synchronous (NULL) forms — a guest
+                // address change never occurs in this model, so the
+                // synchronous wait can never complete either.
+                state.set(Register::Rax, u64::from(ERROR_IO_PENDING));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "NotifyAddrChange",
+                    BTreeMap::from([("overlapped".to_string(), json!(overlapped != 0))]),
+                    json!(ERROR_IO_PENDING),
+                );
+            }
+            HostThunk::NotifyRouteChange => {
+                let overlapped = guest_call_arg(state, memory, 0)?;
+                let handle_ptr = guest_call_arg(state, memory, 1)?;
+                let handle = self.mint_mib_change_notification();
+                if handle_ptr != 0 {
+                    write_guest_pointer(memory, handle_ptr, handle, self.guest_arch)?;
+                }
+                let _ = overlapped;
+                state.set(Register::Rax, u64::from(ERROR_IO_PENDING));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "NotifyRouteChange",
+                    BTreeMap::from([("overlapped".to_string(), json!(overlapped != 0))]),
+                    json!(ERROR_IO_PENDING),
+                );
+            }
+            HostThunk::CancelMibChangeNotify2 => {
+                let cancel_handle = guest_call_arg(state, memory, 0)?;
+                let cancelled = self.mib_change_notifications.remove(&cancel_handle).is_some();
+                state.set(
+                    Register::Rax,
+                    u64::from(if cancelled { NO_ERROR } else { ERROR_INVALID_PARAMETER }),
+                );
+                self.last_error = 0;
             }
             HostThunk::GetCurrentThread => {
                 let handle = self.win32.current_thread_handle();
@@ -53318,6 +55491,54 @@ impl PeHostRuntime {
         Ok(address)
     }
 
+    /// Mint a MIB change-notification registration handle
+    /// (NotifyAddrChange / NotifyRouteChange).  The guest network is
+    /// static, so the registration never completes; CancelMibChangeNotify2
+    /// consumes the handle.
+    fn mint_mib_change_notification(&mut self) -> u64 {
+        let handle = self.next_mib_change_notify_handle;
+        self.next_mib_change_notify_handle = self.next_mib_change_notify_handle.wrapping_add(1);
+        self.mib_change_notifications.insert(handle, 0);
+        handle
+    }
+
+    /// Allocate a guest `SecPkgInfoW` for a package name (used by
+    /// QueryContextAttributesW(SECPKG_ATTR_PACKAGE_INFO)).
+    fn alloc_sec_pkg_info(&mut self, memory: &mut MemoryImage, package: &str) -> AppResult<u64> {
+        let comment = match package {
+            "Negotiate" => "Microsoft Negotiate SSP",
+            _ => "Microsoft NTLM SSP",
+        };
+        let stride = if self.guest_arch == GuestArch::X86 {
+            20
+        } else {
+            32
+        };
+        let entry = self.alloc_heap(memory, stride, true)?;
+        write_u32(memory, entry, 0x7); // SECPKG_FLAG_INTEGRITY|PRIVACY|TOKEN_ONLY
+        memory.map_bytes(entry + 4, &0_u16.to_le_bytes()); // wVersion
+        memory.map_bytes(
+            entry + 6,
+            &(if package == "Negotiate" {
+                9_u16
+            } else {
+                10_u16
+            })
+            .to_le_bytes(),
+        ); // wRpcid
+        write_u32(memory, entry + 8, crate::sspi::SSPI_CB_MAX_TOKEN);
+        let name_addr = self.alloc_utf16_string(memory, package)?;
+        let comment_addr = self.alloc_utf16_string(memory, comment)?;
+        if self.guest_arch == GuestArch::X86 {
+            write_guest_pointer(memory, entry + 12, name_addr, self.guest_arch)?;
+            write_guest_pointer(memory, entry + 16, comment_addr, self.guest_arch)?;
+        } else {
+            write_guest_pointer(memory, entry + 16, name_addr, self.guest_arch)?;
+            write_guest_pointer(memory, entry + 24, comment_addr, self.guest_arch)?;
+        }
+        Ok(entry)
+    }
+
     fn alloc_pointer_array(&mut self, memory: &mut MemoryImage, values: &[u64]) -> AppResult<u64> {
         let pointer_bytes = self.guest_arch.pointer_bytes();
         let address =
@@ -66918,6 +69139,186 @@ impl HostThunk {
             }
             ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSASocketA" => {
                 Self::WsaSocketA
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 1 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 1 }) => Self::Accept,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "accept" => Self::Accept,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAAccept" => {
+                Self::WsaAccept
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 13 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 13 }) => Self::Listen,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "listen" => Self::Listen,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 7 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 7 }) => Self::Getsockopt,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "getsockopt" => {
+                Self::Getsockopt
+            }
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAConnect" => {
+                Self::WsaConnect
+            }
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAPoll" => Self::WsaPoll,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSASocketW" => {
+                Self::WsaSocketW
+            }
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSADuplicateSocketW" => {
+                Self::WsaDuplicateSocketW
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 52 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 52 }) => Self::Gethostbyname,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "gethostbyname" => {
+                Self::Gethostbyname
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 51 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 51 }) => Self::Gethostbyaddr,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "gethostbyaddr" => {
+                Self::Gethostbyaddr
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 57 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 57 }) => Self::Gethostname,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "gethostname" => {
+                Self::Gethostname
+            }
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "getnameinfo" => {
+                Self::Getnameinfo
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 53 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 53 }) => Self::Getprotobyname,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "getprotobyname" => {
+                Self::Getprotobyname
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 55 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 55 }) => Self::Getservbyname,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "getservbyname" => {
+                Self::Getservbyname
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 11 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 11 }) => Self::InetAddr,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "inet_addr" => {
+                Self::InetAddr
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 12 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 12 }) => Self::InetNtoa,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "inet_ntoa" => {
+                Self::InetNtoa
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "AcceptSecurityContext" =>
+            {
+                Self::AcceptSecurityContext
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "AcquireCredentialsHandleW" =>
+            {
+                Self::AcquireCredentialsHandleW
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "CompleteAuthToken" => {
+                Self::CompleteAuthToken
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "DecryptMessage" => {
+                Self::DecryptMessage
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "DeleteSecurityContext" =>
+            {
+                Self::DeleteSecurityContext
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "EncryptMessage" => {
+                Self::EncryptMessage
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "EnumerateSecurityPackagesW" =>
+            {
+                Self::EnumerateSecurityPackagesW
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "FreeCredentialsHandle" =>
+            {
+                Self::FreeCredentialsHandle
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "GetUserNameExW" => {
+                Self::GetUserNameExW
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImpersonateSecurityContext" =>
+            {
+                Self::ImpersonateSecurityContext
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InitializeSecurityContextW" =>
+            {
+                Self::InitializeSecurityContextW
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "MakeSignature" => {
+                Self::MakeSignature
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "QueryContextAttributesW" =>
+            {
+                Self::QueryContextAttributesW
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. })
+                if name == "RevertSecurityContext" =>
+            {
+                Self::RevertSecurityContext
+            }
+            ("secur32.dll", ImportSymbol::ByName { name, .. }) if name == "VerifySignature" => {
+                Self::VerifySignature
+            }
+            ("netapi32.dll", ImportSymbol::ByName { name, .. }) if name == "NetApiBufferFree" => {
+                Self::NetApiBufferFree
+            }
+            ("netapi32.dll", ImportSymbol::ByName { name, .. }) if name == "NetServerEnum" => {
+                Self::NetServerEnum
+            }
+            ("netapi32.dll", ImportSymbol::ByName { name, .. }) if name == "NetUserGetInfo" => {
+                Self::NetUserGetInfo
+            }
+            ("netapi32.dll", ImportSymbol::ByName { name, .. }) if name == "NetWkstaGetInfo" => {
+                Self::NetWkstaGetInfo
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetAdaptersInfo" => {
+                Self::GetAdaptersInfo
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetAdaptersAddresses" =>
+            {
+                Self::GetAdaptersAddresses
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetIfTable" => {
+                Self::GetIfTable
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetIfEntry" => {
+                Self::GetIfEntry
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetIpAddrTable" => {
+                Self::GetIpAddrTable
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetIpForwardTable" => {
+                Self::GetIpForwardTable
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetNetworkParams" => {
+                Self::GetNetworkParams
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetBestInterface" => {
+                Self::GetBestInterface
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetBestRoute" => {
+                Self::GetBestRoute
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetRTTAndHopCount" => {
+                Self::GetRTTAndHopCount
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "NotifyAddrChange" => {
+                Self::NotifyAddrChange
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. }) if name == "NotifyRouteChange" => {
+                Self::NotifyRouteChange
+            }
+            ("iphlpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "CancelMibChangeNotify2" =>
+            {
+                Self::CancelMibChangeNotify2
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentThread" => {
                 Self::GetCurrentThread
@@ -91966,6 +94367,1526 @@ mod tests {
     }
 
     #[test]
+    fn evidence_net_sys_winsock_socket_lifecycle() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-net-sys-winsock");
+            let mut memory = MemoryImage::default();
+
+            // WSAStartup first: the transport records require the Winsock
+            // refcount like every guest does.
+            let wsa_startup = runtime.alloc_host_thunk(HostThunk::WsaStartup);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsa_startup, &[0x0202, 0]),
+                0
+            );
+
+            // WSASocketW with a WSAPROTOCOL_INFOW: the family comes from the
+            // structure (iAddressFamily at offset 76), like WinSock.
+            let wsa_socket_w = runtime.alloc_host_thunk(HostThunk::WsaSocketW);
+            let proto_info = 0x62_000;
+            memory.map_bytes(proto_info, &[0_u8; 626]);
+            write_u32(&mut memory, proto_info + 76, 2);
+            let listener = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wsa_socket_w,
+                &[0, 0, 0, proto_info as u32, 0, 0],
+            );
+            assert_ne!(listener, 0);
+            assert_ne!(listener, u32::MAX as u64);
+
+            // bind + listen transition the socket into the listening state.
+            let bind = runtime.alloc_host_thunk(HostThunk::Bind);
+            let sockaddr = 0x62_200;
+            write_guest_sockaddr(
+                &mut memory,
+                sockaddr,
+                &SockAddr {
+                    family: AddressFamily::Ipv4,
+                    host: "127.0.0.1".to_string(),
+                    port: 4321,
+                },
+            )
+            .expect("write sockaddr");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    bind,
+                    &[listener as u32, sockaddr as u32, 16]
+                ),
+                0
+            );
+            let listen = runtime.alloc_host_thunk(HostThunk::Listen);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, listen, &[listener as u32, 5]),
+                0
+            );
+
+            // getsockopt(SO_ACCEPTCONN) reports the listening state.
+            let getsockopt = runtime.alloc_host_thunk(HostThunk::Getsockopt);
+            let optval = 0x62_300;
+            let optlen = 0x62_310;
+            memory.map_bytes(optval, &[0_u8; 4]);
+            write_u32(&mut memory, optlen, 4);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    getsockopt,
+                    &[
+                        listener as u32,
+                        0xFFFF,
+                        0x0002,
+                        optval as u32,
+                        optlen as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, optval).expect("acceptconn"), 1);
+
+            // A second WSASocketW socket becomes the client: WSAConnect
+            // carries caller data (sent right after the connect) and a
+            // callee-data WSABUF that gets zeroed.
+            let client =
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsa_socket_w, &[2, 1, 6, 0, 0, 0]);
+            assert_ne!(client, 0);
+            let wsa_connect = runtime.alloc_host_thunk(HostThunk::WsaConnect);
+            let caller_data = 0x62_400;
+            let payload = 0x62_500;
+            memory.map_bytes(caller_data, &[0_u8; 8]);
+            write_u32(&mut memory, caller_data, 4);
+            write_u32(&mut memory, caller_data + 4, payload as u32);
+            memory.map_bytes(payload, b"ping");
+            let callee_data = 0x62_600;
+            memory.map_bytes(callee_data, &[0_u8; 8]);
+            write_u32(&mut memory, callee_data, 0xDEAD);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wsa_connect,
+                    &[
+                        client as u32,
+                        sockaddr as u32,
+                        16,
+                        caller_data as u32,
+                        callee_data as u32,
+                        0,
+                        0
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, callee_data).expect("callee len"), 0);
+
+            // WSAPoll reports the listener readable (pending accept).
+            let wsa_poll = runtime.alloc_host_thunk(HostThunk::WsaPoll);
+            let pollfd = 0x62_700;
+            memory.map_bytes(pollfd, &[0_u8; 16]);
+            write_u32(&mut memory, pollfd, listener as u32);
+            write_u32(&mut memory, pollfd + 4, 0x0100); // POLLRDNORM
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsa_poll, &[pollfd as u32, 1, 0]),
+                1
+            );
+            let revents = read_u16(&memory, pollfd + 6).expect("revents");
+            assert_ne!(revents & 0x0100, 0, "pending accept reports POLLRDNORM");
+            assert_ne!(revents & 0x0010, 0, "listening sockets are writable");
+
+            // accept pops the pending connection and mints a win32-table
+            // socket handle for the accepted side.
+            let accept = runtime.alloc_host_thunk(HostThunk::Accept);
+            let addr_out = 0x62_800;
+            let addr_len = 0x62_900;
+            memory.map_bytes(addr_out, &[0_u8; 16]);
+            write_u32(&mut memory, addr_len, 16);
+            let accepted = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                accept,
+                &[listener as u32, addr_out as u32, addr_len as u32],
+            );
+            assert_ne!(accepted, 0);
+            assert_ne!(accepted, u32::MAX as u64);
+
+            // The connect-time caller data is in the accepted socket's
+            // receive queue; the send/recv pair round-trips on both sides.
+            let send = runtime.alloc_host_thunk(HostThunk::Send);
+            let recv = runtime.alloc_host_thunk(HostThunk::Recv);
+            let recv_buf = 0x62_A00;
+            memory.map_bytes(recv_buf, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    send,
+                    &[client as u32, payload as u32, 4, 0]
+                ),
+                4
+            );
+            // The accepted socket's queue holds the WSAConnect caller data
+            // plus this send: both 4-byte "ping" payloads.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    recv,
+                    &[accepted as u32, recv_buf as u32, 16, 0]
+                ),
+                8
+            );
+            assert_eq!(
+                read_guest_bytes(&memory, recv_buf, 8).expect("data"),
+                b"pingping"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    send,
+                    &[accepted as u32, payload as u32, 4, 0]
+                ),
+                4
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    recv,
+                    &[client as u32, recv_buf as u32, 16, 0]
+                ),
+                4
+            );
+            assert_eq!(
+                read_guest_bytes(&memory, recv_buf, 4).expect("echo"),
+                b"ping"
+            );
+
+            // getsockopt(SO_TYPE) on the accepted socket reports SOCK_STREAM.
+            write_u32(&mut memory, optlen, 4);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    getsockopt,
+                    &[
+                        accepted as u32,
+                        0xFFFF,
+                        0x1008,
+                        optval as u32,
+                        optlen as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, optval).expect("type"), 1);
+
+            // WSAAccept (no condition callback) accepts a second pending
+            // connection the same way `accept` does.
+            let wsa_accept = runtime.alloc_host_thunk(HostThunk::WsaAccept);
+            let second_client =
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsa_socket_w, &[2, 1, 6, 0, 0, 0]);
+            assert_ne!(second_client, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wsa_connect,
+                    &[second_client as u32, sockaddr as u32, 16, 0, 0, 0, 0]
+                ),
+                0
+            );
+            let accepted2 = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wsa_accept,
+                &[listener as u32, addr_out as u32, addr_len as u32, 0, 0],
+            );
+            assert_ne!(accepted2, 0);
+            assert_ne!(accepted2, u32::MAX as u64);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    send,
+                    &[second_client as u32, payload as u32, 4, 0]
+                ),
+                4
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    recv,
+                    &[accepted2 as u32, recv_buf as u32, 16, 0]
+                ),
+                4
+            );
+            assert_eq!(
+                read_guest_bytes(&memory, recv_buf, 4).expect("data2"),
+                b"ping"
+            );
+
+            // closesocket tears the accepted/client/listener sockets down.
+            let closesocket = runtime.alloc_host_thunk(HostThunk::Closesocket);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, closesocket, &[accepted2 as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    closesocket,
+                    &[second_client as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, closesocket, &[accepted as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, closesocket, &[client as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, closesocket, &[listener as u32]),
+                0
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_net_sys_winsock_dns_service_and_conversion_helpers() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-net-sys-winsock-dns");
+            let mut memory = MemoryImage::default();
+            let wsa_startup = runtime.alloc_host_thunk(HostThunk::WsaStartup);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsa_startup, &[0x0202, 0]),
+                0
+            );
+            let socket_w = runtime.alloc_host_thunk(HostThunk::WsaSocketW);
+
+            // gethostname reports the configured guest host name.
+            let gethostname = runtime.alloc_host_thunk(HostThunk::Gethostname);
+            let name_buf = 0x63_000;
+            memory.map_bytes(name_buf, &[0_u8; 64]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gethostname,
+                    &[name_buf as u32, 64]
+                ),
+                0
+            );
+            assert_eq!(read_c_string(&memory, name_buf).expect("hostname"), "CASA1");
+            // Truncated buffer → WSAEFAULT.
+            memory.map_bytes(name_buf, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gethostname,
+                    &[name_buf as u32, 4]
+                ),
+                u32::MAX as u64
+            );
+            assert_eq!(runtime.network.wsa_get_last_error(), WSAEFAULT);
+
+            // gethostbyname resolves from the guest DNS records.
+            let gethostbyname = runtime.alloc_host_thunk(HostThunk::Gethostbyname);
+            let host = runtime
+                .alloc_c_string(&mut memory, "example.com")
+                .expect("host name");
+            let hostent =
+                dispatch_x86_thunk(&mut runtime, &mut memory, gethostbyname, &[host as u32]);
+            assert_ne!(hostent, 0);
+            let h_name = read_guest_pointer(&memory, hostent, GuestArch::X86).expect("h_name");
+            assert_eq!(read_c_string(&memory, h_name).expect("name"), "example.com");
+            let h_length = read_u16(&memory, hostent + 10).expect("h_length");
+            assert_eq!(h_length, 4);
+            let addr_list =
+                read_guest_pointer(&memory, hostent + 12, GuestArch::X86).expect("addr list");
+            let addr_ptr = read_guest_pointer(&memory, addr_list, GuestArch::X86).expect("addr");
+            assert_eq!(
+                read_guest_bytes(&memory, addr_ptr, 4).expect("bytes"),
+                [93, 184, 216, 34]
+            );
+            // gethostbyaddr reverses the address into the guest DNS name.
+            let gethostbyaddr = runtime.alloc_host_thunk(HostThunk::Gethostbyaddr);
+            let addr_bytes = 0x63_100;
+            memory.map_bytes(addr_bytes, &[93, 184, 216, 34]);
+            let hostent2 = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                gethostbyaddr,
+                &[addr_bytes as u32, 4, 2],
+            );
+            assert_ne!(hostent2, 0);
+            let h_name2 = read_guest_pointer(&memory, hostent2, GuestArch::X86).expect("h_name");
+            assert_eq!(
+                read_c_string(&memory, h_name2).expect("name"),
+                "example.com"
+            );
+            // Unknown address (outside the guest DNS records) → the
+            // numeric form is the fallback name, like Windows.
+            memory.map_bytes(addr_bytes, &[192, 0, 2, 1]);
+            let hostent3 = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                gethostbyaddr,
+                &[addr_bytes as u32, 4, 2],
+            );
+            assert_ne!(hostent3, 0);
+            let h_name3 = read_guest_pointer(&memory, hostent3, GuestArch::X86).expect("h_name");
+            assert_eq!(read_c_string(&memory, h_name3).expect("name"), "192.0.2.1");
+            // Unsupported family → NULL.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gethostbyaddr,
+                    &[addr_bytes as u32, 4, 99]
+                ),
+                0
+            );
+
+            // getnameinfo: reverse name + service from the guest databases.
+            let getnameinfo = runtime.alloc_host_thunk(HostThunk::Getnameinfo);
+            let sa = 0x63_200;
+            write_guest_sockaddr(
+                &mut memory,
+                sa,
+                &SockAddr {
+                    family: AddressFamily::Ipv4,
+                    host: "93.184.216.34".to_string(),
+                    port: 80,
+                },
+            )
+            .expect("sockaddr");
+            let host_out = 0x63_300;
+            let serv_out = 0x63_400;
+            memory.map_bytes(host_out, &[0_u8; 64]);
+            memory.map_bytes(serv_out, &[0_u8; 64]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    getnameinfo,
+                    &[sa as u32, 16, host_out as u32, 64, serv_out as u32, 64, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_c_string(&memory, host_out).expect("host"),
+                "example.com"
+            );
+            assert_eq!(read_c_string(&memory, serv_out).expect("serv"), "http");
+            // NI_NUMERICHOST | NI_NUMERICSERV forces the numeric forms.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    getnameinfo,
+                    &[
+                        sa as u32,
+                        16,
+                        host_out as u32,
+                        64,
+                        serv_out as u32,
+                        64,
+                        0x02 | 0x08
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_c_string(&memory, host_out).expect("host"),
+                "93.184.216.34"
+            );
+            assert_eq!(read_c_string(&memory, serv_out).expect("serv"), "80");
+
+            // getprotobyname / getservbyname from the guest databases.
+            let getprotobyname = runtime.alloc_host_thunk(HostThunk::Getprotobyname);
+            let tcp = runtime.alloc_c_string(&mut memory, "tcp").expect("tcp");
+            let protoent =
+                dispatch_x86_thunk(&mut runtime, &mut memory, getprotobyname, &[tcp as u32]);
+            assert_ne!(protoent, 0);
+            let p_name = read_guest_pointer(&memory, protoent, GuestArch::X86).expect("p_name");
+            assert_eq!(read_c_string(&memory, p_name).expect("name"), "tcp");
+            assert_eq!(read_u16(&memory, protoent + 8).expect("p_proto"), 6);
+            let getservbyname = runtime.alloc_host_thunk(HostThunk::Getservbyname);
+            let http = runtime.alloc_c_string(&mut memory, "http").expect("http");
+            let servent = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                getservbyname,
+                &[http as u32, tcp as u32],
+            );
+            assert_ne!(servent, 0);
+            assert_eq!(
+                read_u16(&memory, servent + 8).expect("s_port"),
+                80_u16.to_be()
+            );
+            let s_proto =
+                read_guest_pointer(&memory, servent + 12, GuestArch::X86).expect("s_proto");
+            assert_eq!(read_c_string(&memory, s_proto).expect("proto"), "tcp");
+
+            // inet_addr / inet_ntoa conversions (network byte order).
+            let inet_addr = runtime.alloc_host_thunk(HostThunk::InetAddr);
+            let dotted = runtime
+                .alloc_c_string(&mut memory, "1.2.3.4")
+                .expect("dotted");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, inet_addr, &[dotted as u32]),
+                0x0403_0201
+            );
+            let bad = runtime
+                .alloc_c_string(&mut memory, "not-an-ip")
+                .expect("bad");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, inet_addr, &[bad as u32]),
+                u32::MAX as u64
+            );
+            let inet_ntoa = runtime.alloc_host_thunk(HostThunk::InetNtoa);
+            let rendered = dispatch_x86_thunk(&mut runtime, &mut memory, inet_ntoa, &[0x0403_0201]);
+            assert_ne!(rendered, 0);
+            assert_eq!(read_c_string(&memory, rendered).expect("ntoa"), "1.2.3.4");
+
+            // WSADuplicateSocketW fills the WSAPROTOCOL_INFOW.
+            let socket =
+                dispatch_x86_thunk(&mut runtime, &mut memory, socket_w, &[2, 1, 6, 0, 0, 0]);
+            assert_ne!(socket, 0);
+            let wsa_dup = runtime.alloc_host_thunk(HostThunk::WsaDuplicateSocketW);
+            let info = 0x63_500;
+            memory.map_bytes(info, &[0_u8; 626]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wsa_dup,
+                    &[socket as u32, 42, info as u32]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, info + 76).expect("family"), 2);
+            assert_eq!(read_u32(&memory, info + 88).expect("type"), 1);
+            assert_eq!(read_u32(&memory, info + 92).expect("proto"), 6);
+            assert_eq!(read_u32(&memory, info + 108).expect("msg size"), 0);
+            let closesocket = runtime.alloc_host_thunk(HostThunk::Closesocket);
+            dispatch_x86_thunk(&mut runtime, &mut memory, closesocket, &[socket as u32]);
+        })
+    }
+
+    #[test]
+    fn evidence_net_sys_sspi_handshake_envelopes_and_message_protection() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-net-sys-sspi");
+            let mut memory = MemoryImage::default();
+
+            // Guest memory layout for the SecBufferDesc pairs.  The token
+            // buffers are 0x400 bytes each, so every region is spaced apart
+            // (a token buffer must never cover another fixed region).
+            let client_desc = 0x64_000;
+            let client_bufs = 0x64_100;
+            let client_token = 0x64_200; // 0x400 bytes: ..0x64_600
+            let server_desc = 0x64_600;
+            let server_bufs = 0x64_700;
+            let server_token = 0x64_800; // 0x400 bytes: ..0x64_C00
+            let cred_client = 0x64_C00;
+            let cred_server = 0x64_D00;
+            let ctx_client = 0x64_E00;
+            let ctx_server = 0x64_F00;
+            let data_buf = 0x65_000;
+            let data_buf2 = 0x65_100;
+            let attrs = 0x65_200;
+            let expiry = 0x65_300;
+            let package_w = runtime
+                .alloc_utf16_string(&mut memory, "NTLM")
+                .expect("package");
+            let target_w = runtime
+                .alloc_utf16_string(&mut memory, "server")
+                .expect("target");
+            memory.map_bytes(client_desc, &[0_u8; 12]);
+            write_u32(&mut memory, client_desc + 4, 1);
+            write_u32(&mut memory, client_desc + 8, client_bufs as u32);
+            memory.map_bytes(client_bufs, &[0_u8; 12]);
+            write_u32(&mut memory, client_bufs, 0x400);
+            write_u32(&mut memory, client_bufs + 4, crate::sspi::SECBUFFER_TOKEN);
+            write_u32(&mut memory, client_bufs + 8, client_token as u32);
+            memory.map_bytes(client_token, &[0_u8; 0x400]);
+            memory.map_bytes(server_desc, &[0_u8; 12]);
+            write_u32(&mut memory, server_desc + 4, 1);
+            write_u32(&mut memory, server_desc + 8, server_bufs as u32);
+            memory.map_bytes(server_bufs, &[0_u8; 12]);
+            write_u32(&mut memory, server_bufs, 0x400);
+            write_u32(&mut memory, server_bufs + 4, crate::sspi::SECBUFFER_TOKEN);
+            write_u32(&mut memory, server_bufs + 8, server_token as u32);
+            memory.map_bytes(server_token, &[0_u8; 0x400]);
+            memory.map_bytes(cred_client, &[0_u8; 8]);
+            memory.map_bytes(cred_server, &[0_u8; 8]);
+            memory.map_bytes(ctx_client, &[0_u8; 8]);
+            memory.map_bytes(ctx_server, &[0_u8; 8]);
+            memory.map_bytes(attrs, &[0_u8; 4]);
+            memory.map_bytes(expiry, &[0_u8; 8]);
+            memory.map_bytes(data_buf, &[0_u8; 64]);
+            memory.map_bytes(data_buf2, &[0_u8; 64]);
+
+            // AcquireCredentialsHandleW on both sides.
+            let acquire = runtime.alloc_host_thunk(HostThunk::AcquireCredentialsHandleW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    acquire,
+                    &[
+                        0,
+                        package_w as u32,
+                        1, // SECPKG_CRED_OUTBOUND
+                        0,
+                        0,
+                        0,
+                        0,
+                        cred_client as u32,
+                        expiry as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    acquire,
+                    &[
+                        0,
+                        package_w as u32,
+                        2, // SECPKG_CRED_INBOUND
+                        0,
+                        0,
+                        0,
+                        0,
+                        cred_server as u32,
+                        expiry as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_u64(&memory, cred_client).expect("cred handle") >> 32,
+                0_u64
+            );
+            let _client_cred = read_u32(&memory, cred_client).expect("cred handle");
+
+            // Client call 1: NEGOTIATE message, SEC_I_CONTINUE_NEEDED.
+            let init_ctx = runtime.alloc_host_thunk(HostThunk::InitializeSecurityContextW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    init_ctx,
+                    &[
+                        cred_client as u32,
+                        0,
+                        target_w as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        ctx_client as u32,
+                        client_desc as u32,
+                        attrs as u32,
+                        expiry as u32
+                    ]
+                ),
+                crate::sspi::SEC_I_CONTINUE_NEEDED as u64
+            );
+            let token_len = read_u32(&memory, client_bufs).expect("token len");
+            assert!(token_len > 0);
+            let token1 =
+                read_guest_bytes(&memory, client_token, token_len as usize).expect("token");
+            assert_eq!(&token1[..8], b"NTLMSSP\x00");
+            assert_eq!(&token1[8..12], &1_u32.to_le_bytes());
+
+            // Server call 1: CHALLENGE message, SEC_I_CONTINUE_NEEDED.
+            let accept_ctx = runtime.alloc_host_thunk(HostThunk::AcceptSecurityContext);
+            memory.map_bytes(server_token, &[0_u8; 0x400]);
+            write_u32(&mut memory, server_bufs, 0x400);
+            memory.map_bytes(client_token, &token1);
+            write_u32(&mut memory, client_bufs, token1.len() as u32);
+            let server_cred = read_u32(&memory, cred_server).expect("cred handle");
+            assert_ne!(server_cred, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    accept_ctx,
+                    &[
+                        cred_server as u32,
+                        0,
+                        client_desc as u32,
+                        0,
+                        0,
+                        ctx_server as u32,
+                        server_desc as u32,
+                        attrs as u32
+                    ]
+                ),
+                crate::sspi::SEC_I_CONTINUE_NEEDED as u64
+            );
+            let token2_len = read_u32(&memory, server_bufs).expect("token len");
+            let token2 =
+                read_guest_bytes(&memory, server_token, token2_len as usize).expect("token");
+            assert_eq!(&token2[8..12], &2_u32.to_le_bytes());
+
+            // Client call 2: AUTHENTICATE message, SEC_E_OK.
+            let client_ctx = read_u32(&memory, ctx_client).expect("client ctx");
+            assert_ne!(client_ctx, 0);
+            memory.map_bytes(client_token, &[0_u8; 0x400]);
+            write_u32(&mut memory, client_bufs, 0x400);
+            memory.map_bytes(server_token, &token2);
+            write_u32(&mut memory, server_bufs, token2.len() as u32);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    init_ctx,
+                    &[
+                        cred_client as u32,
+                        ctx_client as u32,
+                        target_w as u32,
+                        0,
+                        0,
+                        0,
+                        server_desc as u32,
+                        0,
+                        ctx_client as u32,
+                        client_desc as u32,
+                        attrs as u32,
+                        expiry as u32
+                    ]
+                ),
+                crate::sspi::SEC_E_OK as u64
+            );
+            let token3_len = read_u32(&memory, client_bufs).expect("token len");
+            let token3 =
+                read_guest_bytes(&memory, client_token, token3_len as usize).expect("token");
+            assert_eq!(&token3[8..12], &3_u32.to_le_bytes());
+
+            // Server call 2: handshake completes, SEC_E_OK.
+            let server_ctx = read_u32(&memory, ctx_server).expect("server ctx");
+            assert_ne!(server_ctx, 0);
+            memory.map_bytes(server_token, &[0_u8; 0x400]);
+            write_u32(&mut memory, server_bufs, 0x400);
+            memory.map_bytes(client_token, &token3);
+            write_u32(&mut memory, client_bufs, token3.len() as u32);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    accept_ctx,
+                    &[
+                        cred_server as u32,
+                        ctx_server as u32,
+                        client_desc as u32,
+                        0,
+                        0,
+                        ctx_server as u32,
+                        server_desc as u32,
+                        attrs as u32
+                    ]
+                ),
+                crate::sspi::SEC_E_OK as u64
+            );
+
+            // QueryContextAttributesW: sizes, session key, names.
+            let query = runtime.alloc_host_thunk(HostThunk::QueryContextAttributesW);
+            let sizes = 0x65_400;
+            memory.map_bytes(sizes, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[
+                        ctx_client as u32,
+                        crate::sspi::SECPKG_ATTR_SIZES,
+                        sizes as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, sizes).expect("cbMaxToken"), 0x1_0000);
+            assert_eq!(read_u32(&memory, sizes + 4).expect("cbMaxSignature"), 16);
+            let key_buf = 0x65_500;
+            memory.map_bytes(key_buf, &[0_u8; 36]);
+            write_u32(&mut memory, key_buf, 32);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[
+                        ctx_client as u32,
+                        crate::sspi::SECPKG_ATTR_SESSION_KEY,
+                        key_buf as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, key_buf).expect("key len"), 32);
+            let key = read_guest_bytes(&memory, key_buf + 4, 32).expect("key");
+            let names = 0x65_600;
+            memory.map_bytes(names, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query,
+                    &[
+                        ctx_client as u32,
+                        crate::sspi::SECPKG_ATTR_NAMES,
+                        names as u32
+                    ]
+                ),
+                0
+            );
+            let name_ptr = read_u32(&memory, names).expect("name ptr");
+            assert!(!read_guest_utf16_string(&memory, name_ptr as u64, 64).is_empty());
+
+            // MakeSignature / VerifySignature over a message envelope.
+            let sig_desc = 0x65_700;
+            let sig_bufs = 0x65_800;
+            let sig_token = 0x65_900;
+            memory.map_bytes(sig_desc, &[0_u8; 12]);
+            write_u32(&mut memory, sig_desc + 4, 2);
+            write_u32(&mut memory, sig_desc + 8, sig_bufs as u32);
+            memory.map_bytes(sig_bufs, &[0_u8; 24]);
+            write_u32(&mut memory, sig_bufs, 16); // cbBuffer
+            write_u32(&mut memory, sig_bufs + 4, crate::sspi::SECBUFFER_TOKEN);
+            write_u32(&mut memory, sig_bufs + 8, sig_token as u32);
+            memory.map_bytes(sig_token, &[0_u8; 16]);
+            write_u32(&mut memory, sig_bufs + 12, 5); // data buffer
+            write_u32(&mut memory, sig_bufs + 16, crate::sspi::SECBUFFER_DATA);
+            write_u32(&mut memory, sig_bufs + 20, data_buf as u32);
+            memory.map_bytes(data_buf, b"hello");
+            let make_sig = runtime.alloc_host_thunk(HostThunk::MakeSignature);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    make_sig,
+                    &[ctx_client as u32, 0, sig_desc as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, sig_bufs).expect("sig len"), 16);
+            let verify_sig = runtime.alloc_host_thunk(HostThunk::VerifySignature);
+            // The peer (server context) verifies the client's signature.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_sig,
+                    &[ctx_server as u32, sig_desc as u32, 0, 0]
+                ),
+                0
+            );
+            // Tampering with the payload → SEC_E_MESSAGE_ALTERED (a fresh
+            // signature over the original payload is verified against the
+            // modified data — replaying the consumed envelope would
+            // correctly report SEC_E_OUT_OF_SEQ instead).
+            write_u32(&mut memory, sig_bufs, 16);
+            memory.map_bytes(sig_token, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    make_sig,
+                    &[ctx_client as u32, 0, sig_desc as u32, 0]
+                ),
+                0
+            );
+            memory.map_bytes(data_buf, b"hella");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify_sig,
+                    &[ctx_server as u32, sig_desc as u32, 0, 0]
+                ),
+                crate::sspi::SEC_E_MESSAGE_ALTERED as u64
+            );
+
+            // EncryptMessage / DecryptMessage round-trip (seal envelope).
+            memory.map_bytes(data_buf, b"hello");
+            write_u32(&mut memory, sig_bufs, 16);
+            memory.map_bytes(sig_token, &[0_u8; 16]);
+            let encrypt = runtime.alloc_host_thunk(HostThunk::EncryptMessage);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    encrypt,
+                    &[ctx_client as u32, 0, sig_desc as u32, 0]
+                ),
+                0
+            );
+            let ciphertext = read_guest_bytes(&memory, data_buf, 5).expect("ciphertext");
+            assert_ne!(ciphertext, b"hello");
+            let decrypt = runtime.alloc_host_thunk(HostThunk::DecryptMessage);
+            let qop = 0x65_A00;
+            memory.map_bytes(qop, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    decrypt,
+                    &[ctx_server as u32, sig_desc as u32, 0, qop as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_bytes(&memory, data_buf, 5).expect("plaintext"),
+                b"hello"
+            );
+
+            // CompleteAuthToken / Impersonate / Revert / Delete / Free.
+            let complete = runtime.alloc_host_thunk(HostThunk::CompleteAuthToken);
+            write_u32(&mut memory, client_bufs, 1);
+            memory.map_bytes(client_token, &token3);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    complete,
+                    &[ctx_client as u32, client_desc as u32]
+                ),
+                0
+            );
+            let impersonate = runtime.alloc_host_thunk(HostThunk::ImpersonateSecurityContext);
+            let revert = runtime.alloc_host_thunk(HostThunk::RevertSecurityContext);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, impersonate, &[ctx_client as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revert, &[ctx_client as u32]),
+                0
+            );
+            let delete = runtime.alloc_host_thunk(HostThunk::DeleteSecurityContext);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[ctx_client as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[ctx_server as u32]),
+                0
+            );
+            let free_cred = runtime.alloc_host_thunk(HostThunk::FreeCredentialsHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free_cred, &[cred_client as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free_cred, &[cred_server as u32]),
+                0
+            );
+            // Deleting a stale context → SEC_E_INVALID_HANDLE.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[ctx_client as u32]),
+                crate::sspi::SEC_E_INVALID_HANDLE as u64
+            );
+
+            // EnumerateSecurityPackagesW: NTLM + Negotiate.
+            let enumerate = runtime.alloc_host_thunk(HostThunk::EnumerateSecurityPackagesW);
+            let pkg_count = 0x65_B00;
+            let pkg_info = 0x65_C00;
+            memory.map_bytes(pkg_count, &[0_u8; 4]);
+            memory.map_bytes(pkg_info, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enumerate,
+                    &[pkg_count as u32, pkg_info as u32]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, pkg_count).expect("count"), 2);
+
+            // GetUserNameExW derives from the guest environment.
+            let get_user_ex = runtime.alloc_host_thunk(HostThunk::GetUserNameExW);
+            let user_out = 0x65_D00;
+            let user_len = 0x65_E00;
+            memory.map_bytes(user_out, &[0_u8; 64]);
+            write_u32(&mut memory, user_len, 64);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_user_ex,
+                    &[2, user_out as u32, user_len as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                read_guest_utf16_string(&memory, user_out, 64),
+                format!("WORKGROUP\\{}", runtime.win32.ge().config.user_name)
+            );
+
+            // The client/server session keys agree (documented PRF).
+            assert_eq!(key.len(), 32);
+            let _ = key;
+        })
+    }
+
+    #[test]
+    fn evidence_net_sys_iphlpapi_tables_from_guest_config() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-net-sys-iphlpapi");
+            let mut memory = MemoryImage::default();
+
+            // GetAdaptersInfo: the size query reports 688 (x86), then the
+            // chain is filled from the guest config.
+            let get_adapters_info = runtime.alloc_host_thunk(HostThunk::GetAdaptersInfo);
+            let len_slot = 0x66_000;
+            memory.map_bytes(len_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_adapters_info,
+                    &[0, len_slot as u32]
+                ),
+                ERROR_BUFFER_OVERFLOW as u64
+            );
+            assert_eq!(read_u32(&memory, len_slot).expect("required"), 688 * 2);
+            let info_buf = 0x66_100;
+            memory.map_bytes(info_buf, &[0_u8; 688 * 2]);
+            write_u32(&mut memory, len_slot, 688 * 2);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_adapters_info,
+                    &[info_buf as u32, len_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, len_slot).expect("used"), 688 * 2);
+            // Loopback adapter (first entry).
+            let adapter_name = read_c_string(&memory, info_buf + 8).expect("name");
+            assert!(adapter_name.contains("CASA1-0000-0000-0000-000000000001"));
+            assert_eq!(read_u32(&memory, info_buf + 412).expect("index"), 1);
+            assert_eq!(read_u32(&memory, info_buf + 416).expect("type"), 24);
+            // Ethernet adapter (second entry): 10.0.2.15/24, gateway.
+            let eth = info_buf + 688;
+            let ip_list = eth + 464;
+            let ip_addr = read_c_string(&memory, ip_list + 4).expect("ip");
+            assert_eq!(ip_addr, "10.0.2.15");
+            let ip_mask = read_c_string(&memory, ip_list + 20).expect("mask");
+            assert_eq!(ip_mask, "255.255.255.0");
+            let gateway_list = eth + 504;
+            let gateway = read_c_string(&memory, gateway_list + 4).expect("gateway");
+            assert_eq!(gateway, "10.0.2.2");
+            assert_eq!(read_u32(&memory, eth + 412).expect("index"), 2);
+            assert_eq!(read_u32(&memory, eth + 416).expect("type"), 6);
+
+            // GetAdaptersAddresses: size query + unicast/dns/gateway chains.
+            let get_addresses = runtime.alloc_host_thunk(HostThunk::GetAdaptersAddresses);
+            memory.map_bytes(len_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_addresses,
+                    &[0, 0, 0, 0, len_slot as u32]
+                ),
+                ERROR_BUFFER_OVERFLOW as u64
+            );
+            assert_eq!(read_u32(&memory, len_slot).expect("required"), 344 * 2);
+            let addr_buf = 0x66_500;
+            memory.map_bytes(addr_buf, &[0_u8; 344 * 2]);
+            write_u32(&mut memory, len_slot, 344 * 2);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_addresses,
+                    &[0, 0, 0, addr_buf as u32, len_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            let eth_addr = addr_buf + 344;
+            assert_eq!(read_u32(&memory, eth_addr).expect("length"), 344);
+            assert_eq!(read_u32(&memory, eth_addr + 4).expect("ifindex"), 2);
+            assert_eq!(read_u32(&memory, eth_addr + 64).expect("iftype"), 6);
+            let unicast = read_u32(&memory, eth_addr + 16).expect("unicast head");
+            assert_ne!(unicast, 0);
+            let sockaddr_ptr = read_u32(&memory, unicast as u64 + 16).expect("sockaddr");
+            let family = read_u16(&memory, sockaddr_ptr as u64).expect("family");
+            assert_eq!(family, 2);
+            assert_eq!(
+                read_u32(&memory, u64::from(sockaddr_ptr) + 4).expect("addr"),
+                u32::from_ne_bytes([10, 0, 2, 15])
+            );
+            assert_eq!(
+                read_u32(&memory, eth_addr + 56).expect("flags") & IP_ADAPTER_IPV4_ENABLED,
+                IP_ADAPTER_IPV4_ENABLED
+            );
+            let gateway_head = read_u32(&memory, eth_addr + 164).expect("gateway head");
+            assert_ne!(gateway_head, 0);
+            let gw_sockaddr = read_u32(&memory, u64::from(gateway_head) + 16).expect("gw sockaddr");
+            assert_eq!(
+                read_u32(&memory, gw_sockaddr as u64 + 4).expect("gw addr"),
+                u32::from_ne_bytes([10, 0, 2, 2])
+            );
+
+            // GetIfTable: 2 rows from the guest adapters.
+            let get_if_table = runtime.alloc_host_thunk(HostThunk::GetIfTable);
+            let size_slot = 0x66_600;
+            memory.map_bytes(size_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_if_table,
+                    &[0, size_slot as u32]
+                ),
+                ERROR_INSUFFICIENT_BUFFER as u64
+            );
+            assert_eq!(read_u32(&memory, size_slot).expect("required"), 4 + 860 * 2);
+            let table = 0x66_700;
+            memory.map_bytes(table, &[0_u8; 4 + 860 * 2]);
+            write_u32(&mut memory, size_slot, 4 + 860 * 2);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_if_table,
+                    &[table as u32, size_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, table).expect("entries"), 2);
+            assert_eq!(read_u32(&memory, table + 4 + 512).expect("idx0"), 1);
+            assert_eq!(read_u32(&memory, table + 4 + 516).expect("type0"), 24);
+            assert_eq!(read_u32(&memory, table + 4 + 860 + 512).expect("idx1"), 2);
+            assert_eq!(
+                read_u32(&memory, table + 4 + 860 + 520).expect("mtu1"),
+                1500
+            );
+
+            // GetIfEntry fills the requested row by index.
+            let get_if_entry = runtime.alloc_host_thunk(HostThunk::GetIfEntry);
+            let row = 0x66_900;
+            memory.map_bytes(row, &[0_u8; 860]);
+            write_u32(&mut memory, row + 512, 2);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_if_entry, &[row as u32]),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, row + 516).expect("type"), 6);
+            assert_eq!(read_u32(&memory, row + 520).expect("mtu"), 1500);
+
+            // GetIpAddrTable: one row per IPv4 adapter.
+            let get_ip_addr_table = runtime.alloc_host_thunk(HostThunk::GetIpAddrTable);
+            memory.map_bytes(size_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_ip_addr_table,
+                    &[0, size_slot as u32]
+                ),
+                ERROR_INSUFFICIENT_BUFFER as u64
+            );
+            assert_eq!(read_u32(&memory, size_slot).expect("required"), 4 + 20 * 2);
+            let ip_table = 0x66_A00;
+            memory.map_bytes(ip_table, &[0_u8; 4 + 20 * 2]);
+            write_u32(&mut memory, size_slot, 4 + 20 * 2);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_ip_addr_table,
+                    &[ip_table as u32, size_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, ip_table).expect("entries"), 2);
+            assert_eq!(
+                read_u32(&memory, ip_table + 4).expect("addr0"),
+                u32::from_ne_bytes([127, 0, 0, 1])
+            );
+            assert_eq!(
+                read_u32(&memory, ip_table + 24).expect("addr1"),
+                u32::from_ne_bytes([10, 0, 2, 15])
+            );
+            assert_eq!(read_u32(&memory, ip_table + 28).expect("idx1"), 2);
+
+            // GetIpForwardTable: the three guest routes.
+            let get_forward = runtime.alloc_host_thunk(HostThunk::GetIpForwardTable);
+            memory.map_bytes(size_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_forward,
+                    &[0, size_slot as u32]
+                ),
+                ERROR_INSUFFICIENT_BUFFER as u64
+            );
+            assert_eq!(read_u32(&memory, size_slot).expect("required"), 4 + 44 * 3);
+            let fwd = 0x66_B00;
+            memory.map_bytes(fwd, &[0_u8; 4 + 44 * 3]);
+            write_u32(&mut memory, size_slot, 4 + 44 * 3);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_forward,
+                    &[fwd as u32, size_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, fwd).expect("entries"), 3);
+            // Default route row (dest 0.0.0.0, via 10.0.2.2, ifIndex 2).
+            assert_eq!(read_u32(&memory, fwd + 4 + 88).expect("dest"), 0);
+            assert_eq!(
+                read_u32(&memory, fwd + 4 + 100).expect("nh"),
+                u32::from_ne_bytes([10, 0, 2, 2])
+            );
+            assert_eq!(read_u32(&memory, fwd + 4 + 104).expect("ifidx"), 2);
+
+            // GetNetworkParams: host/domain/DNS from the guest config.
+            let get_params = runtime.alloc_host_thunk(HostThunk::GetNetworkParams);
+            memory.map_bytes(len_slot, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_params, &[0, len_slot as u32]),
+                ERROR_BUFFER_OVERFLOW as u64
+            );
+            assert_eq!(read_u32(&memory, len_slot).expect("required"), 592);
+            let fixed = 0x66_C00;
+            memory.map_bytes(fixed, &[0_u8; 592]);
+            write_u32(&mut memory, len_slot, 592);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_params,
+                    &[fixed as u32, len_slot as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_c_string(&memory, fixed).expect("host"), "CASA1");
+            assert_eq!(
+                read_c_string(&memory, fixed + 132).expect("domain"),
+                "WORKGROUP"
+            );
+            let dns_server = read_c_string(&memory, fixed + 276).expect("dns");
+            assert_eq!(dns_server, "10.0.2.3");
+
+            // GetBestInterface / GetBestRoute use the guest route table.
+            let best_iface = runtime.alloc_host_thunk(HostThunk::GetBestInterface);
+            let best_idx = 0x66_D00;
+            memory.map_bytes(best_idx, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    best_iface,
+                    &[u32::from_ne_bytes([127, 0, 0, 1]), best_idx as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, best_idx).expect("idx"), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    best_iface,
+                    &[u32::from_ne_bytes([8, 8, 8, 8]), best_idx as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, best_idx).expect("idx"), 2);
+            let best_route = runtime.alloc_host_thunk(HostThunk::GetBestRoute);
+            let route_out = 0x66_E00;
+            memory.map_bytes(route_out, &[0_u8; 44]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    best_route,
+                    &[u32::from_ne_bytes([10, 0, 2, 15]), 0, route_out as u32]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(
+                read_u32(&memory, route_out).expect("dest"),
+                u32::from_ne_bytes([10, 0, 2, 0])
+            );
+            assert_eq!(
+                read_u32(&memory, route_out + 4).expect("mask"),
+                u32::from_ne_bytes([255, 255, 255, 0])
+            );
+            assert_eq!(read_u32(&memory, route_out + 16).expect("ifidx"), 2);
+
+            // GetRTTAndHopCount: local = 1 hop, routed = 2 hops.
+            let rtt = runtime.alloc_host_thunk(HostThunk::GetRTTAndHopCount);
+            let hops = 0x66_F00;
+            let rtt_out = 0x66_F10;
+            memory.map_bytes(hops, &[0_u8; 4]);
+            memory.map_bytes(rtt_out, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rtt,
+                    &[
+                        u32::from_ne_bytes([127, 0, 0, 1]),
+                        hops as u32,
+                        30,
+                        rtt_out as u32
+                    ]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, hops).expect("hops"), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rtt,
+                    &[
+                        u32::from_ne_bytes([93, 184, 216, 34]),
+                        hops as u32,
+                        30,
+                        rtt_out as u32
+                    ]
+                ),
+                NO_ERROR as u64
+            );
+            assert_eq!(read_u32(&memory, hops).expect("hops"), 2);
+
+            // NotifyAddrChange / NotifyRouteChange: pending semantics +
+            // CancelMibChangeNotify2 cancels the registration.
+            let notify_addr = runtime.alloc_host_thunk(HostThunk::NotifyAddrChange);
+            let notify_route = runtime.alloc_host_thunk(HostThunk::NotifyRouteChange);
+            let cancel = runtime.alloc_host_thunk(HostThunk::CancelMibChangeNotify2);
+            let notify_handle = 0x66_F20;
+            memory.map_bytes(notify_handle, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    notify_addr,
+                    &[0, notify_handle as u32]
+                ),
+                ERROR_IO_PENDING as u64
+            );
+            let addr_handle = read_u32(&memory, notify_handle).expect("addr handle");
+            assert_ne!(addr_handle, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    notify_route,
+                    &[0, notify_handle as u32]
+                ),
+                ERROR_IO_PENDING as u64
+            );
+            let route_handle = read_u32(&memory, notify_handle).expect("route handle");
+            assert_ne!(route_handle, 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[addr_handle]),
+                NO_ERROR as u64
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[route_handle]),
+                NO_ERROR as u64
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[addr_handle]),
+                ERROR_INVALID_PARAMETER as u64
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_net_sys_netapi32_workstation_and_user_info() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-net-sys-netapi32");
+            let mut memory = MemoryImage::default();
+
+            // NetWkstaGetInfo(level 100) fills WKSTA_INFO_100 from the guest
+            // environment: platform id, computer name, workgroup, version.
+            let wksta = runtime.alloc_host_thunk(HostThunk::NetWkstaGetInfo);
+            let bufptr = 0x67_000;
+            memory.map_bytes(bufptr, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wksta, &[0, 100, bufptr as u32]),
+                0
+            );
+            let info = read_u32(&memory, bufptr).expect("info ptr");
+            assert_eq!(read_u32(&memory, info as u64).expect("platform"), 400);
+            let computer = read_u32(&memory, info as u64 + 4).expect("computer");
+            assert_eq!(
+                read_guest_utf16_string(&memory, computer as u64, 64),
+                "CASA1"
+            );
+            let langroup = read_u32(&memory, info as u64 + 8).expect("langroup");
+            assert_eq!(
+                read_guest_utf16_string(&memory, langroup as u64, 64),
+                "WORKGROUP"
+            );
+            assert_eq!(read_u32(&memory, info as u64 + 12).expect("major"), 10);
+            assert_eq!(read_u32(&memory, info as u64 + 16).expect("minor"), 0);
+            // The returned buffer is freed through NetApiBufferFree.
+            let free = runtime.alloc_host_thunk(HostThunk::NetApiBufferFree);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free, &[info as u32]),
+                0
+            );
+            // Freeing it twice → ERROR_INVALID_PARAMETER.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free, &[info as u32]),
+                ERROR_INVALID_PARAMETER as u64
+            );
+
+            // NetWkstaGetInfo(level 101) adds the lanroot and user counts.
+            memory.map_bytes(bufptr, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wksta, &[0, 101, bufptr as u32]),
+                0
+            );
+            let info101 = read_u32(&memory, bufptr).expect("info ptr");
+            let lanroot = read_u32(&memory, info101 as u64 + 20).expect("lanroot");
+            assert_eq!(
+                read_guest_utf16_string(&memory, lanroot as u64, 64),
+                "C:\\WINDOWS"
+            );
+            assert_eq!(
+                read_u32(&memory, info101 as u64 + 24).expect("logged on"),
+                1
+            );
+            // Unsupported level → ERROR_INVALID_LEVEL.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wksta, &[0, 999, bufptr as u32]),
+                ERROR_INVALID_LEVEL as u64
+            );
+
+            // NetUserGetInfo(level 1) fills USER_INFO_1 for the guest user.
+            let user_info = runtime.alloc_host_thunk(HostThunk::NetUserGetInfo);
+            let user_w = runtime
+                .alloc_utf16_string(&mut memory, "casa1")
+                .expect("user");
+            memory.map_bytes(bufptr, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    user_info,
+                    &[0, user_w as u32, 1, bufptr as u32]
+                ),
+                0
+            );
+            let info1 = read_u32(&memory, bufptr).expect("info ptr");
+            let name = read_u32(&memory, info1 as u64).expect("name");
+            assert_eq!(read_guest_utf16_string(&memory, name as u64, 64), "casa1");
+            assert_eq!(read_u32(&memory, info1 as u64 + 12).expect("priv"), 1);
+            assert_eq!(read_u32(&memory, info1 as u64 + 24).expect("flags"), 0x0200);
+            let home = read_u32(&memory, info1 as u64 + 16).expect("home");
+            assert_eq!(
+                read_guest_utf16_string(&memory, home as u64, 128),
+                "C:\\Users\\casa1"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free, &[info1 as u32]),
+                0
+            );
+            // Unknown user → NERR_UserNotFound.
+            let other_w = runtime
+                .alloc_utf16_string(&mut memory, "administrator")
+                .expect("other");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    user_info,
+                    &[0, other_w as u32, 1, bufptr as u32]
+                ),
+                NERR_UserNotFound as u64
+            );
+            // Unsupported level → ERROR_INVALID_LEVEL.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    user_info,
+                    &[0, user_w as u32, 9, bufptr as u32]
+                ),
+                ERROR_INVALID_LEVEL as u64
+            );
+
+            // NetServerEnum: the empty guest server list terminates with
+            // ERROR_NO_MORE_ITEMS and a correctly-filled empty structure.
+            let server_enum = runtime.alloc_host_thunk(HostThunk::NetServerEnum);
+            let entries_read = 0x67_100;
+            let total_entries = 0x67_200;
+            memory.map_bytes(entries_read, &[0_u8; 4]);
+            memory.map_bytes(total_entries, &[0_u8; 4]);
+            memory.map_bytes(bufptr, &[0_u8; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    server_enum,
+                    &[
+                        0,
+                        1,
+                        bufptr as u32,
+                        0x1000,
+                        entries_read as u32,
+                        total_entries as u32,
+                        0
+                    ]
+                ),
+                ERROR_NO_MORE_ITEMS as u64
+            );
+            assert_eq!(read_u32(&memory, entries_read).expect("read"), 0);
+            assert_eq!(read_u32(&memory, total_entries).expect("total"), 0);
+            assert_eq!(read_u32(&memory, bufptr).expect("bufptr"), 0);
+            // Unsupported level → ERROR_INVALID_LEVEL.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    server_enum,
+                    &[
+                        0,
+                        2,
+                        bufptr as u32,
+                        0x1000,
+                        entries_read as u32,
+                        total_entries as u32,
+                        0
+                    ]
+                ),
+                ERROR_INVALID_LEVEL as u64
+            );
+        })
+    }
+
+    #[test]
     fn winhttp_thunk_headers_write_credentials_and_proxy() {
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
@@ -106468,6 +110389,970 @@ fn read_guid_string(memory: &MemoryImage, address: u64) -> AppResult<String> {
         data4[6],
         data4[7],
     ))
+}
+
+/// The guest-visible service database (port, tcp name, udp name) backing
+/// `getservbyname` and the service half of `getnameinfo`.  This is the
+/// guest's own view of the services — it never consults the host's
+/// /etc/services.
+const GUEST_SERVICES: &[(u16, &str, &str)] = &[
+    (7, "echo", "echo"),
+    (9, "discard", "discard"),
+    (13, "daytime", "daytime"),
+    (17, "qotd", "qotd"),
+    (19, "chargen", "chargen"),
+    (20, "ftp-data", "ftp-data"),
+    (21, "ftp", "ftp"),
+    (22, "ssh", "ssh"),
+    (23, "telnet", "telnet"),
+    (25, "smtp", "smtp"),
+    (37, "time", "time"),
+    (42, "nameserver", "nameserver"),
+    (43, "whois", "whois"),
+    (53, "domain", "domain"),
+    (67, "bootps", "bootps"),
+    (68, "bootpc", "bootpc"),
+    (69, "tftp", "tftp"),
+    (70, "gopher", "gopher"),
+    (79, "finger", "finger"),
+    (80, "http", "http"),
+    (88, "kerberos", "kerberos"),
+    (110, "pop3", "pop3"),
+    (111, "sunrpc", "sunrpc"),
+    (113, "auth", "auth"),
+    (119, "nntp", "nntp"),
+    (123, "ntp", "ntp"),
+    (137, "netbios-ns", "netbios-ns"),
+    (138, "netbios-dgm", "netbios-dgm"),
+    (139, "netbios-ssn", "netbios-ssn"),
+    (143, "imap", "imap"),
+    (161, "snmp", "snmp"),
+    (162, "snmptrap", "snmptrap"),
+    (179, "bgp", "bgp"),
+    (194, "irc", "irc"),
+    (389, "ldap", "ldap"),
+    (443, "https", "https"),
+    (445, "microsoft-ds", "microsoft-ds"),
+    (465, "smtps", "smtps"),
+    (514, "shell", "shell"),
+    (515, "printer", "printer"),
+    (548, "afp", "afp"),
+    (554, "rtsp", "rtsp"),
+    (587, "submission", "submission"),
+    (631, "ipp", "ipp"),
+    (636, "ldaps", "ldaps"),
+    (873, "rsync", "rsync"),
+    (993, "imaps", "imaps"),
+    (995, "pop3s", "pop3s"),
+    (1080, "socks", "socks"),
+    (1433, "ms-sql-s", "ms-sql-s"),
+    (1900, "ssdp", "ssdp"),
+    (3306, "mysql", "mysql"),
+    (3389, "ms-wbt-server", "ms-wbt-server"),
+    (5353, "mdns", "mdns"),
+    (5432, "postgresql", "postgresql"),
+    (8080, "http-alt", "http-alt"),
+    (8443, "pcsync-https", "pcsync-https"),
+];
+
+/// The guest-visible protocol database backing `getprotobyname`.
+const GUEST_PROTOCOLS: &[(&str, i16)] = &[("ip", 0), ("icmp", 1), ("tcp", 6), ("udp", 17)];
+
+/// `inet_addr` dotted-decimal parsing with the documented Windows partial
+/// forms: `a.b.c.d`, `a.b.c` (c up to 16 bits), `a.b` (b up to 16 bits) and
+/// `a`.  The result is the address in NETWORK byte order — the numeric
+/// value whose in-memory byte layout is the address octets.
+fn parse_guest_inet_addr(input: &str) -> Option<u32> {
+    let components = input.split('.').collect::<Vec<_>>();
+    if components.is_empty() || components.len() > 4 {
+        return None;
+    }
+    let mut octets = [0_u8; 4];
+    for (index, component) in components.iter().enumerate() {
+        if component.is_empty() {
+            return None;
+        }
+        let is_last = index + 1 == components.len();
+        let max_value: u32 = if is_last {
+            match components.len() {
+                1 => 0xFFFF_FFFF,
+                2 => 0xFFFF,
+                3 => 0xFFFF,
+                _ => 255,
+            }
+        } else {
+            255
+        };
+        let value: u32 = component.parse().ok()?;
+        if value > max_value {
+            return None;
+        }
+        if is_last {
+            if components.len() == 1 {
+                octets = value.to_be_bytes();
+            } else if components.len() == 2 {
+                octets[2] = (value >> 8) as u8;
+                octets[3] = value as u8;
+            } else {
+                octets[3] = value as u8;
+            }
+        } else {
+            octets[index] = value as u8;
+        }
+    }
+    // The caller observes the in_addr bytes; report the network-order
+    // numeric value (LE layout of the octets on little-endian hosts).
+    Some(u32::from_ne_bytes(octets))
+}
+
+/// Read the handle value out of a guest SecHandle (two pointer-sized
+/// words; `dwLower` carries the value, `dwUpper` is 0).
+fn read_guest_sec_handle(
+    memory: &MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+) -> AppResult<u64> {
+    if address == 0 {
+        return Ok(0);
+    }
+    read_guest_pointer(memory, address, guest_arch)
+}
+
+/// Write a handle value into a guest SecHandle.
+fn write_guest_sec_handle(
+    memory: &mut MemoryImage,
+    address: u64,
+    value: u64,
+    guest_arch: GuestArch,
+) -> AppResult<()> {
+    if address == 0 {
+        return Ok(());
+    }
+    write_guest_pointer(memory, address, value, guest_arch)?;
+    write_guest_pointer(
+        memory,
+        address + guest_arch.pointer_bytes() as u64,
+        0,
+        guest_arch,
+    )
+}
+
+/// The stride of a guest `SecBuffer` (cbBuffer, BufferType, pvBuffer).
+fn sec_buffer_stride(guest_arch: GuestArch) -> u64 {
+    if guest_arch == GuestArch::X86 { 12 } else { 24 }
+}
+
+/// The offset of `pvBuffer` inside a guest `SecBuffer`.
+fn sec_buffer_buffer_offset(guest_arch: GuestArch) -> u64 {
+    if guest_arch == GuestArch::X86 { 8 } else { 16 }
+}
+
+/// Read the SECBUFFER_TOKEN payload out of a SecBufferDesc.  Returns
+/// `None` when the descriptor has no token buffer.
+fn read_sec_buffer_desc_token(
+    memory: &MemoryImage,
+    desc: u64,
+    guest_arch: GuestArch,
+) -> AppResult<Option<Vec<u8>>> {
+    if desc == 0 {
+        return Ok(None);
+    }
+    let count = read_guest_u32(memory, desc + 4)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let buffers = read_guest_pointer(memory, desc + 8, guest_arch)?;
+    if buffers == 0 {
+        return Ok(None);
+    }
+    let stride = sec_buffer_stride(guest_arch);
+    for index in 0..count {
+        let entry = buffers + u64::from(index) * stride;
+        let cb = read_guest_u32(memory, entry)?;
+        let buffer_type = read_guest_u32(memory, entry + 4)?;
+        let pv = read_guest_pointer(
+            memory,
+            entry + sec_buffer_buffer_offset(guest_arch),
+            guest_arch,
+        )?;
+        if buffer_type == crate::sspi::SECBUFFER_TOKEN {
+            if cb == 0 || pv == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            return Ok(Some(read_guest_bytes(memory, pv, cb as usize)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Write a token into the SECBUFFER_TOKEN buffer of a SecBufferDesc.
+/// Returns `false` when the descriptor has no writable token buffer.
+fn write_sec_buffer_desc_token(
+    memory: &mut MemoryImage,
+    desc: u64,
+    guest_arch: GuestArch,
+    token: &[u8],
+) -> AppResult<bool> {
+    if desc == 0 {
+        return Ok(false);
+    }
+    let count = read_guest_u32(memory, desc + 4)?;
+    if count == 0 {
+        return Ok(false);
+    }
+    let buffers = read_guest_pointer(memory, desc + 8, guest_arch)?;
+    if buffers == 0 {
+        return Ok(false);
+    }
+    let stride = sec_buffer_stride(guest_arch);
+    for index in 0..count {
+        let entry = buffers + u64::from(index) * stride;
+        let buffer_type = read_guest_u32(memory, entry + 4)?;
+        if buffer_type == crate::sspi::SECBUFFER_TOKEN {
+            let pv = read_guest_pointer(
+                memory,
+                entry + sec_buffer_buffer_offset(guest_arch),
+                guest_arch,
+            )?;
+            if pv == 0 {
+                return Ok(false);
+            }
+            write_u32(memory, entry, token.len() as u32);
+            if !token.is_empty() {
+                memory.map_bytes(pv, token);
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read the concatenation of the data buffers (every buffer except the
+/// SECBUFFER_TOKEN at index 0) of a SecBufferDesc.
+fn read_sec_buffer_desc_data(
+    memory: &MemoryImage,
+    desc: u64,
+    guest_arch: GuestArch,
+) -> AppResult<Vec<u8>> {
+    if desc == 0 {
+        return Ok(Vec::new());
+    }
+    let count = read_guest_u32(memory, desc + 4)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let buffers = read_guest_pointer(memory, desc + 8, guest_arch)?;
+    if buffers == 0 {
+        return Ok(Vec::new());
+    }
+    let stride = sec_buffer_stride(guest_arch);
+    let mut data = Vec::new();
+    for index in 1..count {
+        let entry = buffers + u64::from(index) * stride;
+        let cb = read_guest_u32(memory, entry)?;
+        let pv = read_guest_pointer(
+            memory,
+            entry + sec_buffer_buffer_offset(guest_arch),
+            guest_arch,
+        )?;
+        if cb != 0 {
+            if pv == 0 {
+                continue;
+            }
+            data.extend(read_guest_bytes(memory, pv, cb as usize)?);
+        }
+    }
+    Ok(data)
+}
+
+/// Overwrite the data buffers (index 1..) of a SecBufferDesc with `data`,
+/// writing as many bytes as the buffers hold.
+fn write_sec_buffer_desc_data(
+    memory: &mut MemoryImage,
+    desc: u64,
+    guest_arch: GuestArch,
+    data: &[u8],
+) -> AppResult<()> {
+    if desc == 0 || data.is_empty() {
+        return Ok(());
+    }
+    let count = read_guest_u32(memory, desc + 4)?;
+    if count == 0 {
+        return Ok(());
+    }
+    let buffers = read_guest_pointer(memory, desc + 8, guest_arch)?;
+    if buffers == 0 {
+        return Ok(());
+    }
+    let stride = sec_buffer_stride(guest_arch);
+    let mut written = 0_usize;
+    for index in 1..count {
+        if written >= data.len() {
+            break;
+        }
+        let entry = buffers + u64::from(index) * stride;
+        let cb = read_guest_u32(memory, entry)?;
+        let pv = read_guest_pointer(
+            memory,
+            entry + sec_buffer_buffer_offset(guest_arch),
+            guest_arch,
+        )?;
+        if cb == 0 || pv == 0 {
+            continue;
+        }
+        let chunk_len = (cb as usize).min(data.len() - written);
+        memory.map_bytes(pv, &data[written..written + chunk_len]);
+        written += chunk_len;
+    }
+    Ok(())
+}
+
+/// Allocate one guest-heap block big enough for `struct_size` plus the
+/// UTF-16 forms of `strings`, and write the strings after the struct.
+/// Returns `(base, string_pointers)` — the caller writes the pointers into
+/// the struct fields.  The single-block layout mirrors the documented
+/// netapi32 contract (one buffer, freed with a single NetApiBufferFree).
+fn alloc_packed_string_block(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    struct_size: usize,
+    strings: &[&str],
+) -> AppResult<(u64, Vec<u64>)> {
+    let string_bytes: usize = strings
+        .iter()
+        .map(|value| value.encode_utf16().count() * 2 + 2)
+        .sum();
+    let base = runtime.alloc_heap(memory, struct_size + string_bytes, true)?;
+    let mut cursor = base + struct_size as u64;
+    let mut pointers = Vec::with_capacity(strings.len());
+    for value in strings {
+        let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        memory.map_bytes(cursor, &bytes);
+        pointers.push(cursor);
+        cursor += bytes.len() as u64;
+    }
+    Ok((base, pointers))
+}
+
+/// The canonical guest network config for the runtime's guest identity.
+fn guest_net_config(runtime: &PeHostRuntime) -> crate::network::GuestNetworkConfig {
+    crate::network::guest_network_config(&runtime.win32.ge().config.user_name)
+}
+
+// ---------------------------------------------------------------------------
+// iphlpapi guest-structure writers
+// ---------------------------------------------------------------------------
+//
+// Every table is derived from the guest network configuration
+// (`guest_network_config`) — the host's real adapters never leak into the
+// guest.  The layouts below mirror the documented iphlpapi structures for
+// both guest ABIs (pointer fields widen on x64; ULONGLONG members stay
+// 8-aligned on x86).
+
+/// Size of MIB_IFROW (860 bytes on both ABIs — no pointer members).
+const MIB_IFROW_SIZE: u32 = 860;
+/// Size of MIB_IPFORWARDROW (44 bytes on both ABIs).
+const MIB_IPFORWARDROW_SIZE: u32 = 44;
+
+/// Write one MIB_IFROW (the guest adapter) at `address`; returns the next
+/// cursor.  The row layout is ABI-independent (fixed-width members only).
+fn write_guest_mib_ifrow(
+    memory: &mut MemoryImage,
+    address: u64,
+    adapter: &crate::network::GuestAdapter,
+) -> AppResult<u64> {
+    let name_units = adapter.adapter_name.encode_utf16().collect::<Vec<_>>();
+    for (index, unit) in name_units.iter().enumerate().take(256) {
+        memory.map_bytes(address + index as u64 * 2, &unit.to_le_bytes());
+    }
+    memory.map_bytes(address + name_units.len() as u64 * 2, &0_u16.to_le_bytes());
+    write_u32(memory, address + 512, adapter.index);
+    write_u32(memory, address + 516, adapter.if_type);
+    write_u32(memory, address + 520, adapter.mtu);
+    write_u32(memory, address + 524, adapter.speed as u32);
+    write_u32(memory, address + 528, adapter.mac.len() as u32);
+    memory.map_bytes(address + 532, &adapter.mac);
+    write_u32(memory, address + 540, MIB_IF_ADMIN_STATUS_UP);
+    write_u32(memory, address + 544, adapter.oper_status);
+    write_u32(memory, address + 548, 0); // dwLastChange
+    // Counters: the guest model has no traffic.
+    for offset in [
+        552_u64, 556, 560, 564, 568, 572, 576, 580, 584, 588, 592, 596,
+    ] {
+        write_u32(memory, address + offset, 0);
+    }
+    let description = adapter.description.as_bytes();
+    let description_len = description.len().min(256);
+    write_u32(memory, address + 600, description_len as u32);
+    memory.map_bytes(address + 604, &description[..description_len]);
+    Ok(address + u64::from(MIB_IFROW_SIZE))
+}
+
+/// Write one MIB_IPFORWARDROW (a guest route).
+fn write_guest_mib_ipforwardrow(
+    memory: &mut MemoryImage,
+    address: u64,
+    route: &crate::network::GuestRoute,
+) -> AppResult<()> {
+    write_u32(memory, address, u32::from_ne_bytes(route.dest.octets()));
+    write_u32(memory, address + 4, u32::from_ne_bytes(route.mask.octets()));
+    write_u32(memory, address + 8, 0); // dwForwardPolicy
+    write_u32(
+        memory,
+        address + 12,
+        u32::from_ne_bytes(route.next_hop.octets()),
+    );
+    write_u32(memory, address + 16, route.if_index);
+    write_u32(memory, address + 20, route.route_type);
+    write_u32(memory, address + 24, MIB_IPPROTO_NETMGMT);
+    write_u32(memory, address + 28, 0); // dwForwardAge
+    write_u32(memory, address + 32, 0); // dwForwardNextHopAS
+    write_u32(memory, address + 36, route.metric); // dwForwardMetric1
+    for offset in [40_u64, 44, 48, 52] {
+        write_u32(memory, address + offset, 0);
+    }
+    Ok(())
+}
+
+/// The longest-prefix guest route for a destination (network-order u32).
+fn best_guest_route(
+    config: &crate::network::GuestNetworkConfig,
+    dest_network_order: u32,
+) -> &crate::network::GuestRoute {
+    let dest = Ipv4Addr::from(dest_network_order.to_ne_bytes());
+    let dest_u32 = u32::from_ne_bytes(dest.octets());
+    let mut best: Option<&crate::network::GuestRoute> = None;
+    let mut best_prefix = 0_u32;
+    for route in &config.routes {
+        let mask = u32::from_ne_bytes(route.mask.octets());
+        let network = u32::from_ne_bytes(route.dest.octets());
+        if dest_u32 & mask == network & mask {
+            let prefix = mask.count_ones();
+            if prefix >= best_prefix {
+                best_prefix = prefix;
+                best = Some(route);
+            }
+        }
+    }
+    best.unwrap_or_else(|| {
+        config
+            .routes
+            .iter()
+            .find(|route| route.mask == Ipv4Addr::UNSPECIFIED)
+            .expect("the guest config always carries the default route")
+    })
+}
+
+/// The size of the guest FIXED_INFO structure (per-arch).
+fn guest_fixed_info_size(guest_arch: GuestArch) -> u32 {
+    if guest_arch == GuestArch::X86 {
+        592
+    } else {
+        608
+    }
+}
+
+/// Write FIXED_INFO (GetNetworkParams) from the guest configuration.
+fn write_guest_fixed_info(
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    config: &crate::network::GuestNetworkConfig,
+) -> AppResult<()> {
+    let hostname = config.hostname.as_bytes();
+    memory.map_bytes(address, hostname);
+    memory.map_bytes(address + hostname.len() as u64, &[0]);
+    let domain = config.domain.as_bytes();
+    memory.map_bytes(address + 132, domain);
+    memory.map_bytes(address + 132 + domain.len() as u64, &[0]);
+    let dns_addr_ptr = if guest_arch == GuestArch::X86 {
+        address + 272
+    } else {
+        address + 280
+    };
+    let dns_head_ptr = if guest_arch == GuestArch::X86 {
+        address + 268
+    } else {
+        address + 272
+    };
+    write_guest_pointer(memory, dns_head_ptr, dns_addr_ptr, guest_arch)?;
+    // DnsServerList: one entry (10.0.2.3), Next = NULL.
+    let dns_ip = config
+        .dns_servers
+        .first()
+        .map(String::as_str)
+        .unwrap_or("10.0.2.3");
+    let mut dns_bytes = dns_ip.as_bytes().to_vec();
+    dns_bytes.push(0);
+    memory.map_bytes(dns_addr_ptr, &[0_u8; 40]);
+    if guest_arch == GuestArch::X64 {
+        memory.map_bytes(dns_addr_ptr, &[0_u8; 48]);
+    }
+    memory.map_bytes(dns_addr_ptr + 4, &dns_bytes);
+    memory.map_bytes(dns_addr_ptr + 20, b"255.255.255.255\x00");
+    write_guest_pointer(memory, dns_addr_ptr, 0, guest_arch)?;
+    write_u32(memory, dns_addr_ptr + 36, 0); // Context
+    let node_type = if guest_arch == GuestArch::X86 {
+        address + 312
+    } else {
+        address + 328
+    };
+    write_u32(memory, node_type, 1); // BROADCAST_NODETYPE
+    // ScopeId (264 bytes) stays zeroed.
+    let enable_routing = if guest_arch == GuestArch::X86 {
+        address + 580
+    } else {
+        address + 596
+    };
+    write_u32(memory, enable_routing, 0);
+    write_u32(memory, enable_routing + 4, 0); // EnableProxy
+    write_u32(memory, enable_routing + 8, 1); // EnableDns
+    Ok(())
+}
+
+/// The required GetAdaptersInfo buffer size (one IP_ADAPTER_INFO per guest
+/// adapter).
+fn guest_adapter_info_total_size(guest_arch: GuestArch, adapter_count: usize) -> u32 {
+    let per = if guest_arch == GuestArch::X86 {
+        688
+    } else {
+        736
+    };
+    (per * adapter_count) as u32
+}
+
+/// Write one IP_ADAPTER_INFO chain entry; returns the next cursor.
+fn write_guest_ip_adapter_info(
+    _runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    adapter: &crate::network::GuestAdapter,
+) -> AppResult<u64> {
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let ip_addr_string_size = if guest_arch == GuestArch::X86 { 40 } else { 48 };
+    let struct_size = if guest_arch == GuestArch::X86 {
+        688
+    } else {
+        736
+    };
+    memory.map_bytes(address, &vec![0_u8; struct_size as usize]);
+    write_u32(memory, address + pointer_bytes, 0); // ComboIndex
+    let mut adapter_name = adapter.adapter_name.as_bytes().to_vec();
+    adapter_name.push(0);
+    memory.map_bytes(address + pointer_bytes + 4, &adapter_name);
+    let mut description = adapter.description.as_bytes().to_vec();
+    description.push(0);
+    memory.map_bytes(address + pointer_bytes + 264, &description);
+    write_u32(
+        memory,
+        address + pointer_bytes + 396,
+        adapter.mac.len() as u32,
+    );
+    memory.map_bytes(address + pointer_bytes + 400, &adapter.mac);
+    write_u32(memory, address + pointer_bytes + 408, adapter.index);
+    write_u32(memory, address + pointer_bytes + 412, adapter.if_type);
+    write_u32(
+        memory,
+        address + pointer_bytes + 416,
+        u32::from(adapter.dhcp_enabled),
+    );
+    // CurrentIpAddress: NULL (the documented "may be NULL" state).
+    let current = address + pointer_bytes + 420;
+    write_guest_pointer(memory, current, 0, guest_arch)?;
+    let ip_list = current + ip_addr_string_size;
+    let gateway_list = ip_list + ip_addr_string_size;
+    let dhcp_server = gateway_list + ip_addr_string_size;
+    if let Some(ipv4) = &adapter.ipv4 {
+        write_guest_ip_addr_string(
+            memory,
+            ip_list,
+            guest_arch,
+            &ipv4.address.to_string(),
+            &ipv4.mask.to_string(),
+        )?;
+        let gateway = ipv4
+            .gateway
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        write_guest_ip_addr_string(
+            memory,
+            gateway_list,
+            guest_arch,
+            &gateway,
+            "255.255.255.255",
+        )?;
+    } else {
+        write_guest_ip_addr_string(memory, ip_list, guest_arch, "0.0.0.0", "0.0.0.0")?;
+        write_guest_ip_addr_string(memory, gateway_list, guest_arch, "0.0.0.0", "0.0.0.0")?;
+    }
+    let dhcp_ip = adapter
+        .dns_servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    write_guest_ip_addr_string(memory, dhcp_server, guest_arch, &dhcp_ip, "255.255.255.255")?;
+    let have_wins = dhcp_server + ip_addr_string_size;
+    write_u32(memory, have_wins, 0);
+    // Primary/SecondaryWinsServer: empty entries.
+    let wins_primary = have_wins + 4;
+    let wins_secondary = wins_primary + ip_addr_string_size;
+    write_guest_ip_addr_string(memory, wins_primary, guest_arch, "0.0.0.0", "0.0.0.0")?;
+    write_guest_ip_addr_string(memory, wins_secondary, guest_arch, "0.0.0.0", "0.0.0.0")?;
+    let lease_obtained = align_up_u64(wins_secondary + ip_addr_string_size, 8);
+    memory.map_bytes(lease_obtained, &0_u64.to_le_bytes());
+    memory.map_bytes(lease_obtained + 8, &0_u64.to_le_bytes());
+    Ok(lease_obtained + 16)
+}
+
+/// Write one IP_ADDR_STRING (Next + address + mask + context).
+fn write_guest_ip_addr_string(
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    ip: &str,
+    mask: &str,
+) -> AppResult<()> {
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    write_guest_pointer(memory, address, 0, guest_arch)?;
+    let mut ip_bytes = ip.as_bytes().to_vec();
+    ip_bytes.push(0);
+    memory.map_bytes(address + pointer_bytes, &ip_bytes);
+    let mut mask_bytes = mask.as_bytes().to_vec();
+    mask_bytes.push(0);
+    memory.map_bytes(address + pointer_bytes + 16, &mask_bytes);
+    write_u32(memory, address + pointer_bytes + 32, 0); // Context
+    Ok(())
+}
+
+/// The required GetAdaptersAddresses buffer size.
+fn guest_adapters_addresses_total_size(guest_arch: GuestArch, adapter_count: usize) -> u32 {
+    let per = if guest_arch == GuestArch::X86 {
+        344
+    } else {
+        408
+    };
+    (per * adapter_count) as u32
+}
+
+/// Write one IP_ADAPTER_ADDRESSES entry (the Vista structure) for a guest
+/// adapter; returns the next cursor.
+fn write_guest_ip_adapter_addresses(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    adapter: &crate::network::GuestAdapter,
+    family_filter: u32,
+) -> AppResult<u64> {
+    let _pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let x86 = guest_arch == GuestArch::X86;
+    let struct_size = if x86 { 344 } else { 408 };
+    // Per-arch field offsets (pointer fields widen on x64; ULONGLONG
+    // members stay 8-aligned).
+    let off_adapter_name = if x86 { 12 } else { 16 };
+    let off_first_unicast = if x86 { 16 } else { 24 };
+    let off_first_dns = if x86 { 28 } else { 48 };
+    let off_dns_suffix = if x86 { 32 } else { 56 };
+    let off_description = if x86 { 36 } else { 64 };
+    let off_friendly_name = if x86 { 40 } else { 72 };
+    let off_first_prefix = if x86 { 140 } else { 176 };
+    let off_transmit_speed = if x86 { 144 } else { 184 };
+    let off_receive_speed = if x86 { 152 } else { 192 };
+    let off_first_gateway = if x86 { 164 } else { 208 };
+    let off_ipv4_metric = if x86 { 168 } else { 216 };
+    let off_ipv6_metric = if x86 { 172 } else { 220 };
+    memory.map_bytes(address, &vec![0_u8; struct_size as usize]);
+    write_u32(memory, address, struct_size); // Length
+    write_u32(memory, address + 4, adapter.index); // IfIndex
+    write_guest_pointer(memory, address + 8, 0, guest_arch)?; // Next
+    let name_ptr = runtime.alloc_c_string(memory, &adapter.adapter_name)?;
+    write_guest_pointer(memory, address + off_adapter_name, name_ptr, guest_arch)?;
+    let dns_suffix = runtime.alloc_utf16_string(memory, "")?;
+    let description = runtime.alloc_utf16_string(memory, &adapter.description)?;
+    let friendly = runtime.alloc_utf16_string(memory, &adapter.friendly_name)?;
+    write_guest_pointer(memory, address + off_dns_suffix, dns_suffix, guest_arch)?;
+    write_guest_pointer(memory, address + off_description, description, guest_arch)?;
+    write_guest_pointer(memory, address + off_friendly_name, friendly, guest_arch)?;
+    let off_physical_address = if x86 { 44 } else { 80 };
+    let off_physical_len = if x86 { 52 } else { 88 };
+    let off_flags = if x86 { 56 } else { 92 };
+    let off_mtu = if x86 { 60 } else { 96 };
+    let off_if_type = if x86 { 64 } else { 100 };
+    let off_oper_status = if x86 { 68 } else { 104 };
+    let off_ipv6_if_index = if x86 { 72 } else { 108 };
+    memory.map_bytes(address + off_physical_address, &adapter.mac);
+    write_u32(memory, address + off_physical_len, adapter.mac.len() as u32);
+    let flags = IP_ADAPTER_DDNS_ENABLED
+        | IP_ADAPTER_REGISTER_ADAPTER_SUFFIX
+        | (if adapter.dhcp_enabled {
+            IP_ADAPTER_DHCP_ENABLED
+        } else {
+            0
+        })
+        | IP_ADAPTER_IPV4_ENABLED
+        | IP_ADAPTER_IPV6_ENABLED;
+    write_u32(memory, address + off_flags, flags);
+    write_u32(memory, address + off_mtu, adapter.mtu);
+    write_u32(memory, address + off_if_type, adapter.if_type);
+    write_u32(memory, address + off_oper_status, adapter.oper_status);
+    write_u32(memory, address + off_ipv6_if_index, 0); // Ipv6IfIndex
+    // ZoneIndices[16] stays zeroed.
+    // Unicast chain: the adapter's IPv4 (+ IPv6 when the filter allows).
+    // The chain entries are guest-heap allocations referenced through the
+    // struct's pointer fields — they never overlap the struct itself.
+    let unicast_size = if x86 { 48 } else { 64 };
+    let entry_size = if x86 { 20 } else { 32 };
+    let mut unicast_entries = Vec::new();
+    if let Some(ipv4) = &adapter.ipv4
+        && (family_filter == AF_UNSPEC as u32 || family_filter == AF_INET as u32)
+    {
+        unicast_entries.push((AddressFamily::Ipv4, ipv4.address.to_string(), 24_u32));
+    }
+    if let Some(ipv6) = &adapter.ipv6
+        && (family_filter == AF_UNSPEC as u32 || family_filter == AF_INET6 as u32)
+    {
+        unicast_entries.push((
+            AddressFamily::Ipv6,
+            ipv6.address.to_string(),
+            u32::from(ipv6.prefix_len),
+        ));
+    }
+    let mut unicast_ptrs = Vec::new();
+    for (family, host, prefix_len) in unicast_entries {
+        let entry = runtime.alloc_heap(memory, unicast_size as usize, true)?;
+        unicast_ptrs.push(entry);
+        write_guest_unicast_address(
+            runtime, memory, entry, guest_arch, family, &host, prefix_len,
+        )?;
+    }
+    write_guest_pointer(
+        memory,
+        address + off_first_unicast,
+        unicast_ptrs.first().copied().unwrap_or(0),
+        guest_arch,
+    )?;
+    for pair in unicast_ptrs.windows(2) {
+        write_guest_pointer(memory, pair[0] + 8, pair[1], guest_arch)?;
+    }
+    // DNS server chain.
+    let mut dns_ptrs = Vec::new();
+    for server in &adapter.dns_servers {
+        let entry = runtime.alloc_heap(memory, entry_size as usize, true)?;
+        dns_ptrs.push(entry);
+        write_guest_dns_entry(runtime, memory, entry, guest_arch, server)?;
+    }
+    write_guest_pointer(
+        memory,
+        address + off_first_dns,
+        dns_ptrs.first().copied().unwrap_or(0),
+        guest_arch,
+    )?;
+    for pair in dns_ptrs.windows(2) {
+        write_guest_pointer(memory, pair[0] + 8, pair[1], guest_arch)?;
+    }
+    // Prefix chain (one on-link prefix for the IPv4 subnet).
+    if let Some(ipv4) = &adapter.ipv4 {
+        let prefix_ptr = runtime.alloc_heap(memory, 40, true)?;
+        write_guest_prefix(
+            runtime,
+            memory,
+            prefix_ptr,
+            guest_arch,
+            &ipv4.address.to_string(),
+            24,
+        )?;
+        write_guest_pointer(memory, address + off_first_prefix, prefix_ptr, guest_arch)?;
+    }
+    write_u64(memory, address + off_transmit_speed, adapter.speed); // TransmitLinkSpeed
+    write_u64(memory, address + off_receive_speed, adapter.speed); // ReceiveLinkSpeed
+    // Gateway chain.
+    if let Some(gateway) = adapter.ipv4.as_ref().and_then(|ipv4| ipv4.gateway) {
+        let gateway_ptr = runtime.alloc_heap(memory, entry_size as usize, true)?;
+        write_guest_socket_address_entry(
+            runtime,
+            memory,
+            gateway_ptr,
+            guest_arch,
+            AddressFamily::Ipv4,
+            &gateway.to_string(),
+        )?;
+        write_guest_pointer(memory, address + off_first_gateway, gateway_ptr, guest_arch)?;
+    }
+    write_u32(memory, address + off_ipv4_metric, adapter.metric); // Ipv4Metric
+    write_u32(memory, address + off_ipv6_metric, 0); // Ipv6Metric
+    // Luid stays zeroed; Dhcpv4Server/Dhcpv6Server stay zeroed.
+    Ok(address + struct_size as u64)
+}
+
+/// Write one IP_ADAPTER_UNICAST_ADDRESS for the guest adapter.
+fn write_guest_unicast_address(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    family: AddressFamily,
+    host: &str,
+    prefix_len: u32,
+) -> AppResult<u64> {
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let unicast_size = if guest_arch == GuestArch::X86 { 48 } else { 64 };
+    let sockaddr_len = u32::from(guest_sockaddr_len(family));
+    let sockaddr_ptr = runtime.alloc_heap(memory, sockaddr_len as usize, true)?;
+    write_guest_sockaddr(
+        memory,
+        sockaddr_ptr,
+        &SockAddr {
+            family,
+            host: host.to_string(),
+            port: 0,
+        },
+    )?;
+    memory.map_bytes(address, &vec![0_u8; unicast_size as usize]);
+    write_guest_pointer(memory, address + 8, 0, guest_arch)?; // Next
+    write_u32(memory, address + 12, sockaddr_len); // iSockaddrLength
+    write_guest_pointer(
+        memory,
+        address + 12 + pointer_bytes,
+        sockaddr_ptr,
+        guest_arch,
+    )?;
+    write_u32(memory, address + 20, 0); // PrefixOrigin
+    write_u32(memory, address + 24, 0); // SuffixOrigin
+    write_u32(memory, address + 28, 0); // DadState
+    write_u32(memory, address + 32, u32::MAX); // ValidLifetime
+    write_u32(memory, address + 36, u32::MAX); // PreferredLifetime
+    write_u32(memory, address + 40, u32::MAX); // LeaseLifetime
+    memory.map_bytes(address + 44, &(prefix_len as u8).to_le_bytes()); // OnLinkPrefixLength
+    memory.map_bytes(address + 45, &0_u8.to_le_bytes()); // SkipAsSource
+    Ok(address + unicast_size as u64)
+}
+
+/// Write one IP_ADAPTER_DNS_SERVER_ADDRESS / GATEWAY entry.
+fn write_guest_socket_address_entry(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    family: AddressFamily,
+    host: &str,
+) -> AppResult<u64> {
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let entry_size = if guest_arch == GuestArch::X86 { 20 } else { 32 };
+    let sockaddr_len = u32::from(guest_sockaddr_len(family));
+    let sockaddr_ptr = runtime.alloc_heap(memory, sockaddr_len as usize, true)?;
+    write_guest_sockaddr(
+        memory,
+        sockaddr_ptr,
+        &SockAddr {
+            family,
+            host: host.to_string(),
+            port: 0,
+        },
+    )?;
+    memory.map_bytes(address, &vec![0_u8; entry_size as usize]);
+    write_guest_pointer(memory, address + 8, 0, guest_arch)?; // Next
+    write_u32(memory, address + 12, sockaddr_len);
+    write_guest_pointer(
+        memory,
+        address + 12 + pointer_bytes,
+        sockaddr_ptr,
+        guest_arch,
+    )?;
+    Ok(address + entry_size as u64)
+}
+
+/// Write one IP_ADAPTER_DNS_SERVER_ADDRESS entry for a DNS server.
+fn write_guest_dns_entry(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    server: &str,
+) -> AppResult<u64> {
+    write_guest_socket_address_entry(
+        runtime,
+        memory,
+        address,
+        guest_arch,
+        AddressFamily::Ipv4,
+        server,
+    )
+}
+
+/// Write one IP_ADAPTER_PREFIX entry.
+fn write_guest_prefix(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    host: &str,
+    prefix_len: u32,
+) -> AppResult<()> {
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let prefix_size = if guest_arch == GuestArch::X86 { 28 } else { 40 };
+    let sockaddr_len = u32::from(guest_sockaddr_len(AddressFamily::Ipv4));
+    let sockaddr_ptr = runtime.alloc_heap(memory, sockaddr_len as usize, true)?;
+    write_guest_sockaddr(
+        memory,
+        sockaddr_ptr,
+        &SockAddr {
+            family: AddressFamily::Ipv4,
+            host: host.to_string(),
+            port: 0,
+        },
+    )?;
+    memory.map_bytes(address, &vec![0_u8; prefix_size as usize]);
+    write_guest_pointer(memory, address + 8, 0, guest_arch)?; // Next
+    write_u32(memory, address + 12, sockaddr_len);
+    write_guest_pointer(
+        memory,
+        address + 12 + pointer_bytes,
+        sockaddr_ptr,
+        guest_arch,
+    )?;
+    write_u32(memory, address + 20, prefix_len);
+    write_u32(memory, address + 24, 0); // Flags
+    Ok(())
+}
+
+/// Read a SEC_WINNT_AUTH_IDENTITY (guest credentials structure).
+fn read_guest_auth_identity(
+    memory: &MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+) -> AppResult<crate::sspi::SspiIdentity> {
+    use crate::sspi::SspiIdentity;
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let read_field = |index: usize| -> AppResult<String> {
+        let ptr = read_guest_pointer(memory, address + index as u64 * pointer_bytes, guest_arch)?;
+        let len = read_guest_u32(memory, address + 3 * pointer_bytes + index as u64 * 4)?;
+        if ptr == 0 || len == 0 {
+            return Ok(String::new());
+        }
+        let units = read_guest_bytes(memory, ptr, len as usize)?;
+        let mut code_units = Vec::with_capacity(units.len() / 2);
+        for chunk in units.chunks_exact(2) {
+            code_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        Ok(String::from_utf16_lossy(&code_units))
+    };
+    let flags = read_guest_u32(memory, address + 3 * pointer_bytes + 3 * 4)?;
+    let (user, domain, password) = if flags == 0x2 {
+        // SEC_WINNT_AUTH_IDENTITY_UNICODE
+        (read_field(0)?, read_field(1)?, read_field(2)?)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+    Ok(SspiIdentity {
+        user,
+        domain,
+        password,
+    })
 }
 
 fn write_shell_link_clsid(memory: &mut MemoryImage, address: u64) {
