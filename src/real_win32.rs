@@ -10231,6 +10231,125 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(xinput.vibration[0].left_motor_speed, 65535);
+        assert_eq!(xinput.vibration[0].right_motor_speed, 32768);
+    }
+
+    #[test]
+    fn xinput_state_round_trip_via_update() {
+        let mut xinput = XInputManager::new();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
+
+        // update_state replaces the state and stamps a fresh packet number
+        // (the guest-visible XInputGetState round-trip).
+        xinput
+            .update_state(
+                0,
+                XInputState {
+                    packet_number: 99,
+                    buttons: XINPUT_GAMEPAD_B,
+                    left_trigger: 200,
+                    right_trigger: 40,
+                    left_thumb_x: 1200,
+                    left_thumb_y: -800,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
+        let state = xinput.get_state(0).unwrap();
+        assert_eq!(
+            state.packet_number, 99,
+            "a caller-stamped newer packet wins"
+        );
+        assert_eq!(state.buttons, XINPUT_GAMEPAD_B);
+        assert_eq!(state.left_trigger, 200);
+        assert_eq!(state.right_trigger, 40);
+        assert_eq!(state.left_thumb_x, 1200);
+        assert_eq!(state.left_thumb_y, -800);
+
+        // Updating a disconnected slot fails.
+        let result = xinput.update_state(
+            1,
+            XInputState {
+                packet_number: 1,
+                buttons: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                left_thumb_x: 0,
+                left_thumb_y: 0,
+                right_thumb_x: 0,
+                right_thumb_y: 0,
+            },
+        );
+        assert!(result.is_err(), "update of a disconnected slot must fail");
+    }
+
+    #[test]
+    fn xinput_battery_information_reports_wired_full() {
+        let mut xinput = XInputManager::new();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
+
+        // Connected controller: BATTERY_TYPE_WIRED (0) / BATTERY_LEVEL_FULL (3).
+        let battery = xinput.get_battery_information(0).unwrap();
+        assert_eq!(battery.battery_type, 0);
+        assert_eq!(battery.battery_level, 3);
+
+        // Disconnected controller: the query fails.
+        let result = xinput.get_battery_information(1);
+        assert!(result.is_err(), "disconnected slot must fail");
+        let result = xinput.get_battery_information(4);
+        assert!(result.is_err(), "invalid index must fail");
+    }
+
+    #[test]
+    fn xinput_keystroke_is_empty_without_events() {
+        let xinput = XInputManager::new();
+        // No keyboard emulation: the keystroke queue is always empty but the
+        // query itself succeeds (maps to ERROR_EMPTY at the export surface).
+        let keystroke = xinput.get_keystroke(0).unwrap();
+        assert!(keystroke.is_none(), "no pending keystroke events");
+        // Invalid index fails.
+        let result = xinput.get_keystroke(4);
+        assert!(result.is_err(), "invalid index must fail");
+    }
+
+    #[test]
+    fn xinput_enable_toggles_processing() {
+        let mut xinput = XInputManager::new();
+        assert!(xinput.enabled, "XInput processing starts enabled");
+        xinput.set_enabled(false);
+        assert!(!xinput.enabled, "XInputEnable(false) disables processing");
+        xinput.set_enabled(true);
+        assert!(xinput.enabled, "XInputEnable(true) re-enables processing");
     }
 
     // --- BCrypt Tests ---
