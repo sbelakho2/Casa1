@@ -100034,30 +100034,35 @@ mod tests {
 
     #[test]
     fn evidence_core_fiber_thunks_round_trip() {
-        let (mut runtime, _tmp) = test_runtime("evidence-core-fibers");
-        let mut memory = MemoryImage::default();
-        let convert_thread = runtime.alloc_host_thunk(HostThunk::ConvertThreadToFiber);
-        let switch_fiber = runtime.alloc_host_thunk(HostThunk::SwitchToFiber);
-        let convert_fiber = runtime.alloc_host_thunk(HostThunk::ConvertFiberToThread);
-        let delete_fiber = runtime.alloc_host_thunk(HostThunk::DeleteFiber);
+        // The merged dispatch match (2000+ HostThunk arms) has a debug-build
+        // stack frame larger than the default test-thread stack; run on the
+        // 8 MiB big-stack thread like the other dispatch-heavy tests.
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-core-fibers");
+            let mut memory = MemoryImage::default();
+            let convert_thread = runtime.alloc_host_thunk(HostThunk::ConvertThreadToFiber);
+            let switch_fiber = runtime.alloc_host_thunk(HostThunk::SwitchToFiber);
+            let convert_fiber = runtime.alloc_host_thunk(HostThunk::ConvertFiberToThread);
+            let delete_fiber = runtime.alloc_host_thunk(HostThunk::DeleteFiber);
 
-        // ConvertThreadToFiber mints the primary fiber handle and tracks it
-        // as the current fiber of this thread.
-        let primary = dispatch_x86_thunk(&mut runtime, &mut memory, convert_thread, &[]);
-        assert_ne!(primary, 0);
-        // Switching to the current fiber round-trips (the manager records
-        // the previous-fiber chain and the runtime saves/restores state).
-        dispatch_x86_thunk(&mut runtime, &mut memory, switch_fiber, &[primary as u32]);
-        assert_eq!(runtime.last_error, 0);
-        // ConvertFiberToThread detaches the current fiber.
-        assert_eq!(
-            dispatch_x86_thunk(&mut runtime, &mut memory, convert_fiber, &[]),
-            1
-        );
-        // DeleteFiber removes the current fiber (the thread-local tracker is
-        // cleared so a stale handle can never be saved into).
-        dispatch_x86_thunk(&mut runtime, &mut memory, delete_fiber, &[primary as u32]);
-        assert_eq!(runtime.last_error, 0);
+            // ConvertThreadToFiber mints the primary fiber handle and tracks it
+            // as the current fiber of this thread.
+            let primary = dispatch_x86_thunk(&mut runtime, &mut memory, convert_thread, &[]);
+            assert_ne!(primary, 0);
+            // Switching to the current fiber round-trips (the manager records
+            // the previous-fiber chain and the runtime saves/restores state).
+            dispatch_x86_thunk(&mut runtime, &mut memory, switch_fiber, &[primary as u32]);
+            assert_eq!(runtime.last_error, 0);
+            // ConvertFiberToThread detaches the current fiber.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, convert_fiber, &[]),
+                1
+            );
+            // DeleteFiber removes the current fiber (the thread-local tracker is
+            // cleared so a stale handle can never be saved into).
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_fiber, &[primary as u32]);
+            assert_eq!(runtime.last_error, 0);
+        })
     }
 
     #[test]
