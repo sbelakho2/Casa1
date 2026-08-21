@@ -6,7 +6,6 @@
 //! seeded from it, and the database is the project-wide compatibility
 //! accounting for DLL/export-keyed API completeness — not just Steam
 //! diagnostics.
-//!
 //! The database provides:
 //!
 //! - [`ApiEntry`] — per-(DLL, export, architecture, Windows version)
@@ -677,7 +676,8 @@ impl ApiDatabase {
     /// - The `Nt*` / interface skeletons are marked against what the runtime
     ///   actually dispatches (see the table documentation).
     /// - Finally [`ApiDatabase::apply_coverage_evidence`] merges the
-    ///   oracle-backed coverage registry ([`COVERAGE_EVIDENCE`]).
+    ///   coverage-evidence registry ([`COVERAGE_EVIDENCE`]) — differential
+    ///   oracle contracts, conformance suites, and subsystem scenarios.
     pub fn from_thunk_metadata() -> Self {
         let mut database = ApiDatabase::new();
 
@@ -727,14 +727,17 @@ impl ApiDatabase {
         database
     }
 
-    /// Merge the oracle-backed coverage evidence registry
-    /// ([`COVERAGE_EVIDENCE`]) into the database.
+    /// Merge the coverage-evidence registry ([`COVERAGE_EVIDENCE`]) into the
+    /// database.
     ///
     /// For every evidence row whose (DLL, export, arch, Windows version) key
     /// matches an entry, the entry's [`CoverageLevel`] takes the registry's
     /// level (the strongest applicable).  Evidence is never inferred from the
-    /// existence of a Rust test — each row names the actual
-    /// `windows-oracle:<category>` differential contract.
+    /// existence of a Rust test — each row names the actual contract behind
+    /// the level: a `windows-oracle:<category>` differential capture run on
+    /// real Windows, a `casa1-conformance:<suite>` suite that genuinely
+    /// exercises the API, or a `casa1-scenario:<suite>` subsystem scenario
+    /// test (see [`crate::api_coverage`] for the naming rules).
     pub fn apply_coverage_evidence(&mut self) {
         for row in COVERAGE_EVIDENCE {
             let matches: Vec<usize> = self

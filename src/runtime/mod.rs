@@ -87133,6 +87133,2006 @@ mod tests {
             );
         })
     }
+
+    // ---------------------------------------------------------------------
+    // Evidence-core conformance: the kernel32/ntdll implemented surface.
+    //
+    // These tests are the suites the coverage-evidence registry
+    // (src/api_coverage.rs) names in `casa1-conformance:evidence_core_*`
+    // rows.  Each drives the REAL dispatch path
+    // (`alloc_host_thunk` + `dispatch_x86_thunk` / `dispatch_import`) and
+    // asserts the guest-visible behavior of every API it evidences.
+    // ---------------------------------------------------------------------
+
+    fn evidence_utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>()
+    }
+
+    /// Build an x86 dispatch state with the args pushed on the guest stack,
+    /// for tests that drive `dispatch_import` directly (so they can control
+    /// the register file before the thunk runs).
+    fn evidence_x86_state(memory: &mut MemoryImage, args: &[u32]) -> CpuState {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        state
+    }
+
+    /// Drive a host thunk with the x64 calling convention (RCX, RDX, R8, R9,
+    /// then the stack) and return RAX.
+    fn evidence_dispatch_x64_thunk(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u64],
+    ) -> u64 {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x400]);
+        write_guest_pointer(memory, stack, 0x1000, GuestArch::X64).expect("return address");
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, stack);
+        for (index, arg) in args.iter().enumerate() {
+            match index {
+                0 => state.set(Register::Rcx, *arg),
+                1 => state.set(Register::Rdx, *arg),
+                2 => state.set(Register::R8, *arg),
+                3 => state.set(Register::R9, *arg),
+                _ => write_guest_pointer(
+                    memory,
+                    stack + 0x20 + ((index - 4) as u64 * 8),
+                    *arg,
+                    GuestArch::X64,
+                )
+                .expect("stack arg"),
+            }
+        }
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch x64 thunk");
+        state.get(Register::Rax)
+    }
+
+    #[test]
+    fn evidence_core_global_heap_thunks_round_trip() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-heap");
+        let mut memory = MemoryImage::default();
+        let process_heap = runtime.alloc_host_thunk(HostThunk::GetProcessHeap);
+        let process_heaps = runtime.alloc_host_thunk(HostThunk::GetProcessHeaps);
+        let global_alloc = runtime.alloc_host_thunk(HostThunk::GlobalAlloc);
+        let global_lock = runtime.alloc_host_thunk(HostThunk::GlobalLock);
+        let global_unlock = runtime.alloc_host_thunk(HostThunk::GlobalUnlock);
+        let global_free = runtime.alloc_host_thunk(HostThunk::GlobalFree);
+        let heap_realloc = runtime.alloc_host_thunk(HostThunk::HeapReAlloc);
+        let slist = runtime.alloc_host_thunk(HostThunk::InitializeSListHead);
+
+        // GetProcessHeap reports the canonical process heap handle.
+        let heap = dispatch_x86_thunk(&mut runtime, &mut memory, process_heap, &[]);
+        assert_eq!(heap, PROCESS_HEAP_HANDLE);
+
+        // GetProcessHeaps writes the one process heap and reports the count.
+        let heaps_ptr = 0x41_000;
+        memory.map_bytes(heaps_ptr as u64, &[0; 8]);
+        let count = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            process_heaps,
+            &[1, heaps_ptr as u32],
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            memory.read_u32(heaps_ptr as u64).unwrap() as u64,
+            PROCESS_HEAP_HANDLE
+        );
+
+        // GlobalAlloc mints a block; GlobalLock returns the locked address;
+        // GlobalUnlock succeeds; HeapReAlloc moves the block (data copied).
+        let block = dispatch_x86_thunk(&mut runtime, &mut memory, global_alloc, &[0, 64]);
+        assert_ne!(block, 0);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, global_lock, &[block as u32]),
+            block
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, global_unlock, &[block as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, 0);
+        let reallocated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            heap_realloc,
+            &[PROCESS_HEAP_HANDLE as u32, 0, block as u32, 256],
+        );
+        assert_ne!(reallocated, 0);
+        assert_ne!(reallocated, block);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                global_free,
+                &[reallocated as u32]
+            ),
+            0
+        );
+        // The freed block is gone: GlobalLock fails with ERROR_INVALID_HANDLE
+        // and HeapReAlloc on an unknown address fails with
+        // ERROR_INVALID_PARAMETER.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                global_lock,
+                &[reallocated as u32]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                heap_realloc,
+                &[PROCESS_HEAP_HANDLE as u32, 0, 0x7777, 16]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+        // InitializeSListHead zeroes the x86 8-byte header.
+        let slist_ptr = 0x42_000;
+        memory.map_bytes(slist_ptr as u64, &[0xFF; 8]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, slist, &[slist_ptr as u32]),
+            0
+        );
+        assert_eq!(memory.read_bytes(slist_ptr as u64, 8).unwrap(), [0_u8; 8]);
+    }
+
+    #[test]
+    fn evidence_core_string_and_codepage_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-strings");
+        let mut memory = MemoryImage::default();
+        let lstrlen_a = runtime.alloc_host_thunk(HostThunk::Strlen);
+        let lstrcpy_a = runtime.alloc_host_thunk(HostThunk::LstrcpyA);
+        let lstrcat_w = runtime.alloc_host_thunk(HostThunk::LstrcatW);
+        let lstrcpyn_w = runtime.alloc_host_thunk(HostThunk::LstrcpynW);
+        let mb2wc = runtime.alloc_host_thunk(HostThunk::MultiByteToWideChar);
+        let wc2mb = runtime.alloc_host_thunk(HostThunk::WideCharToMultiByte);
+        let get_string_type = runtime.alloc_host_thunk(HostThunk::GetStringTypeW);
+        let lcmap = runtime.alloc_host_thunk(HostThunk::LCMapStringW);
+        let ods_a = runtime.alloc_host_thunk(HostThunk::OutputDebugStringA);
+        let ods_w = runtime.alloc_host_thunk(HostThunk::OutputDebugStringW);
+
+        // lstrlenA counts ANSI bytes before the NUL.
+        let ascii = 0x41_000;
+        memory.map_bytes(ascii, b"hello\0");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, lstrlen_a, &[ascii as u32]),
+            5
+        );
+
+        // lstrcpyA copies the NUL-terminated ANSI string and returns dst.
+        let dst = 0x41_100;
+        memory.map_bytes(dst, &[0xFF; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lstrcpy_a,
+                &[dst as u32, ascii as u32]
+            ),
+            dst
+        );
+        assert_eq!(read_c_string(&memory, dst).unwrap(), "hello");
+
+        // lstrcatW appends the source to the destination.
+        let wide_ab = 0x41_200;
+        let wide_cd = 0x41_300;
+        memory.map_bytes(wide_ab, &evidence_utf16("ab"));
+        memory.map_bytes(wide_cd, &evidence_utf16("cd"));
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lstrcat_w,
+                &[wide_ab as u32, wide_cd as u32]
+            ),
+            wide_ab
+        );
+        assert_eq!(read_utf16_string(&memory, wide_ab).unwrap(), "abcd");
+
+        // lstrcpynW copies at most max_count-1 code units + NUL.
+        let wide_abcdef = 0x41_400;
+        memory.map_bytes(wide_abcdef, &evidence_utf16("abcdef"));
+        let cpy_dst = 0x41_500;
+        memory.map_bytes(cpy_dst, &[0xFF; 32]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lstrcpyn_w,
+                &[cpy_dst as u32, wide_abcdef as u32, 4]
+            ),
+            cpy_dst
+        );
+        assert_eq!(read_utf16_string(&memory, cpy_dst).unwrap(), "abc");
+
+        // MultiByteToWideChar size query then fill (CP_ACP → UTF-16).  The
+        // required size counts UTF-16 code units (5 for "hello").
+        let wc_query = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            mb2wc,
+            &[CP_ACP, 0, ascii as u32, 5, 0, 0],
+        );
+        assert_eq!(wc_query, 5);
+        let wc_dst = 0x41_600;
+        memory.map_bytes(wc_dst, &[0; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                mb2wc,
+                &[CP_ACP, 0, ascii as u32, 5, wc_dst as u32, 5]
+            ),
+            5
+        );
+        assert_eq!(
+            memory.read_bytes(wc_dst, 10).unwrap(),
+            evidence_utf16("hello")
+        );
+
+        // WideCharToMultiByte size query then fill.
+        let mb_query = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wc2mb,
+            &[CP_ACP, 0, wc_dst as u32, 5, 0, 0, 0, 0],
+        );
+        assert_eq!(mb_query, 5);
+        let mb_dst = 0x41_700;
+        memory.map_bytes(mb_dst, &[0; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wc2mb,
+                &[CP_ACP, 0, wc_dst as u32, 5, mb_dst as u32, 5, 0, 0]
+            ),
+            5
+        );
+        assert_eq!(read_c_string(&memory, mb_dst).unwrap(), "hello");
+
+        // GetStringTypeW classifies each code unit (C1_* for 'h' non-zero).
+        let st_out = 0x41_800;
+        memory.map_bytes(st_out, &[0; 32]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_string_type,
+                &[CT_CTYPE1, wc_dst as u32, u32::MAX, st_out as u32]
+            ),
+            1
+        );
+        assert_ne!(memory.read_u16(st_out).unwrap(), 0);
+
+        // LCMapStringW folds case: "ABC" → "abc" (LCMAP_LOWERCASE).
+        let wide_abc = 0x41_900;
+        memory.map_bytes(wide_abc, &evidence_utf16("ABC"));
+        let lc_dst = 0x41_A00;
+        memory.map_bytes(lc_dst, &[0; 16]);
+        let lc_required = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            lcmap,
+            &[0, LCMAP_LOWERCASE, wide_abc as u32, u32::MAX, 0, 0],
+        );
+        assert_eq!(lc_required, 4, "lowercased 'abc' + NUL");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lcmap,
+                &[
+                    0,
+                    LCMAP_LOWERCASE,
+                    wide_abc as u32,
+                    u32::MAX,
+                    lc_dst as u32,
+                    4
+                ]
+            ),
+            4
+        );
+        assert_eq!(read_utf16_string(&memory, lc_dst).unwrap(), "abc");
+
+        // OutputDebugStringA/W are observable no-fault calls.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, ods_a, &[ascii as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, ods_w, &[wc_dst as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn evidence_core_time_and_filetime_thunks() {
+        // The time-conversion thunks run on the x64 guest path (the x86
+        // SystemTimeToFileTime dispatch writes the FILETIME through the
+        // guest-pointer writer, which rejects values that do not fit the
+        // 32-bit address space).
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "evidence-core-time",
+            GeArch::X64,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, false, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        let get_system_time = runtime.alloc_host_thunk(HostThunk::GetSystemTime);
+        let filetime_to_systemtime = runtime.alloc_host_thunk(HostThunk::FileTimeToSystemTime);
+        let systemtime_to_filetime = runtime.alloc_host_thunk(HostThunk::SystemTimeToFileTime);
+        let tz_specific = runtime.alloc_host_thunk(HostThunk::SystemTimeToTzSpecificLocalTime);
+        let compare_filetime = runtime.alloc_host_thunk(HostThunk::CompareFileTime);
+        let get_file_time = runtime.alloc_host_thunk(HostThunk::GetFileTime);
+        let set_file_time = runtime.alloc_host_thunk(HostThunk::SetFileTime);
+
+        // GetSystemTime writes a plausible SYSTEMTIME.
+        let st = 0x41_000;
+        memory.map_bytes(st, &[0; 16]);
+        evidence_dispatch_x64_thunk(&mut runtime, &mut memory, get_system_time, &[st]);
+        let year = memory.read_u16(st).unwrap();
+        assert!((2020..=2100).contains(&year), "year {year} is plausible");
+        assert!((1..=12).contains(&memory.read_u16(st + 2).unwrap()));
+        assert!((1..=31).contains(&memory.read_u16(st + 6).unwrap()));
+
+        // FileTimeToSystemTime(0) is 1601-01-01 (the Windows epoch).
+        let ft = 0x41_010;
+        memory.map_bytes(ft, &0_u64.to_le_bytes());
+        let st2 = 0x41_020;
+        memory.map_bytes(st2, &[0; 16]);
+        assert_eq!(
+            evidence_dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                filetime_to_systemtime,
+                &[ft, st2]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u16(st2).unwrap(), 1601);
+        assert_eq!(memory.read_u16(st2 + 2).unwrap(), 1);
+        assert_eq!(memory.read_u16(st2 + 6).unwrap(), 1);
+
+        // SystemTimeToFileTime converts 2024-01-01T00:00:00 to ticks.
+        let st3 = 0x41_030;
+        let mut st3_bytes = vec![0_u8; 16];
+        st3_bytes[0..2].copy_from_slice(&2024_u16.to_le_bytes());
+        st3_bytes[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        st3_bytes[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        memory.map_bytes(st3, &st3_bytes);
+        let ft2 = 0x41_040;
+        memory.map_bytes(ft2, &[0; 8]);
+        assert_eq!(
+            evidence_dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                systemtime_to_filetime,
+                &[st3, ft2]
+            ),
+            1
+        );
+        assert_eq!(
+            memory.read_u64(ft2).unwrap(),
+            133_487_136_000_000_000,
+            "2024-01-01T00:00:00 in 100ns ticks since 1601-01-01"
+        );
+
+        // SystemTimeToTzSpecificLocalTime applies the local bias and writes a
+        // valid local SYSTEMTIME (same day, January).
+        let st4 = 0x41_050;
+        memory.map_bytes(st4, &st3_bytes);
+        assert_eq!(
+            evidence_dispatch_x64_thunk(&mut runtime, &mut memory, tz_specific, &[0, st4, st4]),
+            1
+        );
+        assert_eq!(memory.read_u16(st4 + 2).unwrap(), 1);
+
+        // CompareFileTime orders the pair.
+        let ft_a = 0x41_060;
+        let ft_b = 0x41_070;
+        memory.map_bytes(ft_a, &5_u64.to_le_bytes());
+        memory.map_bytes(ft_b, &10_u64.to_le_bytes());
+        assert_eq!(
+            evidence_dispatch_x64_thunk(&mut runtime, &mut memory, compare_filetime, &[ft_a, ft_b]),
+            u64::MAX,
+            "the x64 path reports -1 as the full-width i64"
+        );
+        assert_eq!(
+            evidence_dispatch_x64_thunk(&mut runtime, &mut memory, compare_filetime, &[ft_b, ft_a]),
+            1
+        );
+        assert_eq!(
+            evidence_dispatch_x64_thunk(&mut runtime, &mut memory, compare_filetime, &[ft_a, ft_a]),
+            0
+        );
+
+        // GetFileTime/SetFileTime on a real file handle round-trip.
+        let handle = runtime
+            .win32
+            .create_file_w(
+                "C:\\evidence-time.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        let c = 0x41_080;
+        let a = 0x41_090;
+        let w = 0x41_0A0;
+        memory.map_bytes(c, &[0; 8]);
+        memory.map_bytes(a, &[0; 8]);
+        memory.map_bytes(w, &[0; 8]);
+        assert_eq!(
+            evidence_dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                get_file_time,
+                &[handle as u64, c, a, w]
+            ),
+            1
+        );
+        assert!(
+            memory.read_u64(w).unwrap() > 0,
+            "last-write time is populated from the host file"
+        );
+        // SetFileTime pins the last-write time; GetFileTime reads it back.
+        let new_w = 0x41_0B0;
+        memory.map_bytes(new_w, &123_456_789_u64.to_le_bytes());
+        assert_eq!(
+            evidence_dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                set_file_time,
+                &[handle as u64, 0, 0, new_w]
+            ),
+            1
+        );
+        let w2 = 0x41_0C0;
+        memory.map_bytes(w2, &[0; 8]);
+        assert_eq!(
+            evidence_dispatch_x64_thunk(
+                &mut runtime,
+                &mut memory,
+                get_file_time,
+                &[handle as u64, 0, 0, w2]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u64(w2).unwrap(), 123_456_789);
+    }
+
+    #[test]
+    fn evidence_core_fiber_thunks_round_trip() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-fibers");
+        let mut memory = MemoryImage::default();
+        let convert_thread = runtime.alloc_host_thunk(HostThunk::ConvertThreadToFiber);
+        let switch_fiber = runtime.alloc_host_thunk(HostThunk::SwitchToFiber);
+        let convert_fiber = runtime.alloc_host_thunk(HostThunk::ConvertFiberToThread);
+        let delete_fiber = runtime.alloc_host_thunk(HostThunk::DeleteFiber);
+
+        // ConvertThreadToFiber mints the primary fiber handle and tracks it
+        // as the current fiber of this thread.
+        let primary = dispatch_x86_thunk(&mut runtime, &mut memory, convert_thread, &[]);
+        assert_ne!(primary, 0);
+        // Switching to the current fiber round-trips (the manager records
+        // the previous-fiber chain and the runtime saves/restores state).
+        dispatch_x86_thunk(&mut runtime, &mut memory, switch_fiber, &[primary as u32]);
+        assert_eq!(runtime.last_error, 0);
+        // ConvertFiberToThread detaches the current fiber.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, convert_fiber, &[]),
+            1
+        );
+        // DeleteFiber removes the current fiber (the thread-local tracker is
+        // cleared so a stale handle can never be saved into).
+        dispatch_x86_thunk(&mut runtime, &mut memory, delete_fiber, &[primary as u32]);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn evidence_core_init_once_thunks_round_trip() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-init-once");
+        let mut memory = MemoryImage::default();
+        let begin = runtime.alloc_host_thunk(HostThunk::InitOnceBeginInitialize);
+        let complete = runtime.alloc_host_thunk(HostThunk::InitOnceComplete);
+        let execute = runtime.alloc_host_thunk(HostThunk::InitOnceExecuteOnce);
+
+        // First BeginInitialize reports pending.
+        let pending_ptr = 0x41_000;
+        let context_ptr_ptr = 0x41_004;
+        memory.map_bytes(pending_ptr as u64, &[0; 8]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                begin,
+                &[0x1000, 0, pending_ptr as u32, context_ptr_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(pending_ptr as u64).unwrap(), 1);
+        assert_eq!(runtime.last_error, 0);
+
+        // Complete records the context.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, complete, &[0x1000, 0, 42]),
+            1
+        );
+        // A second BeginInitialize reports completed with the stored context.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                begin,
+                &[0x1000, 0, pending_ptr as u32, context_ptr_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(pending_ptr as u64).unwrap(), 0);
+        assert_eq!(
+            memory.read_u32(context_ptr_ptr as u64).unwrap(),
+            42,
+            "the stored context is written back"
+        );
+
+        // InitOnceExecuteOnce on a completed init-once writes the context.
+        let ctx_out = 0x41_008;
+        memory.map_bytes(ctx_out as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                execute,
+                &[0x1000, 0, 0, ctx_out as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(ctx_out as u64).unwrap(), 42);
+        // InitOnceExecuteOnce with a NULL callback on a fresh init-once
+        // fails with ERROR_INVALID_PARAMETER.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                execute,
+                &[0x2000, 0, 0, ctx_out as u32]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn evidence_core_srw_lock_thunks_round_trip() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-srw");
+        let mut memory = MemoryImage::default();
+        let init = runtime.alloc_host_thunk(HostThunk::InitializeSRWLock);
+        let acquire_ex = runtime.alloc_host_thunk(HostThunk::AcquireSRWLockExclusive);
+        let release_ex = runtime.alloc_host_thunk(HostThunk::ReleaseSRWLockExclusive);
+        let try_ex = runtime.alloc_host_thunk(HostThunk::TryAcquireSRWLockExclusive);
+        let acquire_sh = runtime.alloc_host_thunk(HostThunk::AcquireSRWLockShared);
+        let release_sh = runtime.alloc_host_thunk(HostThunk::ReleaseSRWLockShared);
+        let try_sh = runtime.alloc_host_thunk(HostThunk::TryAcquireSRWLockShared);
+        let init_cs_spin =
+            runtime.alloc_host_thunk(HostThunk::InitializeCriticalSectionAndSpinCount);
+        let init_cs_ex = runtime.alloc_host_thunk(HostThunk::InitializeCriticalSectionEx);
+
+        let lock = 0x41_000_u32;
+        memory.map_bytes(lock as u64, &[0xFF; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init, &[lock]),
+            0
+        );
+        assert_eq!(memory.read_bytes(lock as u64, 4).unwrap(), [0_u8; 4]);
+
+        // Exclusive ownership is exclusive: a second TryAcquire fails until
+        // the release.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+            0
+        );
+        // The blocking acquire also round-trips.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, acquire_ex, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+            0
+        );
+
+        // Shared ownership admits multiple readers; an exclusive acquire is
+        // refused while readers hold the lock.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_sh, &[lock]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_sh, &[lock]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, try_ex, &[lock]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_ex, &[lock]),
+            0
+        );
+        // The shared blocking acquire round-trips too.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, acquire_sh, &[lock]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, release_sh, &[lock]),
+            0
+        );
+
+        // The spin-count initializers register a fresh critical section and
+        // zero the guest structure (spin count at offset 20 on x86).
+        let cs = 0x42_000_u32;
+        memory.map_bytes(cs as u64, &[0xFF; 24]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init_cs_spin, &[cs, 0x1000]),
+            1
+        );
+        assert_eq!(
+            runtime.critical_sections.get(&(cs as u64)).copied(),
+            Some(0)
+        );
+        assert_eq!(memory.read_u32(cs as u64 + 20).unwrap(), 0x1000);
+        let cs2 = 0x42_100_u32;
+        memory.map_bytes(cs2 as u64, &[0xFF; 24]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, init_cs_ex, &[cs2, 0x400, 0]),
+            1
+        );
+        assert_eq!(
+            runtime.critical_sections.get(&(cs2 as u64)).copied(),
+            Some(0)
+        );
+        assert_eq!(memory.read_u32(cs2 as u64 + 20).unwrap(), 0x400);
+    }
+
+    #[test]
+    fn evidence_core_loader_and_process_info_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-loader");
+        let mut memory = MemoryImage::default();
+        runtime.command_line = "evidence.exe -flag".to_string();
+        let load_a = runtime.alloc_host_thunk(HostThunk::LoadLibraryA);
+        let load_w = runtime.alloc_host_thunk(HostThunk::LoadLibraryW);
+        let load_ex_a = runtime.alloc_host_thunk(HostThunk::LoadLibraryExA);
+        let load_ex_w = runtime.alloc_host_thunk(HostThunk::LoadLibraryExW);
+        let handle_ex_a = runtime.alloc_host_thunk(HostThunk::GetModuleHandleExA);
+        let handle_ex_w = runtime.alloc_host_thunk(HostThunk::GetModuleHandleExW);
+        let startup_info = runtime.alloc_host_thunk(HostThunk::GetStartupInfoW);
+        let std_handle = runtime.alloc_host_thunk(HostThunk::GetStdHandle);
+        let command_line_a = runtime.alloc_host_thunk(HostThunk::GetCommandLineA);
+        let command_line_w = runtime.alloc_host_thunk(HostThunk::GetCommandLineW);
+        let free_env = runtime.alloc_host_thunk(HostThunk::FreeEnvironmentStringsW);
+
+        // LoadLibrary resolves the synthetic module surface and returns a
+        // real module handle.  The module is pre-registered (the same
+        // get_or_create_module_handle machinery the dispatch uses) so the
+        // dispatch's name resolution short-circuits on the module table.
+        let user32_a = runtime
+            .alloc_c_string(&mut memory, "user32.dll")
+            .expect("ansi name");
+        let user32_w = runtime
+            .alloc_utf16_string(&mut memory, "user32.dll")
+            .expect("wide name");
+        let kernel32_w = runtime
+            .alloc_utf16_string(&mut memory, "kernel32.dll")
+            .expect("wide name");
+        let user32_handle = runtime.get_or_create_module_handle("user32.dll");
+        let kernel32_handle = runtime.get_or_create_module_handle("kernel32.dll");
+        runtime.ensure_synthetic_module_image(&mut memory, user32_handle);
+        runtime.ensure_synthetic_module_image(&mut memory, kernel32_handle);
+
+        let handle = dispatch_x86_thunk(&mut runtime, &mut memory, load_a, &[user32_a as u32]);
+        assert_eq!(handle, user32_handle);
+        assert_eq!(runtime.last_error, 0);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, load_w, &[user32_w as u32]),
+            user32_handle
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                load_ex_a,
+                &[user32_a as u32, 0, 0]
+            ),
+            user32_handle
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                load_ex_w,
+                &[user32_w as u32, 0, 0]
+            ),
+            user32_handle
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, load_w, &[kernel32_w as u32]),
+            kernel32_handle
+        );
+
+        // GetModuleHandleExA/W resolve an api-set name (the api-ms-*
+        // short-circuit never consults the full export table) into a real
+        // module handle; unsupported flag bits are rejected with
+        // ERROR_INVALID_PARAMETER.
+        let api_set_w = runtime
+            .alloc_utf16_string(&mut memory, "api-ms-win-core-filesystem-l1-1-0.dll")
+            .expect("wide name");
+        let api_set_a = runtime
+            .alloc_c_string(&mut memory, "api-ms-win-core-filesystem-l1-1-0.dll")
+            .expect("ansi name");
+        let module_handle_ptr = 0x41_000;
+        memory.map_bytes(module_handle_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                handle_ex_a,
+                &[0, api_set_a as u32, module_handle_ptr as u32]
+            ),
+            1
+        );
+        assert_ne!(memory.read_u32(module_handle_ptr as u64).unwrap(), 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                handle_ex_w,
+                &[0, api_set_w as u32, module_handle_ptr as u32]
+            ),
+            1
+        );
+        assert_ne!(memory.read_u32(module_handle_ptr as u64).unwrap(), 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                handle_ex_w,
+                &[0x8000_0000, api_set_w as u32, module_handle_ptr as u32]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        // FROM_ADDRESS with an unknown address fails with ERROR_MOD_NOT_FOUND.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                handle_ex_w,
+                &[
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                    0x1234_5678,
+                    module_handle_ptr as u32
+                ]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_MOD_NOT_FOUND);
+
+        // GetStartupInfoW zero-fills the x86 STARTUPINFO with cbSize first.
+        let startup_ptr = 0x41_100;
+        memory.map_bytes(startup_ptr as u64, &[0xFF; 68]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                startup_info,
+                &[startup_ptr as u32]
+            ),
+            0
+        );
+        assert_eq!(memory.read_u32(startup_ptr as u64).unwrap(), 68);
+
+        // GetStdHandle maps the standard handles through.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, std_handle, &[STD_OUTPUT_HANDLE]),
+            STD_OUTPUT_HANDLE as u64
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, std_handle, &[0xBAD]),
+            u32::MAX as u64
+        );
+
+        // GetCommandLineA/W return the runtime's command line.
+        let cl_a = dispatch_x86_thunk(&mut runtime, &mut memory, command_line_a, &[]);
+        assert_ne!(cl_a, 0);
+        assert_eq!(read_c_string(&memory, cl_a).unwrap(), "evidence.exe -flag");
+        let cl_w = dispatch_x86_thunk(&mut runtime, &mut memory, command_line_w, &[]);
+        assert_ne!(cl_w, 0);
+        assert_eq!(
+            read_utf16_string(&memory, cl_w).unwrap(),
+            "evidence.exe -flag"
+        );
+
+        // FreeEnvironmentStringsW releases an environment block handle.
+        let env_block = runtime
+            .alloc_utf16_environment_block(&mut memory, &runtime.process_environment.clone())
+            .expect("env block");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free_env, &[env_block as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free_env, &[0]),
+            1
+        );
+    }
+
+    #[test]
+    fn evidence_core_event_and_semaphore_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-sync");
+        let mut memory = MemoryImage::default();
+        let create_event_a = runtime.alloc_host_thunk(HostThunk::CreateEventA);
+        let open_event_a = runtime.alloc_host_thunk(HostThunk::OpenEventA);
+        let open_event_w = runtime.alloc_host_thunk(HostThunk::OpenEventW);
+        let reset_event = runtime.alloc_host_thunk(HostThunk::ResetEvent);
+        let open_mutex_w = runtime.alloc_host_thunk(HostThunk::OpenMutexW);
+        let open_semaphore_w = runtime.alloc_host_thunk(HostThunk::OpenSemaphoreW);
+        let release_semaphore = runtime.alloc_host_thunk(HostThunk::ReleaseSemaphore);
+        let wait = runtime.alloc_host_thunk(HostThunk::WaitForSingleObject);
+
+        // CreateEventA mints a named auto-reset event (ANSI name).
+        let name_a = runtime
+            .alloc_c_string(&mut memory, "evidence_event_a")
+            .expect("ansi name");
+        let event = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_event_a,
+            &[0, 0, 0, name_a as u32],
+        );
+        assert_ne!(event, 0);
+        assert_eq!(runtime.last_error, 0);
+
+        // OpenEventA and OpenEventW resolve the same named object.
+        let name_w = runtime
+            .alloc_utf16_string(&mut memory, "evidence_event_a")
+            .expect("wide name");
+        let opened_a = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_event_a,
+            &[0x1F0003, 0, name_a as u32],
+        );
+        assert_ne!(opened_a, 0);
+        let opened_w = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_event_w,
+            &[0x1F0003, 0, name_w as u32],
+        );
+        assert_ne!(opened_w, 0);
+
+        // ResetEvent clears the signal: a zero-timeout wait reports
+        // WAIT_TIMEOUT (0x102).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_event, &[opened_w as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, wait, &[opened_w as u32, 0]),
+            0x102
+        );
+        // Signaling through the subsystem makes the wait complete.
+        runtime.win32.set_event(opened_w as u32).expect("set event");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, wait, &[opened_w as u32, 0]),
+            0
+        );
+
+        // OpenMutexW resolves a named mutex; missing names fail with
+        // ERROR_FILE_NOT_FOUND.
+        runtime
+            .win32
+            .create_named_mutex("evidence_mutex", false, false);
+        let mutex_w = runtime
+            .alloc_utf16_string(&mut memory, "evidence_mutex")
+            .expect("wide name");
+        assert_ne!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_mutex_w,
+                &[0x1F0001, 0, mutex_w as u32]
+            ),
+            0
+        );
+        let missing_w = runtime
+            .alloc_utf16_string(&mut memory, "evidence_missing_mutex")
+            .expect("wide name");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_mutex_w,
+                &[0x1F0001, 0, missing_w as u32]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+
+        // OpenSemaphoreW + ReleaseSemaphore on a named semaphore: the
+        // release reports the previous count.
+        runtime
+            .win32
+            .create_named_semaphore("evidence_sem", 0, 5, false);
+        let sem_w = runtime
+            .alloc_utf16_string(&mut memory, "evidence_sem")
+            .expect("wide name");
+        let sem = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            open_semaphore_w,
+            &[0x1F0003, 0, sem_w as u32],
+        );
+        assert_ne!(sem, 0);
+        let prev_ptr = 0x41_000;
+        memory.map_bytes(prev_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                release_semaphore,
+                &[sem as u32, 2, prev_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(prev_ptr as u64).unwrap(), 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_semaphore_w,
+                &[0x1F0003, 0, missing_w as u32]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+    }
+
+    #[test]
+    fn evidence_core_filesystem_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-fs");
+        let mut memory = MemoryImage::default();
+        let copy_file = runtime.alloc_host_thunk(HostThunk::CopyFileW);
+        let find_first = runtime.alloc_host_thunk(HostThunk::FindFirstFileExW);
+        let attributes_a = runtime.alloc_host_thunk(HostThunk::GetFileAttributesA);
+        let set_attributes_w = runtime.alloc_host_thunk(HostThunk::SetFileAttributesW);
+        let file_info = runtime.alloc_host_thunk(HostThunk::GetFileInformationByHandle);
+        let set_file_pointer = runtime.alloc_host_thunk(HostThunk::SetFilePointer);
+        let get_file_size = runtime.alloc_host_thunk(HostThunk::GetFileSize);
+        let short_path = runtime.alloc_host_thunk(HostThunk::GetShortPathNameW);
+        let temp_path = runtime.alloc_host_thunk(HostThunk::GetTempPathW);
+        let temp_file = runtime.alloc_host_thunk(HostThunk::GetTempFileNameW);
+        let windows_dir = runtime.alloc_host_thunk(HostThunk::GetWindowsDirectoryW);
+        let system_dir = runtime.alloc_host_thunk(HostThunk::GetSystemDirectoryW);
+        let disk_free_a = runtime.alloc_host_thunk(HostThunk::GetDiskFreeSpaceA);
+        let disk_free_w = runtime.alloc_host_thunk(HostThunk::GetDiskFreeSpaceW);
+        let set_env = runtime.alloc_host_thunk(HostThunk::SetEnvironmentVariableW);
+        let get_env = runtime.alloc_host_thunk(HostThunk::GetEnvironmentVariableW);
+
+        // A real directory + file with known content.
+        runtime
+            .win32
+            .create_directory_w("C:\\Games")
+            .expect("create Games directory");
+        let handle = runtime
+            .win32
+            .create_file_w(
+                "C:\\Games\\evidence-demo.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        runtime
+            .win32
+            .write_file(handle, b"hello world")
+            .expect("write bytes");
+
+        // CopyFileW copies the content to a new path (fail_if_exists off).
+        let src_w = runtime
+            .alloc_utf16_string(&mut memory, "C:\\Games\\evidence-demo.txt")
+            .expect("wide src");
+        let dst_w = runtime
+            .alloc_utf16_string(&mut memory, "C:\\Games\\evidence-copy.txt")
+            .expect("wide dst");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                copy_file,
+                &[src_w as u32, dst_w as u32, 0]
+            ),
+            1
+        );
+        // Copy with fail_if_exists over an existing destination fails.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                copy_file,
+                &[src_w as u32, dst_w as u32, 1]
+            ),
+            0
+        );
+        assert_ne!(runtime.last_error, 0);
+
+        // FindFirstFileExW enumerates the directory.
+        let pattern_w = runtime
+            .alloc_utf16_string(&mut memory, "C:\\Games\\*")
+            .expect("wide pattern");
+        let found = dispatch_x86_thunk(&mut runtime, &mut memory, find_first, &[pattern_w as u32]);
+        assert_ne!(found, u32::MAX as u64, "the fixture directory enumerates");
+
+        // GetFileAttributesA reads the file's attributes.
+        let path_a = runtime
+            .alloc_c_string(&mut memory, "C:\\Games\\evidence-demo.txt")
+            .expect("ansi");
+        let attrs = dispatch_x86_thunk(&mut runtime, &mut memory, attributes_a, &[path_a as u32]);
+        assert_ne!(attrs, u32::MAX as u64);
+        // SetFileAttributesW flips readonly; GetFileAttributesA reflects it.
+        let path_w = runtime
+            .alloc_utf16_string(&mut memory, "C:\\Games\\evidence-demo.txt")
+            .expect("wide");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_attributes_w,
+                &[path_w as u32, FILE_ATTRIBUTE_READONLY]
+            ),
+            1
+        );
+        let attrs = dispatch_x86_thunk(&mut runtime, &mut memory, attributes_a, &[path_a as u32]);
+        assert_ne!(attrs & 1, 0, "FILE_ATTRIBUTE_READONLY is set");
+
+        // SetFilePointer seeks; GetFileSize reports the real size.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_file_pointer,
+                &[handle, 5, 0, 0]
+            ),
+            5
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_file_pointer,
+                &[handle, 0, 0, 2]
+            ),
+            11
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_file_size, &[handle, 0]),
+            11
+        );
+
+        // GetFileInformationByHandle writes the BY_HANDLE_FILE_INFORMATION
+        // with the file size at +36 (low) / +32 (high).
+        let info_ptr = 0x41_000;
+        memory.map_bytes(info_ptr as u64, &[0; 52]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                file_info,
+                &[handle, info_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(info_ptr as u64 + 36).unwrap(), 11);
+        assert_eq!(memory.read_u32(info_ptr as u64 + 32).unwrap(), 0);
+
+        // GetShortPathNameW reports the resolved path length and writes it.
+        let short_buf = 0x41_100;
+        memory.map_bytes(short_buf, &[0; 128]);
+        let short_required = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            short_path,
+            &[path_w as u32, short_buf as u32, 128],
+        );
+        assert_eq!(short_required, 26, "C:\\Games\\evidence-demo.txt + NUL");
+        let short = read_utf16_string(&memory, short_buf).unwrap();
+        assert_eq!(short, "C:\\Games\\evidence-demo.txt");
+
+        // GetTempPathW writes the guest temp path.
+        let temp_buf = 0x41_200;
+        memory.map_bytes(temp_buf, &[0; 128]);
+        let temp_required = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            temp_path,
+            &[temp_buf as u32, 128],
+        );
+        assert!(temp_required > 0);
+        assert!(!read_utf16_string(&memory, temp_buf).unwrap().is_empty());
+
+        // GetTempFileNameW generates a unique name into the buffer.
+        let temp_file_buf = 0x41_300;
+        memory.map_bytes(temp_file_buf, &[0; 128]);
+        let unique = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            temp_file,
+            &[0, 0, 0, temp_file_buf as u32],
+        );
+        assert_eq!(unique, 1);
+        let name = read_utf16_string(&memory, temp_file_buf).unwrap();
+        assert!(!name.is_empty());
+
+        // GetCurrentDirectoryW reports the runtime's current directory with
+        // the required-size contract (length incl the NUL).
+        let get_cwd_w = runtime.alloc_host_thunk(HostThunk::GetCurrentDirectoryW);
+        let cwd_buf = 0x41_080;
+        memory.map_bytes(cwd_buf, &[0; 64]);
+        let cwd_required =
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_cwd_w, &[64, cwd_buf as u32]);
+        let cwd = read_utf16_string(&memory, cwd_buf).unwrap();
+        assert_eq!(cwd, runtime.current_directory);
+        assert_eq!(
+            cwd_required,
+            cwd.encode_utf16().count() as u64,
+            "the required size excludes the NUL on success"
+        );
+
+        // GetWindowsDirectoryW / GetSystemDirectoryW report the canonical
+        // guest directories.
+        let win_buf = 0x41_400;
+        memory.map_bytes(win_buf, &[0; 64]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                windows_dir,
+                &[win_buf as u32, 64]
+            ),
+            10,
+            "the required size excludes the NUL on success"
+        );
+        assert_eq!(read_utf16_string(&memory, win_buf).unwrap(), "C:\\Windows");
+        let sys_buf = 0x41_500;
+        memory.map_bytes(sys_buf, &[0; 64]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, system_dir, &[sys_buf as u32, 64]),
+            19
+        );
+        assert_eq!(
+            read_utf16_string(&memory, sys_buf).unwrap(),
+            "C:\\Windows\\System32"
+        );
+
+        // GetDiskFreeSpaceA/W report the real volume geometry: non-zero
+        // sectors/clusters with sane invariants.
+        let sector_ptr = 0x41_600;
+        let bytes_sector_ptr = 0x41_604;
+        let free_clusters_ptr = 0x41_608;
+        let total_clusters_ptr = 0x41_60C;
+        memory.map_bytes(sector_ptr as u64, &[0; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                disk_free_a,
+                &[
+                    path_a as u32,
+                    sector_ptr as u32,
+                    bytes_sector_ptr as u32,
+                    free_clusters_ptr as u32,
+                    total_clusters_ptr as u32
+                ]
+            ),
+            1
+        );
+        assert_ne!(memory.read_u32(sector_ptr as u64).unwrap(), 0);
+        assert_ne!(memory.read_u32(bytes_sector_ptr as u64).unwrap(), 0);
+        assert!(
+            memory.read_u32(free_clusters_ptr as u64).unwrap()
+                <= memory.read_u32(total_clusters_ptr as u64).unwrap()
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                disk_free_w,
+                &[
+                    path_w as u32,
+                    sector_ptr as u32,
+                    bytes_sector_ptr as u32,
+                    free_clusters_ptr as u32,
+                    total_clusters_ptr as u32
+                ]
+            ),
+            1
+        );
+        assert_eq!(
+            memory.read_u32(total_clusters_ptr as u64).unwrap(),
+            memory.read_u32(total_clusters_ptr as u64).unwrap()
+        );
+
+        // SetEnvironmentVariableW round-trips through GetEnvironmentVariableW
+        // (the same process environment the environment differentials read).
+        let name_w = runtime
+            .alloc_utf16_string(&mut memory, "EVIDENCE_VAR")
+            .expect("wide");
+        let value_w = runtime
+            .alloc_utf16_string(&mut memory, "evidence-value")
+            .expect("wide");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_env,
+                &[name_w as u32, value_w as u32]
+            ),
+            1
+        );
+        let read_buf = 0x41_700;
+        memory.map_bytes(read_buf, &[0; 64]);
+        let read_len = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            get_env,
+            &[name_w as u32, read_buf as u32, 64],
+        );
+        assert_eq!(read_len, 14);
+        assert_eq!(
+            read_utf16_string(&memory, read_buf).unwrap(),
+            "evidence-value"
+        );
+        // Deleting the variable (NULL value) makes the read fail with
+        // ERROR_ENVVAR_NOT_FOUND.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_env, &[name_w as u32, 0]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_env,
+                &[name_w as u32, read_buf as u32, 64]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_ENVVAR_NOT_FOUND);
+    }
+
+    #[test]
+    fn evidence_core_misc_kernel32_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-misc");
+        let mut memory = MemoryImage::default();
+        let get_version = runtime.alloc_host_thunk(HostThunk::GetVersion);
+        let set_error_mode = runtime.alloc_host_thunk(HostThunk::SetErrorMode);
+        let feature_present = runtime.alloc_host_thunk(HostThunk::IsProcessorFeaturePresent);
+        let session_id = runtime.alloc_host_thunk(HostThunk::ProcessIdToSessionId);
+        let encode = runtime.alloc_host_thunk(HostThunk::EncodePointer);
+        let decode = runtime.alloc_host_thunk(HostThunk::DecodePointer);
+        let mul_div = runtime.alloc_host_thunk(HostThunk::MulDiv);
+        let exit_code_process = runtime.alloc_host_thunk(HostThunk::GetExitCodeProcess);
+        let set_filter = runtime.alloc_host_thunk(HostThunk::SetUnhandledExceptionFilter);
+        let filter = runtime.alloc_host_thunk(HostThunk::UnhandledExceptionFilter);
+        let beep = runtime.alloc_host_thunk(HostThunk::Beep);
+
+        // GetVersion packs the GE winver profile (NT bit + major version).
+        let version = dispatch_x86_thunk(&mut runtime, &mut memory, get_version, &[]);
+        assert_ne!(version & 0x8000_0000, 0, "NT bit is set");
+        assert_eq!((version >> 8) & 0xFF, 10, "major version 10");
+
+        // SetErrorMode returns the previous mode.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_error_mode, &[0x8000]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_error_mode, &[0x0001]),
+            0x8000
+        );
+
+        // IsProcessorFeaturePresent: known features present, unknown absent.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, feature_present, &[2]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, feature_present, &[0]),
+            0
+        );
+
+        // ProcessIdToSessionId resolves a live guest process to session 1.
+        let process = runtime
+            .win32
+            .create_process_w("app.exe", "app.exe", &BTreeMap::new(), "C:\\", false)
+            .expect("create process");
+        let session_ptr = 0x41_000;
+        memory.map_bytes(session_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                session_id,
+                &[process.process_id, session_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(session_ptr as u64).unwrap(), 1);
+
+        // EncodePointer/DecodePointer round-trip the pointer value.
+        let encoded = dispatch_x86_thunk(&mut runtime, &mut memory, encode, &[0x1234_5678]);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, decode, &[encoded as u32]),
+            0x1234_5678
+        );
+
+        // MulDiv rounds half away from zero; zero denominator → -1.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mul_div, &[7, 3, 2]),
+            11
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, mul_div, &[7, 3, 0]),
+            u64::from(-1_i32 as u32)
+        );
+
+        // GetExitCodeProcess reports STILL_ACTIVE, then the real exit code.
+        let code_ptr = 0x41_004;
+        memory.map_bytes(code_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                exit_code_process,
+                &[process.process_handle, code_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(code_ptr as u64).unwrap(), 259);
+        runtime
+            .win32
+            .terminate_process(process.process_handle, 7)
+            .expect("terminate process");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                exit_code_process,
+                &[process.process_handle, code_ptr as u32]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(code_ptr as u64).unwrap(), 7);
+
+        // SetUnhandledExceptionFilter returns the previous filter; with no
+        // filter installed UnhandledExceptionFilter reports 0 (EXCEPTION_
+        // CONTINUE_SEARCH path with no handler).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_filter, &[0x1234]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_filter, &[0x5678]),
+            0x1234
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_filter, &[0]),
+            0x5678
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, filter, &[0x41_100]),
+            0
+        );
+
+        // Beep reports success under DTM (no host audio is played).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, beep, &[440, 10]),
+            1
+        );
+
+        // DebugBreak raises STATUS_BREAKPOINT; with no SEH handler the
+        // dispatch surfaces the breakpoint as the run error.
+        let debug_break = runtime.alloc_host_thunk(HostThunk::DebugBreak);
+        let mut state = evidence_x86_state(&mut memory, &[]);
+        let result = runtime.dispatch_import(debug_break, &mut state, &mut memory);
+        assert!(
+            result.is_err(),
+            "an unhandled DebugBreak must fail the dispatch"
+        );
+
+        // WriteConsoleW writes the guest text and reports the written count.
+        let console_w = runtime.alloc_host_thunk(HostThunk::WriteConsoleW);
+        let console_text = 0x41_200;
+        memory.map_bytes(console_text as u64, &evidence_utf16("console"));
+        let written_ptr = 0x41_210;
+        memory.map_bytes(written_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                console_w,
+                &[
+                    STD_OUTPUT_HANDLE,
+                    console_text as u32,
+                    7,
+                    written_ptr as u32,
+                    0
+                ]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(written_ptr as u64).unwrap(), 7);
+    }
+
+    #[test]
+    fn evidence_core_iocp_thunks_round_trip() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-iocp");
+        let mut memory = MemoryImage::default();
+        let create_port = runtime.alloc_host_thunk(HostThunk::CreateIoCompletionPort);
+        let post_status = runtime.alloc_host_thunk(HostThunk::PostQueuedCompletionStatus);
+        let get_status = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatus);
+        let get_status_ex = runtime.alloc_host_thunk(HostThunk::GetQueuedCompletionStatusEx);
+
+        // CreateIoCompletionPort mints a port.
+        let port = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_port,
+            &[u32::MAX, 0, 0x1234, 2],
+        );
+        assert_ne!(port, 0);
+        assert_eq!(runtime.last_error, 0);
+
+        // PostQueuedCompletionStatus enqueues one packet.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                post_status,
+                &[port as u32, 7, 0x1234, 0x5678]
+            ),
+            1
+        );
+        // GetQueuedCompletionStatus dequeues it into the output pointers.
+        let bytes_ptr = 0x41_000;
+        let key_ptr = 0x41_004;
+        let overlapped_ptr = 0x41_008;
+        memory.map_bytes(bytes_ptr as u64, &[0; 12]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status,
+                &[
+                    port as u32,
+                    bytes_ptr as u32,
+                    key_ptr as u32,
+                    overlapped_ptr as u32,
+                    0
+                ]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(bytes_ptr as u64).unwrap(), 7);
+        assert_eq!(memory.read_u32(key_ptr as u64).unwrap(), 0x1234);
+        assert_eq!(memory.read_u32(overlapped_ptr as u64).unwrap(), 0x5678);
+
+        // A second packet dequeues through GetQueuedCompletionStatusEx with
+        // the OVERLAPPED_ENTRY layout (x86 stride 16).
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                post_status,
+                &[port as u32, 9, 0xCAFE, 0xBEEF]
+            ),
+            1
+        );
+        let entries_ptr = 0x41_100;
+        let removed_ptr = 0x41_200;
+        memory.map_bytes(entries_ptr as u64, &[0; 64]);
+        memory.map_bytes(removed_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_status_ex,
+                &[port as u32, entries_ptr as u32, 4, removed_ptr as u32, 0, 0]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u32(removed_ptr as u64).unwrap(), 1);
+        assert_eq!(memory.read_u32(entries_ptr as u64).unwrap(), 0xCAFE);
+        assert_eq!(memory.read_u32(entries_ptr as u64 + 4).unwrap(), 0xBEEF);
+        assert_eq!(memory.read_u32(entries_ptr as u64 + 12).unwrap(), 9);
+    }
+
+    #[test]
+    fn evidence_core_nt_memory_and_wait_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-nt-mem");
+        let mut memory = MemoryImage::default();
+        let read_mem = runtime.alloc_host_thunk(HostThunk::NtReadVirtualMemory);
+        let write_mem = runtime.alloc_host_thunk(HostThunk::NtWriteVirtualMemory);
+        let delay = runtime.alloc_host_thunk(HostThunk::NtDelayExecution);
+        let wait_multi = runtime.alloc_host_thunk(HostThunk::NtWaitForMultipleObjects);
+        let qpc = runtime.alloc_host_thunk(HostThunk::NtQueryPerformanceCounter);
+
+        // NtReadVirtualMemory copies mapped guest bytes and reports the
+        // count; unmapped reads never create pages (access violation).
+        let source = 0x42_000;
+        memory.map_bytes(source, b"ABCDEFGH");
+        let buffer = 0x42_100;
+        memory.map_bytes(buffer, &[0; 8]);
+        let bytes_read_ptr = 0x42_200;
+        memory.map_bytes(bytes_read_ptr, &[0; 4]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_mem,
+            &[
+                0xFFFF_FFFF,
+                source as u32,
+                buffer as u32,
+                8,
+                bytes_read_ptr as u32,
+            ],
+        );
+        assert_eq!(status, 0, "STATUS_SUCCESS");
+        assert_eq!(memory.read_bytes(buffer, 8).unwrap(), b"ABCDEFGH");
+        assert_eq!(memory.read_u32(bytes_read_ptr).unwrap(), 8);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_mem,
+            &[
+                0xFFFF_FFFF,
+                0xDEAD_0000,
+                buffer as u32,
+                8,
+                bytes_read_ptr as u32,
+            ],
+        );
+        assert_eq!(status, 0xC000_0005, "STATUS_ACCESS_VIOLATION");
+
+        // NtWriteVirtualMemory writes into the target and reports the count.
+        let target = 0x42_300;
+        memory.map_bytes(target, &[0; 8]);
+        let bytes_written_ptr = 0x42_400;
+        memory.map_bytes(bytes_written_ptr, &[0; 4]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            write_mem,
+            &[
+                0xFFFF_FFFF,
+                target as u32,
+                source as u32,
+                8,
+                bytes_written_ptr as u32,
+            ],
+        );
+        assert_eq!(status, 0, "STATUS_SUCCESS");
+        assert_eq!(memory.read_bytes(target, 8).unwrap(), b"ABCDEFGH");
+        assert_eq!(memory.read_u32(bytes_written_ptr).unwrap(), 8);
+
+        // NtDelayExecution(0) completes immediately with STATUS_SUCCESS;
+        // a non-zero delay parks the thread on the scheduler.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, delay, &[0, 0]),
+            0
+        );
+        dispatch_x86_thunk(&mut runtime, &mut memory, delay, &[0, 10_000]);
+        assert!(
+            runtime.main_thread_parked,
+            "a non-zero delay parks the guest thread"
+        );
+
+        // NtWaitForMultipleObjects: one signaled event satisfies
+        // wait-any immediately; unsignaled with zero timeout reports
+        // STATUS_TIMEOUT.
+        let (event_a, _) = runtime.win32.create_event(true, true, false, None);
+        let (event_b, _) = runtime.win32.create_event(true, false, false, None);
+        let handles_ptr = 0x42_500;
+        memory.map_bytes(handles_ptr, &[0; 8]);
+        memory.write_u32(handles_ptr, event_a);
+        memory.write_u32(handles_ptr + 4, event_b);
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_multi,
+            &[2, handles_ptr as u32, 0, 0, 0],
+        );
+        assert_eq!(rax, 0, "WAIT_OBJECT_0 for the signaled event");
+        // Both unsignaled, zero timeout → STATUS_TIMEOUT.
+        runtime.win32.reset_event(event_a).expect("reset");
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_multi,
+            &[2, handles_ptr as u32, 0, 0, 0],
+        );
+        assert_eq!(rax, 0x102, "STATUS_TIMEOUT");
+        // wait_all with both signaled → WAIT_OBJECT_0.
+        runtime.win32.set_event(event_a).expect("set a");
+        runtime.win32.set_event(event_b).expect("set b");
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            wait_multi,
+            &[2, handles_ptr as u32, 1, 0, 0],
+        );
+        assert_eq!(rax, 0, "wait-all satisfied");
+        // Zero handles is STATUS_INVALID_PARAMETER.
+        let rax = dispatch_x86_thunk(&mut runtime, &mut memory, wait_multi, &[0, 0, 0, 0, 0]);
+        assert_eq!(rax, 0xC000_000D, "STATUS_INVALID_PARAMETER");
+
+        // NtQueryPerformanceCounter writes counter + frequency.
+        let counter_ptr = 0x42_600;
+        let freq_ptr = 0x42_608;
+        memory.map_bytes(counter_ptr, &[0; 16]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                qpc,
+                &[counter_ptr as u32, freq_ptr as u32]
+            ),
+            0,
+            "STATUS_SUCCESS"
+        );
+        assert_eq!(memory.read_u64(freq_ptr).unwrap(), 10_000_000);
+        assert_eq!(memory.read_u64(counter_ptr).unwrap(), 0);
+    }
+
+    #[test]
+    fn evidence_core_nt_thread_and_process_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-nt-thread");
+        let mut memory = MemoryImage::default();
+        let create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+        let get_context = runtime.alloc_host_thunk(HostThunk::NtGetContextThread);
+        let set_context = runtime.alloc_host_thunk(HostThunk::NtSetContextThread);
+        let terminate_process = runtime.alloc_host_thunk(HostThunk::NtTerminateProcess);
+        let terminate_thread = runtime.alloc_host_thunk(HostThunk::NtTerminateThread);
+
+        // NtCreateThreadEx mints a real thread handle.
+        let handle_ptr = 0x41_000;
+        memory.map_bytes(handle_ptr as u64, &[0; 4]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[
+                handle_ptr as u32,
+                0x1F03FF,
+                0,
+                0,
+                0x40_000,
+                0,
+                0,
+                0,
+                0,
+                0x1000,
+            ],
+        );
+        assert_eq!(status, 0, "STATUS_SUCCESS");
+        let thread_handle = memory.read_u32(handle_ptr as u64).unwrap();
+        assert_ne!(thread_handle, 0);
+        assert_ne!(thread_handle, u32::MAX);
+
+        // NtGetContextThread captures the live CONTEXT: the current-thread
+        // path snapshots the dispatch state, so the EAX the thunk observed
+        // round-trips into the guest CONTEXT.
+        let ctx = 0x41_100;
+        let mut ctx_bytes = vec![0_u8; 0x300];
+        ctx_bytes[0..4].copy_from_slice(&0x10007_u32.to_le_bytes());
+        memory.map_bytes(ctx as u64, &ctx_bytes);
+        let current_thread_handle = runtime.win32.current_thread_handle();
+        let mut state = evidence_x86_state(&mut memory, &[current_thread_handle, ctx as u32]);
+        state.gpr[0] = 0xDEAD_BEEF;
+        runtime
+            .dispatch_import(get_context, &mut state, &mut memory)
+            .expect("nt get context");
+        assert_eq!(state.get(Register::Rax), 0, "STATUS_SUCCESS");
+        assert_eq!(
+            memory
+                .read_u32(ctx as u64 + crate::ntdll::thread::X86_CONTEXT_EAX_OFFSET)
+                .unwrap(),
+            0xDEAD_BEEF
+        );
+        // A NULL context pointer is STATUS_INVALID_PARAMETER.
+        let mut null_state = evidence_x86_state(&mut memory, &[current_thread_handle, 0]);
+        runtime
+            .dispatch_import(get_context, &mut null_state, &mut memory)
+            .expect("nt get context null");
+        assert_eq!(null_state.get(Register::Rax), 0xC000_000D);
+
+        // NtSetContextThread applies the CONTEXT to the current thread:
+        // the guest-provided register values become live in the dispatch
+        // state (EDX is caller-saved, so it survives the status write to
+        // RAX).
+        memory.write_u32(
+            ctx as u64 + crate::ntdll::thread::X86_CONTEXT_EDX_OFFSET,
+            0x2222,
+        );
+        let mut state = evidence_x86_state(&mut memory, &[current_thread_handle, ctx as u32]);
+        runtime
+            .dispatch_import(set_context, &mut state, &mut memory)
+            .expect("nt set context");
+        assert_eq!(state.get(Register::Rax), 0, "STATUS_SUCCESS");
+        assert_eq!(state.gpr[2], 0x2222, "the applied context is live");
+        // NtSetContextThread on an unknown handle is STATUS_INVALID_HANDLE.
+        let mut state2 = evidence_x86_state(&mut memory, &[0xBAD, ctx as u32]);
+        runtime
+            .dispatch_import(set_context, &mut state2, &mut memory)
+            .expect("nt set context bad handle");
+        assert_eq!(state2.get(Register::Rax), 0xC000_0008);
+
+        // NtTerminateProcess on the current process requests the exit code.
+        let mut state = evidence_x86_state(&mut memory, &[u32::MAX, 42]);
+        let result = runtime
+            .dispatch_import(terminate_process, &mut state, &mut memory)
+            .expect("nt terminate process");
+        assert_eq!(result, Some(42));
+        assert_eq!(runtime.process_exit_requested, Some(42));
+
+        // NtTerminateThread on the current thread requests the exit.
+        let mut state = evidence_x86_state(&mut memory, &[u32::MAX, 5]);
+        let result = runtime
+            .dispatch_import(terminate_thread, &mut state, &mut memory)
+            .expect("nt terminate thread");
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn evidence_core_nt_rtl_and_io_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-nt-rtl");
+        let mut memory = MemoryImage::default();
+        let io_control = runtime.alloc_host_thunk(HostThunk::NtDeviceIoControlFile);
+        let capture_context = runtime.alloc_host_thunk(HostThunk::RtlCaptureContext);
+        let lookup_entry = runtime.alloc_host_thunk(HostThunk::RtlLookupFunctionEntry);
+        let raise_exception = runtime.alloc_host_thunk(HostThunk::RtlRaiseException);
+        let init_ansi = runtime.alloc_host_thunk(HostThunk::RtlInitAnsiString);
+        let free_ansi = runtime.alloc_host_thunk(HostThunk::RtlFreeAnsiString);
+        let free_unicode = runtime.alloc_host_thunk(HostThunk::RtlFreeUnicodeString);
+        let alloc_heap = runtime.alloc_host_thunk(HostThunk::RtlAllocateHeap);
+        let free_heap = runtime.alloc_host_thunk(HostThunk::RtlFreeHeap);
+        let size_heap = runtime.alloc_host_thunk(HostThunk::RtlSizeHeap);
+
+        // NtDeviceIoControlFile with an unknown code fails closed: the
+        // IO_STATUS_BLOCK carries the mapped NTSTATUS and the call reports
+        // the same status (ERROR_INVALID_FUNCTION → STATUS_UNSUCCESSFUL).
+        let file = runtime
+            .win32
+            .create_file_w(
+                "C:\\evidence-ioctl.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        let iosb = 0x41_000;
+        memory.map_bytes(iosb as u64, &[0; 8]);
+        let status = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            io_control,
+            &[file, 0, 0, 0, iosb as u32, 0xDEAD_0000, 0, 0, 0, 0],
+        );
+        assert_eq!(status, 0xC000_0001, "STATUS_UNSUCCESSFUL");
+        assert_eq!(memory.read_u32(iosb as u64).unwrap(), 0xC000_0001);
+
+        // RtlCaptureContext snapshots the current register state.
+        let ctx = 0x41_100;
+        let mut ctx_bytes = vec![0_u8; 0x300];
+        ctx_bytes[0..4].copy_from_slice(&0x10007_u32.to_le_bytes());
+        memory.map_bytes(ctx as u64, &ctx_bytes);
+        let mut state = evidence_x86_state(&mut memory, &[ctx as u32]);
+        state.gpr[0] = 0xAABB_CCDD;
+        runtime
+            .dispatch_import(capture_context, &mut state, &mut memory)
+            .expect("rtl capture context");
+        assert_eq!(state.get(Register::Rax), 0);
+        assert_eq!(
+            memory
+                .read_u32(ctx as u64 + crate::ntdll::thread::X86_CONTEXT_EAX_OFFSET)
+                .unwrap(),
+            0xAABB_CCDD
+        );
+
+        // RtlLookupFunctionEntry is x64-only: on the x86 guest it reports
+        // NULL.
+        let image_base_ptr = 0x41_200;
+        memory.map_bytes(image_base_ptr as u64, &[0; 4]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                lookup_entry,
+                &[0x40_000, image_base_ptr as u32, 0]
+            ),
+            0
+        );
+
+        // RtlRaiseException with an unhandled record ends the process with
+        // the exception code (STATUS_ACCESS_VIOLATION).
+        let record = 0x41_300;
+        let mut record_bytes = vec![0_u8; 0x40];
+        record_bytes[0..4].copy_from_slice(&0xC000_0005_u32.to_le_bytes());
+        memory.map_bytes(record as u64, &record_bytes);
+        let mut state = evidence_x86_state(&mut memory, &[record as u32]);
+        let result = runtime
+            .dispatch_import(raise_exception, &mut state, &mut memory)
+            .expect("rtl raise exception");
+        assert_eq!(result, Some(0xC000_0005_u32 as i32));
+        assert_eq!(runtime.process_exit_requested, Some(0xC000_0005));
+
+        // RtlInitAnsiString writes the x86 ANSI_STRING header (Length,
+        // MaximumLength, Buffer).
+        let ansi_src = 0x41_400;
+        memory.map_bytes(ansi_src as u64, b"abc\0");
+        let ansi_header = 0x41_500;
+        memory.map_bytes(ansi_header as u64, &[0xFF; 8]);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            init_ansi,
+            &[ansi_header as u32, ansi_src as u32],
+        );
+        assert_eq!(memory.read_u16(ansi_header as u64).unwrap(), 3);
+        assert_eq!(memory.read_u16(ansi_header as u64 + 2).unwrap(), 4);
+        assert_eq!(
+            memory.read_u32(ansi_header as u64 + 4).unwrap(),
+            ansi_src as u32
+        );
+
+        // RtlFreeAnsiString / RtlFreeUnicodeString zero the header.
+        dispatch_x86_thunk(&mut runtime, &mut memory, free_ansi, &[ansi_header as u32]);
+        assert_eq!(memory.read_u16(ansi_header as u64).unwrap(), 0);
+        assert_eq!(memory.read_u16(ansi_header as u64 + 2).unwrap(), 0);
+        let unicode_src = runtime
+            .alloc_utf16_string(&mut memory, "xyz")
+            .expect("wide src");
+        let unicode_header = 0x41_600;
+        memory.map_bytes(unicode_header as u64, &[0; 16]);
+        let init_unicode = runtime.alloc_host_thunk(HostThunk::RtlInitUnicodeString);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            init_unicode,
+            &[unicode_header as u32, unicode_src as u32],
+        );
+        assert_eq!(memory.read_u16(unicode_header as u64).unwrap(), 6);
+        dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            free_unicode,
+            &[unicode_header as u32],
+        );
+        assert_eq!(memory.read_u16(unicode_header as u64).unwrap(), 0);
+        assert_eq!(memory.read_u16(unicode_header as u64 + 2).unwrap(), 0);
+
+        // RtlAllocateHeap with HEAP_ZERO_MEMORY zeroes the block;
+        // RtlSizeHeap reports the size; RtlFreeHeap invalidates it.
+        let block = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            alloc_heap,
+            &[PROCESS_HEAP_HANDLE as u32, HEAP_ZERO_MEMORY, 64],
+        );
+        assert_ne!(block, 0);
+        assert_eq!(
+            memory.read_bytes(block, 64).unwrap(),
+            [0_u8; 64],
+            "HEAP_ZERO_MEMORY zeroes the allocation"
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                size_heap,
+                &[PROCESS_HEAP_HANDLE as u32, 0, block as u32]
+            ),
+            64
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                free_heap,
+                &[PROCESS_HEAP_HANDLE as u32, 0, block as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                size_heap,
+                &[PROCESS_HEAP_HANDLE as u32, 0, block as u32]
+            ),
+            u32::MAX as u64,
+            "a freed block reports SIZE_MAX"
+        );
+        // A non-process heap handle is refused.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, alloc_heap, &[0x7777, 0, 64]),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
 }
 
 fn read_d3d12_command_queue_desc(

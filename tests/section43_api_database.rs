@@ -809,9 +809,10 @@ fn report_generator_emits_expected_json_shape() {
         implemented + partial + stub + unsupported,
         "level counts must sum to the DLL total"
     );
-    // The oracle-backed coverage registry seeds Differential coverage for the
-    // kernel32 contracts (CreateFileW, VirtualAlloc, ...): the seeded
-    // database must carry them.
+    // The coverage registry seeds Differential coverage for the kernel32
+    // oracle contracts (CreateFileW, VirtualAlloc, ...) and Conformance
+    // coverage for the suite-evidenced APIs: the seeded database must carry
+    // both.
     assert!(
         summary["differential_tested"]
             .as_u64()
@@ -819,11 +820,12 @@ fn report_generator_emits_expected_json_shape() {
             > 0,
         "the coverage registry must promote oracle-covered kernel32 APIs to Differential"
     );
-    assert_eq!(
+    assert!(
         summary["conformance_tested"]
             .as_u64()
-            .expect("conformance_tested"),
-        0
+            .expect("conformance_tested")
+            > 0,
+        "the coverage registry must promote suite-evidenced kernel32 APIs to Conformance"
     );
 
     // The gate section carries both gate results with counts.
@@ -982,7 +984,6 @@ fn coverage_registry_maps_create_file_w_to_differential_oracle_evidence() {
     .expect("CreateFileW evidence");
     assert_eq!(evidence.level, CoverageLevel::Differential);
     assert_eq!(evidence.evidence_id, "windows-oracle:file_sharing");
-
     // The seeded database carries the registry's level.
     let database = ApiDatabase::from_thunk_metadata();
     let create_file = database
@@ -1025,6 +1026,100 @@ fn coverage_registry_maps_create_file_w_to_differential_oracle_evidence() {
             .expect("evidence");
         assert_eq!(evidence.evidence_id, evidence_id);
     }
+}
+
+#[test]
+fn coverage_registry_maps_suite_evidenced_apis_to_conformance_levels() {
+    // Suite-backed evidence rows (casa1-conformance:<suite>) resolve to
+    // CoverageLevel::Conformance and merge into the seeded database.
+    for (dll, export, evidence_id) in [
+        (
+            "kernel32.dll",
+            "CreateProcessW",
+            "casa1-conformance:section29",
+        ),
+        (
+            "kernel32.dll",
+            "GetSystemInfo",
+            "casa1-conformance:section50",
+        ),
+        (
+            "kernel32.dll",
+            "GetTickCount",
+            "casa1-conformance:section50",
+        ),
+        ("kernel32.dll", "CloseHandle", "casa1-conformance:section38"),
+        ("ntdll.dll", "LdrLoadDll", "casa1-conformance:section48"),
+        ("ntdll.dll", "NtCreateEvent", "casa1-conformance:section47"),
+        ("ntdll.dll", "NtSetEvent", "casa1-conformance:section47"),
+        (
+            "ntdll.dll",
+            "NtQuerySystemTime",
+            "casa1-conformance:section50",
+        ),
+        (
+            "ntdll.dll",
+            "NtAllocateVirtualMemory",
+            "casa1-conformance:section47",
+        ),
+        (
+            "kernel32.dll",
+            "GetCurrentDirectoryA",
+            "casa1-conformance:runtime_unit",
+        ),
+        (
+            "kernel32.dll",
+            "ReleaseSemaphore",
+            "casa1-conformance:evidence_core_event_and_semaphore_thunks",
+        ),
+    ] {
+        let evidence = coverage_evidence_for(dll, export, ArchSet::Any, WindowsVersion::Any)
+            .unwrap_or_else(|| panic!("{dll}!{export} must have conformance evidence"));
+        assert_eq!(
+            evidence.level,
+            CoverageLevel::Conformance,
+            "{dll}!{export} must carry the conformance level"
+        );
+        assert_eq!(evidence.evidence_id, evidence_id);
+    }
+
+    // The seeded database carries the registry's Conformance level.
+    let database = ApiDatabase::from_thunk_metadata();
+    for (dll, export) in [
+        ("kernel32.dll", "CreateProcessW"),
+        ("kernel32.dll", "GetSystemInfo"),
+        ("kernel32.dll", "GetTickCount"),
+        ("kernel32.dll", "CloseHandle"),
+        ("kernel32.dll", "GetCurrentDirectoryA"),
+        ("kernel32.dll", "ReleaseSemaphore"),
+        ("ntdll.dll", "LdrLoadDll"),
+        ("ntdll.dll", "NtCreateEvent"),
+        ("ntdll.dll", "NtQuerySystemTime"),
+    ] {
+        let entry = database
+            .lookup(dll, export)
+            .unwrap_or_else(|| panic!("{dll}!{export} must be seeded"));
+        assert_eq!(
+            entry.semantic_test_coverage,
+            CoverageLevel::Conformance,
+            "{dll}!{export} must carry the conformance-suite level"
+        );
+    }
+}
+
+#[test]
+fn coverage_registry_merges_conformance_only_where_suite_evidence_exists() {
+    // APIs with no evidence row keep CoverageLevel::None in the seeded
+    // database (an honest violation, never an inferred one).
+    let database = ApiDatabase::from_thunk_metadata();
+    let entry = database
+        .lookup("kernel32.dll", "FindResourceA")
+        .expect("FindResourceA entry");
+    assert_eq!(
+        entry.semantic_test_coverage,
+        CoverageLevel::None,
+        "no evidence row exists for FindResourceA"
+    );
 }
 
 // ---------------------------------------------------------------------------

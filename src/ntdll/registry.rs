@@ -738,4 +738,47 @@ mod tests {
             Err(STATUS_OBJECT_NAME_NOT_FOUND)
         );
     }
+
+    #[test]
+    fn evidence_core_nt_enumerate_value_key_lists_values_in_order() {
+        let (_tmp, mut win32) = setup();
+        let (handle, _) = nt_create_key(
+            &mut win32,
+            HKEY_CURRENT_USER,
+            "Software\\Casa1NtEnumVals",
+            0x20019,
+            true,
+        )
+        .expect("create key");
+        let mut data = "v"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect::<Vec<_>>();
+        data.extend_from_slice(&0u16.to_le_bytes());
+        nt_set_value_key(&win32, handle, "zeta", REG_SZ, &data);
+        nt_set_value_key(&win32, handle, "alpha", REG_SZ, &data);
+        nt_set_value_key(&win32, handle, "mid", REG_SZ, &data);
+
+        let mut found = Vec::new();
+        for index in 0..8 {
+            match nt_enumerate_value_key(&win32, handle, index) {
+                Ok(name) => found.push(name),
+                Err(STATUS_NO_MORE_ENTRIES) => break,
+                Err(other) => panic!("enumerate value failed: {other}"),
+            }
+        }
+        assert_eq!(
+            found,
+            vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()],
+            "the values enumerate in the store's sorted order"
+        );
+        assert_eq!(
+            nt_enumerate_value_key(&win32, handle, 99),
+            Err(STATUS_NO_MORE_ENTRIES)
+        );
+        assert_eq!(
+            nt_enumerate_value_key(&win32, 0xBAD, 0),
+            Err(STATUS_INVALID_HANDLE)
+        );
+    }
 }
