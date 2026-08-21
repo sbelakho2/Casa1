@@ -1874,6 +1874,50 @@ mod tests {
     }
 
     #[test]
+    fn evidence_core_fiber_manager_create_switch_delete() {
+        // Evidence for the CreateFiber/SwitchToFiber/DeleteFiber thunks:
+        // the runtime's dispatch arms are thin wrappers over this manager,
+        // so these assertions pin the guest-visible fiber semantics.
+        let mut mgr = GuestFiberManager::new();
+        let primary = mgr.convert_thread_to_fiber();
+        assert_ne!(primary, 0);
+        assert_eq!(mgr.current_fiber(), Some(primary));
+
+        // CreateFiber allocates a real guard-page-protected stack and
+        // records the guest start address + parameter.
+        let fiber = mgr.create_fiber(64 * 1024, 0x0040_1000, 0xDEAD_BEEF);
+        assert_ne!(fiber, 0);
+        assert_ne!(fiber, primary);
+        let context = mgr.get_fiber(fiber).expect("fiber context");
+        assert!(context.stack_allocation.is_some(), "a stack is allocated");
+        assert_eq!(context.start_address, 0x0040_1000);
+        assert_eq!(context.parameter, 0xDEAD_BEEF);
+        assert!(!context.is_executing);
+        let stack_limit = context.stack_limit;
+        let stack_base = context.stack_base;
+        assert!(stack_base > stack_limit, "stack grows down from the base");
+
+        // SwitchToFiber marks the target executing, records the previous
+        // fiber, and moves the thread-local current-fiber tracker.
+        let switched = mgr.switch_to(fiber).expect("switch");
+        assert_eq!(switched, (primary as u32, fiber as u32));
+        assert_eq!(mgr.current_fiber(), Some(fiber));
+        assert!(mgr.get_fiber(fiber).expect("target").is_executing);
+        assert!(!mgr.get_fiber(primary).expect("primary").is_executing);
+        assert_eq!(
+            mgr.get_fiber(fiber).expect("target").previous_fiber,
+            Some(primary as u32),
+            "the fiber records the fiber that ran before it"
+        );
+
+        // DeleteFiber removes the fiber and its stack; the deleted fiber is
+        // gone from the registry and a stale switch target is refused.
+        mgr.delete_fiber(fiber);
+        assert!(mgr.get_fiber(fiber).is_none(), "fiber is deleted");
+        assert!(mgr.switch_to(fiber).is_none(), "stale target is refused");
+    }
+
+    #[test]
     fn guest_mutex_recursive_acquire() {
         let mutex = GuestMutex::new();
         assert!(mutex.try_acquire(1));
