@@ -916,7 +916,7 @@ fn pkcs7_unpad(data: &[u8], block_size: usize) -> Option<Vec<u8>> {
 
 /// AES-CBC through the shared `aes`/`cbc` machinery (16-byte blocks).
 fn aes_cbc(key: &[u8], iv: &[u8; 8], data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
-    use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
     type Aes128Cbc = cbc::Encryptor<aes::Aes128>;
     type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
     type Aes256Cbc = cbc::Encryptor<aes::Aes256>;
@@ -926,17 +926,17 @@ fn aes_cbc(key: &[u8], iv: &[u8; 8], data: &[u8], encrypt: bool) -> Option<Vec<u
     let result = match key.len() {
         16 if encrypt => Aes128Cbc::new_from_slices(key, &iv_full)
             .ok()?
-            .encrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data),
+            .encrypt_padded_vec_mut::<cipher::block_padding::NoPadding>(data),
         16 => Aes128CbcDec::new_from_slices(key, &iv_full)
             .ok()?
-            .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data)
+            .decrypt_padded_vec_mut::<cipher::block_padding::NoPadding>(data)
             .ok()?,
         32 if encrypt => Aes256Cbc::new_from_slices(key, &iv_full)
             .ok()?
-            .encrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data),
+            .encrypt_padded_vec_mut::<cipher::block_padding::NoPadding>(data),
         32 => Aes256CbcDec::new_from_slices(key, &iv_full)
             .ok()?
-            .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data)
+            .decrypt_padded_vec_mut::<cipher::block_padding::NoPadding>(data)
             .ok()?,
         _ => return None,
     };
