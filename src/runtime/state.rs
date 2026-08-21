@@ -28,6 +28,29 @@ pub(crate) struct CrtFileState {
     pub(crate) update: bool,
 }
 
+/// Host-side state behind an msvcp140 `_Mtx_*` mutex.  The guest handle is an
+/// opaque pointer (heap block), so all synchronization state lives here.
+#[derive(Debug, Clone)]
+pub(crate) struct MsvcpMtxState {
+    /// `_Mtx_plain` (0x10000), `_Mtx_recursive` (0x10001) or `_Mtx_timed`
+    /// (0x10002).
+    pub(crate) kind: u32,
+    /// Thread id of the current owner (0 when unlocked).
+    pub(crate) owner: u32,
+    /// Recursive acquisition depth (1 when held once).
+    pub(crate) depth: u32,
+}
+
+impl MsvcpMtxState {
+    pub(crate) fn new(kind: u32) -> Self {
+        Self {
+            kind,
+            owner: 0,
+            depth: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuestObjectKind {
     XAudio2Engine,
@@ -516,6 +539,13 @@ pub(crate) struct PeHostRuntime {
     pub(crate) critical_sections: BTreeMap<u64, usize>,
     pub(crate) condition_variables: BTreeMap<u64, GuestConditionVariable>,
     pub(crate) srw_locks: BTreeMap<u64, Arc<GuestSRWLock>>,
+    // ── Patch 6c: msvcp140.dll C++ runtime state ─────────────────────────────
+    /// Host state for the msvcp140 `_Mtx_*` mutexes, keyed by the opaque
+    /// handle returned to the guest (`_Mtx_t` is an opaque pointer).
+    pub(crate) msvcp_mtxes: BTreeMap<u64, MsvcpMtxState>,
+    /// Host state for the msvcp140 `_Cnd_*` condition variables, keyed by the
+    /// opaque handle returned to the guest (`_Cnd_t` is an opaque pointer).
+    pub(crate) msvcp_cnds: BTreeMap<u64, Arc<GuestConditionVariable>>,
     pub(crate) apc_queues: BTreeMap<u64, GuestApcQueue>,
     pub(crate) timer_queue: GuestTimerQueue,
     /// Shared work queue for timer expirations (filled by background threads,
@@ -1173,6 +1203,8 @@ impl PeHostRuntime {
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),
+            msvcp_mtxes: BTreeMap::new(),
+            msvcp_cnds: BTreeMap::new(),
             apc_queues: BTreeMap::new(),
             timer_queue: GuestTimerQueue::new(),
             timer_work_sink: Arc::new(Mutex::new(VecDeque::new())),
