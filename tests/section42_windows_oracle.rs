@@ -1025,35 +1025,45 @@ fn cpu_flags_runtime_executor_matches_the_known_x86_truth_table() {
 /// the unmapped-address query — all with session-relative addresses.
 #[test]
 fn virtual_memory_corpus_is_the_documented_session_sequence() {
-    let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
-    let operations: Vec<String> = vectors
-        .iter()
-        .map(|vector| {
-            vector.input["operation"]
-                .as_str()
-                .expect("operation")
-                .to_string()
+    // Oracle sessions dispatch the Nt* thunk surface, whose debug-build
+    // dispatch frame overflows libtest's default 2 MiB test-thread stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
+            let operations: Vec<String> = vectors
+                .iter()
+                .map(|vector| {
+                    vector.input["operation"]
+                        .as_str()
+                        .expect("operation")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                operations,
+                [
+                    "reserve", "query", "commit", "protect", "decommit", "release", "commit",
+                    "query",
+                ]
+            );
+            assert_eq!(vectors[0].input["address"], serde_json::json!(0));
+            assert_eq!(vectors[0].input["size"], serde_json::json!(0x4000));
+            assert_eq!(
+                vectors[0].input["allocation_type"],
+                serde_json::json!(0x2000)
+            );
+            // The failures and the unmapped-address probes sit outside the session.
+            assert_eq!(vectors[5].input["free_type"], serde_json::json!(0x8000));
+            assert!(vectors[5].input["size"].as_u64().expect("size") != 0);
+            for vector in &vectors {
+                let result = casa1::windows_oracle::compute_runtime_result(vector);
+                assert!(result.output["state"].is_number(), "{}", vector.id);
+            }
         })
-        .collect();
-    assert_eq!(
-        operations,
-        [
-            "reserve", "query", "commit", "protect", "decommit", "release", "commit", "query",
-        ]
-    );
-    assert_eq!(vectors[0].input["address"], serde_json::json!(0));
-    assert_eq!(vectors[0].input["size"], serde_json::json!(0x4000));
-    assert_eq!(
-        vectors[0].input["allocation_type"],
-        serde_json::json!(0x2000)
-    );
-    // The failures and the unmapped-address probes sit outside the session.
-    assert_eq!(vectors[5].input["free_type"], serde_json::json!(0x8000));
-    assert!(vectors[5].input["size"].as_u64().expect("size") != 0);
-    for vector in &vectors {
-        let result = casa1::windows_oracle::compute_runtime_result(vector);
-        assert!(result.output["state"].is_number(), "{}", vector.id);
-    }
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 /// The runtime vm executor drives the real pe_runtime VM thunk arms: the
@@ -1063,6 +1073,10 @@ fn virtual_memory_corpus_is_the_documented_session_sequence() {
 /// region-relative bases and sizes).
 #[test]
 fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
+    // Oracle sessions dispatch the Nt* thunk surface (big debug frame).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
     use casa1::windows_oracle::compute_runtime_result;
     let vectors = casa1::windows_oracle::generate_vectors(&["virtual_memory".to_string()]);
     let results: Vec<Value> = vectors
@@ -1116,6 +1130,11 @@ fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
             vector.id
         );
     }
+
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── evidence-expansion categories ───────────────────────────────────────────

@@ -1822,6 +1822,13 @@ mod tests {
     use super::*;
     use objc::Encode;
 
+    /// Serializes the HWND↔NSWindow association tests: they share the
+    /// process-global `HWND_TO_NSWINDOW` map, and the parallel libtest
+    /// harness can otherwise interleave `test_hwnd_association`'s
+    /// "map is fresh" assertions with `test_hwnd_association_multiple`'s
+    /// temporary hwnd-1 entry.
+    static ASSOCIATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Returns `true` if the current thread is the main thread.
     ///
     /// Tests that call AppKit-sensitive functions should guard with
@@ -1965,6 +1972,9 @@ mod tests {
 
     #[test]
     fn test_hwnd_association() {
+        let _serial = ASSOCIATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Fresh map should have nothing
         assert!(nswindow_for_hwnd(1).is_none());
         assert!(remove_hwnd_nswindow(1).is_none());
@@ -1989,6 +1999,9 @@ mod tests {
 
     #[test]
     fn test_hwnd_association_multiple() {
+        let _serial = ASSOCIATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ptr1: *mut std::ffi::c_void = 0x1000 as *mut _;
         let ptr2: *mut std::ffi::c_void = 0x2000 as *mut _;
         let ptr3: *mut std::ffi::c_void = 0x3000 as *mut _;
@@ -2014,6 +2027,9 @@ mod tests {
 
     #[test]
     fn test_hwnd_association_nonexistent() {
+        let _serial = ASSOCIATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(nswindow_for_hwnd(99999).is_none());
         assert!(remove_hwnd_nswindow(99999).is_none());
     }

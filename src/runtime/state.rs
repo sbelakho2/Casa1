@@ -682,6 +682,17 @@ pub(crate) struct PeHostRuntime {
     pub(crate) gdi_brushes: BTreeMap<u64, u32>,
     pub(crate) gdi_pens: BTreeMap<u64, u32>,
     pub(crate) gdi_fonts: BTreeMap<u64, GdiFont>,
+    /// HRGN → region geometry (created by `CreateRectRgn` /
+    /// `CreateRoundRectRgn`; read by `GetRgnBox` / `CombineRgn` /
+    /// `GetObjectW`).
+    pub(crate) gdi_regions: BTreeMap<u64, GdiRegion>,
+    /// Device-info-set state for setupapi.dll: HDEVINFO → devices.
+    pub(crate) setup_devices: BTreeMap<u64, Vec<SetupDeviceInfo>>,
+    /// Driver-list state for setupapi.dll: per device-info-element index →
+    /// driver list (empty — the guest registry has no driver database).
+    pub(crate) setup_driver_lists: BTreeMap<u64, Vec<()>>,
+    /// Next HDEVINFO handle.
+    pub(crate) next_setup_info_handle: u64,
     // --- Menu subsystem (Phase I2) ---
     pub(crate) menus: BTreeMap<u32, Menu>,
     pub(crate) next_menu_handle: u32,
@@ -1065,6 +1076,67 @@ pub(crate) struct GdiFont {
     pub(crate) height: i32,
 }
 
+/// A GDI region's geometry (created via `CreateRectRgn` /
+/// `CreateRoundRectRgn`, combined by `CombineRgn`).  The runtime's region
+/// model stores the bounding rectangle — the exact geometry of
+/// rectangular regions and the documented bounding box of rounded
+/// regions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GdiRegion {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
+}
+
+impl GdiRegion {
+    pub(crate) fn is_empty(self) -> bool {
+        self.left >= self.right || self.top >= self.bottom
+    }
+
+    pub(crate) fn intersection(self, other: GdiRegion) -> GdiRegion {
+        GdiRegion {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        }
+    }
+
+    pub(crate) fn union(self, other: GdiRegion) -> GdiRegion {
+        GdiRegion {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    pub(crate) fn contains(self, other: GdiRegion) -> bool {
+        other.is_empty()
+            || (other.left >= self.left
+                && other.top >= self.top
+                && other.right <= self.right
+                && other.bottom <= self.bottom)
+    }
+}
+
+/// A device information element in a setupapi device-info-set.  Backed by
+/// a device instance in the guest registry's device enumeration
+/// (`HKLM\SYSTEM\CurrentControlSet\Enum`); the device-instance ID is the
+/// `<Enumerator>\<DeviceID>\<InstanceID>` path.
+#[derive(Debug, Clone)]
+pub(crate) struct SetupDeviceInfo {
+    /// Device instance ID (e.g. `ROOT\SYSTEM\0000`).
+    pub(crate) instance_id: String,
+    /// Class GUID string (from the device's `ClassGUID` registry value;
+    /// empty when the device has none).
+    pub(crate) class_guid: String,
+    /// Guest registry key of the device instance
+    /// (`SYSTEM\CurrentControlSet\Enum\<instance_id>`).
+    pub(crate) registry_key: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProgressBarState {
     pub(crate) min: i32,
@@ -1274,6 +1346,10 @@ impl PeHostRuntime {
             gdi_brushes: BTreeMap::new(),
             gdi_pens: BTreeMap::new(),
             gdi_fonts: BTreeMap::new(),
+            gdi_regions: BTreeMap::new(),
+            setup_devices: BTreeMap::new(),
+            setup_driver_lists: BTreeMap::new(),
+            next_setup_info_handle: 0x10_0000,
             menus: BTreeMap::new(),
             next_menu_handle: 0x1000,
             window_menus: BTreeMap::new(),
