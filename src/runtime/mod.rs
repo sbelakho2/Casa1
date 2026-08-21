@@ -72454,6 +72454,29 @@ mod tests {
         state.get(Register::Rax)
     }
 
+    /// Dispatch an x86 thunk that reads its arguments from the Win64-style
+    /// registers directly (RCX/RDX/R8/R9) rather than through
+    /// `guest_call_arg`.
+    fn dispatch_x86_thunk_regs(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        regs: &[(Register, u64)],
+    ) -> u64 {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        for (reg, value) in regs {
+            state.set(*reg, *value);
+        }
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch x86 thunk");
+        state.get(Register::Rax)
+    }
+
     /// Build a minimal, structurally valid PE32 image whose security data
     /// directory entry is empty (i.e. the file carries no Authenticode
     /// signature).  `verify_pe_authenticode` must report it as unsigned.
@@ -98015,6 +98038,523 @@ mod tests {
             .expect("dispatch x64 thunk");
         state.get(Register::Rax)
     }
+
+
+
+    // -----------------------------------------------------------------------
+    // Evidence tail-final: the last implemented-without-evidence exports
+    // (kernel32 SetThreadPriority, kernelbase GetFileInformationByHandle,
+    // urlmon bind-ctx/moniker/status-callback, xinput export surface,
+    // d3d9 factory creation, dinput8 creation, dxgi factory2 creation).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_thread_priority_applies_the_priority_domain_and_roundtrips() {
+        let (mut runtime, _temp) = test_runtime("thread-priority");
+        let mut memory = MemoryImage::default();
+        let set = runtime.alloc_host_thunk(HostThunk::SetThreadPriority);
+        let get = runtime.alloc_host_thunk(HostThunk::GetThreadPriority);
+        let handle = runtime.win32.current_thread_handle();
+
+        // A valid thread handle: SetThreadPriority succeeds and the value
+        // round-trips through GetThreadPriority (the SAME storage the Nt
+        // SetInformationThread(ThreadPriority) surface queries).
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, set, &[handle, 2]);
+        assert_eq!(result, 1);
+        assert_eq!(runtime.last_error, 0);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, get, &[handle]);
+        assert_eq!(result, 2, "priority must round-trip through the domain");
+
+        // A NULL handle fails with ERROR_INVALID_HANDLE.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, set, &[0, 2]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+        // An unknown handle fails with ERROR_INVALID_HANDLE.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, set, &[0xDEAD, 2]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn get_file_information_by_handle_populates_the_file_info_struct() {
+        let (mut runtime, _temp) = test_runtime("file-info-by-handle");
+        let mut memory = MemoryImage::default();
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\info.tmp")
+            .expect("path");
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(handle, u32::MAX as u64, "CreateFileW succeeded");
+        assert_eq!(runtime.last_error, 0);
+
+        let info = runtime.alloc_host_thunk(HostThunk::GetFileInformationByHandle);
+        let info_ptr = 0x41_000;
+        memory.map_bytes(info_ptr as u64, &[0; 52]);
+
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, info, &[handle as u32, info_ptr]);
+        assert_eq!(result, 1);
+        assert_eq!(runtime.last_error, 0);
+        // BY_HANDLE_FILE_INFORMATION layout: attributes(4), 3 FILETIMEs(24),
+        // volume serial(4) = 0x4341_5341 ("CASA"), size hi/lo(8), links(4)=1,
+        // file index hi/lo(8) = synthetic_file_index(path).
+        assert_eq!(
+            memory.read_u32(info_ptr as u64).expect("attributes") & FILE_ATTRIBUTE_DIRECTORY,
+            0,
+            "a plain file is not a directory"
+        );
+        assert_eq!(
+            memory
+                .read_u32(info_ptr as u64 + 28)
+                .expect("volume serial"),
+            0x4341_5341
+        );
+        assert_eq!(memory.read_u32(info_ptr as u64 + 40).expect("links"), 1);
+        let file_index = (memory.read_u32(info_ptr as u64 + 48).expect("index low") as u64)
+            | ((memory.read_u32(info_ptr as u64 + 44).expect("index high") as u64) << 32);
+        assert_eq!(
+            file_index,
+            synthetic_file_index(r"C:\package\info.tmp"),
+            "the file index derives from the normalized path"
+        );
+
+        // An invalid handle fails with ERROR_INVALID_HANDLE.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, info, &[0, info_ptr]);
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn urlmon_bind_ctx_moniker_and_status_callback_dispatch() {
+        let (mut runtime, _temp) = test_runtime("urlmon");
+        let mut memory = MemoryImage::default();
+        let create_moniker = runtime.alloc_host_thunk(HostThunk::CreateURLMoniker);
+        let create_bind_ctx = runtime.alloc_host_thunk(HostThunk::CreateAsyncBindCtx);
+        let register_callback = runtime.alloc_host_thunk(HostThunk::RegisterBindStatusCallback);
+
+        // CreateURLMoniker stores the URL in guest memory and writes the
+        // moniker record pointer into the out slot.
+        let url_ptr = runtime
+            .alloc_utf16_string(&mut memory, "http://example.com/game")
+            .expect("url");
+        let moniker_out = 0x41_000;
+        memory.map_bytes(moniker_out as u64, &[0; 4]);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_moniker,
+            &[0, url_ptr as u32, moniker_out],
+        );
+        assert_eq!(result, 0);
+        let moniker_addr = memory.read_u32(moniker_out as u64).expect("moniker out") as u64;
+        assert_ne!(moniker_addr, 0, "a moniker record must be produced");
+        assert_eq!(
+            read_utf16_string(&memory, moniker_addr).expect("moniker url"),
+            "http://example.com/game"
+        );
+        // A NULL moniker out pointer fails with E_INVALIDARG.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_moniker,
+            &[0, url_ptr as u32, 0],
+        );
+        assert_eq!(result, 0x8007_0057);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+        // CreateAsyncBindCtx writes a bind-context record into the out slot.
+        let bind_ctx_out = 0x41_010;
+        memory.map_bytes(bind_ctx_out as u64, &[0; 4]);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_bind_ctx,
+            &[0, 0, 0, bind_ctx_out],
+        );
+        assert_eq!(result, 0);
+        let bind_ctx = memory.read_u32(bind_ctx_out as u64).expect("bind ctx out") as u64;
+        assert_ne!(bind_ctx, 0, "an async bind context must be produced");
+        assert_eq!(
+            read_utf16_string(&memory, bind_ctx).expect("bind ctx tag"),
+            "AsyncBindCtx"
+        );
+        // A NULL bind-ctx out pointer fails with E_INVALIDARG.
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, create_bind_ctx, &[0, 0, 0, 0]);
+        assert_eq!(result, 0x8007_0057);
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+        // RegisterBindStatusCallback accepts the bind context and returns S_OK.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            register_callback,
+            &[bind_ctx as u32, 0, 0, 0],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn xinput_exports_dispatch_roundtrip() {
+        let (mut runtime, _temp) = test_runtime("xinput-exports");
+        let mut memory = MemoryImage::default();
+        let get_state = runtime.alloc_host_thunk(HostThunk::XInputGetState);
+        let set_state = runtime.alloc_host_thunk(HostThunk::XInputSetState);
+        let caps = runtime.alloc_host_thunk(HostThunk::XInputGetCapabilities);
+        let battery = runtime.alloc_host_thunk(HostThunk::XInputGetBatteryInformation);
+        let keystroke = runtime.alloc_host_thunk(HostThunk::XInputGetKeystroke);
+        let enable = runtime.alloc_host_thunk(HostThunk::XInputEnable);
+        let dsound = runtime.alloc_host_thunk(HostThunk::XInputGetDSoundAudioDeviceGuids);
+
+        // Disconnected controller: XInputGetState reports
+        // ERROR_DEVICE_NOT_CONNECTED; NULL state pointer reports E_POINTER.
+        let state_ptr = 0x41_000;
+        memory.map_bytes(state_ptr as u64, &[0; 24]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            get_state,
+            &[(Register::Rcx, 0), (Register::Rdx, state_ptr as u64)],
+        );
+        assert_eq!(
+            result, 0x48F,
+            "disconnected slot reports ERROR_DEVICE_NOT_CONNECTED"
+        );
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            get_state,
+            &[(Register::Rcx, 0), (Register::Rdx, 0)],
+        );
+        assert_eq!(result, 0x8000_4003, "NULL state pointer reports E_POINTER");
+
+        runtime
+            .xinput_manager
+            .connect_controller(
+                0,
+                crate::real_win32::XInputState {
+                    packet_number: 1,
+                    buttons: crate::real_win32::XINPUT_GAMEPAD_A,
+                    left_trigger: 128,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .expect("connect controller");
+
+        // XInputGetState writes XINPUT_STATE (packet + gamepad) to guest memory.
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            get_state,
+            &[(Register::Rcx, 0), (Register::Rdx, state_ptr as u64)],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, 0);
+        assert_eq!(memory.read_u32(state_ptr as u64).expect("packet"), 1);
+        assert_eq!(
+            memory.read_u16(state_ptr as u64 + 4).expect("buttons"),
+            crate::real_win32::XINPUT_GAMEPAD_A
+        );
+        assert_eq!(
+            memory.read_u8(state_ptr as u64 + 6).expect("left trigger"),
+            128
+        );
+
+        // XInputSetState stores the vibration speeds on the controller (the
+        // stored values are pinned by the real_win32 unit tests).
+        let vibration_ptr = 0x41_100;
+        memory.map_bytes(vibration_ptr as u64, &[0; 4]);
+        write_u16(&mut memory, vibration_ptr as u64, 65535);
+        write_u16(&mut memory, vibration_ptr as u64 + 2, 32768);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            set_state,
+            &[(Register::Rcx, 0), (Register::Rdx, vibration_ptr as u64)],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, 0);
+        // A NULL vibration pointer reports E_POINTER.
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            set_state,
+            &[(Register::Rcx, 0), (Register::Rdx, 0)],
+        );
+        assert_eq!(result, 0x8000_4003);
+
+        // XInputGetCapabilities writes XINPUT_CAPABILITIES (28 bytes).
+        let caps_ptr = 0x41_200;
+        memory.map_bytes(caps_ptr as u64, &[0; 28]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            caps,
+            &[
+                (Register::Rcx, 0),
+                (Register::Rdx, 0),
+                (Register::R8, caps_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0);
+        let caps_from_guest = runtime.xinput_manager.get_capabilities(0).expect("caps");
+        assert_eq!(
+            memory.read_u8(caps_ptr as u64).expect("controller type"),
+            caps_from_guest.controller_type
+        );
+        assert_eq!(
+            memory
+                .read_u16(caps_ptr as u64 + 24)
+                .expect("vibration left"),
+            caps_from_guest.vibration_left
+        );
+
+        // XInputGetBatteryInformation: wired + full for a connected slot,
+        // ERROR_DEVICE_NOT_CONNECTED for a disconnected slot.
+        let battery_ptr = 0x41_300;
+        memory.map_bytes(battery_ptr as u64, &[0; 2]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            battery,
+            &[
+                (Register::Rcx, 0),
+                (Register::Rdx, 0),
+                (Register::R8, battery_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(memory.read_u8(battery_ptr as u64).expect("battery type"), 0);
+        assert_eq!(
+            memory
+                .read_u8(battery_ptr as u64 + 1)
+                .expect("battery level"),
+            3
+        );
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            battery,
+            &[
+                (Register::Rcx, 1),
+                (Register::Rdx, 0),
+                (Register::R8, battery_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0x48F);
+
+        // XInputGetKeystroke with no pending events reports ERROR_EMPTY.
+        let keystroke_ptr = 0x41_400;
+        memory.map_bytes(keystroke_ptr as u64, &[0; 8]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            keystroke,
+            &[
+                (Register::Rcx, 0),
+                (Register::Rdx, 0),
+                (Register::R8, keystroke_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 1, "no pending keystroke reports ERROR_EMPTY");
+
+        // XInputEnable flips the manager's processing switch (the flag
+        // round-trip itself is pinned by the real_win32 unit tests).
+        let result =
+            dispatch_x86_thunk_regs(&mut runtime, &mut memory, enable, &[(Register::Rcx, 0)]);
+        assert_eq!(result, 0);
+        let result =
+            dispatch_x86_thunk_regs(&mut runtime, &mut memory, enable, &[(Register::Rcx, 1)]);
+        assert_eq!(result, 0);
+
+        // XInputGetDSoundAudioDeviceGuids zeroes both GUID outputs.
+        let render_ptr = 0x41_500;
+        let capture_ptr = 0x41_510;
+        memory.map_bytes(render_ptr as u64, &[0xFF; 16]);
+        memory.map_bytes(capture_ptr as u64, &[0xFF; 16]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            dsound,
+            &[
+                (Register::Rcx, 0),
+                (Register::Rdx, render_ptr as u64),
+                (Register::R8, capture_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(
+            read_u64(&memory, render_ptr as u64).expect("render guid"),
+            0
+        );
+        assert_eq!(
+            read_u64(&memory, capture_ptr as u64).expect("capture guid"),
+            0
+        );
+    }
+
+    #[test]
+    fn d3d9_direct3d_create9_and_create9_ex_dispatch() {
+        let (mut runtime, _temp) = test_runtime("d3d9-create");
+        let mut memory = MemoryImage::default();
+        let create9 = runtime.alloc_host_thunk(HostThunk::Direct3DCreate9);
+        let create9ex = runtime.alloc_host_thunk(HostThunk::Direct3DCreate9Ex);
+
+        // Direct3DCreate9 returns an IDirect3D9 factory object pointer.
+        let factory =
+            dispatch_x86_thunk_regs(&mut runtime, &mut memory, create9, &[(Register::Rcx, 32)]);
+        assert_ne!(factory, 0, "Direct3DCreate9 returns a factory object");
+        assert_eq!(
+            runtime.guest_object_kind(factory).expect("factory kind"),
+            GuestObjectKind::D3d9Factory
+        );
+
+        // Direct3DCreate9Ex writes the factory pointer into the out slot.
+        let out_ptr = 0x41_000;
+        memory.map_bytes(out_ptr as u64, &[0; 8]);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create9ex,
+            &[(Register::Rcx, 32), (Register::Rdx, out_ptr as u64)],
+        );
+        assert_eq!(result, 0, "Direct3DCreate9Ex returns D3D_OK");
+        let factory_ex = memory.read_u64(out_ptr as u64).expect("factory ex");
+        assert_eq!(
+            runtime
+                .guest_object_kind(factory_ex)
+                .expect("factory ex kind"),
+            GuestObjectKind::D3d9Factory
+        );
+
+        // A NULL out pointer returns E_INVALIDARG.
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create9ex,
+            &[(Register::Rcx, 32), (Register::Rdx, 0)],
+        );
+        assert_eq!(result, 0x8007_0057);
+    }
+
+    #[test]
+    fn direct_input8_create_writes_a_managed_device_object() {
+        let (mut runtime, _temp) = test_runtime("dinput8-create");
+        let mut memory = MemoryImage::default();
+        let create = runtime.alloc_host_thunk(HostThunk::DirectInput8Create);
+        let riid_ptr = 0x41_000;
+        let out_ptr = 0x41_010;
+        memory.map_bytes(riid_ptr as u64, &[0; 16]);
+        memory.map_bytes(out_ptr as u64, &[0; 8]);
+
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create,
+            &[
+                (Register::Rcx, 0x1400_0000),
+                (Register::Rdx, 0x0800),
+                (Register::R8, riid_ptr as u64),
+                (Register::R9, out_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0, "DirectInput8Create returns DI_OK");
+        let dinput_object = memory.read_u64(out_ptr as u64).expect("dinput object");
+        assert_ne!(dinput_object, 0, "a DirectInput8 object must be produced");
+        assert_eq!(
+            runtime.guest_object_kind(dinput_object).expect("kind"),
+            GuestObjectKind::DirectInput8
+        );
+
+        // NULL out / NULL riid fail with E_INVALIDARG.
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create,
+            &[
+                (Register::Rcx, 0x1400_0000),
+                (Register::Rdx, 0x0800),
+                (Register::R8, riid_ptr as u64),
+                (Register::R9, 0),
+            ],
+        );
+        assert_eq!(result, 0x8007_0057);
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create,
+            &[
+                (Register::Rcx, 0x1400_0000),
+                (Register::Rdx, 0x0800),
+                (Register::R8, 0),
+                (Register::R9, out_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0x8007_0057);
+    }
+
+    #[test]
+    fn dxgi_create_factory2_writes_a_managed_factory_object() {
+        let (mut runtime, _temp) = test_runtime("dxgi-factory2");
+        runtime.d3d12_runtime = D3d12Runtime::from_backend(GraphicsBackend::with_host_profile(
+            host_gpu_profile_from_name("NVIDIA GeForce RTX 4080"),
+        ));
+        let mut memory = MemoryImage::default();
+        let create_factory = runtime.alloc_host_thunk(HostThunk::CreateDXGIFactory2);
+        let out_ptr = 0x41_000;
+        memory.map_bytes(out_ptr as u64, &[0; 8]);
+
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create_factory,
+            &[
+                (Register::Rcx, 0),
+                (Register::Rdx, 0),
+                (Register::R8, out_ptr as u64),
+            ],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, 0);
+        let factory_object = memory.read_u64(out_ptr as u64).expect("factory");
+        assert_ne!(factory_object, 0, "a DXGI factory object must be produced");
+        assert_eq!(
+            runtime.guest_object_kind(factory_object).expect("kind"),
+            GuestObjectKind::DxgiFactory
+        );
+
+        // A NULL out pointer returns E_INVALIDARG.
+        let result = dispatch_x86_thunk_regs(
+            &mut runtime,
+            &mut memory,
+            create_factory,
+            &[(Register::Rcx, 0), (Register::Rdx, 0), (Register::R8, 0)],
+        );
+        assert_eq!(result, 0x8007_0057);
+    }
+
 }
 
 fn read_d3d12_command_queue_desc(
