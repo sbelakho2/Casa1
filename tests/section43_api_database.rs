@@ -75,7 +75,9 @@ fn database_seeds_from_thunk_metadata_with_levels() {
         "the reason names the concrete limitation: {reason}"
     );
 
-    // Stub and Unsupported entries are seeded with their metadata levels.
+    // Stub entries are seeded with their metadata levels; the kernel32 core
+    // surface (GetVersionExA and the interlocked/environment/INI/search
+    // family) is Implemented with evidence_core_* conformance suites.
     let find_resource = database
         .lookup("kernel32.dll", "FindResourceA")
         .expect("FindResourceA must be seeded");
@@ -85,7 +87,12 @@ fn database_seeds_from_thunk_metadata_with_levels() {
         .expect("GetVersionExA must be seeded");
     assert_eq!(
         version_ex_a.implementation,
-        ImplementationLevel::Unsupported
+        ImplementationLevel::Implemented
+    );
+    assert_eq!(
+        version_ex_a.semantic_test_coverage,
+        CoverageLevel::Conformance,
+        "GetVersionExA is proven by the file-info/version/move/search suite"
     );
     // GetTickCount64 is implemented and oracle-covered (windows-oracle:time_clock).
     let tick_count_64 = database
@@ -881,7 +888,7 @@ fn report_generator_emits_expected_json_shape() {
             .gate
             .shipping_violations
             .iter()
-            .any(|v| { v.dll == "kernel32.dll" && v.export == "GetVersionExA" }),
+            .any(|v| { v.dll == "user32.dll" && v.export == "GetFocus" }),
         "unregistered Unsupported entries are honest shipping violations"
     );
     assert!(

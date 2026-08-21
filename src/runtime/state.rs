@@ -625,6 +625,11 @@ pub(crate) struct PeHostRuntime {
     /// Populated for synthetic modules (via get_or_create_module_handle),
     /// real PE DLLs (via load_real_dll), and the main module.
     pub(crate) dll_info_table: HashMap<u64, DllInfo>,
+    /// Modules marked by `DisableThreadLibraryCalls` (HMODULE set): their
+    /// DLL_THREAD_ATTACH / DLL_THREAD_DETACH notifications (DllMain and TLS
+    /// callbacks) are suppressed for every later thread, matching the
+    /// loader-lock flag semantics of the Win32 API.
+    pub(crate) disabled_thread_library_calls: BTreeSet<u64>,
     /// Registered initialization callbacks for synthetic/managed DLLs.
     /// Called with (module_handle, DLL_PROCESS_ATTACH) when a synthetic
     /// module is first created.
@@ -920,6 +925,10 @@ pub(crate) struct PeHostRuntime {
     /// Phase L4 — maps IContextMenu guest object addresses to the list of
     /// filesystem paths they represent (used by InvokeCommand to open files).
     pub(crate) context_menu_paths: HashMap<u64, Vec<String>>,
+    /// shlwapi/user32 — context help ids registered by
+    /// SetMenuContextHelpId, keyed by HMENU; GetMenuContextHelpId reads
+    /// them back (0 when unset).
+    pub(crate) menu_context_help_ids: HashMap<u64, u32>,
     // ── DXGI Factory State (Phase 5.5 #2) ──────────────────────────────
     /// Tracked window association for IDXGIFactory::MakeWindowAssociation.
     /// Stores (hwnd, flags).
@@ -1217,6 +1226,7 @@ impl PeHostRuntime {
             loader_lock: LoaderLockState::default(),
             forwarder_export_cache: BTreeMap::new(),
             dll_info_table: HashMap::new(),
+            disabled_thread_library_calls: BTreeSet::new(),
             synthetic_dll_init_callbacks: Vec::new(),
             network: NetworkStack::new(),
             winhttp: WinHttpStack::new(),
@@ -1372,6 +1382,7 @@ impl PeHostRuntime {
             enum_id_lists: HashMap::new(),
             // ── Phase L4: Context menu paths ─────────────────────────────────
             context_menu_paths: HashMap::new(),
+            menu_context_help_ids: HashMap::new(),
             // ── Phase 1 sub-agent fields ──────────────────────────────────────
             dxgi_window_assoc: None,
             dxgi_private_data: HashMap::new(),
