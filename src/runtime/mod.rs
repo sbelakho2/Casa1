@@ -3817,6 +3817,124 @@ pub enum HostThunk {
     MmioDescend,
     MmioCreateChunk,
     MmioStringToFOURCCW,
+    // ── advapi32: access tokens (mid-size families) ────────────────────
+    /// `AdjustTokenPrivileges` — enable/disable privileges in a token.
+    AdjustTokenPrivileges,
+    /// `AllocateAndInitializeSid` — build a SID from subauthorities.
+    AllocateAndInitializeSid,
+    /// `CheckTokenMembership` — test a SID against the token's SIDs.
+    CheckTokenMembership,
+    /// `DuplicateTokenEx` — duplicate a token with a new access/level.
+    DuplicateTokenEx,
+    /// `FreeSid` — free a SID allocated by AllocateAndInitializeSid.
+    FreeSid,
+    /// `GetTokenInformation` — the documented TOKEN_INFORMATION_CLASSes.
+    GetTokenInformation,
+    /// `ImpersonateLoggedOnUser` — attach the token as the thread token.
+    ImpersonateLoggedOnUser,
+    /// `LookupPrivilegeValueW` — the documented privilege LUID constants.
+    LookupPrivilegeValueW,
+    /// `OpenProcessToken` — open the process token.
+    OpenProcessToken,
+    /// `OpenThreadToken` — open the impersonation token of the thread.
+    OpenThreadToken,
+    /// `RevertToSelf` — stop impersonating.
+    RevertToSelf,
+    /// `GetUserNameA` — the ANSI user-name query.
+    GetUserNameA,
+    /// `LogonUserW` — a logon session for the guest user.
+    LogonUserW,
+    // ── advapi32: service control manager ──────────────────────────────
+    /// `CloseServiceHandle` — close an SCM manager/service handle.
+    CloseServiceHandle,
+    /// `ControlService` — the documented SERVICE_CONTROL_* state flow.
+    ControlService,
+    /// `CreateServiceW` — create a service in the guest registry DB.
+    CreateServiceW,
+    /// `DeleteService` — mark a service for deletion.
+    DeleteService,
+    /// `OpenSCManagerW` — open the service database.
+    OpenSCManagerW,
+    /// `OpenServiceW` — open a service handle.
+    OpenServiceW,
+    /// `QueryServiceStatus` — the documented SERVICE_STATUS structure.
+    QueryServiceStatus,
+    /// `StartServiceW` — START_PENDING → RUNNING status flow.
+    StartServiceW,
+    // ── advapi32: CryptoAPI (CSP) ──────────────────────────────────────
+    /// `CryptAcquireContextW` — a provider context with a container name.
+    CryptAcquireContextW,
+    /// `CryptCreateHash` — a hash object (MD5/SHA-1/SHA-2).
+    CryptCreateHash,
+    /// `CryptDecrypt` — RC4/RC2/3DES/DES/AES decryption.
+    CryptDecrypt,
+    /// `CryptDeriveKey` — derive a key from a hash.
+    CryptDeriveKey,
+    /// `CryptDestroyHash` — release a hash object.
+    CryptDestroyHash,
+    /// `CryptDestroyKey` — release a key object.
+    CryptDestroyKey,
+    /// `CryptEncrypt` — RC4/RC2/3DES/DES/AES encryption with padding.
+    CryptEncrypt,
+    /// `CryptGenRandom` — the guest RNG (shared with BCryptGenRandom).
+    CryptGenRandom,
+    /// `CryptGetHashParam` — HP_ALGID/HP_HASHSIZE/HP_HASHVAL.
+    CryptGetHashParam,
+    /// `CryptHashData` — feed bytes into a hash object.
+    CryptHashData,
+    /// `CryptReleaseContext` — release a provider context.
+    CryptReleaseContext,
+    // ── advapi32: registry leftovers ───────────────────────────────────
+    /// `RegEnumValueW` — enumerate a key's values.
+    RegEnumValueW,
+    /// `RegFlushKey` — the write-through registry flush.
+    RegFlushKey,
+    /// `RegOpenCurrentUser` — a handle to HKEY_CURRENT_USER.
+    RegOpenCurrentUser,
+    /// `RegQueryInfoKeyW` — key statistics from the guest registry.
+    RegQueryInfoKeyW,
+    // ── advapi32: ETW event source ─────────────────────────────────────
+    /// `EventRegister` — register an event provider.
+    EventRegister,
+    /// `EventUnregister` — unregister an event provider.
+    EventUnregister,
+    /// `EventWrite` — publish an event record.
+    EventWrite,
+    // ── shell32: icon / path / notify helpers ──────────────────────────
+    /// `ExtractIconW` — extract a module's icon resource as a HICON.
+    ExtractIconW,
+    /// `ExtractIconExW` — extract up to nIcons icon handles.
+    ExtractIconExW,
+    /// `PathIsNetworkPathW` — the UNC/device-path network test.
+    PathIsNetworkPathW,
+    /// `PathMakeUniqueName` — a non-conflicting file name.
+    PathMakeUniqueName,
+    /// `PathRelativePathToW` — the documented relative-path algorithm.
+    PathRelativePathToW,
+    /// `SHChangeNotify` — the documented no-op change notification.
+    SHChangeNotify,
+    /// `SHCreateDirectoryExW` — recursive mkdir via the filesystem layer.
+    SHCreateDirectoryExW,
+    /// `SHCreateShellItem` — a shell item from a PIDL.
+    SHCreateShellItem,
+    /// `SHFileOperationW` — copy/move/delete/rename file operations.
+    SHFileOperationW,
+    /// `SHGetMalloc` — the standard IMalloc allocator.
+    SHGetMalloc,
+    /// `SHUpdateImageW` — the documented no-op image-list update.
+    SHUpdateImageW,
+    /// `ShellExecuteW` — open a file/URL with the documented verb.
+    ShellExecuteW,
+    // IMalloc vtable methods (SHGetMalloc).
+    SHMallocQueryInterface,
+    SHMallocAddRef,
+    SHMallocRelease,
+    SHMallocAlloc,
+    SHMallocRealloc,
+    SHMallocFree,
+    SHMallocGetSize,
+    SHMallocDidAlloc,
+    SHMallocHeapMinimize,
     // ── D3D9 Basic Rendering (Phase 1.5) ──────────────────────────────────────
     /// Direct3DCreate9 — top-level entry point for D3D9.
     Direct3DCreate9,
@@ -9733,6 +9851,119 @@ impl PeHostRuntime {
             raw_csidl,
             self.guest_arch,
         ))
+    }
+
+    /// Extract the largest icon resource of a guest module path (the
+    /// ExtractIconW contract): `None` when the file cannot be read or
+    /// carries no icon resource — the documented zero-handle path.
+    fn extract_guest_icon(&self, guest_path: &str) -> Option<crate::icon::IconImage> {
+        let host_path = self.win32.guest_path_to_host_path(guest_path).ok()?;
+        let bytes = fs::read(&host_path).ok()?;
+        crate::pe::extract_icon_from_pe(&bytes)
+            .ok()?
+            .into_iter()
+            .next()
+    }
+
+    /// Extract all icon resources of a guest module path (the
+    /// ExtractIconExW contract): an empty vector when the file cannot be
+    /// read or carries no icon resources.
+    fn extract_all_guest_icons(&self, guest_path: &str) -> Vec<crate::icon::IconImage> {
+        let Ok(host_path) = self.win32.guest_path_to_host_path(guest_path) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = fs::read(&host_path) else {
+            return Vec::new();
+        };
+        crate::pe::extract_all_icons_from_pe(&bytes).unwrap_or_default()
+    }
+
+    /// PathMakeUniqueName: the template itself when it does not exist;
+    /// otherwise the template with " (n)" inserted before the extension,
+    /// choosing the first non-conflicting name through the guest
+    /// filesystem layer.
+    fn make_unique_guest_path(&self, template: &str) -> String {
+        let exists = |path: &str| -> bool {
+            self.win32
+                .guest_path_to_host_path(path)
+                .map(|host_path| host_path.exists())
+                .unwrap_or(false)
+        };
+        if !exists(template) {
+            return template.to_string();
+        }
+        let (stem, extension) = match template.rfind('.') {
+            Some(dot) if dot > template.rfind('\\').unwrap_or(0) => {
+                (&template[..dot], &template[dot..])
+            }
+            _ => (template, ""),
+        };
+        for counter in 1..1024 {
+            let candidate = format!("{stem} ({counter}){extension}");
+            if !exists(&candidate) {
+                return candidate;
+            }
+        }
+        template.to_string()
+    }
+
+    /// SHFileOperationW over the guest filesystem: FO_MOVE (1), FO_COPY
+    /// (2), FO_DELETE (3), FO_RENAME (4) with the documented return
+    /// codes.
+    fn shell_file_operation(&self, function: u32, from: &str, to: &str) -> u32 {
+        let result = (|| -> AppResult<()> {
+            let from_host = self.win32.guest_path_to_host_path(from)?;
+            let io_error = |operation: &str, error: &std::io::Error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("SHFileOperationW {operation} failed for {from}"),
+                    error,
+                )
+            };
+            match function {
+                // FO_DELETE
+                3 => {
+                    if from_host.is_dir() {
+                        fs::remove_dir_all(&from_host)
+                            .map_err(|error| io_error("delete", &error))?;
+                    } else if from_host.is_file() {
+                        fs::remove_file(&from_host).map_err(|error| io_error("delete", &error))?;
+                    } else {
+                        return Err(AppError::new(
+                            ReasonCode::RcFsNotFound,
+                            format!("delete target missing: {from}"),
+                        ));
+                    }
+                    Ok(())
+                }
+                // FO_MOVE
+                1 => {
+                    let to_host = self.win32.guest_path_to_host_path(to)?;
+                    fs::rename(&from_host, &to_host).map_err(|error| io_error("move", &error))?;
+                    Ok(())
+                }
+                // FO_COPY
+                2 => {
+                    let to_host = self.win32.guest_path_to_host_path(to)?;
+                    fs::copy(&from_host, &to_host).map_err(|error| io_error("copy", &error))?;
+                    Ok(())
+                }
+                // FO_RENAME
+                4 => {
+                    let to_host = self.win32.guest_path_to_host_path(to)?;
+                    fs::rename(&from_host, &to_host).map_err(|error| io_error("rename", &error))?;
+                    Ok(())
+                }
+                _ => Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("unsupported SHFileOperation function {function}"),
+                )),
+            }
+        })();
+        match result {
+            Ok(()) => crate::advapi32::ERROR_SUCCESS,
+            Err(error) => last_error_from_app_error(&error),
+        }
     }
 
     fn alloc_utf16_environment_block(
@@ -41916,6 +42147,1214 @@ impl PeHostRuntime {
                     );
                 }
             }
+            // ── advapi32: access tokens ───────────────────────────────────────
+            HostThunk::OpenProcessToken => {
+                let _process_handle = guest_call_arg_u32(state, memory, 0)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 1)?;
+                let token_out = guest_call_arg(state, memory, 2)?;
+                if token_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // The process token is created lazily: the guest user SID
+                    // with the standard privileges.
+                    let process_token = self.process_token_handle.unwrap_or_else(|| {
+                        let handle = self.next_token_handle;
+                        self.next_token_handle += 1;
+                        self.tokens
+                            .insert(handle, crate::advapi32::TokenInfo::process_token());
+                        self.process_token_handle = Some(handle);
+                        handle
+                    });
+                    write_u32(memory, token_out, process_token as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::OpenThreadToken => {
+                let _thread_handle = guest_call_arg_u32(state, memory, 0)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 1)?;
+                let _open_as_self = guest_call_arg_u32(state, memory, 2)?;
+                let token_out = guest_call_arg(state, memory, 3)?;
+                if token_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // The thread token exists only while impersonating; the
+                    // documented ERROR_NO_TOKEN otherwise.
+                    if let Some((handle, _)) = self
+                        .tokens
+                        .iter()
+                        .find(|(_, token)| token.impersonating)
+                    {
+                        write_u32(memory, token_out, *handle as u32);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    } else {
+                        write_u32(memory, token_out, 0);
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::advapi32::ERROR_NO_TOKEN;
+                    }
+                }
+            }
+            HostThunk::ImpersonateLoggedOnUser => {
+                let token_handle = guest_call_arg_u32(state, memory, 0)?;
+                if self.tokens.contains_key(&u64::from(token_handle)) {
+                    if let Some(token) = self.tokens.get_mut(&u64::from(token_handle)) {
+                        token.impersonating = true;
+                    }
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                }
+            }
+            HostThunk::RevertToSelf => {
+                for token in self.tokens.values_mut() {
+                    token.impersonating = false;
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::DuplicateTokenEx => {
+                let existing = guest_call_arg_u32(state, memory, 0)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 1)?;
+                let _token_attributes = guest_call_arg(state, memory, 2)?;
+                let _impersonation_level = guest_call_arg_u32(state, memory, 3)?;
+                let _token_type = guest_call_arg_u32(state, memory, 4)?;
+                let new_token_out = guest_call_arg(state, memory, 5)?;
+                if new_token_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if let Some(existing_token) = self.tokens.get(&u64::from(existing)).cloned() {
+                    let handle = self.next_token_handle;
+                    self.next_token_handle += 1;
+                    self.tokens.insert(handle, existing_token);
+                    write_u32(memory, new_token_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    write_u32(memory, new_token_out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                }
+            }
+            HostThunk::AdjustTokenPrivileges => {
+                let token_handle = guest_call_arg_u32(state, memory, 0)?;
+                let disable_all = guest_call_arg_u32(state, memory, 1)? != 0;
+                let new_state_ptr = guest_call_arg(state, memory, 2)?;
+                let _prev_len = guest_call_arg_u32(state, memory, 3)?;
+                let prev_state_ptr = guest_call_arg(state, memory, 4)?;
+                let ret_len_ptr = guest_call_arg(state, memory, 5)?;
+                let Some(token) = self.tokens.get_mut(&u64::from(token_handle)) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                if disable_all {
+                    for entry in &mut token.privileges {
+                        entry.enabled = false;
+                    }
+                }
+                // Collect the requested LUID/attribute pairs first.
+                let mut requested = Vec::new();
+                if new_state_ptr != 0 {
+                    let count = read_u32(memory, new_state_ptr)? as usize;
+                    for index in 0..count {
+                        let entry = new_state_ptr + 8 + (index as u64 * 16);
+                        let luid = read_u64(memory, entry)?;
+                        let attributes = read_u32(memory, entry + 8)?;
+                        requested.push((luid, attributes));
+                    }
+                }
+                let mut not_all_assigned = false;
+                for (luid, attributes) in requested {
+                    let enable = attributes & 2 != 0; // SE_PRIVILEGE_ENABLED
+                    let present = token.set_privilege_state(luid as u32, enable);
+                    if !present && !disable_all {
+                        not_all_assigned = true;
+                    }
+                }
+                // The previous-state contract: the privileges that changed.
+                if prev_state_ptr != 0 {
+                    let entries = token
+                        .privileges
+                        .iter()
+                        .filter(|entry| !entry.enabled || disable_all)
+                        .collect::<Vec<_>>();
+                    let required = 4 + entries.len() * 16;
+                    if ret_len_ptr != 0 {
+                        write_u32(memory, ret_len_ptr, required as u32);
+                    }
+                    write_u32(memory, prev_state_ptr, entries.len() as u32);
+                    for (index, entry) in entries.iter().enumerate() {
+                        let slot = prev_state_ptr + 8 + (index as u64 * 16);
+                        write_u64(memory, slot, u64::from(entry.luid));
+                        write_u32(
+                            memory,
+                            slot + 8,
+                            if entry.enabled { 2 } else { 0 }, // SE_PRIVILEGE_ENABLED
+                        );
+                    }
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = if not_all_assigned {
+                    crate::advapi32::ERROR_NOT_ALL_ASSIGNED
+                } else {
+                    0
+                };
+            }
+            HostThunk::AllocateAndInitializeSid => {
+                let pa = guest_call_arg_u32(state, memory, 0)? as u8;
+                let pb = guest_call_arg_u32(state, memory, 1)? as u8;
+                let pc = guest_call_arg_u32(state, memory, 2)? as u8;
+                let pd = guest_call_arg_u32(state, memory, 3)? as u8;
+                let sub0 = guest_call_arg_u32(state, memory, 4)?;
+                let sub1 = guest_call_arg_u32(state, memory, 5)?;
+                let sub2 = guest_call_arg_u32(state, memory, 6)?;
+                let sub3 = guest_call_arg_u32(state, memory, 7)?;
+                let sid_out = guest_call_arg(state, memory, 8)?;
+                if sid_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // The identifier authority is the 32-bit (pa:pb:pc:pd)
+                    // value in the low bytes of the 6-byte field.
+                    let authority = u32::from_be_bytes([pa, pb, pc, pd]);
+                    let mut sid = vec![1u8, 4]; // revision, 4 subauthorities
+                    sid.extend_from_slice(&[0, 0]);
+                    sid.extend_from_slice(&authority.to_be_bytes());
+                    for sub in [sub0, sub1, sub2, sub3] {
+                        sid.extend_from_slice(&sub.to_le_bytes());
+                    }
+                    let handle = self.next_sid_handle;
+                    self.next_sid_handle += 1;
+                    let sid_address = self.alloc_heap(memory, sid.len(), true)?;
+                    memory.map_bytes(sid_address, &sid);
+                    self.allocated_sids.insert(handle, sid);
+                    write_u32(memory, sid_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::FreeSid => {
+                let sid_handle = guest_call_arg_u32(state, memory, 0)?;
+                self.allocated_sids.remove(&u64::from(sid_handle));
+                // The documented success return value is NULL.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::CheckTokenMembership => {
+                let token_handle = guest_call_arg_u32(state, memory, 0)?;
+                let sid_ptr = guest_call_arg(state, memory, 1)?;
+                let is_member_ptr = guest_call_arg(state, memory, 2)?;
+                if sid_ptr == 0 || is_member_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // The SID at sid_ptr is a raw binary SID.
+                    let count = memory.read_u8(sid_ptr + 1)? as usize;
+                    let sid_len = 8 + count * 4;
+                    let sid = memory.read_bytes(sid_ptr, sid_len)?;
+                    let member = if token_handle == 0 {
+                        // NULL token: the process token.
+                        self.tokens
+                            .values()
+                            .any(|token| token.contains_sid(&sid))
+                    } else {
+                        self.tokens
+                            .get(&u64::from(token_handle))
+                            .map(|token| token.contains_sid(&sid))
+                            .unwrap_or(false)
+                    };
+                    write_u32(memory, is_member_ptr, u32::from(member));
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::LookupPrivilegeValueW => {
+                let _system_ptr = guest_call_arg(state, memory, 0)?;
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let luid_out = guest_call_arg(state, memory, 2)?;
+                let name = if name_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, name_ptr)?
+                };
+                match crate::advapi32::lookup_privilege_luid(&name) {
+                    Some(luid) if luid_out != 0 => {
+                        write_u64(memory, luid_out, u64::from(luid));
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    _ => {
+                        if luid_out != 0 {
+                            write_u64(memory, luid_out, 0);
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::advapi32::ERROR_NO_SUCH_PRIVILEGE;
+                    }
+                }
+            }
+            HostThunk::GetTokenInformation => {
+                let token_handle = guest_call_arg_u32(state, memory, 0)?;
+                let class = guest_call_arg_u32(state, memory, 1)?;
+                let info_ptr = guest_call_arg(state, memory, 2)?;
+                let info_len = guest_call_arg_u32(state, memory, 3)?;
+                let ret_len_ptr = guest_call_arg(state, memory, 4)?;
+                // TokenInformationClass: TokenUser=1, TokenGroups=2,
+                // TokenPrivileges=3, TokenType=8, TokenImpersonationLevel=9,
+                // TokenStatistics=10, TokenSessionId=12, TokenElevationType=18,
+                // TokenElevation=20, TokenIntegrityLevel=25.
+                let token = if token_handle == 0 {
+                    self.tokens
+                        .get(&self.process_token_handle.unwrap_or(0))
+                        .cloned()
+                } else {
+                    self.tokens.get(&u64::from(token_handle)).cloned()
+                };
+                let Some(token) = token else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                let pointer_size = self.guest_arch.pointer_bytes() as u64;
+                let sid_and_attributes_size = pointer_size + 4;
+                let required = match class {
+                    // TOKEN_USER: SID_AND_ATTRIBUTES + user SID.
+                    1 => sid_and_attributes_size + token.user_sid.len() as u64,
+                    // TOKEN_GROUPS: count + SID_AND_ATTRIBUTES[] + group SIDs.
+                    2 => {
+                        4 + token.group_sids.len() as u64 * sid_and_attributes_size
+                            + token.group_sids.iter().map(|sid| sid.len() as u64).sum::<u64>()
+                    }
+                    // TOKEN_PRIVILEGES: count + LUID_AND_ATTRIBUTES[].
+                    3 => 4 + token.privileges.len() as u64 * 16,
+                    // TOKEN_TYPE (1 = TokenPrimary), TOKEN_SESSION_ID,
+                    // TOKEN_ELEVATION (0 = not elevated).
+                    8 | 9 | 12 | 18 | 20 => 4,
+                    // TOKEN_STATISTICS (72 bytes).
+                    10 => 72,
+                    // TOKEN_INTEGRITY_LEVEL: SID_AND_ATTRIBUTES + IL SID.
+                    25 => {
+                        let il_sid = crate::advapi32::encode_sid("S-1-16-8192")
+                            .expect("medium integrity SID");
+                        sid_and_attributes_size + il_sid.len() as u64
+                    }
+                    _ => 0,
+                };
+                if info_len < required as u32 || class == 0 {
+                    if ret_len_ptr != 0 {
+                        write_u32(memory, ret_len_ptr, required as u32);
+                    }
+                    state.set(Register::Rax, 0);
+                    self.last_error = if class == 0 {
+                        ERROR_INVALID_PARAMETER
+                    } else {
+                        ERROR_INSUFFICIENT_BUFFER
+                    };
+                    return Ok(None);
+                }
+                if ret_len_ptr != 0 {
+                    write_u32(memory, ret_len_ptr, required as u32);
+                }
+                match class {
+                    1 => {
+                        let sid_at = info_ptr + sid_and_attributes_size;
+                        write_guest_pointer(memory, info_ptr, sid_at, self.guest_arch)?;
+                        write_u32(memory, info_ptr + pointer_size, 0);
+                        memory.map_bytes(sid_at, &token.user_sid);
+                    }
+                    2 => {
+                        write_u32(memory, info_ptr, token.group_sids.len() as u32);
+                        let mut cursor = info_ptr + 4;
+                        let mut sid_cursor =
+                            info_ptr + 4 + token.group_sids.len() as u64 * sid_and_attributes_size;
+                        for sid in &token.group_sids {
+                            write_guest_pointer(memory, cursor, sid_cursor, self.guest_arch)?;
+                            write_u32(memory, cursor + pointer_size, 0x2000); // SE_GROUP_ENABLED
+                            cursor += sid_and_attributes_size;
+                            memory.map_bytes(sid_cursor, sid);
+                            sid_cursor += sid.len() as u64;
+                        }
+                    }
+                    3 => {
+                        write_u32(memory, info_ptr, token.privileges.len() as u32);
+                        for (index, entry) in token.privileges.iter().enumerate() {
+                            let slot = info_ptr + 8 + (index as u64 * 16);
+                            write_u64(memory, slot, u64::from(entry.luid));
+                            write_u32(
+                                memory,
+                                slot + 8,
+                                if entry.enabled { 2 } else { 0 }, // SE_PRIVILEGE_ENABLED
+                            );
+                        }
+                    }
+                    8 => write_u32(memory, info_ptr, 1), // TokenPrimary
+                    9 => write_u32(memory, info_ptr, 2), // SecurityImpersonation
+                    12 => write_u32(memory, info_ptr, 1),
+                    18 => write_u32(memory, info_ptr, 1), // TokenElevationTypeDefault
+                    20 => write_u32(memory, info_ptr, 0), // not elevated
+                    10 => {
+                        // TOKEN_STATISTICS: type, impersonation level,
+                        // authentication id, token type, flags, source,
+                        // token/modified ids, elevation type, policy.
+                        write_u32(memory, info_ptr, 1); // TokenPrimary
+                        write_u32(memory, info_ptr + 4, 2); // SecurityImpersonation
+                        write_u64(memory, info_ptr + 8, 0x0A0000); // AuthenticationId
+                        write_u32(memory, info_ptr + 16, 1); // TokenType
+                        write_u32(memory, info_ptr + 20, 2); // ImpersonationLevel
+                        write_u32(memory, info_ptr + 24, 0); // TokenFlags
+                        write_u64(memory, info_ptr + 36, 0x0A0000); // TokenId
+                        write_u64(memory, info_ptr + 44, 0x0A0000); // AuthenticationId
+                        write_u64(memory, info_ptr + 52, 0x0A0000); // ModifiedId
+                        write_u32(memory, info_ptr + 60, 1); // ElevationType
+                        write_u32(memory, info_ptr + 64, 1); // MandatoryPolicy
+                    }
+                    25 => {
+                        let il_sid = crate::advapi32::encode_sid("S-1-16-8192")
+                            .expect("medium integrity SID");
+                        let sid_at = info_ptr + sid_and_attributes_size;
+                        write_guest_pointer(memory, info_ptr, sid_at, self.guest_arch)?;
+                        write_u32(memory, info_ptr + pointer_size, 0x1000); // SE_GROUP_INTEGRITY
+                        memory.map_bytes(sid_at, &il_sid);
+                    }
+                    _ => {}
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::GetUserNameA => {
+                let buffer_ptr = guest_call_arg(state, memory, 0)?;
+                let size_ptr = guest_call_arg(state, memory, 1)?;
+                let user_name = "user".to_string();
+                if size_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let buffer_size = read_u32(memory, size_ptr)?;
+                    let required = write_ansi_api_string(memory, buffer_ptr, buffer_size, &user_name)?;
+                    write_u32(memory, size_ptr, required);
+                    if buffer_size > 0 && required > buffer_size {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MORE_DATA;
+                    } else {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::LogonUserW => {
+                let user_ptr = guest_call_arg(state, memory, 0)?;
+                let _domain_ptr = guest_call_arg(state, memory, 1)?;
+                let _password_ptr = guest_call_arg(state, memory, 2)?;
+                let _logon_type = guest_call_arg_u32(state, memory, 3)?;
+                let _provider = guest_call_arg_u32(state, memory, 4)?;
+                let token_out = guest_call_arg(state, memory, 5)?;
+                let user = if user_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, user_ptr)?
+                };
+                if user.eq_ignore_ascii_case("user") && token_out != 0 {
+                    // The guest user's logon session: a fresh token with the
+                    // guest user SID (documented logon-session semantics).
+                    let handle = self.next_token_handle;
+                    self.next_token_handle += 1;
+                    self.tokens.insert(handle, crate::advapi32::TokenInfo::process_token());
+                    write_u32(memory, token_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    if token_out != 0 {
+                        write_u32(memory, token_out, 0);
+                    }
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::ERROR_LOGON_FAILURE;
+                }
+            }
+            // ── advapi32: service control manager ────────────────────────────
+            HostThunk::OpenSCManagerW => {
+                let _machine_ptr = guest_call_arg(state, memory, 0)?;
+                let _database_ptr = guest_call_arg(state, memory, 1)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 2)?;
+                let handle = self.next_scm_handle;
+                self.next_scm_handle += 1;
+                self.scm_handles.insert(handle, None);
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+            }
+            HostThunk::OpenServiceW => {
+                let manager_handle = guest_call_arg_u32(state, memory, 0)?;
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 2)?;
+                let name = if name_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, name_ptr)?
+                };
+                if !self.scm_handles.contains_key(&u64::from(manager_handle)) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                } else if !crate::advapi32::service_exists(
+                    self.win32.ge(),
+                    &name,
+                    crate::advapi32::scm_registry_view(),
+                ) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::ERROR_SERVICE_DOES_NOT_EXIST;
+                } else if self
+                    .scm_status
+                    .get(&name)
+                    .map(|status| status.marked_for_delete)
+                    .unwrap_or(false)
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::ERROR_SERVICE_MARKED_FOR_DELETE;
+                } else {
+                    let handle = self.next_scm_handle;
+                    self.next_scm_handle += 1;
+                    self.scm_handles.insert(handle, Some(name.clone()));
+                    state.set(Register::Rax, handle);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::CloseServiceHandle => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                if self.scm_handles.remove(&u64::from(handle)).is_some() {
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                }
+            }
+            HostThunk::CreateServiceW => {
+                let manager_handle = guest_call_arg_u32(state, memory, 0)?;
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let display_ptr = guest_call_arg(state, memory, 2)?;
+                let _desired_access = guest_call_arg_u32(state, memory, 3)?;
+                let service_type = guest_call_arg_u32(state, memory, 4)?;
+                let start_type = guest_call_arg_u32(state, memory, 5)?;
+                let error_control = guest_call_arg_u32(state, memory, 6)?;
+                let path_ptr = guest_call_arg(state, memory, 7)?;
+                let _load_order_ptr = guest_call_arg(state, memory, 8)?;
+                let _tag_ptr = guest_call_arg(state, memory, 9)?;
+                let _dependencies_ptr = guest_call_arg(state, memory, 10)?;
+                let _account_ptr = guest_call_arg(state, memory, 11)?;
+                let _password_ptr = guest_call_arg(state, memory, 12)?;
+                let name = if name_ptr == 0 { String::new() } else { read_utf16_string(memory, name_ptr)? };
+                let display = if display_ptr == 0 { name.clone() } else { read_utf16_string(memory, display_ptr)? };
+                let path = if path_ptr == 0 { String::new() } else { read_utf16_string(memory, path_ptr)? };
+                if name.is_empty() || !self.scm_handles.contains_key(&u64::from(manager_handle)) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = if name.is_empty() {
+                        ERROR_INVALID_PARAMETER
+                    } else {
+                        ERROR_INVALID_HANDLE
+                    };
+                } else {
+                    match crate::advapi32::create_service(
+                        self.win32.ge(),
+                        &name,
+                        &display,
+                        service_type,
+                        start_type,
+                        error_control,
+                        &path,
+                        crate::advapi32::scm_registry_view(),
+                    ) {
+                        Ok(()) => {
+                            let handle = self.next_scm_handle;
+                            self.next_scm_handle += 1;
+                            self.scm_handles.insert(handle, Some(name.clone()));
+                            // Kernel drivers accept no controls; Win32
+                            // processes accept the documented default set.
+                            let controls = if service_type
+                                & (crate::advapi32::SERVICE_WIN32_OWN_PROCESS
+                                    | crate::advapi32::SERVICE_WIN32_SHARE_PROCESS)
+                                != 0
+                            {
+                                crate::advapi32::SERVICE_ACCEPT_DEFAULT
+                            } else {
+                                0
+                            };
+                            self.scm_status
+                                .insert(name.clone(), crate::advapi32::ServiceStatusFlow::new(controls));
+                            state.set(Register::Rax, handle);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = error;
+                        }
+                    }
+                }
+            }
+            HostThunk::DeleteService => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let Some(Some(name)) = self.scm_handles.get(&u64::from(handle)).cloned() else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                match crate::advapi32::delete_service(
+                    self.win32.ge(),
+                    &name,
+                    crate::advapi32::scm_registry_view(),
+                ) {
+                    Ok(()) => {
+                        if let Some(status) = self.scm_status.get_mut(&name) {
+                            status.marked_for_delete = true;
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = error;
+                    }
+                }
+            }
+            HostThunk::StartServiceW => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let _argc = guest_call_arg_u32(state, memory, 1)?;
+                let _argv_ptr = guest_call_arg(state, memory, 2)?;
+                let Some(Some(name)) = self.scm_handles.get(&u64::from(handle)).cloned() else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                let status = self
+                    .scm_status
+                    .entry(name.clone())
+                    .or_insert_with(|| {
+                        crate::advapi32::ServiceStatusFlow::new(crate::advapi32::SERVICE_ACCEPT_DEFAULT)
+                    });
+                let error = status.start();
+                if error == crate::advapi32::ERROR_SUCCESS {
+                    // The deterministic model: the service's work completes
+                    // immediately (START_PENDING → RUNNING).
+                    status.settle();
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = error;
+                }
+            }
+            HostThunk::ControlService => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let control = guest_call_arg_u32(state, memory, 1)?;
+                let status_out = guest_call_arg(state, memory, 2)?;
+                let Some(Some(name)) = self.scm_handles.get(&u64::from(handle)).cloned() else {
+                    if status_out != 0 {
+                        write_service_status(memory, status_out, 0, 0, 0, 0, 0, 0, 0);
+                    }
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                let status = self
+                    .scm_status
+                    .entry(name.clone())
+                    .or_insert_with(|| {
+                        crate::advapi32::ServiceStatusFlow::new(crate::advapi32::SERVICE_ACCEPT_DEFAULT)
+                    });
+                let error = status.apply_control(control);
+                if error == crate::advapi32::ERROR_SUCCESS {
+                    // The deterministic model: pending transitions settle
+                    // immediately (STOP_PENDING → STOPPED, etc.).
+                    status.settle();
+                }
+                if status_out != 0 {
+                    write_service_status(
+                        memory,
+                        status_out,
+                        if crate::advapi32::service_exists(
+                            self.win32.ge(),
+                            &name,
+                            crate::advapi32::scm_registry_view(),
+                        ) { 0x10 } else { 0 },
+                        status.state,
+                        status.controls_accepted,
+                        status.win32_exit_code,
+                        status.service_specific_exit_code,
+                        status.checkpoint,
+                        status.wait_hint,
+                    );
+                }
+                state.set(Register::Rax, if error == 0 { 1 } else { 0 });
+                self.last_error = error;
+            }
+            HostThunk::QueryServiceStatus => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let status_out = guest_call_arg(state, memory, 1)?;
+                let Some(Some(name)) = self.scm_handles.get(&u64::from(handle)).cloned() else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                let status = self
+                    .scm_status
+                    .entry(name.clone())
+                    .or_insert_with(|| {
+                        crate::advapi32::ServiceStatusFlow::new(crate::advapi32::SERVICE_ACCEPT_DEFAULT)
+                    });
+                if status_out != 0 {
+                    write_service_status(
+                        memory,
+                        status_out,
+                        if crate::advapi32::service_exists(
+                            self.win32.ge(),
+                            &name,
+                            crate::advapi32::scm_registry_view(),
+                        ) { 0x10 } else { 0 },
+                        status.state,
+                        status.controls_accepted,
+                        status.win32_exit_code,
+                        status.service_specific_exit_code,
+                        status.checkpoint,
+                        status.wait_hint,
+                    );
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            // ── advapi32: CryptoAPI ──────────────────────────────────────────
+            HostThunk::CryptAcquireContextW => {
+                let prov_out = guest_call_arg(state, memory, 0)?;
+                let container_ptr = guest_call_arg(state, memory, 1)?;
+                let _provider_ptr = guest_call_arg(state, memory, 2)?;
+                let provider_type = guest_call_arg_u32(state, memory, 3)?;
+                let flags = guest_call_arg_u32(state, memory, 4)?;
+                if prov_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let container = if container_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_utf16_string(memory, container_ptr)?
+                    };
+                    let verify_context = flags & 0x4000_0000 != 0; // CRYPT_VERIFYCONTEXT
+                    let handle = self.next_crypt_provider_handle;
+                    self.next_crypt_provider_handle += 1;
+                    self.crypt_providers.insert(
+                        handle,
+                        crate::advapi32::CryptProvider {
+                            container,
+                            provider_type,
+                            verify_context,
+                        },
+                    );
+                    write_u32(memory, prov_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::CryptReleaseContext => {
+                let prov = guest_call_arg_u32(state, memory, 0)?;
+                let _flags = guest_call_arg_u32(state, memory, 1)?;
+                if self.crypt_providers.remove(&u64::from(prov)).is_some() {
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_UID;
+                }
+            }
+            HostThunk::CryptGenRandom => {
+                let _prov = guest_call_arg_u32(state, memory, 0)?;
+                let len = guest_call_arg_u32(state, memory, 1)? as usize;
+                let buffer_ptr = guest_call_arg(state, memory, 2)?;
+                if buffer_ptr != 0 && len > 0 {
+                    let mut random_bytes = vec![0u8; len];
+                    let _ = getrandom::getrandom(&mut random_bytes);
+                    memory.map_bytes(buffer_ptr, &random_bytes);
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::CryptCreateHash => {
+                let prov = guest_call_arg_u32(state, memory, 0)?;
+                let algorithm = guest_call_arg_u32(state, memory, 1)?;
+                let _key = guest_call_arg_u32(state, memory, 2)?;
+                let _flags = guest_call_arg_u32(state, memory, 3)?;
+                let hash_out = guest_call_arg(state, memory, 4)?;
+                if hash_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if !self.crypt_providers.contains_key(&u64::from(prov)) {
+                    write_u32(memory, hash_out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_UID;
+                } else if !crate::advapi32::CryptHashState::is_supported_algorithm(algorithm) {
+                    write_u32(memory, hash_out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_ALGID;
+                } else {
+                    let handle = self.next_crypt_hash_handle;
+                    self.next_crypt_hash_handle += 1;
+                    self.crypt_hashes.insert(
+                        handle,
+                        crate::advapi32::CryptHashState {
+                            algorithm,
+                            data: Vec::new(),
+                        },
+                    );
+                    write_u32(memory, hash_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::CryptHashData => {
+                let hash = guest_call_arg_u32(state, memory, 0)?;
+                let data_ptr = guest_call_arg(state, memory, 1)?;
+                let len = guest_call_arg_u32(state, memory, 2)? as usize;
+                let _flags = guest_call_arg_u32(state, memory, 3)?;
+                if let Some(hash_state) = self.crypt_hashes.get_mut(&u64::from(hash)) {
+                    if data_ptr != 0 && len > 0 {
+                        let bytes = memory.read_bytes(data_ptr, len)?;
+                        hash_state.data.extend_from_slice(&bytes);
+                    }
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_HASH;
+                }
+            }
+            HostThunk::CryptGetHashParam => {
+                let hash = guest_call_arg_u32(state, memory, 0)?;
+                let param = guest_call_arg_u32(state, memory, 1)?;
+                let data_ptr = guest_call_arg(state, memory, 2)?;
+                let len_ptr = guest_call_arg(state, memory, 3)?;
+                let _flags = guest_call_arg_u32(state, memory, 4)?;
+                let Some(hash_state) = self.crypt_hashes.get(&u64::from(hash)) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_HASH;
+                    return Ok(None);
+                };
+                // HP_ALGID = 1, HP_HASHVAL = 2, HP_HASHSIZE = 4.
+                let digest = hash_state.finish();
+                let (required, payload): (u32, Vec<u8>) = match param {
+                    1 => (4, hash_state.algorithm.to_le_bytes().to_vec()),
+                    4 => {
+                        let size = digest.as_ref().map_or(0, |d| d.len() as u32);
+                        (4, size.to_le_bytes().to_vec())
+                    }
+                    2 => match digest {
+                        Some(digest) => (digest.len() as u32, digest),
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = crate::advapi32::NTE_BAD_ALGID;
+                            return Ok(None);
+                        }
+                    },
+                    _ => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::advapi32::NTE_BAD_TYPE;
+                        return Ok(None);
+                    }
+                };
+                let available = if len_ptr == 0 { 0 } else { read_u32(memory, len_ptr)? };
+                if len_ptr != 0 {
+                    write_u32(memory, len_ptr, required);
+                }
+                if data_ptr != 0 && available >= required {
+                    memory.map_bytes(data_ptr, &payload);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::ERROR_MORE_DATA;
+                }
+            }
+            HostThunk::CryptDestroyHash => {
+                let hash = guest_call_arg_u32(state, memory, 0)?;
+                if self.crypt_hashes.remove(&u64::from(hash)).is_some() {
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_HASH;
+                }
+            }
+            HostThunk::CryptDeriveKey => {
+                let prov = guest_call_arg_u32(state, memory, 0)?;
+                let algorithm = guest_call_arg_u32(state, memory, 1)?;
+                let hash = guest_call_arg_u32(state, memory, 2)?;
+                let _flags = guest_call_arg_u32(state, memory, 3)?;
+                let key_out = guest_call_arg(state, memory, 4)?;
+                if key_out == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if !self.crypt_providers.contains_key(&u64::from(prov)) {
+                    write_u32(memory, key_out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_UID;
+                } else if !crate::advapi32::CryptKeyState::is_supported_algorithm(algorithm) {
+                    write_u32(memory, key_out, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_ALGID;
+                } else {
+                    let digest = self
+                        .crypt_hashes
+                        .get(&u64::from(hash))
+                        .and_then(|hash_state| hash_state.finish());
+                    let Some(digest) = digest else {
+                        write_u32(memory, key_out, 0);
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::advapi32::NTE_BAD_HASH;
+                        return Ok(None);
+                    };
+                    let material = crate::advapi32::CryptKeyState::derive_material(algorithm, &digest)
+                        .expect("supported algorithm derives material");
+                    let handle = self.next_crypt_key_handle;
+                    self.next_crypt_key_handle += 1;
+                    let key_state = crate::advapi32::CryptKeyState::from_material(algorithm, material)
+                        .expect("supported algorithm builds key state");
+                    self.crypt_keys.insert(handle, key_state);
+                    write_u32(memory, key_out, handle as u32);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::CryptEncrypt => {
+                let key = guest_call_arg_u32(state, memory, 0)?;
+                let _hash = guest_call_arg_u32(state, memory, 1)?;
+                let _final = guest_call_arg_u32(state, memory, 2)?;
+                let _flags = guest_call_arg_u32(state, memory, 3)?;
+                let data_ptr = guest_call_arg(state, memory, 4)?;
+                let len_ptr = guest_call_arg(state, memory, 5)?;
+                let buffer_len = guest_call_arg_u32(state, memory, 6)?;
+                let Some(key_state) = self.crypt_keys.get_mut(&u64::from(key)) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_KEY;
+                    return Ok(None);
+                };
+                if data_ptr == 0 || len_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let data_len = read_u32(memory, len_ptr)? as usize;
+                    let data = memory.read_bytes(data_ptr, data_len)?;
+                    match key_state.encrypt(&data) {
+                        Some(ciphertext) => {
+                            if ciphertext.len() as u32 > buffer_len {
+                                write_u32(memory, len_ptr, ciphertext.len() as u32);
+                                state.set(Register::Rax, 0);
+                                self.last_error = crate::advapi32::ERROR_MORE_DATA;
+                            } else {
+                                memory.map_bytes(data_ptr, &ciphertext);
+                                write_u32(memory, len_ptr, ciphertext.len() as u32);
+                                state.set(Register::Rax, 1);
+                                self.last_error = 0;
+                            }
+                        }
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = crate::advapi32::NTE_BAD_DATA;
+                        }
+                    }
+                }
+            }
+            HostThunk::CryptDecrypt => {
+                let key = guest_call_arg_u32(state, memory, 0)?;
+                let _hash = guest_call_arg_u32(state, memory, 1)?;
+                let final_call = guest_call_arg_u32(state, memory, 2)? != 0;
+                let _flags = guest_call_arg_u32(state, memory, 3)?;
+                let data_ptr = guest_call_arg(state, memory, 4)?;
+                let len_ptr = guest_call_arg(state, memory, 5)?;
+                let Some(key_state) = self.crypt_keys.get_mut(&u64::from(key)) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_KEY;
+                    return Ok(None);
+                };
+                if data_ptr == 0 || len_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let data_len = read_u32(memory, len_ptr)? as usize;
+                    let data = memory.read_bytes(data_ptr, data_len)?;
+                    match key_state.decrypt(&data) {
+                        Some(mut plaintext) => {
+                            if !final_call && key_state.block_size > 0 {
+                                // Intermediate blocks keep the padding; only
+                                // the final call strips it.
+                                plaintext = data;
+                            }
+                            memory.map_bytes(data_ptr, &plaintext);
+                            write_u32(memory, len_ptr, plaintext.len() as u32);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = crate::advapi32::NTE_BAD_DATA;
+                        }
+                    }
+                }
+            }
+            HostThunk::CryptDestroyKey => {
+                let key = guest_call_arg_u32(state, memory, 0)?;
+                if self.crypt_keys.remove(&u64::from(key)).is_some() {
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = crate::advapi32::NTE_BAD_KEY;
+                }
+            }
+            // ── advapi32: registry leftovers ─────────────────────────────────
+            HostThunk::RegEnumValueW => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let index = guest_call_arg_u32(state, memory, 1)?;
+                let name_ptr = guest_call_arg(state, memory, 2)?;
+                let name_size_ptr = guest_call_arg(state, memory, 3)?;
+                let _reserved = guest_call_arg_u32(state, memory, 4)?;
+                let type_ptr = guest_call_arg(state, memory, 5)?;
+                let data_ptr = guest_call_arg(state, memory, 6)?;
+                let data_size_ptr = guest_call_arg(state, memory, 7)?;
+                if name_size_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let (hive, key_path, key_view) = match resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                            return Ok(None);
+                        }
+                    };
+                    let normalized_key = normalize_registry_runtime_key(&hive, &key_path);
+                    let values = self.win32.ge().registry_enum_values(&hive, &normalized_key, key_view);
+                    match values {
+                        Ok(values) => {
+                            if index as usize >= values.len() {
+                                if name_size_ptr != 0 {
+                                    write_u32(memory, name_size_ptr, 0);
+                                }
+                                if name_ptr != 0 {
+                                    write_u16(memory, name_ptr, 0);
+                                }
+                                state.set(Register::Rax, ERROR_NO_MORE_ITEMS as u64);
+                                self.last_error = ERROR_NO_MORE_ITEMS;
+                            } else {
+                                let value_name = &values[index as usize];
+                                let stored = self.win32.ge().registry_get_value(
+                                    &hive,
+                                    &normalized_key,
+                                    value_name,
+                                    key_view,
+                                );
+                                let (value_type, data_bytes) = match stored {
+                                    Ok(Some(stored)) => {
+                                        let value_type = registry_value_type_to_win32(&stored.value_type)
+                                                            .unwrap_or(REG_SZ);
+                                        let data_bytes = encode_registry_value_data(&stored)
+                                                            .unwrap_or_default();
+                                        (value_type, data_bytes)
+                                    }
+                                    _ => (REG_SZ, Vec::new()),
+                                };
+                                let name_capacity = read_u32(memory, name_size_ptr)?;
+                                let char_count = write_utf16_api_string(
+                                    memory,
+                                    name_ptr,
+                                    name_capacity,
+                                    value_name,
+                                )?;
+                                write_u32(memory, name_size_ptr, char_count);
+                                if type_ptr != 0 {
+                                    write_u32(memory, type_ptr, value_type);
+                                }
+                                if data_size_ptr != 0 {
+                                    let data_capacity = read_u32(memory, data_size_ptr)?;
+                                    let written = data_bytes.len().min(data_capacity as usize);
+                                    if data_ptr != 0 && written > 0 {
+                                        memory.map_bytes(data_ptr, &data_bytes[..written]);
+                                    }
+                                    write_u32(memory, data_size_ptr, data_bytes.len() as u32);
+                                }
+                                state.set(Register::Rax, 0);
+                                self.last_error = 0;
+                            }
+                        }
+                        Err(error) => {
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
+            HostThunk::RegFlushKey => {
+                let _hkey = guest_call_arg_u32(state, memory, 0)?;
+                // The guest registry is write-through: the flush is a
+                // documented success.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::RegOpenCurrentUser => {
+                let _sam_desired = guest_call_arg_u32(state, memory, 0)?;
+                let key_out = guest_call_arg(state, memory, 1)?;
+                if key_out == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let view = registry_view_from_sam_desired(0, self.guest_arch);
+                    let handle = self.win32.open_registry_key("HKCU", "", view, false);
+                    write_u32(memory, key_out, handle);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::RegQueryInfoKeyW => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let class_ptr = guest_call_arg(state, memory, 1)?;
+                let class_size_ptr = guest_call_arg(state, memory, 2)?;
+                let _reserved = guest_call_arg_u32(state, memory, 3)?;
+                let subkeys_ptr = guest_call_arg(state, memory, 4)?;
+                let max_subkey_ptr = guest_call_arg(state, memory, 5)?;
+                let max_class_ptr = guest_call_arg(state, memory, 6)?;
+                let values_ptr = guest_call_arg(state, memory, 7)?;
+                let max_value_name_ptr = guest_call_arg(state, memory, 8)?;
+                let max_value_data_ptr = guest_call_arg(state, memory, 9)?;
+                let _security_descriptor_ptr = guest_call_arg(state, memory, 10)?;
+                let last_write_ptr = guest_call_arg(state, memory, 11)?;
+                let (hive, key_path, key_view) = match resolve_registry_root_key(
+                    &self.win32,
+                    hkey,
+                    registry_view_from_sam_desired(0, self.guest_arch),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let status = last_error_from_app_error(&error);
+                        state.set(Register::Rax, status as u64);
+                        self.last_error = status;
+                        return Ok(None);
+                    }
+                };
+                let normalized_key = normalize_registry_runtime_key(&hive, &key_path);
+                let subkeys = self.win32.ge().registry_enum_keys(&hive, &normalized_key, key_view);
+                let values = self.win32.ge().registry_enum_values(&hive, &normalized_key, key_view);
+                match (subkeys, values) {
+                    (Ok(subkeys), Ok(values)) => {
+                        let max_subkey = subkeys
+                            .iter()
+                            .map(|key| key.encode_utf16().count() as u32 + 1)
+                            .max()
+                            .unwrap_or(0);
+                        let max_value = values
+                            .iter()
+                            .map(|name| name.encode_utf16().count() as u32 + 1)
+                            .max()
+                            .unwrap_or(0);
+                        if subkeys_ptr != 0 {
+                            write_u32(memory, subkeys_ptr, subkeys.len() as u32);
+                        }
+                        if max_subkey_ptr != 0 {
+                            write_u32(memory, max_subkey_ptr, max_subkey);
+                        }
+                        if values_ptr != 0 {
+                            write_u32(memory, values_ptr, values.len() as u32);
+                        }
+                        if max_value_name_ptr != 0 {
+                            write_u32(memory, max_value_name_ptr, max_value);
+                        }
+                        if max_value_data_ptr != 0 {
+                            write_u32(memory, max_value_data_ptr, 0);
+                        }
+                        if class_ptr != 0 && class_size_ptr != 0 {
+                            write_u16(memory, class_ptr, 0);
+                        }
+                        if class_size_ptr != 0 {
+                            write_u32(memory, class_size_ptr, 0);
+                        }
+                        if max_class_ptr != 0 {
+                            write_u32(memory, max_class_ptr, 0);
+                        }
+                        if last_write_ptr != 0 {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            // The FILETIME domain: 100 ns intervals since
+                            // 1601-01-01 (11644473600 s offset).
+                            let filetime = now.saturating_add(11_644_473_600) * 10_000_000;
+                            write_u32(memory, last_write_ptr, filetime as u32);
+                            write_u32(memory, last_write_ptr + 4, (filetime >> 32) as u32);
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                    _ => {
+                        state.set(Register::Rax, ERROR_ACCESS_DENIED as u64);
+                        self.last_error = ERROR_ACCESS_DENIED;
+                    }
+                }
+            }
+            // ── advapi32: ETW event source ───────────────────────────────────
+            HostThunk::EventRegister => {
+                let provider_guid_ptr = guest_call_arg(state, memory, 0)?;
+                let _callback = guest_call_arg(state, memory, 1)?;
+                let _context = guest_call_arg(state, memory, 2)?;
+                let reg_handle_out = guest_call_arg(state, memory, 3)?;
+                if reg_handle_out == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let provider_guid = if provider_guid_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_guid_string(memory, provider_guid_ptr)?
+                    };
+                    let handle = self.next_event_registration_handle;
+                    self.next_event_registration_handle += 1;
+                    self.event_registrations.insert(handle, provider_guid);
+                    write_u64(memory, reg_handle_out, handle);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::EventUnregister => {
+                let reg_handle = guest_call_arg_u32(state, memory, 0)?;
+                if self.event_registrations.remove(&u64::from(reg_handle)).is_some() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::EventWrite => {
+                let reg_handle = guest_call_arg_u32(state, memory, 0)?;
+                let _descriptor = guest_call_arg(state, memory, 1)?;
+                let _count = guest_call_arg_u32(state, memory, 2)?;
+                let _data = guest_call_arg(state, memory, 3)?;
+                if self.event_registrations.contains_key(&u64::from(reg_handle)) {
+                    self.push_trace(
+                        "advapi32",
+                        "EventWrite",
+                        BTreeMap::from([("registration".to_string(), json!(reg_handle))]),
+                        json!(0),
+                    );
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
             HostThunk::GetComputerNameW => {
                 let buffer_ptr = guest_call_arg(state, memory, 0)?;
                 let size_ptr = guest_call_arg(state, memory, 1)?;
@@ -42393,6 +43832,417 @@ impl PeHostRuntime {
                         );
                     }
                 }
+            }
+            // ── shell32: icon / path / notify helpers ───────────────────────
+            HostThunk::ExtractIconW => {
+                let hinst = guest_call_arg_u32(state, memory, 0)?;
+                let file_ptr = guest_call_arg(state, memory, 1)?;
+                let _icon_index = guest_call_arg_u32(state, memory, 2)?;
+                let file = if file_ptr == 0 {
+                    self.module_paths_by_handle
+                        .get(&u64::from(hinst))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    read_utf16_string(memory, file_ptr)?
+                };
+                let extracted = self.extract_guest_icon(&file);
+                match extracted {
+                    Some(icon) => {
+                        let handle = self.next_icon_handle;
+                        self.next_icon_handle += 1;
+                        self.icons.insert(handle, icon);
+                        state.set(Register::Rax, handle);
+                        self.last_error = 0;
+                    }
+                    None => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::ExtractIconExW => {
+                let file_ptr = guest_call_arg(state, memory, 0)?;
+                let _icon_index = guest_call_arg_u32(state, memory, 1)?;
+                let large_out = guest_call_arg(state, memory, 2)?;
+                let small_out = guest_call_arg(state, memory, 3)?;
+                let count = guest_call_arg_u32(state, memory, 4)? as usize;
+                let file = if file_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, file_ptr)?
+                };
+                let icons = self.extract_all_guest_icons(&file);
+                let extracted = icons.len().min(count);
+                for (index, icon) in icons.into_iter().take(extracted).enumerate() {
+                    let handle = self.next_icon_handle;
+                    self.next_icon_handle += 1;
+                    self.icons.insert(handle, icon);
+                    let slot = index as u64 * self.guest_arch.pointer_bytes() as u64;
+                    if large_out != 0 {
+                        write_guest_pointer(memory, large_out + slot, handle, self.guest_arch)?;
+                    }
+                    if small_out != 0 {
+                        write_guest_pointer(memory, small_out + slot, handle, self.guest_arch)?;
+                    }
+                }
+                state.set(Register::Rax, extracted as u64);
+                self.last_error = 0;
+            }
+            HostThunk::PathIsNetworkPathW => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let path = if path_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, path_ptr)?
+                };
+                // The documented rule: a network path starts with two
+                // backslashes (\\server\share) or a device-namespace form.
+                let is_network = path.starts_with("\\\\")
+                    || path.starts_with("//")
+                    || path.starts_with("\\??\\UNC\\");
+                state.set(Register::Rax, u64::from(is_network));
+                self.last_error = 0;
+            }
+            HostThunk::PathRelativePathToW => {
+                let out_ptr = guest_call_arg(state, memory, 0)?;
+                let from_ptr = guest_call_arg(state, memory, 1)?;
+                let _from_attr = guest_call_arg_u32(state, memory, 2)?;
+                let to_ptr = guest_call_arg(state, memory, 3)?;
+                let _to_attr = guest_call_arg_u32(state, memory, 4)?;
+                let from = if from_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, from_ptr)?
+                };
+                let to = if to_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, to_ptr)?
+                };
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    match shlwapi_relative_path_to(&from, &to) {
+                        Some(relative) => {
+                            let bytes = relative
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(out_ptr, &bytes);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        None => {
+                            write_u16(memory, out_ptr, 0);
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                        }
+                    }
+                }
+            }
+            HostThunk::PathMakeUniqueName => {
+                let unique_ptr = guest_call_arg(state, memory, 0)?;
+                let _cch = guest_call_arg_u32(state, memory, 1)?;
+                let template_ptr = guest_call_arg(state, memory, 2)?;
+                let _long_name_ptr = guest_call_arg(state, memory, 3)?;
+                let _flags = guest_call_arg_u32(state, memory, 4)?;
+                let template = if template_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, template_ptr)?
+                };
+                if unique_ptr == 0 || template.is_empty() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let unique = self.make_unique_guest_path(&template);
+                    let bytes = unique
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(unique_ptr, &bytes);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::SHChangeNotify => {
+                let event_id = guest_call_arg_u32(state, memory, 0)?;
+                let _flags = guest_call_arg_u32(state, memory, 1)?;
+                let _item1 = guest_call_arg(state, memory, 2)?;
+                let _item2 = guest_call_arg(state, memory, 3)?;
+                // The documented change-notification contract: the function
+                // reports the change and returns no value.  The runtime
+                // publishes it to the trace/observer layer.
+                self.push_trace(
+                    "shell32",
+                    "SHChangeNotify",
+                    BTreeMap::from([("event".to_string(), json!(format!("{event_id:#x}")))]),
+                    json!(null),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::SHCreateDirectoryExW => {
+                let _hwnd = guest_call_arg(state, memory, 0)?;
+                let path_ptr = guest_call_arg(state, memory, 1)?;
+                let _security_attrs = guest_call_arg(state, memory, 2)?;
+                let path = if path_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, path_ptr)?
+                };
+                if path.is_empty() {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // Recursive mkdir through the guest filesystem layer;
+                    // the documented ERROR_ALREADY_EXISTS when the
+                    // directory already exists.
+                    let result = (|| -> AppResult<bool> {
+                        let host_path = self.win32.guest_path_to_host_path(&path)?;
+                        if host_path.is_dir() {
+                            return Ok(false);
+                        }
+                        if host_path.is_file() {
+                            return Err(AppError::new(
+                                ReasonCode::RcIo,
+                                format!("path exists as a file: {path}"),
+                            ));
+                        }
+                        fs::create_dir_all(&host_path).map_err(|error| {
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!("SHCreateDirectoryExW failed for {path}"),
+                                &error,
+                            )
+                        })?;
+                        Ok(true)
+                    })();
+                    match result {
+                        Ok(true) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                        }
+                        Ok(false) => {
+                            state.set(Register::Rax, crate::advapi32::ERROR_ALREADY_EXISTS as u64);
+                            self.last_error = crate::advapi32::ERROR_ALREADY_EXISTS;
+                        }
+                        Err(error) => {
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
+            HostThunk::SHCreateShellItem => {
+                let _pidl_parent = guest_call_arg(state, memory, 0)?;
+                let _psf_parent = guest_call_arg(state, memory, 1)?;
+                let pidl = guest_call_arg(state, memory, 2)?;
+                let out_ptr = guest_call_arg(state, memory, 3)?;
+                if pidl == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // The PIDL model aliases the item path as a UTF-16
+                    // string; the shell item object carries that path.
+                    let path = read_utf16_string(memory, pidl)?;
+                    let item = self.alloc_utf16_string(memory, &path)?;
+                    self.shell_item_paths.insert(item, path);
+                    write_guest_pointer(memory, out_ptr, item, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::SHFileOperationW => {
+                let op_ptr = guest_call_arg(state, memory, 0)?;
+                if op_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    // SHFILEOPSTRUCTW (x86): hwnd(0) wFunc(4) pFrom(8)
+                    // pTo(12) fFlags(16) fAnyOperationsAborted(18).
+                    let function = read_u32(memory, op_ptr + 4)?;
+                    let from_ptr = read_guest_pointer(memory, op_ptr + 8, self.guest_arch)?;
+                    let to_ptr = read_guest_pointer(memory, op_ptr + 12, self.guest_arch)?;
+                    let from = if from_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_utf16_string(memory, from_ptr)?
+                    };
+                    let to = if to_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_utf16_string(memory, to_ptr)?
+                    };
+                    let status = self.shell_file_operation(function, &from, &to);
+                    state.set(Register::Rax, status as u64);
+                    self.last_error = status;
+                }
+            }
+            HostThunk::SHGetMalloc => {
+                let out_ptr = guest_call_arg(state, memory, 0)?;
+                if out_ptr == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let methods = vec![
+                        HostThunk::SHMallocQueryInterface,
+                        HostThunk::SHMallocAddRef,
+                        HostThunk::SHMallocRelease,
+                        HostThunk::SHMallocAlloc,
+                        HostThunk::SHMallocRealloc,
+                        HostThunk::SHMallocFree,
+                        HostThunk::SHMallocGetSize,
+                        HostThunk::SHMallocDidAlloc,
+                        HostThunk::SHMallocHeapMinimize,
+                    ];
+                    let vtable = self.alloc_guest_vtable(memory, methods)?;
+                    let object = self.alloc_guest_object(memory, GuestObjectKind::ShMalloc, vtable)?;
+                    write_guest_pointer(memory, out_ptr, object, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::SHUpdateImageW => {
+                let _hash_item_ptr = guest_call_arg(state, memory, 0)?;
+                let _index = guest_call_arg_u32(state, memory, 1)?;
+                let _flags = guest_call_arg_u32(state, memory, 2)?;
+                let _image_list = guest_call_arg_u32(state, memory, 3)?;
+                // The documented no-op: the runtime has no shared icon
+                // cache to invalidate; the request is recorded.
+                self.push_trace(
+                    "shell32",
+                    "SHUpdateImageW",
+                    BTreeMap::new(),
+                    json!(null),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::ShellExecuteW => {
+                let _hwnd = guest_call_arg(state, memory, 0)?;
+                let verb_ptr = guest_call_arg(state, memory, 1)?;
+                let file_ptr = guest_call_arg(state, memory, 2)?;
+                let _params_ptr = guest_call_arg(state, memory, 3)?;
+                let _dir_ptr = guest_call_arg(state, memory, 4)?;
+                let _show = guest_call_arg_u32(state, memory, 5)?;
+                let verb = if verb_ptr == 0 {
+                    String::from("open")
+                } else {
+                    read_utf16_string(memory, verb_ptr)?
+                };
+                let file = if file_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, file_ptr)?
+                };
+                if verb.eq_ignore_ascii_case("open") && !file.is_empty() {
+                    if let Err(_error) = Command::new("open").arg(&file).spawn() {
+                        let _ = Command::new("xdg-open").arg(&file).spawn();
+                    }
+                    // Success: a HINSTANCE value above 32 (SE_ERR_* range).
+                    state.set(Register::Rax, 42);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_ACCESS_DENIED;
+                }
+            }
+            // IMalloc vtable methods (SHGetMalloc).
+            HostThunk::SHMallocQueryInterface => {
+                let this = guest_call_arg(state, memory, 0)?;
+                let iid_ptr = guest_call_arg(state, memory, 1)?;
+                let out_ptr = guest_call_arg(state, memory, 2)?;
+                let iid = read_guid_string(memory, iid_ptr)?;
+                // IID_IUnknown {00000000-0000-0000-C000-000000000046} and
+                // IID_IMalloc {00000002-0000-0000-C000-000000000046}.
+                let supported = iid.eq_ignore_ascii_case("00000000-0000-0000-c000-000000000046")
+                    || iid.eq_ignore_ascii_case("00000002-0000-0000-c000-000000000046");
+                if out_ptr != 0 {
+                    write_guest_pointer(
+                        memory,
+                        out_ptr,
+                        if supported { this } else { 0 },
+                        self.guest_arch,
+                    )?;
+                }
+                state.set(Register::Rax, if supported { 0 } else { E_NOINTERFACE });
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocAddRef => {
+                let this = guest_call_arg(state, memory, 0)?;
+                state.set(Register::Rax, self.add_ref_guest_object(this)? as u64);
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocRelease => {
+                let this = guest_call_arg(state, memory, 0)?;
+                state.set(Register::Rax, self.release_guest_object(this)? as u64);
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocAlloc => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let allocation = self.alloc_heap(memory, size, true)?;
+                state.set(Register::Rax, allocation);
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocRealloc => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                let old_ptr = guest_call_arg(state, memory, 1)?;
+                let new_size = guest_call_arg(state, memory, 2)? as usize;
+                if old_ptr == 0 {
+                    let allocation = self.alloc_heap(memory, new_size, true)?;
+                    state.set(Register::Rax, allocation);
+                } else if let Some(&old_size) = self.heap_allocations.get(&old_ptr) {
+                    let allocation = self.alloc_heap(memory, new_size, true)?;
+                    let copy_len = old_size.min(new_size);
+                    let old_bytes = memory.read_bytes(old_ptr, copy_len)?;
+                    memory.map_bytes(allocation, &old_bytes);
+                    self.heap_allocations.remove(&old_ptr);
+                    state.set(Register::Rax, allocation);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocFree => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                let ptr = guest_call_arg(state, memory, 1)?;
+                if ptr != 0 {
+                    self.heap_allocations.remove(&ptr);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocGetSize => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                let ptr = guest_call_arg(state, memory, 1)?;
+                state.set(
+                    Register::Rax,
+                    self.heap_allocations
+                        .get(&ptr)
+                        .copied()
+                        // The documented "size unknown" result.
+                        .map(|size| size as u64)
+                        .unwrap_or(u64::MAX),
+                );
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocDidAlloc => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                let ptr = guest_call_arg(state, memory, 1)?;
+                state.set(
+                    Register::Rax,
+                    if self.heap_allocations.contains_key(&ptr) { 1 } else { 0 },
+                );
+                self.last_error = 0;
+            }
+            HostThunk::SHMallocHeapMinimize => {
+                let _this = guest_call_arg(state, memory, 0)?;
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
             }
             // ── shlwapi.dll: path helpers (pure string operations) ─────────
             HostThunk::PathAppendW => {
@@ -54686,11 +56536,11 @@ impl PeHostRuntime {
                 let callback_instance = guest_call_arg_u32(state, memory, 3)?;
                 let _flags = guest_call_arg_u32(state, memory, 4)?;
                 let cb = if callback != 0 { Some((callback, callback_instance as u64)) } else { None };
-                let handle = self.audio.winmm.write().unwrap().midi_out_open(device_id, cb);
+                let (rc, handle) = self.audio.winmm.write().unwrap().midi_out_open(device_id, cb);
                 if phmo != 0 {
                     write_u32(memory, phmo, handle);
                 }
-                state.set(Register::Rax, handle as u64);
+                state.set(Register::Rax, rc as u64);
                 self.last_error = 0;
             }
             // midiOutClose(hmio)
@@ -54776,11 +56626,11 @@ impl PeHostRuntime {
                 let callback_instance = guest_call_arg_u32(state, memory, 3)?;
                 let _flags = guest_call_arg_u32(state, memory, 4)?;
                 let cb = if callback != 0 { Some((callback, callback_instance as u64)) } else { None };
-                let handle = self.audio.winmm.write().unwrap().midi_in_open(device_id, cb);
+                let (rc, handle) = self.audio.winmm.write().unwrap().midi_in_open(device_id, cb);
                 if phmi != 0 {
                     write_u32(memory, phmi, handle);
                 }
-                state.set(Register::Rax, handle as u64);
+                state.set(Register::Rax, rc as u64);
                 self.last_error = 0;
             }
             // midiInClose(hmi)
@@ -60147,6 +61997,11 @@ impl PeHostRuntime {
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::D2d1RenderTarget => {
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::ShMalloc => {
+                // The standard allocator is stateless apart from the COM
+                // refcount (tracked in guest_objects).
                 self.guest_objects.remove(&address);
             }
         }
@@ -72941,6 +74796,140 @@ impl HostThunk {
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetUserNameW" => {
                 Self::GetUserNameW
             }
+            // -- advapi32: access tokens, SCM, CryptoAPI (mid families) --
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "AdjustTokenPrivileges" =>
+            {
+                Self::AdjustTokenPrivileges
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "AllocateAndInitializeSid" =>
+            {
+                Self::AllocateAndInitializeSid
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CheckTokenMembership" =>
+            {
+                Self::CheckTokenMembership
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "DuplicateTokenEx" => {
+                Self::DuplicateTokenEx
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "FreeSid" => {
+                Self::FreeSid
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetTokenInformation" =>
+            {
+                Self::GetTokenInformation
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImpersonateLoggedOnUser" =>
+            {
+                Self::ImpersonateLoggedOnUser
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "LookupPrivilegeValueW" =>
+            {
+                Self::LookupPrivilegeValueW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenProcessToken" => {
+                Self::OpenProcessToken
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenThreadToken" => {
+                Self::OpenThreadToken
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RevertToSelf" => {
+                Self::RevertToSelf
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetUserNameA" => {
+                Self::GetUserNameA
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "LogonUserW" => {
+                Self::LogonUserW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CloseServiceHandle" => {
+                Self::CloseServiceHandle
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "ControlService" => {
+                Self::ControlService
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateServiceW" => {
+                Self::CreateServiceW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "DeleteService" => {
+                Self::DeleteService
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenSCManagerW" => {
+                Self::OpenSCManagerW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenServiceW" => {
+                Self::OpenServiceW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "QueryServiceStatus" => {
+                Self::QueryServiceStatus
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "StartServiceW" => {
+                Self::StartServiceW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CryptAcquireContextW" =>
+            {
+                Self::CryptAcquireContextW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptCreateHash" => {
+                Self::CryptCreateHash
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptDecrypt" => {
+                Self::CryptDecrypt
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptDeriveKey" => {
+                Self::CryptDeriveKey
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptDestroyHash" => {
+                Self::CryptDestroyHash
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptDestroyKey" => {
+                Self::CryptDestroyKey
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptEncrypt" => {
+                Self::CryptEncrypt
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptGenRandom" => {
+                Self::CryptGenRandom
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptGetHashParam" => {
+                Self::CryptGetHashParam
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "CryptHashData" => {
+                Self::CryptHashData
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CryptReleaseContext" =>
+            {
+                Self::CryptReleaseContext
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegEnumValueW" => {
+                Self::RegEnumValueW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegFlushKey" => {
+                Self::RegFlushKey
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegOpenCurrentUser" => {
+                Self::RegOpenCurrentUser
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegQueryInfoKeyW" => {
+                Self::RegQueryInfoKeyW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "EventRegister" => {
+                Self::EventRegister
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "EventUnregister" => {
+                Self::EventUnregister
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "EventWrite" => {
+                Self::EventWrite
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetComputerNameW" => {
                 Self::GetComputerNameW
             }
@@ -73022,6 +75011,66 @@ impl HostThunk {
             }
             ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "ShellExecuteExW" => {
                 Self::ShellExecuteExW
+            }
+            // -- shell32: icon/path/notify helpers (mid families) ---------
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "ExtractIconW" => {
+                Self::ExtractIconW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "ExtractIconExW" => {
+                Self::ExtractIconExW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathAppendW" => {
+                Self::PathAppendW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathCombineW" => {
+                Self::PathCombineW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathFileExistsW" => {
+                Self::PathFileExistsW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathFindExtensionW" => {
+                Self::PathFindExtensionW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathFindFileNameW" => {
+                Self::PathFindFileNameW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathIsDirectoryW" => {
+                Self::PathIsDirectoryW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathIsNetworkPathW" => {
+                Self::PathIsNetworkPathW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathMakeUniqueName" => {
+                Self::PathMakeUniqueName
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathRelativePathToW" => {
+                Self::PathRelativePathToW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "PathRemoveFileSpecW" => {
+                Self::PathRemoveFileSpecW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHChangeNotify" => {
+                Self::SHChangeNotify
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. })
+                if name == "SHCreateDirectoryExW" =>
+            {
+                Self::SHCreateDirectoryExW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHCreateShellItem" => {
+                Self::SHCreateShellItem
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHFileOperationW" => {
+                Self::SHFileOperationW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHGetMalloc" => {
+                Self::SHGetMalloc
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHUpdateImageW" => {
+                Self::SHUpdateImageW
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "ShellExecuteW" => {
+                Self::ShellExecuteW
             }
             // -- WinHTTP (winhttp.dll) -------------------------------------------
             ("winhttp.dll", ImportSymbol::ByName { name, .. }) if name == "WinHttpOpen" => {
@@ -75445,6 +77494,103 @@ impl HostThunk {
             }
             ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioStringToFOURCCW" => {
                 Self::MmioStringToFOURCCW
+            }
+            // -- winmmbase.dll: the same wave/midi device surface (the
+            //    exports dispatch into the shared winmm device model).
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutOpen" => {
+                Self::WaveOutOpen
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutClose" => {
+                Self::WaveOutClose
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutWrite" => {
+                Self::WaveOutWrite
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutReset" => {
+                Self::WaveOutReset
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutGetVolume" => {
+                Self::WaveOutGetVolume
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutSetVolume" => {
+                Self::WaveOutSetVolume
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "waveOutGetDevCapsW" =>
+            {
+                Self::WaveOutGetDevCapsW
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutGetNumDevs" => {
+                Self::WaveOutGetNumDevs
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInOpen" => {
+                Self::WaveInOpen
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInClose" => {
+                Self::WaveInClose
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "waveInPrepareHeader" =>
+            {
+                Self::WaveInPrepareHeader
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "waveInUnprepareHeader" =>
+            {
+                Self::WaveInUnprepareHeader
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInAddBuffer" => {
+                Self::WaveInAddBuffer
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInStart" => {
+                Self::WaveInStart
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInStop" => {
+                Self::WaveInStop
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInGetDevCapsW" => {
+                Self::WaveInGetDevCapsW
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "waveInGetNumDevs" => {
+                Self::WaveInGetNumDevs
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutOpen" => {
+                Self::MidiOutOpen
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutClose" => {
+                Self::MidiOutClose
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutShortMsg" => {
+                Self::MidiOutShortMsg
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutLongMsg" => {
+                Self::MidiOutLongMsg
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutReset" => {
+                Self::MidiOutReset
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "midiOutGetDevCapsW" =>
+            {
+                Self::MidiOutGetDevCapsW
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutGetNumDevs" => {
+                Self::MidiOutGetNumDevs
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiInOpen" => {
+                Self::MidiInOpen
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiInClose" => {
+                Self::MidiInClose
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiInStart" => {
+                Self::MidiInStart
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiInStop" => {
+                Self::MidiInStop
+            }
+            ("winmmbase.dll", ImportSymbol::ByName { name, .. }) if name == "midiInReset" => {
+                Self::MidiInReset
             }
             ("dwmapi.dll", ImportSymbol::ByName { name, .. })
                 if name == "DwmIsCompositionEnabled" =>
@@ -78475,9 +80621,31 @@ fn encode_registry_value_data(value: &crate::ge::StoredRegistryValue) -> AppResu
         }
         other => Err(AppError::new(
             ReasonCode::RcCliInvalid,
-            format!("unsupported registry value type {other}"),
+            format!("unsupported registry value type code {other}"),
         )),
     }
+}
+
+/// Write a documented SERVICE_STATUS structure (28 bytes, all DWORDs).
+#[allow(clippy::too_many_arguments)]
+fn write_service_status(
+    memory: &mut MemoryImage,
+    status_ptr: u64,
+    service_type: u32,
+    current_state: u32,
+    controls_accepted: u32,
+    win32_exit_code: u32,
+    service_specific_exit_code: u32,
+    checkpoint: u32,
+    wait_hint: u32,
+) {
+    write_u32(memory, status_ptr, service_type);
+    write_u32(memory, status_ptr + 4, current_state);
+    write_u32(memory, status_ptr + 8, controls_accepted);
+    write_u32(memory, status_ptr + 12, win32_exit_code);
+    write_u32(memory, status_ptr + 16, service_specific_exit_code);
+    write_u32(memory, status_ptr + 20, checkpoint);
+    write_u32(memory, status_ptr + 24, wait_hint);
 }
 
 fn decode_registry_value_data_ansi(
@@ -103486,13 +105654,6 @@ mod tests {
                 &[0, 0 /* main module */, name_buf as u32, 128],
             );
 
-            assert!(written > 0, "GetModuleFileNameExW returns the char count");
-            let name = read_utf16_string(&memory, name_buf).expect("module path");
-            assert_eq!(
-                name, "C:\\Games\\SampleGame\\game.ex",
-                "the module path is written up to the buffer's NUL slot"
-            );
-
             assert_eq!(
                 written, 28,
                 "GetModuleFileNameExW returns the full char count when the buffer fits"
@@ -103501,7 +105662,6 @@ mod tests {
             assert_eq!(
                 name, "C:\\Games\\SampleGame\\game.exe",
                 "the module path is written in full when the buffer fits"
-
             );
 
             let info = 0x30_100_u64;
@@ -112019,8 +114179,6 @@ mod tests {
             );
             assert_eq!(result, 0x8007_0057);
         })
-
-
     }
 
     // ── Evidence-ui-gdi-sys: user32 focus/message/ANSI surface ───────────────
@@ -113519,7 +115677,2198 @@ mod tests {
             );
             assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
         })
+    }
 
+    // ── evidence-mid: advapi32 token machinery ─────────────────────────────
+    #[test]
+    fn evidence_mid_advapi32_token_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-token");
+            let mut memory = MemoryImage::default();
+
+            // OpenProcessToken mints the process token lazily.
+            let token_out = 0x61_000;
+            memory.map_bytes(token_out, &[0; 4]);
+            let open_process_token = runtime.alloc_host_thunk(HostThunk::OpenProcessToken);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_process_token,
+                    &[0xFFFF_FFFF, 0x20008, token_out as u32]
+                ),
+                1
+            );
+            let token_handle = read_u32(&memory, token_out).expect("token handle");
+            assert_ne!(token_handle, 0);
+            assert_eq!(
+                runtime
+                    .tokens
+                    .get(&u64::from(token_handle))
+                    .map(|token| token.user_name.as_str()),
+                Some("user")
+            );
+
+            // GetTokenInformation(TokenUser): the guest user SID.
+            let info = 0x61_100;
+            memory.map_bytes(info, &[0; 128]);
+            let ret_len = 0x61_200;
+            memory.map_bytes(ret_len, &[0; 4]);
+            let get_token_info = runtime.alloc_host_thunk(HostThunk::GetTokenInformation);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_token_info,
+                    &[token_handle, 1, info as u32, 128, ret_len as u32]
+                ),
+                1
+            );
+            let user_sid_ptr =
+                read_guest_pointer(&memory, info, GuestArch::X86).expect("user psid");
+            let user_sid = memory
+                .read_bytes(user_sid_ptr, 8 + 5 * 4)
+                .expect("user sid bytes");
+            assert_eq!(
+                crate::advapi32::decode_sid(&user_sid).expect("decode sid"),
+                "S-1-5-21-3654781254-1934577812-2019068222-1001"
+            );
+
+            // GetTokenInformation(TokenPrivileges): SeChangeNotifyPrivilege
+            // is present and enabled; SeShutdownPrivilege disabled.
+            let priv_info = 0x61_300;
+            memory.map_bytes(priv_info, &[0; 256]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_token_info,
+                    &[token_handle, 3, priv_info as u32, 256, ret_len as u32]
+                ),
+                1
+            );
+            let privilege_count = read_u32(&memory, priv_info).expect("privilege count");
+            assert!(privilege_count >= 10);
+            let mut seen_change_notify = false;
+            let mut seen_shutdown = false;
+            for index in 0..privilege_count as u64 {
+                let slot = priv_info + 8 + index * 16;
+                let luid = read_u64(&memory, slot).expect("luid");
+                let attributes = read_u32(&memory, slot + 8).expect("attributes");
+                if luid == 23 {
+                    seen_change_notify = true;
+                    assert_eq!(attributes & 2, 2, "SeChangeNotifyPrivilege enabled");
+                }
+                if luid == 19 {
+                    seen_shutdown = true;
+                    assert_eq!(attributes & 2, 0, "SeShutdownPrivilege disabled");
+                }
+            }
+            assert!(seen_change_notify && seen_shutdown);
+
+            // GetTokenInformation(TokenType/TokenElevation/TokenIntegrityLevel).
+            let word = 0x61_400;
+            memory.map_bytes(word, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_token_info,
+                    &[token_handle, 8, word as u32, 4, ret_len as u32]
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, word).expect("token type"), 1); // TokenPrimary
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_token_info,
+                    &[token_handle, 20, word as u32, 4, ret_len as u32]
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, word).expect("elevation"), 0);
+            let il_info = 0x61_500;
+            memory.map_bytes(il_info, &[0; 64]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_token_info,
+                    &[token_handle, 25, il_info as u32, 64, ret_len as u32]
+                ),
+                1
+            );
+            let il_sid_ptr = read_guest_pointer(&memory, il_info, GuestArch::X86).expect("il sid");
+            let il_sid = memory.read_bytes(il_sid_ptr, 12).expect("il sid bytes");
+            assert_eq!(
+                crate::advapi32::decode_sid(&il_sid).expect("decode il sid"),
+                "S-1-16-8192"
+            );
+
+            // LookupPrivilegeValueW: the documented LUID constants.
+            let name_ptr = runtime
+                .alloc_utf16_string(&mut memory, "SeDebugPrivilege")
+                .expect("name");
+            let luid_out = 0x61_600;
+            memory.map_bytes(luid_out, &[0; 8]);
+            let lookup_privilege = runtime.alloc_host_thunk(HostThunk::LookupPrivilegeValueW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lookup_privilege,
+                    &[0, name_ptr as u32, luid_out as u32]
+                ),
+                1
+            );
+            assert_eq!(read_u64(&memory, luid_out).expect("luid"), 20);
+            let bad_name_ptr = runtime
+                .alloc_utf16_string(&mut memory, "SeNoSuchPrivilege")
+                .expect("name");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lookup_privilege,
+                    &[0, bad_name_ptr as u32, luid_out as u32]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_NO_SUCH_PRIVILEGE);
+
+            // AdjustTokenPrivileges enables SeShutdownPrivilege; the change
+            // is visible through GetTokenInformation.
+            let new_state = 0x61_700;
+            memory.map_bytes(new_state, &[0; 32]);
+            write_u32(&mut memory, new_state, 1);
+            write_u64(&mut memory, new_state + 8, 19);
+            write_u32(&mut memory, new_state + 16, 2); // SE_PRIVILEGE_ENABLED
+            let adjust = runtime.alloc_host_thunk(HostThunk::AdjustTokenPrivileges);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    adjust,
+                    &[token_handle, 0, new_state as u32, 0, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(runtime.last_error, 0);
+            assert!(
+                runtime
+                    .tokens
+                    .get(&u64::from(token_handle))
+                    .expect("token")
+                    .privilege_enabled(19),
+                "SeShutdownPrivilege is enabled after AdjustTokenPrivileges"
+            );
+            // An unknown LUID reports ERROR_NOT_ALL_ASSIGNED (still TRUE).
+            let unknown_state = 0x61_720;
+            memory.map_bytes(unknown_state, &[0; 32]);
+            write_u32(&mut memory, unknown_state, 1);
+            write_u64(&mut memory, unknown_state + 8, 9999);
+            write_u32(&mut memory, unknown_state + 16, 2);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    adjust,
+                    &[token_handle, 0, unknown_state as u32, 0, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_NOT_ALL_ASSIGNED);
+
+            // AllocateAndInitializeSid → CheckTokenMembership → FreeSid.
+            let sid_out = 0x61_800;
+            memory.map_bytes(sid_out, &[0; 4]);
+            let alloc_sid = runtime.alloc_host_thunk(HostThunk::AllocateAndInitializeSid);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    alloc_sid,
+                    &[
+                        0,
+                        0,
+                        0,
+                        5,
+                        21,
+                        0x1111_1111,
+                        0x2222_2222,
+                        0x3333_3333,
+                        sid_out as u32
+                    ]
+                ),
+                1
+            );
+            let sid_handle = read_u32(&memory, sid_out).expect("sid handle");
+            let sid_bytes = runtime
+                .allocated_sids
+                .get(&u64::from(sid_handle))
+                .cloned()
+                .expect("sid");
+            assert_eq!(
+                crate::advapi32::decode_sid(&sid_bytes).expect("decode"),
+                "S-1-5-21-286331153-572662306-858993459"
+            );
+            let check = runtime.alloc_host_thunk(HostThunk::CheckTokenMembership);
+            let member_out = 0x61_900;
+            memory.map_bytes(member_out, &[0; 4]);
+            let guest_sid = crate::advapi32::guest_user_sid();
+            let sid_storage = runtime
+                .alloc_heap(&mut memory, guest_sid.len(), true)
+                .expect("sid heap");
+            memory.map_bytes(sid_storage, &guest_sid);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    check,
+                    &[token_handle, sid_storage as u32, member_out as u32]
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, member_out).expect("member"), 1);
+            // A SID outside the token is not a member.
+            let system_sid = crate::advapi32::encode_sid("S-1-5-18").expect("system sid");
+            let system_storage = runtime
+                .alloc_heap(&mut memory, system_sid.len(), true)
+                .expect("sid heap");
+            memory.map_bytes(system_storage, &system_sid);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    check,
+                    &[token_handle, system_storage as u32, member_out as u32]
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, member_out).expect("member"), 0);
+            let free_sid = runtime.alloc_host_thunk(HostThunk::FreeSid);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, free_sid, &[sid_handle]),
+                0,
+                "FreeSid returns NULL on success"
+            );
+            assert!(!runtime.allocated_sids.contains_key(&u64::from(sid_handle)));
+
+            // DuplicateTokenEx copies the token into a new handle.
+            let dup_out = 0x61_A00;
+            memory.map_bytes(dup_out, &[0; 4]);
+            let duplicate = runtime.alloc_host_thunk(HostThunk::DuplicateTokenEx);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    duplicate,
+                    &[token_handle, 0x20008, 0, 2, 1, dup_out as u32]
+                ),
+                1
+            );
+            let duplicated = read_u32(&memory, dup_out).expect("dup handle");
+            assert_ne!(duplicated, token_handle);
+
+            // ImpersonateLoggedOnUser → OpenThreadToken succeeds; RevertToSelf
+            // → OpenThreadToken reports ERROR_NO_TOKEN.
+            let impersonate = runtime.alloc_host_thunk(HostThunk::ImpersonateLoggedOnUser);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, impersonate, &[duplicated]),
+                1
+            );
+            let thread_token_out = 0x61_B00;
+            memory.map_bytes(thread_token_out, &[0; 4]);
+            let open_thread_token = runtime.alloc_host_thunk(HostThunk::OpenThreadToken);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_thread_token,
+                    &[0xFFFF_FFFF, 0x20008, 0, thread_token_out as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                read_u32(&memory, thread_token_out).expect("thread token"),
+                duplicated
+            );
+            let revert = runtime.alloc_host_thunk(HostThunk::RevertToSelf);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, revert, &[]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_thread_token,
+                    &[0xFFFF_FFFF, 0x20008, 0, thread_token_out as u32]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_NO_TOKEN);
+
+            // GetUserNameA: the ANSI user name with the size contract.
+            let ansi_buf = 0x61_C00;
+            memory.map_bytes(ansi_buf, &[0; 32]);
+            let ansi_size = 0x61_D00;
+            memory.map_bytes(ansi_size, &32_u32.to_le_bytes());
+            let get_user_name_a = runtime.alloc_host_thunk(HostThunk::GetUserNameA);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_user_name_a,
+                    &[ansi_buf as u32, ansi_size as u32]
+                ),
+                1
+            );
+            let name = memory.read_bytes(ansi_buf, 32).expect("ansi name");
+            let name = String::from_utf8_lossy(&name);
+            assert!(name.starts_with("user\0"), "ANSI user name: {name:?}");
+
+            // LogonUserW: the guest user logs on; unknown users fail.
+            let logon_user = runtime.alloc_host_thunk(HostThunk::LogonUserW);
+            let logon_name = runtime
+                .alloc_utf16_string(&mut memory, "user")
+                .expect("logon name");
+            let logon_password = runtime
+                .alloc_utf16_string(&mut memory, "pw")
+                .expect("password");
+            let logon_out = 0x61_E00;
+            memory.map_bytes(logon_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    logon_user,
+                    &[
+                        logon_name as u32,
+                        0,
+                        logon_password as u32,
+                        2,
+                        0,
+                        logon_out as u32
+                    ]
+                ),
+                1
+            );
+            assert_ne!(read_u32(&memory, logon_out).expect("logon token"), 0);
+            let bad_name = runtime
+                .alloc_utf16_string(&mut memory, "admin")
+                .expect("bad name");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    logon_user,
+                    &[
+                        bad_name as u32,
+                        0,
+                        logon_password as u32,
+                        2,
+                        0,
+                        logon_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_LOGON_FAILURE);
+        })
+    }
+
+    // ── evidence-mid: advapi32 service control manager ────────────────────
+    #[test]
+    fn evidence_mid_advapi32_scm_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-scm");
+            let mut memory = MemoryImage::default();
+
+            // OpenSCManagerW returns a manager handle.
+            let open_manager = runtime.alloc_host_thunk(HostThunk::OpenSCManagerW);
+            let manager =
+                dispatch_x86_thunk(&mut runtime, &mut memory, open_manager, &[0, 0, 0x10006]);
+            assert_ne!(manager, 0);
+
+            // CreateServiceW writes the service into the guest registry.
+            let service_name = runtime
+                .alloc_utf16_string(&mut memory, "DemoSvc")
+                .expect("name");
+            let display_name = runtime
+                .alloc_utf16_string(&mut memory, "Demo Service")
+                .expect("display");
+            let image_path = runtime
+                .alloc_utf16_string(&mut memory, "C:\\bin\\demo.exe")
+                .expect("path");
+            let create = runtime.alloc_host_thunk(HostThunk::CreateServiceW);
+            let service_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create,
+                &[
+                    manager as u32,
+                    service_name as u32,
+                    display_name as u32,
+                    0xF01FF,
+                    crate::advapi32::SERVICE_WIN32_OWN_PROCESS,
+                    crate::advapi32::SERVICE_AUTO_START,
+                    crate::advapi32::SERVICE_ERROR_NORMAL,
+                    image_path as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert_ne!(service_handle, 0);
+            let ge = runtime.win32.ge();
+            let image_path_stored = ge
+                .registry_get_value(
+                    "HKLM",
+                    "SYSTEM\\CurrentControlSet\\Services\\DemoSvc",
+                    "ImagePath",
+                    crate::ge::RegistryView::Native,
+                )
+                .expect("registry read")
+                .expect("image path value");
+            assert_eq!(image_path_stored.data.as_str(), Some("C:\\bin\\demo.exe"));
+
+            // A duplicate CreateServiceW reports ERROR_SERVICE_EXISTS.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create,
+                    &[
+                        manager as u32,
+                        service_name as u32,
+                        display_name as u32,
+                        0xF01FF,
+                        crate::advapi32::SERVICE_WIN32_OWN_PROCESS,
+                        crate::advapi32::SERVICE_AUTO_START,
+                        crate::advapi32::SERVICE_ERROR_NORMAL,
+                        image_path as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_SERVICE_EXISTS);
+
+            // QueryServiceStatus: STOPPED before start.
+            let status_ptr = 0x62_000;
+            memory.map_bytes(status_ptr, &[0; 28]);
+            let query_status = runtime.alloc_host_thunk(HostThunk::QueryServiceStatus);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_status,
+                    &[service_handle as u32, status_ptr as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                read_u32(&memory, status_ptr + 4).expect("state"),
+                crate::advapi32::SERVICE_STOPPED
+            );
+            assert_eq!(
+                read_u32(&memory, status_ptr + 8).expect("controls"),
+                crate::advapi32::SERVICE_ACCEPT_DEFAULT
+            );
+
+            // StartServiceW: the status flow START_PENDING → RUNNING.
+            let start = runtime.alloc_host_thunk(HostThunk::StartServiceW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    start,
+                    &[service_handle as u32, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_status,
+                    &[service_handle as u32, status_ptr as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                read_u32(&memory, status_ptr + 4).expect("state"),
+                crate::advapi32::SERVICE_RUNNING
+            );
+            // Starting an already-running service reports ERROR_SERVICE_ALREADY_RUNNING.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    start,
+                    &[service_handle as u32, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.last_error,
+                crate::advapi32::ERROR_SERVICE_ALREADY_RUNNING
+            );
+
+            // ControlService(STOP): RUNNING → STOP_PENDING → STOPPED.
+            let control = runtime.alloc_host_thunk(HostThunk::ControlService);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    control,
+                    &[
+                        service_handle as u32,
+                        crate::advapi32::SERVICE_CONTROL_STOP,
+                        status_ptr as u32
+                    ]
+                ),
+                1
+            );
+            assert_eq!(
+                read_u32(&memory, status_ptr + 4).expect("state"),
+                crate::advapi32::SERVICE_STOPPED
+            );
+            // Stopping a stopped service reports ERROR_SERVICE_NOT_ACTIVE.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    control,
+                    &[
+                        service_handle as u32,
+                        crate::advapi32::SERVICE_CONTROL_STOP,
+                        status_ptr as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.last_error,
+                crate::advapi32::ERROR_SERVICE_NOT_ACTIVE
+            );
+
+            // OpenServiceW: an unknown service reports
+            // ERROR_SERVICE_DOES_NOT_EXIST.
+            let open_service = runtime.alloc_host_thunk(HostThunk::OpenServiceW);
+            let missing_name = runtime
+                .alloc_utf16_string(&mut memory, "NoSuchSvc")
+                .expect("name");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_service,
+                    &[manager as u32, missing_name as u32, 0x10001]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.last_error,
+                crate::advapi32::ERROR_SERVICE_DOES_NOT_EXIST
+            );
+            // The created service opens.
+            let opened = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_service,
+                &[manager as u32, service_name as u32, 0x10001],
+            );
+            assert_ne!(opened, 0);
+
+            // DeleteService removes the registry database entry.
+            let delete = runtime.alloc_host_thunk(HostThunk::DeleteService);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[service_handle as u32]),
+                1
+            );
+            assert!(
+                !crate::advapi32::service_exists(
+                    runtime.win32.ge(),
+                    "DemoSvc",
+                    crate::advapi32::scm_registry_view(),
+                ),
+                "the service database entry is gone after DeleteService"
+            );
+
+            // CloseServiceHandle closes both handle kinds.
+            let close = runtime.alloc_host_thunk(HostThunk::CloseServiceHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[opened as u32]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[manager as u32]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[manager as u32]),
+                0,
+                "closing a closed handle fails"
+            );
+        })
+    }
+
+    // ── evidence-mid: advapi32 CryptoAPI ───────────────────────────────────
+    #[test]
+    fn evidence_mid_advapi32_crypto_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-crypto");
+            let mut memory = MemoryImage::default();
+
+            // CryptAcquireContextW with a container name.
+            let prov_out = 0x63_000;
+            memory.map_bytes(prov_out, &[0; 4]);
+            let container_ptr = runtime
+                .alloc_utf16_string(&mut memory, "GameKeys")
+                .expect("container");
+            let acquire = runtime.alloc_host_thunk(HostThunk::CryptAcquireContextW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    acquire,
+                    &[prov_out as u32, container_ptr as u32, 0, 1, 0]
+                ),
+                1
+            );
+            let prov = read_u32(&memory, prov_out).expect("prov handle");
+            assert_eq!(
+                runtime
+                    .crypt_providers
+                    .get(&u64::from(prov))
+                    .map(|p| p.container.as_str()),
+                Some("GameKeys")
+            );
+
+            // CryptCreateHash(CALG_MD5) + CryptHashData + CryptGetHashParam:
+            // the RFC 1321 "abc" digest proves the shared hash machinery.
+            let hash_out = 0x63_100;
+            memory.map_bytes(hash_out, &[0; 4]);
+            let create_hash = runtime.alloc_host_thunk(HostThunk::CryptCreateHash);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_hash,
+                    &[prov, crate::advapi32::CALG_MD5, 0, 0, hash_out as u32]
+                ),
+                1
+            );
+            let hash = read_u32(&memory, hash_out).expect("hash handle");
+            let data_ptr = runtime.alloc_heap(&mut memory, 3, true).expect("data heap");
+            memory.map_bytes(data_ptr, b"abc");
+            let hash_data = runtime.alloc_host_thunk(HostThunk::CryptHashData);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    hash_data,
+                    &[hash, data_ptr as u32, 3, 0]
+                ),
+                1
+            );
+            let digest_out = 0x63_200;
+            memory.map_bytes(digest_out, &[0; 32]);
+            let digest_len = 0x63_300;
+            memory.map_bytes(digest_len, &32_u32.to_le_bytes());
+            let get_param = runtime.alloc_host_thunk(HostThunk::CryptGetHashParam);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_param,
+                    &[hash, 2, digest_out as u32, digest_len as u32, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                memory.read_bytes(digest_out, 16).expect("md5 digest"),
+                crate::crypto::md5(b"abc").to_vec()
+            );
+            // HP_HASHSIZE reports the digest size; a small buffer reports
+            // ERROR_MORE_DATA with the required size.
+            let size_out = 0x63_400;
+            memory.map_bytes(size_out, &[0; 4]);
+            memory.map_bytes(digest_len, &4_u32.to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_param,
+                    &[hash, 4, size_out as u32, digest_len as u32, 0]
+                ),
+                1
+            );
+            assert_eq!(read_u32(&memory, size_out).expect("hash size"), 16);
+            memory.map_bytes(digest_len, &4_u32.to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_param,
+                    &[hash, 2, digest_out as u32, digest_len as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::ERROR_MORE_DATA);
+            assert_eq!(read_u32(&memory, digest_len).expect("required"), 16);
+
+            // CryptDeriveKey(CALG_RC4) from the hash + CryptEncrypt/
+            // CryptDecrypt round trip in the guest buffer.
+            let key_out = 0x63_500;
+            memory.map_bytes(key_out, &[0; 4]);
+            let derive_key = runtime.alloc_host_thunk(HostThunk::CryptDeriveKey);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    derive_key,
+                    &[prov, crate::advapi32::CALG_RC4, hash, 0, key_out as u32]
+                ),
+                1
+            );
+            let key = read_u32(&memory, key_out).expect("key handle");
+            let plain = b"secret message";
+            let buffer = runtime
+                .alloc_heap(&mut memory, 64, true)
+                .expect("crypto heap");
+            memory.map_bytes(buffer, plain);
+            let data_len = 0x63_600;
+            memory.map_bytes(data_len, &(plain.len() as u32).to_le_bytes());
+            let encrypt = runtime.alloc_host_thunk(HostThunk::CryptEncrypt);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    encrypt,
+                    &[key, 0, 1, 0, buffer as u32, data_len as u32, 64]
+                ),
+                1
+            );
+            let cipher_len = read_u32(&memory, data_len).expect("cipher len");
+            assert_eq!(cipher_len as usize, plain.len());
+            let ciphertext = memory
+                .read_bytes(buffer, cipher_len as usize)
+                .expect("cipher");
+            assert_ne!(ciphertext, plain.to_vec());
+            let decrypt = runtime.alloc_host_thunk(HostThunk::CryptDecrypt);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    decrypt,
+                    &[key, 0, 1, 0, buffer as u32, data_len as u32]
+                ),
+                1
+            );
+            let round_trip = memory
+                .read_bytes(buffer, cipher_len as usize)
+                .expect("plain");
+            assert_eq!(round_trip, plain.to_vec());
+
+            // CALG_RC2: block cipher with PKCS#7 padding (9 bytes → 16).
+            // The key object owns the CBC chaining state, so decryption
+            // runs on a freshly derived key (the documented usage pattern).
+            let rc2_key_out = 0x63_700;
+            memory.map_bytes(rc2_key_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    derive_key,
+                    &[prov, crate::advapi32::CALG_RC2, hash, 0, rc2_key_out as u32]
+                ),
+                1
+            );
+            let rc2_key = read_u32(&memory, rc2_key_out).expect("rc2 key handle");
+            let rc2_plain = b"rc2 secret"; // 9 bytes
+            memory.map_bytes(buffer, rc2_plain);
+            memory.map_bytes(data_len, &(rc2_plain.len() as u32).to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    encrypt,
+                    &[rc2_key, 0, 1, 0, buffer as u32, data_len as u32, 64]
+                ),
+                1
+            );
+            let padded_len = read_u32(&memory, data_len).expect("padded len");
+            assert_eq!(padded_len, 16, "RC2 pads to the 8-byte block size");
+            let ciphertext = memory
+                .read_bytes(buffer, padded_len as usize)
+                .expect("rc2 cipher");
+            let rc2_dec_key_out = 0x63_708;
+            memory.map_bytes(rc2_dec_key_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    derive_key,
+                    &[
+                        prov,
+                        crate::advapi32::CALG_RC2,
+                        hash,
+                        0,
+                        rc2_dec_key_out as u32
+                    ]
+                ),
+                1
+            );
+            let rc2_dec_key = read_u32(&memory, rc2_dec_key_out).expect("rc2 dec key handle");
+            memory.map_bytes(buffer, &ciphertext);
+            memory.map_bytes(data_len, &(ciphertext.len() as u32).to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    decrypt,
+                    &[rc2_dec_key, 0, 1, 0, buffer as u32, data_len as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                memory
+                    .read_bytes(buffer, rc2_plain.len())
+                    .expect("rc2 plain"),
+                rc2_plain.to_vec()
+            );
+
+            // CALG_3DES round trip through the FIPS EDE machinery.
+            let tdes_key_out = 0x63_710;
+            memory.map_bytes(tdes_key_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    derive_key,
+                    &[
+                        prov,
+                        crate::advapi32::CALG_3DES,
+                        hash,
+                        0,
+                        tdes_key_out as u32
+                    ]
+                ),
+                1
+            );
+            let tdes_key = read_u32(&memory, tdes_key_out).expect("tdes key handle");
+            memory.map_bytes(buffer, rc2_plain);
+            memory.map_bytes(data_len, &(rc2_plain.len() as u32).to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    encrypt,
+                    &[tdes_key, 0, 1, 0, buffer as u32, data_len as u32, 64]
+                ),
+                1
+            );
+            let tdes_len = read_u32(&memory, data_len).expect("tdes len");
+            assert_eq!(tdes_len, 16);
+            let tdes_cipher = memory
+                .read_bytes(buffer, tdes_len as usize)
+                .expect("tdes cipher");
+            let tdes_dec_key_out = 0x63_718;
+            memory.map_bytes(tdes_dec_key_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    derive_key,
+                    &[
+                        prov,
+                        crate::advapi32::CALG_3DES,
+                        hash,
+                        0,
+                        tdes_dec_key_out as u32
+                    ]
+                ),
+                1
+            );
+            let tdes_dec_key = read_u32(&memory, tdes_dec_key_out).expect("tdes dec key handle");
+            memory.map_bytes(buffer, &tdes_cipher);
+            memory.map_bytes(data_len, &(tdes_cipher.len() as u32).to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    decrypt,
+                    &[tdes_dec_key, 0, 1, 0, buffer as u32, data_len as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                memory
+                    .read_bytes(buffer, rc2_plain.len())
+                    .expect("tdes plain"),
+                rc2_plain.to_vec()
+            );
+
+            // CryptGenRandom: two draws of the same length differ.
+            let rng_a = 0x63_800;
+            let rng_b = 0x63_900;
+            memory.map_bytes(rng_a, &[0; 32]);
+            memory.map_bytes(rng_b, &[0; 32]);
+            let gen_random = runtime.alloc_host_thunk(HostThunk::CryptGenRandom);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gen_random,
+                    &[prov, 32, rng_a as u32]
+                ),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gen_random,
+                    &[prov, 32, rng_b as u32]
+                ),
+                1
+            );
+            assert_ne!(
+                memory.read_bytes(rng_a, 32).expect("random a"),
+                memory.read_bytes(rng_b, 32).expect("random b")
+            );
+
+            // An unsupported algorithm reports NTE_BAD_ALGID.
+            let bad_hash_out = 0x63_A00;
+            memory.map_bytes(bad_hash_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_hash,
+                    &[prov, 0x1111, 0, 0, bad_hash_out as u32]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, crate::advapi32::NTE_BAD_ALGID);
+
+            // Destroy hash/key and release the provider.
+            let destroy_hash = runtime.alloc_host_thunk(HostThunk::CryptDestroyHash);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, destroy_hash, &[hash]),
+                1
+            );
+            let destroy_key = runtime.alloc_host_thunk(HostThunk::CryptDestroyKey);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, destroy_key, &[key]),
+                1
+            );
+            let release = runtime.alloc_host_thunk(HostThunk::CryptReleaseContext);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release, &[prov, 0]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release, &[prov, 0]),
+                0,
+                "releasing an unknown provider fails"
+            );
+        })
+    }
+
+    // ── evidence-mid: advapi32 registry leftovers + event source ──────────
+    #[test]
+    fn evidence_mid_advapi32_registry_event_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-registry");
+            let mut memory = MemoryImage::default();
+
+            // RegCreateKeyExW + RegSetValueExW provision the key.
+            let root = HKEY_CURRENT_USER;
+            let subkey_ptr = runtime
+                .alloc_utf16_string(&mut memory, "Software\\Game")
+                .expect("subkey");
+            let key_out = 0x64_000;
+            memory.map_bytes(key_out, &[0; 4]);
+            let create_key = runtime.alloc_host_thunk(HostThunk::RegCreateKeyExW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_key,
+                    &[
+                        root,
+                        subkey_ptr as u32,
+                        0,
+                        0,
+                        0,
+                        0x20019,
+                        0,
+                        key_out as u32,
+                        0
+                    ]
+                ),
+                0
+            );
+            let hkey = read_u32(&memory, key_out).expect("hkey");
+            let set_value = runtime.alloc_host_thunk(HostThunk::RegSetValueExW);
+            let value_name = runtime
+                .alloc_utf16_string(&mut memory, "Score")
+                .expect("value name");
+            let dword_data = 0x64_100;
+            memory.map_bytes(dword_data, &42_u32.to_le_bytes());
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_value,
+                    &[hkey, value_name as u32, 0, REG_DWORD, dword_data as u32, 4]
+                ),
+                0
+            );
+
+            // RegQueryInfoKeyW reports the key's statistics.
+            let subkeys_out = 0x64_200;
+            let values_out = 0x64_210;
+            let max_value_out = 0x64_220;
+            memory.map_bytes(subkeys_out, &[0; 4]);
+            memory.map_bytes(values_out, &[0; 4]);
+            memory.map_bytes(max_value_out, &[0; 4]);
+            let query_info = runtime.alloc_host_thunk(HostThunk::RegQueryInfoKeyW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_info,
+                    &[
+                        hkey,
+                        0,
+                        0,
+                        0,
+                        subkeys_out as u32,
+                        0,
+                        0,
+                        values_out as u32,
+                        max_value_out as u32,
+                        0,
+                        0,
+                        0
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_u32(&memory, subkeys_out).expect("subkeys"), 0);
+            assert_eq!(read_u32(&memory, values_out).expect("values"), 1);
+            assert!(read_u32(&memory, max_value_out).expect("max value") >= 5);
+
+            // RegEnumValueW enumerates "Score" with its REG_DWORD payload.
+            let name_buf = 0x64_300;
+            memory.map_bytes(name_buf, &[0; 32]);
+            let name_size = 0x64_310;
+            memory.map_bytes(name_size, &16_u32.to_le_bytes());
+            let type_out = 0x64_320;
+            memory.map_bytes(type_out, &[0; 4]);
+            let data_buf = 0x64_330;
+            memory.map_bytes(data_buf, &[0; 16]);
+            let data_size = 0x64_340;
+            memory.map_bytes(data_size, &16_u32.to_le_bytes());
+            let enum_value = runtime.alloc_host_thunk(HostThunk::RegEnumValueW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_value,
+                    &[
+                        hkey,
+                        0,
+                        name_buf as u32,
+                        name_size as u32,
+                        0,
+                        type_out as u32,
+                        data_buf as u32,
+                        data_size as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_utf16_string(&memory, name_buf).expect("value name"),
+                "Score"
+            );
+            assert_eq!(read_u32(&memory, type_out).expect("type"), REG_DWORD);
+            assert_eq!(read_u32(&memory, data_buf).expect("data"), 42);
+            // Exhaustion reports ERROR_NO_MORE_ITEMS.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_value,
+                    &[
+                        hkey,
+                        1,
+                        name_buf as u32,
+                        name_size as u32,
+                        0,
+                        type_out as u32,
+                        data_buf as u32,
+                        data_size as u32
+                    ]
+                ),
+                ERROR_NO_MORE_ITEMS as u64
+            );
+
+            // RegFlushKey succeeds on the write-through registry.
+            let flush = runtime.alloc_host_thunk(HostThunk::RegFlushKey);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, flush, &[hkey]),
+                0
+            );
+
+            // RegOpenCurrentUser mints an HKCU root handle usable with
+            // RegQueryInfoKeyW.
+            let user_key_out = 0x64_400;
+            memory.map_bytes(user_key_out, &[0; 4]);
+            let open_current_user = runtime.alloc_host_thunk(HostThunk::RegOpenCurrentUser);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_current_user,
+                    &[0x20019, user_key_out as u32]
+                ),
+                0
+            );
+            let user_key = read_u32(&memory, user_key_out).expect("user key");
+            assert_ne!(user_key, 0);
+            let user_values = 0x64_410;
+            memory.map_bytes(user_values, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_info,
+                    &[user_key, 0, 0, 0, 0, 0, 0, user_values as u32, 0, 0, 0, 0]
+                ),
+                0,
+                "the HKCU root handle resolves for RegQueryInfoKeyW"
+            );
+
+            // EventRegister → EventWrite → EventUnregister: the documented
+            // ERROR_SUCCESS contract.
+            let provider_guid = 0x64_500;
+            write_test_guid(&mut memory, provider_guid, 0x1122_3344);
+            let reg_handle_out = 0x64_510;
+            memory.map_bytes(reg_handle_out, &[0; 8]);
+            let event_register = runtime.alloc_host_thunk(HostThunk::EventRegister);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    event_register,
+                    &[provider_guid as u32, 0, 0, reg_handle_out as u32]
+                ),
+                0
+            );
+            let reg_handle = read_u64(&memory, reg_handle_out).expect("reg handle");
+            assert_ne!(reg_handle, 0);
+            let event_write = runtime.alloc_host_thunk(HostThunk::EventWrite);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    event_write,
+                    &[reg_handle as u32, 0, 0, 0]
+                ),
+                0
+            );
+            let event_unregister = runtime.alloc_host_thunk(HostThunk::EventUnregister);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    event_unregister,
+                    &[reg_handle as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    event_write,
+                    &[reg_handle as u32, 0, 0, 0]
+                ),
+                ERROR_INVALID_PARAMETER as u64,
+                "writing through an unregistered handle fails"
+            );
+        })
+    }
+
+    // ── evidence-mid: shell32 path helpers ─────────────────────────────────
+    #[test]
+    fn evidence_mid_shell32_path_helpers_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-shell-path");
+            let mut memory = MemoryImage::default();
+
+            // PathIsNetworkPathW: the documented UNC test.
+            let network = runtime
+                .alloc_utf16_string(&mut memory, r"\\server\share\file.txt")
+                .expect("path");
+            let local = runtime
+                .alloc_utf16_string(&mut memory, r"C:\game\file.txt")
+                .expect("path");
+            let is_network = runtime.alloc_host_thunk(HostThunk::PathIsNetworkPathW);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, is_network, &[network as u32]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, is_network, &[local as u32]),
+                0
+            );
+
+            // PathRelativePathToW: the common-prefix algorithm.
+            let from = runtime
+                .alloc_utf16_string(&mut memory, r"C:\a\b\c\d")
+                .expect("from");
+            let to = runtime
+                .alloc_utf16_string(&mut memory, r"C:\a\b\x\y")
+                .expect("to");
+            let out = 0x65_000;
+            memory.map_bytes(out, &[0; 128]);
+            let relative = runtime.alloc_host_thunk(HostThunk::PathRelativePathToW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    relative,
+                    &[out as u32, from as u32, 0x10, to as u32, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                read_utf16_string(&memory, out).expect("relative"),
+                r"..\..\x\y"
+            );
+            // Different drives fail with an empty output buffer.
+            let other_drive = runtime
+                .alloc_utf16_string(&mut memory, r"D:\elsewhere")
+                .expect("to");
+            memory.map_bytes(out, &[0; 128]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    relative,
+                    &[out as u32, from as u32, 0x10, other_drive as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(read_utf16_string(&memory, out).expect("empty"), "");
+
+            // The shell32-registered Path* helpers dispatch into the shared
+            // shlwapi machinery: PathFindFileNameW returns a pointer into
+            // the path (the documented contract).
+            let path = runtime
+                .alloc_utf16_string(&mut memory, r"C:\dir\game.exe")
+                .expect("path");
+            let find_file_name = runtime.alloc_host_thunk(HostThunk::PathFindFileNameW);
+            let file_name_ptr =
+                dispatch_x86_thunk(&mut runtime, &mut memory, find_file_name, &[path as u32]);
+            assert!(
+                file_name_ptr >= path && file_name_ptr < path + 64,
+                "PathFindFileNameW points into the path: {file_name_ptr:#x}"
+            );
+            assert_eq!(
+                read_utf16_string(&memory, file_name_ptr).expect("file name"),
+                "game.exe"
+            );
+
+            // PathMakeUniqueName: the template when free, " (n)" otherwise.
+            let template = r"C:\unique\save.dat";
+            let template_ptr = runtime
+                .alloc_utf16_string(&mut memory, template)
+                .expect("template");
+            let unique_out = 0x65_200;
+            memory.map_bytes(unique_out, &[0; 128]);
+            let make_unique = runtime.alloc_host_thunk(HostThunk::PathMakeUniqueName);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    make_unique,
+                    &[unique_out as u32, 64, template_ptr as u32, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                read_utf16_string(&memory, unique_out).expect("unique"),
+                template,
+                "a free template is used as-is"
+            );
+            // The conflict path: stage the template, expect "save (1).dat".
+            let host_dir = runtime
+                .win32
+                .guest_path_to_host_path(r"C:\unique")
+                .expect("host dir");
+            std::fs::create_dir_all(&host_dir).expect("create dir");
+            std::fs::write(host_dir.join("save.dat"), b"data").expect("write save");
+            let unique_out2 = 0x65_300;
+            memory.map_bytes(unique_out2, &[0; 128]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    make_unique,
+                    &[unique_out2 as u32, 64, template_ptr as u32, 0, 0]
+                ),
+                1
+            );
+            assert_eq!(
+                read_utf16_string(&memory, unique_out2).expect("unique"),
+                r"C:\unique\save (1).dat"
+            );
+
+            // PathAppendW/PathCombineW under the shell32 name resolve to the
+            // shlwapi machinery through the import-name tables.
+            let import = ResolvedImport {
+                requested_module: "shell32.dll".to_string(),
+                resolved_module: "shell32.dll".to_string(),
+                symbol: ImportSymbol::ByName {
+                    hint: 0,
+                    name: "PathCombineW".to_string(),
+                },
+                iat_rva: 0,
+                export: synthetic_export_symbol(&ImportSymbol::ByName {
+                    hint: 0,
+                    name: "PathCombineW".to_string(),
+                }),
+            };
+            assert!(
+                matches!(HostThunk::from_import(&import), HostThunk::PathCombineW),
+                "shell32!PathCombineW dispatches into the shared path helper"
+            );
+        })
+    }
+
+    // ── evidence-mid: shell32 fs/notify/icon/shell-item helpers ───────────
+    #[test]
+    fn evidence_mid_shell32_fs_notify_icon_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-shell-fs");
+            let mut memory = MemoryImage::default();
+
+            // SHCreateDirectoryExW: recursive mkdir through the fs layer.
+            let dir_path = r"C:\game\saves\slot1";
+            let dir_ptr = runtime
+                .alloc_utf16_string(&mut memory, dir_path)
+                .expect("dir");
+            let create_dir = runtime.alloc_host_thunk(HostThunk::SHCreateDirectoryExW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_dir,
+                    &[0, dir_ptr as u32, 0]
+                ),
+                0,
+                "SHCreateDirectoryExW creates the tree"
+            );
+            let host_dir = runtime
+                .win32
+                .guest_path_to_host_path(dir_path)
+                .expect("host dir");
+            assert!(host_dir.is_dir(), "the guest-visible directory exists");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_dir,
+                    &[0, dir_ptr as u32, 0]
+                ),
+                crate::advapi32::ERROR_ALREADY_EXISTS as u64,
+                "the documented ERROR_ALREADY_EXISTS for an existing directory"
+            );
+
+            // SHFileOperationW: FO_DELETE + FO_RENAME over the fs layer.
+            let file_guest = r"C:\game\save.dat";
+            let file_host = runtime
+                .win32
+                .guest_path_to_host_path(file_guest)
+                .expect("host file");
+            std::fs::write(&file_host, b"save").expect("write save");
+            let from_ptr = runtime
+                .alloc_utf16_string(&mut memory, file_guest)
+                .expect("from");
+            let op_struct = 0x65_400;
+            memory.map_bytes(op_struct, &[0; 32]);
+            write_u32(&mut memory, op_struct + 4, 3); // FO_DELETE
+            write_guest_pointer(&mut memory, op_struct + 8, from_ptr, GuestArch::X86)
+                .expect("pFrom");
+            let file_op = runtime.alloc_host_thunk(HostThunk::SHFileOperationW);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, file_op, &[op_struct as u32]),
+                0,
+                "FO_DELETE succeeds"
+            );
+            assert!(!file_host.exists(), "the file is gone");
+            // FO_RENAME moves the file.
+            let renamed_guest = r"C:\game\save2.dat";
+            std::fs::write(&file_host, b"save").expect("rewrite save");
+            let to_ptr = runtime
+                .alloc_utf16_string(&mut memory, renamed_guest)
+                .expect("to");
+            write_u32(&mut memory, op_struct + 4, 4); // FO_RENAME
+            write_guest_pointer(&mut memory, op_struct + 8, from_ptr, GuestArch::X86)
+                .expect("pFrom");
+            write_guest_pointer(&mut memory, op_struct + 12, to_ptr, GuestArch::X86).expect("pTo");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, file_op, &[op_struct as u32]),
+                0,
+                "FO_RENAME succeeds"
+            );
+            assert!(
+                runtime
+                    .win32
+                    .guest_path_to_host_path(renamed_guest)
+                    .expect("renamed host")
+                    .exists(),
+                "the renamed file exists"
+            );
+
+            // SHChangeNotify + SHUpdateImageW: the documented no-ops.
+            let change_notify = runtime.alloc_host_thunk(HostThunk::SHChangeNotify);
+            let _ = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                change_notify,
+                &[0x8000, 0, 0, 0], // SHCNE_ASSOCCHANGED
+            );
+            let update_image = runtime.alloc_host_thunk(HostThunk::SHUpdateImageW);
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, update_image, &[0, 0, 0, 0]);
+
+            // ShellExecuteW: the "open" verb delegates to the host.
+            let open_verb = runtime
+                .alloc_utf16_string(&mut memory, "open")
+                .expect("verb");
+            let target = runtime
+                .alloc_utf16_string(&mut memory, r"C:\game\save.dat")
+                .expect("file");
+            let shell_execute = runtime.alloc_host_thunk(HostThunk::ShellExecuteW);
+            let hinst = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                shell_execute,
+                &[0, open_verb as u32, target as u32, 0, 0, 1],
+            );
+            assert!(hinst > 32, "a HINSTANCE above the SE_ERR_* range: {hinst}");
+
+            // SHCreateShellItem: a shell item object from a PIDL.
+            let pidl = runtime
+                .alloc_utf16_string(&mut memory, r"C:\game")
+                .expect("pidl");
+            let item_out = 0x65_500;
+            memory.map_bytes(item_out, &[0; 4]);
+            let create_item = runtime.alloc_host_thunk(HostThunk::SHCreateShellItem);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_item,
+                    &[0, 0, pidl as u32, item_out as u32]
+                ),
+                0,
+                "SHCreateShellItem returns S_OK"
+            );
+            let item = read_u32(&memory, item_out).expect("item");
+            assert_ne!(item, 0);
+
+            // ExtractIconW on a module without an icon resource: the
+            // documented zero handle.
+            let no_icon_file = r"C:\game\noicon.bin";
+            let no_icon_host = runtime
+                .win32
+                .guest_path_to_host_path(no_icon_file)
+                .expect("host file");
+            std::fs::write(&no_icon_host, b"not a pe").expect("write file");
+            let file_ptr = runtime
+                .alloc_utf16_string(&mut memory, no_icon_file)
+                .expect("file");
+            let extract_icon = runtime.alloc_host_thunk(HostThunk::ExtractIconW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    extract_icon,
+                    &[0, file_ptr as u32, 0]
+                ),
+                0,
+                "a module without icon resources yields no HICON"
+            );
+
+            // SHGetMalloc: the standard allocator's Alloc/GetSize/DidAlloc/
+            // Free contract.
+            let malloc_out = 0x65_600;
+            memory.map_bytes(malloc_out, &[0; 4]);
+            let get_malloc = runtime.alloc_host_thunk(HostThunk::SHGetMalloc);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_malloc, &[malloc_out as u32]),
+                0
+            );
+            let malloc_object = read_u32(&memory, malloc_out).expect("malloc object");
+            let malloc_vtable =
+                read_u32(&memory, u64::from(malloc_object)).expect("malloc vtable") as u64;
+            let alloc_thunk = read_u32(&memory, malloc_vtable + 3 * 4).expect("alloc thunk") as u64;
+            let get_size_thunk =
+                read_u32(&memory, malloc_vtable + 6 * 4).expect("get size thunk") as u64;
+            let did_alloc_thunk =
+                read_u32(&memory, malloc_vtable + 7 * 4).expect("did alloc thunk") as u64;
+            let free_thunk = read_u32(&memory, malloc_vtable + 5 * 4).expect("free thunk") as u64;
+            let allocation = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                alloc_thunk,
+                &[malloc_object, 128],
+            );
+            assert_ne!(allocation, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_size_thunk,
+                    &[malloc_object, allocation as u32]
+                ),
+                128
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    did_alloc_thunk,
+                    &[malloc_object, allocation as u32]
+                ),
+                1
+            );
+            let _ = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                free_thunk,
+                &[malloc_object, allocation as u32],
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    did_alloc_thunk,
+                    &[malloc_object, allocation as u32]
+                ),
+                0,
+                "the freed block is no longer tracked"
+            );
+        })
+    }
+
+    // ── evidence-mid: shell32 icon extraction from a real PE resource ─────
+    #[test]
+    fn evidence_mid_shell32_extract_icon_resource_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-shell-icon");
+            let mut memory = MemoryImage::default();
+
+            // A PE with an RT_ICON resource tree (16×16 32-bpp icon).
+            let icon_pe = build_test_pe_with_icon();
+            let guest_path = r"C:\game\app.exe";
+            let host_path = runtime
+                .win32
+                .guest_path_to_host_path(guest_path)
+                .expect("host path");
+            if let Some(parent) = host_path.parent() {
+                std::fs::create_dir_all(parent).expect("parent dir");
+            }
+            std::fs::write(&host_path, &icon_pe).expect("write icon PE");
+
+            // ExtractIconW returns a HICON handle backed by the resource.
+            let file_ptr = runtime
+                .alloc_utf16_string(&mut memory, guest_path)
+                .expect("file");
+            let extract_icon = runtime.alloc_host_thunk(HostThunk::ExtractIconW);
+            let icon_handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                extract_icon,
+                &[0, file_ptr as u32, 0],
+            );
+            assert_ne!(icon_handle, 0, "the icon resource yields a HICON");
+            let icon = runtime.icons.get(&icon_handle).expect("icon image");
+            assert_eq!(icon.width, 16);
+            assert_eq!(icon.height, 16);
+            assert!(!icon.data.is_empty());
+
+            // ExtractIconExW extracts the icon into the large/small arrays.
+            let large_out = 0x66_000;
+            let small_out = 0x66_100;
+            memory.map_bytes(large_out, &[0; 16]);
+            memory.map_bytes(small_out, &[0; 16]);
+            let extract_ex = runtime.alloc_host_thunk(HostThunk::ExtractIconExW);
+            let extracted = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                extract_ex,
+                &[file_ptr as u32, 0, large_out as u32, small_out as u32, 1],
+            );
+            assert_eq!(extracted, 1, "one icon is extracted");
+            let large_icon = read_u32(&memory, large_out).expect("large icon");
+            let small_icon = read_u32(&memory, small_out).expect("small icon");
+            assert_ne!(large_icon, 0);
+            assert_ne!(small_icon, 0);
+            assert!(
+                runtime.icons.contains_key(&u64::from(large_icon)),
+                "the large HICON is registered"
+            );
+            assert!(
+                runtime.icons.contains_key(&u64::from(small_icon)),
+                "the small HICON is registered"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_mid_shell_link_persist_file_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-persist");
+            let mut memory = MemoryImage::default();
+
+            // CoCreateInstance(CLSID_ShellLink, IID_IShellLinkW), then
+            // QueryInterface to IPersistFile and Load/GetCurFile.
+            let co_create_instance = runtime.alloc_host_thunk(HostThunk::CoCreateInstance);
+            let clsid_ptr = 0x40_000;
+            let iid_shell_link_ptr = 0x40_020;
+            let iid_persist_file_ptr = 0x40_040;
+            let shell_link_out_ptr = 0x40_060;
+            let persist_file_out_ptr = 0x40_080;
+            write_test_guid(&mut memory, clsid_ptr, 0x0002_1401);
+            write_test_guid(&mut memory, iid_shell_link_ptr, 0x0002_14F9);
+            write_test_guid(&mut memory, iid_persist_file_ptr, 0x0000_010B);
+            memory.map_bytes(shell_link_out_ptr, &[0; 4]);
+            memory.map_bytes(persist_file_out_ptr, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    co_create_instance,
+                    &[
+                        clsid_ptr as u32,
+                        0,
+                        1,
+                        iid_shell_link_ptr as u32,
+                        shell_link_out_ptr as u32,
+                    ],
+                ),
+                0
+            );
+            let shell_link_object =
+                read_u32(&memory, shell_link_out_ptr).expect("shell link") as u64;
+            let shell_link_vtable = read_u32(&memory, shell_link_object).expect("vtable") as u64;
+            let query_interface =
+                read_u32(&memory, shell_link_vtable).expect("query interface") as u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_interface,
+                    &[
+                        shell_link_object as u32,
+                        iid_persist_file_ptr as u32,
+                        persist_file_out_ptr as u32
+                    ],
+                ),
+                0,
+                "QueryInterface for IPersistFile succeeds on the shell link"
+            );
+            let persist_file =
+                read_u32(&memory, persist_file_out_ptr).expect("persist file") as u64;
+            let persist_vtable = read_u32(&memory, persist_file).expect("persist vtable") as u64;
+            let persist_load = read_u32(&memory, persist_vtable + 5 * 4).expect("load") as u64;
+            let get_cur_file =
+                read_u32(&memory, persist_vtable + 8 * 4).expect("get cur file") as u64;
+
+            // IPersistFile::Load pins the current file; GetCurFile returns it.
+            let link_path = r"C:\users\casa1\Desktop\Game.lnk";
+            let path_ptr = runtime
+                .alloc_utf16_string(&mut memory, link_path)
+                .expect("link path");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    persist_load,
+                    &[persist_file as u32, path_ptr as u32, 0],
+                ),
+                0
+            );
+            let cur_file_out = 0x40_0A0;
+            memory.map_bytes(cur_file_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_cur_file,
+                    &[persist_file as u32, cur_file_out as u32],
+                ),
+                0
+            );
+            let cur_file_ptr = read_u32(&memory, cur_file_out).expect("cur file ptr") as u64;
+            assert_eq!(
+                read_utf16_string(&memory, cur_file_ptr).expect("cur file"),
+                link_path
+            );
+        })
+    }
+
+    // ── evidence-mid: winmmbase IN-device family ──────────────────────────
+    #[test]
+    fn evidence_mid_winmmbase_device_thunks() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mid-winmmbase");
+            let mut memory = MemoryImage::default();
+
+            // The winmmbase export names resolve into the shared device
+            // model through the import-name tables.
+            let resolved = |name: &str| {
+                let import = ResolvedImport {
+                    requested_module: "winmmbase.dll".to_string(),
+                    resolved_module: "winmmbase.dll".to_string(),
+                    symbol: ImportSymbol::ByName {
+                        hint: 0,
+                        name: name.to_string(),
+                    },
+                    iat_rva: 0,
+                    export: synthetic_export_symbol(&ImportSymbol::ByName {
+                        hint: 0,
+                        name: name.to_string(),
+                    }),
+                };
+                HostThunk::from_import(&import)
+            };
+            assert!(matches!(resolved("waveInOpen"), HostThunk::WaveInOpen));
+            assert!(matches!(
+                resolved("waveInAddBuffer"),
+                HostThunk::WaveInAddBuffer
+            ));
+            assert!(matches!(
+                resolved("midiOutShortMsg"),
+                HostThunk::MidiOutShortMsg
+            ));
+            assert!(matches!(resolved("midiInReset"), HostThunk::MidiInReset));
+            assert!(matches!(
+                resolved("waveOutGetNumDevs"),
+                HostThunk::WaveOutGetNumDevs
+            ));
+            assert!(
+                !matches!(resolved("waveInOpen"), HostThunk::Unsupported { .. }),
+                "winmmbase exports dispatch into the shared winmm device model"
+            );
+
+            // waveOutGetNumDevs: the device enumeration.
+            let get_num_devs = runtime.alloc_host_thunk(HostThunk::WaveOutGetNumDevs);
+            let num_out = dispatch_x86_thunk(&mut runtime, &mut memory, get_num_devs, &[]);
+            assert!(num_out >= 1, "at least one wave-out device");
+
+            // waveOutOpen + waveOutWrite + waveOutReset + waveOutClose:
+            // the OUT device lifecycle.
+            let format_ptr = 0x67_000;
+            let format = crate::winmm::WaveFormatEx::pcm(2, 44100, 16);
+            let format_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &format as *const crate::winmm::WaveFormatEx as *const u8,
+                    std::mem::size_of::<crate::winmm::WaveFormatEx>(),
+                )
+            };
+            memory.map_bytes(format_ptr, format_bytes);
+            let handle_out = 0x67_100;
+            memory.map_bytes(handle_out, &[0; 4]);
+            let wave_out_open = runtime.alloc_host_thunk(HostThunk::WaveOutOpen);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wave_out_open,
+                    &[handle_out as u32, 0, format_ptr as u32, 0, 0, 0]
+                ),
+                0
+            );
+            let wave_out = read_u32(&memory, handle_out).expect("wave out handle");
+            assert_ne!(wave_out, 0);
+            // waveOutGetVolume/SetVolume ride the same model (before close).
+            let volume_out = 0x67_800;
+            memory.map_bytes(volume_out, &[0; 4]);
+            let get_volume = runtime.alloc_host_thunk(HostThunk::WaveOutGetVolume);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_volume,
+                    &[wave_out, volume_out as u32]
+                ),
+                0
+            );
+            let wave_out_close = runtime.alloc_host_thunk(HostThunk::WaveOutClose);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wave_out_close, &[wave_out]),
+                0
+            );
+
+            // waveInOpen/PrepareHeader/AddBuffer: the deterministic model —
+            // the buffer stays queued (no real audio input).
+            let wave_in_open = runtime.alloc_host_thunk(HostThunk::WaveInOpen);
+            let in_handle_out = 0x67_200;
+            memory.map_bytes(in_handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wave_in_open,
+                    &[in_handle_out as u32, 0, format_ptr as u32, 0, 0, 0]
+                ),
+                0
+            );
+            let wave_in = read_u32(&memory, in_handle_out).expect("wave in handle");
+            let header = 0x67_300;
+            let data_buf = 0x67_400;
+            memory.map_bytes(header, &[0; 32]);
+            memory.map_bytes(data_buf, &[0; 128]);
+            write_u64(&mut memory, header, data_buf);
+            write_u32(&mut memory, header + 8, 128);
+            let prepare = runtime.alloc_host_thunk(HostThunk::WaveInPrepareHeader);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    prepare,
+                    &[wave_in, header as u32, 32]
+                ),
+                0
+            );
+            let add_buffer = runtime.alloc_host_thunk(HostThunk::WaveInAddBuffer);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_buffer,
+                    &[wave_in, header as u32, 32]
+                ),
+                0
+            );
+            // The deterministic model: with no real audio input the buffer
+            // stays parked in the device queue.
+            {
+                let winmm = runtime.audio.winmm.read().unwrap();
+                let device = winmm
+                    .wave_in_devices
+                    .iter()
+                    .find(|device| device.handle == wave_in)
+                    .expect("wave-in device");
+                assert!(
+                    device.buffers.iter().any(|buffer| buffer.is_queued),
+                    "the buffer is parked until input data arrives"
+                );
+            }
+            let start = runtime.alloc_host_thunk(HostThunk::WaveInStart);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, start, &[wave_in]),
+                0
+            );
+            let stop = runtime.alloc_host_thunk(HostThunk::WaveInStop);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, stop, &[wave_in]),
+                0
+            );
+            // Stop dequeues the parked buffer (still no WIM_DATA delivered).
+            {
+                let winmm = runtime.audio.winmm.read().unwrap();
+                let device = winmm
+                    .wave_in_devices
+                    .iter()
+                    .find(|device| device.handle == wave_in)
+                    .expect("wave-in device");
+                assert!(
+                    !device.buffers.iter().any(|buffer| buffer.is_queued),
+                    "stop dequeues the parked buffer"
+                );
+            }
+            let wave_in_close = runtime.alloc_host_thunk(HostThunk::WaveInClose);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wave_in_close, &[wave_in]),
+                0
+            );
+
+            // waveInGetDevCapsW: the documented WAVEINCAPSW layout.
+            let caps_out = 0x67_500;
+            memory.map_bytes(caps_out, &[0; 80]);
+            let get_in_caps = runtime.alloc_host_thunk(HostThunk::WaveInGetDevCapsW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_in_caps,
+                    &[0, caps_out as u32, 80]
+                ),
+                0
+            );
+            assert_eq!(
+                read_u16(&memory, caps_out + 4).expect("driver version"),
+                0x0100
+            );
+            assert_eq!(read_u16(&memory, caps_out + 76).expect("channels"), 0x000F);
+
+            // midiOutOpen → midiOutShortMsg → midiOutReset → midiOutClose.
+            let midi_out_open = runtime.alloc_host_thunk(HostThunk::MidiOutOpen);
+            let midi_handle_out = 0x67_600;
+            memory.map_bytes(midi_handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    midi_out_open,
+                    &[midi_handle_out as u32, 0, 0, 0, 0]
+                ),
+                0
+            );
+            let midi_out = read_u32(&memory, midi_handle_out).expect("midi out handle");
+            let short_msg = runtime.alloc_host_thunk(HostThunk::MidiOutShortMsg);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    short_msg,
+                    &[midi_out, 0x0078_3C90] // note-on, channel 0, note 60, vel 120
+                ),
+                0
+            );
+            let midi_out_reset = runtime.alloc_host_thunk(HostThunk::MidiOutReset);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_out_reset, &[midi_out]),
+                0
+            );
+            let midi_out_close = runtime.alloc_host_thunk(HostThunk::MidiOutClose);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_out_close, &[midi_out]),
+                0
+            );
+
+            // midiInOpen → Start → Stop → Reset → Close: the IN device.
+            let midi_in_open = runtime.alloc_host_thunk(HostThunk::MidiInOpen);
+            let midi_in_handle_out = 0x67_700;
+            memory.map_bytes(midi_in_handle_out, &[0; 4]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    midi_in_open,
+                    &[midi_in_handle_out as u32, 0, 0, 0, 0]
+                ),
+                0
+            );
+            let midi_in = read_u32(&memory, midi_in_handle_out).expect("midi in handle");
+            let midi_in_start = runtime.alloc_host_thunk(HostThunk::MidiInStart);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_in_start, &[midi_in]),
+                0
+            );
+            let midi_in_stop = runtime.alloc_host_thunk(HostThunk::MidiInStop);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_in_stop, &[midi_in]),
+                0
+            );
+            let midi_in_reset = runtime.alloc_host_thunk(HostThunk::MidiInReset);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_in_reset, &[midi_in]),
+                0
+            );
+            let midi_in_close = runtime.alloc_host_thunk(HostThunk::MidiInClose);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, midi_in_close, &[midi_in]),
+                0
+            );
+            let _ = format;
+            let _ = format_bytes;
+        })
+    }
+
+    /// Build a minimal PE32 whose `.rsrc` directory carries an RT_GROUP_ICON
+    /// resource referencing a 16×16 32-bpp RT_ICON payload.
+    fn build_test_pe_with_icon() -> Vec<u8> {
+        const SECTION_ALIGN: u32 = 0x1000;
+        const FILE_ALIGN: u32 = 0x200;
+        const RSRC_RVA: u32 = 0x1000;
+        const RSRC_SIZE: u32 = 0x600;
+        const RSRC_RAW: u32 = 0x400;
+
+        // The icon payload: BITMAPINFOHEADER + 16×16 BGRA (XOR rows) + AND mask.
+        let mut icon_data = Vec::new();
+        let mut header = [0u8; 40];
+        header[0..4].copy_from_slice(&40_u32.to_le_bytes());
+        header[4..8].copy_from_slice(&16_i32.to_le_bytes());
+        header[8..12].copy_from_slice(&32_i32.to_le_bytes()); // XOR + AND
+        header[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        header[14..16].copy_from_slice(&32_u16.to_le_bytes());
+        icon_data.extend_from_slice(&header);
+        for _ in 0..16 {
+            for _ in 0..16 {
+                icon_data.extend_from_slice(&[0, 0, 255, 255]); // BGRA red
+            }
+        }
+        icon_data.extend_from_slice(&[0u8; 16 * 4]); // AND mask
+
+        let mut group_icon = Vec::new();
+        group_icon.extend_from_slice(&0_u16.to_le_bytes()); // reserved
+        group_icon.extend_from_slice(&1_u16.to_le_bytes()); // type = icon
+        group_icon.extend_from_slice(&1_u16.to_le_bytes()); // count
+        group_icon.extend_from_slice(&[16, 16, 0, 0]); // width, height, colors, reserved
+        group_icon.extend_from_slice(&1_u16.to_le_bytes()); // planes
+        group_icon.extend_from_slice(&32_u16.to_le_bytes()); // bitcount
+        group_icon.extend_from_slice(&(icon_data.len() as u32).to_le_bytes()); // bytesInRes
+        group_icon.extend_from_slice(&1_u16.to_le_bytes()); // icon resource ID
+
+        // The resource tree, with every subdirectory/data pointer expressed
+        // as a byte offset from the resource root RVA (the parser's
+        // convention; the high bit marks a subdirectory pointer):
+        //
+        //   0x00 root directory (2 type entries)
+        //   0x40 RT_ICON name directory (name ID 1)
+        //   0x60 RT_GROUP_ICON name directory (name ID 1)
+        //   0x80 icon language directory (lang 0)
+        //   0xA0 group language directory (lang 0)
+        //   0xC0 icon data entry
+        //   0xD0 group data entry
+        //   0xE0 group icon payload
+        //   0x100 icon payload
+        let mut rsrc_bytes = vec![0u8; RSRC_SIZE as usize];
+        let mut put = |offset: usize, bytes: &[u8]| {
+            rsrc_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        };
+        // Root directory: 2 ID entries.
+        let mut root = Vec::new();
+        root.extend_from_slice(&0_u32.to_le_bytes());
+        root.extend_from_slice(&0_u32.to_le_bytes());
+        root.extend_from_slice(&0_u16.to_le_bytes());
+        root.extend_from_slice(&0_u16.to_le_bytes());
+        root.extend_from_slice(&0_u16.to_le_bytes()); // no named entries
+        root.extend_from_slice(&2_u16.to_le_bytes()); // two ID entries
+        root.extend_from_slice(&3_u32.to_le_bytes()); // RT_ICON (id, no name bit)
+        root.extend_from_slice(&(0x40_u32 | 0x8000_0000).to_le_bytes()); // → name dir
+        root.extend_from_slice(&14_u32.to_le_bytes()); // RT_GROUP_ICON
+        root.extend_from_slice(&(0x60_u32 | 0x8000_0000).to_le_bytes()); // → name dir
+        put(0x00, &root);
+        // RT_ICON name directory: name ID 1 → language dir at 0x80.
+        let mut icon_name = Vec::new();
+        icon_name.extend_from_slice(&0_u32.to_le_bytes());
+        icon_name.extend_from_slice(&0_u32.to_le_bytes());
+        icon_name.extend_from_slice(&0_u16.to_le_bytes());
+        icon_name.extend_from_slice(&0_u16.to_le_bytes());
+        icon_name.extend_from_slice(&0_u16.to_le_bytes());
+        icon_name.extend_from_slice(&1_u16.to_le_bytes());
+        icon_name.extend_from_slice(&1_u32.to_le_bytes()); // name ID 1
+        icon_name.extend_from_slice(&(0x80_u32 | 0x8000_0000).to_le_bytes()); // → lang dir
+        put(0x40, &icon_name);
+        // RT_GROUP_ICON name directory: name ID 1 → language dir at 0xA0.
+        let mut group_name = Vec::new();
+        group_name.extend_from_slice(&0_u32.to_le_bytes());
+        group_name.extend_from_slice(&0_u32.to_le_bytes());
+        group_name.extend_from_slice(&0_u16.to_le_bytes());
+        group_name.extend_from_slice(&0_u16.to_le_bytes());
+        group_name.extend_from_slice(&0_u16.to_le_bytes());
+        group_name.extend_from_slice(&1_u16.to_le_bytes());
+        group_name.extend_from_slice(&1_u32.to_le_bytes()); // name ID 1
+        group_name.extend_from_slice(&(0xA0_u32 | 0x8000_0000).to_le_bytes()); // → lang dir
+        put(0x60, &group_name);
+        // Icon language directory: lang 0 → data entry at 0xC0.
+        let mut icon_lang = Vec::new();
+        icon_lang.extend_from_slice(&0_u32.to_le_bytes());
+        icon_lang.extend_from_slice(&0_u32.to_le_bytes());
+        icon_lang.extend_from_slice(&0_u16.to_le_bytes());
+        icon_lang.extend_from_slice(&0_u16.to_le_bytes());
+        icon_lang.extend_from_slice(&0_u16.to_le_bytes());
+        icon_lang.extend_from_slice(&1_u16.to_le_bytes());
+        icon_lang.extend_from_slice(&0_u32.to_le_bytes()); // language id 0
+        icon_lang.extend_from_slice(&0xC0_u32.to_le_bytes()); // → data entry
+        put(0x80, &icon_lang);
+        // Group language directory: lang 0 → data entry at 0xD0.
+        let mut group_lang = Vec::new();
+        group_lang.extend_from_slice(&0_u32.to_le_bytes());
+        group_lang.extend_from_slice(&0_u32.to_le_bytes());
+        group_lang.extend_from_slice(&0_u16.to_le_bytes());
+        group_lang.extend_from_slice(&0_u16.to_le_bytes());
+        group_lang.extend_from_slice(&0_u16.to_le_bytes());
+        group_lang.extend_from_slice(&1_u16.to_le_bytes());
+        group_lang.extend_from_slice(&0_u32.to_le_bytes()); // language id 0
+        group_lang.extend_from_slice(&0xD0_u32.to_le_bytes()); // → data entry
+        put(0xA0, &group_lang);
+        // Data entries: (data RVA, size).
+        let mut icon_data_entry = Vec::new();
+        icon_data_entry.extend_from_slice(&(RSRC_RVA + 0x100).to_le_bytes());
+        icon_data_entry.extend_from_slice(&(icon_data.len() as u32).to_le_bytes());
+        icon_data_entry.extend_from_slice(&0_u32.to_le_bytes());
+        icon_data_entry.extend_from_slice(&0_u32.to_le_bytes());
+        put(0xC0, &icon_data_entry);
+        let mut group_data_entry = Vec::new();
+        group_data_entry.extend_from_slice(&(RSRC_RVA + 0xE0).to_le_bytes());
+        group_data_entry.extend_from_slice(&(group_icon.len() as u32).to_le_bytes());
+        group_data_entry.extend_from_slice(&0_u32.to_le_bytes());
+        group_data_entry.extend_from_slice(&0_u32.to_le_bytes());
+        put(0xD0, &group_data_entry);
+        // Payloads.
+        put(0xE0, &group_icon);
+        put(0x100, &icon_data);
+
+        let mut pe = vec![0u8; 0x400];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        let pe_offset = 0x80_u32;
+        pe[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+        let pe_off = pe_offset as usize;
+        pe[pe_off..pe_off + 4].copy_from_slice(b"PE\x00\x00");
+        pe[pe_off + 4..pe_off + 6].copy_from_slice(&0x014c_u16.to_le_bytes()); // I386
+        pe[pe_off + 6..pe_off + 8].copy_from_slice(&1_u16.to_le_bytes()); // one section
+        pe[pe_off + 20..pe_off + 22].copy_from_slice(&0xE0_u16.to_le_bytes());
+        pe[pe_off + 22..pe_off + 24].copy_from_slice(&0x0102_u16.to_le_bytes());
+        let opt_off = pe_off + 24;
+        pe[opt_off..opt_off + 2].copy_from_slice(&0x010b_u16.to_le_bytes()); // PE32
+        pe[opt_off + 16..opt_off + 20].copy_from_slice(&0x1000_u32.to_le_bytes()); // entry RVA
+        pe[opt_off + 28..opt_off + 32].copy_from_slice(&0x0040_0000_u32.to_le_bytes());
+        pe[opt_off + 32..opt_off + 36].copy_from_slice(&SECTION_ALIGN.to_le_bytes());
+        pe[opt_off + 36..opt_off + 40].copy_from_slice(&FILE_ALIGN.to_le_bytes());
+        pe[opt_off + 56..opt_off + 60].copy_from_slice(&0x3000_u32.to_le_bytes()); // size of image
+        pe[opt_off + 60..opt_off + 64].copy_from_slice(&0x0400_u32.to_le_bytes()); // size of headers
+        pe[opt_off + 92..opt_off + 96].copy_from_slice(&16_u32.to_le_bytes()); // data dirs
+        // Data directory 2 = resource table.
+        pe[opt_off + 96 + 2 * 8..opt_off + 96 + 2 * 8 + 4].copy_from_slice(&RSRC_RVA.to_le_bytes());
+        pe[opt_off + 96 + 2 * 8 + 4..opt_off + 96 + 2 * 8 + 8]
+            .copy_from_slice(&RSRC_SIZE.to_le_bytes());
+        // Section header ".rsrc".
+        let section_off = opt_off + 0xE0;
+        pe[section_off..section_off + 8].copy_from_slice(b".rsrc\x00\x00\x00");
+        pe[section_off + 8..section_off + 12].copy_from_slice(&RSRC_SIZE.to_le_bytes()); // virtual size
+        pe[section_off + 12..section_off + 16].copy_from_slice(&RSRC_RVA.to_le_bytes());
+        pe[section_off + 16..section_off + 20].copy_from_slice(&RSRC_SIZE.to_le_bytes()); // raw size
+        pe[section_off + 20..section_off + 24].copy_from_slice(&RSRC_RAW.to_le_bytes()); // raw ptr
+        pe[section_off + 36..section_off + 40].copy_from_slice(&0x4000_0040_u32.to_le_bytes());
+        // Pad to the raw offset and append the resource section.
+        pe.resize(RSRC_RAW as usize, 0);
+        pe.extend_from_slice(&rsrc_bytes);
+        pe
     }
 }
 
@@ -118430,6 +122779,56 @@ fn resolve_search_path(
 fn shlwapi_is_drive_spec(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// PathRelativePathToW: build the relative path from `from` to `to` with
+/// the documented algorithm — strip the common prefix, then one `..\`
+/// per remaining component of `from`, then the remaining components of
+/// `to`.  Different drives or no common root yield `None` (FALSE with an
+/// empty output buffer).
+fn shlwapi_relative_path_to(from: &str, to: &str) -> Option<String> {
+    let drive = |path: &str| -> Option<char> {
+        let bytes = path.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            Some(bytes[0] as char)
+        } else {
+            None
+        }
+    };
+    let from_drive = drive(from)?;
+    let to_drive = drive(to)?;
+    if from_drive != to_drive {
+        return None;
+    }
+    let normalize = |path: &str| -> Vec<String> {
+        path.replace('/', "\\")
+            .split('\\')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let from_components = normalize(from);
+    let to_components = normalize(to);
+    let mut common = 0usize;
+    while common < from_components.len()
+        && common < to_components.len()
+        && from_components[common] == to_components[common]
+    {
+        common += 1;
+    }
+    if common == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for _ in common..from_components.len() {
+        parts.push("..".to_string());
+    }
+    parts.extend(to_components[common..].iter().cloned());
+    let mut relative = parts.join("\\");
+    if relative.is_empty() {
+        relative = ".".to_string();
+    }
+    Some(relative)
 }
 
 /// PathIsRelativeW: TRUE when the path is not drive-qualified and does not

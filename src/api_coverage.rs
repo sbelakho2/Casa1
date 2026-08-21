@@ -5152,7 +5152,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "NotifyRouteChange",
         "casa1-conformance:evidence_net_sys_iphlpapi_tables_from_guest_config",
     ),
-
     // == evidence-ui-gdi-sys ==
     //
     // UI/GDI/system surface: user32 focus/message/ANSI variants, the gdi32
@@ -5395,7 +5394,486 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "setupapi.dll",
         "SetupDiUninstallDevice",
         "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
-
+    ),
+    // == evidence-mid ==
+    //
+    // Mid-size families: advapi32 (access tokens, the SCM service
+    // database, CryptoAPI), shell32 (icon/path/notify helpers, the
+    // IPersistFile wiring on the shell-link object) and the winmmbase
+    // wave/midi IN-device surface.  All rows are backed by the semantic
+    // dispatch tests in src/runtime/mod.rs (evidence_mid_*), each wrapped
+    // in `with_big_stack` and driving the real thunks through
+    // `dispatch_x86_thunk`:
+    //
+    // - evidence_mid_advapi32_token_thunks — OpenProcessToken,
+    //   GetTokenInformation (the documented TOKEN_INFORMATION_CLASSes),
+    //   LookupPrivilegeValueW, AdjustTokenPrivileges, AllocateAndInitializeSid,
+    //   CheckTokenMembership, FreeSid, DuplicateTokenEx,
+    //   ImpersonateLoggedOnUser/OpenThreadToken/RevertToSelf, GetUserNameA,
+    //   LogonUserW.
+    // - evidence_mid_advapi32_scm_thunks — the service database in the
+    //   guest registry with the documented status flow and
+    //   ERROR_SERVICE_DOES_NOT_EXIST/ERROR_SERVICE_EXISTS/
+    //   ERROR_SERVICE_ALREADY_RUNNING/ERROR_SERVICE_NOT_ACTIVE errors.
+    // - evidence_mid_advapi32_crypto_thunks — CryptAcquireContextW with
+    //   the container name, MD5/SHA-1 hashing, CryptDeriveKey +
+    //   CryptEncrypt/CryptDecrypt (RC4/RC2/3DES), CryptGenRandom and the
+    //   NTE_* failure domain.
+    // - evidence_mid_advapi32_registry_event_thunks — RegEnumValueW,
+    //   RegQueryInfoKeyW, RegFlushKey, RegOpenCurrentUser and the
+    //   EventRegister/EventWrite/EventUnregister source.
+    // - evidence_mid_shell32_path_helpers_thunks — PathIsNetworkPathW,
+    //   PathRelativePathToW, PathMakeUniqueName and the shell32-registered
+    //   Path* helpers that share the shlwapi dispatch arms (the shared
+    //   thunks are additionally driven by the evidence_shlwapi_path_*
+    //   suites).
+    // - evidence_mid_shell32_fs_notify_icon_thunks — SHCreateDirectoryExW,
+    //   SHFileOperationW, SHChangeNotify, SHUpdateImageW, ShellExecuteW,
+    //   SHCreateShellItem, SHGetMalloc (the IMalloc allocator) and the
+    //   documented zero-handle icon path.
+    // - evidence_mid_shell32_extract_icon_resource_thunks — ExtractIconW/
+    //   ExtractIconExW against a PE whose .rsrc tree carries a real
+    //   RT_GROUP_ICON/RT_ICON resource.
+    // - evidence_mid_shell_link_persist_file_thunks — the IPersistFile
+    //   interface wired onto the shell-link object (QI, Load, GetCurFile).
+    // - evidence_mid_winmmbase_device_thunks — the 29 winmmbase exports
+    //   dispatch into the shared winmm device model (wave out/in
+    //   lifecycles with the deterministic parked-buffer input model, midi
+    //   out/in, caps, volume).
+    conformance(
+        "advapi32.dll",
+        "AdjustTokenPrivileges",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "AllocateAndInitializeSid",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CheckTokenMembership",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CloseServiceHandle",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "ControlService",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CreateServiceW",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptAcquireContextW",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptCreateHash",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptDecrypt",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptDeriveKey",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptDestroyHash",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptDestroyKey",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptEncrypt",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptGenRandom",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptGetHashParam",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptHashData",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "CryptReleaseContext",
+        "casa1-conformance:evidence_mid_advapi32_crypto_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "DeleteService",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "DuplicateTokenEx",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "EventRegister",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "EventUnregister",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "EventWrite",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "FreeSid",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "GetTokenInformation",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "GetUserNameA",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "ImpersonateLoggedOnUser",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "LogonUserW",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "LookupPrivilegeValueW",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "OpenProcessToken",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "OpenSCManagerW",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "OpenServiceW",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "OpenThreadToken",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "QueryServiceStatus",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "RegEnumValueW",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "RegFlushKey",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "RegOpenCurrentUser",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "RegQueryInfoKeyW",
+        "casa1-conformance:evidence_mid_advapi32_registry_event_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "RevertToSelf",
+        "casa1-conformance:evidence_mid_advapi32_token_thunks",
+    ),
+    conformance(
+        "advapi32.dll",
+        "StartServiceW",
+        "casa1-conformance:evidence_mid_advapi32_scm_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "ExtractIconExW",
+        "casa1-conformance:evidence_mid_shell32_extract_icon_resource_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "ExtractIconW",
+        "casa1-conformance:evidence_mid_shell32_extract_icon_resource_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathAppendW",
+        "casa1-conformance:evidence_shlwapi_path_append_combine_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathCombineW",
+        "casa1-conformance:evidence_shlwapi_path_append_combine_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathFileExistsW",
+        "casa1-conformance:evidence_shlwapi_fs_registry_and_url_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathFindExtensionW",
+        "casa1-conformance:evidence_shlwapi_path_find_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathFindFileNameW",
+        "casa1-conformance:evidence_mid_shell32_path_helpers_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathIsDirectoryW",
+        "casa1-conformance:evidence_shlwapi_fs_registry_and_url_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathIsNetworkPathW",
+        "casa1-conformance:evidence_mid_shell32_path_helpers_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathMakeUniqueName",
+        "casa1-conformance:evidence_mid_shell32_path_helpers_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathRelativePathToW",
+        "casa1-conformance:evidence_mid_shell32_path_helpers_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "PathRemoveFileSpecW",
+        "casa1-conformance:evidence_shlwapi_path_remove_spec_and_root_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHChangeNotify",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHCreateDirectoryExW",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHCreateShellItem",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHFileOperationW",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHGetMalloc",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "SHUpdateImageW",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "shell32.dll",
+        "ShellExecuteW",
+        "casa1-conformance:evidence_mid_shell32_fs_notify_icon_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiInClose",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiInOpen",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiInReset",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiInStart",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiInStop",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutClose",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutGetDevCapsW",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutGetNumDevs",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutLongMsg",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutOpen",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutReset",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "midiOutShortMsg",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInAddBuffer",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInClose",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInGetDevCapsW",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInGetNumDevs",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInOpen",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInPrepareHeader",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInStart",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInStop",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveInUnprepareHeader",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutClose",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutGetDevCapsW",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutGetNumDevs",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutGetVolume",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutOpen",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutReset",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutSetVolume",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
+    ),
+    conformance(
+        "winmmbase.dll",
+        "waveOutWrite",
+        "casa1-conformance:evidence_mid_winmmbase_device_thunks",
     ),
 ];
 
@@ -5514,19 +5992,25 @@ mod tests {
         "evidence_math_crt_stdio",
         "evidence_math_crt_vcruntime",
         "evidence_math_crt_msvcp",
-
         "evidence_net_sys_winsock_socket_lifecycle",
         "evidence_net_sys_winsock_dns_service_and_conversion_helpers",
         "evidence_net_sys_sspi_handshake_envelopes_and_message_protection",
         "evidence_net_sys_iphlpapi_tables_from_guest_config",
         "evidence_net_sys_netapi32_workstation_and_user_info",
-
         "evidence_ui_gdi_focus_and_message_a_thunks",
         "evidence_ui_gdi_bitmap_dc_object_thunks",
         "evidence_ui_gdi_draw_region_and_blend_thunks",
         "evidence_ui_gdi_psapi_guest_process_thunks",
         "evidence_ui_gdi_setupapi_device_info_sets",
-
+        "evidence_mid_advapi32_token_thunks",
+        "evidence_mid_advapi32_scm_thunks",
+        "evidence_mid_advapi32_crypto_thunks",
+        "evidence_mid_advapi32_registry_event_thunks",
+        "evidence_mid_shell32_path_helpers_thunks",
+        "evidence_mid_shell32_fs_notify_icon_thunks",
+        "evidence_mid_shell32_extract_icon_resource_thunks",
+        "evidence_mid_shell_link_persist_file_thunks",
+        "evidence_mid_winmmbase_device_thunks",
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",

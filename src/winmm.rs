@@ -1634,15 +1634,20 @@ impl WinMmSubsystem {
     ///
     /// `device_id` should be 0 or `MIDI_MAPPER` (0xFFFF).
     /// Creates / accesses the global MIDI synthesizer and returns a device handle.
-    pub fn midi_out_open(&mut self, device_id: u32, callback: Option<(u64, u64)>) -> u32 {
+    /// Open a MIDI output device.
+    ///
+    /// Returns `(mmresult, device_handle)` mirroring the wave-out
+    /// contract: `MMSYSERR_NOERROR` with the minted device handle on
+    /// success, an `MMSYSERR_*` code with handle 0 otherwise.
+    pub fn midi_out_open(&mut self, device_id: u32, callback: Option<(u64, u64)>) -> (u32, u32) {
         if device_id != 0 && device_id != MIDI_MAPPER {
-            return MMSYSERR_BADDEVICEID;
+            return (MMSYSERR_BADDEVICEID, 0);
         }
 
         // The synthesizer is lazily initialized via midi.rs lazy_static.
         let midi_handle = match midi::midi_out_open() {
             Ok(h) => h,
-            Err(_) => return MMSYSERR_ERROR,
+            Err(_) => return (MMSYSERR_ERROR, 0),
         };
 
         let device_handle = self.next_device_id;
@@ -1654,7 +1659,7 @@ impl WinMmSubsystem {
             callback,
         });
 
-        MMSYSERR_NOERROR
+        (MMSYSERR_NOERROR, device_handle)
     }
 
     /// Close a MIDI output device.
@@ -1757,9 +1762,13 @@ impl WinMmSubsystem {
     /// by [`midi_in_start`].
     ///
     /// Returns `MMSYSERR_NOERROR` with a valid handle.
-    pub fn midi_in_open(&mut self, device_id: u32, callback: Option<(u64, u64)>) -> u32 {
+    /// Open a MIDI input device.
+    ///
+    /// Returns `(mmresult, device_handle)` mirroring the wave-in
+    /// contract.
+    pub fn midi_in_open(&mut self, device_id: u32, callback: Option<(u64, u64)>) -> (u32, u32) {
         if device_id != 0 && device_id != MIDI_MAPPER {
-            return MMSYSERR_BADDEVICEID;
+            return (MMSYSERR_BADDEVICEID, 0);
         }
 
         let device_handle = self.next_device_id;
@@ -1774,7 +1783,7 @@ impl WinMmSubsystem {
             midi_buffer: Arc::new(Mutex::new(VecDeque::new())),
         });
 
-        MMSYSERR_NOERROR
+        (MMSYSERR_NOERROR, device_handle)
     }
 
     /// Close a MIDI input device.
@@ -2702,7 +2711,7 @@ mod tests {
     #[test]
     fn test_midi_out_open_close() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(0, None);
+        let (rc, _handle) = mm.midi_out_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR, "midiOutOpen should succeed");
 
         // Should have one device
@@ -2717,7 +2726,7 @@ mod tests {
     #[test]
     fn test_midi_out_open_with_mapper() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(MIDI_MAPPER, None);
+        let (rc, _handle) = mm.midi_out_open(MIDI_MAPPER, None);
         assert_eq!(
             rc, MMSYSERR_NOERROR,
             "midiOutOpen with MIDI_MAPPER should succeed"
@@ -2727,14 +2736,14 @@ mod tests {
     #[test]
     fn test_midi_out_bad_device_id() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(999, None);
+        let (rc, _handle) = mm.midi_out_open(999, None);
         assert_eq!(rc, MMSYSERR_BADDEVICEID);
     }
 
     #[test]
     fn test_midi_out_short_msg() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(0, None);
+        let (rc, _handle) = mm.midi_out_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR);
         let dev_id = mm.midi_out_devices[0].device_id;
 
@@ -2767,7 +2776,7 @@ mod tests {
     #[test]
     fn test_midi_out_long_msg() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(0, None);
+        let (rc, _handle) = mm.midi_out_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR);
         let dev_id = mm.midi_out_devices[0].device_id;
 
@@ -2782,7 +2791,7 @@ mod tests {
     #[test]
     fn test_midi_out_reset() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_out_open(0, None);
+        let (rc, _handle) = mm.midi_out_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR);
         let dev_id = mm.midi_out_devices[0].device_id;
 
@@ -2815,7 +2824,7 @@ mod tests {
     #[test]
     fn test_midi_in_open_close() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_in_open(0, None);
+        let (rc, _handle) = mm.midi_in_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR, "midiInOpen should succeed");
         assert_eq!(mm.midi_in_devices.len(), 1);
         let dev_id = mm.midi_in_devices[0].device_id;
@@ -2828,7 +2837,7 @@ mod tests {
     #[test]
     fn test_midi_in_start_stop() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_in_open(0, None);
+        let (rc, _handle) = mm.midi_in_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR);
         let dev_id = mm.midi_in_devices[0].device_id;
 
@@ -2846,7 +2855,7 @@ mod tests {
     #[test]
     fn test_midi_in_reset() {
         let mut mm = WinMmSubsystem::new();
-        let rc = mm.midi_in_open(0, None);
+        let (rc, _handle) = mm.midi_in_open(0, None);
         assert_eq!(rc, MMSYSERR_NOERROR);
         let dev_id = mm.midi_in_devices[0].device_id;
 

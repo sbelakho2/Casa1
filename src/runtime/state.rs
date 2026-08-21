@@ -86,6 +86,8 @@ pub(crate) enum GuestObjectKind {
     DirectSound8,
     /// A COM-created FileOpenDialog/FileSaveDialog object.
     FileDialog,
+    /// The standard IMalloc allocator returned by SHGetMalloc.
+    ShMalloc,
     SteamVRHmd,
     SteamVRCompositor,
     SteamVRChaperone,
@@ -1018,6 +1020,46 @@ pub(crate) struct PeHostRuntime {
     /// Per-hwnd extended frame margins for DwmExtendFrameIntoClientArea.
     /// Stores (cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight).
     pub(crate) dwm_margins: HashMap<u32, (u32, u32, u32, u32)>,
+    // ── advapi32: access tokens ───────────────────────────────────────
+    /// Maps token handle → access token.  The process token is created
+    /// lazily on the first OpenProcessToken.
+    pub(crate) tokens: BTreeMap<u64, crate::advapi32::TokenInfo>,
+    /// The process token handle (created lazily).
+    pub(crate) process_token_handle: Option<u64>,
+    /// Next token handle value.
+    pub(crate) next_token_handle: u64,
+    /// SIDs created by AllocateAndInitializeSid (freed by FreeSid).
+    pub(crate) allocated_sids: BTreeMap<u64, Vec<u8>>,
+    /// Next allocated-SID handle value.
+    pub(crate) next_sid_handle: u64,
+    // ── advapi32: service control manager ─────────────────────────────
+    /// SCM handles: handle → Some(service name) for a service handle,
+    /// None for the SCM manager handle.
+    pub(crate) scm_handles: BTreeMap<u64, Option<String>>,
+    /// Per-service status flow, keyed by service name.
+    pub(crate) scm_status: BTreeMap<String, crate::advapi32::ServiceStatusFlow>,
+    /// Next SCM handle value.
+    pub(crate) next_scm_handle: u64,
+    // ── advapi32: CryptoAPI ───────────────────────────────────────────
+    /// CryptoAPI provider contexts (HCRYPTPROV).
+    pub(crate) crypt_providers: BTreeMap<u64, crate::advapi32::CryptProvider>,
+    /// CryptoAPI hash objects (HCRYPTHASH).
+    pub(crate) crypt_hashes: BTreeMap<u64, crate::advapi32::CryptHashState>,
+    /// CryptoAPI key objects (HCRYPTKEY).
+    pub(crate) crypt_keys: BTreeMap<u64, crate::advapi32::CryptKeyState>,
+    /// Next CryptoAPI handle values.
+    pub(crate) next_crypt_provider_handle: u64,
+    pub(crate) next_crypt_hash_handle: u64,
+    pub(crate) next_crypt_key_handle: u64,
+    /// ETW registration handles (EventRegister) → provider GUID string.
+    pub(crate) event_registrations: BTreeMap<u64, String>,
+    /// Next ETW registration handle value.
+    pub(crate) next_event_registration_handle: u64,
+    // ── shell32: HICON registry (ExtractIconW/ExtractIconExW) ─────────
+    /// HICON handle → extracted icon image.
+    pub(crate) icons: BTreeMap<u64, crate::icon::IconImage>,
+    /// Next HICON handle value.
+    pub(crate) next_icon_handle: u64,
 }
 
 #[derive(Debug)]
@@ -1516,6 +1558,25 @@ impl PeHostRuntime {
             cef_cross_origin_whitelist: HashSet::new(),
             dwm_blur_states: HashMap::new(),
             dwm_margins: HashMap::new(),
+            // ── advapi32: tokens, SCM, CryptoAPI ──────────────────────────
+            tokens: BTreeMap::new(),
+            process_token_handle: None,
+            next_token_handle: 0xE1000001,
+            allocated_sids: BTreeMap::new(),
+            next_sid_handle: 0xE1100001,
+            scm_handles: BTreeMap::new(),
+            scm_status: BTreeMap::new(),
+            next_scm_handle: 0xE1200001,
+            crypt_providers: BTreeMap::new(),
+            crypt_hashes: BTreeMap::new(),
+            crypt_keys: BTreeMap::new(),
+            next_crypt_provider_handle: 0xE1300001,
+            next_crypt_hash_handle: 0xE1400001,
+            next_crypt_key_handle: 0xE1500001,
+            event_registrations: BTreeMap::new(),
+            next_event_registration_handle: 0xE1600001,
+            icons: BTreeMap::new(),
+            next_icon_handle: 0xE1700001,
         };
         // Wire the runtime's observer list into the subsystems that emit
         // events outside the runtime's own dispatch (the Win32 file layer
