@@ -22,7 +22,8 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::{
-    Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
+    Ipv4Addr, Ipv6Addr, Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream,
+    ToSocketAddrs, UdpSocket,
 };
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_void};
@@ -311,6 +312,172 @@ pub struct SockAddr {
     pub port: u16,
 }
 
+// ---------------------------------------------------------------------------
+// Guest network configuration model
+// ---------------------------------------------------------------------------
+//
+// The GUEST's view of the network — the single source of truth for the
+// iphlpapi.dll adapter/route/interface tables, the netapi32 workstation
+// identity, and `gethostname`.  Everything derives from the guest
+// environment (the hostname `GetComputerNameW` reports and the guest user),
+// so the HOST's real adapters can never leak into the guest: the tables
+// describe a deterministic, self-contained guest network (loopback +
+// one Ethernet adapter on a private subnet with a gateway and a DNS
+// server).
+
+/// An IPv4 assignment on a guest adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestIpv4 {
+    pub address: Ipv4Addr,
+    pub mask: Ipv4Addr,
+    pub gateway: Option<Ipv4Addr>,
+}
+
+/// An IPv6 assignment on a guest adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestIpv6 {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+}
+
+/// One guest network adapter (mirrors the MIB_IFROW/IP_ADAPTER_INFO model).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestAdapter {
+    /// Interface index (`ifIndex`).
+    pub index: u32,
+    /// Registry-style adapter name (`AdapterName` / `{GUID}` form).
+    pub adapter_name: String,
+    /// Long description (`Description`).
+    pub description: String,
+    /// Friendly display name (`FriendlyName`).
+    pub friendly_name: String,
+    pub mac: [u8; 6],
+    pub ipv4: Option<GuestIpv4>,
+    pub ipv6: Option<GuestIpv6>,
+    pub dhcp_enabled: bool,
+    pub dns_servers: Vec<String>,
+    pub mtu: u32,
+    /// Bits per second (`dwSpeed` / `TransmitLinkSpeed`).
+    pub speed: u64,
+    /// `IF_TYPE_*` (6 = IF_TYPE_ETHERNET_CSMACD, 24 = IF_TYPE_SOFTWARE_LOOPBACK).
+    pub if_type: u32,
+    /// `IfOperStatusUp` = 1.
+    pub oper_status: u32,
+    /// Interface metric.
+    pub metric: u32,
+}
+
+/// One guest IPv4 route (mirrors MIB_IPFORWARDROW).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestRoute {
+    pub dest: Ipv4Addr,
+    pub mask: Ipv4Addr,
+    pub next_hop: Ipv4Addr,
+    pub if_index: u32,
+    /// MIB_IPFORWARD_TYPE: 3 = direct, 4 = indirect.
+    pub route_type: u32,
+    pub metric: u32,
+}
+
+/// The complete guest network identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestNetworkConfig {
+    /// The host name `gethostname`/`GetComputerNameW` report.
+    pub hostname: String,
+    /// The workgroup/domain the workstation belongs to.
+    pub domain: String,
+    /// The guest user name (from the guest environment).
+    pub user_name: String,
+    pub adapters: Vec<GuestAdapter>,
+    pub routes: Vec<GuestRoute>,
+    pub dns_servers: Vec<String>,
+}
+
+/// The canonical guest network configuration.  Deterministic per runtime —
+/// the guest's adapters, addresses and routes never depend on the host
+/// machine this runtime runs on.
+pub fn guest_network_config(user_name: &str) -> GuestNetworkConfig {
+    let hostname = "CASA1".to_string();
+    let domain = "WORKGROUP".to_string();
+    GuestNetworkConfig {
+        hostname,
+        domain: domain.clone(),
+        user_name: user_name.to_string(),
+        adapters: vec![
+            GuestAdapter {
+                index: 1,
+                adapter_name: "{CASA1-0000-0000-0000-000000000001}".to_string(),
+                description: "Loopback Pseudo-Interface 1".to_string(),
+                friendly_name: "Loopback Pseudo-Interface 1".to_string(),
+                mac: [0, 0, 0, 0, 0, 0],
+                ipv4: Some(GuestIpv4 {
+                    address: Ipv4Addr::LOCALHOST,
+                    mask: Ipv4Addr::new(255, 0, 0, 0),
+                    gateway: None,
+                }),
+                ipv6: None,
+                dhcp_enabled: false,
+                dns_servers: Vec::new(),
+                mtu: 65_536,
+                speed: 1_000_000_000,
+                if_type: 24, // IF_TYPE_SOFTWARE_LOOPBACK
+                oper_status: 1,
+                metric: 1,
+            },
+            GuestAdapter {
+                index: 2,
+                adapter_name: "{CASA1-0000-0000-0000-000000000002}".to_string(),
+                description: "Casa1 Virtual Ethernet Adapter".to_string(),
+                friendly_name: "Ethernet".to_string(),
+                mac: [0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E],
+                ipv4: Some(GuestIpv4 {
+                    address: Ipv4Addr::new(10, 0, 2, 15),
+                    mask: Ipv4Addr::new(255, 255, 255, 0),
+                    gateway: Some(Ipv4Addr::new(10, 0, 2, 2)),
+                }),
+                ipv6: Some(GuestIpv6 {
+                    address: "fd00::2".parse().expect("static guest IPv6"),
+                    prefix_len: 64,
+                }),
+                dhcp_enabled: true,
+                dns_servers: vec!["10.0.2.3".to_string()],
+                mtu: 1500,
+                speed: 1_000_000_000,
+                if_type: 6, // IF_TYPE_ETHERNET_CSMACD
+                oper_status: 1,
+                metric: 10,
+            },
+        ],
+        routes: vec![
+            GuestRoute {
+                dest: Ipv4Addr::new(127, 0, 0, 0),
+                mask: Ipv4Addr::new(255, 0, 0, 0),
+                next_hop: Ipv4Addr::LOCALHOST,
+                if_index: 1,
+                route_type: 3,
+                metric: 1,
+            },
+            GuestRoute {
+                dest: Ipv4Addr::new(10, 0, 2, 0),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+                next_hop: Ipv4Addr::UNSPECIFIED,
+                if_index: 2,
+                route_type: 3,
+                metric: 10,
+            },
+            GuestRoute {
+                dest: Ipv4Addr::UNSPECIFIED,
+                mask: Ipv4Addr::UNSPECIFIED,
+                next_hop: Ipv4Addr::new(10, 0, 2, 2),
+                if_index: 2,
+                route_type: 4,
+                metric: 10,
+            },
+        ],
+        dns_servers: vec!["10.0.2.3".to_string()],
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PollState {
     pub socket: SocketId,
@@ -365,6 +532,12 @@ struct SocketRecord {
     recv_queue: VecDeque<u8>,
     /// Whether the peer has closed the real stream (EOF observed).
     real_eof: bool,
+    /// Per-socket SO_ERROR slot: set by failed connect attempts and
+    /// transport errors; read-and-cleared by `getsockopt(SO_ERROR)`.
+    /// This is what makes the non-blocking connect + select + getsockopt
+    /// contract observable (a connect in progress reports WSAEWOULDBLOCK
+    /// until it completes, exactly like WinSock).
+    pending_error: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -1059,6 +1232,7 @@ impl NetworkStack {
                 state: SocketState::Created,
                 recv_queue: VecDeque::new(),
                 real_eof: false,
+                pending_error: 0,
             },
         );
         self.last_wsa_error = 0;
@@ -1091,6 +1265,7 @@ impl NetworkStack {
                 state: SocketState::Created,
                 recv_queue: VecDeque::new(),
                 real_eof: false,
+                pending_error: 0,
             },
         );
         self.last_wsa_error = 0;
@@ -1162,6 +1337,104 @@ impl NetworkStack {
         }
     }
 
+    /// Accept a pending connection and re-register the accepted transport
+    /// record under `new_id` — a win32-table-minted handle — so the value
+    /// returned to the guest is a first-class socket in the unified handle
+    /// namespace (send/recv/closesocket type-check it as a socket).
+    ///
+    /// The accepted record is moved from its host-side pending-accept id to
+    /// `new_id`; the connecting client's peer pointer is repointed at
+    /// `new_id` so its sends land in the accepted socket's receive queue
+    /// (and vice versa).  Returns the client's address, which is what the
+    /// `accept`/`WSAAccept` out-parameter must report.
+    pub fn accept_with_id(&mut self, listener: SocketId, new_id: u64) -> AppResult<SockAddr> {
+        self.ensure_wsa_started()?;
+        let nonblocking = self.socket_record(listener)?.nonblocking;
+        let queue = self.pending_accept.entry(listener).or_default();
+        let client_socket = match queue.pop_front() {
+            Some(client_socket) => client_socket,
+            None if nonblocking => {
+                self.last_wsa_error = WSAEWOULDBLOCK;
+                return Err(AppError::new(
+                    ReasonCode::RcWinsockWouldBlock,
+                    "non-blocking accept would block",
+                ));
+            }
+            None => {
+                self.last_wsa_error = 0;
+                return Err(AppError::new(ReasonCode::RcIo, "no pending connections"));
+            }
+        };
+        let client_record = self.socket_record(client_socket)?;
+        let client_family = client_record.family;
+        let client_addr = client_record
+            .bound_addr
+            .clone()
+            .unwrap_or_else(|| default_sockaddr(client_family));
+        let accepted = self.sockets.remove(&client_socket).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("pending accept record {client_socket} is gone"),
+            )
+        })?;
+        // The connecting client still points its Connected peer at the old
+        // host-side id — repoint it so its sends reach the accepted socket.
+        let peer = match &accepted.state {
+            SocketState::Connected { peer } => Some(*peer),
+            _ => None,
+        };
+        if let Some(peer) = peer
+            && let Ok(client_record) = self.socket_record_mut(peer)
+        {
+            client_record.state = SocketState::Connected { peer: new_id };
+        }
+        self.sockets.insert(new_id, accepted);
+        self.last_wsa_error = 0;
+        Ok(client_addr)
+    }
+
+    /// Read and clear the per-socket SO_ERROR slot (getsockopt semantics:
+    /// the error is consumed by the read).
+    pub fn take_pending_error(&mut self, socket: SocketId) -> AppResult<i32> {
+        self.ensure_wsa_started()?;
+        let record = self.socket_record_mut(socket)?;
+        let error = std::mem::replace(&mut record.pending_error, 0);
+        self.last_wsa_error = 0;
+        Ok(error)
+    }
+
+    /// Peek the per-socket SO_ERROR slot without clearing it (WSAPoll
+    /// uses this to report POLLERR).
+    pub fn peek_pending_error(&self, socket: SocketId) -> AppResult<i32> {
+        Ok(self.socket_record(socket)?.pending_error)
+    }
+
+    /// Whether the socket is in the listening state (SO_ACCEPTCONN).
+    pub fn socket_is_listening(&self, socket: SocketId) -> AppResult<bool> {
+        Ok(matches!(
+            self.socket_record(socket)?.state,
+            SocketState::Listening { .. }
+        ))
+    }
+
+    /// The address family of a registered socket (used by
+    /// WSADuplicateSocketW to fill the protocol info structure).
+    pub fn socket_family(&self, socket: SocketId) -> AppResult<AddressFamily> {
+        Ok(self.socket_record(socket)?.family)
+    }
+
+    /// Reverse DNS lookup against the configured guest DNS records: returns
+    /// the first host name whose resolved addresses contain `ip`.  This is
+    /// the guest-visible name database — the host's resolver is never used
+    /// in reverse (the configured records ARE the guest's view of the
+    /// network, mirroring `getaddrinfo`'s forward path).
+    pub fn reverse_dns(&self, ip: &str) -> Option<String> {
+        self.dns_records
+            .iter()
+            .find(|(_host, records)| records.iter().any(|record| record.host == ip))
+            .map(|(host, _records)| host.clone())
+    }
+
     pub fn connect(&mut self, socket: SocketId, addr: SockAddr) -> AppResult<()> {
         self.ensure_wsa_started()?;
         if let Some(listener) = self.listeners.get(&addr).copied() {
@@ -1176,6 +1449,7 @@ impl NetworkStack {
                     state: SocketState::Connected { peer: socket },
                     recv_queue: VecDeque::new(),
                     real_eof: false,
+                    pending_error: 0,
                 },
             );
             let record = self.socket_record_mut(socket)?;
@@ -1224,7 +1498,11 @@ impl NetworkStack {
             // immediately when it is still in progress, matching WinSock
             // semantics. Completion is observed via SO_ERROR in select/recv/send.
             let (stream, in_progress) = nonblocking_connect(&candidate).map_err(|error| {
-                self.last_wsa_error = map_wsa_error(&error);
+                let wsa_error = map_wsa_error(&error);
+                self.last_wsa_error = wsa_error;
+                if let Ok(record) = self.socket_record_mut(socket) {
+                    record.pending_error = wsa_error;
+                }
                 AppError::new(
                     ReasonCode::RcIo,
                     format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
@@ -1238,6 +1516,7 @@ impl NetworkStack {
                     record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
                 }
                 record.state = SocketState::ConnectingReal { peer: addr.clone() };
+                record.pending_error = WSAEWOULDBLOCK;
                 self.last_wsa_error = WSAEWOULDBLOCK;
                 return Err(AppError::new(
                     ReasonCode::RcWinsockWouldBlock,
@@ -1254,6 +1533,7 @@ impl NetworkStack {
                 record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
             }
             record.state = SocketState::ConnectedReal { _peer: addr };
+            record.pending_error = 0;
             self.last_wsa_error = 0;
             return Ok(());
         }
@@ -1262,7 +1542,11 @@ impl NetworkStack {
         // caller indefinitely.
         let stream =
             TcpStream::connect_timeout(&candidate, Duration::from_secs(15)).map_err(|error| {
-                self.last_wsa_error = map_wsa_error(&error);
+                let wsa_error = map_wsa_error(&error);
+                self.last_wsa_error = wsa_error;
+                if let Ok(record) = self.socket_record_mut(socket) {
+                    record.pending_error = wsa_error;
+                }
                 AppError::new(
                     ReasonCode::RcIo,
                     format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
@@ -1276,6 +1560,7 @@ impl NetworkStack {
             record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
         }
         record.state = SocketState::ConnectedReal { _peer: addr };
+        record.pending_error = 0;
         self.last_wsa_error = 0;
         Ok(())
     }
@@ -1296,7 +1581,11 @@ impl NetworkStack {
         self.maybe_finish_connect(socket)?;
         if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
             let written = stream.write(bytes).map_err(|error| {
-                self.last_wsa_error = map_wsa_error(&error);
+                let wsa_error = map_wsa_error(&error);
+                self.last_wsa_error = wsa_error;
+                if let Ok(record) = self.socket_record_mut(socket) {
+                    record.pending_error = wsa_error;
+                }
                 AppError::new(
                     ReasonCode::RcIo,
                     format!("TCP send failed on socket {socket}: {error}"),
@@ -1349,7 +1638,11 @@ impl NetworkStack {
             let capped = length.min(MAX_SOCKET_RECEIVE_QUEUE);
             let mut bytes = vec![0; capped];
             let read = stream.read(&mut bytes).map_err(|error| {
-                self.last_wsa_error = map_wsa_error(&error);
+                let wsa_error = map_wsa_error(&error);
+                self.last_wsa_error = wsa_error;
+                if let Ok(record) = self.socket_record_mut(socket) {
+                    record.pending_error = wsa_error;
+                }
                 AppError::new(
                     ReasonCode::RcIo,
                     format!("TCP recv failed on socket {socket}: {error}"),

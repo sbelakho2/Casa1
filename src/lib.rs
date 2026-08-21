@@ -213,6 +213,7 @@ pub mod security;
 pub mod seh;
 pub mod shader;
 pub mod shader_compiler;
+pub mod sspi;
 pub mod steam;
 pub mod steam_acceptance;
 pub mod steam_input;

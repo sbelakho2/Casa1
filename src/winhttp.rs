@@ -3874,6 +3874,127 @@ fn compute_ntlmv2_response(ntlmv2_hash: &[u8], challenge: &[u8]) -> Vec<u8> {
     response
 }
 
+/// Create an NTLM CHALLENGE message (Type 2) — the server-side half of the
+/// envelope the secur32 SSPI surface hands to the guest.  The guest workload
+/// only ever parses the server challenge bytes (`ntlm_parse_challenge_msg`),
+/// so the target name and AV-pair payload are structural: the message is a
+/// well-formed Type 2 with the documented fixed-header layout (target name
+/// fields, negotiate flags, the 8-byte server challenge, reserved, target
+/// info fields, OS version, then the payloads).
+pub fn ntlm_create_challenge_msg(server_challenge: [u8; 8], target: &str) -> Vec<u8> {
+    let mut msg = b"NTLMSSP\x00".to_vec();
+    msg.extend_from_slice(&2u32.to_le_bytes());
+
+    let flags = NTLM_NEGOTIATE_FLAG_UNICODE
+        | NTLM_NEGOTIATE_FLAG_NTLM
+        | NTLM_NEGOTIATE_FLAG_NEG_128
+        | NTLM_NEGOTIATE_FLAG_NEG_56
+        | NTLM_NEGOTIATE_FLAG_REQUEST_NON_NT_SESSION_KEY
+        | NTLM_NEGOTIATE_FLAG_TARGET_INFO
+        | NTLM_NEGOTIATE_FLAG_VERSION
+        | 0x0000_0004  // NEGOTIATE_REQUEST_TARGET
+        | 0x0001_0000; // NEGOTIATE_TARGET_TYPE_DOMAIN
+
+    let target_enc: Vec<u16> = target.encode_utf16().collect();
+    let target_bytes: Vec<u8> = target_enc.iter().flat_map(|&c| c.to_le_bytes()).collect();
+    let target_len = target_bytes.len() as u16;
+    const FIXED_HEADER: u32 = 56;
+    let target_offset = FIXED_HEADER;
+    let target_info_offset = target_offset + target_len as u32;
+
+    // AV pairs: computer name (1), domain name (2), EOL (0).
+    let mut target_info = Vec::new();
+    for (name, id) in [("CASA1", 1_u16), (target, 2_u16)] {
+        let bytes: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        target_info.extend_from_slice(&id.to_le_bytes());
+        target_info.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        target_info.extend_from_slice(&bytes);
+    }
+    target_info.extend_from_slice(&0u16.to_le_bytes());
+    target_info.extend_from_slice(&0u16.to_le_bytes());
+
+    // Target name fields
+    msg.extend_from_slice(&target_len.to_le_bytes());
+    msg.extend_from_slice(&target_len.to_le_bytes());
+    msg.extend_from_slice(&target_offset.to_le_bytes());
+    // Negotiate flags
+    msg.extend_from_slice(&flags.to_le_bytes());
+    // Server challenge
+    msg.extend_from_slice(&server_challenge);
+    // Reserved
+    msg.extend_from_slice(&[0u8; 8]);
+    // Target info fields
+    msg.extend_from_slice(&(target_info.len() as u16).to_le_bytes());
+    msg.extend_from_slice(&(target_info.len() as u16).to_le_bytes());
+    msg.extend_from_slice(&target_info_offset.to_le_bytes());
+    // OS version structure (8 bytes)
+    msg.extend_from_slice(&[0x06, 0x01, 0x70, 0x01, 0x00, 0x00, 0x00, 0x0f]);
+
+    // Payloads
+    msg.extend_from_slice(&target_bytes);
+    msg.extend_from_slice(&target_info);
+    msg
+}
+
+/// Parse an NTLM AUTHENTICATE message (Type 3) to extract the identity the
+/// client authenticated as (domain + user) and the 8-byte client challenge
+/// embedded in the NTLMv2 response blob (the blob nonce).  The server side
+/// of the SSPI handshake uses this to complete the envelope and derive the
+/// shared session key.
+pub fn ntlm_parse_authenticate_msg(data: &[u8]) -> Option<(String, String, [u8; 8])> {
+    if data.len() < 72 || &data[..8] != b"NTLMSSP\x00" {
+        return None;
+    }
+    let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    if msg_type != 3 {
+        return None;
+    }
+    let field = |offset: usize| -> Option<(usize, usize)> {
+        let len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        let start = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+        Some((len, start))
+    };
+    let (domain_len, domain_off) = field(28)?;
+    let (user_len, user_off) = field(36)?;
+    let (nt_len, nt_off) = field(20)?;
+    let read_utf16 = |off: usize, len: usize| -> String {
+        if off + len > data.len() {
+            return String::new();
+        }
+        let mut units = Vec::with_capacity(len / 2);
+        for chunk in data[off..off + len].chunks_exact(2) {
+            units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        String::from_utf16_lossy(&units)
+    };
+    let domain = read_utf16(domain_off, domain_len);
+    let user = read_utf16(user_off, user_len);
+    let mut client_challenge = [0u8; 8];
+    // NTLMv2 response: 16-byte proof + 32-byte blob; the client challenge
+    // is the blob nonce at response[16 + 16 .. 16 + 24].
+    if nt_len >= 40 && nt_off + 40 <= data.len() {
+        client_challenge.copy_from_slice(&data[nt_off + 32..nt_off + 40]);
+    }
+    Some((domain, user, client_challenge))
+}
+
+/// Derive the SSPI session key both handshake sides agree on.  The real
+/// NTLM chain derives this from DES-encrypted hashes; this runtime models
+/// the CONTRACT (both sides derive the SAME key from the two challenges)
+/// with a documented internal PRF — HMAC-SHA256 over the concatenated
+/// server + client challenges.
+pub fn sspi_derive_session_key(server_challenge: &[u8], client_challenge: &[u8]) -> Vec<u8> {
+    let mut material = server_challenge.to_vec();
+    material.extend_from_slice(client_challenge);
+    crate::network::hmac_sha256(&material, b"casa1-sspi-session-key")
+        .expect("HMAC-SHA256 accepts any key length")
+}
+
 // -----------------------------------------------------------------------
 // J4: Kerberos Authentication (macOS GSS.framework)
 // -----------------------------------------------------------------------
