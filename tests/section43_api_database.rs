@@ -888,7 +888,7 @@ fn report_generator_emits_expected_json_shape() {
             .gate
             .shipping_violations
             .iter()
-            .any(|v| { v.dll == "user32.dll" && v.export == "GetFocus" }),
+            .any(|v| { v.dll == "advapi32.dll" && v.export == "AdjustTokenPrivileges" }),
         "unregistered Unsupported entries are honest shipping violations"
     );
     assert!(

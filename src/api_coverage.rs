@@ -4904,6 +4904,7 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     // ntdll.dll tail: the implemented NT surface lost to the evidence-ui-mm
     // conflict resolution (section47/48/49/50 suites, the evidence_core_*
     // round-trip tests, and the ntdll_*_unit module tests).
+
     // == evidence-net-sys ==
     //
     // The implemented network/system surface (ws2_32 socket lifecycle +
@@ -5151,6 +5152,251 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "NotifyRouteChange",
         "casa1-conformance:evidence_net_sys_iphlpapi_tables_from_guest_config",
     ),
+
+    // == evidence-ui-gdi-sys ==
+    //
+    // UI/GDI/system surface: user32 focus/message/ANSI variants, the gdi32
+    // drawing/region/blend surface, psapi guest-process introspection and
+    // the setupapi device-info-set machinery.  All rows are backed by the
+    // semantic dispatch tests in src/runtime/mod.rs (evidence_ui_gdi_*),
+    // each wrapped in `with_big_stack` and driving the real thunks through
+    // `dispatch_x86_thunk`:
+    //
+    // - evidence_ui_gdi_focus_and_message_a_thunks — GetFocus/SetFocus
+    //   (focus tracking + WM_KILLFOCUS/WM_SETFOCUS), GetMessageA,
+    //   PostMessageA/PostMessageW, GetWindowTextA (CP1252 conversion).
+    // - evidence_ui_gdi_bitmap_dc_object_thunks — CreateCompatibleBitmap,
+    //   CreateDCW, GetObjectW, GetRgnBox, GetCharWidthW, GetGlyphOutlineW,
+    //   GdiFlush, GdiComment, GetPixel/SetPixel.
+    // - evidence_ui_gdi_draw_region_and_blend_thunks — Ellipse, InvertRect,
+    //   CombineRgn, AlphaBlend, TransparentBlt, DrawTextExW (and FillRect/
+    //   GetDC/ReleaseDC/DrawTextW ride the same machinery).
+    // - evidence_ui_gdi_psapi_guest_process_thunks — EnumProcesses (guest
+    //   process list), GetModuleBaseNameW, GetModuleFileNameExW,
+    //   GetProcessMemoryInfo (guest address-space stats).
+    // - evidence_ui_gdi_setupapi_device_info_sets — the setupapi
+    //   device-info-set surface against the guest registry device store.
+    conformance(
+        "user32.dll",
+        "GetFocus",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "user32.dll",
+        "GetMessageA",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "user32.dll",
+        "GetWindowTextA",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "user32.dll",
+        "PostMessageA",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "user32.dll",
+        "PostMessageW",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "user32.dll",
+        "SetFocus",
+        "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "AlphaBlend",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "CombineRgn",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "CreateCompatibleBitmap",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "CreateDCW",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "DrawTextExW",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "DrawTextW",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "Ellipse",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "FillRect",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GdiComment",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GdiFlush",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetCharWidthW",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetDC",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetGlyphOutlineW",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetObjectW",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetPixel",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "GetRgnBox",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "InvertRect",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "ReleaseDC",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "SetPixel",
+        "casa1-conformance:evidence_ui_gdi_bitmap_dc_object_thunks",
+    ),
+    conformance(
+        "gdi32.dll",
+        "TransparentBlt",
+        "casa1-conformance:evidence_ui_gdi_draw_region_and_blend_thunks",
+    ),
+    conformance(
+        "psapi.dll",
+        "EnumProcesses",
+        "casa1-conformance:evidence_ui_gdi_psapi_guest_process_thunks",
+    ),
+    conformance(
+        "psapi.dll",
+        "GetModuleBaseNameW",
+        "casa1-conformance:evidence_ui_gdi_psapi_guest_process_thunks",
+    ),
+    conformance(
+        "psapi.dll",
+        "GetProcessMemoryInfo",
+        "casa1-conformance:evidence_ui_gdi_psapi_guest_process_thunks",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiBuildDriverInfoList",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiCallClassInstaller",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiDestroyDeviceInfoList",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiDestroyDriverInfoList",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiEnumDeviceInfo",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiEnumDriverInfoW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiGetClassDescriptionW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiGetClassDevsW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiGetDeviceInstanceIdW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiGetDeviceRegistryPropertyW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiGetSelectedDriverW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiInstallDevice",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiOpenDeviceInfoW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiSetDeviceRegistryPropertyW",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+    ),
+    conformance(
+        "setupapi.dll",
+        "SetupDiUninstallDevice",
+        "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
+
+    ),
 ];
 
 /// Evidence-ui-mm: conformance-backed rows (additive; the differential
@@ -5268,11 +5514,19 @@ mod tests {
         "evidence_math_crt_stdio",
         "evidence_math_crt_vcruntime",
         "evidence_math_crt_msvcp",
+
         "evidence_net_sys_winsock_socket_lifecycle",
         "evidence_net_sys_winsock_dns_service_and_conversion_helpers",
         "evidence_net_sys_sspi_handshake_envelopes_and_message_protection",
         "evidence_net_sys_iphlpapi_tables_from_guest_config",
         "evidence_net_sys_netapi32_workstation_and_user_info",
+
+        "evidence_ui_gdi_focus_and_message_a_thunks",
+        "evidence_ui_gdi_bitmap_dc_object_thunks",
+        "evidence_ui_gdi_draw_region_and_blend_thunks",
+        "evidence_ui_gdi_psapi_guest_process_thunks",
+        "evidence_ui_gdi_setupapi_device_info_sets",
+
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",

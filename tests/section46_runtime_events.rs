@@ -129,39 +129,49 @@ impl RuntimeObserver for RecordingObserver {
 
 #[test]
 fn runtime_emits_file_opened_on_create_file_w() {
-    let _cleanup = gate_setup();
-    let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-    let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
+    // thunk_drive* dispatches through the host-thunk match, whose
+    // debug-build frame overflows libtest's default 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+        let _cleanup = gate_setup();
+        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+        let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
 
-    let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), vec![observer])
-        .expect("manifest gate through the thunk layer");
+        let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), vec![observer])
+            .expect("manifest gate through the thunk layer");
 
-    assert!(
-        result.manifest_open_ok,
-        "CreateFileW must open the manifest"
-    );
-    assert!(result.manifest_read_ok, "ReadFile must succeed");
-    let received = events.lock().unwrap();
-    let file_opened = received
-        .iter()
-        .find(|event| matches!(event, RuntimeEvent::FileOpened { .. }));
-    assert!(
-        file_opened.is_some(),
-        "an observer attached to the runtime must receive FileOpened, got: {received:?}"
-    );
-    assert!(
-        received.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::FileOpened { path, .. } if path == r"C:\package\steam_client_win32.installed"
-        )),
-        "the manifest open must be reported with its normalized path, got: {received:?}"
-    );
-    assert!(
-        received
+        assert!(
+            result.manifest_open_ok,
+            "CreateFileW must open the manifest"
+        );
+        assert!(result.manifest_read_ok, "ReadFile must succeed");
+        let received = events.lock().unwrap();
+        let file_opened = received
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::FileRead { path, .. } if path == r"C:\package\steam_client_win32.installed")),
-        "the manifest read must be reported as FileRead, got: {received:?}"
-    );
+            .find(|event| matches!(event, RuntimeEvent::FileOpened { .. }));
+        assert!(
+            file_opened.is_some(),
+            "an observer attached to the runtime must receive FileOpened, got: {received:?}"
+        );
+        assert!(
+            received.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::FileOpened { path, .. } if path == r"C:\package\steam_client_win32.installed"
+            )),
+            "the manifest open must be reported with its normalized path, got: {received:?}"
+        );
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::FileRead { path, .. } if path == r"C:\package\steam_client_win32.installed")),
+            "the manifest read must be reported as FileRead, got: {received:?}"
+        );
+
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ---------------------------------------------------------------------------
@@ -170,23 +180,32 @@ fn runtime_emits_file_opened_on_create_file_w() {
 
 #[test]
 fn runtime_works_with_no_observer() {
-    let _cleanup = gate_setup();
-    // No observers attached — the default.  The gate must run perfectly and
-    // produce a usable result; without an observer NOTHING is recorded into
-    // the milestone state (the runtime never records Steam milestones on its
-    // own).
-    let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), Vec::new())
-        .expect("manifest gate must run with no observer attached");
-    assert!(result.manifest_open_ok, "CreateFileW must still succeed");
-    assert!(result.manifest_read_ok, "ReadFile must still succeed");
-    assert!(
-        result.milestones.steam.manifest_opened.is_none(),
-        "no observer attached → no milestone inference may leak into the result"
-    );
-    assert!(
-        result.milestones.steam.manifest_full_read.is_none(),
-        "no observer attached → no milestone inference may leak into the result"
-    );
+    // thunk_drive* dispatches through the host-thunk match, whose
+    // debug-build frame overflows libtest's default 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let _cleanup = gate_setup();
+            // No observers attached — the default.  The gate must run perfectly and
+            // produce a usable result; without an observer NOTHING is recorded into
+            // the milestone state (the runtime never records Steam milestones on its
+            // own).
+            let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), Vec::new())
+                .expect("manifest gate must run with no observer attached");
+            assert!(result.manifest_open_ok, "CreateFileW must still succeed");
+            assert!(result.manifest_read_ok, "ReadFile must still succeed");
+            assert!(
+                result.milestones.steam.manifest_opened.is_none(),
+                "no observer attached → no milestone inference may leak into the result"
+            );
+            assert!(
+                result.milestones.steam.manifest_full_read.is_none(),
+                "no observer attached → no milestone inference may leak into the result"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ---------------------------------------------------------------------------
@@ -279,39 +298,49 @@ fn steam_observer_infers_manifest_milestones_from_generic_events() {
 
 #[test]
 fn unsupported_call_event_fires_for_unknown_thunk() {
-    let _cleanup = gate_setup();
-    let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-    let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
+    // The unknown-thunk path dispatches through the host-thunk match,
+    // whose debug-build frame overflows libtest's default 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let _cleanup = gate_setup();
+            let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+            let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
 
-    let (error_message, _observers) = thunk_drive_unknown_thunk(open_gate_ge(), vec![observer]);
-    assert!(
-        error_message.contains("unknown PE host thunk"),
-        "dispatch must fail with the unknown-thunk error, got: {error_message}"
-    );
-    let received = events.lock().unwrap();
-    let unsupported = received
-        .iter()
-        .find(|event| matches!(event, RuntimeEvent::UnsupportedCall { .. }));
-    assert!(
-        unsupported.is_some(),
-        "the UnsupportedCall event must be emitted for an unknown thunk, got: {received:?}"
-    );
-    match unsupported.unwrap() {
-        RuntimeEvent::UnsupportedCall {
-            api,
-            implementation_level,
-            reason,
-            ..
-        } => {
+            let (error_message, _observers) =
+                thunk_drive_unknown_thunk(open_gate_ge(), vec![observer]);
             assert!(
-                api.contains("unknown-thunk"),
-                "the api field must name the unknown thunk, got: {api}"
+                error_message.contains("unknown PE host thunk"),
+                "dispatch must fail with the unknown-thunk error, got: {error_message}"
             );
-            assert_eq!(implementation_level, "unsupported");
-            assert!(reason.contains("unknown PE host thunk"));
-        }
-        _ => unreachable!(),
-    }
+            let received = events.lock().unwrap();
+            let unsupported = received
+                .iter()
+                .find(|event| matches!(event, RuntimeEvent::UnsupportedCall { .. }));
+            assert!(
+                unsupported.is_some(),
+                "the UnsupportedCall event must be emitted for an unknown thunk, got: {received:?}"
+            );
+            match unsupported.unwrap() {
+                RuntimeEvent::UnsupportedCall {
+                    api,
+                    implementation_level,
+                    reason,
+                    ..
+                } => {
+                    assert!(
+                        api.contains("unknown-thunk"),
+                        "the api field must name the unknown thunk, got: {api}"
+                    );
+                    assert_eq!(implementation_level, "unsupported");
+                    assert!(reason.contains("unknown PE host thunk"));
+                }
+                _ => unreachable!(),
+            }
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ---------------------------------------------------------------------------

@@ -3103,9 +3103,15 @@ impl User32Subsystem {
         wparam: i64,
         lparam: i64,
     ) -> AppResult<()> {
-        self.window(hwnd)?;
+        // Windows PostMessageW semantics: a NULL hwnd posts to the calling
+        // thread's queue (with no target window on the message); a real
+        // window must exist and the message carries its hwnd so
+        // DispatchMessageW routes it to the window proc.
+        if hwnd != 0 {
+            self.window(hwnd)?;
+        }
         self.enqueue(Message {
-            hwnd: Some(hwnd),
+            hwnd: (hwnd != 0).then_some(hwnd),
             kind,
             wparam,
             lparam,

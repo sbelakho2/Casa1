@@ -126,480 +126,545 @@ fn query_thread_u32(session: &mut NtThunkSession, query: u64, handle: u32, info_
 
 #[test]
 fn interleaved_win32_and_nt_suspend_resume_keep_counters_equal() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let nt_resume = session.alloc_thunk(HostThunk::NtResumeThread);
-    let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let nt_resume = session.alloc_thunk(HostThunk::NtResumeThread);
+            let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    let assert_counters_equal = |session: &NtThunkSession| {
-        let subsystem = session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("subsystem count");
-        let scheduler = session
-            .pending_thread_suspend_count(handle)
-            .expect("scheduler count");
-        assert_eq!(
-            subsystem, scheduler,
-            "the subsystem counter and the scheduler record must agree"
-        );
-    };
+            let assert_counters_equal = |session: &NtThunkSession| {
+                let subsystem = session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("subsystem count");
+                let scheduler = session
+                    .pending_thread_suspend_count(handle)
+                    .expect("scheduler count");
+                assert_eq!(
+                    subsystem, scheduler,
+                    "the subsystem counter and the scheduler record must agree"
+                );
+            };
 
-    // Win32 suspend: previous count 0 → 1.
-    assert_eq!(session.call_x86(suspend_thread, &[handle]), 0);
-    assert_counters_equal(&session);
-    // Win32 suspend again: previous count 1 → 2.
-    assert_eq!(session.call_x86(suspend_thread, &[handle]), 1);
-    assert_counters_equal(&session);
-    // Nt resume: previous count 2 → 1 — the thread is still suspended.
-    let prev_ptr = OUT_PTR as u32;
-    session.map_guest(OUT_PTR, &[0xFF_u8; 4]);
-    assert_eq!(
-        session.call_x86(nt_resume, &[handle, prev_ptr]),
-        STATUS_SUCCESS.raw()
-    );
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
-        2,
-        "NtResumeThread reports the true previous count"
-    );
-    assert_counters_equal(&session);
-    assert!(!session.pump_pending_guest_thread(), "still suspended");
+            // Win32 suspend: previous count 0 → 1.
+            assert_eq!(session.call_x86(suspend_thread, &[handle]), 0);
+            assert_counters_equal(&session);
+            // Win32 suspend again: previous count 1 → 2.
+            assert_eq!(session.call_x86(suspend_thread, &[handle]), 1);
+            assert_counters_equal(&session);
+            // Nt resume: previous count 2 → 1 — the thread is still suspended.
+            let prev_ptr = OUT_PTR as u32;
+            session.map_guest(OUT_PTR, &[0xFF_u8; 4]);
+            assert_eq!(
+                session.call_x86(nt_resume, &[handle, prev_ptr]),
+                STATUS_SUCCESS.raw()
+            );
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
+                2,
+                "NtResumeThread reports the true previous count"
+            );
+            assert_counters_equal(&session);
+            assert!(!session.pump_pending_guest_thread(), "still suspended");
 
-    // Nt resume: previous count 1 → 0 — the pump may start the thread.
-    assert_eq!(
-        session.call_x86(nt_resume, &[handle, 0]),
-        STATUS_SUCCESS.raw()
-    );
-    assert_counters_equal(&session);
-    assert!(
-        session.pump_pending_guest_thread(),
-        "starts after the final resume"
-    );
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
-        1,
-        "the thread ran exactly after the last suspension was released"
-    );
+            // Nt resume: previous count 1 → 0 — the pump may start the thread.
+            assert_eq!(
+                session.call_x86(nt_resume, &[handle, 0]),
+                STATUS_SUCCESS.raw()
+            );
+            assert_counters_equal(&session);
+            assert!(
+                session.pump_pending_guest_thread(),
+                "starts after the final resume"
+            );
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
+                1,
+                "the thread ran exactly after the last suspension was released"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn suspend_resume_on_terminated_thread_fails_win32_and_nt() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
-    let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
-    let nt_suspend = session.alloc_thunk(HostThunk::NtSuspendThread);
-    let nt_resume = session.alloc_thunk(HostThunk::NtResumeThread);
-    let (handle, _thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
+            let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
+            let nt_suspend = session.alloc_thunk(HostThunk::NtSuspendThread);
+            let nt_resume = session.alloc_thunk(HostThunk::NtResumeThread);
+            let (handle, _thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    // Terminate the thread: the queue entry is dropped and the subsystem
-    // state records the exit, but the handle stays open.
-    assert_eq!(session.call_x86(terminate_thread, &[handle, 0x77]), 1);
+            // Terminate the thread: the queue entry is dropped and the subsystem
+            // state records the exit, but the handle stays open.
+            assert_eq!(session.call_x86(terminate_thread, &[handle, 0x77]), 1);
 
-    // Win32: THREAD_SUSPEND_FAILED with ERROR_ACCESS_DENIED — Windows
-    // behavior for terminated threads.
-    assert_eq!(
-        session.call_x86(suspend_thread, &[handle]),
-        THREAD_SUSPEND_FAILED
-    );
-    assert_eq!(session.last_error(), ERROR_ACCESS_DENIED);
-    assert_eq!(
-        session.call_x86(resume_thread, &[handle]),
-        THREAD_SUSPEND_FAILED
-    );
-    assert_eq!(session.last_error(), ERROR_ACCESS_DENIED);
+            // Win32: THREAD_SUSPEND_FAILED with ERROR_ACCESS_DENIED — Windows
+            // behavior for terminated threads.
+            assert_eq!(
+                session.call_x86(suspend_thread, &[handle]),
+                THREAD_SUSPEND_FAILED
+            );
+            assert_eq!(session.last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(
+                session.call_x86(resume_thread, &[handle]),
+                THREAD_SUSPEND_FAILED
+            );
+            assert_eq!(session.last_error(), ERROR_ACCESS_DENIED);
 
-    // Nt: STATUS_THREAD_IS_TERMINATING (0xC000004A).
-    let prev_ptr = OUT_PTR as u32;
-    session.map_guest(OUT_PTR, &[0xFF_u8; 4]);
-    assert_eq!(
-        session.call_x86(nt_suspend, &[handle, prev_ptr]),
-        STATUS_THREAD_IS_TERMINATING.raw()
-    );
-    assert_eq!(
-        session.call_x86(nt_resume, &[handle, prev_ptr]),
-        STATUS_THREAD_IS_TERMINATING.raw()
-    );
-    // The previous-count out parameter is untouched on failure.
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
-        0xFFFF_FFFF,
-        "the previous-count out parameter is not written on failure"
-    );
+            // Nt: STATUS_THREAD_IS_TERMINATING (0xC000004A).
+            let prev_ptr = OUT_PTR as u32;
+            session.map_guest(OUT_PTR, &[0xFF_u8; 4]);
+            assert_eq!(
+                session.call_x86(nt_suspend, &[handle, prev_ptr]),
+                STATUS_THREAD_IS_TERMINATING.raw()
+            );
+            assert_eq!(
+                session.call_x86(nt_resume, &[handle, prev_ptr]),
+                STATUS_THREAD_IS_TERMINATING.raw()
+            );
+            // The previous-count out parameter is untouched on failure.
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
+                0xFFFF_FFFF,
+                "the previous-count out parameter is not written on failure"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn create_suspended_wait_stays_pending_until_resume() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
-    let wait_for_single_object = session.alloc_thunk(HostThunk::WaitForSingleObject);
-    let (handle, thread_id) = create_queued_thread(&mut session, create_thread, CREATE_SUSPENDED);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
+            let wait_for_single_object = session.alloc_thunk(HostThunk::WaitForSingleObject);
+            let (handle, thread_id) =
+                create_queued_thread(&mut session, create_thread, CREATE_SUSPENDED);
 
-    // The initial suspension is recorded in BOTH counters.
-    assert_eq!(
-        session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("count"),
-        1
-    );
-    assert_eq!(session.pending_thread_suspend_count(handle), Some(1));
-    assert!(
-        !session.pump_pending_guest_thread(),
-        "a CREATE_SUSPENDED thread does not start"
-    );
+            // The initial suspension is recorded in BOTH counters.
+            assert_eq!(
+                session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("count"),
+                1
+            );
+            assert_eq!(session.pending_thread_suspend_count(handle), Some(1));
+            assert!(
+                !session.pump_pending_guest_thread(),
+                "a CREATE_SUSPENDED thread does not start"
+            );
 
-    // A wait on it stays pending (a suspended thread cannot exit).
-    session.call_x86(wait_for_single_object, &[handle, u32::MAX]);
-    assert_eq!(session.parked_waiter_count(), 2);
-    assert!(!session.parked_waiter_satisfiable());
+            // A wait on it stays pending (a suspended thread cannot exit).
+            session.call_x86(wait_for_single_object, &[handle, u32::MAX]);
+            assert_eq!(session.parked_waiter_count(), 2);
+            assert!(!session.parked_waiter_satisfiable());
 
-    // ResumeThread releases the thread; it runs to completion and the
-    // waiter's descriptor becomes satisfiable.
-    assert_eq!(session.call_x86(resume_thread, &[handle]), 1);
-    assert_eq!(
-        session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("count"),
-        0
-    );
-    assert!(
-        session.pump_pending_guest_thread(),
-        "the thread starts after ResumeThread"
-    );
-    assert!(session.parked_waiter_satisfiable());
+            // ResumeThread releases the thread; it runs to completion and the
+            // waiter's descriptor becomes satisfiable.
+            assert_eq!(session.call_x86(resume_thread, &[handle]), 1);
+            assert_eq!(
+                session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("count"),
+                0
+            );
+            assert!(
+                session.pump_pending_guest_thread(),
+                "the thread starts after ResumeThread"
+            );
+            assert!(session.parked_waiter_satisfiable());
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn query_information_thread_classes_agree_with_the_win32_subsystem() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let nt_set_information = session.alloc_thunk(HostThunk::NtSetInformationThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
-    let get_thread_times = session.alloc_thunk(HostThunk::GetThreadTimes);
-    let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
-    let query = session.alloc_thunk(HostThunk::NtQueryInformationThread);
-    let (handle, _thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let nt_set_information = session.alloc_thunk(HostThunk::NtSetInformationThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
+            let get_thread_times = session.alloc_thunk(HostThunk::GetThreadTimes);
+            let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
+            let query = session.alloc_thunk(HostThunk::NtQueryInformationThread);
+            let (handle, _thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    // ThreadPriority: NtSetInformationThread routes into the Win32
-    // subsystem, and NtQueryInformationThread reports the same value
-    // GetThreadPriority reads.
-    session.map_guest(OUT_PTR, &7_i32.to_le_bytes());
-    assert_eq!(
-        session.call_x86(
-            nt_set_information,
-            &[handle, THREAD_PRIORITY_CLASS, OUT_PTR as u32, 4]
-        ),
-        STATUS_SUCCESS.raw()
-    );
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_PRIORITY_CLASS),
-        7
-    );
-    assert_eq!(
-        session
-            .win32()
-            .get_thread_priority(handle)
-            .expect("priority"),
-        7
-    );
+            // ThreadPriority: NtSetInformationThread routes into the Win32
+            // subsystem, and NtQueryInformationThread reports the same value
+            // GetThreadPriority reads.
+            session.map_guest(OUT_PTR, &7_i32.to_le_bytes());
+            assert_eq!(
+                session.call_x86(
+                    nt_set_information,
+                    &[handle, THREAD_PRIORITY_CLASS, OUT_PTR as u32, 4]
+                ),
+                STATUS_SUCCESS.raw()
+            );
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_PRIORITY_CLASS),
+                7
+            );
+            assert_eq!(
+                session
+                    .win32()
+                    .get_thread_priority(handle)
+                    .expect("priority"),
+                7
+            );
 
-    // ThreadBasePriority: the process base priority, the same value
-    // ThreadBasicInformation reports.
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_BASE_PRIORITY_CLASS),
-        0
-    );
+            // ThreadBasePriority: the process base priority, the same value
+            // ThreadBasicInformation reports.
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_BASE_PRIORITY_CLASS),
+                0
+            );
 
-    // ThreadAffinityMask: the fixed 8-way mask.
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_AFFINITY_MASK_CLASS),
-        0xFF
-    );
+            // ThreadAffinityMask: the fixed 8-way mask.
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_AFFINITY_MASK_CLASS),
+                0xFF
+            );
 
-    // ThreadIsTerminated: 0 while the thread is alive.
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_IS_TERMINATED_CLASS),
-        0
-    );
+            // ThreadIsTerminated: 0 while the thread is alive.
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_IS_TERMINATED_CLASS),
+                0
+            );
 
-    // ThreadBasicInformation: exit status pending, priority and base
-    // priority consistent with the subsystem (28 bytes on x86).
-    session.map_guest(OUT_PTR, &[0_u8; 32]);
-    let status = session.call_x86(
-        query,
-        &[
-            handle,
-            THREAD_BASIC_INFORMATION_CLASS,
-            OUT_PTR as u32,
-            28,
-            0,
-        ],
-    );
-    assert_eq!(status, STATUS_SUCCESS.raw());
-    let basic = session.read_guest(OUT_PTR, 28);
-    assert_eq!(
-        u32::from_le_bytes(basic[0..4].try_into().unwrap()),
-        casa1::ntdll::STATUS_PENDING.raw(),
-        "exit status is STATUS_PENDING while alive"
-    );
-    assert_eq!(
-        u32::from_le_bytes(basic[20..24].try_into().unwrap()),
-        7,
-        "priority matches SetThreadPriority"
-    );
-    assert_eq!(
-        u32::from_le_bytes(basic[24..28].try_into().unwrap()),
-        0,
-        "base priority matches ThreadBasePriority"
-    );
+            // ThreadBasicInformation: exit status pending, priority and base
+            // priority consistent with the subsystem (28 bytes on x86).
+            session.map_guest(OUT_PTR, &[0_u8; 32]);
+            let status = session.call_x86(
+                query,
+                &[
+                    handle,
+                    THREAD_BASIC_INFORMATION_CLASS,
+                    OUT_PTR as u32,
+                    28,
+                    0,
+                ],
+            );
+            assert_eq!(status, STATUS_SUCCESS.raw());
+            let basic = session.read_guest(OUT_PTR, 28);
+            assert_eq!(
+                u32::from_le_bytes(basic[0..4].try_into().unwrap()),
+                casa1::ntdll::STATUS_PENDING.raw(),
+                "exit status is STATUS_PENDING while alive"
+            );
+            assert_eq!(
+                u32::from_le_bytes(basic[20..24].try_into().unwrap()),
+                7,
+                "priority matches SetThreadPriority"
+            );
+            assert_eq!(
+                u32::from_le_bytes(basic[24..28].try_into().unwrap()),
+                0,
+                "base priority matches ThreadBasePriority"
+            );
 
-    // ThreadQuerySetWin32StartAddress: the queued thread's start routine.
-    let status = session.call_x86(
-        query,
-        &[
-            handle,
-            THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
-            OUT_PTR as u32,
-            4,
-            0,
-        ],
-    );
-    assert_eq!(status, STATUS_SUCCESS.raw());
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
-        ENTRY_POINT as u32
-    );
+            // ThreadQuerySetWin32StartAddress: the queued thread's start routine.
+            let status = session.call_x86(
+                query,
+                &[
+                    handle,
+                    THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
+                    OUT_PTR as u32,
+                    4,
+                    0,
+                ],
+            );
+            assert_eq!(status, STATUS_SUCCESS.raw());
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
+                ENTRY_POINT as u32
+            );
 
-    // ThreadAmILastThread: the queued thread is not the last one while the
-    // main thread exists.
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_AM_I_LAST_THREAD_CLASS),
-        0
-    );
+            // ThreadAmILastThread: the queued thread is not the last one while the
+            // main thread exists.
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_AM_I_LAST_THREAD_CLASS),
+                0
+            );
 
-    // ThreadPriorityBoost: enabled (the Windows default).
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_PRIORITY_BOOST_CLASS),
-        1
-    );
+            // ThreadPriorityBoost: enabled (the Windows default).
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_PRIORITY_BOOST_CLASS),
+                1
+            );
 
-    // ThreadHideFromDebugger: not hidden.
-    let status = session.call_x86(
-        query,
-        &[
-            handle,
-            THREAD_HIDE_FROM_DEBUGGER_CLASS,
-            OUT_PTR as u32,
-            1,
-            0,
-        ],
-    );
-    assert_eq!(status, STATUS_SUCCESS.raw());
-    assert_eq!(session.read_guest(OUT_PTR, 1), [0]);
+            // ThreadHideFromDebugger: not hidden.
+            let status = session.call_x86(
+                query,
+                &[
+                    handle,
+                    THREAD_HIDE_FROM_DEBUGGER_CLASS,
+                    OUT_PTR as u32,
+                    1,
+                    0,
+                ],
+            );
+            assert_eq!(status, STATUS_SUCCESS.raw());
+            assert_eq!(session.read_guest(OUT_PTR, 1), [0]);
 
-    // ThreadSuspendCount: the subsystem count (the single source of truth)
-    // is reported verbatim, including while suspended.
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
-        0
-    );
-    assert_eq!(session.call_x86(suspend_thread, &[handle]), 0);
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
-        1
-    );
-    assert_eq!(session.call_x86(resume_thread, &[handle]), 1);
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
-        0
-    );
+            // ThreadSuspendCount: the subsystem count (the single source of truth)
+            // is reported verbatim, including while suspended.
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
+                0
+            );
+            assert_eq!(session.call_x86(suspend_thread, &[handle]), 0);
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
+                1
+            );
+            assert_eq!(session.call_x86(resume_thread, &[handle]), 1);
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_SUSPEND_COUNT_CLASS),
+                0
+            );
 
-    // ThreadTimes and GetThreadTimes derive from the same guest-clock
-    // domain, so the Nt query and the Win32 API always agree (deterministic
-    // sessions report the clock delta — zero here).
-    session.map_guest(OUT_PTR, &[0xFF_u8; 32]);
-    let status = session.call_x86(query, &[handle, THREAD_TIMES_CLASS, OUT_PTR as u32, 32, 0]);
-    assert_eq!(status, STATUS_SUCCESS.raw());
-    let nt_times = session.read_guest(OUT_PTR, 32);
-    let win32_times_buf = 0x41_400;
-    session.map_guest(win32_times_buf, &[0_u8; 32]);
-    let ok = session.call_x86(
-        get_thread_times,
-        &[
-            handle,
-            win32_times_buf as u32,
-            (win32_times_buf + 8) as u32,
-            (win32_times_buf + 16) as u32,
-            (win32_times_buf + 24) as u32,
-        ],
-    );
-    assert_eq!(ok, 1, "GetThreadTimes succeeds");
-    let win32_times = session.read_guest(win32_times_buf, 32);
-    assert_eq!(
-        win32_times, nt_times,
-        "GetThreadTimes and ThreadTimes report the same values"
-    );
+            // ThreadTimes and GetThreadTimes derive from the same guest-clock
+            // domain, so the Nt query and the Win32 API always agree (deterministic
+            // sessions report the clock delta — zero here).
+            session.map_guest(OUT_PTR, &[0xFF_u8; 32]);
+            let status =
+                session.call_x86(query, &[handle, THREAD_TIMES_CLASS, OUT_PTR as u32, 32, 0]);
+            assert_eq!(status, STATUS_SUCCESS.raw());
+            let nt_times = session.read_guest(OUT_PTR, 32);
+            let win32_times_buf = 0x41_400;
+            session.map_guest(win32_times_buf, &[0_u8; 32]);
+            let ok = session.call_x86(
+                get_thread_times,
+                &[
+                    handle,
+                    win32_times_buf as u32,
+                    (win32_times_buf + 8) as u32,
+                    (win32_times_buf + 16) as u32,
+                    (win32_times_buf + 24) as u32,
+                ],
+            );
+            assert_eq!(ok, 1, "GetThreadTimes succeeds");
+            let win32_times = session.read_guest(win32_times_buf, 32);
+            assert_eq!(
+                win32_times, nt_times,
+                "GetThreadTimes and ThreadTimes report the same values"
+            );
 
-    // ThreadIsTerminated flips to 1 once the thread is terminated.
-    assert_eq!(session.call_x86(terminate_thread, &[handle, 0x55]), 1);
-    assert_eq!(
-        query_thread_u32(&mut session, query, handle, THREAD_IS_TERMINATED_CLASS),
-        1
-    );
-    assert_eq!(
-        session
-            .win32()
-            .get_exit_code_thread(handle)
-            .expect("exit code"),
-        Some(0x55)
-    );
+            // ThreadIsTerminated flips to 1 once the thread is terminated.
+            assert_eq!(session.call_x86(terminate_thread, &[handle, 0x55]), 1);
+            assert_eq!(
+                query_thread_u32(&mut session, query, handle, THREAD_IS_TERMINATED_CLASS),
+                1
+            );
+            assert_eq!(
+                session
+                    .win32()
+                    .get_exit_code_thread(handle)
+                    .expect("exit code"),
+                Some(0x55)
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn wait_on_suspended_thread_stays_pending_until_resumed_and_exited() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
-    let wait_for_single_object = session.alloc_thunk(HostThunk::WaitForSingleObject);
-    let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
+            let wait_for_single_object = session.alloc_thunk(HostThunk::WaitForSingleObject);
+            let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    // Suspend the queued thread: both counters move to 1 together.
-    let prev = session.call_x86(suspend_thread, &[handle]);
-    assert_eq!(prev, 0);
-    assert_eq!(
-        session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("count"),
-        1
-    );
-    assert_eq!(session.pending_thread_suspend_count(handle), Some(1));
+            // Suspend the queued thread: both counters move to 1 together.
+            let prev = session.call_x86(suspend_thread, &[handle]);
+            assert_eq!(prev, 0);
+            assert_eq!(
+                session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("count"),
+                1
+            );
+            assert_eq!(session.pending_thread_suspend_count(handle), Some(1));
 
-    // WaitForSingleObject on the suspended thread parks the waiter (the
-    // main thread) — a suspended thread cannot exit, so the wait never
-    // completes while the suspension holds.  The park path leaves the
-    // resume result to the pump, so the evidence is the parked descriptor.
-    session.call_x86(wait_for_single_object, &[handle, u32::MAX]);
-    assert_eq!(session.parked_waiter_count(), 2, "target + parked waiter");
+            // WaitForSingleObject on the suspended thread parks the waiter (the
+            // main thread) — a suspended thread cannot exit, so the wait never
+            // completes while the suspension holds.  The park path leaves the
+            // resume result to the pump, so the evidence is the parked descriptor.
+            session.call_x86(wait_for_single_object, &[handle, u32::MAX]);
+            assert_eq!(session.parked_waiter_count(), 2, "target + parked waiter");
 
-    // Nothing is runnable: the target is suspended, the waiter is parked.
-    assert!(!session.pump_pending_guest_thread());
-    assert!(
-        !session.parked_waiter_satisfiable(),
-        "a wait on a suspended thread must never complete"
-    );
+            // Nothing is runnable: the target is suspended, the waiter is parked.
+            assert!(!session.pump_pending_guest_thread());
+            assert!(
+                !session.parked_waiter_satisfiable(),
+                "a wait on a suspended thread must never complete"
+            );
 
-    // Resume releases the pump gate; the thread runs to completion and
-    // exits, which makes the waiter's descriptor satisfiable.
-    let prev = session.call_x86(resume_thread, &[handle]);
-    assert_eq!(prev, 1);
-    assert!(
-        session.pump_pending_guest_thread(),
-        "target ran after resume"
-    );
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
-        1,
-        "the thread start routine ran"
-    );
-    assert!(
-        session.parked_waiter_satisfiable(),
-        "the waiter completes once the thread has exited"
-    );
-    assert_eq!(session.parked_waiter_count(), 1, "only the waiter remains");
+            // Resume releases the pump gate; the thread runs to completion and
+            // exits, which makes the waiter's descriptor satisfiable.
+            let prev = session.call_x86(resume_thread, &[handle]);
+            assert_eq!(prev, 1);
+            assert!(
+                session.pump_pending_guest_thread(),
+                "target ran after resume"
+            );
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
+                1,
+                "the thread start routine ran"
+            );
+            assert!(
+                session.parked_waiter_satisfiable(),
+                "the waiter completes once the thread has exited"
+            );
+            assert_eq!(session.parked_waiter_count(), 1, "only the waiter remains");
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn nt_wait_on_suspended_thread_stays_pending_until_resumed_and_exited() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
-    let nt_wait = session.alloc_thunk(HostThunk::NtWaitForSingleObject);
-    let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let resume_thread = session.alloc_thunk(HostThunk::ResumeThread);
+            let nt_wait = session.alloc_thunk(HostThunk::NtWaitForSingleObject);
+            let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    let prev = session.call_x86(suspend_thread, &[handle]);
-    assert_eq!(prev, 0);
-    assert_eq!(
-        session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("count"),
-        1
-    );
+            let prev = session.call_x86(suspend_thread, &[handle]);
+            assert_eq!(prev, 0);
+            assert_eq!(
+                session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("count"),
+                1
+            );
 
-    // NtWaitForSingleObject with a long finite timeout parks (never
-    // host-blocks); the suspended target keeps it pending.
-    session.call_x86(nt_wait, &[handle, 0, 0xFFFF_FFFF]);
-    assert_eq!(session.parked_waiter_count(), 2);
-    assert!(!session.pump_pending_guest_thread());
-    assert!(
-        !session.parked_waiter_satisfiable(),
-        "an Nt wait on a suspended thread must never complete"
-    );
+            // NtWaitForSingleObject with a long finite timeout parks (never
+            // host-blocks); the suspended target keeps it pending.
+            session.call_x86(nt_wait, &[handle, 0, 0xFFFF_FFFF]);
+            assert_eq!(session.parked_waiter_count(), 2);
+            assert!(!session.pump_pending_guest_thread());
+            assert!(
+                !session.parked_waiter_satisfiable(),
+                "an Nt wait on a suspended thread must never complete"
+            );
 
-    let prev = session.call_x86(resume_thread, &[handle]);
-    assert_eq!(prev, 1);
-    assert!(
-        session.pump_pending_guest_thread(),
-        "target ran after resume"
-    );
-    assert!(
-        session.parked_waiter_satisfiable(),
-        "the Nt waiter completes once the thread has exited"
-    );
+            let prev = session.call_x86(resume_thread, &[handle]);
+            assert_eq!(prev, 1);
+            assert!(
+                session.pump_pending_guest_thread(),
+                "target ran after resume"
+            );
+            assert!(
+                session.parked_waiter_satisfiable(),
+                "the Nt waiter completes once the thread has exited"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn terminate_suspended_thread_succeeds_and_thread_never_starts() {
-    let (_tmp, mut session) = setup_session();
-    let create_thread = session.alloc_thunk(HostThunk::CreateThread);
-    let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
-    let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
-    let get_exit_code = session.alloc_thunk(HostThunk::GetExitCodeThread);
-    let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
+    // Thread-semantics thunks dispatch through the host-thunk match,
+    // whose debug-build frame overflows libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_tmp, mut session) = setup_session();
+            let create_thread = session.alloc_thunk(HostThunk::CreateThread);
+            let suspend_thread = session.alloc_thunk(HostThunk::SuspendThread);
+            let terminate_thread = session.alloc_thunk(HostThunk::TerminateThread);
+            let get_exit_code = session.alloc_thunk(HostThunk::GetExitCodeThread);
+            let (handle, thread_id) = create_queued_thread(&mut session, create_thread, 0);
 
-    // Suspend it, then terminate it while suspended.
-    let prev = session.call_x86(suspend_thread, &[handle]);
-    assert_eq!(prev, 0);
-    assert_eq!(
-        session
-            .win32()
-            .thread_suspend_count(thread_id)
-            .expect("count"),
-        1
-    );
+            // Suspend it, then terminate it while suspended.
+            let prev = session.call_x86(suspend_thread, &[handle]);
+            assert_eq!(prev, 0);
+            assert_eq!(
+                session
+                    .win32()
+                    .thread_suspend_count(thread_id)
+                    .expect("count"),
+                1
+            );
 
-    let terminated = session.call_x86(terminate_thread, &[handle, 0x1234]);
-    assert_eq!(
-        terminated, 1,
-        "TerminateThread on a suspended thread succeeds"
-    );
-    assert_eq!(session.last_error(), 0);
+            let terminated = session.call_x86(terminate_thread, &[handle, 0x1234]);
+            assert_eq!(
+                terminated, 1,
+                "TerminateThread on a suspended thread succeeds"
+            );
+            assert_eq!(session.last_error(), 0);
 
-    // The queued record is gone: the thread can never start.
-    assert_eq!(session.parked_waiter_count(), 0);
-    assert!(!session.pump_pending_guest_thread(), "nothing to run");
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
-        0,
-        "the suspended thread never ran"
-    );
+            // The queued record is gone: the thread can never start.
+            assert_eq!(session.parked_waiter_count(), 0);
+            assert!(!session.pump_pending_guest_thread(), "nothing to run");
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
+                0,
+                "the suspended thread never ran"
+            );
 
-    // GetExitCodeThread reports the termination code.
-    let ok = session.call_x86(get_exit_code, &[handle, OUT_PTR as u32]);
-    assert_eq!(ok, 1);
-    assert_eq!(
-        u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
-        0x1234,
-        "the termination code is reported"
-    );
+            // GetExitCodeThread reports the termination code.
+            let ok = session.call_x86(get_exit_code, &[handle, OUT_PTR as u32]);
+            assert_eq!(ok, 1);
+            assert_eq!(
+                u32::from_le_bytes(session.read_guest(OUT_PTR, 4).try_into().unwrap()),
+                0x1234,
+                "the termination code is reported"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }

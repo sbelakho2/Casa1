@@ -532,6 +532,23 @@ const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 const ERROR_OLD_WIN_VERSION: u32 = 1_150;
 const ERROR_TIMEOUT: u32 = 1460;
 const APPMODEL_ERROR_NO_PACKAGE: u32 = 15_700;
+/// setupapi.dll error codes (setupapi.h / winerror.h): a property value
+/// requested by `SetupDiGetDeviceRegistryPropertyW` does not exist.
+const ERROR_INVALID_DATA: u32 = 13;
+/// setupapi.dll error codes: the glyph outline could not be produced
+/// (bitmap fonts — the runtime's font model).
+const ERROR_CANNOT_COMPLETE: u32 = 1_003;
+/// setupapi.dll error codes: the device information element does not name a
+/// known device instance.
+const ERROR_INVALID_DEVINST: u32 = 1_004;
+/// setupapi.dll error codes: `SetupDiGetSelectedDriverW` when no driver is
+/// selected for the device.
+const ERROR_NO_DEVICE_SELECTED: u32 = 575;
+/// setupapi.dll error codes: an SP_DEVINFO_DATA buffer smaller than the
+/// struct size.
+const ERROR_INVALID_USER_BUFFER: u32 = 1_784;
+/// GDI error return value (`GetGlyphOutlineW` failure).
+const GDI_ERROR: u32 = 0xFFFF_FFFF;
 const VER_MINORVERSION: u32 = 0x0000_0001;
 const VER_MAJORVERSION: u32 = 0x0000_0002;
 const VER_BUILDNUMBER: u32 = 0x0000_0004;
@@ -1880,6 +1897,18 @@ pub enum HostThunk {
     ShowWindow,
     GetDC,
     ReleaseDC,
+    /// `GetFocus` — retrieves the HWND that currently has the keyboard focus
+    /// for the calling thread's message queue.  The focus HWND is tracked in
+    /// the user32 subsystem (`User32Subsystem::focus`); `SetFocus` and the
+    /// focus-transition paths (window creation, `ShowWindow`, destruction)
+    /// maintain it.  Returns 0 when no window in this thread has focus.
+    GetFocus,
+    /// `SetFocus` — sets the keyboard focus to the given window, sending
+    /// WM_KILLFOCUS to the previously focused window and WM_SETFOCUS to the
+    /// newly focused one through the message queue, and returns the previous
+    /// focus HWND (0 if there was none).  Fails with 0 + ERROR_INVALID_WINDOW
+    /// _HANDLE when the window does not exist.
+    SetFocus,
     SetForegroundWindow,
     DestroyWindow,
     InvalidateRect,
@@ -1933,6 +1962,16 @@ pub enum HostThunk {
     LoadMenuIndirectW,
     PostQuitMessage,
     PostThreadMessageW,
+    /// `PostMessageA` — posts a message to the thread that created the given
+    /// window (ANSI variant: identical message plumbing to `PostMessageW`;
+    /// the MSG payload carries no text, so no string conversion is needed).
+    PostMessageA,
+    /// `PostMessageW` — posts a message to the thread that created the given
+    /// window.  The message lands in that thread's message queue
+    /// (the same `thread_message_queues` machinery as `PostThreadMessageW`,
+    /// with the target HWND recorded on the message); a NULL `hwnd` posts to
+    /// the calling thread's queue, exactly like Windows.
+    PostMessageW,
     SetTimer,
     // --- I8: Animations ---
     AnimateWindow,
@@ -1944,6 +1983,11 @@ pub enum HostThunk {
     GetWindowLongW,
     SetWindowLongW,
     LoadImageW,
+    /// `GetMessageA` — retrieves a message from the calling thread's queue
+    /// (ANSI variant).  The MSG structure carries no string data, so the
+    /// retrieval loop is identical to `GetMessageW`; the result is written
+    /// into the same MSG layout in guest memory.
+    GetMessageA,
     GetMessageW,
     TranslateMessage,
     PeekMessageW,
@@ -1980,6 +2024,62 @@ pub enum HostThunk {
     BitBlt,
     StretchBlt,
     Rectangle,
+    /// `Ellipse` — draws an ellipse bounded by the given rectangle into the
+    /// DC's window surface using the selected pen color for the outline.
+    Ellipse,
+    /// `InvertRect` — inverts the pixel colors of a rectangle in the DC's
+    /// window surface.
+    InvertRect,
+    /// `GetRgnBox` — retrieves the bounding rectangle of a region.
+    GetRgnBox,
+    /// `CombineRgn` — combines two regions into a third region with the
+    /// given combine mode, returning the result type (NULLREGION/SIMPLEREGION/
+    /// COMPLEXREGION/ERROR).
+    CombineRgn,
+    /// `GetObjectW` — retrieves the properties of a GDI object into the
+    /// caller's buffer (LOGBRUSH for brushes, LOGFONT for fonts, BITMAP for
+    /// bitmaps, RECT for regions).
+    GetObjectW,
+    /// `AlphaBlend` — blends a source bitmap into the destination DC with a
+    /// per-pixel alpha channel (BLENDFUNCTION).  Rasterizes into the DC's
+    /// window surface following the documented alpha-compositing formula.
+    AlphaBlend,
+    /// `TransparentBlt` — copies a bitmap region into the destination DC,
+    /// making pixels matching the given transparent color invisible.
+    TransparentBlt,
+    /// `GdiFlush` — flushes any pending GDI drawing (a no-op success: the
+    /// runtime rasterizes drawing calls synchronously, so nothing is
+    /// pending).
+    GdiFlush,
+    /// `GdiComment` — appends a comment to the enhanced metafile of the DC
+    /// (a no-op success for non-metafile DCs).
+    GdiComment,
+    /// `CreateCompatibleBitmap` — creates a bitmap compatible with the given
+    /// DC's pixel format (32bpp BGRA, matching the memory-DC surfaces).
+    CreateCompatibleBitmap,
+    /// `CreateDCW` — creates a device context for the named display driver
+    /// (e.g. "DISPLAY"); unknown drivers fail with ERROR_INVALID_PARAMETER
+    /// and return NULL, exactly like Windows.
+    CreateDCW,
+    /// `GetPixel` — reads the color of the pixel at (x, y) from the DC's
+    /// window surface as a COLORREF (0x00BBGGRR); CLR_INVALID when the
+    /// surface has no content.
+    GetPixel,
+    /// `SetPixel` — sets the pixel at (x, y) in the DC's window surface to
+    /// the given COLORREF, returning the set color.
+    SetPixel,
+    /// `GetCharWidthW` — retrieves the advance widths of a run of characters
+    /// in the DC's selected font (from the same text-metrics machinery as
+    /// `GetTextExtentPoint32W`).
+    GetCharWidthW,
+    /// `GetGlyphOutlineW` — retrieves glyph outline data.  The runtime's
+    /// bitmap-font model cannot produce outlines, so this returns
+    /// GDI_ERROR (0xFFFFFFFF) with ERROR_CANNOT_COMPLETE, the documented
+    /// failure for bitmap fonts.
+    GetGlyphOutlineW,
+    /// `DrawTextExW` — extended `DrawTextW` with additional formatting
+    /// flags (DT_CALCRECT etc.) through the same text-drawing machinery.
+    DrawTextExW,
     GetTextColor,
     GetBkColor,
     GetBkMode,
@@ -2139,6 +2239,11 @@ pub enum HostThunk {
     EnumProcesses,
     EnumProcessModules,
     GetModuleBaseNameA,
+    /// `GetModuleBaseNameW` — retrieves the base name of the specified module
+    /// (the module's file name without the directory path) as a UTF-16
+    /// string.  Resolves the module from the runtime's module-handle tables;
+    /// unknown handles fail with ERROR_INVALID_HANDLE.
+    GetModuleBaseNameW,
     WsprintfW,
     CreateFileW,
     AreFileApisANSI,
@@ -2684,6 +2789,11 @@ pub enum HostThunk {
     GetWindow,
     /// `GetWindowTextW` — retrieves the title/text of a window.
     GetWindowTextW,
+    /// `GetWindowTextA` — retrieves the title/text of a window (ANSI
+    /// variant): the wide title is converted to the ANSI code page
+    /// (CP_ACP, CP1252 for the default locale) and copied into the caller's
+    /// buffer with the Windows truncation/NUL contract.
+    GetWindowTextA,
     /// `GetWindowTextLengthW` — retrieves the length (in chars) of a window's title/text.
     GetWindowTextLengthW,
     /// `GetUpdateRect` — retrieves the update rectangle of a window.
@@ -3076,6 +3186,63 @@ pub enum HostThunk {
     GetModuleInformation,
     /// `GetProcessMemoryInfo` — retrieves information about the memory usage of the specified process.
     GetProcessMemoryInfo,
+    // -- setupapi.dll: device-info-set surface --------------------------------
+    /// `SetupDiGetClassDevsW` — builds a device information set for the
+    /// devices matching the given class GUID / enumerator / device instance
+    /// path.  The device list is backed by the guest registry's device
+    /// enumeration (`HKLM\SYSTEM\CurrentControlSet\Enum`); returns an
+    /// HDEVINFO handle for the device-info-set, or INVALID_HANDLE_VALUE +
+    /// ERROR_INVALID_PARAMETER for an unknown class GUID.
+    SetupDiGetClassDevsW,
+    /// `SetupDiDestroyDeviceInfoList` — frees a device information set.
+    SetupDiDestroyDeviceInfoList,
+    /// `SetupDiEnumDeviceInfo` — enumerates the device information elements
+    /// in a device information set; returns FALSE + ERROR_NO_MORE_ITEMS when
+    /// the index is past the end of the list.
+    SetupDiEnumDeviceInfo,
+    /// `SetupDiGetDeviceInstanceIdW` — retrieves the device instance ID
+    /// (e.g. `ROOT\SYSTEM\0000`) of a device information element.
+    SetupDiGetDeviceInstanceIdW,
+    /// `SetupDiGetDeviceRegistryPropertyW` — reads a device property value
+    /// from the device's guest-registry key under `HKLM\SYSTEM\
+    /// CurrentControlSet\Enum\<device instance ID>`.
+    SetupDiGetDeviceRegistryPropertyW,
+    /// `SetupDiOpenDeviceInfoW` — opens an existing device information
+    /// element for the given device instance ID.
+    SetupDiOpenDeviceInfoW,
+    /// `SetupDiSetDeviceRegistryPropertyW` — writes a device property value
+    /// into the device's guest-registry key.
+    SetupDiSetDeviceRegistryPropertyW,
+    /// `SetupDiCallClassInstaller` — invokes the default class installer
+    /// behavior for a DIF code; the default-installer codes are handled
+    /// (success) and unhandled codes fail honestly with
+    /// ERROR_INVALID_PARAMETER.
+    SetupDiCallClassInstaller,
+    /// `SetupDiGetClassDescriptionW` — retrieves the class description for a
+    /// class GUID from the guest registry's class database
+    /// (`HKLM\SYSTEM\CurrentControlSet\Control\Class\<GUID>`).
+    SetupDiGetClassDescriptionW,
+    /// `SetupDiBuildDriverInfoList` — builds a list of drivers for a device;
+    /// with an empty guest driver database the list is empty and the call
+    /// succeeds.
+    SetupDiBuildDriverInfoList,
+    /// `SetupDiDestroyDriverInfoList` — frees a driver information list.
+    SetupDiDestroyDriverInfoList,
+    /// `SetupDiEnumDriverInfoW` — enumerates the driver information elements
+    /// of a device's driver list; returns FALSE + ERROR_NO_MORE_ITEMS when
+    /// the list is exhausted (or was never built).
+    SetupDiEnumDriverInfoW,
+    /// `SetupDiGetSelectedDriverW` — retrieves the selected driver of a
+    /// device; fails with ERROR_NO_DEVICE_SELECTED when no driver has been
+    /// selected (the honest documented error for an empty driver list).
+    SetupDiGetSelectedDriverW,
+    /// `SetupDiInstallDevice` — installs a device through the default
+    /// installer: marks the device installed in its guest-registry key and
+    /// returns success.
+    SetupDiInstallDevice,
+    /// `SetupDiUninstallDevice` — uninstalls a device: marks the device
+    /// uninstalled in its guest-registry key and returns success.
+    SetupDiUninstallDevice,
     // -- Phase 1.3.3: Missing bcrypt.dll imports for Steam.exe ------------------
     /// `BCryptGenRandom` — generates a random number.
     BCryptGenRandom,
@@ -4284,6 +4451,22 @@ pub enum HostThunk {
         dll: String,
         symbol: String,
     },
+}
+
+/// Outcome of one [`PeHostRuntime::get_message_pump`] iteration — the
+/// shared retrieval loop behind `GetMessageW` and `GetMessageA`.
+enum GetMessagePumpOutcome {
+    /// A message was retrieved from the thread's queue and written into the
+    /// guest MSG structure; the caller applies the API-specific result and
+    /// trace.
+    Retrieved(Message),
+    /// A pumped guest thread (or timer callback) requested process exit;
+    /// the caller must propagate the code so the run terminates.
+    ProcessExit(i32),
+    /// No message was available and the scheduler was serviced (guest
+    /// threads pumped, timers fired, callbacks drained); the caller loops
+    /// and tries again.
+    Idle,
 }
 
 impl Default for ProgressBarState {
@@ -10229,6 +10412,516 @@ impl PeHostRuntime {
 
     fn hdc_target_window(&self, hdc: u64) -> Option<u32> {
         self.device_contexts.get(&hdc).copied().flatten()
+    }
+
+    /// `GetPixel` semantics: the COLORREF (0x00BBGGRR) of the pixel at
+    /// (x, y) in the DC.  Window DCs read the window surface; memory DCs
+    /// read the selected bitmap (bottom-up native layout, refreshed from
+    /// guest memory).  Returns CLR_INVALID (0xFFFFFFFF) when the DC or the
+    /// pixel is out of bounds.
+    fn gdi_get_pixel(&mut self, memory: &MemoryImage, hdc: u64, x: i64, y: i64) -> u32 {
+        if x < 0 || y < 0 {
+            return 0xFFFF_FFFF;
+        }
+        if let Some(hwnd) = self.hdc_target_window(hdc) {
+            let Some(preview) = self.window_preview(hwnd) else {
+                return 0xFFFF_FFFF;
+            };
+            let width = preview.width as usize;
+            let height = preview.height as usize;
+            let Some(surface) = self.window_surfaces.get(&hwnd) else {
+                return 0xFFFF_FFFF;
+            };
+            let (x, y) = (x as usize, y as usize);
+            if x >= width || y >= height {
+                return 0xFFFF_FFFF;
+            }
+            let index = (y * width + x) * 4;
+            if index + 3 >= surface.bytes.len() {
+                return 0xFFFF_FFFF;
+            }
+            // BGRA surface → COLORREF 0x00BBGGRR: the low byte is RED,
+            // the high byte is BLUE.
+            u32::from(surface.bytes[index + 2])
+                | (u32::from(surface.bytes[index + 1]) << 8)
+                | (u32::from(surface.bytes[index]) << 16)
+        } else {
+            let Some((_object, bitmap)) = self.refresh_dc_bitmap(memory, hdc) else {
+                return 0xFFFF_FFFF;
+            };
+            let (x, y) = (x as usize, y as usize);
+            if x >= bitmap.width || y >= bitmap.height {
+                return 0xFFFF_FFFF;
+            }
+            let bpp = bitmap.bpp.max(1);
+            // Bitmaps are bottom-up: row 0 is the bottom of the image.
+            let row = bitmap.height - 1 - y;
+            let index = (row * bitmap.width + x) * bpp;
+            if index + bpp > bitmap.bytes.len() {
+                return 0xFFFF_FFFF;
+            }
+            let pixel = &bitmap.bytes[index..index + bpp];
+            match bpp {
+                1 => u32::from(pixel[0]) * 0x01_0101,
+                2 => {
+                    let value = u16::from_le_bytes([pixel[0], pixel[1]]);
+                    let r = (((value >> 10) & 0x1f) * 255 / 31) as u32;
+                    let g = (((value >> 5) & 0x1f) * 255 / 31) as u32;
+                    let b = ((value & 0x1f) * 255 / 31) as u32;
+                    r | (g << 8) | (b << 16)
+                }
+                _ => {
+                    // Native BGRA/BGR layout.
+                    u32::from(pixel[2]) | (u32::from(pixel[1]) << 8) | (u32::from(pixel[0]) << 16)
+                }
+            }
+        }
+    }
+
+    /// `SetPixel` semantics: set the pixel at (x, y) in the DC to the
+    /// COLORREF.  Window DCs write the window surface; memory DCs write
+    /// the selected bitmap and mirror the bytes back into guest memory.
+    /// Returns the color actually set, or CLR_INVALID (0xFFFFFFFF) when
+    /// the DC or the pixel is out of bounds.
+    fn gdi_set_pixel(
+        &mut self,
+        memory: &mut MemoryImage,
+        hdc: u64,
+        x: i64,
+        y: i64,
+        color: u32,
+    ) -> u32 {
+        if x < 0 || y < 0 {
+            return 0xFFFF_FFFF;
+        }
+        if let Some(hwnd) = self.hdc_target_window(hdc) {
+            let Some(preview) = self.window_preview(hwnd) else {
+                return 0xFFFF_FFFF;
+            };
+            let width = preview.width as usize;
+            let height = preview.height as usize;
+            let (x, y) = (x as usize, y as usize);
+            if x >= width || y >= height {
+                return 0xFFFF_FFFF;
+            }
+            let surface =
+                self.ensure_window_surface(hwnd, preview.width as usize, preview.height as usize);
+            let index = (y * width + x) * 4;
+            if index + 3 >= surface.bytes.len() {
+                return 0xFFFF_FFFF;
+            }
+            let bgra = colorref_to_bgra(color);
+            surface.bytes[index..index + 4].copy_from_slice(&bgra);
+            color
+        } else {
+            let Some(object) = self.dc_selected_objects.get(&hdc).copied() else {
+                return 0xFFFF_FFFF;
+            };
+            let Some(bitmap) = self.gdi_bitmaps.get_mut(&object) else {
+                return 0xFFFF_FFFF;
+            };
+            let (x, y) = (x as usize, y as usize);
+            if x >= bitmap.width || y >= bitmap.height {
+                return 0xFFFF_FFFF;
+            }
+            let bpp = bitmap.bpp.max(1);
+            let row = bitmap.height - 1 - y;
+            let index = (row * bitmap.width + x) * bpp;
+            if index + bpp > bitmap.bytes.len() {
+                return 0xFFFF_FFFF;
+            }
+            let bgra = colorref_to_bgra(color);
+            let n = bpp.min(4);
+            bitmap.bytes[index..index + n].copy_from_slice(&bgra[..n]);
+            if bitmap.guest_pixel_ptr != 0 {
+                for (offset, &byte) in bgra.iter().take(n).enumerate() {
+                    memory.write_u8(bitmap.guest_pixel_ptr + index as u64 + offset as u64, byte);
+                }
+            }
+            color
+        }
+    }
+
+    /// `AlphaBlend` semantics: alpha-composite a source DC region into the
+    /// destination DC's window surface.  `source_alpha` (the
+    /// BLENDFUNCTION.SourceConstantAlpha) scales every source pixel; with
+    /// `use_source_alpha` (AC_SRC_ALPHA) the source per-pixel alpha is
+    /// used instead, using the documented formula
+    /// `dst = src·a + dst·(1−a)` per channel.
+    #[allow(clippy::too_many_arguments)]
+    fn alpha_blend_dc(
+        &mut self,
+        memory: &mut MemoryImage,
+        hdc_dest: u64,
+        x_dest: i64,
+        y_dest: i64,
+        w_dest: i64,
+        h_dest: i64,
+        hdc_src: u64,
+        x_src: i64,
+        y_src: i64,
+        w_src: i64,
+        h_src: i64,
+        source_alpha: u32,
+        use_source_alpha: bool,
+    ) -> bool {
+        let Some(hwnd) = self.hdc_target_window(hdc_dest) else {
+            return false;
+        };
+        let Some(preview) = self.window_preview(hwnd) else {
+            return false;
+        };
+        let Some((src_w, src_h, src_pixels)) = self.gather_dc_pixels(memory, hdc_src) else {
+            return false;
+        };
+        if src_w == 0 || src_h == 0 || w_dest <= 0 || h_dest <= 0 {
+            return false;
+        }
+        let surface =
+            self.ensure_window_surface(hwnd, preview.width as usize, preview.height as usize);
+        let surf_w = surface.width;
+        for dy in 0..h_dest as usize {
+            let sy = ((dy as i64 * h_src.max(1) / h_dest.max(1)) + y_src) as usize;
+            for dx in 0..w_dest as usize {
+                let sx = ((dx as i64 * w_src.max(1) / w_dest.max(1)) + x_src) as usize;
+                if sy >= src_h || sx >= src_w {
+                    continue;
+                }
+                let tx = x_dest + dx as i64;
+                let ty = y_dest + dy as i64;
+                if tx < 0 || ty < 0 || tx as usize >= surf_w || ty as usize >= surface.height {
+                    continue;
+                }
+                let s_idx = (sy * src_w + sx) * 4;
+                let d_idx = (ty as usize * surf_w + tx as usize) * 4;
+                if s_idx + 3 >= src_pixels.len() || d_idx + 3 >= surface.bytes.len() {
+                    continue;
+                }
+                let src_b = src_pixels[s_idx];
+                let src_g = src_pixels[s_idx + 1];
+                let src_r = src_pixels[s_idx + 2];
+                let src_a = src_pixels[s_idx + 3];
+                let dst_b = surface.bytes[d_idx];
+                let dst_g = surface.bytes[d_idx + 1];
+                let dst_r = surface.bytes[d_idx + 2];
+                let dst_a = surface.bytes[d_idx + 3];
+                // Per-pixel alpha: AC_SRC_ALPHA uses the source alpha;
+                // otherwise only SourceConstantAlpha applies.
+                let alpha = if use_source_alpha {
+                    (u32::from(src_a) * source_alpha.min(255)) / 255
+                } else {
+                    source_alpha.min(255)
+                };
+                let alpha = alpha.min(255);
+                let inv = 255 - alpha;
+                let blend = |src: u8, dst: u8| {
+                    ((u32::from(src) * alpha + u32::from(dst) * inv) / 255) as u8
+                };
+                surface.bytes[d_idx] = blend(src_b, dst_b);
+                surface.bytes[d_idx + 1] = blend(src_g, dst_g);
+                surface.bytes[d_idx + 2] = blend(src_r, dst_r);
+                // The destination alpha channel follows the same blend.
+                surface.bytes[d_idx + 3] = blend(src_a, dst_a);
+            }
+        }
+        true
+    }
+
+    /// `TransparentBlt` semantics: copy a source DC region into the
+    /// destination DC's window surface, skipping source pixels that match
+    /// the transparent COLORREF.
+    #[allow(clippy::too_many_arguments)]
+    fn transparent_blit_dc(
+        &mut self,
+        memory: &mut MemoryImage,
+        hdc_dest: u64,
+        x_dest: i64,
+        y_dest: i64,
+        w_dest: i64,
+        h_dest: i64,
+        hdc_src: u64,
+        x_src: i64,
+        y_src: i64,
+        w_src: i64,
+        h_src: i64,
+        transparent: u32,
+    ) -> bool {
+        let Some(hwnd) = self.hdc_target_window(hdc_dest) else {
+            return false;
+        };
+        let Some(preview) = self.window_preview(hwnd) else {
+            return false;
+        };
+        let Some((src_w, src_h, src_pixels)) = self.gather_dc_pixels(memory, hdc_src) else {
+            return false;
+        };
+        if src_w == 0 || src_h == 0 || w_dest <= 0 || h_dest <= 0 {
+            return false;
+        }
+        let transparent_bgra = colorref_to_bgra(transparent);
+        let surface =
+            self.ensure_window_surface(hwnd, preview.width as usize, preview.height as usize);
+        let surf_w = surface.width;
+        for dy in 0..h_dest as usize {
+            let sy = ((dy as i64 * h_src.max(1) / h_dest.max(1)) + y_src) as usize;
+            for dx in 0..w_dest as usize {
+                let sx = ((dx as i64 * w_src.max(1) / w_dest.max(1)) + x_src) as usize;
+                if sy >= src_h || sx >= src_w {
+                    continue;
+                }
+                let s_idx = (sy * src_w + sx) * 4;
+                if s_idx + 3 >= src_pixels.len() {
+                    continue;
+                }
+                // Skip the transparent color (RGB match; alpha is not part
+                // of the COLORREF).
+                if src_pixels[s_idx] == transparent_bgra[0]
+                    && src_pixels[s_idx + 1] == transparent_bgra[1]
+                    && src_pixels[s_idx + 2] == transparent_bgra[2]
+                {
+                    continue;
+                }
+                let tx = x_dest + dx as i64;
+                let ty = y_dest + dy as i64;
+                if tx < 0 || ty < 0 || tx as usize >= surf_w || ty as usize >= surface.height {
+                    continue;
+                }
+                let d_idx = (ty as usize * surf_w + tx as usize) * 4;
+                if d_idx + 3 < surface.bytes.len() {
+                    surface.bytes[d_idx..d_idx + 4].copy_from_slice(&src_pixels[s_idx..s_idx + 4]);
+                }
+            }
+        }
+        true
+    }
+
+    /// Format a Windows GUID struct (16 bytes, little-endian Data1/Data2/
+    /// Data3 followed by the 8 Data4 bytes) as the canonical
+    /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` string.
+    fn guid_bytes_to_string(bytes: &[u8; 16]) -> String {
+        let data1 = u32::from_le_bytes(bytes[0..4].try_into().expect("guid data1"));
+        let data2 = u16::from_le_bytes(bytes[4..6].try_into().expect("guid data2"));
+        let data3 = u16::from_le_bytes(bytes[6..8].try_into().expect("guid data3"));
+        format!(
+            "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+            data1,
+            data2,
+            data3,
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        )
+    }
+
+    /// Parse a GUID string (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`) into
+    /// the 16-byte Windows GUID struct layout; returns `None` for strings
+    /// that do not follow the canonical form.
+    fn parse_guid_string(guid: &str) -> Option<[u8; 16]> {
+        let trimmed = guid.trim().trim_start_matches('{').trim_end_matches('}');
+        let hex = trimmed.replace('-', "");
+        if hex.len() != 32 {
+            return None;
+        }
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect::<Option<_>>()?;
+        let mut out = [0_u8; 16];
+        out[0..4].copy_from_slice(&u32::from_be_bytes(bytes[0..4].try_into().ok()?).to_le_bytes());
+        out[4..6].copy_from_slice(&u16::from_be_bytes(bytes[4..6].try_into().ok()?).to_le_bytes());
+        out[6..8].copy_from_slice(&u16::from_be_bytes(bytes[6..8].try_into().ok()?).to_le_bytes());
+        out[8..16].copy_from_slice(&bytes[8..16]);
+        Some(out)
+    }
+
+    /// Read a guest registry string value (REG_SZ) from the device
+    /// enumeration store.
+    fn setupapi_registry_string(&self, hive: &str, key: &str, value_name: &str) -> Option<String> {
+        self.win32
+            .ge()
+            .registry_get_value(hive, key, value_name, RegistryView::Native)
+            .ok()
+            .flatten()
+            .and_then(|stored| stored.data.as_str().map(str::to_string))
+    }
+
+    /// Enumerate the device instances in the guest registry's device store
+    /// (`HKLM\SYSTEM\CurrentControlSet\Enum`), optionally filtered by class
+    /// GUID and enumerator — the device-info-set contents behind
+    /// `SetupDiGetClassDevsW`.
+    fn setupapi_device_list(
+        &self,
+        class_guid: Option<&str>,
+        enumerator: Option<&str>,
+    ) -> Vec<SetupDeviceInfo> {
+        const ENUM_ROOT: &str = "SYSTEM\\CurrentControlSet\\Enum";
+        let ge = self.win32.ge();
+        let mut devices = Vec::new();
+        let Ok(enumerators) = ge.registry_enum_keys("HKLM", ENUM_ROOT, RegistryView::Native) else {
+            return devices;
+        };
+        for enumerator_name in enumerators {
+            if let Some(filter) = enumerator
+                && !filter.eq_ignore_ascii_case(&enumerator_name)
+            {
+                continue;
+            }
+            let enumerator_key = format!("{ENUM_ROOT}\\{enumerator_name}");
+            let Ok(device_ids) =
+                ge.registry_enum_keys("HKLM", &enumerator_key, RegistryView::Native)
+            else {
+                continue;
+            };
+            for device_id in device_ids {
+                let device_key = format!("{enumerator_key}\\{device_id}");
+                let Ok(instances) =
+                    ge.registry_enum_keys("HKLM", &device_key, RegistryView::Native)
+                else {
+                    continue;
+                };
+                for instance in instances {
+                    let registry_key = format!("{device_key}\\{instance}");
+                    let instance_id = format!("{enumerator_name}\\{device_id}\\{instance}");
+                    let device_class =
+                        self.setupapi_registry_string("HKLM", &registry_key, "ClassGUID");
+                    if let Some(filter) = class_guid
+                        && device_class
+                            .as_deref()
+                            .is_some_and(|class| !class.eq_ignore_ascii_case(filter))
+                    {
+                        continue;
+                    }
+                    devices.push(SetupDeviceInfo {
+                        instance_id,
+                        class_guid: device_class.unwrap_or_default(),
+                        registry_key,
+                    });
+                }
+            }
+        }
+        devices
+    }
+
+    /// Resolve a device-information element (devinst) within a
+    /// device-info-set to its device record.
+    fn setupapi_device(&self, dev_info_set: u64, devinst: u32) -> Option<SetupDeviceInfo> {
+        let devices = self.setup_devices.get(&dev_info_set)?;
+        devices.get(devinst as usize).cloned()
+    }
+
+    /// The SPDRP_* property → guest-registry value-name mapping for
+    /// `SetupDiGetDeviceRegistryPropertyW` / `SetupDiSetDeviceRegistryPropertyW`.
+    fn setupapi_property_value_name(property: u32) -> Option<&'static str> {
+        match property {
+            0 => Some("DeviceDesc"),     // SPDRP_DEVICEDESC
+            1 => Some("HardwareID"),     // SPDRP_HARDWAREID
+            2 => Some("CompatibleIDs"),  // SPDRP_COMPATIBLEIDS
+            4 => Some("Service"),        // SPDRP_SERVICE
+            7 => Some("Class"),          // SPDRP_CLASS
+            8 => Some("ClassGUID"),      // SPDRP_CLASSGUID
+            9 => Some("Driver"),         // SPDRP_DRIVER
+            11 => Some("Mfg"),           // SPDRP_MFG
+            12 => Some("FriendlyName"),  // SPDRP_FRIENDLYNAME
+            34 => Some("InstallState"),  // SPDRP_INSTALL_STATE (DWORD)
+            47 => Some("DevType"),       // SPDRP_DEVTYPE (DWORD)
+            48 => Some("BusTypeGUID"),   // SPDRP_BUSTYPEGUID
+            49 => Some("LegacyBusType"), // SPDRP_LEGACYBUSTYPE (DWORD)
+            50 => Some("BusNumber"),     // SPDRP_BUSNUMBER (DWORD)
+            _ => None,
+        }
+    }
+
+    /// Read the typed data of a device property from the guest registry:
+    /// returns `(registry_type, bytes)` for the property buffer.
+    fn setupapi_read_property(
+        &self,
+        device: &SetupDeviceInfo,
+        property: u32,
+    ) -> Option<(u32, Vec<u8>)> {
+        let value_name = Self::setupapi_property_value_name(property)?;
+        let stored = self
+            .win32
+            .ge()
+            .registry_get_value(
+                "HKLM",
+                &device.registry_key,
+                value_name,
+                RegistryView::Native,
+            )
+            .ok()
+            .flatten()?;
+        match stored.value_type.as_str() {
+            "REG_DWORD" => stored
+                .data
+                .as_u64()
+                .map(|value| (4, (value as u32).to_le_bytes().to_vec())),
+            "REG_QWORD" => stored
+                .data
+                .as_u64()
+                .map(|value| (11, value.to_le_bytes().to_vec())),
+            "REG_SZ" | "REG_EXPAND_SZ" => stored.data.as_str().map(|text| {
+                let mut bytes = text
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                bytes.extend_from_slice(&[0, 0]);
+                (1, bytes)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Write a typed device property into the guest registry.
+    fn setupapi_write_property(
+        &self,
+        device: &SetupDeviceInfo,
+        property: u32,
+        bytes: &[u8],
+    ) -> bool {
+        let Some(value_name) = Self::setupapi_property_value_name(property) else {
+            return false;
+        };
+        let ge = self.win32.ge();
+        let is_dword = matches!(property, 34 | 47 | 49 | 50);
+        if is_dword {
+            if bytes.len() < 4 {
+                return false;
+            }
+            let value = u32::from_le_bytes(bytes[..4].try_into().expect("dword"));
+            ge.registry_set_value(
+                "HKLM",
+                &device.registry_key,
+                value_name,
+                "REG_DWORD",
+                json!(value),
+                RegistryView::Native,
+            )
+            .is_ok()
+        } else {
+            // String property (REG_SZ): the buffer is a NUL-terminated
+            // UTF-16 string.
+            let units = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .take_while(|unit| *unit != 0)
+                .collect::<Vec<_>>();
+            let text = String::from_utf16_lossy(&units);
+            ge.registry_set_value(
+                "HKLM",
+                &device.registry_key,
+                value_name,
+                "REG_SZ",
+                json!(text),
+                RegistryView::Native,
+            )
+            .is_ok()
+        }
     }
 
     fn selected_text_scale(&self, hdc: u64) -> usize {
@@ -20743,6 +21436,41 @@ impl PeHostRuntime {
                     json!(updated),
                 );
             }
+            HostThunk::GetFocus => {
+                // GetFocus() — the focus HWND tracked by the user32
+                // subsystem (set by SetFocus and the focus-transition
+                // window paths).  0 means no window in this thread has
+                // focus; the function never fails.
+                let focus = self.user32.get_focus().unwrap_or(0);
+                state.set(Register::Rax, u64::from(focus));
+                self.last_error = 0;
+                self.push_trace("input", "GetFocus", BTreeMap::new(), json!(focus));
+            }
+            HostThunk::SetFocus => {
+                // SetFocus(hwnd) — set the keyboard focus.  The user32
+                // subsystem sends WM_KILLFOCUS to the previous focus window
+                // and WM_SETFOCUS to the new one through the message queue
+                // and returns the previous focus HWND.  Windows semantics:
+                // an invalid window fails with 0 + ERROR_INVALID_WINDOW_HANDLE.
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                let previous = if hwnd != 0 && self.user32.has_window(hwnd) {
+                    self.user32.set_focus(hwnd)?.unwrap_or(0)
+                } else {
+                    0
+                };
+                state.set(Register::Rax, u64::from(previous));
+                self.last_error = if hwnd != 0 && self.user32.has_window(hwnd) {
+                    0
+                } else {
+                    ERROR_INVALID_WINDOW_HANDLE
+                };
+                self.push_trace(
+                    "input",
+                    "SetFocus",
+                    BTreeMap::from([("hwnd".to_string(), json!(hwnd))]),
+                    json!(previous),
+                );
+            }
             HostThunk::DestroyWindow => {
                 let hwnd = guest_call_arg(state, memory, 0)? as u32;
                 let destroyed = self.user32.destroy_window(hwnd)?;
@@ -21825,6 +22553,72 @@ impl PeHostRuntime {
                     json!(1),
                 );
             }
+            HostThunk::PostMessageW => {
+                // PostMessageW(hwnd, msg, wParam, lParam) — post a message
+                // into the queue of the thread that created the window
+                // (thread 1 for the runtime's single UI thread); a NULL
+                // hwnd posts to the calling thread's queue.  The message
+                // carries the target hwnd so DispatchMessageW routes it to
+                // the window proc.  Fails with ERROR_INVALID_WINDOW_HANDLE
+                // for an unknown window, matching Windows.
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                let raw_message_id = guest_call_arg_u32(state, memory, 1)?;
+                let wparam = guest_call_arg(state, memory, 2)? as i64;
+                let lparam = guest_call_arg(state, memory, 3)? as i64;
+                let posted = if hwnd != 0 && !self.user32.has_window(hwnd) {
+                    false
+                } else {
+                    self.user32.post_message_w(
+                        hwnd,
+                        message_kind(raw_message_id)?,
+                        wparam,
+                        lparam,
+                    )?;
+                    true
+                };
+                state.set(Register::Rax, u64::from(posted));
+                self.last_error = if posted { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
+                self.push_trace(
+                    "input",
+                    "PostMessageW",
+                    BTreeMap::from([
+                        ("hwnd".to_string(), json!(hwnd)),
+                        ("message".to_string(), json!(format!("{raw_message_id:#x}"))),
+                    ]),
+                    json!(posted),
+                );
+            }
+            HostThunk::PostMessageA => {
+                // PostMessageA — the ANSI variant of PostMessageW.  The MSG
+                // payload carries no text, so the message plumbing is
+                // identical to PostMessageW.
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                let raw_message_id = guest_call_arg_u32(state, memory, 1)?;
+                let wparam = guest_call_arg(state, memory, 2)? as i64;
+                let lparam = guest_call_arg(state, memory, 3)? as i64;
+                let posted = if hwnd != 0 && !self.user32.has_window(hwnd) {
+                    false
+                } else {
+                    self.user32.post_message_w(
+                        hwnd,
+                        message_kind(raw_message_id)?,
+                        wparam,
+                        lparam,
+                    )?;
+                    true
+                };
+                state.set(Register::Rax, u64::from(posted));
+                self.last_error = if posted { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
+                self.push_trace(
+                    "input",
+                    "PostMessageA",
+                    BTreeMap::from([
+                        ("hwnd".to_string(), json!(hwnd)),
+                        ("message".to_string(), json!(format!("{raw_message_id:#x}"))),
+                    ]),
+                    json!(posted),
+                );
+            }
             HostThunk::SetTimer => {
                 let hwnd = guest_call_arg(state, memory, 0)? as u32;
                 let timer_id = guest_call_arg(state, memory, 1)? as u32;
@@ -22628,6 +23422,43 @@ impl PeHostRuntime {
                     json!(copied),
                 );
             }
+            HostThunk::GetWindowTextA => {
+                // GetWindowTextA(hwnd, text, maxCount) — ANSI variant:
+                // the window's wide title is converted to the ANSI code
+                // page (CP_ACP) and copied as bytes with the same
+                // truncation/NUL contract as GetWindowTextW.  Returns the
+                // number of bytes copied (0 + ERROR_INVALID_WINDOW_HANDLE
+                // for an unknown window).
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                let text_ptr = guest_call_arg(state, memory, 1)?;
+                let max_count = guest_call_arg(state, memory, 2)? as usize;
+                let text = self.user32.get_window_text_w(hwnd);
+                let copied = if let Some(text) = text {
+                    let ansi = self
+                        .win32
+                        .wide_char_to_multi_byte(
+                            crate::win32::CP_ACP,
+                            &text.encode_utf16().collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_else(|_| text.as_bytes().to_vec());
+                    let copy_len = ansi.len().min(max_count.saturating_sub(1));
+                    for (i, &byte) in ansi.iter().take(copy_len).enumerate() {
+                        memory.write_u8(text_ptr + i as u64, byte);
+                    }
+                    memory.write_u8(text_ptr + copy_len as u64, 0);
+                    copy_len as u64
+                } else {
+                    0
+                };
+                state.set(Register::Rax, copied);
+                self.last_error = if copied > 0 { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
+                self.push_trace(
+                    "input",
+                    "GetWindowTextA",
+                    BTreeMap::from([("hwnd".to_string(), json!(hwnd))]),
+                    json!(copied),
+                );
+            }
             HostThunk::GetWindowTextLengthW => {
                 let hwnd = guest_call_arg(state, memory, 0)? as u32;
                 let len = self.user32.get_window_text_length_w(hwnd);
@@ -23212,47 +24043,69 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::CreateRectRgn => {
-                let _left = guest_call_arg(state, memory, 0)? as i32;
-                let _top = guest_call_arg(state, memory, 1)? as i32;
-                let _right = guest_call_arg(state, memory, 2)? as i32;
-                let _bottom = guest_call_arg(state, memory, 3)? as i32;
+                let left = guest_call_arg(state, memory, 0)? as i32;
+                let top = guest_call_arg(state, memory, 1)? as i32;
+                let right = guest_call_arg(state, memory, 2)? as i32;
+                let bottom = guest_call_arg(state, memory, 3)? as i32;
                 let handle = self.next_gdi_object_handle;
                 self.next_gdi_object_handle = self.next_gdi_object_handle.wrapping_add(1);
                 self.gdi_objects.insert(handle, "region".to_string());
+                // Record the region geometry so GetRgnBox / CombineRgn /
+                // GetObjectW operate on real bounds.
+                self.gdi_regions.insert(
+                    handle,
+                    GdiRegion {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                );
                 state.set(Register::Rax, handle);
                 self.last_error = 0;
                 self.push_trace(
                     "input",
                     "CreateRectRgn",
                     BTreeMap::from([
-                        ("left".to_string(), json!(_left)),
-                        ("top".to_string(), json!(_top)),
-                        ("right".to_string(), json!(_right)),
-                        ("bottom".to_string(), json!(_bottom)),
+                        ("left".to_string(), json!(left)),
+                        ("top".to_string(), json!(top)),
+                        ("right".to_string(), json!(right)),
+                        ("bottom".to_string(), json!(bottom)),
                     ]),
                     json!(handle),
                 );
             }
             HostThunk::CreateRoundRectRgn => {
-                let _left = guest_call_arg(state, memory, 0)? as i32;
-                let _top = guest_call_arg(state, memory, 1)? as i32;
-                let _right = guest_call_arg(state, memory, 2)? as i32;
-                let _bottom = guest_call_arg(state, memory, 3)? as i32;
+                let left = guest_call_arg(state, memory, 0)? as i32;
+                let top = guest_call_arg(state, memory, 1)? as i32;
+                let right = guest_call_arg(state, memory, 2)? as i32;
+                let bottom = guest_call_arg(state, memory, 3)? as i32;
                 let _ellipse_width = guest_call_arg(state, memory, 4)? as i32;
                 let _ellipse_height = guest_call_arg(state, memory, 5)? as i32;
                 let handle = self.next_gdi_object_handle;
                 self.next_gdi_object_handle = self.next_gdi_object_handle.wrapping_add(1);
                 self.gdi_objects.insert(handle, "region".to_string());
+                // Rounded regions are modelled by their bounding rectangle
+                // (the documented GetRgnBox result for a rounded region).
+                self.gdi_regions.insert(
+                    handle,
+                    GdiRegion {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                );
                 state.set(Register::Rax, handle);
                 self.last_error = 0;
                 self.push_trace(
                     "input",
                     "CreateRoundRectRgn",
                     BTreeMap::from([
-                        ("left".to_string(), json!(_left)),
-                        ("top".to_string(), json!(_top)),
-                        ("right".to_string(), json!(_right)),
-                        ("bottom".to_string(), json!(_bottom)),
+                        ("left".to_string(), json!(left)),
+                        ("top".to_string(), json!(top)),
+                        ("right".to_string(), json!(right)),
+                        ("bottom".to_string(), json!(bottom)),
                     ]),
                     json!(handle),
                 );
@@ -23635,6 +24488,683 @@ impl PeHostRuntime {
                 ]), json!(result));
                 if result { self.publish_live_window_preview_if_needed(); }
             }
+            HostThunk::Ellipse => {
+                // Ellipse(hdc, left, top, right, bottom) — draw an ellipse
+                // bounded by the rectangle: the interior is filled with the
+                // DC's selected brush and the outline is drawn with the
+                // selected pen, rasterized into the DC's window surface
+                // with the midpoint ellipse scan (the documented GDI
+                // boundary convention: the bounding box is [left, right) ×
+                // [top, bottom)).
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let left = guest_call_arg(state, memory, 1)? as i32;
+                let top = guest_call_arg(state, memory, 2)? as i32;
+                let right = guest_call_arg(state, memory, 3)? as i32;
+                let bottom = guest_call_arg(state, memory, 4)? as i32;
+                let result = if self.device_contexts.contains_key(&hdc) {
+                    let brush_color = self
+                        .dc_selected_objects
+                        .get(&hdc)
+                        .copied()
+                        .and_then(|object| self.gdi_brushes.get(&object).copied())
+                        .map(colorref_to_bgra)
+                        .unwrap_or([0xff, 0xff, 0xff, 0xff]);
+                    let pen_color = self
+                        .dc_selected_objects
+                        .get(&hdc)
+                        .copied()
+                        .and_then(|object| self.gdi_pens.get(&object).copied())
+                        .map(colorref_to_bgra)
+                        .unwrap_or([0x00, 0x00, 0x00, 0xff]);
+                    if let Some(hwnd) = self.hdc_target_window(hdc) {
+                        if let Some(preview) = self.window_preview(hwnd) {
+                            let surface = self.ensure_window_surface(
+                                hwnd,
+                                preview.width as usize,
+                                preview.height as usize,
+                            );
+                            fill_ellipse_bgra(
+                                &mut surface.bytes,
+                                surface.width,
+                                surface.height,
+                                left,
+                                top,
+                                right,
+                                bottom,
+                                brush_color,
+                                pen_color,
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(result));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "Ellipse",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("left".to_string(), json!(left)),
+                        ("top".to_string(), json!(top)),
+                        ("right".to_string(), json!(right)),
+                        ("bottom".to_string(), json!(bottom)),
+                    ]),
+                    json!(result),
+                );
+                if result {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
+            HostThunk::InvertRect => {
+                // InvertRect(hdc, lprc) — invert the colors of every pixel
+                // in the rectangle (DSTINVERT semantics: NOT applied to all
+                // channels of the BGRA surface).
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let rect_ptr = guest_call_arg(state, memory, 1)?;
+                let result = if self.device_contexts.contains_key(&hdc) && rect_ptr != 0 {
+                    let left = read_i32_from_memory(memory, rect_ptr)?;
+                    let top = read_i32_from_memory(memory, rect_ptr + 4)?;
+                    let right = read_i32_from_memory(memory, rect_ptr + 8)?;
+                    let bottom = read_i32_from_memory(memory, rect_ptr + 12)?;
+                    if let Some(hwnd) = self.hdc_target_window(hdc) {
+                        if let Some(preview) = self.window_preview(hwnd) {
+                            let surface = self.ensure_window_surface(
+                                hwnd,
+                                preview.width as usize,
+                                preview.height as usize,
+                            );
+                            invert_bgra_rect(
+                                &mut surface.bytes,
+                                surface.width,
+                                surface.height,
+                                left,
+                                top,
+                                right,
+                                bottom,
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(result));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "InvertRect",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("rect_ptr".to_string(), json!(format!("{rect_ptr:#x}"))),
+                    ]),
+                    json!(result),
+                );
+                if result {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
+            HostThunk::GetPixel => {
+                // GetPixel(hdc, x, y) — the COLORREF (0x00BBGGRR) of the
+                // pixel at (x, y) in the DC's surface.  For a window DC the
+                // pixel comes from the window surface; for a memory DC from
+                // the selected bitmap (bottom-up).  Returns CLR_INVALID
+                // (0xFFFFFFFF) when the DC or the pixel is out of bounds.
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let x = guest_call_arg(state, memory, 1)? as i64;
+                let y = guest_call_arg(state, memory, 2)? as i64;
+                let color = self.gdi_get_pixel(memory, hdc, x, y);
+                state.set(Register::Rax, u64::from(color));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "GetPixel",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("x".to_string(), json!(x)),
+                        ("y".to_string(), json!(y)),
+                    ]),
+                    json!(format!("{color:#010x}")),
+                );
+            }
+            HostThunk::SetPixel => {
+                // SetPixel(hdc, x, y, color) — set the pixel at (x, y) in
+                // the DC's surface to the COLORREF and return the color
+                // actually set; CLR_INVALID (0xFFFFFFFF) when the DC or
+                // the pixel is out of bounds.
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let x = guest_call_arg(state, memory, 1)? as i64;
+                let y = guest_call_arg(state, memory, 2)? as i64;
+                let color = guest_call_arg(state, memory, 3)? as u32;
+                let set = self.gdi_set_pixel(memory, hdc, x, y, color);
+                state.set(Register::Rax, u64::from(set));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "SetPixel",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("x".to_string(), json!(x)),
+                        ("y".to_string(), json!(y)),
+                        ("color".to_string(), json!(format!("{color:#010x}"))),
+                    ]),
+                    json!(set),
+                );
+                if set != 0xFFFF_FFFF {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
+            HostThunk::GetRgnBox => {
+                // GetRgnBox(hrgn, lprc) — the bounding rectangle of the
+                // region, plus the region type (NULLREGION=1, SIMPLEREGION
+                // =2, COMPLEXREGION=3, ERROR=0).
+                let region = guest_call_arg(state, memory, 0)?;
+                let rect_ptr = guest_call_arg(state, memory, 1)?;
+                let (region_type, left, top, right, bottom) =
+                    match self.gdi_regions.get(&region).copied() {
+                        Some(bounds) if bounds.is_empty() => (1, 0, 0, 0, 0),
+                        Some(bounds) => (2, bounds.left, bounds.top, bounds.right, bounds.bottom),
+                        None => (0, 0, 0, 0, 0),
+                    };
+                if rect_ptr != 0 {
+                    write_u32(memory, rect_ptr, left as u32);
+                    write_u32(memory, rect_ptr + 4, top as u32);
+                    write_u32(memory, rect_ptr + 8, right as u32);
+                    write_u32(memory, rect_ptr + 12, bottom as u32);
+                }
+                state.set(Register::Rax, region_type as u64);
+                self.last_error = if region_type == 0 {
+                    ERROR_INVALID_PARAMETER
+                } else {
+                    0
+                };
+                self.push_trace(
+                    "input",
+                    "GetRgnBox",
+                    BTreeMap::from([("hrgn".to_string(), json!(region))]),
+                    json!(region_type),
+                );
+            }
+            HostThunk::CombineRgn => {
+                // CombineRgn(hrgnDst, hrgnSrc1, hrgnSrc2, mode) — combine
+                // two regions with the RGN_* mode.  The region model is
+                // rect-geometry based, so AND/OR/COPY produce exact rect
+                // results; XOR and partial DIFF are reported as
+                // COMPLEXREGION over the bounding-box approximation
+                // (documented).  Returns the result type: NULLREGION=1,
+                // SIMPLEREGION=2, COMPLEXREGION=3, ERROR=0.
+                const RGN_AND: u32 = 1;
+                const RGN_OR: u32 = 2;
+                const RGN_XOR: u32 = 3;
+                const RGN_DIFF: u32 = 4;
+                const RGN_COPY: u32 = 5;
+                const NULLREGION: u32 = 1;
+                const SIMPLEREGION: u32 = 2;
+                const COMPLEXREGION: u32 = 3;
+                const ERROR: u32 = 0;
+                let destination = guest_call_arg(state, memory, 0)?;
+                let source1 = guest_call_arg(state, memory, 1)?;
+                let source2 = guest_call_arg(state, memory, 2)?;
+                let mode = guest_call_arg(state, memory, 3)? as u32;
+                let (result_type, combined) = match (
+                    self.gdi_regions.get(&source1).copied(),
+                    self.gdi_regions.get(&source2).copied(),
+                ) {
+                    (Some(first), Some(second)) => match mode {
+                        RGN_AND => {
+                            let combined = first.intersection(second);
+                            if combined.is_empty() {
+                                (NULLREGION, combined)
+                            } else {
+                                (SIMPLEREGION, combined)
+                            }
+                        }
+                        RGN_OR | RGN_COPY => {
+                            let combined = first.union(second);
+                            if combined.is_empty() {
+                                (NULLREGION, combined)
+                            } else {
+                                (SIMPLEREGION, combined)
+                            }
+                        }
+                        RGN_XOR => {
+                            let combined = first.union(second);
+                            let intersection = first.intersection(second);
+                            if intersection.is_empty() {
+                                (SIMPLEREGION, combined)
+                            } else {
+                                // Union minus intersection is not a
+                                // rectangle in general — report the
+                                // bounding box as a complex region.
+                                (COMPLEXREGION, combined)
+                            }
+                        }
+                        RGN_DIFF => {
+                            let intersection = first.intersection(second);
+                            if intersection.is_empty() {
+                                (SIMPLEREGION, first)
+                            } else if second.contains(first) {
+                                (NULLREGION, first.intersection(second))
+                            } else {
+                                // Partial difference — bounding-box
+                                // approximation of the remaining area.
+                                (COMPLEXREGION, first)
+                            }
+                        }
+                        _ => {
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                            (
+                                ERROR,
+                                GdiRegion {
+                                    left: 0,
+                                    top: 0,
+                                    right: 0,
+                                    bottom: 0,
+                                },
+                            )
+                        }
+                    },
+                    _ => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        (
+                            ERROR,
+                            GdiRegion {
+                                left: 0,
+                                top: 0,
+                                right: 0,
+                                bottom: 0,
+                            },
+                        )
+                    }
+                };
+                if destination != 0 && result_type != ERROR {
+                    self.gdi_objects
+                        .insert(destination, "region".to_string());
+                    self.gdi_regions.insert(destination, combined);
+                }
+                state.set(Register::Rax, result_type as u64);
+                self.push_trace(
+                    "input",
+                    "CombineRgn",
+                    BTreeMap::from([
+                        ("hrgnDst".to_string(), json!(destination)),
+                        ("hrgnSrc1".to_string(), json!(source1)),
+                        ("hrgnSrc2".to_string(), json!(source2)),
+                        ("mode".to_string(), json!(mode)),
+                    ]),
+                    json!(result_type),
+                );
+            }
+            HostThunk::GetObjectW => {
+                // GetObjectW(hObject, c, pvObject) — copy the object's
+                // properties into the caller's buffer: LOGBRUSH (12/16
+                // bytes) for brushes, LOGPEN (16) for pens, LOGFONTW (92)
+                // for fonts, BITMAP (24/28) for bitmaps and RECT (16) for
+                // regions.  Returns the number of bytes written (the
+                // required size when the buffer is NULL or c is 0), or 0
+                // for an unknown object.
+                let object = guest_call_arg(state, memory, 0)?;
+                let count = guest_call_arg(state, memory, 1)? as usize;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let ptr_size = if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
+                let bytes_written = if let Some(brush) = self.gdi_brushes.get(&object).copied() {
+                    // LOGBRUSH: lbStyle u32, lbColor u32, lbHatch ptr.
+                    let size = 8 + ptr_size;
+                    if buffer != 0 && count >= size {
+                        write_u32(memory, buffer, 0); // BS_SOLID
+                        write_u32(memory, buffer + 4, brush);
+                        write_guest_pointer(memory, buffer + 8, 0, self.guest_arch)?;
+                    }
+                    size as u64
+                } else if let Some(pen) = self.gdi_pens.get(&object).copied() {
+                    // LOGPEN: lopnStyle u32, lopnWidth POINT (2×i32),
+                    // lopnColor u32.
+                    const SIZE: usize = 16;
+                    if buffer != 0 && count >= SIZE {
+                        write_u32(memory, buffer, 0); // PS_SOLID
+                        write_u32(memory, buffer + 4, 1); // lopnWidth.x
+                        write_u32(memory, buffer + 8, 0); // lopnWidth.y
+                        write_u32(memory, buffer + 12, pen);
+                    }
+                    SIZE as u64
+                } else if let Some(font) = self.gdi_fonts.get(&object).copied() {
+                    // LOGFONTW is 92 bytes on both x86 and x64.
+                    const SIZE: usize = 92;
+                    if buffer != 0 && count >= SIZE {
+                        let mut layout = vec![0_u8; SIZE];
+                        layout[0..4].copy_from_slice(&font.height.to_le_bytes());
+                        memory.map_bytes(buffer, &layout);
+                    }
+                    SIZE as u64
+                } else if let Some(bitmap) = self.gdi_bitmaps.get(&object) {
+                    // BITMAP: bmType, bmWidth, bmHeight, bmWidthBytes
+                    // (4×u32), bmPlanes, bmBitsPixel (2×u16), bmBits ptr.
+                    let size = 20 + ptr_size;
+                    if buffer != 0 && count >= size {
+                        write_u32(memory, buffer, 0);
+                        write_u32(memory, buffer + 4, bitmap.width as u32);
+                        write_u32(memory, buffer + 8, bitmap.height as u32);
+                        write_u32(
+                            memory,
+                            buffer + 12,
+                            bitmap.width as u32 * bitmap.bpp as u32,
+                        );
+                        write_u32(memory, buffer + 16, 1); // bmPlanes
+                        write_u32(memory, buffer + 18, bitmap.bpp as u32 * 8); // bmBitsPixel
+                        write_guest_pointer(memory, buffer + 20, 0, self.guest_arch)?;
+                    }
+                    size as u64
+                } else if let Some(region) = self.gdi_regions.get(&object).copied() {
+                    // RECT: left, top, right, bottom.
+                    const SIZE: usize = 16;
+                    if buffer != 0 && count >= SIZE {
+                        write_u32(memory, buffer, region.left as u32);
+                        write_u32(memory, buffer + 4, region.top as u32);
+                        write_u32(memory, buffer + 8, region.right as u32);
+                        write_u32(memory, buffer + 12, region.bottom as u32);
+                    }
+                    SIZE as u64
+                } else {
+                    0
+                };
+                state.set(Register::Rax, bytes_written);
+                self.last_error = if bytes_written == 0 {
+                    ERROR_INVALID_PARAMETER
+                } else {
+                    0
+                };
+                self.push_trace(
+                    "input",
+                    "GetObjectW",
+                    BTreeMap::from([
+                        ("object".to_string(), json!(object)),
+                        ("count".to_string(), json!(count)),
+                    ]),
+                    json!(bytes_written),
+                );
+            }
+            HostThunk::GetCharWidthW => {
+                // GetCharWidthW(hdc, iFirst, iLast, lpBuffer) — advance
+                // widths of the character range in the DC's selected font,
+                // from the same text-metrics machinery as
+                // GetTextExtentPoint32W (per-character width at the
+                // selected scale).
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let first = guest_call_arg(state, memory, 1)? as u32;
+                let last = guest_call_arg(state, memory, 2)? as u32;
+                let buffer = guest_call_arg(state, memory, 3)?;
+                let ok = if buffer != 0 && self.device_contexts.contains_key(&hdc) {
+                    let scale = self.selected_text_scale(hdc);
+                    let first = first.min(0xFFFF);
+                    let last = last.min(0xFFFF);
+                    for (index, character) in (first..=last).enumerate() {
+                        let (width, _) = measure_text_bgra(
+                            &char::from_u32(character).map(String::from).unwrap_or_default(),
+                            scale,
+                        );
+                        write_u32(memory, buffer + index as u64 * 4, width as u32);
+                    }
+                    true
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(ok));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "GetCharWidthW",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("first".to_string(), json!(first)),
+                        ("last".to_string(), json!(last)),
+                    ]),
+                    json!(ok),
+                );
+            }
+            HostThunk::GetGlyphOutlineW => {
+                // GetGlyphOutlineW — the runtime's font model is a bitmap
+                // font; Windows documents that outline retrieval fails for
+                // bitmap fonts with GDI_ERROR and ERROR_CANNOT_COMPLETE.
+                state.set(Register::Rax, GDI_ERROR as u64);
+                self.last_error = ERROR_CANNOT_COMPLETE;
+                self.push_trace(
+                    "input",
+                    "GetGlyphOutlineW",
+                    BTreeMap::new(),
+                    json!("GDI_ERROR"),
+                );
+            }
+            HostThunk::GdiFlush => {
+                // GdiFlush() — flush pending GDI drawing.  The runtime
+                // rasterizes drawing synchronously, so nothing is pending;
+                // always succeeds (TRUE), exactly the documented contract.
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace("input", "GdiFlush", BTreeMap::new(), json!(1));
+            }
+            HostThunk::GdiComment => {
+                // GdiComment(hdc, nSize, lpData) — attach a comment to an
+                // enhanced metafile DC.  The runtime has no metafile DCs;
+                // a valid tracked DC accepts the comment (a no-op on the
+                // raster surface), anything else fails like Windows.
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg(state, memory, 1)? as usize;
+                let data = guest_call_arg(state, memory, 2)?;
+                let ok = self.device_contexts.contains_key(&hdc) && (size == 0 || data != 0);
+                state.set(Register::Rax, u64::from(ok));
+                self.last_error = if ok { 0 } else { ERROR_INVALID_PARAMETER };
+                self.push_trace(
+                    "input",
+                    "GdiComment",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("size".to_string(), json!(size)),
+                    ]),
+                    json!(ok),
+                );
+            }
+            HostThunk::DrawTextExW => {
+                // DrawTextExW(hdc, text, len, rect, format, params) — the
+                // extended DrawTextW: same drawing machinery, plus the
+                // DRAWTEXTPARAMS (tab stops / margins are accepted; the
+                // runtime's text rasterizer does not justify).
+                let hdc = guest_call_arg(state, memory, 0)?;
+                let text_ptr = guest_call_arg(state, memory, 1)?;
+                let text_len = guest_call_arg(state, memory, 2)? as i32;
+                let rect_ptr = guest_call_arg(state, memory, 3)?;
+                let format = guest_call_arg(state, memory, 4)? as u32;
+                let _params_ptr = guest_call_arg(state, memory, 5)?;
+                let text = if text_ptr == 0 {
+                    String::new()
+                } else if text_len < 0 {
+                    read_utf16_string(memory, text_ptr)?
+                } else {
+                    let mut code_units = Vec::with_capacity(text_len as usize);
+                    for index in 0..text_len as u64 {
+                        let low = memory.read_u8(text_ptr + index * 2)?;
+                        let high = memory.read_u8(text_ptr + index * 2 + 1)?;
+                        code_units.push(u16::from_le_bytes([low, high]));
+                    }
+                    String::from_utf16_lossy(&code_units)
+                };
+                let scale = self.selected_text_scale(hdc);
+                let (measured_width, measured_height) = measure_text_bgra(&text, scale);
+                let mut rect = if rect_ptr != 0 {
+                    preview_rect_from_bounds(
+                        read_i32_from_memory(memory, rect_ptr)?,
+                        read_i32_from_memory(memory, rect_ptr + 4)?,
+                        read_i32_from_memory(memory, rect_ptr + 8)?,
+                        read_i32_from_memory(memory, rect_ptr + 12)?,
+                    )
+                } else {
+                    match self.hdc_target_window(hdc).and_then(|hwnd| self.window_preview(hwnd)) {
+                        Some(preview) => PreviewRect {
+                            x: 0,
+                            y: 0,
+                            width: preview.width as usize,
+                            height: preview.height as usize,
+                        },
+                        None => PreviewRect {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        },
+                    }
+                };
+                if format & 0x0400 != 0 {
+                    rect.width = measured_width;
+                    rect.height = measured_height;
+                    if rect_ptr != 0 {
+                        let left = rect.x as i32;
+                        let top = rect.y as i32;
+                        let right = left + rect.width as i32;
+                        let bottom = top + rect.height as i32;
+                        memory.map_bytes(rect_ptr, &left.to_le_bytes());
+                        memory.map_bytes(rect_ptr + 4, &top.to_le_bytes());
+                        memory.map_bytes(rect_ptr + 8, &right.to_le_bytes());
+                        memory.map_bytes(rect_ptr + 12, &bottom.to_le_bytes());
+                    }
+                }
+                let drawn = if self.device_contexts.contains_key(&hdc) {
+                    if format & 0x0400 == 0 {
+                        self.draw_text_to_hdc(hdc, rect, &text, format)
+                    } else {
+                        measured_height as i32
+                    }
+                } else {
+                    0
+                };
+                state.set(Register::Rax, drawn as i64 as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "DrawTextExW",
+                    BTreeMap::from([
+                        ("hdc".to_string(), json!(hdc)),
+                        ("text".to_string(), json!(text)),
+                        ("format".to_string(), json!(format)),
+                    ]),
+                    json!(drawn),
+                );
+                if drawn > 0 && format & 0x0400 == 0 {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
+            HostThunk::AlphaBlend => {
+                // AlphaBlend(hdcDest, x, y, w, h, hdcSrc, xSrc, ySrc,
+                // wSrc, hSrc, blend) — alpha-composite a source DC region
+                // into the destination DC's surface.  The BLENDFUNCTION is
+                // passed by value as the 11th x86 argument
+                // (blendOp, blendFlags, sourceConstantAlpha,
+                // alphaFormat): sourceConstantAlpha scales every source
+                // pixel; AC_SRC_ALPHA (0x01) additionally uses the source
+                // per-pixel alpha, with the documented premultiplied
+                // blending formula.
+                let hdc_dest = guest_call_arg(state, memory, 0)?;
+                let x_dest = guest_call_arg(state, memory, 1)? as i64;
+                let y_dest = guest_call_arg(state, memory, 2)? as i64;
+                let w_dest = guest_call_arg(state, memory, 3)? as i64;
+                let h_dest = guest_call_arg(state, memory, 4)? as i64;
+                let hdc_src = guest_call_arg(state, memory, 5)?;
+                let x_src = guest_call_arg(state, memory, 6)? as i64;
+                let y_src = guest_call_arg(state, memory, 7)? as i64;
+                let w_src = guest_call_arg(state, memory, 8)? as i64;
+                let h_src = guest_call_arg(state, memory, 9)? as i64;
+                let blend = guest_call_arg(state, memory, 10)? as u32;
+                let source_alpha = ((blend >> 16) & 0xff) as u32;
+                let use_source_alpha = (blend >> 24) & 0x01 != 0;
+                let blended = self.alpha_blend_dc(
+                    memory,
+                    hdc_dest,
+                    x_dest,
+                    y_dest,
+                    w_dest,
+                    h_dest,
+                    hdc_src,
+                    x_src,
+                    y_src,
+                    w_src,
+                    h_src,
+                    source_alpha,
+                    use_source_alpha,
+                );
+                state.set(Register::Rax, u64::from(blended));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "AlphaBlend",
+                    BTreeMap::from([
+                        ("hdcDest".to_string(), json!(hdc_dest)),
+                        ("hdcSrc".to_string(), json!(hdc_src)),
+                        ("w".to_string(), json!(w_dest)),
+                        ("h".to_string(), json!(h_dest)),
+                        ("sourceAlpha".to_string(), json!(source_alpha)),
+                    ]),
+                    json!(blended),
+                );
+                if blended {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
+            HostThunk::TransparentBlt => {
+                // TransparentBlt(hdcDest, x, y, w, h, hdcSrc, xSrc, ySrc,
+                // wSrc, hSrc, crTransparent) — copy a source DC region
+                // into the destination DC's surface, skipping pixels that
+                // match the transparent COLORREF.
+                let hdc_dest = guest_call_arg(state, memory, 0)?;
+                let x_dest = guest_call_arg(state, memory, 1)? as i64;
+                let y_dest = guest_call_arg(state, memory, 2)? as i64;
+                let w_dest = guest_call_arg(state, memory, 3)? as i64;
+                let h_dest = guest_call_arg(state, memory, 4)? as i64;
+                let hdc_src = guest_call_arg(state, memory, 5)?;
+                let x_src = guest_call_arg(state, memory, 6)? as i64;
+                let y_src = guest_call_arg(state, memory, 7)? as i64;
+                let w_src = guest_call_arg(state, memory, 8)? as i64;
+                let h_src = guest_call_arg(state, memory, 9)? as i64;
+                let transparent = guest_call_arg(state, memory, 10)? as u32;
+                let copied = self.transparent_blit_dc(
+                    memory,
+                    hdc_dest,
+                    x_dest,
+                    y_dest,
+                    w_dest,
+                    h_dest,
+                    hdc_src,
+                    x_src,
+                    y_src,
+                    w_src,
+                    h_src,
+                    transparent,
+                );
+                state.set(Register::Rax, u64::from(copied));
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "TransparentBlt",
+                    BTreeMap::from([
+                        ("hdcDest".to_string(), json!(hdc_dest)),
+                        ("hdcSrc".to_string(), json!(hdc_src)),
+                        ("w".to_string(), json!(w_dest)),
+                        ("h".to_string(), json!(h_dest)),
+                        ("transparent".to_string(), json!(format!("{transparent:#010x}"))),
+                    ]),
+                    json!(copied),
+                );
+                if copied {
+                    self.publish_live_window_preview_if_needed();
+                }
+            }
             HostThunk::GetTextColor => {
                 let hdc = guest_call_arg(state, memory, 0)?;
                 let color = self.dc_text_colors.get(&hdc).copied().unwrap_or(0);
@@ -23835,68 +25365,61 @@ impl PeHostRuntime {
                 let max_filter = guest_call_arg(state, memory, 3)? as u32;
                 let thread_id = self.win32.current_thread_id();
                 loop {
-                    self.poll_live_input()?;
-                    // Drain all XAudio2 engines to keep audio playing during
-                    // the message loop even when no Windows messages arrive.
-                    let engine_keys: Vec<u64> = self.xaudio_engines.keys().copied().collect();
-                    for &engine_object in &engine_keys {
-                        let _ = self.drain_xaudio2_engine(engine_object);
-                    }
-                    if let Some(message) = self.user32.get_message_for_thread(thread_id) {
-                        match state.arch {
-                            GuestArch::X64 => write_win64_msg(memory, msg_ptr, &message)?,
-                            GuestArch::X86 => write_win32_msg(memory, msg_ptr, &message)?,
+                    match self.get_message_pump(state, memory, msg_ptr, thread_id)? {
+                        GetMessagePumpOutcome::ProcessExit(code) => return Ok(Some(code)),
+                        GetMessagePumpOutcome::Idle => {}
+                        GetMessagePumpOutcome::Retrieved(message) => {
+                            let result =
+                                if message.kind == MessageKind::Quit { 0_u64 } else { 1_u64 };
+                            state.set(Register::Rax, result);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "input",
+                                "GetMessageW",
+                                BTreeMap::from([
+                                    ("hwnd".to_string(), json!(hwnd)),
+                                    ("min_filter".to_string(), json!(min_filter)),
+                                    ("max_filter".to_string(), json!(max_filter)),
+                                ]),
+                                json!(message_id(message.kind)),
+                            );
+                            break;
                         }
-                        let result = if message.kind == MessageKind::Quit { 0_u64 } else { 1_u64 };
-                        state.set(Register::Rax, result);
-                        self.last_error = 0;
-                        self.push_trace(
-                            "input",
-                            "GetMessageW",
-                            BTreeMap::from([
-                                ("hwnd".to_string(), json!(hwnd)),
-                                ("min_filter".to_string(), json!(min_filter)),
-                                ("max_filter".to_string(), json!(max_filter)),
-                            ]),
-                            json!(message_id(message.kind)),
-                        );
-                        break;
                     }
-                    let pump_outcome = self.pump_pending_guest_thread(memory)?;
-                    if let Some(code) = pump_outcome.process_exit {
-                        // A pumped thread requested process exit — propagate
-                        // the code so the main loop terminates the run.
-                        return Ok(Some(code));
-                    }
-                    if pump_outcome.did_work {
-                        continue;
-                    }
-                    // Poll due SetTimer timers and post WM_TIMER messages so
-                    // guest timers fire during message-loop idle — not only
-                    // at block-dispatch safepoints.
-                    if self.poll_guest_timers()? {
-                        continue;
-                    }
-                    // Drain expired timer and wait callbacks from the
-                    // background timer_work_sink (filled by CreateTimerQueueTimer
-                    // and RegisterWaitForSingleObject background threads).
-                    if self.drain_timer_work_queue(state, memory)? {
-                        // A timer callback may have requested process exit —
-                        // propagate the code so the main loop ends the run.
-                        if let Some(code) = self.process_exit_requested {
-                            return Ok(Some(code as i32));
+                }
+            }
+            HostThunk::GetMessageA => {
+                // GetMessageA — the ANSI variant of GetMessageW.  The MSG
+                // structure carries no string data, so the retrieval loop
+                // (including the idle pump and process-exit propagation) is
+                // the shared GetMessage machinery; only the trace label and
+                // the filter args differ.
+                let msg_ptr = guest_call_arg(state, memory, 0)?;
+                let hwnd = guest_call_arg(state, memory, 1)? as u32;
+                let min_filter = guest_call_arg(state, memory, 2)? as u32;
+                let max_filter = guest_call_arg(state, memory, 3)? as u32;
+                let thread_id = self.win32.current_thread_id();
+                loop {
+                    match self.get_message_pump(state, memory, msg_ptr, thread_id)? {
+                        GetMessagePumpOutcome::ProcessExit(code) => return Ok(Some(code)),
+                        GetMessagePumpOutcome::Idle => {}
+                        GetMessagePumpOutcome::Retrieved(message) => {
+                            let result =
+                                if message.kind == MessageKind::Quit { 0_u64 } else { 1_u64 };
+                            state.set(Register::Rax, result);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "input",
+                                "GetMessageA",
+                                BTreeMap::from([
+                                    ("hwnd".to_string(), json!(hwnd)),
+                                    ("min_filter".to_string(), json!(min_filter)),
+                                    ("max_filter".to_string(), json!(max_filter)),
+                                ]),
+                                json!(message_id(message.kind)),
+                            );
+                            break;
                         }
-                        continue;
-                    }
-                    self.win32.sleep_ex(16, false, None)?;
-                    // Always yield the CPU between GetMessageW polls to prevent
-                    // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
-                    // session is active so audio/frame processing isn't starved;
-                    // use a longer sleep (16 ms) when fully idle.
-                    if self.live_session.is_some() || self.dtm {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(16));
                     }
                 }
             }
@@ -37018,15 +38541,14 @@ impl PeHostRuntime {
                 self.push_trace("process", "GetCurrentProcess", BTreeMap::new(), json!(format!("{handle:#x}")));
             }
             HostThunk::EnumProcesses => {
+                // EnumProcesses(processIds, cb, bytesNeeded) — the GUEST
+                // process model: the canonical guest process plus every
+                // process object in the guest handle table, never the
+                // host's POSIX pids.
                 let process_ids_ptr = guest_call_arg(state, memory, 0)?;
                 let buffer_bytes = guest_call_arg_u32(state, memory, 1)?;
                 let bytes_needed_ptr = guest_call_arg(state, memory, 2)?;
-                let snapshot = self.win32.create_toolhelp_snapshot();
-                let process_ids = snapshot
-                    .processes
-                    .iter()
-                    .map(|process| process.process_id)
-                    .collect::<Vec<_>>();
+                let process_ids = self.win32.guest_process_ids();
                 let bytes_needed = process_ids.len().saturating_mul(std::mem::size_of::<u32>()) as u32;
                 if bytes_needed_ptr != 0 {
                     write_u32(memory, bytes_needed_ptr, bytes_needed);
@@ -37121,6 +38643,49 @@ impl PeHostRuntime {
                 self.push_trace(
                     "process",
                     "GetModuleBaseNameA",
+                    BTreeMap::from([
+                        ("process_handle".to_string(), json!(format!("{process_handle:#x}"))),
+                        ("module_handle".to_string(), json!(format!("{module_handle:#x}"))),
+                        ("module_name".to_string(), json!(module_name)),
+                    ]),
+                    json!(written),
+                );
+            }
+            HostThunk::GetModuleBaseNameW => {
+                // GetModuleBaseNameW(process, module, buffer, size) — the
+                // UTF-16 variant: resolves the module's base name from the
+                // runtime's module-handle tables and copies it with the
+                // Windows size contract (success returns the length
+                // excluding the NUL; the (NULL,0) query and truncation
+                // return the required size including the NUL).
+                let process_handle = guest_call_arg(state, memory, 0)?;
+                let module_handle = guest_call_arg(state, memory, 1)?;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let size = guest_call_arg_u32(state, memory, 3)?;
+                let current_process_handle = u64::from(self.win32.current_process_handle());
+                let (written, last_error, module_name) = if process_handle != current_process_handle
+                {
+                    (0, ERROR_INVALID_HANDLE, String::new())
+                } else {
+                    let module_name = self.module_base_name(module_handle);
+                    if module_name.is_empty() {
+                        (0, ERROR_INVALID_HANDLE, module_name)
+                    } else {
+                        let units = module_name.encode_utf16().count() as u32;
+                        let written = write_utf16_api_string(memory, buffer, size, &module_name)?;
+                        let last_error = if buffer != 0 && size != 0 && size <= units {
+                            ERROR_INSUFFICIENT_BUFFER
+                        } else {
+                            0
+                        };
+                        (written, last_error, module_name)
+                    }
+                };
+                state.set(Register::Rax, written as u64);
+                self.last_error = last_error;
+                self.push_trace(
+                    "process",
+                    "GetModuleBaseNameW",
                     BTreeMap::from([
                         ("process_handle".to_string(), json!(format!("{process_handle:#x}"))),
                         ("module_handle".to_string(), json!(format!("{module_handle:#x}"))),
@@ -46726,6 +48291,94 @@ impl PeHostRuntime {
                 self.device_contexts.insert(dc_handle, None);
                 state.set(Register::Rax, dc_handle);
             }
+            HostThunk::CreateCompatibleBitmap => {
+                // CreateCompatibleBitmap(hdc, width, height) — a bitmap with
+                // the same pixel format as the DC (the runtime's surfaces
+                // are 32-bpp BGRA, matching window and memory DCs).  The
+                // bitmap is registered in `gdi_bitmaps` so SelectObject /
+                // BitBlt / GetObjectW / SetPixel operate on it; a NULL or
+                // unknown hdc is treated as the screen DC, exactly like
+                // Windows.
+                let hdc = arg(0);
+                let width = arg(1) as usize;
+                let height = arg(2) as usize;
+                if width == 0 || height == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let bitmap_handle = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.gdi_objects
+                        .insert(bitmap_handle, "bitmap".to_string());
+                    self.gdi_bitmaps.insert(
+                        bitmap_handle,
+                        MemoryBitmap {
+                            width,
+                            height,
+                            bpp: 4,
+                            bytes: vec![0_u8; width.saturating_mul(height).saturating_mul(4)],
+                            guest_pixel_ptr: 0,
+                        },
+                    );
+                    state.set(Register::Rax, bitmap_handle);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "input",
+                        "CreateCompatibleBitmap",
+                        BTreeMap::from([
+                            ("hdc".to_string(), json!(hdc)),
+                            ("width".to_string(), json!(width)),
+                            ("height".to_string(), json!(height)),
+                        ]),
+                        json!(bitmap_handle),
+                    );
+                }
+            }
+            HostThunk::CreateDCW => {
+                // CreateDCW(pwszDriver, pwszDevice, pszPort, pdm) — create
+                // a device context for the named display driver.  The
+                // "DISPLAY" driver creates a screen DC (a valid HDC with
+                // no target window); NULL driver/device also names the
+                // display.  An unknown driver fails with NULL +
+                // ERROR_INVALID_PARAMETER, the documented error.
+                let driver_ptr = arg(0);
+                let _device_ptr = arg(1);
+                let _port_ptr = arg(2);
+                let _pdm_ptr = arg(3);
+                let driver = if driver_ptr == 0 {
+                    "DISPLAY".to_string()
+                } else {
+                    read_utf16_string(memory, driver_ptr).unwrap_or_default()
+                };
+                let known_driver = driver.eq_ignore_ascii_case("DISPLAY")
+                    || driver.eq_ignore_ascii_case("WINSPOOL")
+                    || driver.is_empty();
+                if known_driver {
+                    let dc_handle = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.device_contexts.insert(dc_handle, None);
+                    state.set(Register::Rax, dc_handle);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "input",
+                        "CreateDCW",
+                        BTreeMap::from([("driver".to_string(), json!(driver))]),
+                        json!(dc_handle),
+                    );
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "input",
+                        "CreateDCW",
+                        BTreeMap::from([
+                            ("driver".to_string(), json!(driver)),
+                            ("error".to_string(), json!(ERROR_INVALID_PARAMETER)),
+                        ]),
+                        json!(0),
+                    );
+                }
+            }
             HostThunk::SwapBuffers => {
                 state.set(Register::Rax, 1); // TRUE
             }
@@ -46829,13 +48482,28 @@ impl PeHostRuntime {
                             .or_else(|| self.module_names_by_handle.get(&module_handle).cloned())
                             .unwrap_or_default()
                     };
-                    let utf16: Vec<u16> = path.encode_utf16().collect();
-                    let write_len = (buffer_size as usize).min(utf16.len()).saturating_sub(1);
-                    for (i, &c) in utf16.iter().take(write_len).enumerate() {
-                        memory.write_u16(buffer_ptr + i as u64 * 2, c);
-                    }
-                    memory.write_u16(buffer_ptr + write_len as u64 * 2, 0);
-                    state.set(Register::Rax, write_len as u64);
+                    // Windows contract: success returns the length in
+                    // characters EXCLUDING the NUL; a too-small buffer is
+                    // truncated to size-1 characters plus the NUL, returns
+                    // size, and sets ERROR_INSUFFICIENT_BUFFER.
+                    let units = path.encode_utf16().count() as u32;
+                    let written =
+                        write_utf16_api_string(memory, buffer_ptr, buffer_size, &path)?;
+                    let truncated = buffer_size <= units;
+                    state.set(
+                        Register::Rax,
+                        if truncated { buffer_size as u64 } else { written as u64 },
+                    );
+                    self.last_error = if truncated { ERROR_INSUFFICIENT_BUFFER } else { 0 };
+                    self.push_trace(
+                        "process",
+                        "GetModuleFileNameExW",
+                        BTreeMap::from([
+                            ("module_handle".to_string(), json!(module_handle)),
+                            ("path".to_string(), json!(path)),
+                        ]),
+                        json!(written),
+                    );
                 }
             }
             HostThunk::GetModuleInformation => {
@@ -46865,29 +48533,703 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::GetProcessMemoryInfo => {
-                let _process_handle = arg(0) as u32;
+                // GetProcessMemoryInfo(process, ppsmemCounters, cb) — fill
+                // PROCESS_MEMORY_COUNTERS from the GUEST address space:
+                // the working-set sizes come from the guest image's
+                // committed memory pages (memory.committed_page_addresses)
+                // plus the runtime's live heap allocations, never from the
+                // host process.
+                let process_handle = arg(0) as u32;
                 let counters_ptr = arg(1);
                 let cb = arg(2) as u32;
                 if counters_ptr == 0 || cb < 72 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    // PROCESS_MEMORY_COUNTERS struct (40 bytes for the basic version, 72 for Ex)
-                    // Write plausible memory counters
+                    let page_bytes = 0x1000_u64;
+                    let committed_pages = memory.committed_page_addresses().len() as u64;
+                    let committed_bytes = committed_pages.saturating_mul(page_bytes);
+                    // Live heap allocations (guest malloc/calloc/realloc
+                    // blocks tracked by the runtime).
+                    let heap_bytes: u64 = self
+                        .heap_allocations
+                        .values()
+                        .map(|&size| size as u64)
+                        .sum();
+                    let working_set = committed_bytes.saturating_add(heap_bytes);
+                    let peak_working_set = working_set.max(self.mapped_image_size);
+                    let pagefile = working_set;
+                    // Quota pools: the committed image pages dominate the
+                    // paged pool; the non-paged pool holds the guest
+                    // thread/process blocks.
+                    let quota_paged = committed_bytes;
+                    let quota_non_paged = heap_bytes.min(working_set);
                     let offset = 0u64;
                     write_u32(memory, counters_ptr + offset, cb); // cb
                     write_u32(memory, counters_ptr + offset + 4, 0); // PageFaultCount
-                    write_guest_pointer(memory, counters_ptr + offset + 8, 50 * 1024 * 1024, self.guest_arch)?; // PeakWorkingSetSize
-                    write_guest_pointer(memory, counters_ptr + offset + 16, 32 * 1024 * 1024, self.guest_arch)?; // WorkingSetSize
-                    let _ptr_size = if self.guest_arch == GuestArch::X86 { 4u64 } else { 8u64 };
-                    write_guest_pointer(memory, counters_ptr + offset + 24, 64 * 1024 * 1024, self.guest_arch)?; // QuotaPeakPagedPoolUsage
-                    write_guest_pointer(memory, counters_ptr + offset + 32, 32 * 1024 * 1024, self.guest_arch)?; // QuotaPagedPoolUsage
-                    write_guest_pointer(memory, counters_ptr + offset + 40, 8 * 1024 * 1024, self.guest_arch)?; // QuotaPeakNonPagedPoolUsage
-                    write_guest_pointer(memory, counters_ptr + offset + 48, 4 * 1024 * 1024, self.guest_arch)?; // QuotaNonPagedPoolUsage
-                    write_guest_pointer(memory, counters_ptr + offset + 56, 128 * 1024 * 1024, self.guest_arch)?; // PagefileUsage
-                    write_guest_pointer(memory, counters_ptr + offset + 64, 256 * 1024 * 1024, self.guest_arch)?; // PeakPagefileUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 8, peak_working_set, self.guest_arch)?; // PeakWorkingSetSize
+                    write_guest_pointer(memory, counters_ptr + offset + 16, working_set, self.guest_arch)?; // WorkingSetSize
+                    write_guest_pointer(memory, counters_ptr + offset + 24, quota_paged, self.guest_arch)?; // QuotaPeakPagedPoolUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 32, quota_paged, self.guest_arch)?; // QuotaPagedPoolUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 40, quota_non_paged, self.guest_arch)?; // QuotaPeakNonPagedPoolUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 48, quota_non_paged, self.guest_arch)?; // QuotaNonPagedPoolUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 56, pagefile, self.guest_arch)?; // PagefileUsage
+                    write_guest_pointer(memory, counters_ptr + offset + 64, pagefile, self.guest_arch)?; // PeakPagefileUsage
                     state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "process",
+                        "GetProcessMemoryInfo",
+                        BTreeMap::from([
+                            ("process_handle".to_string(), json!(process_handle)),
+                            ("working_set".to_string(), json!(working_set)),
+                            ("committed_pages".to_string(), json!(committed_pages)),
+                            ("heap_bytes".to_string(), json!(heap_bytes)),
+                        ]),
+                        json!(1),
+                    );
                 }
+            }
+            // -- setupapi.dll: device-info-set machinery -------------------------
+            HostThunk::SetupDiGetClassDevsW => {
+                // SetupDiGetClassDevsW(ClassGuid, Enumerator, hwndParent,
+                // Flags) — build a device information set from the guest
+                // registry's device store (HKLM\SYSTEM\CurrentControlSet\
+                // Enum), filtered by the class GUID and/or enumerator.
+                // An unknown class GUID (no device and no class database
+                // entry) fails with INVALID_HANDLE_VALUE +
+                // ERROR_INVALID_PARAMETER, matching Windows.
+                const DIGCF_PRESENT: u32 = 0x0000_0002;
+                const DIGCF_ALLCLASSES: u32 = 0x0000_0004;
+                let class_guid_ptr = guest_call_arg(state, memory, 0)?;
+                let enumerator_ptr = guest_call_arg(state, memory, 1)?;
+                let _hwnd_parent = guest_call_arg(state, memory, 2)?;
+                let flags = guest_call_arg(state, memory, 3)? as u32;
+                let class_guid = if class_guid_ptr != 0 {
+                    let mut guid_bytes = [0_u8; 16];
+                    for (index, byte) in guid_bytes.iter_mut().enumerate() {
+                        *byte = memory.read_u8(class_guid_ptr + index as u64)?;
+                    }
+                    Some(Self::guid_bytes_to_string(&guid_bytes))
+                } else {
+                    None
+                };
+                let enumerator = if enumerator_ptr != 0 {
+                    Some(read_utf16_string(memory, enumerator_ptr).unwrap_or_default())
+                } else {
+                    None
+                };
+                let devices =
+                    self.setupapi_device_list(class_guid.as_deref(), enumerator.as_deref());
+                // Class validation: a specific class GUID must be a real
+                // installed class — either a device carries it or the class
+                // database (HKLM\SYSTEM\CurrentControlSet\Control\Class\
+                // <guid>) contains it.
+                let class_known = match class_guid.as_deref() {
+                    None => true,
+                    Some(_guid) if flags & DIGCF_ALLCLASSES != 0 => true,
+                    Some(guid) => {
+                        !devices.is_empty()
+                            || self
+                                .win32
+                                .ge()
+                                .registry_key_exists(
+                                    "HKLM",
+                                    &format!(
+                                        "SYSTEM\\CurrentControlSet\\Control\\Class\\{guid}"
+                                    ),
+                                    RegistryView::Native,
+                                )
+                                .unwrap_or(false)
+                    }
+                };
+                if class_known {
+                    let handle = self.next_setup_info_handle;
+                    self.next_setup_info_handle += 4;
+                    self.setup_devices.insert(handle, devices);
+                    state.set(Register::Rax, handle);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "setupapi",
+                        "SetupDiGetClassDevsW",
+                        BTreeMap::from([
+                            ("class_guid".to_string(), json!(class_guid.unwrap_or_default())),
+                            (
+                                "enumerator".to_string(),
+                                json!(enumerator.unwrap_or_default()),
+                            ),
+                            ("flags".to_string(), json!(format!("{flags:#x}"))),
+                            (
+                                "device_count".to_string(),
+                                json!(self
+                                    .setup_devices
+                                    .get(&handle)
+                                    .map(Vec::len)
+                                    .unwrap_or(0)),
+                            ),
+                        ]),
+                        json!(handle),
+                    );
+                } else {
+                    state.set(Register::Rax, u64::MAX);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "setupapi",
+                        "SetupDiGetClassDevsW",
+                        BTreeMap::from([
+                            ("class_guid".to_string(), json!(class_guid.unwrap_or_default())),
+                            ("error".to_string(), json!(ERROR_INVALID_PARAMETER)),
+                        ]),
+                        json!("INVALID_HANDLE_VALUE"),
+                    );
+                }
+                let _ = DIGCF_PRESENT;
+            }
+            HostThunk::SetupDiDestroyDeviceInfoList => {
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let destroyed = self.setup_devices.remove(&dev_info_set).is_some();
+                state.set(Register::Rax, u64::from(destroyed));
+                self.last_error = if destroyed { 0 } else { ERROR_INVALID_HANDLE };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiDestroyDeviceInfoList",
+                    BTreeMap::from([("dev_info_set".to_string(), json!(dev_info_set))]),
+                    json!(destroyed),
+                );
+            }
+            HostThunk::SetupDiEnumDeviceInfo => {
+                // SetupDiEnumDeviceInfo(set, index, devInfoData) — fill
+                // SP_DEVINFO_DATA (cbSize, ClassGuid, DevInst, Reserved)
+                // for the indexed device; the enumeration ends with
+                // FALSE + ERROR_NO_MORE_ITEMS, the documented terminal
+                // error.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let member_index = guest_call_arg(state, memory, 1)? as usize;
+                let dev_info_data = guest_call_arg(state, memory, 2)?;
+                let devices = self.setup_devices.get(&dev_info_set).cloned();
+                let Some(devices) = devices else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                if dev_info_data != 0 && memory.read_u32(dev_info_data).unwrap_or(0) < 28 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_USER_BUFFER;
+                    return Ok(None);
+                }
+                let Some(device) = devices.get(member_index) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_NO_MORE_ITEMS;
+                    return Ok(None);
+                };
+                if dev_info_data != 0 {
+                    write_u32(memory, dev_info_data, 28); // cbSize
+                    let guid = Self::parse_guid_string(&device.class_guid).unwrap_or([0_u8; 16]);
+                    for (index, byte) in guid.iter().enumerate() {
+                        memory.write_u8(dev_info_data + 4 + index as u64, *byte);
+                    }
+                    write_u32(memory, dev_info_data + 20, member_index as u32); // DevInst
+                    write_u32(memory, dev_info_data + 24, 0); // Reserved
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiEnumDeviceInfo",
+                    BTreeMap::from([
+                        ("dev_info_set".to_string(), json!(dev_info_set)),
+                        ("member_index".to_string(), json!(member_index)),
+                        ("instance_id".to_string(), json!(device.instance_id)),
+                    ]),
+                    json!(1),
+                );
+            }
+            HostThunk::SetupDiGetDeviceInstanceIdW => {
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let buffer_size = guest_call_arg(state, memory, 3)? as u32;
+                let required_size = guest_call_arg(state, memory, 4)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let Some(device) = self.setupapi_device(dev_info_set, devinst) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_DEVINST;
+                    return Ok(None);
+                };
+                let units = device.instance_id.encode_utf16().count() as u32;
+                if required_size != 0 {
+                    write_u32(memory, required_size, units + 1);
+                }
+                let written =
+                    write_utf16_api_string(memory, buffer, buffer_size, &device.instance_id)?;
+                let insufficient = buffer != 0 && buffer_size != 0 && buffer_size <= units;
+                state.set(Register::Rax, u64::from(!insufficient));
+                self.last_error = if insufficient {
+                    ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    0
+                };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiGetDeviceInstanceIdW",
+                    BTreeMap::from([
+                        ("instance_id".to_string(), json!(device.instance_id)),
+                        ("written".to_string(), json!(written)),
+                    ]),
+                    json!(!insufficient),
+                );
+            }
+            HostThunk::SetupDiGetDeviceRegistryPropertyW => {
+                // SetupDiGetDeviceRegistryPropertyW(set, data, property,
+                // regDataType, buffer, bufferSize, requiredSize) — read a
+                // device property from its guest-registry key.  A missing
+                // property fails with ERROR_INVALID_DATA, the documented
+                // error.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let property = guest_call_arg(state, memory, 2)? as u32;
+                let reg_data_type = guest_call_arg(state, memory, 3)?;
+                let buffer = guest_call_arg(state, memory, 4)?;
+                let buffer_size = guest_call_arg(state, memory, 5)? as u32;
+                let required_size = guest_call_arg(state, memory, 6)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let Some(device) = self.setupapi_device(dev_info_set, devinst) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_DEVINST;
+                    return Ok(None);
+                };
+                let Some((data_type, data)) = self.setupapi_read_property(&device, property) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_DATA;
+                    return Ok(None);
+                };
+                if reg_data_type != 0 {
+                    write_u32(memory, reg_data_type, data_type);
+                }
+                if required_size != 0 {
+                    write_u32(memory, required_size, data.len() as u32);
+                }
+                let insufficient = buffer_size != 0 && data.len() as u32 > buffer_size;
+                if buffer != 0 && buffer_size != 0 {
+                    let copy_len = (data.len() as u32).min(buffer_size) as usize;
+                    memory.map_bytes(buffer, &data[..copy_len]);
+                }
+                state.set(Register::Rax, u64::from(!insufficient));
+                self.last_error = if insufficient {
+                    ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    0
+                };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiGetDeviceRegistryPropertyW",
+                    BTreeMap::from([
+                        ("property".to_string(), json!(property)),
+                        ("data_type".to_string(), json!(data_type)),
+                        ("data_len".to_string(), json!(data.len())),
+                    ]),
+                    json!(!insufficient),
+                );
+            }
+            HostThunk::SetupDiOpenDeviceInfoW => {
+                // SetupDiOpenDeviceInfoW(set, instanceId, hwndParent,
+                // flags, devInfoData) — open an existing device
+                // information element by device instance ID.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let instance_id_ptr = guest_call_arg(state, memory, 1)?;
+                let _hwnd_parent = guest_call_arg(state, memory, 2)?;
+                let _open_flags = guest_call_arg(state, memory, 3)?;
+                let dev_info_data = guest_call_arg(state, memory, 4)?;
+                let instance_id = if instance_id_ptr != 0 {
+                    read_utf16_string(memory, instance_id_ptr).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let devices = self.setup_devices.get(&dev_info_set).cloned();
+                let Some(devices) = devices else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                };
+                let index = devices
+                    .iter()
+                    .position(|device| device.instance_id.eq_ignore_ascii_case(&instance_id));
+                let Some(index) = index else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_DEVINST;
+                    return Ok(None);
+                };
+                if dev_info_data != 0 {
+                    write_u32(memory, dev_info_data, 28); // cbSize
+                    let guid = Self::parse_guid_string(&devices[index].class_guid)
+                        .unwrap_or([0_u8; 16]);
+                    for (byte_index, byte) in guid.iter().enumerate() {
+                        memory.write_u8(dev_info_data + 4 + byte_index as u64, *byte);
+                    }
+                    write_u32(memory, dev_info_data + 20, index as u32); // DevInst
+                    write_u32(memory, dev_info_data + 24, 0);
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiOpenDeviceInfoW",
+                    BTreeMap::from([
+                        ("dev_info_set".to_string(), json!(dev_info_set)),
+                        ("instance_id".to_string(), json!(instance_id)),
+                    ]),
+                    json!(1),
+                );
+            }
+            HostThunk::SetupDiSetDeviceRegistryPropertyW => {
+                // SetupDiSetDeviceRegistryPropertyW(set, data, property,
+                // buffer, bufferSize) — write a device property into its
+                // guest-registry key.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let property = guest_call_arg(state, memory, 2)? as u32;
+                let buffer = guest_call_arg(state, memory, 3)?;
+                let buffer_size = guest_call_arg(state, memory, 4)? as usize;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let Some(device) = self.setupapi_device(dev_info_set, devinst) else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_DEVINST;
+                    return Ok(None);
+                };
+                let bytes = if buffer != 0 && buffer_size != 0 {
+                    memory.read_bytes(buffer, buffer_size)?
+                } else {
+                    Vec::new()
+                };
+                let written = self.setupapi_write_property(&device, property, &bytes);
+                state.set(Register::Rax, u64::from(written));
+                self.last_error = if written { 0 } else { ERROR_INVALID_PARAMETER };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiSetDeviceRegistryPropertyW",
+                    BTreeMap::from([
+                        ("property".to_string(), json!(property)),
+                        ("buffer_size".to_string(), json!(buffer_size)),
+                    ]),
+                    json!(written),
+                );
+            }
+            HostThunk::SetupDiCallClassInstaller => {
+                // SetupDiCallClassInstaller(DifCode, set, data) — invoke
+                // the default class installer for the DIF code.  The
+                // standard DIF_* codes are handled by the default
+                // installer semantics (TRUE); unknown codes fail honestly
+                // with ERROR_INVALID_PARAMETER.
+                const DIF_SELECTDEVICE: u32 = 0x0000_0001;
+                const DIF_INSTALLDEVICE: u32 = 0x0000_0002;
+                const DIF_REMOVE: u32 = 0x0000_0004;
+                const DIF_SELECTBESTCOMPATDRV: u32 = 0x0000_000B;
+                const DIF_PROPERTYCHANGE: u32 = 0x0000_0012;
+                const DIF_REGISTERDEVICE: u32 = 0x0000_0013;
+                const DIF_UNREMOVE: u32 = 0x0000_0006;
+                const DIF_FIRSTTIMESETUP: u32 = 0x0000_0014;
+                const DIF_UPDATEDRIVER_UI: u32 = 0x0000_0019;
+                let dif_code = guest_call_arg(state, memory, 0)? as u32;
+                let dev_info_set = guest_call_arg(state, memory, 1)?;
+                let dev_info_data = guest_call_arg(state, memory, 2)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let handled = match dif_code {
+                    DIF_SELECTDEVICE
+                    | DIF_INSTALLDEVICE
+                    | DIF_REMOVE
+                    | DIF_SELECTBESTCOMPATDRV
+                    | DIF_PROPERTYCHANGE
+                    | DIF_REGISTERDEVICE
+                    | DIF_UNREMOVE
+                    | DIF_FIRSTTIMESETUP
+                    | DIF_UPDATEDRIVER_UI => {
+                        // The default installer accepts the request when
+                        // the device information element is valid.
+                        self.setupapi_device(dev_info_set, devinst).is_some()
+                            && dev_info_set != 0
+                    }
+                    _ => false,
+                };
+                state.set(Register::Rax, u64::from(handled));
+                self.last_error = if handled { 0 } else { ERROR_INVALID_PARAMETER };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiCallClassInstaller",
+                    BTreeMap::from([
+                        ("dif_code".to_string(), json!(format!("{dif_code:#x}"))),
+                        ("dev_info_set".to_string(), json!(dev_info_set)),
+                    ]),
+                    json!(handled),
+                );
+            }
+            HostThunk::SetupDiGetClassDescriptionW => {
+                // SetupDiGetClassDescriptionW(ClassGuid, desc, size,
+                // required) — the class description from the guest class
+                // database (HKLM\SYSTEM\CurrentControlSet\Control\Class\
+                // <guid>, default value).  An unknown class fails with
+                // ERROR_CLASS_DOES_NOT_EXIST, the documented error.
+                let class_guid_ptr = guest_call_arg(state, memory, 0)?;
+                let buffer = guest_call_arg(state, memory, 1)?;
+                let buffer_size = guest_call_arg(state, memory, 2)? as u32;
+                let required_size = guest_call_arg(state, memory, 3)?;
+                let description = if class_guid_ptr != 0 {
+                    let mut guid_bytes = [0_u8; 16];
+                    for (index, byte) in guid_bytes.iter_mut().enumerate() {
+                        *byte = memory.read_u8(class_guid_ptr + index as u64)?;
+                    }
+                    let guid = Self::guid_bytes_to_string(&guid_bytes);
+                    self.setupapi_registry_string(
+                        "HKLM",
+                        &format!("SYSTEM\\CurrentControlSet\\Control\\Class\\{guid}"),
+                        "",
+                    )
+                } else {
+                    None
+                };
+                let Some(description) = description else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_CLASS_DOES_NOT_EXIST;
+                    return Ok(None);
+                };
+                let units = description.encode_utf16().count() as u32;
+                if required_size != 0 {
+                    write_u32(memory, required_size, units + 1);
+                }
+                let written = write_utf16_api_string(memory, buffer, buffer_size, &description)?;
+                let insufficient = buffer != 0 && buffer_size != 0 && buffer_size <= units;
+                state.set(Register::Rax, u64::from(!insufficient));
+                self.last_error = if insufficient {
+                    ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    0
+                };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiGetClassDescriptionW",
+                    BTreeMap::from([
+                        ("description".to_string(), json!(description)),
+                        ("written".to_string(), json!(written)),
+                    ]),
+                    json!(!insufficient),
+                );
+            }
+            HostThunk::SetupDiBuildDriverInfoList => {
+                // SetupDiBuildDriverInfoList(set, data, driverType) —
+                // build the driver list for the device.  The guest registry
+                // has no driver database, so the built list is empty and
+                // the call succeeds — SetupDiEnumDriverInfoW then reports
+                // ERROR_NO_MORE_ITEMS, the honest terminal error.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let driver_type = guest_call_arg(state, memory, 2)? as u32;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let known = self.setupapi_device(dev_info_set, devinst).is_some();
+                if known {
+                    self.setup_driver_lists
+                        .insert(u64::from(devinst), Vec::new());
+                }
+                state.set(Register::Rax, u64::from(known));
+                self.last_error = if known { 0 } else { ERROR_INVALID_DEVINST };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiBuildDriverInfoList",
+                    BTreeMap::from([
+                        ("devinst".to_string(), json!(devinst)),
+                        ("driver_type".to_string(), json!(driver_type)),
+                    ]),
+                    json!(known),
+                );
+            }
+            HostThunk::SetupDiEnumDriverInfoW => {
+                // SetupDiEnumDriverInfoW(set, data, driverType, index,
+                // drvInfoData) — enumerate the device's driver list.  The
+                // guest driver database is empty, so the first index
+                // already fails with ERROR_NO_MORE_ITEMS — the documented
+                // terminal error for an exhausted list.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let driver_type = guest_call_arg(state, memory, 2)? as u32;
+                let member_index = guest_call_arg(state, memory, 3)? as usize;
+                let drv_info_data = guest_call_arg(state, memory, 4)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let known = self.setupapi_device(dev_info_set, devinst).is_some();
+                let drivers = self
+                    .setup_driver_lists
+                    .get(&u64::from(devinst))
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let enumerated = known && member_index < drivers;
+                if enumerated && drv_info_data != 0 {
+                    // SP_DRVINFO_DATA: cbSize, DriverType, Reserved,
+                    // Description, MfgName, ProviderName, DriverDate,
+                    // DriverVersion — filled from an (empty) driver record;
+                    // never reached while the driver database is empty.
+                    write_u32(memory, drv_info_data, 28);
+                    write_u32(memory, drv_info_data + 4, driver_type);
+                    write_u32(memory, drv_info_data + 8, 0);
+                }
+                state.set(Register::Rax, u64::from(enumerated));
+                self.last_error = if enumerated {
+                    0
+                } else if !known {
+                    ERROR_INVALID_DEVINST
+                } else {
+                    ERROR_NO_MORE_ITEMS
+                };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiEnumDriverInfoW",
+                    BTreeMap::from([
+                        ("devinst".to_string(), json!(devinst)),
+                        ("member_index".to_string(), json!(member_index)),
+                    ]),
+                    json!(enumerated),
+                );
+            }
+            HostThunk::SetupDiGetSelectedDriverW => {
+                // SetupDiGetSelectedDriverW(set, data, drvInfoData) — the
+                // selected driver of the device.  With an empty driver
+                // database nothing can be selected, so the call fails with
+                // ERROR_NO_DEVICE_SELECTED — the documented error.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let _drv_info_data = guest_call_arg(state, memory, 2)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let known = self.setupapi_device(dev_info_set, devinst).is_some();
+                state.set(Register::Rax, 0);
+                self.last_error = if known {
+                    ERROR_NO_DEVICE_SELECTED
+                } else {
+                    ERROR_INVALID_DEVINST
+                };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiGetSelectedDriverW",
+                    BTreeMap::from([("devinst".to_string(), json!(devinst))]),
+                    json!(0),
+                );
+            }
+            HostThunk::SetupDiDestroyDriverInfoList => {
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let _driver_type = guest_call_arg(state, memory, 2)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let known = self.setupapi_device(dev_info_set, devinst).is_some();
+                if known {
+                    self.setup_driver_lists.remove(&u64::from(devinst));
+                }
+                state.set(Register::Rax, u64::from(known));
+                self.last_error = if known { 0 } else { ERROR_INVALID_DEVINST };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiDestroyDriverInfoList",
+                    BTreeMap::from([("devinst".to_string(), json!(devinst))]),
+                    json!(known),
+                );
+            }
+            HostThunk::SetupDiInstallDevice => {
+                // SetupDiInstallDevice(set, data) — install the device
+                // through the default installer: its guest-registry key is
+                // marked DEVINST_STATE_PRESENT and the call succeeds.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let installed = self
+                    .setupapi_device(dev_info_set, devinst)
+                    .map(|device| {
+                        self.win32
+                            .ge()
+                            .registry_set_value(
+                                "HKLM",
+                                &device.registry_key,
+                                "InstallState",
+                                "REG_DWORD",
+                                json!(0_u32), // DEVINST_STATE_PRESENT
+                                RegistryView::Native,
+                            )
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                state.set(Register::Rax, u64::from(installed));
+                self.last_error = if installed { 0 } else { ERROR_INVALID_DEVINST };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiInstallDevice",
+                    BTreeMap::from([("devinst".to_string(), json!(devinst))]),
+                    json!(installed),
+                );
+            }
+            HostThunk::SetupDiUninstallDevice => {
+                // SetupDiUninstallDevice(set, data) — uninstall the
+                // device: its guest-registry key is marked
+                // DEVINST_STATE_NOTPRESENT and the call succeeds.
+                let dev_info_set = guest_call_arg(state, memory, 0)?;
+                let dev_info_data = guest_call_arg(state, memory, 1)?;
+                let devinst = if dev_info_data != 0 {
+                    memory.read_u32(dev_info_data + 20).unwrap_or(0)
+                } else {
+                    0
+                };
+                let uninstalled = self
+                    .setupapi_device(dev_info_set, devinst)
+                    .map(|device| {
+                        self.win32
+                            .ge()
+                            .registry_set_value(
+                                "HKLM",
+                                &device.registry_key,
+                                "InstallState",
+                                "REG_DWORD",
+                                json!(1_u32), // DEVINST_STATE_NOTPRESENT
+                                RegistryView::Native,
+                            )
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                state.set(Register::Rax, u64::from(uninstalled));
+                self.last_error = if uninstalled { 0 } else { ERROR_INVALID_DEVINST };
+                self.push_trace(
+                    "setupapi",
+                    "SetupDiUninstallDevice",
+                    BTreeMap::from([("devinst".to_string(), json!(devinst))]),
+                    json!(uninstalled),
+                );
             }
             // -- Phase 1.3.3+: bcrypt.dll implementations --------------------------------
             HostThunk::BCryptGenRandom => {
@@ -54733,6 +57075,78 @@ impl PeHostRuntime {
             self.win32.record_sleep_observation(advance_ms, advance_ms);
         }
         Ok(None)
+    }
+
+    /// One GetMessageW/GetMessageA retrieval iteration: poll live input,
+    /// drain the XAudio2 engines (audio keeps playing during message-loop
+    /// idle), pull the first message for `thread_id` out of the queue (if
+    /// any), and otherwise service the guest scheduler — pump pending guest
+    /// threads, fire due `SetTimer` timers, drain expired timer/wait
+    /// callbacks, then yield the CPU and return to the caller's loop.
+    ///
+    /// A retrieved message is written into the guest MSG structure at
+    /// `msg_ptr` (x86 or x64 layout per `state.arch`).  When a pumped
+    /// thread or timer callback requested process exit, the code is
+    /// returned as [`GetMessagePumpOutcome::ProcessExit`] so the caller
+    /// propagates it and the run terminates.
+    fn get_message_pump(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        msg_ptr: u64,
+        thread_id: u32,
+    ) -> AppResult<GetMessagePumpOutcome> {
+        self.poll_live_input()?;
+        // Drain all XAudio2 engines to keep audio playing during
+        // the message loop even when no Windows messages arrive.
+        let engine_keys: Vec<u64> = self.xaudio_engines.keys().copied().collect();
+        for &engine_object in &engine_keys {
+            let _ = self.drain_xaudio2_engine(engine_object);
+        }
+        if let Some(message) = self.user32.get_message_for_thread(thread_id) {
+            match state.arch {
+                GuestArch::X64 => write_win64_msg(memory, msg_ptr, &message)?,
+                GuestArch::X86 => write_win32_msg(memory, msg_ptr, &message)?,
+            }
+            return Ok(GetMessagePumpOutcome::Retrieved(message));
+        }
+        let pump_outcome = self.pump_pending_guest_thread(memory)?;
+        if let Some(code) = pump_outcome.process_exit {
+            // A pumped thread requested process exit — propagate
+            // the code so the main loop terminates the run.
+            return Ok(GetMessagePumpOutcome::ProcessExit(code));
+        }
+        if pump_outcome.did_work {
+            return Ok(GetMessagePumpOutcome::Idle);
+        }
+        // Poll due SetTimer timers and post WM_TIMER messages so
+        // guest timers fire during message-loop idle — not only
+        // at block-dispatch safepoints.
+        if self.poll_guest_timers()? {
+            return Ok(GetMessagePumpOutcome::Idle);
+        }
+        // Drain expired timer and wait callbacks from the
+        // background timer_work_sink (filled by CreateTimerQueueTimer
+        // and RegisterWaitForSingleObject background threads).
+        if self.drain_timer_work_queue(state, memory)? {
+            // A timer callback may have requested process exit —
+            // propagate the code so the main loop ends the run.
+            if let Some(code) = self.process_exit_requested {
+                return Ok(GetMessagePumpOutcome::ProcessExit(code as i32));
+            }
+            return Ok(GetMessagePumpOutcome::Idle);
+        }
+        self.win32.sleep_ex(16, false, None)?;
+        // Always yield the CPU between GetMessageW polls to prevent
+        // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
+        // session is active so audio/frame processing isn't starved;
+        // use a longer sleep (16 ms) when fully idle.
+        if self.live_session.is_some() || self.dtm {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        Ok(GetMessagePumpOutcome::Idle)
     }
 
     /// Poll due `SetTimer` timers and post WM_TIMER messages for them to
@@ -68134,6 +70548,24 @@ impl HostThunk {
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetMessageW" => {
                 Self::GetMessageW
             }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetMessageA" => {
+                Self::GetMessageA
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "PostMessageA" => {
+                Self::PostMessageA
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "PostMessageW" => {
+                Self::PostMessageW
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFocus" => {
+                Self::GetFocus
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "SetFocus" => {
+                Self::SetFocus
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetWindowTextA" => {
+                Self::GetWindowTextA
+            }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "TranslateMessage" => {
                 Self::TranslateMessage
             }
@@ -68151,6 +70583,64 @@ impl HostThunk {
             }
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetDeviceCaps" => {
                 Self::GetDeviceCaps
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetDC" => Self::GetDC,
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "ReleaseDC" => {
+                Self::ReleaseDC
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "FillRect" => {
+                Self::FillRect
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "DrawTextW" => {
+                Self::DrawTextW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "DrawTextExW" => {
+                Self::DrawTextExW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateDCW" => {
+                Self::CreateDCW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateCompatibleBitmap" =>
+            {
+                Self::CreateCompatibleBitmap
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetObjectW" => {
+                Self::GetObjectW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetPixel" => {
+                Self::GetPixel
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "SetPixel" => {
+                Self::SetPixel
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCharWidthW" => {
+                Self::GetCharWidthW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetGlyphOutlineW" => {
+                Self::GetGlyphOutlineW
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "Ellipse" => Self::Ellipse,
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "InvertRect" => {
+                Self::InvertRect
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GetRgnBox" => {
+                Self::GetRgnBox
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "CombineRgn" => {
+                Self::CombineRgn
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "AlphaBlend" => {
+                Self::AlphaBlend
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "TransparentBlt" => {
+                Self::TransparentBlt
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GdiFlush" => {
+                Self::GdiFlush
+            }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "GdiComment" => {
+                Self::GdiComment
             }
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "SelectObject" => {
                 Self::SelectObject
@@ -69034,6 +71524,84 @@ impl HostThunk {
             }
             ("psapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleBaseNameA" => {
                 Self::GetModuleBaseNameA
+            }
+            ("psapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleBaseNameW" => {
+                Self::GetModuleBaseNameW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiGetClassDevsW" =>
+            {
+                Self::SetupDiGetClassDevsW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiDestroyDeviceInfoList" =>
+            {
+                Self::SetupDiDestroyDeviceInfoList
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiEnumDeviceInfo" =>
+            {
+                Self::SetupDiEnumDeviceInfo
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiGetDeviceInstanceIdW" =>
+            {
+                Self::SetupDiGetDeviceInstanceIdW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiGetDeviceRegistryPropertyW" =>
+            {
+                Self::SetupDiGetDeviceRegistryPropertyW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiOpenDeviceInfoW" =>
+            {
+                Self::SetupDiOpenDeviceInfoW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiSetDeviceRegistryPropertyW" =>
+            {
+                Self::SetupDiSetDeviceRegistryPropertyW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiCallClassInstaller" =>
+            {
+                Self::SetupDiCallClassInstaller
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiGetClassDescriptionW" =>
+            {
+                Self::SetupDiGetClassDescriptionW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiBuildDriverInfoList" =>
+            {
+                Self::SetupDiBuildDriverInfoList
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiDestroyDriverInfoList" =>
+            {
+                Self::SetupDiDestroyDriverInfoList
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiEnumDriverInfoW" =>
+            {
+                Self::SetupDiEnumDriverInfoW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiGetSelectedDriverW" =>
+            {
+                Self::SetupDiGetSelectedDriverW
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiInstallDevice" =>
+            {
+                Self::SetupDiInstallDevice
+            }
+            ("setupapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetupDiUninstallDevice" =>
+            {
+                Self::SetupDiUninstallDevice
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetVersion" => {
                 Self::GetVersion
@@ -73244,6 +75812,8 @@ impl HostThunk {
             | Self::GetDesktopWindow
             | Self::EmptyClipboard
             | Self::GetProcessWindowStation
+            | Self::GetFocus
+            | Self::GdiFlush
             | Self::SteamVR_Shutdown
             | Self::SteamVR_IsHmdPresent
             | Self::SteamVR_IsRuntimeInstalled
@@ -73537,6 +76107,9 @@ impl HostThunk {
             | Self::SHSimpleIDListFromPath
             | Self::Freeaddrinfo
             | Self::DragFinish
+            | Self::SetFocus
+            | Self::GdiComment
+            | Self::SetupDiDestroyDeviceInfoList
             | Self::ExitThread => 4,
             Self::SetEnvironmentVariableW
             | Self::GetCPInfo
@@ -73858,7 +76431,11 @@ impl HostThunk {
             | Self::GetMenuItemID
             | Self::LoadMenuW
             | Self::RegisterDragDrop
-            | Self::DragAcceptFiles => 8,
+            | Self::DragAcceptFiles
+            | Self::InvertRect
+            | Self::SetupDiInstallDevice
+            | Self::SetupDiUninstallDevice
+            | Self::SetupDiDestroyDriverInfoList => 8,
             Self::GetEnvironmentVariableW
             | Self::SetHandleInformation
             | Self::Ioctlsocket
@@ -74052,7 +76629,15 @@ impl HostThunk {
             | Self::GetMenuState
             | Self::CheckMenuItem
             | Self::SHCreateItemFromIDList
-            | Self::CreateURLMoniker => 12,
+            | Self::CreateURLMoniker
+            | Self::CreateCompatibleBitmap
+            | Self::GetObjectW
+            | Self::GetPixel
+            | Self::GetRgnBox
+            | Self::SetupDiEnumDeviceInfo
+            | Self::SetupDiCallClassInstaller
+            | Self::SetupDiGetSelectedDriverW
+            | Self::SetupDiBuildDriverInfoList => 12,
             Self::GetStringTypeW
             | Self::DisconnectEx
             | Self::Send
@@ -74186,7 +76771,18 @@ impl HostThunk {
             | Self::DoDragDrop
             | Self::DragQueryFileW
             | Self::CreateAsyncBindCtx
-            | Self::RegisterBindStatusCallback => 16,
+            | Self::RegisterBindStatusCallback
+            | Self::GetMessageA
+            | Self::PostMessageA
+            | Self::PostMessageW
+            | Self::GetWindowTextA
+            | Self::CombineRgn
+            | Self::SetPixel
+            | Self::GetCharWidthW
+            | Self::GetModuleBaseNameW
+            | Self::SetupDiGetClassDevsW
+            | Self::SetupDiGetClassDescriptionW
+            | Self::SetupDiEnumDriverInfoW => 16,
             Self::Setsockopt
             | Self::GetQueuedCompletionStatus
             | Self::Select
@@ -74271,7 +76867,11 @@ impl HostThunk {
             | Self::GetMenuStringW
             | Self::SHParseDisplayName
             | Self::SHGetDataFromIDListW
-            | Self::GetThreadTimes => 20,
+            | Self::GetThreadTimes
+            | Self::Ellipse
+            | Self::SetupDiOpenDeviceInfoW
+            | Self::SetupDiGetDeviceInstanceIdW
+            | Self::SetupDiSetDeviceRegistryPropertyW => 20,
             Self::LCMapStringW
             | Self::WsaSocketA
             | Self::GetQueuedCompletionStatusEx
@@ -74319,7 +76919,8 @@ impl HostThunk {
             | Self::WaveOutOpen
             | Self::SteamAPI_ISteamFriends_GetFriendMessage
             | Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberData
-            | Self::WaveInOpen => 24,
+            | Self::WaveInOpen
+            | Self::DrawTextExW => 24,
             Self::DuplicateHandle
             | Self::WsaRecv
             | Self::WsaSend
@@ -74344,7 +76945,8 @@ impl HostThunk {
             | Self::GdipDrawString
             | Self::GdipAddPathArc
             | Self::GdipSetMatrixElements
-            | Self::WinHttpWebSocketCompleteUpgrade => 28,
+            | Self::WinHttpWebSocketCompleteUpgrade
+            | Self::GetGlyphOutlineW => 28,
             Self::WideCharToMultiByte
             | Self::ExtTextOutW
             | Self::CreateNamedPipeW
@@ -74376,6 +76978,7 @@ impl HostThunk {
             | Self::BCryptEncrypt
             | Self::BCryptDecrypt
             | Self::ScriptShape => 40,
+            Self::AlphaBlend | Self::TransparentBlt => 44,
             Self::CreateWindowExW => 48,
             Self::CreateFontW | Self::GdipDrawImageRectRect => 56,
             // -- Stage-4 NTDLL foundation: Nt*/Rtl* x86 stack-arg sizes -------
@@ -82268,35 +84871,41 @@ mod tests {
     #[test]
     #[ignore = "requires AppKit on main thread"]
     fn redraw_window_queues_paint_like_invalidate_rect() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge =
-            GameEnvironment::create_in(temp_dir.path(), "redraw-window", GeArch::X86, "win11-23h2")
-                .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "redraw-window",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
 
-        runtime.user32.register_class_ex_w("test-window");
-        let hwnd = runtime
-            .user32
-            .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
-            .expect("create window");
-        let _ = std::iter::from_fn(|| runtime.user32.get_message_w()).collect::<Vec<_>>();
+            runtime.user32.register_class_ex_w("test-window");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
+                .expect("create window");
+            let _ = std::iter::from_fn(|| runtime.user32.get_message_w()).collect::<Vec<_>>();
 
-        let redraw_window = runtime.alloc_host_thunk(HostThunk::RedrawWindow);
-        let result = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            redraw_window,
-            &[hwnd, 0, 0, 0x0001],
-        );
+            let redraw_window = runtime.alloc_host_thunk(HostThunk::RedrawWindow);
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                redraw_window,
+                &[hwnd, 0, 0, 0x0001],
+            );
 
-        assert_eq!(result, 1);
-        assert_eq!(runtime.last_error, 0);
-        let kinds =
-            std::iter::from_fn(|| runtime.user32.get_message_w().map(|message| message.kind))
-                .collect::<Vec<_>>();
-        assert!(kinds.contains(&MessageKind::Paint));
+            assert_eq!(result, 1);
+            assert_eq!(runtime.last_error, 0);
+            let kinds =
+                std::iter::from_fn(|| runtime.user32.get_message_w().map(|message| message.kind))
+                    .collect::<Vec<_>>();
+            assert!(kinds.contains(&MessageKind::Paint));
+        })
     }
 
     #[test]
@@ -100876,11 +103485,23 @@ mod tests {
                 get_name,
                 &[0, 0 /* main module */, name_buf as u32, 128],
             );
+
             assert!(written > 0, "GetModuleFileNameExW returns the char count");
             let name = read_utf16_string(&memory, name_buf).expect("module path");
             assert_eq!(
                 name, "C:\\Games\\SampleGame\\game.ex",
                 "the module path is written up to the buffer's NUL slot"
+            );
+
+            assert_eq!(
+                written, 28,
+                "GetModuleFileNameExW returns the full char count when the buffer fits"
+            );
+            let name = read_utf16_string(&memory, name_buf).expect("module path");
+            assert_eq!(
+                name, "C:\\Games\\SampleGame\\game.exe",
+                "the module path is written in full when the buffer fits"
+
             );
 
             let info = 0x30_100_u64;
@@ -109398,6 +112019,1507 @@ mod tests {
             );
             assert_eq!(result, 0x8007_0057);
         })
+
+
+    }
+
+    // ── Evidence-ui-gdi-sys: user32 focus/message/ANSI surface ───────────────
+
+    #[test]
+    fn evidence_ui_gdi_focus_and_message_a_thunks() {
+        with_big_stack(|| {
+            const WS_CHILD: u32 = 0x4000_0000;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "ui-gdi-focus",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime.user32.register_class_ex_w("focus-window");
+            let hwnd_a = runtime
+                .user32
+                .create_window_ex_styled(
+                    "focus-window",
+                    "focus-a",
+                    64,
+                    32,
+                    true,
+                    false,
+                    None,
+                    1,
+                    WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create focus window a");
+            let hwnd_b = runtime
+                .user32
+                .create_window_ex_styled(
+                    "focus-window",
+                    "focus-b",
+                    64,
+                    32,
+                    true,
+                    false,
+                    None,
+                    1,
+                    WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create focus window b");
+            while runtime.user32.get_message_w().is_some() {}
+
+            // GetFocus: the first visible window creation focuses the window
+            // (the focus-tracking state machine).
+            let get_focus = runtime.alloc_host_thunk(HostThunk::GetFocus);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_focus, &[]),
+                u64::from(hwnd_a),
+                "GetFocus reflects the first visible window"
+            );
+
+            // SetFocus: returns the previous focus (the focus state machine),
+            // tracks the new one, and queues the focus-transition messages.
+            let set_focus = runtime.alloc_host_thunk(HostThunk::SetFocus);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_focus, &[hwnd_b]),
+                u64::from(hwnd_a),
+                "SetFocus returns the previous focus window"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_focus, &[]),
+                u64::from(hwnd_b),
+                "GetFocus reflects the SetFocus window"
+            );
+            // The WM_KILLFOCUS (old window) + WM_SETFOCUS (new window) pair
+            // is queued in order.
+            let peek = runtime.alloc_host_thunk(HostThunk::PeekMessageW);
+            let msg_ptr = 0x61_000;
+            memory.map_bytes(msg_ptr, &[0; 28]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    peek,
+                    &[msg_ptr as u32, 0, 0, 0, 1]
+                ),
+                1,
+                "SetFocus queues WM_KILLFOCUS for the old window"
+            );
+            let queued = read_win32_msg(&memory, msg_ptr).expect("queued msg");
+            assert_eq!(message_id(queued.kind), 0x0008, "WM_KILLFOCUS queued");
+            assert_eq!(queued.hwnd, Some(hwnd_a));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    peek,
+                    &[msg_ptr as u32, 0, 0, 0, 1]
+                ),
+                1,
+                "SetFocus queues WM_SETFOCUS for the new window"
+            );
+            let queued = read_win32_msg(&memory, msg_ptr).expect("setfocus msg");
+            assert_eq!(message_id(queued.kind), 0x0007, "WM_SETFOCUS queued");
+            assert_eq!(queued.hwnd, Some(hwnd_b));
+
+            // Switching focus back queues the reverse pair.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_focus, &[hwnd_a]),
+                u64::from(hwnd_b),
+                "SetFocus returns the previous focus window"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    peek,
+                    &[msg_ptr as u32, 0, 0, 0, 1]
+                ),
+                1,
+                "WM_KILLFOCUS queued for the old window"
+            );
+            let queued = read_win32_msg(&memory, msg_ptr).expect("killfocus msg");
+            assert_eq!(message_id(queued.kind), 0x0008, "WM_KILLFOCUS");
+            assert_eq!(queued.hwnd, Some(hwnd_b));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    peek,
+                    &[msg_ptr as u32, 0, 0, 0, 1]
+                ),
+                1,
+                "WM_SETFOCUS queued for the new window"
+            );
+            let queued = read_win32_msg(&memory, msg_ptr).expect("setfocus msg");
+            assert_eq!(message_id(queued.kind), 0x0007);
+            assert_eq!(queued.hwnd, Some(hwnd_a));
+
+            // Invalid window: SetFocus fails with ERROR_INVALID_WINDOW_HANDLE.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_focus, &[0xDEAD]),
+                0,
+                "SetFocus on an unknown window returns NULL"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_WINDOW_HANDLE);
+
+            // PostMessageW: posts into the queue of the window's thread with
+            // the target hwnd recorded; GetMessageW retrieves it.
+            let post_w = runtime.alloc_host_thunk(HostThunk::PostMessageW);
+            let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, post_w, &[hwnd_a, 0x0111, 42, 0]),
+                1,
+                "PostMessageW posts to the window's thread queue"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_message,
+                    &[msg_ptr as u32, 0, 0, 0]
+                ),
+                1,
+                "GetMessageW retrieves the posted message"
+            );
+            let posted = read_win32_msg(&memory, msg_ptr).expect("posted msg");
+            assert_eq!(
+                posted.hwnd,
+                Some(hwnd_a),
+                "posted message targets the window"
+            );
+            assert_eq!(message_id(posted.kind), 0x0111);
+            assert_eq!(posted.wparam, 42);
+
+            // PostMessageW on an unknown window fails honestly.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, post_w, &[0xDEAD, 0x0111, 1, 0]),
+                0,
+                "PostMessageW on an unknown window returns FALSE"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_WINDOW_HANDLE);
+
+            // PostMessageA: identical plumbing, retrievable via GetMessageA.
+            let post_a = runtime.alloc_host_thunk(HostThunk::PostMessageA);
+            let get_message_a = runtime.alloc_host_thunk(HostThunk::GetMessageA);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, post_a, &[hwnd_b, 0x0112, 7, 8]),
+                1,
+                "PostMessageA posts to the window's thread queue"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_message_a,
+                    &[msg_ptr as u32, 0, 0, 0]
+                ),
+                1,
+                "GetMessageA retrieves the ANSI-posted message"
+            );
+            let posted = read_win32_msg(&memory, msg_ptr).expect("posted msg a");
+            assert_eq!(posted.hwnd, Some(hwnd_b));
+            assert_eq!(message_id(posted.kind), 0x0112);
+            assert_eq!(posted.wparam, 7);
+
+            // GetMessageA: WM_QUIT returns 0 (the loop-termination contract).
+            let post_thread = runtime.alloc_host_thunk(HostThunk::PostThreadMessageW);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, post_thread, &[1, 0x0012, 0, 0]),
+                1,
+                "PostThreadMessageW(WM_QUIT)"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_message_a,
+                    &[msg_ptr as u32, 0, 0, 0]
+                ),
+                0,
+                "GetMessageA returns 0 for WM_QUIT"
+            );
+
+            // GetWindowTextA: the wide title converted to ANSI (CP1252).
+            assert!(
+                runtime
+                    .user32
+                    .set_window_text_w(hwnd_a, "Caf\u{e9} \u{2013} x"),
+                "set window text"
+            );
+            let text_buffer = 0x62_000;
+            memory.map_bytes(text_buffer, &[0; 32]);
+            let get_text_a = runtime.alloc_host_thunk(HostThunk::GetWindowTextA);
+            let copied = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_text_a,
+                &[hwnd_a, text_buffer as u32, 32],
+            );
+            assert_eq!(copied, 8, "GetWindowTextA copies the ANSI byte count");
+            let ansi = memory.read_bytes(text_buffer, 9).expect("ansi text");
+            // "Café – x": C,a,f,0xE9,space,0x96(–),space,x + NUL
+            assert_eq!(
+                &ansi[..],
+                &[0x43, 0x61, 0x66, 0xE9, 0x20, 0x96, 0x20, 0x78, 0x00]
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_ui_gdi_bitmap_dc_object_thunks() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "ui-gdi-bitmap",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            // CreateCompatibleBitmap: a 16x8 32-bpp bitmap, readable via
+            // GetObjectW as a BITMAP.
+            let create_bitmap = runtime.alloc_host_thunk(HostThunk::CreateCompatibleBitmap);
+            let bitmap = dispatch_x86_thunk(&mut runtime, &mut memory, create_bitmap, &[0, 16, 8]);
+            assert_ne!(bitmap, 0, "CreateCompatibleBitmap returns an HBITMAP");
+            let object_buffer = 0x61_000;
+            memory.map_bytes(object_buffer, &[0; 64]);
+            let get_object = runtime.alloc_host_thunk(HostThunk::GetObjectW);
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_object,
+                &[bitmap as u32, 64, object_buffer as u32],
+            );
+            assert_eq!(written, 24, "BITMAP layout on x86 is 24 bytes");
+            assert_eq!(read_u32(&memory, object_buffer).expect("bmType"), 0);
+            assert_eq!(read_u32(&memory, object_buffer + 4).expect("bmWidth"), 16);
+            assert_eq!(read_u32(&memory, object_buffer + 8).expect("bmHeight"), 8);
+            assert_eq!(
+                read_u32(&memory, object_buffer + 12).expect("bmWidthBytes"),
+                64
+            );
+            assert_eq!(
+                read_u32(&memory, object_buffer + 18).expect("bmBitsPixel"),
+                32
+            );
+
+            // CreateDCW: "DISPLAY" creates a screen DC; unknown drivers fail
+            // with NULL + ERROR_INVALID_PARAMETER.
+            let display = runtime
+                .alloc_utf16_string(&mut memory, "DISPLAY")
+                .expect("display name");
+            let bogus = runtime
+                .alloc_utf16_string(&mut memory, "BOGUSDRV")
+                .expect("bogus driver");
+            let create_dc = runtime.alloc_host_thunk(HostThunk::CreateDCW);
+            let screen_dc = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_dc,
+                &[display as u32, 0, 0, 0],
+            );
+            assert_ne!(screen_dc, 0, "CreateDCW(DISPLAY) creates a screen DC");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_dc,
+                    &[bogus as u32, 0, 0, 0]
+                ),
+                0,
+                "CreateDCW with an unknown driver returns NULL"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // GetObjectW on a brush returns LOGBRUSH with the color.
+            let create_brush = runtime.alloc_host_thunk(HostThunk::CreateSolidBrush);
+            let brush = dispatch_x86_thunk(&mut runtime, &mut memory, create_brush, &[0x00FF_0000]);
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_object,
+                &[brush as u32, 16, object_buffer as u32],
+            );
+            assert_eq!(written, 12, "LOGBRUSH on x86 is 12 bytes");
+            assert_eq!(read_u32(&memory, object_buffer).expect("lbStyle"), 0);
+            assert_eq!(
+                read_u32(&memory, object_buffer + 4).expect("lbColor"),
+                0x00FF_0000
+            );
+
+            // GetObjectW on a region returns the RECT geometry.
+            let create_rgn = runtime.alloc_host_thunk(HostThunk::CreateRectRgn);
+            let region = dispatch_x86_thunk(&mut runtime, &mut memory, create_rgn, &[1, 2, 9, 10]);
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_object,
+                &[region as u32, 16, object_buffer as u32],
+            );
+            assert_eq!(written, 16, "RECT is 16 bytes");
+            assert_eq!(read_u32(&memory, object_buffer).expect("left"), 1);
+            assert_eq!(read_u32(&memory, object_buffer + 4).expect("top"), 2);
+            assert_eq!(read_u32(&memory, object_buffer + 8).expect("right"), 9);
+            assert_eq!(read_u32(&memory, object_buffer + 12).expect("bottom"), 10);
+
+            // GetObjectW on an unknown object fails with 0.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_object,
+                    &[0x7BAD, 16, object_buffer as u32]
+                ),
+                0,
+                "GetObjectW on an unknown object returns 0"
+            );
+
+            // GetRgnBox reports the region's bounding rectangle.
+            let rgn_box = runtime.alloc_host_thunk(HostThunk::GetRgnBox);
+            let rect_out = 0x61_100;
+            memory.map_bytes(rect_out, &[0; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rgn_box,
+                    &[region as u32, rect_out as u32]
+                ),
+                2,
+                "GetRgnBox returns SIMPLEREGION"
+            );
+            assert_eq!(read_u32(&memory, rect_out).expect("left"), 1);
+            assert_eq!(read_u32(&memory, rect_out + 8).expect("right"), 9);
+
+            // GetCharWidthW: the glyph widths from the text-metrics machinery.
+            let create_dc_thunk = runtime.alloc_host_thunk(HostThunk::CreateCompatibleDC);
+            let mem_dc = dispatch_x86_thunk(&mut runtime, &mut memory, create_dc_thunk, &[0]);
+            let widths = 0x61_200;
+            memory.map_bytes(widths, &[0; 16]);
+            let get_char_width = runtime.alloc_host_thunk(HostThunk::GetCharWidthW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_char_width,
+                    &[
+                        mem_dc as u32,
+                        u32::from(b'A'),
+                        u32::from(b'C'),
+                        widths as u32
+                    ]
+                ),
+                1,
+                "GetCharWidthW succeeds"
+            );
+            for index in 0..3 {
+                assert_eq!(
+                    read_u32(&memory, widths + index as u64 * 4).expect("width"),
+                    5,
+                    "5x7 glyph advance width (measure_text_bgra subtracts the trailing advance) at scale 1"
+                );
+            }
+
+            // GetGlyphOutlineW: bitmap fonts fail with GDI_ERROR +
+            // ERROR_CANNOT_COMPLETE (the documented error).
+            let glyph_outline = runtime.alloc_host_thunk(HostThunk::GetGlyphOutlineW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    glyph_outline,
+                    &[mem_dc as u32, u32::from(b'A'), 0, 0, 0, 0, 0]
+                ),
+                GDI_ERROR as u64,
+                "GetGlyphOutlineW returns GDI_ERROR for the bitmap font"
+            );
+            assert_eq!(runtime.last_error, ERROR_CANNOT_COMPLETE);
+
+            // GdiFlush is an unconditional success (drawing is synchronous).
+            let gdi_flush = runtime.alloc_host_thunk(HostThunk::GdiFlush);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, gdi_flush, &[]),
+                1
+            );
+
+            // GdiComment: valid DC accepts; invalid DC fails.
+            let gdi_comment = runtime.alloc_host_thunk(HostThunk::GdiComment);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gdi_comment,
+                    &[mem_dc as u32, 4, 0x61_300_u32]
+                ),
+                1,
+                "GdiComment succeeds on a valid DC"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, gdi_comment, &[0x7BAD, 4, 0]),
+                0,
+                "GdiComment fails on an invalid DC"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // GetPixel/SetPixel on a window DC round trip.
+            runtime.user32.register_class_ex_w("pixel-window");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_styled(
+                    "pixel-window",
+                    "pixel",
+                    16,
+                    16,
+                    true,
+                    false,
+                    None,
+                    1,
+                    0x4000_0000,
+                    0,
+                    None,
+                )
+                .expect("create pixel window");
+            while runtime.user32.get_message_w().is_some() {}
+            let get_dc_thunk = runtime.alloc_host_thunk(HostThunk::GetDC);
+            let win_dc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc_thunk, &[hwnd]);
+            let set_pixel = runtime.alloc_host_thunk(HostThunk::SetPixel);
+            let get_pixel = runtime.alloc_host_thunk(HostThunk::GetPixel);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_pixel,
+                    &[win_dc as u32, 3, 4, 0x00A1_B2C3]
+                ),
+                0x00A1_B2C3,
+                "SetPixel returns the set COLORREF"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_pixel, &[win_dc as u32, 3, 4]),
+                0x00A1_B2C3,
+                "GetPixel reads back the set COLORREF"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_pixel,
+                    &[win_dc as u32, 99, 4]
+                ),
+                0xFFFF_FFFF,
+                "GetPixel out of bounds returns CLR_INVALID"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_ui_gdi_draw_region_and_blend_thunks() {
+        with_big_stack(|| {
+            const WS_CHILD: u32 = 0x4000_0000;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "ui-gdi-draw",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime.user32.register_class_ex_w("draw-window");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_styled(
+                    "draw-window",
+                    "draw",
+                    32,
+                    24,
+                    true,
+                    false,
+                    None,
+                    1,
+                    WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create draw window");
+            while runtime.user32.get_message_w().is_some() {}
+            let get_dc_thunk = runtime.alloc_host_thunk(HostThunk::GetDC);
+            let win_dc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc_thunk, &[hwnd]);
+
+            // Ellipse: the interior is filled with the default white brush
+            // and the outline is drawn with the default black pen.
+            let ellipse = runtime.alloc_host_thunk(HostThunk::Ellipse);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ellipse,
+                    &[win_dc as u32, 0, 0, 8, 8]
+                ),
+                1,
+                "Ellipse draws into the window surface"
+            );
+            let surface = runtime
+                .window_surfaces
+                .get(&hwnd)
+                .expect("window surface after Ellipse");
+            let pixel = |x: usize, y: usize| {
+                let index = (y * 32 + x) * 4;
+                surface.bytes[index..index + 4].to_vec()
+            };
+            assert_eq!(
+                pixel(4, 4),
+                vec![0xff, 0xff, 0xff, 0xff],
+                "ellipse interior uses the brush color (white)"
+            );
+            assert_eq!(
+                pixel(0, 4),
+                vec![0x00, 0x00, 0x00, 0xff],
+                "ellipse boundary uses the pen color (black)"
+            );
+
+            // InvertRect: DSTINVERT (NOT all channels) on the rect.
+            let set_pixel = runtime.alloc_host_thunk(HostThunk::SetPixel);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[win_dc as u32, 2, 2, 0x00FF_0000],
+            );
+            let rect_ptr = 0x61_000;
+            memory.map_bytes(rect_ptr, &[0; 16]);
+            write_u32(&mut memory, rect_ptr, 0);
+            write_u32(&mut memory, rect_ptr + 4, 0);
+            write_u32(&mut memory, rect_ptr + 8, 4);
+            write_u32(&mut memory, rect_ptr + 12, 4);
+            let invert = runtime.alloc_host_thunk(HostThunk::InvertRect);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    invert,
+                    &[win_dc as u32, rect_ptr as u32]
+                ),
+                1,
+                "InvertRect inverts the rectangle pixels"
+            );
+            let get_pixel = runtime.alloc_host_thunk(HostThunk::GetPixel);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_pixel, &[win_dc as u32, 2, 2]),
+                0x0000_FFFF,
+                "DSTINVERT turns COLORREF 0x00FF0000 (blue) into 0x0000FFFF"
+            );
+
+            // CombineRgn: the RGN_* modes over region geometry.
+            let create_rgn = runtime.alloc_host_thunk(HostThunk::CreateRectRgn);
+            let a = dispatch_x86_thunk(&mut runtime, &mut memory, create_rgn, &[0, 0, 10, 10]);
+            let b = dispatch_x86_thunk(&mut runtime, &mut memory, create_rgn, &[5, 5, 15, 15]);
+            let c = dispatch_x86_thunk(&mut runtime, &mut memory, create_rgn, &[0, 0, 2, 2]);
+            let combine = runtime.alloc_host_thunk(HostThunk::CombineRgn);
+            let rgn_box = runtime.alloc_host_thunk(HostThunk::GetRgnBox);
+            let rect_out = 0x61_100;
+            memory.map_bytes(rect_out, &[0; 16]);
+            // RGN_AND: [5,10)x[5,10) — a simple region.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, b as u32, 1]
+                ),
+                2,
+                "RGN_AND of overlapping regions is SIMPLEREGION"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rgn_box,
+                    &[c as u32, rect_out as u32]
+                ),
+                2,
+                "the combined region's bounding box"
+            );
+            assert_eq!(read_u32(&memory, rect_out).expect("left"), 5);
+            assert_eq!(read_u32(&memory, rect_out + 4).expect("top"), 5);
+            assert_eq!(read_u32(&memory, rect_out + 8).expect("right"), 10);
+            assert_eq!(read_u32(&memory, rect_out + 12).expect("bottom"), 10);
+            // Disjoint RGN_AND → NULLREGION.
+            let far = dispatch_x86_thunk(&mut runtime, &mut memory, create_rgn, &[50, 50, 60, 60]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, far as u32, 1]
+                ),
+                1,
+                "disjoint RGN_AND is NULLREGION"
+            );
+            // RGN_OR → the union box.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, b as u32, 2]
+                ),
+                2,
+                "RGN_OR is SIMPLEREGION"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rgn_box,
+                    &[c as u32, rect_out as u32]
+                ),
+                2
+            );
+            assert_eq!(read_u32(&memory, rect_out + 8).expect("right"), 15);
+            // RGN_XOR with overlap → COMPLEXREGION.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, b as u32, 3]
+                ),
+                3,
+                "overlapping RGN_XOR is COMPLEXREGION"
+            );
+            // RGN_DIFF where b covers nothing of a → SIMPLEREGION of a.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, far as u32, 4]
+                ),
+                2,
+                "disjoint RGN_DIFF keeps the source region"
+            );
+            // Invalid handles → ERROR.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    combine,
+                    &[c as u32, a as u32, 0x7BAD_u32, 2]
+                ),
+                0,
+                "CombineRgn with an invalid region returns ERROR"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // AlphaBlend: a memory-DC bitmap with a 50% source alpha over a
+            // white destination follows the documented blend formula.
+            let create_dc_thunk = runtime.alloc_host_thunk(HostThunk::CreateCompatibleDC);
+            let mem_dc = dispatch_x86_thunk(&mut runtime, &mut memory, create_dc_thunk, &[0]);
+            let bitmap_thunk = runtime.alloc_host_thunk(HostThunk::CreateCompatibleBitmap);
+            let src_bitmap =
+                dispatch_x86_thunk(&mut runtime, &mut memory, bitmap_thunk, &[0, 2, 2]);
+            let select_thunk = runtime.alloc_host_thunk(HostThunk::SelectObject);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select_thunk,
+                &[mem_dc as u32, src_bitmap as u32],
+            );
+            // Solid opaque red BGRA [0,0,255,255] in the source bitmap.
+            {
+                let bitmap = runtime
+                    .gdi_bitmaps
+                    .get_mut(&src_bitmap)
+                    .expect("source bitmap");
+                for pixel_bytes in bitmap.bytes.chunks_mut(4) {
+                    pixel_bytes.copy_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+            // White destination pixel.
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[win_dc as u32, 1, 1, 0x00FF_FFFF],
+            );
+            // BLENDFUNCTION: blendOp=0, flags=0, SourceConstantAlpha=0x80.
+            let alpha_blend = runtime.alloc_host_thunk(HostThunk::AlphaBlend);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    alpha_blend,
+                    &[
+                        win_dc as u32,
+                        1,
+                        1,
+                        1,
+                        1,
+                        mem_dc as u32,
+                        0,
+                        0,
+                        1,
+                        1,
+                        0x0080_0000
+                    ]
+                ),
+                1,
+                "AlphaBlend composites the source over the destination"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_pixel, &[win_dc as u32, 1, 1]),
+                0x007F_7FFF,
+                "50% red over white: B=0x7F, G=0x7F, R=0xFF (COLORREF 0x007F7FFF)"
+            );
+
+            // TransparentBlt: the transparent color is skipped.
+            let bitmap2_thunk = runtime.alloc_host_thunk(HostThunk::CreateCompatibleBitmap);
+            let src_bitmap2 =
+                dispatch_x86_thunk(&mut runtime, &mut memory, bitmap2_thunk, &[0, 2, 1]);
+            {
+                let bitmap = runtime
+                    .gdi_bitmaps
+                    .get_mut(&src_bitmap2)
+                    .expect("second source bitmap");
+                bitmap.bytes[0..4].copy_from_slice(&[0, 0, 255, 255]); // red
+                bitmap.bytes[4..8].copy_from_slice(&[0, 255, 0, 255]); // green
+            }
+            let select2_thunk = runtime.alloc_host_thunk(HostThunk::SelectObject);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select2_thunk,
+                &[mem_dc as u32, src_bitmap2 as u32],
+            );
+            // White destination pixels.
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[win_dc as u32, 5, 5, 0x00FF_FFFF],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[win_dc as u32, 6, 5, 0x00FF_FFFF],
+            );
+            let transparent_blt = runtime.alloc_host_thunk(HostThunk::TransparentBlt);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    transparent_blt,
+                    &[
+                        win_dc as u32,
+                        5,
+                        5,
+                        2,
+                        1,
+                        mem_dc as u32,
+                        0,
+                        0,
+                        2,
+                        1,
+                        0x0000_FF00
+                    ]
+                ),
+                1,
+                "TransparentBlt copies the non-transparent pixels"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_pixel, &[win_dc as u32, 5, 5]),
+                0x0000_00FF,
+                "red pixel copied"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_pixel, &[win_dc as u32, 6, 5]),
+                0x00FF_FFFF,
+                "green (transparent) pixel skipped — destination kept"
+            );
+
+            // DrawTextExW: DT_CALCRECT reports the measured metrics through
+            // the same machinery as DrawTextW.
+            let text_ptr = runtime.alloc_utf16_string(&mut memory, "Hi").expect("text");
+            let draw_rect = 0x61_200;
+            memory.map_bytes(draw_rect, &[0; 16]);
+            write_u32(&mut memory, draw_rect, 0);
+            write_u32(&mut memory, draw_rect + 4, 0);
+            write_u32(&mut memory, draw_rect + 8, 100);
+            write_u32(&mut memory, draw_rect + 12, 100);
+            let draw_text_ex = runtime.alloc_host_thunk(HostThunk::DrawTextExW);
+            let height = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_text_ex,
+                &[
+                    win_dc as u32,
+                    text_ptr as u32,
+                    2,
+                    draw_rect as u32,
+                    0x0400,
+                    0,
+                ],
+            );
+            assert_eq!(height, 8, "DT_CALCRECT returns the measured line height");
+            assert_eq!(
+                read_u32(&memory, draw_rect + 8).expect("right"),
+                11,
+                "DT_CALCRECT tightens the rect width to the text width"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_ui_gdi_psapi_guest_process_thunks() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "ui-gdi-psapi",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+            runtime.main_module_path = "C:\\game\\app.exe".to_string();
+            runtime.main_module_name = "app.exe".to_string();
+
+            // EnumProcesses: the GUEST process list (the guest pid, never
+            // the host pid), with the Windows size contract.
+            let ids_ptr = 0x61_000;
+            memory.map_bytes(ids_ptr, &[0; 64]);
+            let needed_ptr = 0x61_100;
+            memory.map_bytes(needed_ptr, &[0; 4]);
+            let enum_processes = runtime.alloc_host_thunk(HostThunk::EnumProcesses);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_processes,
+                    &[ids_ptr as u32, 64, needed_ptr as u32]
+                ),
+                1,
+                "EnumProcesses succeeds"
+            );
+            let count = read_u32(&memory, needed_ptr).expect("bytes needed") / 4;
+            assert!(count >= 1, "at least the guest process is enumerated");
+            let guest_pid = runtime.win32.current_process_id();
+            let ids = (0..count)
+                .map(|index| read_u32(&memory, ids_ptr + index as u64 * 4).expect("pid"))
+                .collect::<Vec<_>>();
+            assert!(
+                ids.contains(&guest_pid),
+                "the guest pid is in the enumeration (never the host pid)"
+            );
+            assert!(
+                !ids.contains(&std::process::id()),
+                "the host pid must never leak into EnumProcesses"
+            );
+
+            // GetModuleBaseNameW: resolves the module base name as UTF-16.
+            let base_buffer = 0x61_200;
+            memory.map_bytes(base_buffer, &[0; 64]);
+            let base_name = runtime.alloc_host_thunk(HostThunk::GetModuleBaseNameW);
+            let process_handle = u64::from(runtime.win32.current_process_handle());
+            let image_base = runtime.mapped_image_base;
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                base_name,
+                &[
+                    process_handle as u32,
+                    image_base as u32,
+                    base_buffer as u32,
+                    32,
+                ],
+            );
+            assert_eq!(written, 7, "GetModuleBaseNameW returns the char count");
+            let name = read_utf16_string(&memory, base_buffer).expect("base name");
+            assert_eq!(name, "app.exe");
+
+            // GetModuleFileNameExW: the full module path.
+            let path_buffer = 0x61_300;
+            memory.map_bytes(path_buffer, &[0; 128]);
+            let module_file_name = runtime.alloc_host_thunk(HostThunk::GetModuleFileNameExW);
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                module_file_name,
+                &[
+                    process_handle as u32,
+                    image_base as u32,
+                    path_buffer as u32,
+                    64,
+                ],
+            );
+            assert_eq!(written, 15, "GetModuleFileNameExW returns the char count");
+            let path = read_utf16_string(&memory, path_buffer).expect("path");
+            assert_eq!(path, "C:\\game\\app.exe");
+
+            // GetProcessMemoryInfo: PROCESS_MEMORY_COUNTERS from the guest
+            // address space (committed pages + live heap).
+            let heap_ptr = runtime.alloc_heap(&mut memory, 256, true).expect("heap");
+            assert_ne!(heap_ptr, 0);
+            memory.map_bytes(0x70_000, &[0_u8; 0x1000]);
+            let counters = 0x61_400;
+            memory.map_bytes(counters, &[0; 72]);
+            let memory_info = runtime.alloc_host_thunk(HostThunk::GetProcessMemoryInfo);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    memory_info,
+                    &[process_handle as u32, counters as u32, 72]
+                ),
+                1,
+                "GetProcessMemoryInfo succeeds"
+            );
+            assert_eq!(read_u32(&memory, counters).expect("cb"), 72);
+            let working_set =
+                read_guest_pointer(&memory, counters + 16, GuestArch::X86).expect("working set");
+            assert!(
+                working_set >= 0x1000,
+                "WorkingSetSize reflects the committed guest pages"
+            );
+            let pagefile =
+                read_guest_pointer(&memory, counters + 56, GuestArch::X86).expect("pagefile usage");
+            assert_eq!(pagefile, working_set);
+            // Small buffer: fails honestly with ERROR_INVALID_PARAMETER.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    memory_info,
+                    &[process_handle as u32, counters as u32, 8]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        })
+    }
+
+    #[test]
+    fn evidence_ui_gdi_setupapi_device_info_sets() {
+        with_big_stack(|| {
+            const CLASS_GUID: &str = "{6BDD1FC1-810F-11D0-BEC7-08002BE2092F}";
+            const SPDRP_DEVICEDESC: u32 = 0;
+            const SPDRP_FRIENDLYNAME: u32 = 12;
+            const DIF_INSTALLDEVICE: u32 = 0x0000_0002;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "ui-gdi-setupapi",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            // Seed the guest registry device store: two ROOT devices with a
+            // class GUID, plus the class database entry.
+            for instance in ["0000", "0001"] {
+                let key = format!("SYSTEM\\CurrentControlSet\\Enum\\ROOT\\SYSTEM\\{instance}");
+                ge.registry_set_value(
+                    "HKLM",
+                    &key,
+                    "DeviceDesc",
+                    "REG_SZ",
+                    json!("Fake Display Adapter"),
+                    RegistryView::Native,
+                )
+                .expect("seed DeviceDesc");
+                ge.registry_set_value(
+                    "HKLM",
+                    &key,
+                    "ClassGUID",
+                    "REG_SZ",
+                    json!(CLASS_GUID),
+                    RegistryView::Native,
+                )
+                .expect("seed ClassGUID");
+            }
+            ge.registry_set_value(
+                "HKLM",
+                &format!("SYSTEM\\CurrentControlSet\\Control\\Class\\{CLASS_GUID}"),
+                "",
+                "REG_SZ",
+                json!("Display adapters"),
+                RegistryView::Native,
+            )
+            .expect("seed class description");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            // The class GUID struct bytes for
+            // {6BDD1FC1-810F-11D0-BEC7-08002BE2092F}.
+            let guid_ptr = 0x61_000;
+            memory.map_bytes(
+                guid_ptr,
+                &[
+                    0xC1, 0x1F, 0xDD, 0x6B, // Data1 LE
+                    0x0F, 0x81, // Data2 LE
+                    0xD0, 0x11, // Data3 LE
+                    0xBE, 0xC7, 0x08, 0x00, 0x2B, 0xE2, 0x09, 0x2F, // Data4
+                ],
+            );
+
+            // SetupDiGetClassDevsW: the device info set from the guest
+            // registry device store, filtered by class.
+            let get_class_devs = runtime.alloc_host_thunk(HostThunk::SetupDiGetClassDevsW);
+            let dev_info_set = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_class_devs,
+                &[guid_ptr as u32, 0, 0, 0],
+            );
+            assert_ne!(
+                dev_info_set,
+                u32::MAX as u64,
+                "SetupDiGetClassDevsW for an installed class succeeds"
+            );
+            assert_ne!(dev_info_set, 0, "the device info set handle is valid");
+
+            // Unknown class GUID → INVALID_HANDLE_VALUE + ERROR_INVALID_PARAMETER.
+            let bogus_guid_ptr = 0x61_010;
+            memory.map_bytes(bogus_guid_ptr, &[0x11; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_class_devs,
+                    &[bogus_guid_ptr as u32, 0, 0, 0]
+                ),
+                u32::MAX as u64,
+                "an unknown class GUID returns INVALID_HANDLE_VALUE"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // SetupDiEnumDeviceInfo: fills SP_DEVINFO_DATA, then the
+            // enumeration ends with ERROR_NO_MORE_ITEMS.
+            let dev_data = 0x61_020;
+            memory.map_bytes(dev_data, &[0; 28]);
+            write_u32(&mut memory, dev_data, 28); // cbSize
+            let enum_device = runtime.alloc_host_thunk(HostThunk::SetupDiEnumDeviceInfo);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_device,
+                    &[dev_info_set as u32, 0, dev_data as u32]
+                ),
+                1,
+                "SetupDiEnumDeviceInfo enumerates device 0"
+            );
+            assert_eq!(read_u32(&memory, dev_data + 20).expect("devinst"), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_device,
+                    &[dev_info_set as u32, 1, dev_data as u32]
+                ),
+                1,
+                "SetupDiEnumDeviceInfo enumerates device 1"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_device,
+                    &[dev_info_set as u32, 2, dev_data as u32]
+                ),
+                0,
+                "SetupDiEnumDeviceInfo past the end fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_NO_MORE_ITEMS);
+
+            // SetupDiGetDeviceInstanceIdW: "ROOT\\SYSTEM\\0001" (devinst 1 is
+            // the last enumerated element).
+            let id_buffer = 0x61_040;
+            memory.map_bytes(id_buffer, &[0; 64]);
+            let required = 0x61_080;
+            memory.map_bytes(required, &[0; 4]);
+            let get_instance_id = runtime.alloc_host_thunk(HostThunk::SetupDiGetDeviceInstanceIdW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_instance_id,
+                    &[
+                        dev_info_set as u32,
+                        dev_data as u32,
+                        id_buffer as u32,
+                        32,
+                        required as u32
+                    ]
+                ),
+                1,
+                "SetupDiGetDeviceInstanceIdW succeeds"
+            );
+            assert_eq!(
+                read_utf16_string(&memory, id_buffer).expect("instance id"),
+                "ROOT\\SYSTEM\\0001"
+            );
+            assert_eq!(read_u32(&memory, required).expect("required"), 17);
+
+            // SetupDiGetDeviceRegistryPropertyW: reads DeviceDesc from the
+            // device's guest-registry key.
+            let property_buffer = 0x61_0A0;
+            memory.map_bytes(property_buffer, &[0; 64]);
+            let data_type = 0x61_100;
+            memory.map_bytes(data_type, &[0; 4]);
+            let required = 0x61_110;
+            memory.map_bytes(required, &[0; 4]);
+            let get_property =
+                runtime.alloc_host_thunk(HostThunk::SetupDiGetDeviceRegistryPropertyW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[
+                        dev_info_set as u32,
+                        dev_data as u32,
+                        SPDRP_DEVICEDESC,
+                        data_type as u32,
+                        property_buffer as u32,
+                        64,
+                        required as u32
+                    ]
+                ),
+                1,
+                "SetupDiGetDeviceRegistryPropertyW reads the device property"
+            );
+            assert_eq!(read_u32(&memory, data_type).expect("reg type"), 1, "REG_SZ");
+            assert_eq!(
+                read_utf16_string(&memory, property_buffer).expect("description"),
+                "Fake Display Adapter"
+            );
+            // Missing property → ERROR_INVALID_DATA (documented).
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[
+                        dev_info_set as u32,
+                        dev_data as u32,
+                        SPDRP_FRIENDLYNAME,
+                        data_type as u32,
+                        property_buffer as u32,
+                        64,
+                        required as u32
+                    ]
+                ),
+                0,
+                "a missing property fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_DATA);
+
+            // SetupDiOpenDeviceInfoW: opens the second device instance.
+            let instance2_ptr = runtime
+                .alloc_utf16_string(&mut memory, "ROOT\\SYSTEM\\0001")
+                .expect("instance 2");
+            let open_device = runtime.alloc_host_thunk(HostThunk::SetupDiOpenDeviceInfoW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_device,
+                    &[
+                        dev_info_set as u32,
+                        instance2_ptr as u32,
+                        0,
+                        0,
+                        dev_data as u32
+                    ]
+                ),
+                1,
+                "SetupDiOpenDeviceInfoW opens ROOT\\SYSTEM\\0001"
+            );
+            assert_eq!(read_u32(&memory, dev_data + 20).expect("devinst"), 1);
+            let missing_instance = runtime
+                .alloc_utf16_string(&mut memory, "ROOT\\MISSING\\0000")
+                .expect("missing instance");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_device,
+                    &[
+                        dev_info_set as u32,
+                        missing_instance as u32,
+                        0,
+                        0,
+                        dev_data as u32
+                    ]
+                ),
+                0,
+                "opening an unknown instance fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_DEVINST);
+
+            // SetupDiSetDeviceRegistryPropertyW: writes into the guest
+            // registry; SetupDiGetDeviceRegistryPropertyW reads it back.
+            let set_property =
+                runtime.alloc_host_thunk(HostThunk::SetupDiSetDeviceRegistryPropertyW);
+            let friendly = runtime
+                .alloc_utf16_string(&mut memory, "My Fancy Device")
+                .expect("friendly name");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_property,
+                    &[
+                        dev_info_set as u32,
+                        dev_data as u32,
+                        SPDRP_FRIENDLYNAME,
+                        friendly as u32,
+                        32
+                    ]
+                ),
+                1,
+                "SetupDiSetDeviceRegistryPropertyW writes the property"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[
+                        dev_info_set as u32,
+                        dev_data as u32,
+                        SPDRP_FRIENDLYNAME,
+                        data_type as u32,
+                        property_buffer as u32,
+                        64,
+                        required as u32
+                    ]
+                ),
+                1,
+                "the written property reads back"
+            );
+            assert_eq!(
+                read_utf16_string(&memory, property_buffer).expect("friendly name"),
+                "My Fancy Device"
+            );
+
+            // SetupDiGetClassDescriptionW: from the class database.
+            let class_desc = 0x61_140;
+            memory.map_bytes(class_desc, &[0; 64]);
+            let get_class_desc = runtime.alloc_host_thunk(HostThunk::SetupDiGetClassDescriptionW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_class_desc,
+                    &[guid_ptr as u32, class_desc as u32, 32, required as u32]
+                ),
+                1,
+                "SetupDiGetClassDescriptionW succeeds"
+            );
+            assert_eq!(
+                read_utf16_string(&memory, class_desc).expect("class description"),
+                "Display adapters"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_class_desc,
+                    &[
+                        bogus_guid_ptr as u32,
+                        class_desc as u32,
+                        32,
+                        required as u32
+                    ]
+                ),
+                0,
+                "an unknown class fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_CLASS_DOES_NOT_EXIST);
+
+            // SetupDiCallClassInstaller: standard DIF codes are handled by
+            // the default installer; unknown codes fail.
+            let call_installer = runtime.alloc_host_thunk(HostThunk::SetupDiCallClassInstaller);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    call_installer,
+                    &[DIF_INSTALLDEVICE, dev_info_set as u32, dev_data as u32]
+                ),
+                1,
+                "DIF_INSTALLDEVICE is handled by the default installer"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    call_installer,
+                    &[0x7FFF, dev_info_set as u32, dev_data as u32]
+                ),
+                0,
+                "an unknown DIF code fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // Driver lists: building succeeds with an empty database;
+            // enumeration ends with ERROR_NO_MORE_ITEMS and selection fails
+            // with ERROR_NO_DEVICE_SELECTED.
+            let build_drivers = runtime.alloc_host_thunk(HostThunk::SetupDiBuildDriverInfoList);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    build_drivers,
+                    &[dev_info_set as u32, dev_data as u32, 1]
+                ),
+                1,
+                "SetupDiBuildDriverInfoList succeeds (empty driver database)"
+            );
+            let enum_drivers = runtime.alloc_host_thunk(HostThunk::SetupDiEnumDriverInfoW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_drivers,
+                    &[dev_info_set as u32, dev_data as u32, 1, 0, 0]
+                ),
+                0,
+                "SetupDiEnumDriverInfoW reports the exhausted empty list"
+            );
+            assert_eq!(runtime.last_error, ERROR_NO_MORE_ITEMS);
+            let selected_driver = runtime.alloc_host_thunk(HostThunk::SetupDiGetSelectedDriverW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    selected_driver,
+                    &[dev_info_set as u32, dev_data as u32, 0]
+                ),
+                0,
+                "SetupDiGetSelectedDriverW fails with no selected driver"
+            );
+            assert_eq!(runtime.last_error, ERROR_NO_DEVICE_SELECTED);
+            let destroy_drivers = runtime.alloc_host_thunk(HostThunk::SetupDiDestroyDriverInfoList);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    destroy_drivers,
+                    &[dev_info_set as u32, dev_data as u32, 1]
+                ),
+                1,
+                "SetupDiDestroyDriverInfoList frees the list"
+            );
+
+            // SetupDiInstallDevice / SetupDiUninstallDevice: the device's
+            // guest-registry InstallState flips between PRESENT and
+            // NOTPRESENT.
+            let install = runtime.alloc_host_thunk(HostThunk::SetupDiInstallDevice);
+            let uninstall = runtime.alloc_host_thunk(HostThunk::SetupDiUninstallDevice);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    install,
+                    &[dev_info_set as u32, dev_data as u32]
+                ),
+                1,
+                "SetupDiInstallDevice succeeds"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .ge()
+                    .registry_get_value(
+                        "HKLM",
+                        "SYSTEM\\CurrentControlSet\\Enum\\ROOT\\SYSTEM\\0001",
+                        "InstallState",
+                        RegistryView::Native,
+                    )
+                    .expect("read InstallState")
+                    .expect("InstallState value")
+                    .data
+                    .as_u64(),
+                Some(0),
+                "install marks DEVINST_STATE_PRESENT"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    uninstall,
+                    &[dev_info_set as u32, dev_data as u32]
+                ),
+                1,
+                "SetupDiUninstallDevice succeeds"
+            );
+            assert_eq!(
+                runtime
+                    .win32
+                    .ge()
+                    .registry_get_value(
+                        "HKLM",
+                        "SYSTEM\\CurrentControlSet\\Enum\\ROOT\\SYSTEM\\0001",
+                        "InstallState",
+                        RegistryView::Native,
+                    )
+                    .expect("read InstallState")
+                    .expect("InstallState value")
+                    .data
+                    .as_u64(),
+                Some(1),
+                "uninstall marks DEVINST_STATE_NOTPRESENT"
+            );
+
+            // SetupDiDestroyDeviceInfoList: frees the set; a second destroy
+            // fails.
+            let destroy_list = runtime.alloc_host_thunk(HostThunk::SetupDiDestroyDeviceInfoList);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    destroy_list,
+                    &[dev_info_set as u32]
+                ),
+                1,
+                "SetupDiDestroyDeviceInfoList frees the set"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    destroy_list,
+                    &[dev_info_set as u32]
+                ),
+                0,
+                "destroying an unknown set fails"
+            );
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        })
+
     }
 }
 
@@ -110844,6 +114966,88 @@ fn fill_bgra_rect(
         for column in x..x_end {
             let offset = (row * frame_width + column) * 4;
             bytes[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+/// Rasterize an ellipse bounded by `[left, right) × [top, bottom)` into a
+/// BGRA surface with the documented GDI convention: the interior is filled
+/// with `fill_color` and the one-pixel outline is drawn with `pen_color`
+/// (the ellipse equation `((x−cx)/rx)² + ((y−cy)/ry)² = 1` evaluated at
+/// pixel centers; pixels on the boundary are painted with the pen).
+#[allow(clippy::too_many_arguments)]
+fn fill_ellipse_bgra(
+    bytes: &mut [u8],
+    frame_width: usize,
+    frame_height: usize,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    fill_color: [u8; 4],
+    pen_color: [u8; 4],
+) {
+    if frame_width == 0 || right <= left || bottom <= top {
+        return;
+    }
+    let rx = f64::from(right - left) / 2.0;
+    let ry = f64::from(bottom - top) / 2.0;
+    if rx <= 0.0 || ry <= 0.0 {
+        return;
+    }
+    let cx = f64::from(left) + rx;
+    let cy = f64::from(top) + ry;
+    let inv_rx2 = 1.0 / (rx * rx);
+    let inv_ry2 = 1.0 / (ry * ry);
+    for row in top.max(0)..bottom.min(frame_height as i32) {
+        for column in left.max(0)..right.min(frame_width as i32) {
+            let dx = f64::from(column) + 0.5 - cx;
+            let dy = f64::from(row) + 0.5 - cy;
+            let inside = dx * dx * inv_rx2 + dy * dy * inv_ry2 <= 1.0;
+            if !inside {
+                continue;
+            }
+            // Boundary test: a pixel is on the outline when a 4-neighbor
+            // lies outside the ellipse (or outside the surface bounds).
+            let on_outline = !is_inside_ellipse(dx - 1.0, dy, inv_rx2, inv_ry2)
+                || !is_inside_ellipse(dx + 1.0, dy, inv_rx2, inv_ry2)
+                || !is_inside_ellipse(dx, dy - 1.0, inv_rx2, inv_ry2)
+                || !is_inside_ellipse(dx, dy + 1.0, inv_rx2, inv_ry2);
+            let offset = (row as usize * frame_width + column as usize) * 4;
+            bytes[offset..offset + 4].copy_from_slice(if on_outline {
+                &pen_color
+            } else {
+                &fill_color
+            });
+        }
+    }
+}
+
+fn is_inside_ellipse(dx: f64, dy: f64, inv_rx2: f64, inv_ry2: f64) -> bool {
+    dx * dx * inv_rx2 + dy * dy * inv_ry2 <= 1.0
+}
+
+/// Invert the color of every pixel in `[left, right) × [top, bottom)`
+/// (DSTINVERT semantics: NOT applied to every channel, including alpha,
+/// matching the documented raster op on 32-bpp surfaces).
+fn invert_bgra_rect(
+    bytes: &mut [u8],
+    frame_width: usize,
+    frame_height: usize,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) {
+    if frame_width == 0 {
+        return;
+    }
+    for row in top.max(0)..bottom.min(frame_height as i32) {
+        for column in left.max(0)..right.min(frame_width as i32) {
+            let offset = (row as usize * frame_width + column as usize) * 4;
+            for channel in 0..4 {
+                bytes[offset + channel] = !bytes[offset + channel];
+            }
         }
     }
 }
@@ -125943,6 +130147,8 @@ fn merge_registered_surface_exports(tables: &mut BTreeMap<String, Vec<ExportSymb
         (
             "psapi.dll",
             &[
+                "EnumProcesses",
+                "GetModuleBaseNameW",
                 "GetModuleFileNameExW",
                 "GetModuleInformation",
                 "GetProcessMemoryInfo",

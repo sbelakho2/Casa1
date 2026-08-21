@@ -5887,6 +5887,22 @@ impl Win32Subsystem {
         ToolhelpSnapshot { processes, modules }
     }
 
+    /// The GUEST process id list for psapi-style enumeration
+    /// (`EnumProcesses`): the canonical current guest process plus every
+    /// process object in the canonical handle table — NEVER the host's
+    /// POSIX pid.
+    pub fn guest_process_ids(&self) -> Vec<u32> {
+        let mut ids = vec![self.process.pid];
+        for (_, entry) in self.process.handle_table.iter() {
+            if let KernelObject::Process(process) = self.objects.object(entry.object_id) {
+                ids.push(process.process_id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     pub fn query_performance_frequency(&self) -> u64 {
         self.time.perf_frequency
     }
