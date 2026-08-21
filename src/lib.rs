@@ -149,6 +149,7 @@
 #[macro_use]
 extern crate objc;
 
+pub mod advapi32;
 pub mod anticheat;
 pub mod api_coverage;
 pub mod api_database;
@@ -163,6 +164,7 @@ pub mod cli;
 pub mod compatibility_profile;
 pub mod cpu;
 pub mod crash_recovery;
+pub mod crypto;
 pub mod d2d;
 pub mod d3d10;
 pub mod d3d11;
