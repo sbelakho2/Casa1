@@ -98039,8 +98039,6 @@ mod tests {
         state.get(Register::Rax)
     }
 
-
-
     // -----------------------------------------------------------------------
     // Evidence tail-final: the last implemented-without-evidence exports
     // (kernel32 SetThreadPriority, kernelbase GetFileInformationByHandle,
@@ -98554,7 +98552,6 @@ mod tests {
         );
         assert_eq!(result, 0x8007_0057);
     }
-
 }
 
 fn read_d3d12_command_queue_desc(

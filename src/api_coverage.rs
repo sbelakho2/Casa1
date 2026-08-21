@@ -4018,7 +4018,7 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "RtlSizeHeap",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-// == evidence-tail-final ==
+    // == evidence-tail-final ==
     //
     // The FINAL implemented-without-evidence surface:
     //
@@ -5400,10 +5400,6 @@ const fn conformance(
 
 /// Look up oracle-backed coverage evidence for a (DLL, export, arch, winver)
 /// key, returning the strongest applicable evidence row.
-
-/// Look up coverage evidence for a (DLL, export, arch, winver) key,
-/// returning the strongest applicable evidence row.
-
 pub fn coverage_evidence_for(
     dll: &str,
     export: &str,
