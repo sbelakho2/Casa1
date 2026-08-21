@@ -5005,7 +5005,6 @@ mod tests {
         "evidence_core_nt_rtl_and_io_thunks",
         "evidence_core_fiber_manager_create_switch_delete",
         "evidence_core_nt_enumerate_value_key_lists_values_in_order",
-
         "evidence_core_kernel32_disable_thread_library_calls_thunk",
         "evidence_core_kernel32_environment_expand_thunks",
         "evidence_core_kernel32_file_info_version_move_search_thunks",
@@ -5018,12 +5017,10 @@ mod tests {
         "evidence_shlwapi_path_find_thunks",
         "evidence_shlwapi_path_remove_spec_and_root_thunks",
         "evidence_shlwapi_string_thunks",
-
         "evidence_math_crt_math",
         "evidence_math_crt_stdio",
         "evidence_math_crt_vcruntime",
         "evidence_math_crt_msvcp",
-
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",
