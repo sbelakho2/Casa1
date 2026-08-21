@@ -161,6 +161,21 @@ impl PeHostRuntime {
         self.module_handles.get(&normalized).copied()
     }
 
+    /// Resolve the module (HMODULE / image base) whose image range contains
+    /// the given guest address.  Used by `DisableThreadLibraryCalls(NULL)`
+    /// to identify the calling module; falls back to the main image base.
+    pub(crate) fn module_handle_containing(&self, address: u64) -> u64 {
+        if address != 0 {
+            for (handle, info) in &self.dll_info_table {
+                let image_size = info.image_size.max(1);
+                if address >= *handle && address < handle.saturating_add(image_size) {
+                    return *handle;
+                }
+            }
+        }
+        self.mapped_image_base
+    }
+
     pub(crate) fn can_synthesize_module(&self, module_name: &str) -> bool {
         let normalized = normalize_module_name(module_name);
         !normalized.is_empty()
@@ -841,6 +856,14 @@ impl PeHostRuntime {
         while let Some((image_base, entry_point_rva, reason)) =
             self.pending_dll_main_calls.pop_front()
         {
+            // Modules marked by DisableThreadLibraryCalls never receive
+            // DLL_THREAD_ATTACH / DLL_THREAD_DETACH notifications (the
+            // loader-lock flag semantics of the Win32 API).
+            if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH)
+                && self.disabled_thread_library_calls.contains(&image_base)
+            {
+                continue;
+            }
             // Fire TLS callbacks BEFORE DllMain for attach reasons.
             if reason == DLL_PROCESS_ATTACH || reason == DLL_THREAD_ATTACH {
                 self.execute_tls_callbacks_for_module(state, memory, image_base, reason)?;
@@ -893,7 +916,8 @@ impl PeHostRuntime {
     ///
     /// Only DLLs with a non-zero `entry_point_rva` (i.e. those that actually
     /// export a DllMain) are notified.  Synthetic/managed modules that have no
-    /// PE entry point are skipped.
+    /// PE entry point are skipped.  Modules marked by
+    /// `DisableThreadLibraryCalls` are skipped for thread attach/detach.
     ///
     /// The calls are deferred via [`pending_dll_main_calls`] and must be drained
     /// later (e.g. via [`drain_pending_dll_main_calls`]) from a context where
@@ -902,6 +926,10 @@ impl PeHostRuntime {
     pub fn call_dll_entry_points(&mut self, dll_handles: &[u64], reason: DllReason) {
         let raw_reason = reason.to_raw();
         for &handle in dll_handles {
+            let thread_reason = matches!(reason, DllReason::ThreadAttach | DllReason::ThreadDetach);
+            if thread_reason && self.disabled_thread_library_calls.contains(&handle) {
+                continue;
+            }
             if let Some(info) = self.dll_info_table.get(&handle)
                 && info.entry_point_rva != 0
             {
@@ -1168,14 +1196,22 @@ impl PeHostRuntime {
     }
 
     /// Fire TLS callbacks with the given reason for all registered modules.
+    ///
+    /// Modules marked by `DisableThreadLibraryCalls` are skipped for the
+    /// thread attach/detach reasons (their thread notifications are
+    /// suppressed as a whole, TLS callbacks included).
     pub(crate) fn fire_tls_callbacks_for_all_modules(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
         reason: u32,
     ) -> AppResult<()> {
+        let thread_reason = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
         let handles: Vec<u64> = self.dll_info_table.keys().copied().collect();
         for handle in handles {
+            if thread_reason && self.disabled_thread_library_calls.contains(&handle) {
+                continue;
+            }
             self.execute_tls_callbacks_for_module(state, memory, handle, reason)?;
         }
         Ok(())

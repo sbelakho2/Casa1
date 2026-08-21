@@ -1748,6 +1748,140 @@ impl MemoryImage {
         self.write_fixed(address, value.to_le_bytes());
     }
 
+    /// Serialized fallback for unaligned interlocked access (Windows x86
+    /// tolerates unaligned lock-prefixed operations; x64 requires 32-bit
+    /// alignment — the fallback keeps an unaligned guest call well-defined
+    /// instead of faulting).
+    fn unaligned_interlocked<F>(&self, address: u64, op: F) -> AppResult<u32>
+    where
+        F: FnOnce(u32) -> u32,
+    {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let previous = self.read_u32(address)?;
+        let page_base = address & MEMORY_PAGE_MASK;
+        let page_offset = (address - page_base) as usize;
+        let index = self.page_index(page_base).expect("range validated above");
+        let page = &self.pages[index].1;
+        let replacement = op(previous).to_le_bytes();
+        // SAFETY: the range was validated readable/mapped by read_u32 above
+        // and the LOCK excludes every other fallback writer; the mapping is
+        // never mutated by this accessor, so the raw store cannot reallocate.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                replacement.as_ptr(),
+                page.bytes.as_ptr().add(page_offset) as *mut u8,
+                4,
+            );
+        }
+        Ok(previous)
+    }
+
+    /// Resolve a 4-byte aligned, fully-mapped guest range as an
+    /// [`AtomicU32`] view over the page bytes.
+    ///
+    /// The pointer stays valid for the lifetime of the page buffer: the
+    /// pages vector is only reallocated through `&mut` methods, while the
+    /// interlocked accessors take `&self` and never mutate the mapping.
+    fn atomic_u32_at(&self, address: u64) -> AppResult<&std::sync::atomic::AtomicU32> {
+        self.check_canonical_access(address, false, false)?;
+        let page_base = address & MEMORY_PAGE_MASK;
+        let page_offset = (address - page_base) as usize;
+        if !page_offset.is_multiple_of(4) || page_offset + 4 > MEMORY_PAGE_SIZE {
+            return Err(Self::unmapped_memory_error(address));
+        }
+        let Some(index) = self.page_index(page_base) else {
+            return Err(Self::unmapped_memory_error(address));
+        };
+        let page = &self.pages[index].1;
+        if !page.range_is_mapped(page_offset, 4) {
+            return Err(Self::unmapped_memory_error(address));
+        }
+        // SAFETY: the reference covers the 4 mapped bytes of a committed
+        // guest page (validated above); atomic access needs no `&mut`, and
+        // the underlying allocation is never freed while `&self` is alive.
+        Ok(unsafe {
+            &*(page.bytes.as_ptr().add(page_offset) as *const std::sync::atomic::AtomicU32)
+        })
+    }
+
+    /// Atomic 32-bit exchange on guest memory (InterlockedExchange).
+    ///
+    /// SeqCst so the interlocked semantics hold even when guest threads are
+    /// driven by concurrent host threads; returns the PREVIOUS value.
+    pub fn interlocked_exchange_u32(&self, address: u64, value: u32) -> AppResult<u32> {
+        if !address.is_multiple_of(4) {
+            return self.unaligned_interlocked(address, |_| value);
+        }
+        Ok(self
+            .atomic_u32_at(address)?
+            .swap(value, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Atomic 32-bit compare-and-exchange on guest memory
+    /// (InterlockedCompareExchange): stores `exchange` when the current
+    /// value equals `comparand`; returns the PREVIOUS value either way.
+    pub fn interlocked_compare_exchange_u32(
+        &self,
+        address: u64,
+        exchange: u32,
+        comparand: u32,
+    ) -> AppResult<u32> {
+        if !address.is_multiple_of(4) {
+            return self.unaligned_interlocked(address, |current| {
+                if current == comparand {
+                    exchange
+                } else {
+                    current
+                }
+            });
+        }
+        let previous = match self.atomic_u32_at(address)?.compare_exchange(
+            comparand,
+            exchange,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(previous) | Err(previous) => previous,
+        };
+        Ok(previous)
+    }
+
+    /// Atomic 32-bit add on guest memory (InterlockedExchangeAdd): adds
+    /// `addend` and returns the PREVIOUS value.
+    pub fn interlocked_exchange_add_u32(&self, address: u64, addend: u32) -> AppResult<u32> {
+        if !address.is_multiple_of(4) {
+            return self.unaligned_interlocked(address, |current| current.wrapping_add(addend));
+        }
+        Ok(self
+            .atomic_u32_at(address)?
+            .fetch_add(addend, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Atomic 32-bit increment on guest memory (InterlockedIncrement):
+    /// increments and returns the NEW value.
+    pub fn interlocked_increment_u32(&self, address: u64) -> AppResult<u32> {
+        if !address.is_multiple_of(4) {
+            return self.unaligned_interlocked(address, |current| current.wrapping_add(1));
+        }
+        Ok(self
+            .atomic_u32_at(address)?
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1))
+    }
+
+    /// Atomic 32-bit decrement on guest memory (InterlockedDecrement):
+    /// decrements and returns the NEW value.
+    pub fn interlocked_decrement_u32(&self, address: u64) -> AppResult<u32> {
+        if !address.is_multiple_of(4) {
+            return self.unaligned_interlocked(address, |current| current.wrapping_sub(1));
+        }
+        Ok(self
+            .atomic_u32_at(address)?
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_sub(1))
+    }
+
     pub fn stable_hash(&self) -> String {
         let mut hasher = Sha256::new();
         let mut pages = self.pages.iter().collect::<Vec<_>>();

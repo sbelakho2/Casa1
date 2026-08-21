@@ -475,6 +475,9 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
 const ERROR_INVALID_FUNCTION: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_BUFFER_OVERFLOW: u32 = 111;
+const ERROR_SUCCESS: u32 = 0;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 const ERROR_OLD_WIN_VERSION: u32 = 1_150;
@@ -2291,6 +2294,161 @@ pub enum HostThunk {
     CoUninitialize,
     SHGetKnownFolderPath,
     ShellExecuteExW,
+    // -- shlwapi.dll: path helpers -------------------------------------------
+    /// `PathAppendW` — appends a relative path element to a path in place,
+    /// inserting a single backslash separator; an absolute `pszMore`
+    /// replaces the path; a leading `..` pops the last element first.
+    PathAppendW,
+    /// `PathCombineW` — combines a directory and a file name into `pszOut`
+    /// following the Windows append rules (absolute file replaces the
+    /// directory, `..` pops, empty directory yields `\file`); returns
+    /// `pszOut` or NULL when nothing was combined.
+    PathCombineW,
+    /// `PathFileExistsW` — TRUE when the resolved guest path names an
+    /// existing file or directory.
+    PathFileExistsW,
+    /// `PathFindExtensionW` — pointer to the extension of a path (the last
+    /// dot after the last directory separator, colon, or space), or a
+    /// pointer to the trailing NUL when the path has no extension.
+    PathFindExtensionW,
+    /// `PathFindFileNameW` — pointer to the last path component (after the
+    /// last `\`, `/`, or `:`), or the whole string when no separator exists.
+    PathFindFileNameW,
+    /// `PathRemoveFileSpecW` — removes the trailing file name (and the
+    /// separator before it); returns TRUE when a component was removed and
+    /// FALSE (path unchanged) for roots and separator-less paths.
+    PathRemoveFileSpecW,
+    /// `PathRemoveExtensionW` — removes the extension from a path in place,
+    /// including the leading dot; no-op when the path has no extension.
+    PathRemoveExtensionW,
+    /// `PathRemoveBlanksW` — removes all leading and trailing spaces from a
+    /// path in place.
+    PathRemoveBlanksW,
+    /// `PathIsDirectoryW` — TRUE when the resolved guest path names an
+    /// existing directory (uses the file attributes of the win32
+    /// subsystem).
+    PathIsDirectoryW,
+    /// `PathIsRelativeW` — TRUE when the path is not drive-qualified, not
+    /// UNC, and does not begin with a separator.
+    PathIsRelativeW,
+    /// `PathCanonicalizeW` — canonicalizes a path in place (`.`, `..`, and
+    /// duplicate separators collapsed, separators normalized to `\`);
+    /// returns FALSE when the input is not an absolute path.
+    PathCanonicalizeW,
+    /// `PathMatchSpecW` — TRUE when the path matches a DOS-style wildcard
+    /// pattern (`*`, `?`, and `;`-separated alternates).
+    PathMatchSpecW,
+    /// `PathStripPathW` — removes the directory portion of a path in place,
+    /// leaving only the final component.
+    PathStripPathW,
+    /// `PathGetDriveNumberW` — the drive index (0 for `A:`, 1 for `B:`,
+    /// ...) of a drive-qualified path, or -1 when the path has no drive.
+    PathGetDriveNumberW,
+    /// `PathAddBackslashW` — appends a trailing backslash when the path
+    /// does not already end with one; returns the path or NULL when the
+    /// path is too long.
+    PathAddBackslashW,
+    /// `PathRemoveBackslashW` — removes the trailing backslash from a path
+    /// (but not a root like `C:\`); returns the path or NULL.
+    PathRemoveBackslashW,
+    /// `PathSkipRootW` — pointer to the first path component after the
+    /// root (drive `X:\` or UNC `\\server\share\`); NULL when the path
+    /// has no root.
+    PathSkipRootW,
+    /// `PathIsRootW` — TRUE when the path is a root path (`C:\`, `\`,
+    /// `\\server\share`, or the UNC root forms).
+    PathIsRootW,
+    /// `ChrCmpIW` — case-insensitive comparison of two characters; TRUE
+    /// when they match (the case_fold machinery, like lstrcmpiW on single
+    /// characters).
+    ChrCmpIW,
+    /// `IntlStrEqWorkerW` — case-insensitive (or case-sensitive when
+    /// `bCaseSensitive`) prefix comparison of `nChar` characters; TRUE when
+    /// the strings compare equal over that length.
+    IntlStrEqWorkerW,
+    /// `IsCharAlphaW` — TRUE when the character is alphabetic (Unicode
+    /// letter class).
+    IsCharAlphaW,
+    /// `IsCharAlphaNumericW` — TRUE when the character is alphabetic or a
+    /// decimal digit.
+    IsCharAlphaNumericW,
+    /// `IsCharLowerW` — TRUE when the character is a lowercase letter.
+    IsCharLowerW,
+    /// `IsCharUpperW` — TRUE when the character is an uppercase letter.
+    IsCharUpperW,
+    /// `IsCharSpaceW` — TRUE when the character is a whitespace character.
+    IsCharSpaceW,
+    /// `ParseURLW` — parses a URL into its scheme and location; writes the
+    /// scheme into the URL_COMPONENTS structure and returns URL_SUCCESS (0)
+    /// for supported schemes or URL_INVALID_URL when no scheme is present.
+    ParseURLW,
+    /// `StrChrW` — pointer to the first occurrence of a character in a
+    /// string (case-sensitive), or NULL.
+    StrChrW,
+    /// `StrChrIW` — case-insensitive first-occurrence search.
+    StrChrIW,
+    /// `StrRChrW` — pointer to the LAST occurrence of a character in a
+    /// string at or before `chStart` (case-sensitive), or NULL.
+    StrRChrW,
+    /// `StrStrW` — pointer to the first occurrence of a substring
+    /// (case-sensitive), or NULL.
+    StrStrW,
+    /// `StrStrIW` — case-insensitive substring search.
+    StrStrIW,
+    /// `StrCmpIW` — case-insensitive string comparison (0 when equal).
+    StrCmpIW,
+    /// `StrCmpNIW` — case-insensitive comparison of the first `nChar`
+    /// characters (0 when equal).
+    StrCmpNIW,
+    /// `StrCmpNW` — case-sensitive comparison of the first `nChar`
+    /// characters (0 when equal).
+    StrCmpNW,
+    /// `StrCmpW` — case-sensitive string comparison (0 when equal).
+    StrCmpW,
+    /// `StrCpyNW` — copies at most `cchMax` characters (including the NUL
+    /// terminator) into the destination; returns the destination pointer.
+    StrCpyNW,
+    /// `StrCpyW` — copies a string into the destination; returns the
+    /// destination pointer.
+    StrCpyW,
+    /// `StrCatW` — concatenates a source string onto the destination;
+    /// returns the destination pointer.
+    StrCatW,
+    /// `StrToIntW` — parses an optional sign followed by decimal digits
+    /// into an i32; returns 0 when no digits are present.
+    StrToIntW,
+    /// `StrFromTimeIntervalW` — formats a time interval (milliseconds) as
+    /// `d:hh:mm:ss` / `hh:mm:ss` with the requested significant digits;
+    /// returns the number of characters written.
+    StrFromTimeIntervalW,
+    /// `SHRegGetValueW` — reads a registry value with subkey-path
+    /// resolution (SRRF_RT_* type checking); returns ERROR_SUCCESS or a
+    /// Win32 error code.
+    SHRegGetValueW,
+    /// `SHRegSetValueW` — writes a registry value, creating intermediate
+    /// keys as needed; returns ERROR_SUCCESS or a Win32 error code.
+    SHRegSetValueW,
+    /// `SHDeleteKeyW` — deletes a registry key (and its subkeys).
+    SHDeleteKeyW,
+    /// `SHDeleteEmptyKeyW` — deletes a registry key only when it has no
+    /// subkeys or values.
+    SHDeleteEmptyKeyW,
+    /// `SHSearchMapInt` — looks up an integer key in a (key, value) pair
+    /// table (two parallel int arrays); returns the first matching value,
+    /// or -1 when the key is not found.
+    SHSearchMapInt,
+    /// `GetMenuContextHelpId` — returns 0 (no context help id).
+    GetMenuContextHelpId,
+    /// `SetMenuContextHelpId` — no-op; returns TRUE.
+    SetMenuContextHelpId,
+    /// `UrlCanonicalizeW` — canonicalizes a URL (lowercases the scheme and
+    /// host, collapses duplicate slashes, resolves `.`/`..` segments) into
+    /// the output buffer; returns URL_SUCCESS or URL_E_INVALIDURL.
+    UrlCanonicalizeW,
+    /// `UrlCombineW` — combines a base URL and a relative URL into the
+    /// output buffer following RFC 3986 resolution; returns URL_SUCCESS or
+    /// URL_E_INVALIDURL.
+    UrlCombineW,
     GetNativeSystemInfo,
     GetSystemInfo,
     IsWow64Process,
@@ -2484,6 +2642,65 @@ pub enum HostThunk {
     CopyFileW,
     /// `MoveFileExW` — moves an existing file or a directory, including its children.
     MoveFileExW,
+    // -- kernel32 core surface: interlocked / environment / INI / file-info /
+    //    version / search / loader-lock --------------------------------------
+    /// `DisableThreadLibraryCalls` — marks the module (hModule, or the
+    /// calling module when NULL) so the loader skips its DLL_THREAD_ATTACH
+    /// and DLL_THREAD_DETACH notifications (DllMain reasons and the
+    /// matching TLS callbacks) for every later thread.  Always succeeds.
+    DisableThreadLibraryCalls,
+    /// `ExpandEnvironmentStringsW` — expands `%VARNAME%` references in the
+    /// source string against the guest process environment; undefined
+    /// variables are copied through literally.  Returns the length written
+    /// (excluding the NUL) or the required size (including the NUL) when
+    /// the buffer is too small, with ERROR_INSUFFICIENT_BUFFER.
+    ExpandEnvironmentStringsW,
+    /// `GetFileInformationByHandleEx` — FileBasicInfo class: writes the
+    /// creation/last-access/last-write FILETIMEs (the same values GetFileTime
+    /// reports for the handle), the change time (equal to the write time, as
+    /// the runtime tracks no separate change timestamp), and the file
+    /// attributes.
+    GetFileInformationByHandleEx,
+    /// `GetPrivateProfileStringW` — reads a section/key value from an INI
+    /// document (the same storage WritePrivateProfileStringW maintains);
+    /// missing sections/keys return the default string.  A NULL key name
+    /// lists the section's key names (multi-string); a NULL app name lists
+    /// the section names.
+    GetPrivateProfileStringW,
+    /// `GetVersionExA` — ANSI variant of GetVersionExW: identical version
+    /// fields with the OSVERSIONINFOEXA structure layout.
+    GetVersionExA,
+    /// `InterlockedCompareExchange` — atomically stores `exchange` into the
+    /// guest-memory 32-bit value at `destination` when it equals `comparand`;
+    /// returns the previous value.
+    InterlockedCompareExchange,
+    /// `InterlockedDecrement` — atomically decrements the guest-memory
+    /// 32-bit value at `destination`; returns the NEW value.
+    InterlockedDecrement,
+    /// `InterlockedExchange` — atomically stores `value` into the
+    /// guest-memory 32-bit value at `destination`; returns the previous
+    /// value.
+    InterlockedExchange,
+    /// `InterlockedExchangeAdd` — atomically adds `addend` to the
+    /// guest-memory 32-bit value at `destination`; returns the previous
+    /// value.
+    InterlockedExchangeAdd,
+    /// `InterlockedIncrement` — atomically increments the guest-memory
+    /// 32-bit value at `destination`; returns the NEW value.
+    InterlockedIncrement,
+    /// `MoveFileW` — moves an existing file or directory (rename); the
+    /// MOVEFILE_REPLACE_EXISTING=0 path of MoveFileExW, so an existing
+    /// destination fails.
+    MoveFileW,
+    /// `SearchPathW` — resolves a file name against the DLL search path
+    /// (app directory → System32 → Windows → PATH) or an explicit
+    /// semicolon-separated path list; returns the found path length, the
+    /// required size on a small buffer, or 0 with ERROR_FILE_NOT_FOUND.
+    SearchPathW,
+    /// `lstrcmpiA` — case-insensitive ordinal comparison of two ANSI
+    /// strings (the case_fold machinery of lstrcmpiW over the ANSI code
+    /// page); returns -1 / 0 / 1.
+    LstrcmpiA,
     /// `CreateFileA` — ANSI variant of CreateFileW.
     CreateFileA,
     /// `RemoveDirectoryA` — ANSI variant of RemoveDirectoryW.
@@ -37926,6 +38143,1031 @@ impl PeHostRuntime {
                     }
                 }
             }
+            // ── shlwapi.dll: path helpers (pure string operations) ─────────
+            HostThunk::PathAppendW => {
+                let path_ptr = arg(0);
+                let more_ptr = arg(1);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let base = read_utf16_string(memory, path_ptr)?;
+                    let more = if more_ptr != 0 {
+                        read_utf16_string(memory, more_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let joined = shlwapi_path_append(&base, &more);
+                    let bytes = joined
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(path_ptr, &bytes);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathCombineW => {
+                let out_ptr = arg(0);
+                let dir_ptr = arg(1);
+                let file_ptr = arg(2);
+                let dir = (dir_ptr != 0)
+                    .then(|| read_utf16_string(memory, dir_ptr).unwrap_or_default());
+                let file = if file_ptr != 0 {
+                    read_utf16_string(memory, file_ptr)?
+                } else {
+                    String::new()
+                };
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if let Some(combined) = shlwapi_path_combine(dir.as_deref(), &file) {
+                    let bytes = combined
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(out_ptr, &bytes);
+                    state.set(Register::Rax, out_ptr);
+                    self.last_error = 0;
+                } else {
+                    // (NULL dir, NULL file): nothing to combine.
+                    write_u16(memory, out_ptr, 0);
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathFileExistsW => {
+                let path_ptr = arg(0);
+                let exists = if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    if path.is_empty() {
+                        false
+                    } else {
+                        let resolved = resolve_guest_path(&self.current_directory, &path);
+                        self.win32.get_file_attributes_w(&resolved).is_ok()
+                    }
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(exists));
+                self.last_error = 0;
+            }
+            HostThunk::PathFindExtensionW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let offset = shlwapi_path_find_extension_offset(&path);
+                    let unit_offset = path[..offset].encode_utf16().count() as u64;
+                    state.set(Register::Rax, path_ptr + unit_offset * 2);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathFindFileNameW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let offset = shlwapi_path_find_file_name_offset(&path);
+                    let unit_offset = path[..offset].encode_utf16().count() as u64;
+                    state.set(Register::Rax, path_ptr + unit_offset * 2);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathRemoveFileSpecW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let result = shlwapi_path_remove_file_spec(&path);
+                    match result {
+                        Some(removed) => {
+                            let bytes = removed
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(path_ptr, &bytes);
+                            state.set(Register::Rax, 1);
+                        }
+                        None => state.set(Register::Rax, 0),
+                    }
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathRemoveExtensionW => {
+                let path_ptr = arg(0);
+                if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let offset = shlwapi_path_find_extension_offset(&path);
+                    if offset < path.len() {
+                        let trimmed = &path[..offset];
+                        let bytes = trimmed
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        memory.map_bytes(path_ptr, &bytes);
+                    }
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::PathRemoveBlanksW => {
+                let path_ptr = arg(0);
+                if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let trimmed = path.trim_matches(' ');
+                    let bytes = trimmed
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(path_ptr, &bytes);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::PathIsDirectoryW => {
+                let path_ptr = arg(0);
+                let is_directory = if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    if path.is_empty() {
+                        false
+                    } else {
+                        let resolved = resolve_guest_path(&self.current_directory, &path);
+                        self.win32
+                            .ge()
+                            .get_file_metadata(&resolved)
+                            .map(|metadata| metadata.kind == crate::ge::FsEntryKind::Directory)
+                            .unwrap_or(false)
+                    }
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(is_directory));
+                self.last_error = 0;
+            }
+            HostThunk::PathIsRelativeW => {
+                let path_ptr = arg(0);
+                let relative = if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    shlwapi_path_is_relative(&path)
+                } else {
+                    true
+                };
+                state.set(Register::Rax, u64::from(relative));
+                self.last_error = 0;
+            }
+            HostThunk::PathCanonicalizeW => {
+                let out_ptr = arg(0);
+                let path_ptr = arg(1);
+                if out_ptr == 0 || path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let canonical = shlwapi_path_canonicalize(&path);
+                    let bytes = canonical
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(out_ptr, &bytes);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathMatchSpecW => {
+                let path_ptr = arg(0);
+                let spec_ptr = arg(1);
+                let matches = if path_ptr != 0 && spec_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let spec = read_utf16_string(memory, spec_ptr)?;
+                    shlwapi_path_match_spec(&path, &spec)
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(matches));
+                self.last_error = 0;
+            }
+            HostThunk::PathStripPathW => {
+                let path_ptr = arg(0);
+                if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let offset = shlwapi_path_find_file_name_offset(&path);
+                    let stripped = &path[offset..];
+                    let bytes = stripped
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(path_ptr, &bytes);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::PathGetDriveNumberW => {
+                let path_ptr = arg(0);
+                let drive_number = if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let mut path = path.as_str();
+                    if let Some(stripped) = path.strip_prefix(r"\\?\") {
+                        path = stripped;
+                    }
+                    let bytes = path.as_bytes();
+                    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                        i32::from(bytes[0].to_ascii_uppercase() - b'A')
+                    } else {
+                        -1
+                    }
+                } else {
+                    -1
+                };
+                state.set(Register::Rax, drive_number as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::PathAddBackslashW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let mut result = path;
+                    if !result.ends_with('\\') && !result.ends_with('/') {
+                        result.push('\\');
+                    }
+                    let bytes = result
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(path_ptr, &bytes);
+                    state.set(Register::Rax, path_ptr);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathRemoveBackslashW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let mut result = path;
+                    if !shlwapi_path_is_root(&result) && result.ends_with('\\') {
+                        result.pop();
+                    }
+                    let bytes = result
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(path_ptr, &bytes);
+                    // The return value is the address of the new end of the
+                    // string.
+                    state.set(Register::Rax, path_ptr + (result.encode_utf16().count() as u64) * 2);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::PathSkipRootW => {
+                let path_ptr = arg(0);
+                if path_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    let offset = shlwapi_path_skip_root_offset(&path);
+                    match offset {
+                        Some(offset) => {
+                            let unit_offset = path[..offset].encode_utf16().count() as u64;
+                            state.set(Register::Rax, path_ptr + unit_offset * 2);
+                            self.last_error = 0;
+                        }
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                        }
+                    }
+                }
+            }
+            HostThunk::PathIsRootW => {
+                let path_ptr = arg(0);
+                let is_root = if path_ptr != 0 {
+                    let path = read_utf16_string(memory, path_ptr)?;
+                    shlwapi_path_is_root(&path)
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(is_root));
+                self.last_error = 0;
+            }
+            // ── shlwapi.dll: string / char-class helpers ───────────────────
+            HostThunk::ChrCmpIW => {
+                let left = arg(0) as u16;
+                let right = arg(1) as u16;
+                let left_folded = char::from_u32(u32::from(left))
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .unwrap_or(char::from_u32(0).unwrap());
+                let right_folded = char::from_u32(u32::from(right))
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .unwrap_or(char::from_u32(0).unwrap());
+                state.set(Register::Rax, u64::from(left_folded == right_folded));
+                self.last_error = 0;
+            }
+            HostThunk::IntlStrEqWorkerW => {
+                let case_sensitive = arg(0) != 0;
+                let left_ptr = arg(1);
+                let right_ptr = arg(2);
+                let count = arg(3) as usize;
+                let left = if left_ptr != 0 {
+                    read_utf16_string(memory, left_ptr)?
+                } else {
+                    String::new()
+                };
+                let right = if right_ptr != 0 {
+                    read_utf16_string(memory, right_ptr)?
+                } else {
+                    String::new()
+                };
+                let left_units: Vec<u16> = left.encode_utf16().collect();
+                let right_units: Vec<u16> = right.encode_utf16().collect();
+                let equal = (0..count).all(|index| {
+                    let l = left_units.get(index).copied().unwrap_or(0);
+                    let r = right_units.get(index).copied().unwrap_or(0);
+                    if case_sensitive {
+                        l == r
+                    } else {
+                        fold_utf16_unit(l) == fold_utf16_unit(r)
+                    }
+                });
+                state.set(Register::Rax, u64::from(equal));
+                self.last_error = 0;
+            }
+            HostThunk::IsCharAlphaW
+            | HostThunk::IsCharAlphaNumericW
+            | HostThunk::IsCharLowerW
+            | HostThunk::IsCharUpperW
+            | HostThunk::IsCharSpaceW => {
+                let ch = arg(0) as u16;
+                let mask = classify_wide_char_type(CT_CTYPE1, ch);
+                let result = match thunk {
+                    HostThunk::IsCharAlphaW => mask & C1_ALPHA != 0,
+                    HostThunk::IsCharAlphaNumericW => mask & (C1_ALPHA | C1_DIGIT) != 0,
+                    HostThunk::IsCharLowerW => mask & C1_LOWER != 0,
+                    HostThunk::IsCharUpperW => mask & C1_UPPER != 0,
+                    HostThunk::IsCharSpaceW => mask & C1_SPACE != 0,
+                    _ => unreachable!(),
+                };
+                state.set(Register::Rax, u64::from(result));
+                self.last_error = 0;
+            }
+            HostThunk::ParseURLW => {
+                let url_ptr = arg(0);
+                let components_ptr = arg(1);
+                const URL_SUCCESS: u32 = 0;
+                const URL_E_INVALID_SYNTAX: u32 = 0x8004_1001;
+                const E_INVALIDARG: u32 = 0x8007_0057;
+                let pointer_bytes = match self.guest_arch {
+                    GuestArch::X86 => 4_u64,
+                    GuestArch::X64 => 8_u64,
+                };
+                // PARSEDURLW layout (natural alignment):
+                //   cbSize, pszProtocol, cchProtocol, pszSuffix, cchSuffix, nScheme
+                let protocol_offset = pointer_bytes;
+                let cch_protocol_offset = pointer_bytes + 4;
+                let suffix_offset = pointer_bytes * 2 + 4;
+                let cch_suffix_offset = pointer_bytes * 2 + 8;
+                let n_scheme_offset = pointer_bytes * 2 + 12;
+                let parsed_url_size = pointer_bytes * 2 + 16;
+                let result = (|| -> AppResult<u32> {
+                    if url_ptr == 0 || components_ptr == 0 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let reported_size = read_u32(memory, components_ptr)?;
+                    if reported_size != parsed_url_size as u32 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let url = read_utf16_string(memory, url_ptr)?;
+                    match shlwapi_parse_url(&url) {
+                        Some((scheme_len, n_scheme, suffix_offset_units)) => {
+                            write_guest_pointer(
+                                memory,
+                                components_ptr + protocol_offset,
+                                url_ptr,
+                                self.guest_arch,
+                            )?;
+                            write_u32(
+                                memory,
+                                components_ptr + cch_protocol_offset,
+                                scheme_len as u32,
+                            );
+                            write_guest_pointer(
+                                memory,
+                                components_ptr + suffix_offset,
+                                url_ptr + suffix_offset_units as u64 * 2,
+                                self.guest_arch,
+                            )?;
+                            let suffix_units = url.encode_utf16().count() as u32 - scheme_len as u32 - 1;
+                            write_u32(memory, components_ptr + cch_suffix_offset, suffix_units);
+                            write_u32(memory, components_ptr + n_scheme_offset, n_scheme);
+                            Ok(URL_SUCCESS)
+                        }
+                        None => {
+                            write_guest_pointer(
+                                memory,
+                                components_ptr + protocol_offset,
+                                0,
+                                self.guest_arch,
+                            )?;
+                            Ok(URL_E_INVALID_SYNTAX)
+                        }
+                    }
+                })();
+                match result {
+                    Ok(hr) => {
+                        state.set(Register::Rax, u64::from(hr));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(URL_E_INVALID_SYNTAX));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::StrChrW | HostThunk::StrChrIW => {
+                let string_ptr = arg(0);
+                let match_char = arg(1) as u16;
+                if string_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    let string = read_utf16_string(memory, string_ptr)?;
+                    let found = if matches!(thunk, HostThunk::StrChrIW) {
+                        string
+                            .char_indices()
+                            .find(|(_, ch)| {
+                                ch.to_lowercase().next().unwrap_or(*ch)
+                                    == char::from_u32(u32::from(match_char))
+                                        .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                                        .unwrap_or('\0')
+                            })
+                            .map(|(index, _)| index)
+                    } else {
+                        let target = char::from_u32(u32::from(match_char));
+                        string
+                            .char_indices()
+                            .find(|(_, ch)| Some(*ch) == target)
+                            .map(|(index, _)| index)
+                    };
+                    match found {
+                        Some(offset) => {
+                            let unit_offset = string[..offset].encode_utf16().count() as u64;
+                            state.set(Register::Rax, string_ptr + unit_offset * 2);
+                            self.last_error = 0;
+                        }
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                        }
+                    }
+                }
+            }
+            HostThunk::StrRChrW => {
+                let string_ptr = arg(0);
+                let start_ptr = arg(1);
+                let match_char = arg(2) as u16;
+                if string_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    let string = read_utf16_string(memory, string_ptr)?;
+                    // chStart (inclusive) bounds the backwards search; a
+                    // zero chStart means the end of the string.
+                    let start_offset = if start_ptr == 0 {
+                        string.len()
+                    } else {
+                        let end = string.encode_utf16().count() as u64;
+                        let start_units = start_ptr - string_ptr;
+                        let start = start_units.min(end) as usize;
+                        string
+                            .char_indices()
+                            .nth(start)
+                            .map(|(index, _)| index)
+                            .unwrap_or(string.len())
+                    };
+                    let target = char::from_u32(u32::from(match_char));
+                    let found = string[..start_offset]
+                        .char_indices()
+                        .rev()
+                        .find(|(_, ch)| Some(*ch) == target)
+                        .map(|(index, _)| index);
+                    match found {
+                        Some(offset) => {
+                            let unit_offset = string[..offset].encode_utf16().count() as u64;
+                            state.set(Register::Rax, string_ptr + unit_offset * 2);
+                            self.last_error = 0;
+                        }
+                        None => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                        }
+                    }
+                }
+            }
+            HostThunk::StrStrW | HostThunk::StrStrIW => {
+                let string_ptr = arg(0);
+                let search_ptr = arg(1);
+                if string_ptr == 0 || search_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                } else {
+                    let string = read_utf16_string(memory, string_ptr)?;
+                    let search = read_utf16_string(memory, search_ptr)?;
+                    if search.is_empty() {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    } else {
+                        let case_insensitive = matches!(thunk, HostThunk::StrStrIW);
+                        let found = find_case_fold_substring(&string, &search, case_insensitive);
+                        match found {
+                            Some(offset) => {
+                                let unit_offset = string[..offset].encode_utf16().count() as u64;
+                                state.set(Register::Rax, string_ptr + unit_offset * 2);
+                                self.last_error = 0;
+                            }
+                            None => {
+                                state.set(Register::Rax, 0);
+                                self.last_error = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            HostThunk::StrCmpIW | HostThunk::StrCmpW => {
+                let left_ptr = arg(0);
+                let right_ptr = arg(1);
+                let left = if left_ptr != 0 {
+                    read_utf16_string(memory, left_ptr)?
+                } else {
+                    String::new()
+                };
+                let right = if right_ptr != 0 {
+                    read_utf16_string(memory, right_ptr)?
+                } else {
+                    String::new()
+                };
+                let equal = if matches!(thunk, HostThunk::StrCmpIW) {
+                    left.to_lowercase() == right.to_lowercase()
+                } else {
+                    left == right
+                };
+                state.set(Register::Rax, u64::from(!equal));
+                self.last_error = 0;
+            }
+            HostThunk::StrCmpNIW | HostThunk::StrCmpNW => {
+                let left_ptr = arg(0);
+                let right_ptr = arg(1);
+                let count = arg(2) as usize;
+                let left = if left_ptr != 0 {
+                    read_utf16_string(memory, left_ptr)?
+                } else {
+                    String::new()
+                };
+                let right = if right_ptr != 0 {
+                    read_utf16_string(memory, right_ptr)?
+                } else {
+                    String::new()
+                };
+                let left_units: Vec<u16> = left.encode_utf16().collect();
+                let right_units: Vec<u16> = right.encode_utf16().collect();
+                let case_insensitive = matches!(thunk, HostThunk::StrCmpNIW);
+                let equal = (0..count).all(|index| {
+                    let l = left_units.get(index).copied().unwrap_or(0);
+                    let r = right_units.get(index).copied().unwrap_or(0);
+                    if case_insensitive {
+                        fold_utf16_unit(l) == fold_utf16_unit(r)
+                    } else {
+                        l == r
+                    }
+                });
+                state.set(Register::Rax, u64::from(!equal));
+                self.last_error = 0;
+            }
+            HostThunk::StrCpyNW | HostThunk::StrCpyW => {
+                let dest_ptr = arg(0);
+                let source_ptr = arg(1);
+                let count = match thunk {
+                    HostThunk::StrCpyNW => arg(2) as usize,
+                    _ => usize::MAX,
+                };
+                let source = if source_ptr != 0 {
+                    read_utf16_string(memory, source_ptr)?
+                } else {
+                    String::new()
+                };
+                if dest_ptr != 0 {
+                    let units: Vec<u16> = source.encode_utf16().collect();
+                    let copy_units = units.len().min(count.saturating_sub(1));
+                    let mut bytes = Vec::with_capacity((copy_units + 1) * 2);
+                    for unit in units.iter().take(copy_units) {
+                        bytes.extend_from_slice(&unit.to_le_bytes());
+                    }
+                    if count > 0 {
+                        bytes.extend_from_slice(&0_u16.to_le_bytes());
+                    }
+                    memory.map_bytes(dest_ptr, &bytes);
+                    state.set(Register::Rax, dest_ptr);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::StrCatW => {
+                let dest_ptr = arg(0);
+                let source_ptr = arg(1);
+                if dest_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let dest = read_utf16_string(memory, dest_ptr)?;
+                    let source = if source_ptr != 0 {
+                        read_utf16_string(memory, source_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let combined = format!("{dest}{source}");
+                    let bytes = combined
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(|unit| unit.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    memory.map_bytes(dest_ptr, &bytes);
+                    state.set(Register::Rax, dest_ptr);
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::StrToIntW => {
+                let string_ptr = arg(0);
+                let value = if string_ptr != 0 {
+                    let string = read_utf16_string(memory, string_ptr)?;
+                    shlwapi_str_to_int(&string)
+                } else {
+                    0
+                };
+                state.set(Register::Rax, value as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::StrFromTimeIntervalW => {
+                let buffer_ptr = arg(0);
+                let buffer_len = arg(1) as usize;
+                let milliseconds = arg(2) as u32;
+                let digits = arg(3) as i32;
+                let written = if buffer_ptr == 0 || buffer_len == 0 {
+                    0
+                } else {
+                    match shlwapi_format_time_interval(milliseconds, digits) {
+                        Some(formatted) => {
+                            let units: Vec<u16> = formatted.encode_utf16().collect();
+                            let copy_units = units.len().min(buffer_len.saturating_sub(1));
+                            let mut bytes = Vec::with_capacity((copy_units + 1) * 2);
+                            for unit in units.iter().take(copy_units) {
+                                bytes.extend_from_slice(&unit.to_le_bytes());
+                            }
+                            bytes.extend_from_slice(&0_u16.to_le_bytes());
+                            memory.map_bytes(buffer_ptr, &bytes);
+                            copy_units as u32
+                        }
+                        None => {
+                            write_u16(memory, buffer_ptr, 0);
+                            0
+                        }
+                    }
+                };
+                state.set(Register::Rax, u64::from(written));
+                self.last_error = 0;
+            }
+            // ── shlwapi.dll: registry / URL / menu helpers ─────────────────
+            HostThunk::SHRegGetValueW => {
+                let hkey = arg(0) as u32;
+                let sub_key_ptr = arg(1);
+                let value_ptr = arg(2);
+                let srrf_flags = arg(3) as u32;
+                let type_ptr = arg(4);
+                let data_ptr = arg(5);
+                let data_size_ptr = arg(6);
+                let result = (|| -> AppResult<u32> {
+                    let (hive, base_key, key_view) = resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    )?;
+                    let sub_key = if sub_key_ptr != 0 {
+                        read_utf16_string(memory, sub_key_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let full_key = normalize_registry_runtime_key(
+                        &hive,
+                        &join_registry_subkey(&base_key, &sub_key),
+                    );
+                    let value_name = if value_ptr != 0 {
+                        read_utf16_string(memory, value_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let stored = self
+                        .win32
+                        .ge()
+                        .registry_get_value(&hive, &full_key, &value_name, key_view)?;
+                    let Some(stored) = stored else {
+                        return Ok(ERROR_FILE_NOT_FOUND);
+                    };
+                    // SRRF_RT_* type filtering (0xFFFF selects any type).
+                    const SRRF_RT_ANY: u32 = 0xFFFF;
+                    if srrf_flags & SRRF_RT_ANY != 0 {
+                        let registry_type = registry_value_type_to_win32(&stored.value_type)?;
+                        let mask = match registry_type {
+                            1 => 0x0002,   // REG_SZ
+                            2 => 0x0004,   // REG_EXPAND_SZ
+                            7 => 0x0008,   // REG_MULTI_SZ
+                            3 => 0x0010,   // REG_BINARY
+                            4 => 0x0020,   // REG_DWORD
+                            11 => 0x0040,  // REG_QWORD
+                            _ => 0,
+                        };
+                        if srrf_flags & mask == 0 {
+                            return Ok(ERROR_INVALID_PARAMETER);
+                        }
+                    }
+                    let encoded = encode_registry_value_data(&stored)?;
+                    if type_ptr != 0 {
+                        write_u32(memory, type_ptr, registry_value_type_to_win32(&stored.value_type)?);
+                    }
+                    let available = encoded.len() as u32;
+                    if data_size_ptr != 0 {
+                        let capacity = read_u32(memory, data_size_ptr)?;
+                        if data_ptr != 0 && capacity < available {
+                            write_u32(memory, data_size_ptr, available);
+                            return Ok(ERROR_MORE_DATA);
+                        }
+                        if data_ptr != 0 && !encoded.is_empty() {
+                            memory.map_bytes(data_ptr, &encoded);
+                        }
+                        write_u32(memory, data_size_ptr, available);
+                    }
+                    Ok(ERROR_SUCCESS)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(ERROR_FILE_NOT_FOUND));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::SHRegSetValueW => {
+                let hkey = arg(0) as u32;
+                let sub_key_ptr = arg(1);
+                let value_ptr = arg(2);
+                let _srrf_flags = arg(3) as u32;
+                let value_type = arg(4) as u32;
+                let data_ptr = arg(5);
+                let data_size = arg(6) as u32;
+                let result = (|| -> AppResult<u32> {
+                    let (hive, base_key, key_view) = resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    )?;
+                    let sub_key = if sub_key_ptr != 0 {
+                        read_utf16_string(memory, sub_key_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let full_key = normalize_registry_runtime_key(
+                        &hive,
+                        &join_registry_subkey(&base_key, &sub_key),
+                    );
+                    let value_name = if value_ptr != 0 {
+                        read_utf16_string(memory, value_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    // Create the key (and intermediate keys) as needed, the
+                    // documented SHRegSetValueW behavior.
+                    let _ = self
+                        .win32
+                        .create_registry_key(&hive, &full_key, key_view)?;
+                    let (value_type_name, data) =
+                        decode_registry_value_data(memory, data_ptr, data_size, value_type)?;
+                    self.win32.ge().registry_set_value(
+                        &hive,
+                        &full_key,
+                        &value_name,
+                        &value_type_name,
+                        data,
+                        key_view,
+                    )?;
+                    Ok(ERROR_SUCCESS)
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                                                state.set(Register::Rax, u64::from(ERROR_ACCESS_DENIED));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::SHDeleteKeyW | HostThunk::SHDeleteEmptyKeyW => {
+                let hkey = arg(0) as u32;
+                let sub_key_ptr = arg(1);
+                let delete_empty_only = matches!(thunk, HostThunk::SHDeleteEmptyKeyW);
+                let result = (|| -> AppResult<u32> {
+                    let (hive, base_key, key_view) = resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    )?;
+                    let sub_key = if sub_key_ptr != 0 {
+                        read_utf16_string(memory, sub_key_ptr)?
+                    } else {
+                        String::new()
+                    };
+                    let full_key = normalize_registry_runtime_key(
+                        &hive,
+                        &join_registry_subkey(&base_key, &sub_key),
+                    );
+                    if delete_empty_only {
+                        let subkeys = self
+                            .win32
+                            .ge()
+                            .registry_enum_keys(&hive, &full_key, key_view)?;
+                        let values = self
+                            .win32
+                            .ge()
+                            .registry_enum_values(&hive, &full_key, key_view)?;
+                        if !subkeys.is_empty() || !values.is_empty() {
+                            return Ok(ERROR_DIR_NOT_EMPTY);
+                        }
+                    }
+                    match self
+                        .win32
+                        .ge()
+                        .registry_delete_key(&hive, &full_key, key_view)
+                    {
+                        Ok(()) => Ok(ERROR_SUCCESS),
+                        Err(error) if error.code == ReasonCode::RcRegistryNotFound => {
+                            Ok(ERROR_FILE_NOT_FOUND)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })();
+                match result {
+                    Ok(code) => {
+                        state.set(Register::Rax, u64::from(code));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(ERROR_ACCESS_DENIED));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::SHSearchMapInt => {
+                let keys_ptr = arg(0);
+                let values_ptr = arg(1);
+                let count = arg(2) as usize;
+                let search_key = arg(3) as i32;
+                let mut found = -1_i32;
+                if keys_ptr != 0 && values_ptr != 0 {
+                    for index in 0..count {
+                        let key = read_u32(memory, keys_ptr + (index as u64) * 4)? as i32;
+                        if key == search_key {
+                            found = read_u32(memory, values_ptr + (index as u64) * 4)? as i32;
+                            break;
+                        }
+                    }
+                }
+                state.set(Register::Rax, found as i64 as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GetMenuContextHelpId => {
+                let menu = arg(0);
+                let help_id = self.menu_context_help_ids.get(&menu).copied().unwrap_or(0);
+                state.set(Register::Rax, u64::from(help_id));
+                self.last_error = 0;
+            }
+            HostThunk::SetMenuContextHelpId => {
+                let menu = arg(0);
+                let help_id = arg(1) as u32;
+                self.menu_context_help_ids.insert(menu, help_id);
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::UrlCanonicalizeW => {
+                let url_ptr = arg(0);
+                let out_ptr = arg(1);
+                let out_len_ptr = arg(2);
+                let _flags = arg(3) as u32;
+                const E_INVALIDARG: u32 = 0x8007_0057;
+                const E_POINTER: u32 = 0x8000_4003;
+                let result = (|| -> AppResult<u32> {
+                    if url_ptr == 0 || out_ptr == 0 || out_len_ptr == 0 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let capacity = read_u32(memory, out_len_ptr)? as usize;
+                    if capacity == 0 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let url = read_utf16_string(memory, url_ptr)?;
+                    let canonical = shlwapi_url_canonicalize(&url);
+                    let required = canonical.encode_utf16().count() + 1;
+                    if required <= capacity {
+                        let bytes = canonical
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        memory.map_bytes(out_ptr, &bytes);
+                        write_u32(memory, out_len_ptr, (required - 1) as u32);
+                        Ok(0)
+                    } else {
+                        write_u32(memory, out_len_ptr, required as u32);
+                        Ok(E_POINTER)
+                    }
+                })();
+                match result {
+                    Ok(hr) => {
+                        state.set(Register::Rax, u64::from(hr));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(E_INVALIDARG));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::UrlCombineW => {
+                let base_ptr = arg(0);
+                let relative_ptr = arg(1);
+                let out_ptr = arg(2);
+                let out_len_ptr = arg(3);
+                let _flags = arg(4) as u32;
+                const E_INVALIDARG: u32 = 0x8007_0057;
+                const E_POINTER: u32 = 0x8000_4003;
+                let result = (|| -> AppResult<u32> {
+                    if base_ptr == 0 || relative_ptr == 0 || out_ptr == 0 || out_len_ptr == 0 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let capacity = read_u32(memory, out_len_ptr)? as usize;
+                    if capacity == 0 {
+                        return Ok(E_INVALIDARG);
+                    }
+                    let base = read_utf16_string(memory, base_ptr)?;
+                    let relative = read_utf16_string(memory, relative_ptr)?;
+                    let combined = shlwapi_url_combine(&base, &relative);
+                                        let required = combined.encode_utf16().count() + 1;
+                    if required <= capacity {
+                        let bytes = combined
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        memory.map_bytes(out_ptr, &bytes);
+                        write_u32(memory, out_len_ptr, (required - 1) as u32);
+                        Ok(0)
+                    } else {
+                        write_u32(memory, out_len_ptr, required as u32);
+                        Ok(E_POINTER)
+                    }
+                })();
+                match result {
+                    Ok(hr) => {
+                        state.set(Register::Rax, u64::from(hr));
+                        self.last_error = 0;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, u64::from(E_INVALIDARG));
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
             HostThunk::GetNativeSystemInfo => {
                 let info_ptr = guest_call_arg(state, memory, 0)?;
                 if info_ptr != 0 {
@@ -39761,6 +41003,441 @@ impl PeHostRuntime {
                         }
                     }
                 }
+            }
+            // ── kernel32 core surface: interlocked / environment / INI /
+            //    file-info / version / search / loader-lock ─────────────────
+            HostThunk::DisableThreadLibraryCalls => {
+                // DisableThreadLibraryCalls(hModule) — mark the module so the
+                // loader skips its DLL_THREAD_ATTACH/DLL_THREAD_DETACH
+                // notifications.  hModule == 0 names the CALLING module.
+                let handle = arg(0);
+                let module = if handle == 0 {
+                    self.module_handle_containing(return_address)
+                } else {
+                    handle
+                };
+                self.disabled_thread_library_calls.insert(module);
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "kernel32",
+                    "DisableThreadLibraryCalls",
+                    BTreeMap::from([
+                        ("handle".to_string(), json!(format!("{handle:#x}"))),
+                        ("module".to_string(), json!(format!("{module:#x}"))),
+                    ]),
+                    json!(1),
+                );
+            }
+            HostThunk::ExpandEnvironmentStringsW => {
+                let source_ptr = arg(0);
+                let buffer_ptr = arg(1);
+                let buffer_len = arg(2) as u32;
+                if source_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let source = read_utf16_string(memory, source_ptr)?;
+                    let expanded =
+                        expand_environment_strings(&self.process_environment, &source);
+                    let units = expanded.encode_utf16().count() as u32;
+                    let required = units + 1;
+                    let fits = buffer_ptr != 0 && buffer_len > units;
+                    if fits {
+                        let bytes = expanded
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        memory.map_bytes(buffer_ptr, &bytes);
+                        state.set(Register::Rax, units as u64);
+                        self.last_error = 0;
+                    } else {
+                        // Too-small buffer (or the (NULL,0) required-size
+                        // query): return the required size INCLUDING the NUL.
+                        if buffer_ptr != 0 && buffer_len != 0 {
+                            let copy_units = (buffer_len as usize).saturating_sub(1);
+                            let bytes = expanded
+                                .encode_utf16()
+                                .take(copy_units)
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(buffer_ptr, &bytes);
+                        }
+                        state.set(Register::Rax, required as u64);
+                        self.last_error = if buffer_ptr != 0 && buffer_len != 0 {
+                            ERROR_INSUFFICIENT_BUFFER
+                        } else {
+                            0
+                        };
+                    }
+                    self.push_trace(
+                        "kernel32",
+                        "ExpandEnvironmentStringsW",
+                        BTreeMap::from([
+                            ("source".to_string(), json!(source)),
+                            ("expanded".to_string(), json!(expanded)),
+                        ]),
+                        json!(state.get(Register::Rax)),
+                    );
+                }
+            }
+            HostThunk::GetFileInformationByHandleEx => {
+                let handle = arg(0) as u32;
+                let info_class = arg(1) as u32;
+                let info_ptr = arg(2);
+                let info_size = arg(3) as u32;
+                // FileBasicInfo (FILE_INFO_BY_HANDLE_CLASS == 0): the only
+                // class the runtime serves — everything else fails with
+                // ERROR_INVALID_PARAMETER (the documented unsupported-class
+                // behavior).
+                const FILE_BASIC_INFO_SIZE: u32 = 40;
+                if info_class != 0 || info_ptr == 0 || info_size < FILE_BASIC_INFO_SIZE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    match self.win32.get_file_information_by_handle_ex(handle) {
+                        Ok(info) => {
+                            // FILE_BASIC_INFO: CreationTime, LastAccessTime,
+                            // LastWriteTime, ChangeTime (FILETIME each, the
+                            // SAME ticks GetFileTime reports), then
+                            // FileAttributes (DWORD) + padding.
+                            write_filetime(memory, info_ptr, info.creation_time_ticks);
+                            write_filetime(memory, info_ptr + 8, info.last_access_time_ticks);
+                            write_filetime(memory, info_ptr + 16, info.last_write_time_ticks);
+                            // The runtime tracks no separate change time:
+                            // Windows reports the last-write time.
+                            write_filetime(memory, info_ptr + 24, info.last_write_time_ticks);
+                            let mut attributes = file_attributes_mask(&info.attributes);
+                            if info.is_directory {
+                                attributes |= FILE_ATTRIBUTE_DIRECTORY;
+                            }
+                            write_u32(memory, info_ptr + 32, attributes);
+                            write_u32(memory, info_ptr + 36, 0);
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "GetFileInformationByHandleEx",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                    ("path".to_string(), json!(info.normalized_path.clone())),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
+                }
+            }
+            HostThunk::GetPrivateProfileStringW => {
+                let app_name_ptr = arg(0);
+                let key_name_ptr = arg(1);
+                let default_ptr = arg(2);
+                let buffer_ptr = arg(3);
+                let buffer_len = arg(4) as usize;
+                let file_ptr = arg(5);
+                let app_name = (app_name_ptr != 0)
+                    .then(|| read_utf16_string(memory, app_name_ptr).unwrap_or_default());
+                let key_name = (key_name_ptr != 0)
+                    .then(|| read_utf16_string(memory, key_name_ptr).unwrap_or_default());
+                let default = if default_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, default_ptr).unwrap_or_default()
+                };
+                let result = (|| -> AppResult<Option<String>> {
+                    if file_ptr == 0 {
+                        return Ok(None);
+                    }
+                    let path = resolve_guest_path(
+                        &self.current_directory,
+                        &read_utf16_string(memory, file_ptr)?,
+                    );
+                    let Ok(host_path) = self.win32.guest_path_to_host_path(&path) else {
+                        return Ok(None);
+                    };
+                    let (sections, _) = read_ini_document(&host_path)?;
+                    // Section/key names compare case-insensitively, matching
+                    // the WritePrivateProfileStringW storage machinery.
+                    let section_index = app_name.as_deref().and_then(|name| {
+                        sections
+                            .iter()
+                            .position(|section| section.name.eq_ignore_ascii_case(name))
+                    });
+                    let Some(section_index) = section_index else {
+                        // Missing section (or the section-name listing when
+                        // lpAppName is NULL): the default applies.
+                        return Ok(match app_name {
+                            None => Some(list_ini_section_names(&sections)),
+                            Some(_) => Some(default.clone()),
+                        });
+                    };
+                    let section = &sections[section_index];
+                    let Some(key_name) = key_name.as_deref() else {
+                        // lpKeyName == NULL: list the section's key names.
+                        return Ok(Some(list_ini_keys(section)));
+                    };
+                    let value = section
+                        .entries
+                        .iter()
+                        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key_name))
+                        .map(|(_, value)| value.clone());
+                    Ok(Some(value.unwrap_or_else(|| default.clone())))
+                })();
+                match result {
+                    Ok(Some(value)) => {
+                        let written =
+                            write_ini_query_string(memory, buffer_ptr, buffer_len, &value);
+                        state.set(Register::Rax, written as u64);
+                        self.last_error = 0;
+                    }
+                    Ok(None) => {
+                        // No readable file: the default applies.
+                        let written =
+                            write_ini_query_string(memory, buffer_ptr, buffer_len, &default);
+                        state.set(Register::Rax, written as u64);
+                        self.last_error = ERROR_FILE_NOT_FOUND;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::GetVersionExA => {
+                // OSVERSIONINFOEXA layout (x86):
+                //   +0x00 dwOSVersionInfoSize (DWORD)
+                //   +0x04 dwMajorVersion / +0x08 dwMinorVersion
+                //   +0x0C dwBuildNumber / +0x10 dwPlatformId
+                //   +0x14 szCSDVersion [128] CHAR (ANSI)
+                //   +0x94 wServicePackMajor (WORD) — only if cb >= sizeof(OSVERSIONINFOEXA)
+                //   +0x96 wServicePackMinor / +0x98 wSuiteMask (WORD)
+                //   +0x9A wProductType / +0x9B wReserved (BYTE)
+                const VER_PLATFORM_WIN32_NT: u32 = 2;
+                const OSVERSIONINFOEXA_SIZE: u32 = 0x9C; // 156 bytes — extended struct
+                let info_ptr = arg(0);
+                let version = guest_version_info_from_profile(&self.win32.ge().config.winver)?;
+                let major: u32 = version.major;
+                let minor: u32 = version.minor;
+                let build: u32 = version.build;
+                if info_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let reported_size = read_u32(memory, info_ptr)?;
+                    write_u32(memory, info_ptr + 0x04, major);
+                    write_u32(memory, info_ptr + 0x08, minor);
+                    write_u32(memory, info_ptr + 0x0C, build);
+                    write_u32(memory, info_ptr + 0x10, VER_PLATFORM_WIN32_NT);
+                    for offset in (0x14..0x94).step_by(1) {
+                        memory.write_u8(info_ptr + offset, 0);
+                    }
+                    if reported_size >= OSVERSIONINFOEXA_SIZE {
+                        write_u16(memory, info_ptr + 0x94, version.service_pack_major);
+                        write_u16(memory, info_ptr + 0x96, version.service_pack_minor);
+                        write_u16(memory, info_ptr + 0x98, version.suite_mask);
+                        memory.write_u8(info_ptr + 0x9A, version.product_type);
+                        memory.write_u8(info_ptr + 0x9B, 0);
+                    }
+                    write_u32(memory, info_ptr, reported_size);
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                }
+                self.push_trace(
+                    "kernel32",
+                    "GetVersionExA",
+                    BTreeMap::from([
+                        ("info_ptr".to_string(), json!(format!("{info_ptr:#x}"))),
+                        ("major".to_string(), json!(major)),
+                        ("minor".to_string(), json!(minor)),
+                        ("build".to_string(), json!(build)),
+                    ]),
+                    json!(1),
+                );
+            }
+            HostThunk::InterlockedCompareExchange => {
+                let destination = arg(0);
+                let exchange = arg(1) as u32;
+                let comparand = arg(2) as u32;
+                match memory.interlocked_compare_exchange_u32(destination, exchange, comparand) {
+                    Ok(previous) => {
+                        state.set(Register::Rax, u64::from(previous));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                }
+            }
+            HostThunk::InterlockedDecrement => {
+                let destination = arg(0);
+                match memory.interlocked_decrement_u32(destination) {
+                    Ok(new_value) => {
+                        state.set(Register::Rax, u64::from(new_value));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                }
+            }
+            HostThunk::InterlockedExchange => {
+                let destination = arg(0);
+                let value = arg(1) as u32;
+                match memory.interlocked_exchange_u32(destination, value) {
+                    Ok(previous) => {
+                        state.set(Register::Rax, u64::from(previous));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                }
+            }
+            HostThunk::InterlockedExchangeAdd => {
+                let destination = arg(0);
+                let addend = arg(1) as u32;
+                match memory.interlocked_exchange_add_u32(destination, addend) {
+                    Ok(previous) => {
+                        state.set(Register::Rax, u64::from(previous));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                }
+            }
+            HostThunk::InterlockedIncrement => {
+                let destination = arg(0);
+                match memory.interlocked_increment_u32(destination) {
+                    Ok(new_value) => {
+                        state.set(Register::Rax, u64::from(new_value));
+                        self.last_error = 0;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
+                }
+            }
+            HostThunk::MoveFileW => {
+                let existing_file_ptr = arg(0);
+                let new_file_ptr = arg(1);
+                let existing_path = read_utf16_string(memory, existing_file_ptr).unwrap_or_default();
+                let new_path = read_utf16_string(memory, new_file_ptr).unwrap_or_default();
+                if existing_path.is_empty() || new_path.is_empty() {
+                    // MoveFileW is MoveFileExW with flags == 0: an empty
+                    // path fails with ERROR_PATH_NOT_FOUND (3).
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_PATH_NOT_FOUND;
+                } else {
+                    let src = resolve_guest_path(&self.current_directory, &existing_path);
+                    let dst = resolve_guest_path(&self.current_directory, &new_path);
+                    // No MOVEFILE_REPLACE_EXISTING: an existing destination
+                    // fails (the win32 move_file_ex_w contract).
+                    match self.win32.move_file_ex_w(&src, &dst, false, false) {
+                        Ok(_) => {
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
+                }
+            }
+            HostThunk::SearchPathW => {
+                let path_ptr = arg(0);
+                let file_name_ptr = arg(1);
+                let extension_ptr = arg(2);
+                let buffer_len = arg(3) as u32;
+                let buffer_ptr = arg(4);
+                let file_part_ptr = arg(5);
+                let file_name = read_utf16_string(memory, file_name_ptr)?;
+                let search_dirs = (path_ptr != 0)
+                    .then(|| read_utf16_string(memory, path_ptr).unwrap_or_default());
+                let extension = (extension_ptr != 0)
+                    .then(|| read_utf16_string(memory, extension_ptr).unwrap_or_default());
+                let found = resolve_search_path(
+                    &self.win32,
+                    &self.current_directory,
+                    &self.process_environment,
+                    search_dirs.as_deref(),
+                    &file_name,
+                    extension.as_deref(),
+                );
+                match found {
+                    Some(path) => {
+                        let units = path.encode_utf16().count() as u32;
+                        if buffer_ptr != 0 && buffer_len > units {
+                            let bytes = path
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(buffer_ptr, &bytes);
+                            if file_part_ptr != 0 {
+                                let file_part =
+                                    windows_file_part_offset(&path).map(|offset| buffer_ptr + offset);
+                                write_guest_pointer(
+                                    memory,
+                                    file_part_ptr,
+                                    file_part.unwrap_or(0),
+                                    self.guest_arch,
+                                )?;
+                            }
+                            state.set(Register::Rax, units as u64);
+                            self.last_error = 0;
+                        } else {
+                            // Too-small buffer: required size INCLUDING the
+                            // NUL, ERROR_BUFFER_OVERFLOW (Windows contract).
+                            state.set(Register::Rax, (units + 1) as u64);
+                            self.last_error = ERROR_BUFFER_OVERFLOW;
+                        }
+                    }
+                    None => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_FILE_NOT_FOUND;
+                    }
+                }
+            }
+            HostThunk::LstrcmpiA => {
+                let left_ptr = arg(0);
+                let right_ptr = arg(1);
+                let left = if left_ptr == 0 {
+                    String::new()
+                } else {
+                    read_c_string(memory, left_ptr)?
+                };
+                let right = if right_ptr == 0 {
+                    String::new()
+                } else {
+                    read_c_string(memory, right_ptr)?
+                };
+                // lstrcmpiA is the case_fold machinery of lstrcmpiW over the
+                // ANSI-decoded strings.
+                let result = match left.to_lowercase().cmp(&right.to_lowercase()) {
+                    std::cmp::Ordering::Less => -1_i32,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                state.set(Register::Rax, result as i64 as u64);
+                self.last_error = 0;
             }
             HostThunk::CreateFileA => {
                 let path_ptr = arg(0);
@@ -67792,6 +69469,225 @@ impl HostThunk {
             ("wintrust.dll", ImportSymbol::ByName { name, .. }) if name == "WinVerifyTrust" => {
                 Self::WinVerifyTrust
             }
+            // -- kernel32 core surface (interlocked / environment / INI /
+            //    file-info / version / search / loader-lock) -----------------
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "DisableThreadLibraryCalls" =>
+            {
+                Self::DisableThreadLibraryCalls
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ExpandEnvironmentStringsW" =>
+            {
+                Self::ExpandEnvironmentStringsW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetFileInformationByHandleEx" =>
+            {
+                Self::GetFileInformationByHandleEx
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetPrivateProfileStringW" =>
+            {
+                Self::GetPrivateProfileStringW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetVersionExA" => {
+                Self::GetVersionExA
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InterlockedCompareExchange" =>
+            {
+                Self::InterlockedCompareExchange
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InterlockedDecrement" =>
+            {
+                Self::InterlockedDecrement
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InterlockedExchange" =>
+            {
+                Self::InterlockedExchange
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InterlockedExchangeAdd" =>
+            {
+                Self::InterlockedExchangeAdd
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "InterlockedIncrement" =>
+            {
+                Self::InterlockedIncrement
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "MoveFileW" => {
+                Self::MoveFileW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SearchPathW" => {
+                Self::SearchPathW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrcmpiA" => {
+                Self::LstrcmpiA
+            }
+            // -- shlwapi.dll: path helpers -----------------------------------
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathAppendW" => {
+                Self::PathAppendW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathCombineW" => {
+                Self::PathCombineW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathFileExistsW" => {
+                Self::PathFileExistsW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathFindExtensionW" => {
+                Self::PathFindExtensionW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathFindFileNameW" => {
+                Self::PathFindFileNameW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathRemoveFileSpecW" => {
+                Self::PathRemoveFileSpecW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "PathRemoveExtensionW" =>
+            {
+                Self::PathRemoveExtensionW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathRemoveBlanksW" => {
+                Self::PathRemoveBlanksW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathIsDirectoryW" => {
+                Self::PathIsDirectoryW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathIsRelativeW" => {
+                Self::PathIsRelativeW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathCanonicalizeW" => {
+                Self::PathCanonicalizeW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathMatchSpecW" => {
+                Self::PathMatchSpecW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathStripPathW" => {
+                Self::PathStripPathW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathGetDriveNumberW" => {
+                Self::PathGetDriveNumberW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathAddBackslashW" => {
+                Self::PathAddBackslashW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "PathRemoveBackslashW" =>
+            {
+                Self::PathRemoveBackslashW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathSkipRootW" => {
+                Self::PathSkipRootW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "PathIsRootW" => {
+                Self::PathIsRootW
+            }
+            // -- shlwapi.dll: string / char-class helpers --------------------
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "ChrCmpIW" => {
+                Self::ChrCmpIW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IntlStrEqWorkerW" => {
+                Self::IntlStrEqWorkerW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IsCharAlphaW" => {
+                Self::IsCharAlphaW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IsCharAlphaNumericW" => {
+                Self::IsCharAlphaNumericW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IsCharLowerW" => {
+                Self::IsCharLowerW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IsCharUpperW" => {
+                Self::IsCharUpperW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "IsCharSpaceW" => {
+                Self::IsCharSpaceW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "ParseURLW" => {
+                Self::ParseURLW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrChrW" => {
+                Self::StrChrW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrChrIW" => {
+                Self::StrChrIW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrRChrW" => {
+                Self::StrRChrW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrStrW" => {
+                Self::StrStrW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrStrIW" => {
+                Self::StrStrIW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCmpIW" => {
+                Self::StrCmpIW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCmpNIW" => {
+                Self::StrCmpNIW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCmpNW" => {
+                Self::StrCmpNW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCmpW" => {
+                Self::StrCmpW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCpyNW" => {
+                Self::StrCpyNW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCpyW" => {
+                Self::StrCpyW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrCatW" => {
+                Self::StrCatW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "StrToIntW" => {
+                Self::StrToIntW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "StrFromTimeIntervalW" =>
+            {
+                Self::StrFromTimeIntervalW
+            }
+            // -- shlwapi.dll: registry / URL / misc helpers ------------------
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "SHRegGetValueW" => {
+                Self::SHRegGetValueW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "SHRegSetValueW" => {
+                Self::SHRegSetValueW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "SHDeleteKeyW" => {
+                Self::SHDeleteKeyW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "SHDeleteEmptyKeyW" => {
+                Self::SHDeleteEmptyKeyW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "SHSearchMapInt" => {
+                Self::SHSearchMapInt
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetMenuContextHelpId" =>
+            {
+                Self::GetMenuContextHelpId
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetMenuContextHelpId" =>
+            {
+                Self::SetMenuContextHelpId
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "UrlCanonicalizeW" => {
+                Self::UrlCanonicalizeW
+            }
+            ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "UrlCombineW" => {
+                Self::UrlCombineW
+            }
             (_, ImportSymbol::ByName { name, .. }) => Self::Unsupported {
                 dll: import.resolved_module.clone(),
                 symbol: name.clone(),
@@ -69073,6 +70969,69 @@ impl HostThunk {
             Self::NtCreateSection | Self::NtDuplicateObject | Self::NtCreateKey => 28,
             Self::NtCreateThreadEx | Self::NtDeviceIoControlFile | Self::NtMapViewOfSection => 40,
             Self::NtCreateFile => 44,
+            // ── kernel32 core surface (x86 stdcall byte counts) ────────────
+            Self::DisableThreadLibraryCalls => 4,
+            Self::ExpandEnvironmentStringsW => 12,
+            Self::GetFileInformationByHandleEx => 16,
+            Self::GetPrivateProfileStringW => 24,
+            Self::GetVersionExA => 4,
+            Self::InterlockedCompareExchange => 12,
+            Self::InterlockedDecrement => 4,
+            Self::InterlockedExchange => 8,
+            Self::InterlockedExchangeAdd => 8,
+            Self::InterlockedIncrement => 4,
+            Self::MoveFileW => 8,
+            Self::SearchPathW => 24,
+            Self::LstrcmpiA => 8,
+            // ── shlwapi.dll path helpers ───────────────────────────────────
+            Self::PathAppendW
+            | Self::PathCombineW
+            | Self::PathCanonicalizeW
+            | Self::PathMatchSpecW
+            | Self::ChrCmpIW
+            | Self::ParseURLW
+            | Self::StrChrW
+            | Self::StrChrIW
+            | Self::StrStrW
+            | Self::StrStrIW
+            | Self::StrCmpIW
+            | Self::StrCmpW
+            | Self::StrCpyW
+            | Self::StrCatW
+            | Self::SHDeleteKeyW
+            | Self::SHDeleteEmptyKeyW
+            | Self::SetMenuContextHelpId => 8,
+            Self::PathFileExistsW
+            | Self::PathFindExtensionW
+            | Self::PathFindFileNameW
+            | Self::PathRemoveFileSpecW
+            | Self::PathRemoveExtensionW
+            | Self::PathRemoveBlanksW
+            | Self::PathIsDirectoryW
+            | Self::PathIsRelativeW
+            | Self::PathStripPathW
+            | Self::PathGetDriveNumberW
+            | Self::PathAddBackslashW
+            | Self::PathRemoveBackslashW
+            | Self::PathSkipRootW
+            | Self::PathIsRootW
+            | Self::IsCharAlphaW
+            | Self::IsCharAlphaNumericW
+            | Self::IsCharLowerW
+            | Self::IsCharUpperW
+            | Self::IsCharSpaceW
+            | Self::StrToIntW
+            | Self::GetMenuContextHelpId => 4,
+            Self::IntlStrEqWorkerW
+            | Self::StrCmpNIW
+            | Self::StrCmpNW
+            | Self::StrCpyNW
+            | Self::StrFromTimeIntervalW
+            | Self::UrlCanonicalizeW
+            | Self::SHSearchMapInt => 16,
+            Self::StrRChrW => 12,
+            Self::SHRegGetValueW | Self::SHRegSetValueW => 28,
+            Self::UrlCombineW => 20,
             _ => 0,
         }
     }
@@ -97118,6 +99077,1981 @@ mod tests {
     }
 
     #[test]
+    fn evidence_core_kernel32_interlocked_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-interlocked");
+        let mut memory = MemoryImage::default();
+        let exchange = runtime.alloc_host_thunk(HostThunk::InterlockedExchange);
+        let exchange_add = runtime.alloc_host_thunk(HostThunk::InterlockedExchangeAdd);
+        let compare_exchange = runtime.alloc_host_thunk(HostThunk::InterlockedCompareExchange);
+        let increment = runtime.alloc_host_thunk(HostThunk::InterlockedIncrement);
+        let decrement = runtime.alloc_host_thunk(HostThunk::InterlockedDecrement);
+
+        // The value lives in guest memory; each op returns the documented
+        // previous/new value and leaves the guest word updated.
+        let cell = 0x42_000;
+        memory.map_bytes(cell, &10_u32.to_le_bytes());
+
+        // InterlockedIncrement returns the NEW value.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, increment, &[cell as u32]),
+            11
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 11);
+
+        // InterlockedDecrement returns the NEW value.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, decrement, &[cell as u32]),
+            10
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 10);
+
+        // InterlockedExchange stores and returns the PREVIOUS value.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                exchange,
+                &[cell as u32, 0x1234_5678]
+            ),
+            10
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 0x1234_5678);
+
+        // InterlockedExchangeAdd adds and returns the PREVIOUS value.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, exchange_add, &[cell as u32, 5]),
+            0x1234_5678
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 0x1234_567D);
+
+        // InterlockedCompareExchange stores when equal, returns previous.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                compare_exchange,
+                &[cell as u32, 99, 0x1234_567D]
+            ),
+            0x1234_567D
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 99);
+
+        // A mismatched comparand leaves the guest word untouched.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                compare_exchange,
+                &[cell as u32, 77, 0x1234_567D]
+            ),
+            99
+        );
+        assert_eq!(memory.read_u32(cell).unwrap(), 99);
+    }
+
+    #[test]
+    fn evidence_core_kernel32_environment_expand_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-env-expand");
+        let mut memory = MemoryImage::default();
+        let expand = runtime.alloc_host_thunk(HostThunk::ExpandEnvironmentStringsW);
+
+        // Seed the guest process environment (the same table
+        // SetEnvironmentVariableW maintains).
+        runtime
+            .process_environment
+            .insert("Casa1Dir".to_string(), r"C:\demo".to_string());
+        runtime
+            .process_environment
+            .insert("PATH".to_string(), r"C:\Windows".to_string());
+
+        let source = runtime
+            .alloc_utf16_string(&mut memory, r"run from %Casa1Dir%\bin; %UNSET% stays")
+            .expect("wide source");
+        let buffer = 0x42_100;
+        memory.map_bytes(buffer, &[0_u8; 0x100]);
+
+        // Undefined variables pass through literally; defined ones expand.
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            expand,
+            &[source as u32, buffer as u32, 0x100],
+        );
+        let expanded = read_guest_utf16_string(&memory, buffer, 128);
+        assert_eq!(expanded, r"run from C:\demo\bin; %UNSET% stays");
+        assert_eq!(written, expanded.encode_utf16().count() as u64);
+
+        // Required-size semantics: a too-small buffer returns the size
+        // INCLUDING the NUL with ERROR_INSUFFICIENT_BUFFER.
+        memory.map_bytes(buffer, &[0_u8; 0x100]);
+        let required = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            expand,
+            &[source as u32, buffer as u32, 4],
+        );
+        assert_eq!(required, expanded.encode_utf16().count() as u64 + 1);
+        assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+
+        // The (NULL, 0) query returns the required size without an error.
+        let required =
+            dispatch_x86_thunk(&mut runtime, &mut memory, expand, &[source as u32, 0, 0]);
+        assert_eq!(required, expanded.encode_utf16().count() as u64 + 1);
+        assert_eq!(runtime.last_error, 0);
+
+        // An empty expansion still writes the NUL and returns 0.
+        let empty = runtime
+            .alloc_utf16_string(&mut memory, "plain text")
+            .expect("wide empty");
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            expand,
+            &[empty as u32, buffer as u32, 0x100],
+        );
+        assert_eq!(written, 10);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn evidence_core_kernel32_ini_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-ini");
+        let mut memory = MemoryImage::default();
+        runtime
+            .win32
+            .create_directory_w("C:\\Games")
+            .expect("create Games directory");
+        let write_ini = runtime.alloc_host_thunk(HostThunk::WritePrivateProfileStringW);
+        let read_ini = runtime.alloc_host_thunk(HostThunk::GetPrivateProfileStringW);
+        let ini_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\config.ini")
+            .expect("wide ini path");
+
+        let section = runtime
+            .alloc_utf16_string(&mut memory, "Graphics")
+            .expect("wide section");
+        let key = runtime
+            .alloc_utf16_string(&mut memory, "Resolution")
+            .expect("wide key");
+        let value = runtime
+            .alloc_utf16_string(&mut memory, "1920x1080")
+            .expect("wide value");
+        let default = runtime
+            .alloc_utf16_string(&mut memory, "default")
+            .expect("wide default");
+        let buffer = 0x42_100;
+        memory.map_bytes(buffer, &[0_u8; 0x200]);
+
+        // WritePrivateProfileStringW stores the entry; GetPrivateProfileStringW
+        // reads it back (section/key names compare case-insensitively).
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                write_ini,
+                &[section as u32, key as u32, value as u32, ini_path as u32]
+            ),
+            1
+        );
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                section as u32,
+                key as u32,
+                default as u32,
+                buffer as u32,
+                0x200,
+                ini_path as u32,
+            ],
+        );
+        assert_eq!(written, 9);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), "1920x1080");
+
+        // A missing key returns the default (single string).
+        let missing_key = runtime
+            .alloc_utf16_string(&mut memory, "Fullscreen")
+            .expect("wide missing key");
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                section as u32,
+                missing_key as u32,
+                default as u32,
+                buffer as u32,
+                0x200,
+                ini_path as u32,
+            ],
+        );
+        assert_eq!(written, 7);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), "default");
+
+        // A missing section returns the default too.
+        let missing_section = runtime
+            .alloc_utf16_string(&mut memory, "Audio")
+            .expect("wide missing section");
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                missing_section as u32,
+                key as u32,
+                default as u32,
+                buffer as u32,
+                0x200,
+                ini_path as u32,
+            ],
+        );
+        assert_eq!(written, 7);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), "default");
+
+        // lpKeyName == NULL lists the section's key names (multi-string).
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                section as u32,
+                0,
+                default as u32,
+                buffer as u32,
+                0x200,
+                ini_path as u32,
+            ],
+        );
+        assert_eq!(written, 11);
+        let listing = read_guest_utf16_string(&memory, buffer, 128);
+        assert_eq!(listing, "Resolution");
+
+        // lpAppName == NULL lists the section names.
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[0, 0, default as u32, buffer as u32, 0x200, ini_path as u32],
+        );
+        assert_eq!(written, 9);
+        let listing = read_guest_utf16_string(&memory, buffer, 128);
+        assert_eq!(listing, "Graphics");
+
+        // A missing file returns the default with ERROR_FILE_NOT_FOUND.
+        let missing_file = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\nope.ini")
+            .expect("wide missing file");
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                section as u32,
+                key as u32,
+                default as u32,
+                buffer as u32,
+                0x200,
+                missing_file as u32,
+            ],
+        );
+        assert_eq!(written, 7);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), "default");
+
+        // Truncation: at most nSize-1 characters are copied.
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            read_ini,
+            &[
+                section as u32,
+                key as u32,
+                default as u32,
+                buffer as u32,
+                5,
+                ini_path as u32,
+            ],
+        );
+        assert_eq!(written, 4);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), "1920");
+    }
+
+    #[test]
+    fn evidence_core_kernel32_file_info_version_move_search_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-core-fivms");
+        let mut memory = MemoryImage::default();
+        let file_info_ex = runtime.alloc_host_thunk(HostThunk::GetFileInformationByHandleEx);
+        let file_time = runtime.alloc_host_thunk(HostThunk::GetFileTime);
+        let version_a = runtime.alloc_host_thunk(HostThunk::GetVersionExA);
+        let version_w = runtime.alloc_host_thunk(HostThunk::GetVersionExW);
+        let move_file = runtime.alloc_host_thunk(HostThunk::MoveFileW);
+        let search_path = runtime.alloc_host_thunk(HostThunk::SearchPathW);
+        let attributes = runtime.alloc_host_thunk(HostThunk::GetFileAttributesW);
+
+        runtime
+            .win32
+            .create_directory_w("C:\\Games")
+            .expect("create Games directory");
+        let handle = runtime
+            .win32
+            .create_file_w(
+                "C:\\Games\\move-src.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        runtime
+            .win32
+            .write_file(handle, b"move me")
+            .expect("write bytes");
+
+        // GetFileInformationByHandleEx FileBasicInfo derives the SAME times
+        // GetFileTime reports for the handle.
+        let time_buf = 0x41_000;
+        memory.map_bytes(time_buf, &[0; 24]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                file_time,
+                &[
+                    handle,
+                    time_buf as u32,
+                    time_buf as u32 + 8,
+                    time_buf as u32 + 16
+                ]
+            ),
+            1
+        );
+        let creation = memory.read_u64(time_buf).unwrap();
+        let access = memory.read_u64(time_buf + 8).unwrap();
+        let write = memory.read_u64(time_buf + 16).unwrap();
+        let basic = 0x41_100;
+        memory.map_bytes(basic, &[0; 40]);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                file_info_ex,
+                &[handle, 0, basic as u32, 40]
+            ),
+            1
+        );
+        assert_eq!(memory.read_u64(basic).unwrap(), creation);
+        assert_eq!(memory.read_u64(basic + 8).unwrap(), access);
+        assert_eq!(memory.read_u64(basic + 16).unwrap(), write);
+        assert_eq!(
+            memory.read_u64(basic + 24).unwrap(),
+            write,
+            "change time mirrors the write time"
+        );
+        assert_eq!(
+            memory.read_u32(basic + 32).unwrap() & FILE_ATTRIBUTE_DIRECTORY,
+            0,
+            "a plain file carries no directory bit"
+        );
+
+        // An unsupported info class fails with ERROR_INVALID_PARAMETER.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                file_info_ex,
+                &[handle, 9, basic as u32, 40]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+        // GetVersionExA reports the same fields as GetVersionExW with the
+        // ANSI OSVERSIONINFOEX layout (szCSDVersion is 128 ANSI bytes).
+        let info_a = 0x41_200;
+        let mut version_buffer_a = vec![0xEE_u8; 0x9C];
+        version_buffer_a[0..4].copy_from_slice(&0x9C_u32.to_le_bytes());
+        memory.map_bytes(info_a, &version_buffer_a);
+        let info_w = 0x41_300;
+        let mut version_buffer_w = vec![0xEE_u8; 0x11C];
+        version_buffer_w[0..4].copy_from_slice(&0x11C_u32.to_le_bytes());
+        memory.map_bytes(info_w, &version_buffer_w);
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, version_a, &[info_a as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, version_w, &[info_w as u32]),
+            1
+        );
+        for offset in [0x04, 0x08, 0x0C, 0x10] {
+            assert_eq!(
+                memory.read_u32(info_a + offset).unwrap(),
+                memory.read_u32(info_w + offset).unwrap(),
+                "version field at +{offset:#x} matches GetVersionExW"
+            );
+        }
+        assert_eq!(
+            memory.read_u32(info_a + 0x10).unwrap(),
+            2,
+            "VER_PLATFORM_WIN32_NT"
+        );
+        for offset in 0x14..0x94 {
+            assert_eq!(
+                memory.read_u8(info_a + offset).unwrap(),
+                0,
+                "CSD ANSI cleared"
+            );
+        }
+        assert_eq!(
+            memory.read_u32(info_a + 0x94).unwrap(),
+            memory.read_u32(info_w + 0x114).unwrap(),
+            "service pack major matches"
+        );
+
+        // MoveFileW renames; an existing destination fails (no
+        // MOVEFILE_REPLACE_EXISTING).
+        let src = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\move-src.txt")
+            .expect("wide src");
+        let dst = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\move-dst.txt")
+            .expect("wide dst");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                move_file,
+                &[src as u32, dst as u32]
+            ),
+            1
+        );
+        let dst_w = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\move-dst.txt")
+            .expect("wide dst again");
+        assert_ne!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, attributes, &[dst_w as u32]),
+            u32::MAX as u64
+        );
+        let blocker = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\move-src.txt")
+            .expect("wide blocker");
+        runtime
+            .win32
+            .create_file_w(
+                "C:\\Games\\move-src.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create blocker");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                move_file,
+                &[dst as u32, blocker as u32]
+            ),
+            0
+        );
+        assert_ne!(runtime.last_error, 0);
+
+        // SearchPathW with an explicit path list resolves the file, appends
+        // the requested extension, and honors the required-size contract.
+        runtime
+            .win32
+            .create_file_w(
+                r"C:\Games\tool.exe",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create tool");
+        let dirs = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games")
+            .expect("wide dirs");
+        let tool = runtime
+            .alloc_utf16_string(&mut memory, "tool")
+            .expect("wide tool");
+        let extension = runtime
+            .alloc_utf16_string(&mut memory, ".exe")
+            .expect("wide ext");
+        let found_buf = 0x41_400;
+        memory.map_bytes(found_buf, &[0_u8; 0x100]);
+        let file_part_ptr = 0x41_500;
+        memory.map_bytes(file_part_ptr, &[0_u8; 8]);
+        let length = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            search_path,
+            &[
+                dirs as u32,
+                tool as u32,
+                extension as u32,
+                0x100,
+                found_buf as u32,
+                file_part_ptr as u32,
+            ],
+        );
+        assert_eq!(length, 17);
+        assert_eq!(
+            read_guest_utf16_string(&memory, found_buf, 64),
+            r"C:\Games\tool.exe"
+        );
+        let file_part = read_guest_pointer(&memory, file_part_ptr, GuestArch::X86).unwrap();
+        assert_eq!(file_part, found_buf + 18);
+        assert_eq!(read_guest_utf16_string(&memory, file_part, 64), "tool.exe");
+
+        // A missing file: 0 with ERROR_FILE_NOT_FOUND.
+        let missing = runtime
+            .alloc_utf16_string(&mut memory, "absent")
+            .expect("wide missing");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                search_path,
+                &[dirs as u32, missing as u32, 0, 0x100, found_buf as u32, 0]
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_FILE_NOT_FOUND);
+
+        // A too-small buffer returns the required size (incl. NUL) with
+        // ERROR_BUFFER_OVERFLOW.
+        let length = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            search_path,
+            &[
+                dirs as u32,
+                tool as u32,
+                extension as u32,
+                4,
+                found_buf as u32,
+                0,
+            ],
+        );
+        assert_eq!(length, 18);
+        assert_eq!(runtime.last_error, ERROR_BUFFER_OVERFLOW);
+
+        // lstrcmpiA compares ANSI strings case-insensitively.
+        let cmp = runtime.alloc_host_thunk(HostThunk::LstrcmpiA);
+        let hello = runtime
+            .alloc_c_string(&mut memory, "Hello, World")
+            .expect("ansi hello");
+        let hello_lower = runtime
+            .alloc_c_string(&mut memory, "hello, world")
+            .expect("ansi lower");
+        let different = runtime
+            .alloc_c_string(&mut memory, "hello, worlx")
+            .expect("ansi other");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                cmp,
+                &[hello as u32, hello_lower as u32]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                cmp,
+                &[hello as u32, different as u32]
+            ),
+            u64::from(-1_i32 as u32)
+        );
+    }
+
+    #[test]
+    fn evidence_core_kernel32_disable_thread_library_calls_thunk() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "evidence-disable-tlc",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let disable = runtime.alloc_host_thunk(HostThunk::DisableThreadLibraryCalls);
+        let handle_a = runtime.get_or_create_module_handle("first.dll");
+        let handle_b = runtime.get_or_create_module_handle("second.dll");
+        assert_ne!(handle_a, 0);
+        assert_ne!(handle_b, 0);
+        if let Some(info) = runtime.dll_info_table.get_mut(&handle_a) {
+            info.entry_point_rva = 0x1000;
+        }
+        if let Some(info) = runtime.dll_info_table.get_mut(&handle_b) {
+            info.entry_point_rva = 0x2000;
+        }
+
+        // DisableThreadLibraryCalls marks the module (by handle).
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, disable, &[handle_b as u32]),
+            1
+        );
+
+        // Thread attach/detach notifications skip the marked module but
+        // still reach the other DLLs.
+        runtime.call_dll_entry_points(&[handle_a, handle_b], DllReason::ThreadAttach);
+        assert_eq!(runtime.pending_dll_main_calls.len(), 1);
+        assert_eq!(runtime.pending_dll_main_calls[0].0, handle_a);
+        assert_eq!(runtime.pending_dll_main_calls[0].2, DLL_THREAD_ATTACH);
+        runtime.pending_dll_main_calls.clear();
+
+        // Process-level notifications are unaffected by the flag.
+        runtime.call_dll_entry_points(&[handle_a, handle_b], DllReason::ProcessAttach);
+        assert_eq!(runtime.pending_dll_main_calls.len(), 2);
+
+        // hModule == 0 marks the CALLING module (resolved from the return
+        // address that dispatch popped).
+        let mapped = runtime.mapped_image_base;
+        let disable_stack = 0x50_000;
+        memory.map_bytes(disable_stack, &[0_u8; 0x200]);
+        write_u32(&mut memory, disable_stack, mapped as u32);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, disable_stack);
+        runtime
+            .dispatch_import(disable, &mut state, &mut memory)
+            .expect("dispatch disable");
+        assert_eq!(state.get(Register::Rax), 1);
+        assert!(
+            runtime
+                .disabled_thread_library_calls
+                .contains(&runtime.module_handle_containing(mapped)),
+            "NULL handle marks the calling module"
+        );
+    }
+
+    // ── shlwapi evidence: path helpers (table-driven) ──────────────────────
+
+    #[test]
+    fn evidence_shlwapi_path_find_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-find");
+        let mut memory = MemoryImage::default();
+        let find_extension = runtime.alloc_host_thunk(HostThunk::PathFindExtensionW);
+        let find_file_name = runtime.alloc_host_thunk(HostThunk::PathFindFileNameW);
+        let strip_path = runtime.alloc_host_thunk(HostThunk::PathStripPathW);
+        let remove_extension = runtime.alloc_host_thunk(HostThunk::PathRemoveExtensionW);
+
+        // PathFindExtensionW: the last dot after the last separator, colon,
+        // or space; otherwise a pointer to the trailing NUL.
+        let extension_cases: &[(&str, Option<&str>)] = &[
+            (r"C:\dir\file.txt", Some(".txt")),
+            (r"C:\dir\file.tar.gz", Some(".gz")),
+            (r"C:\dir\file", None),
+            (r"C:\dir\file.", Some(".")),
+            (r"C:\dir.2\file", None),
+            (r"file.txt", Some(".txt")),
+            (r"C:\dir\file.txt ", None),
+            (r"", None),
+            (r"foo.bar baz", None),
+        ];
+        for (input, expected) in extension_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result =
+                dispatch_x86_thunk(&mut runtime, &mut memory, find_extension, &[path as u32]);
+            match expected {
+                Some(expected_ext) => {
+                    assert_eq!(
+                        read_guest_utf16_string(&memory, result, 64),
+                        *expected_ext,
+                        "PathFindExtensionW({input:?})"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        result,
+                        path + input.encode_utf16().count() as u64 * 2,
+                        "PathFindExtensionW({input:?}) points at the NUL"
+                    );
+                }
+            }
+        }
+
+        // PathFindFileNameW: the last component after the last `\`, `/`, or
+        // `:` (skipping separator runs).
+        let file_name_cases: &[(&str, &str)] = &[
+            (r"C:\dir\file.txt", "file.txt"),
+            (r"C:\dir\", "dir\\"),
+            (r"C:\dir", "dir"),
+            (r"file.txt", "file.txt"),
+            (r"C:\a\\b", "b"),
+            (r"C:", "C:"),
+            (r"C:a", "a"),
+            (r"\\server\share\file", "file"),
+        ];
+        for (input, expected) in file_name_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result =
+                dispatch_x86_thunk(&mut runtime, &mut memory, find_file_name, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, result, 64),
+                *expected,
+                "PathFindFileNameW({input:?})"
+            );
+        }
+
+        // PathStripPathW removes the directory portion in place.
+        let strip_cases: &[(&str, &str)] = &[
+            (r"C:\dir\file.txt", "file.txt"),
+            (r"C:\dir\sub\file", "file"),
+            (r"file.txt", "file.txt"),
+            (r"C:\dir\", "dir\\"),
+        ];
+        for (input, expected) in strip_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, strip_path, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 64),
+                *expected,
+                "PathStripPathW({input:?})"
+            );
+        }
+
+        // PathRemoveExtensionW truncates at the extension in place.
+        let remove_ext_cases: &[(&str, &str)] = &[
+            (r"C:\dir\file.txt", r"C:\dir\file"),
+            (r"file.tar.gz", "file.tar"),
+            (r"file", "file"),
+            (r"C:\dir\file.txt ", r"C:\dir\file.txt "),
+        ];
+        for (input, expected) in remove_ext_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, remove_extension, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 64),
+                *expected,
+                "PathRemoveExtensionW({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_shlwapi_path_append_combine_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-combine");
+        let mut memory = MemoryImage::default();
+        let append = runtime.alloc_host_thunk(HostThunk::PathAppendW);
+        let combine = runtime.alloc_host_thunk(HostThunk::PathCombineW);
+
+        // PathAppendW (in place): absolute append replaces; leading `\` is
+        // skipped; `..` pops the last element; drive-relative joins cleanly.
+        let append_cases: &[(&str, &str, &str)] = &[
+            (r"C:\a\b", "c", r"C:\a\b\c"),
+            (r"C:\a\b", r"..\c", r"C:\a\c"),
+            (r"C:\a\b\", "c", r"C:\a\b\c"),
+            (r"C:\a\b", r"\c", r"C:\a\b\c"),
+            (r"C:\a\b", r"C:\x\y", r"C:\x\y"),
+            ("", "foo", "foo"),
+            ("foo", "bar", r"foo\bar"),
+            (r"C:\a\b", "", r"C:\a\b"),
+            (r"C:\a", r"..\..\x", r"C:\x"),
+            (r"C:\", "foo", r"C:\foo"),
+        ];
+        for (base, more, expected) in append_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, base)
+                .expect("wide path");
+            let more_ptr = runtime
+                .alloc_utf16_string(&mut memory, more)
+                .expect("wide more");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                append,
+                &[path as u32, more_ptr as u32],
+            );
+            assert_eq!(result, 1, "PathAppendW({base:?}, {more:?}) succeeds");
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 128),
+                *expected,
+                "PathAppendW({base:?}, {more:?})"
+            );
+        }
+
+        // PathCombineW: NULL/empty dir yields the file; absolute file
+        // replaces; `..` resolves through the canonicalize step.
+        let combine_cases: &[(&str, &str, &str)] = &[
+            (r"C:\dir", "file.txt", r"C:\dir\file.txt"),
+            (r"C:\dir\", "file.txt", r"C:\dir\file.txt"),
+            (r"C:\path", r"..\file", r"C:\file"),
+            (r"C:\dir", r"D:\other.txt", r"D:\other.txt"),
+            ("", "file.txt", "file.txt"),
+            (r"C:\dir", r"\rooted.txt", r"C:\rooted.txt"),
+            (r"C:\a\b", r"..\..\x", r"C:\x"),
+        ];
+        for (dir, file, expected) in combine_cases {
+            let out = 0x43_000;
+            memory.map_bytes(out, &[0_u8; 0x200]);
+            let dir_ptr = runtime
+                .alloc_utf16_string(&mut memory, dir)
+                .expect("wide dir");
+            let file_ptr = runtime
+                .alloc_utf16_string(&mut memory, file)
+                .expect("wide file");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                combine,
+                &[out as u32, dir_ptr as u32, file_ptr as u32],
+            );
+            assert_eq!(result, out, "PathCombineW({dir:?}, {file:?}) returns out");
+            assert_eq!(
+                read_guest_utf16_string(&memory, out, 128),
+                *expected,
+                "PathCombineW({dir:?}, {file:?})"
+            );
+        }
+
+        // A NULL directory with a file yields the file alone.
+        let out = 0x43_100;
+        memory.map_bytes(out, &[0_u8; 0x200]);
+        let file_ptr = runtime
+            .alloc_utf16_string(&mut memory, "solo.txt")
+            .expect("wide file");
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            combine,
+            &[out as u32, 0, file_ptr as u32],
+        );
+        assert_eq!(result, out);
+        assert_eq!(read_guest_utf16_string(&memory, out, 64), "solo.txt");
+    }
+
+    #[test]
+    fn evidence_shlwapi_path_remove_spec_and_root_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-removespec");
+        let mut memory = MemoryImage::default();
+        let remove_file_spec = runtime.alloc_host_thunk(HostThunk::PathRemoveFileSpecW);
+        let skip_root = runtime.alloc_host_thunk(HostThunk::PathSkipRootW);
+        let is_root = runtime.alloc_host_thunk(HostThunk::PathIsRootW);
+        let is_relative = runtime.alloc_host_thunk(HostThunk::PathIsRelativeW);
+        let drive_number = runtime.alloc_host_thunk(HostThunk::PathGetDriveNumberW);
+        let add_backslash = runtime.alloc_host_thunk(HostThunk::PathAddBackslashW);
+        let remove_backslash = runtime.alloc_host_thunk(HostThunk::PathRemoveBackslashW);
+        let remove_blanks = runtime.alloc_host_thunk(HostThunk::PathRemoveBlanksW);
+
+        // PathRemoveFileSpecW drops the last component and its separator;
+        // roots and separator-less paths fail unchanged.
+        let remove_spec_cases: &[(&str, Option<&str>)] = &[
+            (r"C:\a\b\c", Some(r"C:\a\b")),
+            (r"C:\a\b", Some(r"C:\a")),
+            (r"C:\a", Some(r"C:\")),
+            (r"C:\a\", Some(r"C:\a")),
+            (r"C:\", None),
+            (r"C:", None),
+            (r"a\b", Some("a")),
+            ("a", Some("")),
+            ("", None),
+            (r"\a\b", Some(r"\a")),
+        ];
+        for (input, expected) in remove_spec_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result =
+                dispatch_x86_thunk(&mut runtime, &mut memory, remove_file_spec, &[path as u32]);
+            match expected {
+                Some(expected_path) => {
+                    assert_eq!(result, 1, "PathRemoveFileSpecW({input:?}) removes");
+                    assert_eq!(
+                        read_guest_utf16_string(&memory, path, 128),
+                        *expected_path,
+                        "PathRemoveFileSpecW({input:?})"
+                    );
+                }
+                None => {
+                    assert_eq!(result, 0, "PathRemoveFileSpecW({input:?}) fails");
+                    assert_eq!(
+                        read_guest_utf16_string(&memory, path, 128),
+                        *input,
+                        "PathRemoveFileSpecW({input:?}) leaves the path unchanged"
+                    );
+                }
+            }
+        }
+
+        // PathSkipRootW: pointer past `X:\` or `\\server\share\`; NULL when
+        // there is no root.
+        let skip_root_cases: &[(&str, Option<&str>)] = &[
+            (r"C:\dir\file", Some("dir\\file")),
+            (r"C:\", Some("")),
+            (r"\\server\share\file", Some("file")),
+            (r"\\server\share", None),
+            (r"\dir", None),
+            (r"dir", None),
+            (r"C:dir", None),
+        ];
+        for (input, expected) in skip_root_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, skip_root, &[path as u32]);
+            match expected {
+                Some(tail) => {
+                    assert_eq!(
+                        read_guest_utf16_string(&memory, result, 64),
+                        *tail,
+                        "PathSkipRootW({input:?})"
+                    );
+                }
+                None => assert_eq!(result, 0, "PathSkipRootW({input:?}) has no root"),
+            }
+        }
+
+        // PathIsRootW.
+        let is_root_cases: &[(&str, bool)] = &[
+            (r"C:\", true),
+            (r"C:/", true),
+            ("C:", true),
+            (r"C:\a", false),
+            ("C:a", false),
+            ("\\", true),
+            (r"\\server\share", true),
+            (r"\\server\share\", true),
+            (r"\\server", false),
+            (r"\\server\share\file", false),
+            ("", false),
+        ];
+        for (input, expected) in is_root_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, is_root, &[path as u32]);
+            assert_eq!(result, *expected as u64, "PathIsRootW({input:?})");
+        }
+
+        // PathIsRelativeW.
+        let is_relative_cases: &[(&str, bool)] = &[
+            ("foo", true),
+            ("", true),
+            (r"C:\foo", false),
+            ("C:foo", false),
+            (r"\foo", false),
+            (r"\\server\share", false),
+            ("/foo", true),
+        ];
+        for (input, expected) in is_relative_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, is_relative, &[path as u32]);
+            assert_eq!(result, *expected as u64, "PathIsRelativeW({input:?})");
+        }
+
+        // PathGetDriveNumberW: A:..Z: → 0..25, else -1 (extended `\\?\`
+        // prefixes are skipped).
+        let drive_cases: &[(&str, i32)] = &[
+            (r"C:\foo", 2),
+            ("C:", 2),
+            (r"D:\foo", 3),
+            (r"\\?\C:\foo", 2),
+            ("foo", -1),
+            (r"\foo", -1),
+        ];
+        for (input, expected) in drive_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result =
+                dispatch_x86_thunk(&mut runtime, &mut memory, drive_number, &[path as u32]);
+            let expected = if *expected < 0 {
+                u64::from(-1_i32 as u32)
+            } else {
+                *expected as u64
+            };
+            assert_eq!(result, expected, "PathGetDriveNumberW({input:?})");
+        }
+
+        // PathAddBackslashW appends a trailing backslash when missing.
+        let add_backslash_cases: &[(&str, &str)] = &[
+            (r"C:\dir", r"C:\dir\"),
+            (r"C:\dir\", r"C:\dir\"),
+            ("", "\\"),
+            ("foo", r"foo\"),
+        ];
+        for (input, expected) in add_backslash_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, add_backslash, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 64),
+                *expected,
+                "PathAddBackslashW({input:?})"
+            );
+        }
+
+        // PathRemoveBackslashW removes the trailing backslash except on roots.
+        let remove_backslash_cases: &[(&str, &str)] = &[
+            (r"C:\dir\", r"C:\dir"),
+            (r"C:\dir", r"C:\dir"),
+            (r"C:\", r"C:\"),
+            (r"\\server\share\", r"\\server\share\"),
+            ("foo\\", "foo"),
+        ];
+        for (input, expected) in remove_backslash_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, remove_backslash, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 64),
+                *expected,
+                "PathRemoveBackslashW({input:?})"
+            );
+        }
+
+        // PathRemoveBlanksW trims leading and trailing spaces in place.
+        let remove_blanks_cases: &[(&str, &str)] = &[
+            ("  C:\\dir  ", r"C:\dir"),
+            ("C:\\dir", r"C:\dir"),
+            ("   ", ""),
+            (" a b ", "a b"),
+        ];
+        for (input, expected) in remove_blanks_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let _ = dispatch_x86_thunk(&mut runtime, &mut memory, remove_blanks, &[path as u32]);
+            assert_eq!(
+                read_guest_utf16_string(&memory, path, 64),
+                *expected,
+                "PathRemoveBlanksW({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_shlwapi_path_canonicalize_and_match_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-canon");
+        let mut memory = MemoryImage::default();
+        let canonicalize = runtime.alloc_host_thunk(HostThunk::PathCanonicalizeW);
+        let match_spec = runtime.alloc_host_thunk(HostThunk::PathMatchSpecW);
+
+        // PathCanonicalizeW resolves `.`/`..` and preserves trailing
+        // separators; the empty path canonicalizes to `\`.
+        let canonical_cases: &[(&str, &str)] = &[
+            (r"C:\a\b\..\c", r"C:\a\c"),
+            (r"C:\path\..\file.txt", r"C:\file.txt"),
+            (r"C:\a\b\", r"C:\a\b\"),
+            (r"C:\a\.", r"C:\a\."),
+            (r"C:\a\..", r"C:\"),
+            (r"C:\..\b", r"C:\b"),
+            (r"C:\a\..\..\b", r"C:\b"),
+            (r"\\server\share\a\..\b", r"\\server\share\b"),
+            ("", "\\"),
+            (r"C:\a", r"C:\a"),
+            ("C:", r"C:\"),
+            (r"C:\a\b\..\..\..\c", r"C:\c"),
+        ];
+        for (input, expected) in canonical_cases {
+            let out = 0x43_200;
+            memory.map_bytes(out, &[0_u8; 0x200]);
+            let path = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide path");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                canonicalize,
+                &[out as u32, path as u32],
+            );
+            assert_eq!(result, 1, "PathCanonicalizeW({input:?}) succeeds");
+            assert_eq!(
+                read_guest_utf16_string(&memory, out, 128),
+                *expected,
+                "PathCanonicalizeW({input:?})"
+            );
+        }
+
+        // PathMatchSpecW: DOS wildcards with `;`-separated alternates.
+        let match_cases: &[(&str, &str, bool)] = &[
+            ("foo.txt", "*.txt", true),
+            ("foo.txt", "*.t?t", true),
+            ("foo.txt", "f*.*", true),
+            ("foo", "*.txt", false),
+            ("foo.txt", "*.t*t", true),
+            ("foo.txt", "*.doc;*.txt", true),
+            ("foo.doc", "*.doc;*.txt", true),
+            ("foo.bar", "*.doc;*.txt", false),
+            ("foo", "foo", true),
+            ("FOO", "foo", true),
+            ("foo.txt", "", false),
+            ("anything", "*.*", true),
+            ("file", "f*e", true),
+            ("file", "f?le", true),
+            ("file", "f?xle", false),
+        ];
+        for (path_str, spec_str, expected) in match_cases {
+            let path = runtime
+                .alloc_utf16_string(&mut memory, path_str)
+                .expect("wide path");
+            let spec = runtime
+                .alloc_utf16_string(&mut memory, spec_str)
+                .expect("wide spec");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                match_spec,
+                &[path as u32, spec as u32],
+            );
+            assert_eq!(
+                result, *expected as u64,
+                "PathMatchSpecW({path_str:?}, {spec_str:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_shlwapi_string_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-string");
+        let mut memory = MemoryImage::default();
+        let str_chr = runtime.alloc_host_thunk(HostThunk::StrChrW);
+        let str_chr_i = runtime.alloc_host_thunk(HostThunk::StrChrIW);
+        let str_r_chr = runtime.alloc_host_thunk(HostThunk::StrRChrW);
+        let str_str = runtime.alloc_host_thunk(HostThunk::StrStrW);
+        let str_str_i = runtime.alloc_host_thunk(HostThunk::StrStrIW);
+        let str_cmp_i = runtime.alloc_host_thunk(HostThunk::StrCmpIW);
+        let str_cmp = runtime.alloc_host_thunk(HostThunk::StrCmpW);
+        let str_cmp_ni = runtime.alloc_host_thunk(HostThunk::StrCmpNIW);
+        let str_cmp_n = runtime.alloc_host_thunk(HostThunk::StrCmpNW);
+        let str_cpy_n = runtime.alloc_host_thunk(HostThunk::StrCpyNW);
+        let str_cpy = runtime.alloc_host_thunk(HostThunk::StrCpyW);
+        let str_cat = runtime.alloc_host_thunk(HostThunk::StrCatW);
+        let str_to_int = runtime.alloc_host_thunk(HostThunk::StrToIntW);
+
+        let text = runtime
+            .alloc_utf16_string(&mut memory, "The Quick Brown Fox")
+            .expect("wide text");
+
+        // StrChrW: first occurrence (case-sensitive).
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_chr,
+            &[text as u32, 'Q' as u32],
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, result, 64),
+            "Quick Brown Fox"
+        );
+        // StrChrIW: case-insensitive first occurrence.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_chr_i,
+            &[text as u32, 'q' as u32],
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, result, 64),
+            "Quick Brown Fox"
+        );
+        // Missing character → NULL.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_chr,
+                &[text as u32, 'z' as u32]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_chr_i,
+                &[text as u32, 'z' as u32]
+            ),
+            0
+        );
+
+        // StrRChrW: LAST occurrence at or before chStart.
+        let repeated = runtime
+            .alloc_utf16_string(&mut memory, "a.b.c.d")
+            .expect("wide repeated");
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_r_chr,
+            &[repeated as u32, 0, '.' as u32],
+        );
+        assert_eq!(read_guest_utf16_string(&memory, result, 64), ".d");
+        let start = repeated + 4; // inside ".b.c.d" → the dot after "b"
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_r_chr,
+            &[repeated as u32, start as u32, '.' as u32],
+        );
+        assert_eq!(read_guest_utf16_string(&memory, result, 64), ".c.d");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_r_chr,
+                &[repeated as u32, 0, 'x' as u32]
+            ),
+            0
+        );
+
+        // StrStrW: substring (case-sensitive); StrStrIW folds case.
+        let needle = runtime
+            .alloc_utf16_string(&mut memory, "Quick")
+            .expect("wide needle");
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_str,
+            &[text as u32, needle as u32],
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, result, 64),
+            "Quick Brown Fox"
+        );
+        let needle_lower = runtime
+            .alloc_utf16_string(&mut memory, "quick")
+            .expect("wide needle lower");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_str,
+                &[text as u32, needle_lower as u32]
+            ),
+            0
+        );
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_str_i,
+            &[text as u32, needle_lower as u32],
+        );
+        assert_eq!(
+            read_guest_utf16_string(&memory, result, 64),
+            "Quick Brown Fox"
+        );
+
+        // StrCmpW / StrCmpIW: 0 when equal, nonzero otherwise.
+        let hello = runtime
+            .alloc_utf16_string(&mut memory, "Hello")
+            .expect("wide hello");
+        let hello_lower = runtime
+            .alloc_utf16_string(&mut memory, "hello")
+            .expect("wide lower");
+        let world = runtime
+            .alloc_utf16_string(&mut memory, "World")
+            .expect("wide world");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp,
+                &[hello as u32, hello as u32]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp,
+                &[hello as u32, hello_lower as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp_i,
+                &[hello as u32, hello_lower as u32]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp_i,
+                &[hello as u32, world as u32]
+            ),
+            1
+        );
+
+        // StrCmpNW / StrCmpNIW compare up to nChar characters.
+        let longer = runtime
+            .alloc_utf16_string(&mut memory, "HelloWorld")
+            .expect("wide longer");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp_n,
+                &[hello as u32, longer as u32, 5]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp_n,
+                &[hello as u32, longer as u32, 6]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_cmp_ni,
+                &[hello as u32, hello_lower as u32, 5]
+            ),
+            0
+        );
+
+        // StrCpyNW copies at most count characters INCLUDING the NUL.
+        let dest = 0x43_300;
+        memory.map_bytes(dest, &[0xEE; 0x100]);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_cpy_n,
+            &[dest as u32, hello as u32, 3],
+        );
+        assert_eq!(result, dest);
+        assert_eq!(read_guest_utf16_string(&memory, dest, 8), "He");
+        // StrCpyW copies the full string.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_cpy,
+            &[dest as u32, hello as u32],
+        );
+        assert_eq!(result, dest);
+        assert_eq!(read_guest_utf16_string(&memory, dest, 16), "Hello");
+
+        // StrCatW concatenates onto the destination.
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            str_cat,
+            &[dest as u32, world as u32],
+        );
+        assert_eq!(result, dest);
+        assert_eq!(read_guest_utf16_string(&memory, dest, 16), "HelloWorld");
+
+        // StrToIntW parses sign + digits and stops at the first non-digit.
+        let int_cases: &[(&str, i32)] = &[
+            ("123", 123),
+            ("-42", -42),
+            ("+7", 7),
+            ("12x", 12),
+            ("abc", 0),
+            ("-abc", 0),
+            ("", 0),
+            ("007", 7),
+        ];
+        for (input, expected) in int_cases {
+            let ptr = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide int");
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, str_to_int, &[ptr as u32]);
+            let expected = if *expected < 0 {
+                u64::from(*expected as u32)
+            } else {
+                *expected as u64
+            };
+            assert_eq!(result, expected, "StrToIntW({input:?})");
+        }
+    }
+
+    #[test]
+    fn evidence_shlwapi_char_class_and_url_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-charurl");
+        let mut memory = MemoryImage::default();
+        let chr_cmp_i = runtime.alloc_host_thunk(HostThunk::ChrCmpIW);
+        let str_eq_worker = runtime.alloc_host_thunk(HostThunk::IntlStrEqWorkerW);
+        let is_alpha = runtime.alloc_host_thunk(HostThunk::IsCharAlphaW);
+        let is_alnum = runtime.alloc_host_thunk(HostThunk::IsCharAlphaNumericW);
+        let is_lower = runtime.alloc_host_thunk(HostThunk::IsCharLowerW);
+        let is_upper = runtime.alloc_host_thunk(HostThunk::IsCharUpperW);
+        let is_space = runtime.alloc_host_thunk(HostThunk::IsCharSpaceW);
+        let parse_url = runtime.alloc_host_thunk(HostThunk::ParseURLW);
+        let time_interval = runtime.alloc_host_thunk(HostThunk::StrFromTimeIntervalW);
+
+        // ChrCmpIW: case-insensitive character equality.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                chr_cmp_i,
+                &['a' as u32, 'A' as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                chr_cmp_i,
+                &['a' as u32, 'b' as u32]
+            ),
+            0
+        );
+
+        // IntlStrEqWorkerW: prefix equality over nChar, case-insensitive by
+        // default, case-sensitive when bCaseSensitive is set.
+        let alpha = runtime
+            .alloc_utf16_string(&mut memory, "AlphaBeta")
+            .expect("wide alpha");
+        let alpha_lower = runtime
+            .alloc_utf16_string(&mut memory, "alphabeta")
+            .expect("wide lower");
+        let gamma = runtime
+            .alloc_utf16_string(&mut memory, "Gamma")
+            .expect("wide gamma");
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_eq_worker,
+                &[0, alpha as u32, alpha_lower as u32, 5]
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_eq_worker,
+                &[1, alpha as u32, alpha_lower as u32, 5]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_eq_worker,
+                &[0, alpha as u32, gamma as u32, 5]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                str_eq_worker,
+                &[0, alpha as u32, alpha as u32, 100]
+            ),
+            1
+        );
+
+        // IsChar* classification follows the Unicode character classes.
+        let char_cases: &[(&str, u32, bool)] = &[
+            ("IsCharAlphaW", 'A' as u32, true),
+            ("IsCharAlphaW", '1' as u32, false),
+            ("IsCharAlphaNumericW", 'A' as u32, true),
+            ("IsCharAlphaNumericW", '5' as u32, true),
+            ("IsCharAlphaNumericW", '_' as u32, false),
+            ("IsCharLowerW", 'a' as u32, true),
+            ("IsCharLowerW", 'A' as u32, false),
+            ("IsCharUpperW", 'A' as u32, true),
+            ("IsCharUpperW", 'a' as u32, false),
+            ("IsCharSpaceW", ' ' as u32, true),
+            ("IsCharSpaceW", '\t' as u32, true),
+            ("IsCharSpaceW", 'x' as u32, false),
+        ];
+        for (thunk_name, ch, expected) in char_cases {
+            let thunk = match *thunk_name {
+                "IsCharAlphaW" => is_alpha,
+                "IsCharAlphaNumericW" => is_alnum,
+                "IsCharLowerW" => is_lower,
+                "IsCharUpperW" => is_upper,
+                "IsCharSpaceW" => is_space,
+                _ => unreachable!(),
+            };
+            let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[*ch]);
+            assert_eq!(result, *expected as u64, "{thunk_name}({ch:#x})");
+        }
+
+        // ParseURLW: PARSEDURLW (24 bytes on x86) gets the scheme, suffix
+        // and scheme code; invalid syntax reports URL_E_INVALID_SYNTAX.
+        let parsed = 0x43_400;
+        memory.map_bytes(parsed, &[0_u8; 0x40]);
+        write_u32(&mut memory, parsed, 24);
+        let url = runtime
+            .alloc_utf16_string(&mut memory, "https://example.com/a?b")
+            .expect("wide url");
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            parse_url,
+            &[url as u32, parsed as u32],
+        );
+        assert_eq!(result, 0, "ParseURLW succeeds");
+        assert_eq!(memory.read_u32(parsed).unwrap(), 24, "cbSize echoed");
+        assert_eq!(
+            read_guest_pointer(&memory, parsed + 4, GuestArch::X86).unwrap(),
+            url,
+            "pszProtocol points at the URL"
+        );
+        assert_eq!(memory.read_u32(parsed + 8).unwrap(), 5, "cchProtocol");
+        assert_eq!(
+            memory.read_u32(parsed + 0x14).unwrap(),
+            12,
+            "URL_SCHEME_HTTPS"
+        );
+        let suffix = read_guest_pointer(&memory, parsed + 12, GuestArch::X86).unwrap();
+        assert_eq!(
+            read_guest_utf16_string(&memory, suffix, 64),
+            "//example.com/a?b"
+        );
+        assert_eq!(memory.read_u32(parsed + 16).unwrap(), 17, "cchSuffix");
+
+        // A URL without a valid scheme fails with URL_E_INVALID_SYNTAX and
+        // clears pszProtocol.
+        let bad = runtime
+            .alloc_utf16_string(&mut memory, "no-scheme")
+            .expect("wide bad");
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            parse_url,
+            &[bad as u32, parsed as u32],
+        );
+        assert_eq!(result, 0x8004_1001);
+        assert_eq!(
+            read_guest_pointer(&memory, parsed + 4, GuestArch::X86).unwrap(),
+            0
+        );
+
+        // A wrong cbSize fails with E_INVALIDARG.
+        memory.map_bytes(parsed, &[0_u8; 0x40]);
+        write_u32(&mut memory, parsed, 0x40);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            parse_url,
+            &[url as u32, parsed as u32],
+        );
+        assert_eq!(result, 0x8007_0057);
+
+        // StrFromTimeIntervalW formats rounded whole seconds with
+        // significant digits and the " hr"/" min"/" sec" units.
+        let buffer = 0x43_500;
+        memory.map_bytes(buffer, &[0_u8; 0x100]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            time_interval,
+            &[
+                buffer as u32,
+                0x100,
+                138 * 3_600_000 + 43 * 60_000 + 15_000,
+                5,
+            ],
+        );
+        assert_eq!(written, 14);
+        assert_eq!(
+            read_guest_utf16_string(&memory, buffer, 64),
+            " 138 hr 43 min"
+        );
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            time_interval,
+            &[buffer as u32, 0x100, 61_500, 2],
+        );
+        assert_eq!(written, 12);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 64), " 1 min 2 sec");
+        // digits == 0 → empty output.
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            time_interval,
+            &[buffer as u32, 0x100, 5000, 0],
+        );
+        assert_eq!(written, 0);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 64), "");
+    }
+
+    #[test]
+    fn evidence_shlwapi_fs_registry_and_url_thunks() {
+        let (mut runtime, _tmp) = test_runtime("evidence-shlwapi-fsreg");
+        let mut memory = MemoryImage::default();
+        let file_exists = runtime.alloc_host_thunk(HostThunk::PathFileExistsW);
+        let is_directory = runtime.alloc_host_thunk(HostThunk::PathIsDirectoryW);
+        let reg_get = runtime.alloc_host_thunk(HostThunk::SHRegGetValueW);
+        let reg_set = runtime.alloc_host_thunk(HostThunk::SHRegSetValueW);
+        let reg_delete = runtime.alloc_host_thunk(HostThunk::SHDeleteKeyW);
+        let reg_delete_empty = runtime.alloc_host_thunk(HostThunk::SHDeleteEmptyKeyW);
+        let search_map = runtime.alloc_host_thunk(HostThunk::SHSearchMapInt);
+        let get_help_id = runtime.alloc_host_thunk(HostThunk::GetMenuContextHelpId);
+        let set_help_id = runtime.alloc_host_thunk(HostThunk::SetMenuContextHelpId);
+        let url_canonicalize = runtime.alloc_host_thunk(HostThunk::UrlCanonicalizeW);
+        let url_combine = runtime.alloc_host_thunk(HostThunk::UrlCombineW);
+
+        // PathFileExistsW / PathIsDirectoryW consult the win32 filesystem.
+        runtime
+            .win32
+            .create_directory_w("C:\\Games")
+            .expect("create Games directory");
+        runtime
+            .win32
+            .create_file_w(
+                "C:\\Games\\demo.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        let dir_w = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games")
+            .expect("wide dir");
+        let file_w = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\demo.txt")
+            .expect("wide file");
+        let missing_w = runtime
+            .alloc_utf16_string(&mut memory, r"C:\Games\missing.txt")
+            .expect("wide missing");
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, file_exists, &[file_w as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, file_exists, &[dir_w as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, file_exists, &[missing_w as u32]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, is_directory, &[dir_w as u32]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, is_directory, &[file_w as u32]),
+            0
+        );
+
+        // SHRegSetValueW writes a value (creating the key path);
+        // SHRegGetValueW reads it back with type filtering.
+        let sub_key = runtime
+            .alloc_utf16_string(&mut memory, r"Software\Casa1\Demo")
+            .expect("wide subkey");
+        let value_name = runtime
+            .alloc_utf16_string(&mut memory, "Mode")
+            .expect("wide value name");
+        let dword_data = 0x43_600;
+        memory.map_bytes(dword_data, &7_u32.to_le_bytes());
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                reg_set,
+                &[
+                    0x8000_0001, // HKEY_CURRENT_USER
+                    sub_key as u32,
+                    value_name as u32,
+                    0,
+                    4, // REG_DWORD
+                    dword_data as u32,
+                    4,
+                ]
+            ),
+            0
+        );
+        let type_out = 0x43_610;
+        memory.map_bytes(type_out, &[0_u8; 4]);
+        let data_out = 0x43_620;
+        memory.map_bytes(data_out, &[0_u8; 8]);
+        let size_out = 0x43_630;
+        memory.map_bytes(size_out, &4_u32.to_le_bytes());
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                reg_get,
+                &[
+                    0x8000_0001,
+                    sub_key as u32,
+                    value_name as u32,
+                    0x0020, // SRRF_RT_REG_DWORD
+                    type_out as u32,
+                    data_out as u32,
+                    size_out as u32,
+                ]
+            ),
+            0
+        );
+        assert_eq!(memory.read_u32(type_out).unwrap(), 4);
+        assert_eq!(memory.read_u32(data_out).unwrap(), 7);
+        assert_eq!(memory.read_u32(size_out).unwrap(), 4);
+        // A REG_DWORD value under a REG_SZ-only filter fails.
+        let dword_filter = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            reg_get,
+            &[
+                0x8000_0001,
+                sub_key as u32,
+                value_name as u32,
+                0x0002, // SRRF_RT_REG_SZ only
+                type_out as u32,
+                data_out as u32,
+                size_out as u32,
+            ],
+        );
+        assert_eq!(dword_filter, ERROR_INVALID_PARAMETER as u64);
+        // A missing value reports ERROR_FILE_NOT_FOUND.
+        let missing_value = runtime
+            .alloc_utf16_string(&mut memory, "Absent")
+            .expect("wide absent value");
+        let not_found = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            reg_get,
+            &[
+                0x8000_0001,
+                sub_key as u32,
+                missing_value as u32,
+                0xFFFF,
+                type_out as u32,
+                data_out as u32,
+                size_out as u32,
+            ],
+        );
+        assert_eq!(not_found, ERROR_FILE_NOT_FOUND as u64);
+
+        // SHDeleteKeyW removes the key (recursively).
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            reg_delete,
+            &[0x8000_0001, sub_key as u32],
+        );
+        assert_eq!(result, 0);
+        // SHDeleteEmptyKeyW fails on a key that still has values.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                reg_set,
+                &[
+                    0x8000_0001,
+                    sub_key as u32,
+                    value_name as u32,
+                    0,
+                    4,
+                    dword_data as u32,
+                    4,
+                ]
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                reg_delete_empty,
+                &[0x8000_0001, sub_key as u32]
+            ),
+            ERROR_DIR_NOT_EMPTY as u64
+        );
+        // SHDeleteKeyW removes the non-empty key recursively.
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                reg_delete,
+                &[0x8000_0001, sub_key as u32]
+            ),
+            0
+        );
+
+        // SHSearchMapInt: first matching key wins; -1 when absent.
+        let keys = 0x43_640;
+        let mut key_bytes = Vec::new();
+        key_bytes.extend(10_i32.to_le_bytes());
+        key_bytes.extend(20_i32.to_le_bytes());
+        key_bytes.extend(30_i32.to_le_bytes());
+        memory.map_bytes(keys, &key_bytes);
+        let values = 0x43_650;
+        let mut value_bytes = Vec::new();
+        value_bytes.extend(100_i32.to_le_bytes());
+        value_bytes.extend(200_i32.to_le_bytes());
+        value_bytes.extend(300_i32.to_le_bytes());
+        memory.map_bytes(values, &value_bytes);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                search_map,
+                &[keys as u32, values as u32, 3, 20]
+            ),
+            200
+        );
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                search_map,
+                &[keys as u32, values as u32, 3, 99]
+            ),
+            u64::from(-1_i32 as u32)
+        );
+
+        // SetMenuContextHelpId / GetMenuContextHelpId round-trip per HMENU.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_help_id, &[0x1000]),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_help_id, &[0x1000, 0xABCD]),
+            1
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_help_id, &[0x1000]),
+            0xABCD
+        );
+
+        // UrlCanonicalizeW lowercases the scheme/host, resolves dot
+        // segments, and keeps the query/fragment tail.
+        let canonical_cases: &[(&str, &str)] = &[
+            (
+                "HTTP://Example.COM/Path/../file.txt",
+                "http://example.com/file.txt",
+            ),
+            ("http://example.com/a/./b", "http://example.com/a/b"),
+            ("http://example.com", "http://example.com/"),
+            ("http://example.com/a/..", "http://example.com/"),
+            (
+                "http://example.com/a?x=1#frag",
+                "http://example.com/a?x=1#frag",
+            ),
+            ("", ""),
+        ];
+        for (input, expected) in canonical_cases {
+            let out = 0x43_700;
+            memory.map_bytes(out, &[0_u8; 0x200]);
+            let len_out = 0x43_D10;
+            memory.map_bytes(len_out, &0x100_u32.to_le_bytes());
+            let url = runtime
+                .alloc_utf16_string(&mut memory, input)
+                .expect("wide url");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                url_canonicalize,
+                &[url as u32, out as u32, len_out as u32, 0],
+            );
+            assert_eq!(result, 0, "UrlCanonicalizeW({input:?})");
+            assert_eq!(
+                read_guest_utf16_string(&memory, out, 256),
+                *expected,
+                "UrlCanonicalizeW({input:?})"
+            );
+        }
+        // A too-small buffer returns E_POINTER with the required size.
+        let long = runtime
+            .alloc_utf16_string(&mut memory, "http://example.com/toolong")
+            .expect("wide long url");
+        let out = 0x43_900;
+        memory.map_bytes(out, &[0_u8; 0x40]);
+        let len_out = 0x43_910;
+        memory.map_bytes(len_out, &4_u32.to_le_bytes());
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            url_canonicalize,
+            &[long as u32, out as u32, len_out as u32, 0],
+        );
+        assert_eq!(result, 0x8000_4003);
+        assert_eq!(memory.read_u32(len_out).unwrap(), 27);
+
+        // UrlCombineW resolves a relative URL against the base (the base's
+        // last leaf is replaced).
+        let combine_cases: &[(&str, &str, &str)] = &[
+            (
+                "http://example.com/a/b.html",
+                "c.html",
+                "http://example.com/a/c.html",
+            ),
+            (
+                "http://example.com/a/b.html",
+                "/root.html",
+                "http://example.com/root.html",
+            ),
+            (
+                "http://example.com/a/b.html",
+                "http://other.org/x",
+                "http://other.org/x",
+            ),
+        ];
+        for (base, relative, expected) in combine_cases {
+            let out = 0x43_A00;
+            memory.map_bytes(out, &[0_u8; 0x200]);
+            let len_out = 0x43_D00;
+            memory.map_bytes(len_out, &0x100_u32.to_le_bytes());
+            let base_ptr = runtime
+                .alloc_utf16_string(&mut memory, base)
+                .expect("wide base");
+            let rel_ptr = runtime
+                .alloc_utf16_string(&mut memory, relative)
+                .expect("wide relative");
+            let result = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                url_combine,
+                &[
+                    base_ptr as u32,
+                    rel_ptr as u32,
+                    out as u32,
+                    len_out as u32,
+                    0,
+                ],
+            );
+            assert_eq!(result, 0, "UrlCombineW({base:?}, {relative:?})");
+            assert_eq!(
+                read_guest_utf16_string(&memory, out, 256),
+                *expected,
+                "UrlCombineW({base:?}, {relative:?})"
+            );
+        }
+    }
+
+    #[test]
     fn evidence_core_nt_memory_and_wait_thunks() {
         let (mut runtime, _tmp) = test_runtime("evidence-core-nt-mem");
         let mut memory = MemoryImage::default();
@@ -102229,6 +106163,882 @@ fn ini_entry_index(entries: &[(String, String)], key: &str) -> Option<usize> {
         .position(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
 }
 
+/// Expand `%VARNAME%` references in a string against the guest process
+/// environment (the same `process_environment` table SetEnvironmentVariableW
+/// maintains).  Lookups are case-insensitive; undefined variables are copied
+/// through literally, matching ExpandEnvironmentStringsW.
+fn expand_environment_strings(environment: &BTreeMap<String, String>, source: &str) -> String {
+    let mut expanded = String::with_capacity(source.len());
+    let mut remainder = source;
+    while let Some(start) = remainder.find('%') {
+        expanded.push_str(&remainder[..start]);
+        let after_start = &remainder[start + 1..];
+        if let Some(end) = after_start.find('%') {
+            let name = &after_start[..end];
+            let value = environment
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str());
+            if let Some(value) = value {
+                expanded.push_str(value);
+            } else {
+                expanded.push('%');
+                expanded.push_str(name);
+                expanded.push('%');
+            }
+            remainder = &after_start[end + 1..];
+        } else {
+            expanded.push('%');
+            remainder = after_start;
+            break;
+        }
+    }
+    expanded.push_str(remainder);
+    expanded
+}
+
+/// The section names of an INI document as a multi-string (NUL-separated,
+/// double-NUL terminated) for the GetPrivateProfileStringW section listing.
+fn list_ini_section_names(sections: &[IniSection]) -> String {
+    let mut listing = String::new();
+    for section in sections {
+        listing.push_str(&section.name);
+        listing.push('\0');
+    }
+    listing
+}
+
+/// The key names of an INI section as a multi-string (NUL-separated,
+/// double-NUL terminated) for the GetPrivateProfileStringW key listing.
+fn list_ini_keys(section: &IniSection) -> String {
+    let mut listing = String::new();
+    for (key, _) in &section.entries {
+        listing.push_str(key);
+        listing.push('\0');
+    }
+    listing
+}
+
+/// Write a GetPrivateProfileStringW result into a guest buffer with the
+/// documented size contract: at most `buffer_len - 1` characters are copied
+/// plus a NUL terminator; the return value is the number of characters
+/// copied EXCLUDING the final NUL (for multi-string listings the interior
+/// NUL separators count).  A truncated write returns `buffer_len - 1`.
+fn write_ini_query_string(
+    memory: &mut MemoryImage,
+    buffer: u64,
+    buffer_len: usize,
+    value: &str,
+) -> u32 {
+    if buffer == 0 || buffer_len == 0 {
+        return 0;
+    }
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let copy_units = units.len().min(buffer_len.saturating_sub(1));
+    let mut bytes = Vec::with_capacity((copy_units + 1) * 2);
+    for unit in units.iter().take(copy_units) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    memory.map_bytes(buffer, &bytes);
+    if copy_units < units.len() {
+        (buffer_len - 1) as u32
+    } else {
+        copy_units as u32
+    }
+}
+
+/// Resolve a file name against the Windows search path (SearchPathW).
+///
+/// With an explicit `search_dirs` list, each `;`-separated entry is tried in
+/// order (an empty entry means the current directory).  With `None`, the
+/// standard DLL search order applies: the current (application) directory,
+/// `C:\Windows\System32`, `C:\Windows`, then the PATH environment entries.
+/// `extension` (e.g. `.exe`) is appended when the file name has no
+/// extension.  Returns the first existing candidate as a guest path, or
+/// `None` when nothing exists.
+fn resolve_search_path(
+    win32: &crate::win32::Win32Subsystem,
+    current_directory: &str,
+    environment: &BTreeMap<String, String>,
+    search_dirs: Option<&str>,
+    file_name: &str,
+    extension: Option<&str>,
+) -> Option<String> {
+    if file_name.is_empty() {
+        return None;
+    }
+    let mut name = file_name.to_string();
+    let has_extension = file_name
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|component| component.contains('.'));
+    if !has_extension
+        && let Some(extension) = extension
+        && !extension.is_empty()
+    {
+        name.push_str(extension);
+    }
+    let mut directories = Vec::new();
+    match search_dirs {
+        Some(list) => {
+            for entry in list.split(';') {
+                let trimmed = entry.trim_end_matches(['\\', '/']);
+                if trimmed.is_empty() {
+                    directories.push(current_directory.to_string());
+                } else {
+                    directories.push(trimmed.to_string());
+                }
+            }
+        }
+        None => {
+            directories.push(current_directory.to_string());
+            directories.push(r"C:\Windows\System32".to_string());
+            directories.push(r"C:\Windows".to_string());
+            if let Some(path_value) = environment.get("PATH") {
+                for entry in path_value.split(';') {
+                    let trimmed = entry.trim_end_matches(['\\', '/']);
+                    if !trimmed.is_empty() {
+                        directories.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for directory in directories {
+        let candidate = if directory.ends_with(['\\', '/']) {
+            format!("{directory}{name}")
+        } else {
+            format!("{directory}\\{name}")
+        };
+        if win32.get_file_attributes_w(&candidate).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ── shlwapi path helpers: pure string operations on the guest path form ──
+
+/// Windows "drive spec": an alphabetic character followed by `:`.
+fn shlwapi_is_drive_spec(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// PathIsRelativeW: TRUE when the path is not drive-qualified and does not
+/// begin with a backslash (an empty path counts as relative).
+fn shlwapi_path_is_relative(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return true;
+    }
+    !(bytes[0] == b'\\' || (bytes.len() >= 2 && bytes[1] == b':'))
+}
+
+/// PathFindExtensionW: byte offset of the extension (the last `.` after the
+/// last `\`, `/`, `:`, or space), or `path.len()` when there is none.
+fn shlwapi_path_find_extension_offset(path: &str) -> usize {
+    let mut last_dot = None;
+    for (index, ch) in path.char_indices() {
+        match ch {
+            '\\' | '/' | ':' | ' ' => last_dot = None,
+            '.' => last_dot = Some(index),
+            _ => {}
+        }
+    }
+    last_dot.unwrap_or(path.len())
+}
+
+/// PathFindFileNameW: byte offset of the final path component (after the
+/// last `\`, `/`, or `:` that is followed by a non-separator character).
+fn shlwapi_path_find_file_name_offset(path: &str) -> usize {
+    let chars: Vec<char> = path.chars().collect();
+    let mut candidate = 0_usize;
+    for (index, ch) in chars.iter().enumerate() {
+        if (*ch == '\\' || *ch == '/' || *ch == ':')
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| *next != '\\' && *next != '/')
+        {
+            candidate = index + 1;
+        }
+    }
+    chars[..candidate].iter().map(|ch| ch.len_utf8()).sum()
+}
+
+/// PathSkipRootW: byte offset past the root (`X:\` or `\\server\share\`),
+/// or None when the path has no root.
+fn shlwapi_path_skip_root_offset(path: &str) -> Option<usize> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        let rest = &path[2..];
+        let server_end = rest.find('\\')?;
+        let after_server = &rest[server_end + 1..];
+        let share_end = after_server.find('\\')?;
+        Some(2 + server_end + 1 + share_end + 1)
+    } else if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+    {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// PathIsRootW: TRUE for `X:\`, `X:/`, the naked drive spec `X:`, the
+/// single separator `\`, and UNC roots (`\\server\share` with optional
+/// trailing separators).
+fn shlwapi_path_is_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    if bytes[0] == b'\\' {
+        if bytes.get(1) == Some(&b'\\') {
+            // UNC: a server and a share must exist; only separators may
+            // follow the share name.
+            let rest = &path[2..];
+            let Some(server_end) = rest.find('\\') else {
+                return false;
+            };
+            let after_server = &rest[server_end + 1..];
+            if after_server.is_empty() {
+                return false;
+            }
+            return match after_server.find('\\') {
+                None => true,
+                Some(index) => after_server[index..].chars().all(|ch| ch == '\\'),
+            };
+        }
+        return bytes.len() == 1;
+    }
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return bytes.len() == 2 || (bytes.len() == 3 && (bytes[2] == b'\\' || bytes[2] == b'/'));
+    }
+    false
+}
+
+/// PathRemoveFileSpecW semantics: remove the trailing file name (and the
+/// separator before it), keeping the root intact.  Returns the shortened
+/// path, or None when nothing could be removed (the path stays unchanged).
+fn shlwapi_path_remove_file_spec(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let root_end = if shlwapi_is_drive_spec(path) {
+        if bytes.get(2) == Some(&b'\\') { 3 } else { 2 }
+    } else {
+        let mut root_end = 0_usize;
+        if bytes.first() == Some(&b'\\') {
+            root_end = 1;
+        }
+        if bytes.get(root_end + 1).is_some() && bytes.get(root_end + 1) != Some(&b'?') {
+            if bytes.get(root_end) == Some(&b'\\') {
+                root_end += 1;
+            }
+            if root_end > 1 && shlwapi_is_drive_spec(&path[root_end..]) {
+                root_end += 2;
+            }
+            if bytes.get(root_end) == Some(&b'\\')
+                && bytes.get(root_end + 1).is_some()
+                && bytes.get(root_end + 1) != Some(&b'\\')
+            {
+                root_end += 1;
+            }
+        }
+        root_end
+    };
+    let tail = &path[root_end..];
+    if let Some(relative_slash) = tail.rfind('\\') {
+        let slash = root_end + relative_slash;
+        if slash != root_end {
+            let truncate_at = if bytes.get(slash - 1) == Some(&b'\\') {
+                slash - 1
+            } else {
+                slash
+            };
+            return Some(path[..truncate_at].to_string());
+        }
+    }
+    if root_end >= path.len() {
+        return None;
+    }
+    Some(path[..root_end].to_string())
+}
+
+/// PathIsUNCServerShareW semantics: `\\server\share` with no further
+/// separators.
+fn shlwapi_is_unc_server_share(chars: &[char]) -> bool {
+    if chars.len() >= 2 && chars[0] == '\\' && chars[1] == '\\' {
+        let rest = &chars[2..];
+        if let Some(server_end) = rest.iter().position(|ch| *ch == '\\') {
+            return rest[server_end + 1..].iter().all(|ch| *ch != '\\');
+        }
+    }
+    false
+}
+
+/// PathCanonicalizeW semantics: copy the root (`\` or `X:\`), resolve `.`
+/// and `..` segments, keep the trailing separator, and append `\` to a
+/// naked drive spec.  The empty path canonicalizes to `\`.
+fn shlwapi_path_canonicalize(path: &str) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.is_empty() {
+        return "\\".to_string();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut src = 0_usize;
+    if chars[src] == '\\' {
+        out.push(chars[src]);
+        src += 1;
+    } else if src + 1 < chars.len() && chars[src + 1] == ':' {
+        out.push(chars[src]);
+        out.push(chars[src + 1]);
+        src += 2;
+        if src < chars.len() && chars[src] == '\\' {
+            out.push(chars[src]);
+            src += 1;
+        }
+    }
+    let out_char = |out: &[char], index: usize| out.get(index).copied().unwrap_or('\0');
+    while src < chars.len() {
+        if chars[src] == '.' {
+            let next = chars.get(src + 1).copied();
+            let prev = out.last().copied();
+            if next == Some('\\') && (src == 0 || prev == Some('\\') || prev == Some(':')) {
+                src += 2; // "." — skip the segment
+            } else if next == Some('.') && !out.is_empty() && prev == Some('\\') {
+                // ".." — back up over the previous component (never above
+                // the root; the initial `\\` of a UNC path is protected).
+                let mut dst = out.len();
+                if dst > 1 && out[dst - 1] == '\\' && (out[dst - 2] != '\\' || dst > 2) {
+                    if out[dst - 2] == ':' && (dst > 3 || out[dst - 3] == ':') {
+                        dst -= 2;
+                        while dst > 0 && out_char(&out, dst) != '\\' {
+                            dst -= 1;
+                        }
+                        if out_char(&out, dst) == '\\' {
+                            dst += 1;
+                        } else {
+                            dst = 0;
+                        }
+                    } else if out[dst - 2] != ':' && !shlwapi_is_unc_server_share(&out[..dst]) {
+                        dst -= 2;
+                    }
+                }
+                while dst > 0 && out_char(&out, dst) != '\\' {
+                    dst -= 1;
+                }
+                if dst == 0 {
+                    out.push('\\');
+                    src += 1;
+                } else {
+                    out.truncate(dst);
+                }
+                src += 2;
+            } else {
+                out.push(chars[src]);
+                src += 1;
+            }
+        } else {
+            out.push(chars[src]);
+            src += 1;
+        }
+    }
+    // A naked drive spec gets its backslash appended.
+    if out.len() == 2 && out[1] == ':' {
+        out.push('\\');
+    }
+    out.into_iter().collect()
+}
+
+/// PathCombineW semantics: combine `dir` and `file` into one path and
+/// canonicalize it.  `dir` NULL or empty yields `file` alone; a
+/// fully-qualified `file` (drive or UNC) replaces `dir`; a `file` that
+/// begins with `\` but is not UNC is rooted at `dir`'s root.
+fn shlwapi_path_combine(dir: Option<&str>, file: &str) -> Option<String> {
+    let dir = match dir {
+        Some(dir) => dir,
+        // NULL dir: the file alone — or an empty result when both are
+        // missing (the NULL-returning PathCombineW failure case).
+        None => {
+            if file.is_empty() {
+                return None;
+            }
+            return Some(shlwapi_path_canonicalize(file));
+        }
+    };
+    if file.is_empty() {
+        return Some(shlwapi_path_canonicalize(dir));
+    }
+    if dir.is_empty() {
+        return Some(shlwapi_path_canonicalize(file));
+    }
+    if !shlwapi_path_is_relative(file) {
+        // Not relative: either fully-qualified (use file alone) or a
+        // leading-separator path rooted at dir's root.
+        if file.starts_with('\\') && !file.starts_with("\\\\") {
+            let root = shlwapi_path_strip_to_root(dir);
+            return Some(shlwapi_path_canonicalize(&format!(
+                "{root}{}",
+                file.trim_start_matches(['\\', '/'])
+            )));
+        }
+        return Some(shlwapi_path_canonicalize(file));
+    }
+    let joined = if dir.ends_with('\\') || dir.ends_with('/') {
+        format!("{dir}{file}")
+    } else {
+        format!("{dir}\\{file}")
+    };
+    Some(shlwapi_path_canonicalize(&joined))
+}
+
+/// PathStripToRootW semantics: reduce a path to its root (`X:\` or
+/// `\\server\share\`); the input must be drive-qualified or UNC.
+fn shlwapi_path_strip_to_root(path: &str) -> String {
+    if let Some(offset) = shlwapi_path_skip_root_offset(path) {
+        return path[..offset].to_string();
+    }
+    path.to_string()
+}
+
+/// PathAppendW semantics: append a path element in place.  A leading `\`
+/// on the appended part is skipped (unless UNC); a fully-qualified append
+/// replaces the path; `..`-prefixed appends pop the last element first.
+fn shlwapi_path_append(base: &str, more: &str) -> String {
+    if base.is_empty() && more.is_empty() {
+        return String::new();
+    }
+    let more = if more.starts_with('\\') && !more.starts_with("\\\\") {
+        more.trim_start_matches(['\\', '/'])
+    } else {
+        more
+    };
+    if base.is_empty() {
+        return shlwapi_path_canonicalize(more);
+    }
+    shlwapi_path_combine(Some(base), more).unwrap_or_else(|| base.to_string())
+}
+
+/// PathMatchSpecW semantics: DOS wildcard matching (`*`, `?`), with
+/// `;`-separated alternates; `*.*` matches everything.
+fn shlwapi_path_match_spec(path: &str, spec: &str) -> bool {
+    if spec == "*.*" {
+        return true;
+    }
+    let path_chars: Vec<char> = path.chars().collect();
+    let spec_chars: Vec<char> = spec.chars().collect();
+    fn matches(path: &[char], spec: &[char]) -> bool {
+        let mut i = 0;
+        let mut j = 0;
+        while i < path.len() && j < spec.len() && spec[j] != ';' {
+            if spec[j] == '*' {
+                for start in i..=path.len() {
+                    if matches(&path[start..], &spec[j + 1..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            let path_char = path[i].to_lowercase().next().unwrap_or(path[i]);
+            let spec_char = spec[j].to_lowercase().next().unwrap_or(spec[j]);
+            if spec_char != path_char && spec[j] != '?' {
+                return false;
+            }
+            i += 1;
+            j += 1;
+        }
+        if i == path.len() {
+            let mut k = j;
+            while k < spec.len() && spec[k] == '*' {
+                k += 1;
+            }
+            if k >= spec.len() || spec[k] == ';' {
+                return true;
+            }
+        }
+        false
+    }
+    let mut offset = 0;
+    while offset < spec_chars.len() {
+        while offset < spec_chars.len() && spec_chars[offset] == ' ' {
+            offset += 1;
+        }
+        if matches(&path_chars, &spec_chars[offset..]) {
+            return true;
+        }
+        match spec_chars[offset..].iter().position(|ch| *ch == ';') {
+            Some(relative) => offset += relative + 1,
+            None => break,
+        }
+    }
+    false
+}
+
+/// The URL scheme table (scheme name → URL_SCHEME_* value).
+const SHLWAPI_URL_SCHEMES: &[(&str, u32)] = &[
+    ("ftp", 2),
+    ("http", 3),
+    ("gopher", 4),
+    ("mailto", 5),
+    ("news", 6),
+    ("nntp", 7),
+    ("telnet", 8),
+    ("wais", 9),
+    ("file", 10),
+    ("mk", 11),
+    ("https", 12),
+    ("shell", 13),
+    ("snews", 14),
+    ("local", 15),
+    ("javascript", 16),
+    ("vbscript", 17),
+    ("about", 18),
+    ("res", 19),
+];
+
+/// ParseURLW semantics: identify the URL scheme (alphanumeric plus `-`,
+/// `+`, `.` characters, at least two, terminated by `:`).  Returns
+/// (scheme length, URL_SCHEME_* value, suffix offset).
+fn shlwapi_parse_url(url: &str) -> Option<(usize, u32, usize)> {
+    let scheme_len = url
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '+' || *ch == '.')
+        .count();
+    if scheme_len <= 1 {
+        return None;
+    }
+    let scheme_end = url
+        .char_indices()
+        .nth(scheme_len)
+        .map(|(index, _)| index)
+        .unwrap_or(url.len());
+    if !url[scheme_end..].starts_with(':') {
+        return None;
+    }
+    let scheme = &url[..scheme_end];
+    let n_scheme = SHLWAPI_URL_SCHEMES
+        .iter()
+        .find(|(name, _)| scheme.eq_ignore_ascii_case(name))
+        .map(|(_, number)| *number)
+        .unwrap_or(0);
+    Some((scheme_len, n_scheme, scheme_end + 1))
+}
+
+/// Whether a known URL scheme uses a `//host` authority part.
+fn shlwapi_scheme_uses_hostname(n_scheme: u32) -> bool {
+    matches!(n_scheme, 2..=4 | 6..=9 | 12 | 14)
+}
+
+/// UrlCanonicalizeW semantics (flags = 0): strip surrounding whitespace and
+/// C0 controls, drop embedded tabs/newlines, lowercase the scheme and a
+/// known-scheme hostname, normalize `\` to `/`, resolve `.`/`..` segments,
+/// and preserve the `?query`/`#fragment` tail.  The empty URL canonicalizes
+/// to the empty string.
+fn shlwapi_url_canonicalize(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    let cleaned: String = url
+        .trim_matches(|ch| ch <= '\u{20}')
+        .chars()
+        .filter(|ch| *ch != '\t' && *ch != '\n' && *ch != '\r')
+        .collect();
+    let chars: Vec<char> = cleaned.chars().collect();
+    let mut out: Vec<char> = Vec::new();
+    let mut src = 0_usize;
+    let scheme_len = chars
+        .iter()
+        .take_while(|ch| ch.is_alphanumeric() || **ch == '+' || **ch == '-' || **ch == '.')
+        .count();
+    let has_scheme = scheme_len >= 2 && chars.get(scheme_len) == Some(&':');
+    if has_scheme {
+        for ch in &chars[..=scheme_len] {
+            out.push(ch.to_lowercase().next().unwrap_or(*ch));
+        }
+        src = scheme_len + 1;
+    } else if chars.first() == Some(&'\\') && chars.get(1) == Some(&'\\') {
+        out.extend("file:".chars());
+        src = 2;
+    }
+    let n_scheme = if has_scheme {
+        SHLWAPI_URL_SCHEMES
+            .iter()
+            .find(|(name, _)| {
+                chars[..scheme_len]
+                    .iter()
+                    .collect::<String>()
+                    .eq_ignore_ascii_case(name)
+            })
+            .map(|(_, number)| *number)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut is_relative = false;
+    if has_scheme
+        && shlwapi_scheme_uses_hostname(n_scheme)
+        && chars.get(src) == Some(&'/')
+        && chars.get(src + 1) == Some(&'/')
+    {
+        out.push('/');
+        out.push('/');
+        src += 2;
+        let host_start = src;
+        while src < chars.len()
+            && chars[src] != '/'
+            && chars[src] != '\\'
+            && chars[src] != '?'
+            && chars[src] != '#'
+        {
+            src += 1;
+        }
+        let hostname = &chars[host_start..src];
+        if n_scheme != 0 {
+            for ch in hostname {
+                out.push(ch.to_lowercase().next().unwrap_or(*ch));
+            }
+        } else {
+            out.extend(hostname);
+        }
+        if src < chars.len() && (chars[src] == '/' || chars[src] == '\\') {
+            out.push('/');
+            src += 1;
+        } else {
+            out.push('/');
+        }
+        if (chars.get(src) == Some(&'.') && chars.get(src + 1) == Some(&'.'))
+            || (chars.get(src) == Some(&'.') && chars.get(src + 1) == Some(&'/'))
+        {
+            is_relative = true;
+        }
+    }
+    let root_offset = out.len();
+    // Split the remaining text into the path body and the ?query/#fragment
+    // tail (kept verbatim, in original order).
+    let mut body_end = chars.len();
+    for (index, ch) in chars.iter().enumerate().skip(src) {
+        if *ch == '?' || *ch == '#' {
+            body_end = index;
+            break;
+        }
+    }
+    let body = &chars[src..body_end];
+    let mut i = 0_usize;
+    while i < body.len() {
+        let segment_start = i;
+        while i < body.len() && body[i] != '/' && body[i] != '\\' {
+            i += 1;
+        }
+        let segment: String = body[segment_start..i].iter().collect();
+        if segment == "." {
+            if i < body.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if segment == ".." {
+            if !is_relative && out.len() > root_offset {
+                let mut end = out.len();
+                if end > root_offset && out[end - 1] == '/' {
+                    end -= 1;
+                }
+                while end > root_offset && out[end - 1] != '/' {
+                    end -= 1;
+                }
+                out.truncate(end);
+            }
+            if i < body.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if !segment.is_empty() {
+            out.extend(segment.chars());
+        }
+        if i < body.len() {
+            out.push('/');
+            i += 1;
+        }
+    }
+    for ch in &chars[body_end..] {
+        out.push(*ch);
+    }
+    let mut result: String = out.into_iter().collect();
+    if result.is_empty() && !cleaned.is_empty() {
+        result.push('/');
+    }
+    result
+}
+
+/// UrlCombineW semantics (flags = 0): resolve `relative` against `base`
+/// (RFC-3986-style: a relative URL with its own scheme wins; `//location`
+/// replaces the authority; otherwise the base's last leaf is replaced) and
+/// canonicalize the result.
+fn shlwapi_url_combine(base: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        return shlwapi_url_canonicalize(base);
+    }
+    if base.is_empty() || shlwapi_parse_url(base).is_none() {
+        return shlwapi_url_canonicalize(relative);
+    }
+    if shlwapi_parse_url(relative).is_some() || relative.starts_with("//") {
+        return shlwapi_url_canonicalize(relative);
+    }
+    let (_, _, suffix_offset) = shlwapi_parse_url(base).expect("checked above");
+    let suffix = &base[suffix_offset..];
+    let tail_start = suffix
+        .char_indices()
+        .find(|(_, ch)| *ch == '?' || *ch == '#')
+        .map(|(index, _)| index)
+        .unwrap_or(suffix.len());
+    let location = &suffix[..tail_start];
+    // A root-relative reference replaces the base path: keep the scheme and
+    // the authority (the `//host` part) only.
+    let combined = if relative.starts_with('/') && location.starts_with("//") {
+        let authority_end = match location[2..].find('/') {
+            Some(relative_index) => 2 + relative_index + 1,
+            None => location.len(),
+        };
+        format!(
+            "{}{}{}",
+            &base[..suffix_offset],
+            &location[..authority_end],
+            relative.trim_start_matches('/')
+        )
+    } else {
+        match location.rfind('/') {
+            Some(last_slash) => {
+                format!(
+                    "{}{}{}",
+                    &base[..suffix_offset],
+                    &location[..=last_slash],
+                    relative
+                )
+            }
+            None => format!("{}{}/{}", &base[..suffix_offset], location, relative),
+        }
+    };
+    shlwapi_url_canonicalize(&combined)
+}
+
+/// StrFromTimeIntervalW semantics: round to whole seconds and format
+/// ` <hours> hr <minutes> min <seconds> sec`, keeping `digits` significant
+/// digits across the classes (1..=7); returns None when the interval
+/// cannot be formatted (empty output).
+fn shlwapi_format_time_interval(milliseconds: u32, digits: i32) -> Option<String> {
+    if digits <= 0 || digits > 7 {
+        return None;
+    }
+    let mut total = (u64::from(milliseconds) + 500) / 1000;
+    let hours = total / 3600;
+    total -= hours * 3600;
+    let minutes = total / 60;
+    total -= minutes * 60;
+    let seconds = total;
+    fn write_class(out: &mut String, value: u64, unit: &str, digits: i32) -> i32 {
+        let text = value.to_string();
+        let mut number = String::with_capacity(text.len());
+        for (index, ch) in text.chars().enumerate() {
+            if index >= digits as usize {
+                number.push('0');
+            } else {
+                number.push(ch);
+            }
+        }
+        out.push(' ');
+        out.push_str(&number);
+        out.push_str(unit);
+        digits - number.chars().count() as i32
+    }
+    let mut out = String::new();
+    let mut digits_left = digits;
+    if hours != 0 {
+        digits_left = write_class(&mut out, hours, " hr", digits_left);
+    }
+    if minutes != 0 && digits_left > 0 {
+        digits_left = write_class(&mut out, minutes, " min", digits_left);
+    }
+    if digits_left > 0 {
+        let _ = write_class(&mut out, seconds, " sec", digits_left);
+    }
+    Some(out)
+}
+
+/// StrToIntW semantics: optional sign followed by decimal digits; stops at
+/// the first non-digit; 0 when no digits are present.
+fn shlwapi_str_to_int(input: &str) -> i32 {
+    let mut chars = input.chars();
+    let negative = matches!(chars.clone().next(), Some('-'));
+    if matches!(chars.clone().next(), Some('-') | Some('+')) {
+        chars.next();
+    }
+    let mut value: i64 = 0;
+    let mut saw_digit = false;
+    for ch in chars {
+        if let Some(digit) = ch.to_digit(10) {
+            saw_digit = true;
+            value = value * 10 + i64::from(digit);
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return 0;
+    }
+    let value = if negative { -value } else { value };
+    value as i32
+}
+
+/// Case-fold a single UTF-16 code unit (the shlwapi NORM_IGNORECASE
+/// machinery over single units; surrogate halves fold to themselves).
+fn fold_utf16_unit(unit: u16) -> u16 {
+    match char::from_u32(u32::from(unit)) {
+        Some(ch) => ch
+            .to_lowercase()
+            .next()
+            .map(|folded| {
+                let mut buffer = [0_u16; 2];
+                let units = folded.encode_utf16(&mut buffer);
+                units[0]
+            })
+            .unwrap_or(ch as u16),
+        None => unit,
+    }
+}
+
+/// Substring search over case-folded text; returns the byte offset of the
+/// first match in `haystack` (or None).
+fn find_case_fold_substring(haystack: &str, needle: &str, case_insensitive: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    if case_insensitive {
+        let folded_needle: String = needle.to_lowercase();
+        let folded_haystack: String = haystack.to_lowercase();
+        if let Some(relative) = folded_haystack.find(&folded_needle) {
+            let mut char_offset = folded_haystack[..relative].chars().count();
+            let mut byte_offset = 0;
+            for ch in haystack.chars() {
+                if char_offset == 0 {
+                    break;
+                }
+                byte_offset += ch.len_utf8();
+                char_offset -= 1;
+            }
+            return Some(byte_offset);
+        }
+        None
+    } else {
+        haystack.find(needle)
+    }
+}
+
 fn build_shell_link_link_info(path: &str) -> Vec<u8> {
     let normalized = normalize_windows_path(path);
     let (local_base_path, common_path_suffix) =
@@ -105027,6 +109837,76 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ordinal: 35,
             name: Some("IntlStrEqWorkerW".to_string()),
             target: ExportTarget::Rva(0x10220),
+        },
+        ExportSymbol {
+            ordinal: 36,
+            name: Some("PathRemoveExtensionW".to_string()),
+            target: ExportTarget::Rva(0x10230),
+        },
+        ExportSymbol {
+            ordinal: 37,
+            name: Some("PathRemoveBlanksW".to_string()),
+            target: ExportTarget::Rva(0x10240),
+        },
+        ExportSymbol {
+            ordinal: 38,
+            name: Some("PathCanonicalizeW".to_string()),
+            target: ExportTarget::Rva(0x10250),
+        },
+        ExportSymbol {
+            ordinal: 39,
+            name: Some("PathMatchSpecW".to_string()),
+            target: ExportTarget::Rva(0x10260),
+        },
+        ExportSymbol {
+            ordinal: 40,
+            name: Some("PathStripPathW".to_string()),
+            target: ExportTarget::Rva(0x10270),
+        },
+        ExportSymbol {
+            ordinal: 41,
+            name: Some("PathGetDriveNumberW".to_string()),
+            target: ExportTarget::Rva(0x10280),
+        },
+        ExportSymbol {
+            ordinal: 42,
+            name: Some("PathAddBackslashW".to_string()),
+            target: ExportTarget::Rva(0x10290),
+        },
+        ExportSymbol {
+            ordinal: 43,
+            name: Some("PathRemoveBackslashW".to_string()),
+            target: ExportTarget::Rva(0x102a0),
+        },
+        ExportSymbol {
+            ordinal: 44,
+            name: Some("PathSkipRootW".to_string()),
+            target: ExportTarget::Rva(0x102b0),
+        },
+        ExportSymbol {
+            ordinal: 45,
+            name: Some("StrChrIW".to_string()),
+            target: ExportTarget::Rva(0x102c0),
+        },
+        ExportSymbol {
+            ordinal: 46,
+            name: Some("StrStrIW".to_string()),
+            target: ExportTarget::Rva(0x102d0),
+        },
+        ExportSymbol {
+            ordinal: 47,
+            name: Some("StrCmpNIW".to_string()),
+            target: ExportTarget::Rva(0x102e0),
+        },
+        ExportSymbol {
+            ordinal: 48,
+            name: Some("StrCmpNW".to_string()),
+            target: ExportTarget::Rva(0x102f0),
+        },
+        ExportSymbol {
+            ordinal: 49,
+            name: Some("StrCpyNW".to_string()),
+            target: ExportTarget::Rva(0x10300),
         },
     ];
 
