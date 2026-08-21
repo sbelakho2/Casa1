@@ -5152,7 +5152,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "NotifyRouteChange",
         "casa1-conformance:evidence_net_sys_iphlpapi_tables_from_guest_config",
     ),
-
     // == evidence-ui-gdi-sys ==
     //
     // UI/GDI/system surface: user32 focus/message/ANSI variants, the gdi32
@@ -5395,7 +5394,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "setupapi.dll",
         "SetupDiUninstallDevice",
         "casa1-conformance:evidence_ui_gdi_setupapi_device_info_sets",
-
     ),
 ];
 
@@ -5514,19 +5512,16 @@ mod tests {
         "evidence_math_crt_stdio",
         "evidence_math_crt_vcruntime",
         "evidence_math_crt_msvcp",
-
         "evidence_net_sys_winsock_socket_lifecycle",
         "evidence_net_sys_winsock_dns_service_and_conversion_helpers",
         "evidence_net_sys_sspi_handshake_envelopes_and_message_protection",
         "evidence_net_sys_iphlpapi_tables_from_guest_config",
         "evidence_net_sys_netapi32_workstation_and_user_info",
-
         "evidence_ui_gdi_focus_and_message_a_thunks",
         "evidence_ui_gdi_bitmap_dc_object_thunks",
         "evidence_ui_gdi_draw_region_and_blend_thunks",
         "evidence_ui_gdi_psapi_guest_process_thunks",
         "evidence_ui_gdi_setupapi_device_info_sets",
-
         "cef-unit-tests",
         "network-unit-tests",
         "runtime-dispatch-tests",

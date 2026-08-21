@@ -103485,14 +103485,6 @@ mod tests {
                 get_name,
                 &[0, 0 /* main module */, name_buf as u32, 128],
             );
-
-            assert!(written > 0, "GetModuleFileNameExW returns the char count");
-            let name = read_utf16_string(&memory, name_buf).expect("module path");
-            assert_eq!(
-                name, "C:\\Games\\SampleGame\\game.ex",
-                "the module path is written up to the buffer's NUL slot"
-            );
-
             assert_eq!(
                 written, 28,
                 "GetModuleFileNameExW returns the full char count when the buffer fits"
@@ -103501,7 +103493,6 @@ mod tests {
             assert_eq!(
                 name, "C:\\Games\\SampleGame\\game.exe",
                 "the module path is written in full when the buffer fits"
-
             );
 
             let info = 0x30_100_u64;
@@ -103534,7 +103525,6 @@ mod tests {
             );
         })
     }
-    // -- winspool.drv dispatch ------------------------------------------------
 
     fn write_guest_utf16(memory: &mut MemoryImage, address: u64, value: &str) {
         let mut bytes = Vec::new();
@@ -112019,8 +112009,6 @@ mod tests {
             );
             assert_eq!(result, 0x8007_0057);
         })
-
-
     }
 
     // ── Evidence-ui-gdi-sys: user32 focus/message/ANSI surface ───────────────
@@ -113519,7 +113507,6 @@ mod tests {
             );
             assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
         })
-
     }
 }
 
