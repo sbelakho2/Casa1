@@ -154,6 +154,7 @@ pub fn object_type_name(object_type: ObjectType) -> &'static str {
         ObjectType::Pipe => "File",
         ObjectType::DirectorySearch => "File",
         ObjectType::Socket => "File",
+        ObjectType::WindowStation => "WindowStation",
     }
 }
 

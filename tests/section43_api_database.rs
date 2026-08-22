@@ -77,11 +77,21 @@ fn database_seeds_from_thunk_metadata_with_levels() {
 
     // Stub entries are seeded with their metadata levels; the kernel32 core
     // surface (GetVersionExA and the interlocked/environment/INI/search
-    // family) is Implemented with evidence_core_* conformance suites.
+    // family) is Implemented with evidence_core_* conformance suites, and
+    // the partials/stubs-3 wave implemented the resource table (FindResourceA
+    // serves the module's .rsrc directory) with conformance evidence.
     let find_resource = database
         .lookup("kernel32.dll", "FindResourceA")
         .expect("FindResourceA must be seeded");
-    assert_eq!(find_resource.implementation, ImplementationLevel::Stub);
+    assert_eq!(
+        find_resource.implementation,
+        ImplementationLevel::Implemented
+    );
+    assert_eq!(
+        find_resource.semantic_test_coverage,
+        CoverageLevel::Conformance,
+        "FindResourceA is proven by the resources-and-ioctl suite"
+    );
     let version_ex_a = database
         .lookup("kernel32.dll", "GetVersionExA")
         .expect("GetVersionExA must be seeded");
@@ -574,28 +584,33 @@ fn optional_feature_entries_pass_when_the_profile_excludes_them() {
 #[test]
 fn seeded_deliberately_unsupported_entries_carry_compatibility_errors() {
     let database = ApiDatabase::from_thunk_metadata();
-    // IsDebuggerPresent's FALSE answer is the deliberate anti-debug answer.
-    let error = database
-        .deliberately_unsupported_error("kernel32.dll", "IsDebuggerPresent")
-        .expect("IsDebuggerPresent must be seeded as deliberately unsupported");
-    assert!(error.contains("FALSE"));
-    // The deliberately-unsupported stub is not a SHIPPING violation ...
+    // The partials/stubs-3 wave implemented the anti-debug stub: the
+    // debugger flag is a real runtime state, IsDebuggerPresent reads it, and
+    // the debugger/affinity/switch-and-suspend suite proves the behavior.
+    let is_debugger = database
+        .lookup("kernel32.dll", "IsDebuggerPresent")
+        .expect("IsDebuggerPresent must be seeded");
+    assert_eq!(is_debugger.implementation, ImplementationLevel::Implemented);
+    assert_eq!(
+        is_debugger.semantic_test_coverage,
+        CoverageLevel::Conformance,
+        "IsDebuggerPresent is proven by the debugger/affinity/switch suite"
+    );
+    // Implemented + conformance: no shipping violation and NO completeness
+    // violation.
     assert!(
         !database
             .shipping_gate()
             .iter()
             .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
-        "deliberately-unsupported stubs must not be shipping violations"
+        "an implemented, evidenced IsDebuggerPresent is not a shipping violation"
     );
-    // ... but it IS a NativeUserMode completeness violation (user-mode Stub).
     assert!(
-        database
+        !database
             .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
             .iter()
-            .any(|v| v.dll == "kernel32.dll"
-                && v.export == "IsDebuggerPresent"
-                && v.kind == ApiGateViolationKind::StubNotDeliberatelyUnsupported),
-        "a user-mode Stub is an honest completeness violation"
+            .any(|v| v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent"),
+        "an implemented, evidenced IsDebuggerPresent is not a completeness violation"
     );
 }
 
@@ -1120,12 +1135,22 @@ fn coverage_registry_merges_conformance_only_where_suite_evidence_exists() {
     // database (an honest violation, never an inferred one).
     let database = ApiDatabase::from_thunk_metadata();
     let entry = database
-        .lookup("kernel32.dll", "FindResourceA")
-        .expect("FindResourceA entry");
+        .lookup("user32.dll", "DialogBoxParamA")
+        .expect("DialogBoxParamA entry");
     assert_eq!(
         entry.semantic_test_coverage,
         CoverageLevel::None,
-        "no evidence row exists for FindResourceA"
+        "no evidence row exists for DialogBoxParamA"
+    );
+    // FindResourceA now HAS evidence (the resources-and-ioctl suite drives
+    // the module resource table through the thunks).
+    let find_resource = database
+        .lookup("kernel32.dll", "FindResourceA")
+        .expect("FindResourceA entry");
+    assert_eq!(
+        find_resource.semantic_test_coverage,
+        CoverageLevel::Conformance,
+        "FindResourceA is proven by the resources-and-ioctl suite"
     );
 }
 

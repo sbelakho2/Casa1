@@ -61,6 +61,7 @@ pub enum ObjectType {
     Pipe,
     DirectorySearch,
     Socket,
+    WindowStation,
 }
 
 /// Non-consuming satisfiability result for scheduler wait evaluation.
@@ -354,6 +355,16 @@ pub(crate) enum KernelObject {
     Pipe(PipeObject),
     DirectorySearch(DirectorySearchObject),
     Socket(SocketObject),
+    WindowStation(WindowStationObject),
+}
+
+/// A window station object (`WinSta0`).  The runtime models the single
+/// interactive window station every process is attached to; the name is the
+/// object's only payload (the USER object hierarchy it names is the
+/// [`crate::user32::User32Subsystem`] window tree).
+#[derive(Debug, Clone)]
+pub(crate) struct WindowStationObject {
+    pub(crate) name: String,
 }
 
 /// Canonicalize a named-object string for the unified namespace: strips the

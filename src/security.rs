@@ -5415,6 +5415,7 @@ pub fn win_verify_trust(policy_guid: WinTrustPolicyGuid, pe_data: &[u8]) -> WinV
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -6746,6 +6747,97 @@ impl Certificate {
             is_root,
         })
     }
+}
+
+/// Parse the X.509 validity SEQUENCE from a DER certificate and return
+/// `(not_before, not_after)` as Unix seconds since the epoch.
+///
+/// The walk mirrors `extract_basic_cert_info`: Certificate ::= SEQUENCE {
+/// tbsCertificate TBSCertificate, ... } and TBSCertificate's fourth field is
+/// `validity SEQUENCE { notBefore Time, notAfter Time }` (Time is UTCTime
+/// 0x17 or GeneralizedTime 0x18, both with a trailing `Z`).
+pub fn parse_x509_validity(der: &[u8]) -> Option<(i64, i64)> {
+    let mut off = 0;
+    let (outer_tag, cert_start, _cert_len) = der_read_tlv(der, &mut off)?;
+    if outer_tag != 0x30 {
+        return None;
+    }
+    let mut tbs = cert_start;
+    let (tbs_tag, tbs_start, tbs_len) = der_read_tlv(der, &mut tbs)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
+    let tbs_end = tbs_start + tbs_len;
+    let mut p = tbs_start;
+    // version [0] EXPLICIT (optional)
+    if p < tbs_end && *der.get(p).unwrap_or(&0) == 0xa0 {
+        der_read_tlv(der, &mut p)?;
+    }
+    // serialNumber INTEGER
+    let (st, _, _) = der_read_tlv(der, &mut p)?;
+    if st != 0x02 {
+        return None;
+    }
+    // signature AlgorithmIdentifier SEQUENCE
+    der_read_tlv(der, &mut p)?;
+    // issuer SEQUENCE
+    der_read_tlv(der, &mut p)?;
+    // validity SEQUENCE { notBefore Time, notAfter Time }
+    let (val_tag, val_start, val_len) = der_read_tlv(der, &mut p)?;
+    if val_tag != 0x30 {
+        return None;
+    }
+    let val_end = val_start + val_len;
+    let mut v = val_start;
+    let (nb_tag, nb_start, nb_len) = der_read_tlv(der, &mut v)?;
+    let nb = parse_der_time(der, nb_tag, nb_start, nb_len)?;
+    let (na_tag, na_start, na_len) = der_read_tlv(der, &mut v)?;
+    if v > val_end {
+        return None;
+    }
+    let na = parse_der_time(der, na_tag, na_start, na_len)?;
+    Some((nb, na))
+}
+
+/// Parse one DER Time value (UTCTime 0x17 / GeneralizedTime 0x18) into Unix
+/// seconds.  Only the `Z` (UTC) form is accepted; the two-digit UTCTime year
+/// is mapped onto 1950..2049 like the DER spec requires.
+fn parse_der_time(der: &[u8], tag: u8, start: usize, len: usize) -> Option<i64> {
+    if !matches!(tag, 0x17 | 0x18) || start + len > der.len() {
+        return None;
+    }
+    let text = std::str::from_utf8(&der[start..start + len]).ok()?;
+    let text = text.strip_suffix('Z').or_else(|| text.strip_suffix('z'))?;
+    let digits = text.len();
+    let year = if tag == 0x17 && digits == 12 {
+        // YYMMDDHHMMSS — 50..99 → 1950..1999, 0..49 → 2000..2049.
+        let yy: i64 = text[0..2].parse().ok()?;
+        if yy >= 50 { 1900 + yy } else { 2000 + yy }
+    } else if tag == 0x18 && digits == 14 {
+        // YYYYMMDDHHMMSS
+        text[0..4].parse().ok()?
+    } else {
+        return None;
+    };
+    let month: i64 = text[digits - 10..digits - 8].parse().ok()?;
+    let day: i64 = text[digits - 8..digits - 6].parse().ok()?;
+    let hour: i64 = text[digits - 6..digits - 4].parse().ok()?;
+    let minute: i64 = text[digits - 4..digits - 2].parse().ok()?;
+    let second: i64 = text[digits - 2..].parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 /// Minimal DER-based certificate info extraction (fallback when x509-cert parse fails).

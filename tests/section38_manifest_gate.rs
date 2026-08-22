@@ -813,42 +813,54 @@ fn manifest_content_is_stable() {
 /// the cycle runs.
 #[test]
 fn manifest_gate_via_host_thunk_dispatch() {
-    let (_cleanup, _win32) = setup();
-    let ge = GameEnvironment::from_root(repo_ge_root()).expect("open steam-live-run-x86 GE");
-    let result = casa1::pe_runtime::thunk_drive_manifest_gate(ge).expect("thunk-level gate");
-    assert!(
-        result.manifest_open_ok,
-        "CreateFileW(OPEN_EXISTING) through the thunk layer must open the manifest",
-    );
-    assert!(
-        result.manifest_read_ok,
-        "ReadFile through the thunk layer must succeed",
-    );
-    assert_eq!(
-        result.manifest_bytes,
-        read_manifest_from_disk(),
-        "manifest bytes read through the thunk layer must match the disk exactly",
-    );
-    assert!(
-        result.probe_create_ok,
-        "the C:\\.crash writability probe create must succeed through the thunk layer",
-    );
-    assert!(
-        result.probe_delete_ok,
-        "the C:\\.crash writability probe delete must succeed through the thunk layer",
-    );
-    // The instrumentation hooks saw the same cycle: manifest opened, a full
-    // read completed, and the write-open of the probe path was recorded.
-    assert!(
-        result.milestones.steam.manifest_opened.is_some(),
-        "manifest open must be recorded as milestone evidence",
-    );
-    assert!(
-        result.milestones.steam.manifest_full_read.is_some(),
-        "manifest full read must be recorded as milestone evidence",
-    );
-    assert!(
-        result.milestones.steam.package_writability_probe.is_some(),
-        "the probe write-open must be recorded as writability-probe evidence",
-    );
+    // The dispatch match frame exceeds libtest's 2 MiB test-thread stack in
+    // debug builds (same reason every dispatch-heavy runtime test runs on
+    // the 8 MiB big-stack thread).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (_cleanup, _win32) = setup();
+            let ge =
+                GameEnvironment::from_root(repo_ge_root()).expect("open steam-live-run-x86 GE");
+            let result =
+                casa1::pe_runtime::thunk_drive_manifest_gate(ge).expect("thunk-level gate");
+            assert!(
+                result.manifest_open_ok,
+                "CreateFileW(OPEN_EXISTING) through the thunk layer must open the manifest",
+            );
+            assert!(
+                result.manifest_read_ok,
+                "ReadFile through the thunk layer must succeed",
+            );
+            assert_eq!(
+                result.manifest_bytes,
+                read_manifest_from_disk(),
+                "manifest bytes read through the thunk layer must match the disk exactly",
+            );
+            assert!(
+                result.probe_create_ok,
+                "the C:\\.crash writability probe create must succeed through the thunk layer",
+            );
+            assert!(
+                result.probe_delete_ok,
+                "the C:\\.crash writability probe delete must succeed through the thunk layer",
+            );
+            // The instrumentation hooks saw the same cycle: manifest opened, a full
+            // read completed, and the write-open of the probe path was recorded.
+            assert!(
+                result.milestones.steam.manifest_opened.is_some(),
+                "manifest open must be recorded as milestone evidence",
+            );
+            assert!(
+                result.milestones.steam.manifest_full_read.is_some(),
+                "manifest full read must be recorded as milestone evidence",
+            );
+            assert!(
+                result.milestones.steam.package_writability_probe.is_some(),
+                "the probe write-open must be recorded as writability-probe evidence",
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }

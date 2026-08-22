@@ -145,6 +145,19 @@ pub(crate) enum GuestObjectKind {
     ContextMenu,
     /// IPropertyStore COM object.
     PropertyStore,
+    // ── Well-known automation objects (CoCreateInstance) ─────────────────────
+    /// Shell.Application (IShellDispatch).
+    ShellApplication,
+    /// Scripting.FileSystemObject (IFileSystem).
+    FileSystemObject,
+    /// WScript.Shell (IWshShell).
+    WshShell,
+    /// ADODB.Connection / ADODB.Recordset.
+    AdoConnection,
+    /// InternetExplorer.Application (IWebBrowser2).
+    InternetExplorerObject,
+    /// Microsoft.XMLHTTP (IXMLHTTPRequest).
+    XmlHttpObject,
     /// IXMLDOMDocument COM object.
     XmlDomDocument,
     /// IMoniker COM object (URL moniker).
@@ -577,6 +590,69 @@ pub(crate) struct PeHostRuntime {
     pub(crate) cert_store_names: BTreeMap<u64, String>,
     /// Maps cert context handle → raw DER bytes for certificates created via CertCreateCertificateContext.
     pub(crate) cert_contexts: BTreeMap<u64, Vec<u8>>,
+    /// Maps cert context handle → parsed certificate fields (subject, issuer,
+    /// serial, validity) for CertCreateCertificateContext /
+    /// CertGetCertificateChain.
+    pub(crate) cert_parsed: BTreeMap<u64, ParsedCertificate>,
+    // ── Console state (kernel32 console surface) ────────────────────────────
+    /// The console state `GetConsoleCP`/`GetConsoleMode`/`ReadConsole*` /
+    /// `SetConsoleCtrlHandler` all serve from — one state, many thunks.
+    pub(crate) console: ConsoleState,
+    /// Handles that refer to the console INPUT buffer (opened via
+    /// `CreateFileW("CONIN$")` or recognized console handles).
+    pub(crate) console_input_handles: BTreeSet<u32>,
+    /// Handles that refer to the console OUTPUT buffer (opened via
+    /// `CreateFileW("CONOUT$")`/`CONERR$`).
+    pub(crate) console_output_handles: BTreeSet<u32>,
+    // ── Debugger state ──────────────────────────────────────────────────────
+    /// `IsDebuggerPresent` reads the runtime's debugger flag (the model of
+    /// the PEB `BeingDebugged` byte; the live session may attach a debugger
+    /// later).  Default false — the guest runs undebugged.
+    pub(crate) debugger_present: bool,
+    // ── Affinity state ──────────────────────────────────────────────────────
+    /// The process affinity mask (defaults to the runtime's fixed 8-core
+    /// topology mask 0xFF — the same mask GetSystemInfo reports).
+    pub(crate) process_affinity_mask: u64,
+    /// Per-thread affinity masks (thread id → mask; absent = process mask).
+    pub(crate) thread_affinity_masks: BTreeMap<u32, u64>,
+    // ── Std-handle overrides (SetStdHandle) ─────────────────────────────────
+    /// `SetStdHandle` overrides by `STD_*_HANDLE` constant; `GetStdHandle`
+    /// serves the override when present, otherwise the pseudo-handle itself.
+    pub(crate) std_handle_overrides: BTreeMap<u32, u64>,
+    // ── Heap introspection state ────────────────────────────────────────────
+    /// `HeapWalk` iteration cursors keyed by heap handle (the next
+    /// allocation index to report).
+    pub(crate) heap_walk_cursors: BTreeMap<u64, usize>,
+    /// Heaps currently held by `HeapLock` (HeapUnlock clears; a locked heap
+    /// is still fully functional in the cooperative model — the lock is a
+    /// serialization token, and the single pump thread already serializes).
+    pub(crate) heap_locked: BTreeSet<u64>,
+    /// `HeapSetInformation(HeapCompatibilityInformation)` per heap (0 =
+    /// default, 1/2 = LFH).  `HeapQueryInformation` reads it back.
+    pub(crate) heap_information: BTreeMap<u64, u32>,
+    // ── Resource table (FindResourceA / LoadResource) ───────────────────────
+    /// `FindResourceA` handles → resource data (pointer + size).  The data
+    /// lives at `data_ptr` (either the mapped module image for the main
+    /// module, or a runtime heap copy for synthetic modules).
+    pub(crate) resource_entries: BTreeMap<u64, ResourceEntry>,
+    /// Next `FindResourceA` handle value.
+    pub(crate) next_resource_handle: u64,
+    // ── Font memory resources (AddFontMemResourceEx) ────────────────────────
+    /// `AddFontMemResourceEx` registrations: handle → font bytes.  The
+    /// handle value IS the base address of the guest buffer (Windows
+    /// semantics), and the bytes are retained so the GDI font table can
+    /// serve them.
+    pub(crate) font_mem_resources: BTreeMap<u64, Vec<u8>>,
+    /// Next synthetic font-resource handle (for zero-length buffers).
+    pub(crate) next_font_resource_handle: u64,
+    // ── Pixel formats (ChoosePixelFormat / SetPixelFormat) ──────────────────
+    /// Per-DC pixel format index (SetPixelFormat).  The runtime models one
+    /// fixed pixel format (index 1: 32-bit, double-buffered, composited).
+    pub(crate) dc_pixel_formats: BTreeMap<u64, u32>,
+    // ── Foreground grants (AllowSetForegroundWindow) ────────────────────────
+    /// Guest pids granted the foreground-activation right by
+    /// `AllowSetForegroundWindow` (the current process is always granted).
+    pub(crate) foreground_grants: BTreeSet<u32>,
     /// Tracks certificate enumeration position per store (store_handle → next_index).
     pub(crate) cert_enum_cursors: BTreeMap<u64, usize>,
     /// Phase L3: Maps window handle (hwnd) → IDropTarget pointer for drag-and-drop.
@@ -1074,6 +1150,67 @@ pub(crate) struct GdiFont {
     pub(crate) height: i32,
 }
 
+/// The kernel32 console state: the input/output code pages, the input and
+/// output buffer modes, the pending input queue (fed by the host console or
+/// tests; `ReadConsoleA`/`ReadConsoleW` consume it), and the registered
+/// `PHANDLER_ROUTINE` control-handler callbacks (`SetConsoleCtrlHandler`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConsoleState {
+    /// `GetConsoleCP` answer (defaults to the OEM code page 437).
+    pub(crate) input_cp: u32,
+    /// `GetConsoleOutputCP` answer (defaults to the OEM code page 437).
+    #[allow(dead_code)] // console output-codepage state (future console APIs)
+    pub(crate) output_cp: u32,
+    /// Input-buffer mode (`GetConsoleMode` on an input handle).
+    pub(crate) input_mode: u32,
+    /// Output-buffer mode (`GetConsoleMode` on an output handle).
+    pub(crate) output_mode: u32,
+    /// Pending console input characters (UTF-16 units), consumed by
+    /// `ReadConsoleA`/`ReadConsoleW`.
+    pub(crate) input_queue: VecDeque<u16>,
+    /// `SetConsoleCtrlHandler` guest callbacks (PHANDLER_ROUTINE addresses).
+    pub(crate) control_handlers: Vec<u64>,
+    /// Whether `SetConsoleCtrlHandler(NULL, TRUE)` has installed the
+    /// ignore-default flag (the handler list is then preserved).
+    pub(crate) ignore_ctrl_c: bool,
+}
+
+/// One `FindResourceA`/`LoadResource` tracking entry: the resource's data
+/// pointer (in guest space), byte size, and the module/offset needed to
+/// materialize the bytes on `LoadResource` for non-mapped modules.
+#[derive(Debug, Clone)]
+pub(crate) struct ResourceEntry {
+    /// Guest pointer to the resource bytes (0 until `LoadResource` for
+    /// non-mapped modules).
+    pub(crate) data_ptr: u64,
+    /// Byte size of the resource payload.
+    pub(crate) size: u32,
+    /// Host path of the module the resource came from.
+    pub(crate) module_path: String,
+    /// RVA of the payload inside the module image.
+    pub(crate) load_rva: u32,
+    /// True when the module image (including .rsrc) is mapped in guest
+    /// memory — `data_ptr` is then valid immediately.
+    pub(crate) mapped: bool,
+}
+
+/// Parsed certificate fields for a `CertCreateCertificateContext` context,
+/// serving `CertGetCertificateChain` chain building and trust evaluation.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParsedCertificate {
+    pub(crate) subject: String,
+    pub(crate) issuer: String,
+    #[allow(dead_code)] // parsed metadata for CertGetCertificateChain consumers
+    pub(crate) serial_number: String,
+    #[allow(dead_code)] // parsed metadata for CertGetCertificateChain consumers
+    pub(crate) thumbprint: Vec<u8>,
+    pub(crate) is_root: bool,
+    /// Unix seconds of `notBefore` (0 when the DER had no parseable validity).
+    pub(crate) not_before: i64,
+    /// Unix seconds of `notAfter` (0 when the DER had no parseable validity).
+    pub(crate) not_after: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProgressBarState {
     pub(crate) min: i32,
@@ -1233,6 +1370,31 @@ impl PeHostRuntime {
             cert_store_manager: crate::security::CertificateStoreManager::new(),
             cert_store_names: BTreeMap::new(),
             cert_contexts: BTreeMap::new(),
+            cert_parsed: BTreeMap::new(),
+            console: ConsoleState {
+                input_cp: 437,
+                output_cp: 437,
+                input_mode: 0x1A1, // ENABLE_PROCESSED_INPUT|ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_INSERT_MODE|ENABLE_QUICK_EDIT_MODE
+                output_mode: 0x1,  // ENABLE_PROCESSED_OUTPUT
+                input_queue: VecDeque::new(),
+                control_handlers: Vec::new(),
+                ignore_ctrl_c: false,
+            },
+            console_input_handles: BTreeSet::new(),
+            console_output_handles: BTreeSet::new(),
+            debugger_present: false,
+            process_affinity_mask: 0xFF,
+            thread_affinity_masks: BTreeMap::new(),
+            std_handle_overrides: BTreeMap::new(),
+            heap_walk_cursors: BTreeMap::new(),
+            heap_locked: BTreeSet::new(),
+            heap_information: BTreeMap::new(),
+            resource_entries: BTreeMap::new(),
+            next_resource_handle: 0x52000001,
+            font_mem_resources: BTreeMap::new(),
+            next_font_resource_handle: 0x51000001,
+            dc_pixel_formats: BTreeMap::new(),
+            foreground_grants: BTreeSet::new(),
             cert_enum_cursors: BTreeMap::new(),
             drop_targets: BTreeMap::new(),
             next_drop_target_id: 0xDD010000,
