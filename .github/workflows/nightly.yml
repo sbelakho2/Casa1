@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install FFmpeg system dependencies (all-features build needs them)
+        run: brew install ffmpeg
       - name: Test with all features
         run: cargo test --all-features
 
@@ -47,8 +49,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check with metal feature
-        run: cargo check --all-targets --features metal
+      - name: Check all targets (Metal is mandatory, no feature flag)
+        run: cargo check --all-targets
 
   check-vulkan:
     name: Check Vulkan
@@ -94,7 +96,7 @@ jobs:
       - name: Run nightly lib/bins tests
         run: cargo +nightly test --lib --bins
       - name: Test nightly UBSAN if supported
-        run: ./ci/run_nightly_ubsan_if_supported.sh
+        run: bash ci/run_nightly_ubsan_if_supported.sh
 
   fuzz-build:
     name: Fuzz Build (nightly)

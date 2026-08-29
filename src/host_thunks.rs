@@ -15925,7 +15925,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     // Stage-4 NTDLL foundation: the native Windows API layer
     meta(
@@ -15937,7 +15937,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -15948,7 +15948,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -15959,7 +15959,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -15970,7 +15970,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -15981,7 +15981,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -15992,7 +15992,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16003,7 +16003,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16014,7 +16014,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16025,7 +16025,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16036,7 +16036,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16047,7 +16047,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16058,7 +16058,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16069,7 +16069,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16080,7 +16080,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16091,7 +16091,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16102,7 +16102,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16113,7 +16113,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16124,7 +16124,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16135,7 +16135,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16146,7 +16146,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16157,7 +16157,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16168,7 +16168,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16179,7 +16179,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16190,7 +16190,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16201,7 +16201,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16212,7 +16212,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16223,7 +16223,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16234,7 +16234,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16245,7 +16245,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16256,7 +16256,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16267,7 +16267,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16278,7 +16278,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16289,7 +16289,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16300,7 +16300,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16311,7 +16311,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16322,7 +16322,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16333,7 +16333,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16344,7 +16344,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16355,7 +16355,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16366,7 +16366,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16377,7 +16377,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16388,7 +16388,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16399,7 +16399,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16410,7 +16410,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16421,7 +16421,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16432,7 +16432,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16443,7 +16443,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16454,7 +16454,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16465,7 +16465,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16476,7 +16476,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16487,7 +16487,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16498,7 +16498,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16509,7 +16509,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16520,7 +16520,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16531,7 +16531,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16542,7 +16542,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16553,7 +16553,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     // Stage-4 Ldr loader chain: the native loader surface — every Ldr
     // entry point is a thin wrapper over the SAME loader machinery the
@@ -16567,7 +16567,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16578,7 +16578,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16589,7 +16589,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16600,7 +16600,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16611,7 +16611,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16622,7 +16622,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16633,7 +16633,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
@@ -16644,7 +16644,7 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
         ImplementationLevel::Implemented,
         ArchMask::ANY,
         WindowsVersion::Any,
-        SupportPolicy::OutsideUserModeProfile,
+        SupportPolicy::Required,
     ),
     meta(
         "ntdll.dll",
