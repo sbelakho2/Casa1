@@ -1072,10 +1072,22 @@ fn coverage_registry_maps_suite_evidenced_apis_to_conformance_levels() {
             "GetTickCount",
             "casa1-conformance:section50_win32_nt_consistency",
         ),
-        ("kernel32.dll", "CloseHandle", "casa1-conformance:section38_manifest_gate"),
+        (
+            "kernel32.dll",
+            "CloseHandle",
+            "casa1-conformance:section38_manifest_gate",
+        ),
         ("ntdll.dll", "LdrLoadDll", "casa1-conformance:section48_ldr"),
-        ("ntdll.dll", "NtCreateEvent", "casa1-conformance:section47_ntdll"),
-        ("ntdll.dll", "NtSetEvent", "casa1-conformance:section47_ntdll"),
+        (
+            "ntdll.dll",
+            "NtCreateEvent",
+            "casa1-conformance:section47_ntdll",
+        ),
+        (
+            "ntdll.dll",
+            "NtSetEvent",
+            "casa1-conformance:section47_ntdll",
+        ),
         (
             "ntdll.dll",
             "NtQuerySystemTime",
