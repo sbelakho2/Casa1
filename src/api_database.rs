@@ -866,6 +866,90 @@ static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
         "simulates the unwind by adjusting RIP to the target; no full SEH frame-walk of \
          the guest stack",
     ),
+    (
+        "kernel32.dll",
+        "ReadConsoleA",
+        "console input is not available in VM mode — the thunk reports the documented \
+         failure instead of reading real console input",
+    ),
+    (
+        "kernel32.dll",
+        "ReadConsoleW",
+        "console input is not available in VM mode — the thunk reports the documented \
+         failure instead of reading real console input",
+    ),
+    (
+        "user32.dll",
+        "MessageBoxA",
+        "headless message box: the button type is ignored and IDOK is always returned, \
+         which is not valid Windows behavior for MB_YESNO/MB_RETRYCANCEL-style \
+         combinations",
+    ),
+    (
+        "user32.dll",
+        "GetUserObjectInformationW",
+        "UOI_TYPE and other classes are not modeled — only the documented subset \
+         (UOI_FLAGS) is implemented",
+    ),
+    (
+        "gdi32.dll",
+        "ChoosePixelFormat",
+        "exposes one fixed 32-bit double-buffered composited pixel format and rejects \
+         other valid requests",
+    ),
+    (
+        "gdi32.dll",
+        "SetPixelFormat",
+        "exposes one fixed 32-bit double-buffered composited pixel format and rejects \
+         other valid requests",
+    ),
+    (
+        "kernel32.dll",
+        "SetConsoleCtrlHandler",
+        "handler state is recorded but the headless console never delivers normal \
+         console control events",
+    ),
+    (
+        "ws2_32.dll",
+        "WSARecv",
+        "scatter/gather and OVERLAPPED state are real, but completion routines/APCs are \
+         not delivered and overlapped work collapses into synchronous completion",
+    ),
+    (
+        "ws2_32.dll",
+        "WSARecvFrom",
+        "scatter/gather and OVERLAPPED state are real, but completion routines/APCs are \
+         not delivered and overlapped work collapses into synchronous completion",
+    ),
+    (
+        "ws2_32.dll",
+        "WSASend",
+        "scatter/gather and OVERLAPPED state are real, but completion routines/APCs are \
+         not delivered and overlapped work collapses into synchronous completion",
+    ),
+    (
+        "ws2_32.dll",
+        "WSASendTo",
+        "scatter/gather and OVERLAPPED state are real, but completion routines/APCs are \
+         not delivered and overlapped work collapses into synchronous completion",
+    ),
+    (
+        "gdi32.dll",
+        "GetTextMetricsW",
+        "metrics are approximate (previously zeros except height) and do not yet reflect \
+         the actual selected font/text engine closely enough for Windows contracts",
+    ),
+    (
+        "gdi32.dll",
+        "CombineRgn",
+        "nontrivial regions are reduced to bounding-box approximations",
+    ),
+    (
+        "shell32.dll",
+        "SHGetFileInfoW",
+        "restricted semantics for the implemented flags (icon/display-name/attributes \
+         subsets); several SHGFI_* classes return approximate or zero results",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
