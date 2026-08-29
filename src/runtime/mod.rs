@@ -63409,17 +63409,6 @@ impl PeHostRuntime {
             GuestObjectKind::XAudio2MasteringVoice | GuestObjectKind::XAudio2SourceVoice => {
                 self.destroy_xaudio2_voice_object(address)?
             }
-            kind @ (GuestObjectKind::ComStream
-            | GuestObjectKind::ComStorage
-            | GuestObjectKind::ComDataObject
-            | GuestObjectKind::ComOleObject
-            | GuestObjectKind::ComOleInPlaceObject
-            | GuestObjectKind::ComObjectWithSite) => {
-                // COM objects: the per-kind destroyers the ole32 layer
-                // registers; the runtime's guest-object table handles the
-                // refcount teardown.
-                let _ = kind;
-            }
             GuestObjectKind::DxgiFactory => self.destroy_dxgi_factory_object(address)?,
             GuestObjectKind::DxgiAdapter => self.destroy_dxgi_adapter_object(address)?,
             GuestObjectKind::D3d11Device => self.destroy_d3d11_device_object(address)?,
@@ -63629,7 +63618,6 @@ impl PeHostRuntime {
                 // refcount (tracked in guest_objects).
                 self.guest_objects.remove(&address);
             }
-            _ => {}
         }
         Ok(0)
     }
