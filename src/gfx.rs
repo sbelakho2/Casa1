@@ -3583,12 +3583,12 @@ fn encode_ppm(width: u32, height: u32, format: DxgiFormat, bytes: &[u8]) -> AppR
     ppm.reserve(pixel_count * 3);
     match format {
         DxgiFormat::R8G8B8A8Unorm | DxgiFormat::R8G8B8A8UnormSrgb => {
-            for chunk in bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in bytes[..expected_bytes].as_chunks::<4>().0 {
                 ppm.extend_from_slice(&chunk[..3]);
             }
         }
         DxgiFormat::B8G8R8A8Unorm | DxgiFormat::B8G8R8A8UnormSrgb | DxgiFormat::B8G8R8X8Unorm => {
-            for chunk in bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in bytes[..expected_bytes].as_chunks::<4>().0 {
                 ppm.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
             }
         }

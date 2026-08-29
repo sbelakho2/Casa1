@@ -148,7 +148,9 @@ fn run_parser(kind: &str, data: &[u8]) {
                 padded.push(0);
             }
             let words: Vec<u32> = padded
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             let mut translator = casa1::vkgl::SpirvTranslator::new();

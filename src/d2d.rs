@@ -535,7 +535,7 @@ impl HwndRenderTarget {
             let pattern = argb_color.to_le_bytes();
             let row_len = (self.width as usize) * 4;
             for row in self.pixels.chunks_exact_mut(row_len) {
-                for chunk in row.chunks_exact_mut(4) {
+                for chunk in row.as_chunks_mut::<4>().0 {
                     chunk.copy_from_slice(&pattern);
                 }
             }

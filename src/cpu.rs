@@ -21642,7 +21642,7 @@ fn execute_cold_path(
         }
         IrInstruction::Blsi { dst, src } => {
             let val = state.get(*src);
-            let result = val & val.wrapping_neg();
+            let result = val.isolate_lowest_one();
             state.set(*dst, result);
             state.flags = logic_flags(result, 64);
         }
@@ -26975,7 +26975,7 @@ fn parity(value: u8) -> bool {
 fn bit_deposit(mut source: u64, mut mask: u64) -> u64 {
     let mut result = 0_u64;
     while mask != 0 {
-        let lowest = mask & mask.wrapping_neg();
+        let lowest = mask.isolate_lowest_one();
         if source & 1 != 0 {
             result |= lowest;
         }
@@ -26989,7 +26989,7 @@ fn bit_extract(source: u64, mut mask: u64) -> u64 {
     let mut result = 0_u64;
     let mut bit = 0_u32;
     while mask != 0 {
-        let lowest = mask & mask.wrapping_neg();
+        let lowest = mask.isolate_lowest_one();
         if source & lowest != 0 {
             result |= 1_u64 << bit;
         }

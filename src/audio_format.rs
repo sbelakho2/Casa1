@@ -595,7 +595,9 @@ pub fn convert_i32_to_i16(data: &[i32]) -> Vec<i16> {
 
 /// Convert 24-bit signed PCM (packed in 3 bytes, little-endian) to 16-bit PCM.
 pub fn convert_i24_to_i16(data: &[u8]) -> Vec<i16> {
-    data.chunks_exact(3)
+    data.as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| {
             let raw = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
             // Sign-extend from 24-bit
@@ -638,14 +640,18 @@ pub fn decode_to_pcm16(
                 8 => convert_u8_to_i16(data),
                 16 => {
                     // Already 16-bit LE PCM; reinterpret bytes as i16
-                    data.chunks_exact(2)
+                    data.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                         .collect()
                 }
                 24 => convert_i24_to_i16(data),
                 32 => {
                     // 32-bit integer PCM
-                    data.chunks_exact(4)
+                    data.as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|chunk| {
                             let val = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                             (val >> 16).clamp(i16::MIN as i32, i16::MAX as i32) as i16
@@ -659,7 +665,9 @@ pub fn decode_to_pcm16(
         0x0003 => {
             // IEEE float → i16
             let float_samples: Vec<f32> = data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             convert_f32_to_i16(&float_samples)

@@ -1242,7 +1242,9 @@ pub fn float_to_u8_pcm(samples: &[f32]) -> Vec<u8> {
 /// Range: -8388608..8388607 maps to -1.0..+1.0.
 pub fn pcm24_to_float(samples: &[u8]) -> Vec<f32> {
     samples
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| {
             let b0 = chunk[0] as i32;
             let b1 = chunk[1] as i32;
@@ -1262,7 +1264,9 @@ pub fn pcm24_to_float(samples: &[u8]) -> Vec<f32> {
 /// where the most significant byte is zero.
 pub fn pcm24_in_32_to_float(samples: &[u8]) -> Vec<f32> {
     samples
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| {
             let b0 = chunk[0] as i32;
             let b1 = chunk[1] as i32;
@@ -1334,7 +1338,9 @@ pub fn pcm_bytes_to_float(
     match wave_format_tag {
         0x0003 => {
             // IEEE float — 32-bit
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect()
         }
@@ -1342,7 +1348,9 @@ pub fn pcm_bytes_to_float(
             8 => u8_to_float(data),
             16 => {
                 let i16_samples: Vec<i16> = data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect();
                 pcm16_to_float(&i16_samples)
@@ -1350,7 +1358,9 @@ pub fn pcm_bytes_to_float(
             24 => pcm24_to_float(data),
             32 => {
                 let i32_samples: Vec<i32> = data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect();
                 pcm32_to_float(&i32_samples)

@@ -627,8 +627,8 @@ mod tests {
         assert_eq!(info.width, 4);
         assert_eq!(info.height, 4);
         let rgba = &out[..info.buffer_size()];
-        for px in rgba.chunks_exact(4) {
-            assert_eq!(px, [255, 0, 0, 255]);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(*px, [255, 0, 0, 255]);
         }
     }
 

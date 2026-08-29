@@ -2187,7 +2187,7 @@ impl CefBridge {
         // Convert RGBA pixels from RenderedFrame to BGRA for LiveFrame
         let pixels = if frame.pixels.len() >= frame_buffer_len(frame.width, frame.height) {
             let mut bgra = Vec::with_capacity(frame.pixels.len());
-            for chunk in frame.pixels.chunks_exact(4) {
+            for chunk in frame.pixels.as_chunks::<4>().0 {
                 bgra.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
             }
             bgra

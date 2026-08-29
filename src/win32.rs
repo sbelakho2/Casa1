@@ -5840,7 +5840,7 @@ impl Win32Subsystem {
 
     pub fn tls_free(&mut self, slot: u32) {
         // Remove the TLS slot from all thread states
-        for (_tid, state) in self.threads.iter_mut() {
+        for state in self.threads.values_mut() {
             state.tls.remove(&slot);
         }
         // Make the slot index available for reuse.
@@ -6294,6 +6294,14 @@ impl Win32Subsystem {
         let thread_id = self.thread_id(thread_handle)?;
         self.com_apartments.remove(&thread_id);
         Ok(())
+    }
+
+    /// The apartment model currently assigned to a thread, if any
+    /// (CoGetApartmentType reads this).
+    pub fn thread_apartment(&self, thread_handle: Handle) -> Option<ApartmentModel> {
+        self.thread_id(thread_handle)
+            .ok()
+            .and_then(|thread_id| self.com_apartments.get(&thread_id).copied())
     }
 
     pub fn co_create_instance(&self, thread_handle: Handle, clsid: &str) -> AppResult<ComInstance> {

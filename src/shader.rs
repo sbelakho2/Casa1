@@ -1356,9 +1356,9 @@ impl<'a> LlvmBitcodeReader<'a> {
                     if len > 4096 {
                         return None;
                     }
-                    let elem = match iter.next() {
-                        Some(elem) => elem.clone(),
-                        None => return None,
+                    let elem = {
+                        let elem = iter.next()?;
+                        elem.clone()
                     };
                     for _ in 0..len {
                         let value = match &elem {

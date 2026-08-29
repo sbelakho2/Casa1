@@ -5425,6 +5425,7 @@ pub fn execute_with_options(
                             state.rip = target;
                         }
                     }
+
                     _ => {}
                 }
             }
@@ -11138,7 +11139,9 @@ impl PeHostRuntime {
             // String property (REG_SZ): the buffer is a NUL-terminated
             // UTF-16 string.
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .take_while(|unit| *unit != 0)
                 .collect::<Vec<_>>();
@@ -40637,7 +40640,7 @@ impl PeHostRuntime {
                 } else {
                     let text = if string_len > 0 {
                         let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
-                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let text_u16: Vec<u16> = text_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                         String::from_utf16_lossy(&text_u16)
                     } else {
                         String::new()
@@ -41367,7 +41370,7 @@ impl PeHostRuntime {
                 } else {
                     let text = if string_len > 0 {
                         let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
-                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let text_u16: Vec<u16> = text_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                         String::from_utf16_lossy(&text_u16)
                     } else {
                         String::new()
@@ -52478,7 +52481,7 @@ impl PeHostRuntime {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
                     if byte_len > 0
                         && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let rust_str = String::from_utf16_lossy(&utf16_units);
@@ -52518,7 +52521,7 @@ impl PeHostRuntime {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
                     if byte_len > 0
                         && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let rust_str = String::from_utf16_lossy(&utf16_units);
@@ -52601,7 +52604,7 @@ impl PeHostRuntime {
                     let spec_len = memory.read_u64(parts_ptr + 8).unwrap_or(0) as usize;
                     if spec_str_ptr != 0 && spec_len > 0
                         && let Ok(raw) = memory.read_bytes(spec_str_ptr, spec_len.checked_mul(2).unwrap_or(0)) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let url = String::from_utf16_lossy(&utf16_units);
@@ -61795,6 +61798,17 @@ impl PeHostRuntime {
             GuestObjectKind::XAudio2MasteringVoice | GuestObjectKind::XAudio2SourceVoice => {
                 self.destroy_xaudio2_voice_object(address)?
             }
+            kind @ (GuestObjectKind::ComStream
+            | GuestObjectKind::ComStorage
+            | GuestObjectKind::ComDataObject
+            | GuestObjectKind::ComOleObject
+            | GuestObjectKind::ComOleInPlaceObject
+            | GuestObjectKind::ComObjectWithSite) => {
+                // COM objects: the per-kind destroyers the ole32 layer
+                // registers; the runtime's guest-object table handles the
+                // refcount teardown.
+                let _ = kind;
+            }
             GuestObjectKind::DxgiFactory => self.destroy_dxgi_factory_object(address)?,
             GuestObjectKind::DxgiAdapter => self.destroy_dxgi_adapter_object(address)?,
             GuestObjectKind::D3d11Device => self.destroy_d3d11_device_object(address)?,
@@ -62004,6 +62018,7 @@ impl PeHostRuntime {
                 // refcount (tracked in guest_objects).
                 self.guest_objects.remove(&address);
             }
+            _ => {}
         }
         Ok(0)
     }
@@ -80462,7 +80477,9 @@ fn decode_registry_value_data(
     match value_type {
         REG_SZ | REG_EXPAND_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let trimmed = units
@@ -80509,7 +80526,9 @@ fn decode_registry_value_data(
         )),
         REG_MULTI_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let mut items = Vec::new();
@@ -82625,7 +82644,9 @@ fn read_xaudio2_buffer(
                 ));
             }
             let values = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             AudioSamples::Pcm16(values)
@@ -82641,7 +82662,9 @@ fn read_xaudio2_buffer(
                 ));
             }
             let values = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>();
             AudioSamples::Float32(values)
@@ -97264,8 +97287,8 @@ mod tests {
             );
             let sorted = memory.read_bytes(base, 24).expect("sorted");
             let mut values = Vec::new();
-            for chunk in sorted.chunks_exact(4) {
-                values.push(i32::from_le_bytes(chunk.try_into().expect("chunk")));
+            for chunk in sorted.as_chunks::<4>().0 {
+                values.push(i32::from_le_bytes(*chunk));
             }
             assert_eq!(values, vec![1, 2, 3, 5, 8, 9]);
         })
@@ -106412,7 +106435,9 @@ mod tests {
                 .expect("value bytes");
             let value = String::from_utf16_lossy(
                 &value_bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<_>>(),
             );
@@ -120988,7 +121013,7 @@ fn read_guest_auth_identity(
         }
         let units = read_guest_bytes(memory, ptr, len as usize)?;
         let mut code_units = Vec::with_capacity(units.len() / 2);
-        for chunk in units.chunks_exact(2) {
+        for chunk in units.as_chunks::<2>().0 {
             code_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
         Ok(String::from_utf16_lossy(&code_units))
@@ -122492,7 +122517,9 @@ fn read_ini_document(host_path: &Path) -> AppResult<(Vec<IniSection>, bool)> {
 fn parse_ini_document(bytes: &[u8]) -> (Vec<IniSection>, bool) {
     let (text, prefer_utf16) = if bytes.starts_with(&[0xFF, 0xFE]) {
         let units = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         (String::from_utf16_lossy(&units), true)

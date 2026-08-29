@@ -7669,7 +7669,7 @@ impl BCryptRuntime {
                         type Aes128CbcEnc = Encryptor<Aes128>;
                         let mut encryptor =
                             Aes128CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
-                        for chunk in buf.chunks_exact_mut(16) {
+                        for chunk in buf.as_chunks_mut::<16>().0 {
                             encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
                     }
@@ -7679,7 +7679,7 @@ impl BCryptRuntime {
                         type Aes256CbcEnc = Encryptor<Aes256>;
                         let mut encryptor =
                             Aes256CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
-                        for chunk in buf.chunks_exact_mut(16) {
+                        for chunk in buf.as_chunks_mut::<16>().0 {
                             encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
                     }
@@ -7723,7 +7723,7 @@ impl BCryptRuntime {
                         type Aes128CbcDec = Decryptor<Aes128>;
                         let mut decryptor =
                             Aes128CbcDec::new_from_slices(&key.key_data, iv).ok()?;
-                        for chunk in buf.chunks_exact_mut(16) {
+                        for chunk in buf.as_chunks_mut::<16>().0 {
                             decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
                     }
@@ -7733,7 +7733,7 @@ impl BCryptRuntime {
                         type Aes256CbcDec = Decryptor<Aes256>;
                         let mut decryptor =
                             Aes256CbcDec::new_from_slices(&key.key_data, iv).ok()?;
-                        for chunk in buf.chunks_exact_mut(16) {
+                        for chunk in buf.as_chunks_mut::<16>().0 {
                             decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
                         }
                     }

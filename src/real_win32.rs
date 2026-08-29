@@ -5361,6 +5361,89 @@ pub fn safe_array_get_ubound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
         })
 }
 
+/// Convert a GUID byte array to the braced string form used by
+/// `StringFromGUID2`/`StringFromCLSID`/`StringFromIID`:
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`.
+pub fn guid_to_string_braced(guid: &[u8; 16]) -> String {
+    format!("{{{}}}", guid_to_string(guid))
+}
+
+/// Convert a DOS date/time pair (the `FILETIME`-compatible form used by
+/// `CoDosDateTimeToFileTime`) into a Windows FILETIME (100-ns intervals
+/// since 1601-01-01).
+///
+/// DOS date bits: 0-4 day, 5-8 month, 9-15 year offset from 1980.  DOS time
+/// bits: 0-4 seconds/2, 5-10 minutes, 11-15 hours.
+pub fn dos_datetime_to_filetime(dos_date: u16, dos_time: u16) -> Option<u64> {
+    let year = 1980_i64 + ((dos_date >> 9) & 0x7F) as i64;
+    let month = ((dos_date >> 5) & 0x0F) as u32;
+    let day = (dos_date & 0x1F) as u32;
+    let hour = ((dos_time >> 11) & 0x1F) as u32;
+    let minute = ((dos_time >> 5) & 0x3F) as u32;
+    let second = ((dos_time & 0x1F) * 2) as u32;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
+    // 1970-01-01 is 11644473600 seconds after the FILETIME epoch (1601-01-01).
+    if seconds < 0 {
+        return None;
+    }
+    Some(((seconds + 11_644_473_600) as u64) * 10_000_000)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian civil date
+/// (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// The current wall-clock time as a Windows FILETIME (100-ns intervals since
+/// 1601-01-01) — `CoFileTimeNow` semantics.
+pub fn filetime_now() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    ((now.as_secs() + 11_644_473_600) * 10_000_000) + (now.subsec_nanos() as u64 / 100)
+}
+
+/// The `LHashValOfNameSys` case-insensitive name hash.
+///
+/// The documented contract is a deterministic, case-insensitive 32-bit hash
+/// over the UTF-16 name; this implementation folds each character through
+/// FNV-1a after uppercasing (the exact polynomial differs from OLEAUT32's
+/// internal constant, but the case-insensitivity and determinism contract —
+/// the properties guests rely on for hash tables keyed by member name — are
+/// honored).
+pub fn lhash_val_of_name(hash_value_seed: u32, name: &[u16]) -> u32 {
+    let mut hash = hash_value_seed;
+    for &unit in name {
+        let c = if (0x61..=0x7A).contains(&unit) {
+            unit - 0x20
+        } else {
+            unit
+        };
+        hash ^= c as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 /// Get the element size for a VARIANT type.
 pub fn element_size(vt: u16) -> usize {
     match vt & VT_TYPEMASK {
@@ -11431,7 +11514,9 @@ impl HtmlPersistStream {
             // UTF-16 with BOM (common for real MSHTML streams)
             let little_endian = data.starts_with(&[0xFF, 0xFE]);
             let units: Vec<u16> = data[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if little_endian {
                         u16::from_le_bytes([c[0], c[1]])

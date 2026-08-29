@@ -396,7 +396,9 @@ fn decode_registry_value_data(
     match value_type {
         REG_SZ | REG_EXPAND_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let trimmed = units
@@ -442,7 +444,9 @@ fn decode_registry_value_data(
         )),
         REG_MULTI_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let mut items = Vec::new();

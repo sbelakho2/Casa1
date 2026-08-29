@@ -584,7 +584,9 @@ fn t28c_05_sys_alloc_string_round_trip() {
 
     // Verify the string content (after 4-byte length prefix)
     let content: Vec<u16> = bstr[4..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&c| c != 0)
         .collect();
@@ -854,7 +856,9 @@ fn t28c_07b_safe_array_create_read_write_elements() {
     let data_offset = safe_array_access_data(&sa).expect("AccessData") as usize;
     let data_bytes = &sa[data_offset..data_offset + 12]; // 3 * 4 bytes
     let data: Vec<u32> = data_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(

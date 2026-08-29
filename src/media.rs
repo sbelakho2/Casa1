@@ -3474,6 +3474,14 @@ impl SourceReader {
         }
     }
 
+    /// Whether a stream is currently selected (IMFSourceReader::GetStreamSelection).
+    pub fn get_stream_selection(&self, stream_index: u32) -> bool {
+        if self.selected_streams.is_empty() {
+            return stream_index < self.demuxer.track_count() as u32;
+        }
+        self.selected_streams.contains(&stream_index)
+    }
+
     /// Get the current media type for a stream.
     pub fn get_current_media_type(&self, stream_index: u32) -> AppResult<ImfMediaType> {
         let idx = stream_index as usize;
@@ -3485,6 +3493,11 @@ impl SourceReader {
                 format!("Stream {stream_index} not found"),
             ))
         }
+    }
+
+    /// Number of tracks (streams) in the underlying source.
+    pub fn track_count(&self) -> usize {
+        self.demuxer.track_count()
     }
 
     /// Set the current media type for a stream (output type).
@@ -4959,7 +4972,9 @@ mod tests {
         // non-zero.
         let non_zero = output
             .buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .any(|s| u16::from_le_bytes([s[0], s[1]]) != 0);
         assert!(non_zero, "decoded PCM must contain non-zero samples");
 
