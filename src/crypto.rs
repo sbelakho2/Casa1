@@ -502,7 +502,7 @@ mod tests {
         input.copy_from_slice(&block.to_be_bytes());
         let out = des_cbc(&key_arr, &iv, &input, true);
         assert_eq!(
-            u64::from_be_bytes(out.as_slice().try_into().unwrap()),
+            u64::from_be_bytes(out.as_slice().try_into().expect("8 bytes")),
             0x85E8_1354_0F0A_B405
         );
         let back = des_cbc(&key_arr, &iv, &out, false);

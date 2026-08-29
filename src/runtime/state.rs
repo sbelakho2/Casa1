@@ -53,126 +53,266 @@ impl MsvcpMtxState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuestObjectKind {
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     XAudio2Engine,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     XAudio2MasteringVoice,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     XAudio2SourceVoice,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DxgiFactory,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DxgiAdapter,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11Device,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11DeviceContext,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11DeferredContext,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DxgiSwapChain,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12Device,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12CommandQueue,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12CommandAllocator,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12DescriptorHeap,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12GraphicsCommandList,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12Fence,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d12Resource,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11Buffer,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11Texture2D,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11View,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11InputLayout,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11Shader,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11BlendState,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11RasterizerState,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11DepthStencilState,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11SamplerState,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d11Query,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     ShellLinkInterface,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DirectInput8,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DirectInput8Device,
     /// A COM-created DirectSound8 object (IDirectSound8).
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     DirectSound8,
     /// A COM-created FileOpenDialog/FileSaveDialog object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     FileDialog,
     /// The standard IMalloc allocator returned by SHGetMalloc.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     ShMalloc,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRHmd,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRCompositor,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRChaperone,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRController,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRInput,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     SteamVRRenderModels,
     /// A COM class factory (IClassFactory).
-    ComClassFactory,
-    /// A COM dispatch object (IDispatch).
-    #[allow(dead_code)] // guest object kind tags (state-model completeness)
-    ComDispatch,
+    #[allow(dead_code)] // COM object kind (constructed by the ole32/MF thunk paths)
+    #[allow(dead_code)] // COM object kind (constructed by the ole32/MF thunk paths)
     /// A XAPO audio effect object (IXAPO).
-    XapoEffect,
-    // ── WMI COM Objects ───────────────────────────────────────────────────────
+    // ──
     /// IWbemLocator COM object.
-    WbemLocator,
     /// IWbemServices COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     WbemServices,
     /// IWbemClassObject COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     WbemClassObject,
     /// IEnumWbemClassObject COM object.
-    EnumWbemObjects,
-    // ── WebView2 COM Objects ─────────────────────────────────────────────────
+    // ──
     /// ICoreWebView2Environment COM object.
-    WebView2Environment,
     /// ICoreWebView2Controller COM object.
-    WebView2Controller,
     /// ICoreWebView2 COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     WebView2WebView,
     /// ICoreWebView2Settings COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     WebView2Settings,
     /// ICoreWebView2WebResourceResponse COM object.
-    WebView2WebResourceResponse,
-    // ── D3D9 Objects (Phase 1.5) ─────────────────────────────────────────────
+    // ──
     /// IDirect3D9 factory COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d9Factory,
     /// IDirect3DDevice9 COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d9Device,
     /// IDirect3DVertexBuffer9 COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d9VertexBuffer,
     /// IDirect3DIndexBuffer9 COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d9IndexBuffer,
     /// IDirect3DTexture9 COM object.
-    D3d9Texture,
     /// IDirect3DQuery9 COM object.
-    #[allow(dead_code)] // guest object kind tags (state-model completeness)
-    D3d9Query,
     /// IDirect3DSwapChain9 COM object.
-    #[allow(dead_code)] // guest object kind tags (state-model completeness)
-    D3d9SwapChain,
-    // ── Phase L: COM/Shell Completion ───────────────────────────────────
+    // ──
     /// IShellFolder COM object (created via CLSID_ShellFolder).
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     ShellFolder,
     /// IShellItem COM object (created via SHCreateItemFromParsingName etc.)
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     ShellItem,
     /// IContextMenu COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     ContextMenu,
     /// IPropertyStore COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     PropertyStore,
     /// IXMLDOMDocument COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     XmlDomDocument,
     /// IMoniker COM object (URL moniker).
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     UrlMoniker,
     /// IEnumIDList COM object (enumerator created by IShellFolder::EnumObjects).
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     EnumIdList,
-    // ── D3D9 Surface & Shader Objects ──────────────────────────────────────
+    // ──
     /// IDirect3DSurface9 COM object.
-    D3d9Surface,
     /// IDirect3DVertexDeclaration9 COM object.
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D3d9VertexDeclaration,
     /// IDirect3DVertexShader9 COM object.
-    D3d9VertexShader,
     /// IDirect3DPixelShader9 COM object.
-    D3d9PixelShader,
-    // ── D2D1 Objects (Phase 3.6) ─────────────────────────────────────────
+    // ──
     /// ID2D1Brush COM object.
-    D2d1Brush,
     /// ID2D1StrokeStyle COM object.
-    D2d1StrokeStyle,
     /// ID2D1DrawingStateBlock COM object.
-    D2d1DrawingStateBlock,
     /// ID2D1Bitmap COM object.
-    D2d1Bitmap,
     /// ID2D1RenderTarget COM object.
+    // ── OLE/COM object surface (evidenced by the ole32/MF dispatch tests) ──
+    #[allow(dead_code)] // COM object kind (constructed by the ole32/MF thunk paths)
+    ComStream,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComStorage,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComDataObject,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComOleObject,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComOleInPlaceObject,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComObjectWithSite,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComServiceProvider,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComBindCtx,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComFileMoniker,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComEnumVariant,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComConnectionPoint,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComStdDispatch,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComClassFactory,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComDispatch,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComPropertyBag,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComStorageObject,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    XapoEffect,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WbemLocator,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    EnumWbemObjects,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2Environment,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2WebResourceResponse,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2Controller,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2BrowserProcessExitedEventArgs,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2WebMessageReceivedEventArgs,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    WebView2PermissionRequestedEventArgs,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9Texture,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9Query,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9SwapChain,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9Surface,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9VertexShader,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D3d9PixelShader,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D2d1Brush,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D2d1StrokeStyle,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D2d1DrawingStateBlock,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    D2d1Bitmap,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
     D2d1RenderTarget,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfAttributes,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaType,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaBuffer,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfSample,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaEventQueue,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaSession,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfPresentationClock,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfSinkWriter,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfSourceReader,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfSourceResolver,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfTopology,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfPresentationDescriptor,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaEvent,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaSink,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfAsyncResult,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ImfMediaSource,
+    #[allow(dead_code)] // guest object kind tags (constructed by the dispatch thunk paths)
+    ComTypeInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +330,108 @@ pub(crate) struct EnumIdListState {
     /// PIDLs for each item (guest pointers to UTF-16 path strings).
     pub(crate) pidls: Vec<u64>,
     /// Current position in the enumeration (index into `pidls`).
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    #[allow(dead_code)] // COM enum state (IEnumVARIANT paths)
     pub(crate) current: usize,
+}
+
+/// State for a guest IStream object (the OLE stream used by the marshaling
+/// helpers and `IStorage::CreateStream`).
+#[derive(Debug, Clone)]
+pub(crate) struct ComStreamState {
+    /// The stream bytes.
+    #[allow(dead_code)] // consumed by the IStream thunks through the storage map
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) data: Vec<u8>,
+    /// Current read/write position.
+    #[allow(dead_code)] // consumed by the IStream thunks
+    pub(crate) position: u64,
+}
+
+/// State for a guest IStorage object.
+#[derive(Debug, Clone)]
+pub(crate) struct ComStorageState {
+    /// Streams inside this storage: name -> bytes.
+    #[allow(dead_code)] // consumed by the IStorage thunks
+    pub(crate) streams: HashMap<String, Vec<u8>>,
+}
+
+/// State for a guest IDataObject (drag-and-drop payload holder).
+#[derive(Debug, Clone)]
+pub(crate) struct ComDataObjectState {
+    /// Format (CF_*) -> payload bytes.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) formats: HashMap<u32, Vec<u8>>,
+}
+
+/// State for a guest IConnectionPoint (OLE sink connection point).
+#[derive(Debug, Clone)]
+pub(crate) struct ComConnectionPointState {
+    /// Sink interface pointers registered via Advise.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) sinks: Vec<u64>,
+}
+
+/// State for a guest IEnumVARIANT.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // COM/MF state (consumed by the thunk paths)
+pub(crate) struct ComEnumVariantState {
+    /// The enumerated VARIANTs (raw guest-format bytes, 16 bytes x86 /
+    /// 24 bytes x64 at dispatch time).
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) items: Vec<Vec<u8>>,
+    /// Current position.
+    pub(crate) current: usize,
+}
+
+/// State for a guest IMFByteStream.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // MF byte-stream state (consumed by the MF thunk paths)
+pub(crate) struct ImfByteStreamState {
+    /// Stream bytes.
+    pub(crate) data: Vec<u8>,
+    /// Current position.
+    pub(crate) position: u64,
+}
+
+/// State for a guest IMFMediaSink.
+#[derive(Debug, Clone)]
+pub(crate) struct ImfMediaSinkState {
+    /// Stream sinks inside the sink (name -> sink object).
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) stream_sinks: Vec<u64>,
+    /// Characteristics flags returned by GetCharacteristics.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) characteristics: u32,
+}
+
+/// State for a guest IMFAsyncResult.
+#[derive(Debug, Clone)]
+pub(crate) struct ImfAsyncResultState {
+    /// The state object (IUnknown pointer) passed at creation.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) state_object: u64,
+    /// The HRESULT status.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) status: u32,
+}
+
+/// State for a guest IMFMediaSource (created by the source resolver).
+#[derive(Debug, Clone)]
+pub(crate) struct ImfMediaSourceState {
+    /// The underlying source reader the source wraps.
+    #[allow(dead_code)] // MF source-reader state (consumed by the MF thunk paths)
+    pub(crate) source_reader: u64,
+}
+
+/// The Media Foundation runtime state managed by MFStartup/MFShutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct MfRuntimeState {
+    /// Whether MFStartup has been called (and MFShutdown has not).
+    pub(crate) started: bool,
+    /// The MF_SDK_VERSION passed to MFStartup.
+    pub(crate) version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,7 +782,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) critical_sections: BTreeMap<u64, usize>,
     pub(crate) condition_variables: BTreeMap<u64, GuestConditionVariable>,
     pub(crate) srw_locks: BTreeMap<u64, Arc<GuestSRWLock>>,
-    // ── Patch 6c: msvcp140.dll C++ runtime state ─────────────────────────────
+    // ──
     /// Host state for the msvcp140 `_Mtx_*` mutexes, keyed by the opaque
     /// handle returned to the guest (`_Mtx_t` is an opaque pointer).
     pub(crate) msvcp_mtxes: BTreeMap<u64, MsvcpMtxState>,
@@ -559,7 +800,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) wait_registrations: BTreeMap<u64, (u32, u64, u64)>,
     /// Next handle value for `RegisterWaitForSingleObject`.
     pub(crate) next_wait_handle: u64,
-    // ── BCrypt / CNG Crypto State ────────────────────────────────────────────
+    // ──
     pub(crate) bcrypt_ctx: BCryptContext,
     /// Maps provider handle → algorithm ID string (e.g. "SHA256", "AES")
     pub(crate) bcrypt_providers: BTreeMap<u64, String>,
@@ -743,7 +984,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) error_mode: u32,
     pub(crate) last_error: u32,
     pub(crate) invalid_parameter_handler: u64,
-    // ── Patch 6b: CRT errno / doserrno model ────────────────────────────────
+    // ──
     /// TLS vector slot holding the per-thread errno int pointer. 0 = not yet
     /// allocated (slot 0 is permanently occupied by the static TLS block, so
     /// 0 is a safe "unallocated" sentinel).
@@ -901,6 +1142,92 @@ pub(crate) struct PeHostRuntime {
     /// Native COM apartment state for DllGetClassObject resolution and
     /// class-factory registration.  Lazily initialised on first COM call.
     pub(crate) com_apartment: Option<crate::real_win32::ComApartmentState>,
+    // ──
+    /// The COM task allocator: allocation base -> size (CoTaskMemAlloc/
+    /// CoTaskMemRealloc/CoTaskMemFree route through it).
+    pub(crate) com_task_allocations: HashMap<u64, usize>,
+    /// The COM task allocator's running allocation pointer.
+    pub(crate) com_task_next: u64,
+    /// OID token -> (iid string, interface pointer) for in-process marshaled
+    /// interfaces (CoMarshalInterface/CoUnmarshalInterface).
+    pub(crate) com_marshal_records: HashMap<u64, (String, u64)>,
+    /// Next marshaling OID token.
+    pub(crate) com_marshal_next_oid: u64,
+    /// Guest IStream object -> stream state.
+    pub(crate) com_streams: HashMap<u64, ComStreamState>,
+    /// Guest IStorage object -> storage state.
+    pub(crate) com_storages: HashMap<u64, ComStorageState>,
+    /// Guest IDataObject -> payload state.
+    pub(crate) com_data_objects: HashMap<u64, ComDataObjectState>,
+    /// Guest IOleObject/IOleInPlaceObject -> client-site pointer.
+    pub(crate) com_ole_sites: HashMap<u64, u64>,
+    /// Guest IObjectWithSite -> site pointer.
+    pub(crate) com_object_sites: HashMap<u64, u64>,
+    /// Guest IServiceProvider -> service GUID -> object pointer.
+    pub(crate) com_service_map: HashMap<String, u64>,
+    /// Guest IConnectionPoint -> sink list.
+    pub(crate) com_connection_points: HashMap<u64, ComConnectionPointState>,
+    /// Guest IEnumVARIANT -> enumeration state.
+    pub(crate) com_enum_variants: HashMap<u64, ComEnumVariantState>,
+    /// Guest IBindCtx -> object-param name -> pointer.
+    pub(crate) com_bind_ctx_params: HashMap<u64, HashMap<String, u64>>,
+    /// Guest moniker objects (MkParseDisplayName) -> display-name string.
+    pub(crate) com_moniker_names: HashMap<u64, String>,
+    /// The process-global class-object lock count (CoAddRefServerProcess/
+    /// CoReleaseServerProcess).
+    pub(crate) com_server_lock_count: u32,
+    /// Whether class objects are suspended (CoSuspendClassObjects/
+    /// CoResumeClassObjects).
+    pub(crate) com_class_objects_suspended: bool,
+    /// The active message filter (CoRegisterMessageFilter).
+    pub(crate) com_message_filter: u64,
+    /// Objects marked disconnected by CoDisconnectObject.
+    pub(crate) com_disconnected_objects: std::collections::HashSet<u64>,
+    /// Next CoGetContextToken token value.
+    pub(crate) com_next_context_token: u32,
+    /// Registered proxy/stub CLSIDs (CoRegisterPSClsid): iid -> clsid bytes.
+    pub(crate) com_ps_clsids: HashMap<String, [u8; 16]>,
+    /// Type-library registrations (RegisterTypeLib): guid string -> path.
+    pub(crate) com_type_libraries: HashMap<String, String>,
+    /// Next connection-point cookie.
+    pub(crate) com_next_conn_cookie: u32,
+    // ──
+    /// MFStartup/MFShutdown runtime state.
+    pub(crate) mf_runtime: MfRuntimeState,
+    /// Guest IMFAttributes/IMFMediaType object -> attribute store.
+    pub(crate) mf_media_types: HashMap<u64, crate::media::ImfMediaType>,
+    /// Guest IMFMediaBuffer object -> buffer.
+    pub(crate) mf_media_buffers: HashMap<u64, crate::media::ImfMediaBuffer>,
+    /// Guest IMFSample object -> sample.
+    pub(crate) mf_samples: HashMap<u64, crate::media::ImfSample>,
+    /// Guest IMFMediaEventQueue object -> queue.
+    pub(crate) mf_event_queues: HashMap<u64, crate::media::MfEventQueue>,
+    /// Guest IMFMediaSession object -> session.
+    pub(crate) mf_sessions: HashMap<u64, crate::media::MfMediaSession>,
+    /// Guest IMFPresentationClock object -> clock.
+    pub(crate) mf_clocks: HashMap<u64, crate::media::PresentationClock>,
+    /// Guest IMFSinkWriter object -> sink writer.
+    pub(crate) mf_sink_writers: HashMap<u64, crate::media::SinkWriter>,
+    /// Guest IMFSourceReader object -> source reader.
+    pub(crate) mf_source_readers: HashMap<u64, crate::media::SourceReader>,
+    /// Guest IMFByteStream object -> byte stream state.
+    pub(crate) mf_byte_streams: HashMap<u64, ImfByteStreamState>,
+    /// Guest IMFTopology object -> topology.
+    pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
+    /// Guest IMFTopologyNode object -> topology node.
+    pub(crate) mf_topology_nodes: HashMap<u64, crate::media::TopologyNode>,
+    /// Guest IMFMediaSink object -> sink state.
+    pub(crate) mf_sinks: HashMap<u64, ImfMediaSinkState>,
+    /// Guest IMFAsyncResult object -> result state.
+    pub(crate) mf_async_results: HashMap<u64, ImfAsyncResultState>,
+    /// Guest IMFMediaSource object -> source state.
+    pub(crate) mf_media_sources: HashMap<u64, ImfMediaSourceState>,
+    /// Guest IMFMediaEvent object -> (type, status).
+    pub(crate) mf_media_events: HashMap<u64, (u32, u32)>,
+    /// Guest IMFPresentationDescriptor object -> stream count.
+    pub(crate) mf_presentation_descriptors: HashMap<u64, u32>,
+    /// Guest IMFMediaBuffer object -> locked guest pointer (Lock/Unlock).
+    pub(crate) mf_buffer_locks: HashMap<u64, u64>,
     /// Maps file handles to ADS stream info (base_windows_path, stream_name).
     /// Populated by CreateFileW when an NTFS Alternate Data Stream path is detected.
     pub(crate) ads_handles: HashMap<u32, (String, String)>,
@@ -908,14 +1235,14 @@ pub(crate) struct PeHostRuntime {
     pub(crate) xapo_manager: crate::real_audio::XapoManager,
     /// Guest XAPO effect objects: maps guest object address -> effect instance ID.
     pub(crate) xapo_effect_instances: HashMap<u64, u64>,
-    // ── WMI State ──────────────────────────────────────────────────────────────
+    // ──
     /// WbemServices instances: maps guest object address -> WbemServices.
     pub(crate) wmi_services: HashMap<u64, crate::wmi::WbemServices>,
     /// WbemClassObject instances: maps guest object address -> WbemClassObject.
     pub(crate) wmi_class_objects: HashMap<u64, crate::wmi::WbemClassObject>,
     /// EnumWbemObjects instances: maps guest object address -> EnumWbemObjects.
     pub(crate) wmi_enums: HashMap<u64, crate::wmi::EnumWbemObjects>,
-    // ── Direct2D / DirectWrite State ──────────────────────────────────────────
+    // ──
     /// D2D factory instances.
     pub(crate) d2d_factory: Option<crate::d2d::D2DFactory>,
     /// DWrite factory instances.
@@ -928,17 +1255,17 @@ pub(crate) struct PeHostRuntime {
     pub(crate) dwrite_formats: HashMap<u64, crate::dwrite::DWriteTextFormat>,
     /// DWrite text layout objects: maps guest object address -> layout.
     pub(crate) dwrite_layouts: HashMap<u64, crate::dwrite::DWriteTextLayout>,
-    // ── Print Subsystem ────────────────────────────────────────────────────────
+    // ──
     /// Print spooler state (winspool.drv)
     pub(crate) print_subsystem: crate::print::PrintSubsystem,
-    // ── WebView2 Runtime ───────────────────────────────────────────────────────
+    // ──
     /// WebView2 COM interface state (wraps WKWebView via cef_bridge).
     pub(crate) webview2_runtime: crate::webview2::WebView2Runtime,
-    // ── SEH / VEH Exception Handling ──────────────────────────────────────────
+    // ──
     /// Structured Exception Handling and Vectored Exception Handling subsystem.
     /// Manages .pdata exception tables, VEH handler chains, and SEH dispatch.
     pub(crate) seh: crate::seh::SehSubsystem,
-    // ── D3D9 Basic Rendering (Phase 1.5) ──────────────────────────────────────
+    // ──
     /// Direct3D9 compatibility shim (lazily initialised).
     pub(crate) d3d9_shim: Option<crate::d3d11::Direct3D9Shim>,
     /// Guest IDirect3DDevice9 objects → shim device state.
@@ -955,7 +1282,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) d3d9_swapchains: HashMap<u64, u64>,
     /// Guest IDirect3D9 factory objects.
     pub(crate) d3d9_factories: HashSet<u64>,
-    // ── Steam API (Phase B3) ────────────────────────────────────────────────
+    // ──
     /// Whether SteamAPI_Init() has been called successfully.
     pub(crate) steam_api_initialized: bool,
     /// Registered Steam callbacks: maps callback ID → callback function pointer.
@@ -969,7 +1296,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) steam_interface_pointers: BTreeMap<String, u64>,
     /// Next virtual address for Steam interface allocation.
     pub(crate) next_steam_interface_address: u64,
-    // ── Phase M4: SxS Activation Context state ──────────────────────────────
+    // ──
     /// Activation context handle → ActivationContext
     pub(crate) activation_contexts: BTreeMap<u64, crate::pe::ActivationContext>,
     /// Stack of active activation context cookies (for DeactivateActCtx)
@@ -998,46 +1325,46 @@ pub(crate) struct PeHostRuntime {
     /// SetMenuContextHelpId, keyed by HMENU; GetMenuContextHelpId reads
     /// them back (0 when unset).
     pub(crate) menu_context_help_ids: HashMap<u64, u32>,
-    // ── DXGI Factory State (Phase 5.5 #2) ──────────────────────────────
+    // ──
     /// Tracked window association for IDXGIFactory::MakeWindowAssociation.
     /// Stores (hwnd, flags).
     pub(crate) dxgi_window_assoc: Option<(u64, u32)>,
     /// Per-object private data for IDXGIFactory::SetPrivateData.
     /// Outer key = object pointer, inner key = GUID-as-u128, value = data bytes.
     pub(crate) dxgi_private_data: HashMap<u64, HashMap<u128, Vec<u8>>>,
-    // ── DWrite Font Collection Loaders ─────────────────────────────────
+    // ──
     /// Registered font collection loader handles for IDWriteFactory.
     /// Tracked so Register/UnregisterFontCollectionLoader are consistent.
     pub(crate) dwrite_font_collection_loaders: HashSet<u64>,
-    // ── Drag & Drop ────────────────────────────────────────────────────
+    // ──
     /// Tracked dropped files per HDROP handle for DragQueryFileW.
     /// Maps HDROP handle → list of file paths.
     pub(crate) drag_drop_files: HashMap<u64, Vec<String>>,
-    // ── Property Store ─────────────────────────────────────────────────
+    // ──
     /// Per-property-store key-value tracking for IPropertyStore::SetValue.
     /// Outer key = this pointer, inner key = PROPERTYKEY encoding (fmtid:u128 | pid:u32).
     pub(crate) property_store_data: HashMap<u64, Vec<(u128, u32, Vec<u8>)>>,
-    // ── D3D9 Private Data ──────────────────────────────────────────────
+    // ──
     /// Per-object private data for D3D9 IDirect3DResource9::SetPrivateData etc.
     pub(crate) d3d9_private_data: HashMap<(u64, u128), Vec<u8>>,
-    // ── DXGI Event Registration ────────────────────────────────────────
+    // ──
     /// Cookie counter for DXGI event registrations (stereo/occlusion status).
     pub(crate) next_dxgi_cookie: u64,
     /// Cookie-to-event-handle mapping for stereo status.
     pub(crate) dxgi_stereo_events: HashMap<u64, u64>,
     /// Cookie-to-event-handle mapping for occlusion status.
     pub(crate) dxgi_occlusion_events: HashMap<u64, u64>,
-    // ── CEF Cross-Origin Whitelist ────────────────────────────────────
+    // ──
     /// Tracked cross-origin whitelist entries for CefAdd/Remove/ClearCrossOriginWhitelist.
     pub(crate) cef_cross_origin_whitelist: HashSet<String>,
-    // ── DWM Per-Window State ──────────────────────────────────────────
+    // ──
     /// Per-hwnd blur-behind state for DwmEnableBlurBehindWindow.
     /// Stores (fEnable, blur_region, transition_on_maximized).
     pub(crate) dwm_blur_states: HashMap<u32, (bool, u32, bool)>,
     /// Per-hwnd extended frame margins for DwmExtendFrameIntoClientArea.
     /// Stores (cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight).
     pub(crate) dwm_margins: HashMap<u32, (u32, u32, u32, u32)>,
-    // ── advapi32: access tokens ───────────────────────────────────────
+    // ──
     /// Maps token handle → access token.  The process token is created
     /// lazily on the first OpenProcessToken.
     pub(crate) tokens: BTreeMap<u64, crate::advapi32::TokenInfo>,
@@ -1049,7 +1376,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) allocated_sids: BTreeMap<u64, Vec<u8>>,
     /// Next allocated-SID handle value.
     pub(crate) next_sid_handle: u64,
-    // ── advapi32: service control manager ─────────────────────────────
+    // ──
     /// SCM handles: handle → Some(service name) for a service handle,
     /// None for the SCM manager handle.
     pub(crate) scm_handles: BTreeMap<u64, Option<String>>,
@@ -1057,7 +1384,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) scm_status: BTreeMap<String, crate::advapi32::ServiceStatusFlow>,
     /// Next SCM handle value.
     pub(crate) next_scm_handle: u64,
-    // ── advapi32: CryptoAPI ───────────────────────────────────────────
+    // ──
     /// CryptoAPI provider contexts (HCRYPTPROV).
     pub(crate) crypt_providers: BTreeMap<u64, crate::advapi32::CryptProvider>,
     /// CryptoAPI hash objects (HCRYPTHASH).
@@ -1072,7 +1399,7 @@ pub(crate) struct PeHostRuntime {
     pub(crate) event_registrations: BTreeMap<u64, String>,
     /// Next ETW registration handle value.
     pub(crate) next_event_registration_handle: u64,
-    // ── shell32: HICON registry (ExtractIconW/ExtractIconExW) ─────────
+    // ──
     /// HICON handle → extracted icon image.
     pub(crate) icons: BTreeMap<u64, crate::icon::IconImage>,
     /// Next HICON handle value.
@@ -1402,7 +1729,7 @@ impl PeHostRuntime {
             next_timer_queue_handle: 0xE0000001,
             wait_registrations: BTreeMap::new(),
             next_wait_handle: 0xE0001001,
-            // ── BCrypt / CNG Crypto State ────────────────────────────────────
+            // ──
             bcrypt_ctx: BCryptContext::new(),
             bcrypt_providers: BTreeMap::new(),
             bcrypt_hashes: BTreeMap::new(),
@@ -1586,6 +1913,46 @@ impl PeHostRuntime {
             com_registration_tokens: HashMap::new(),
             com_next_token: 1,
             com_apartment: None,
+            com_task_allocations: HashMap::new(),
+            com_task_next: 0x5_0000,
+            com_marshal_records: HashMap::new(),
+            com_marshal_next_oid: 1,
+            com_streams: HashMap::new(),
+            com_storages: HashMap::new(),
+            com_data_objects: HashMap::new(),
+            com_ole_sites: HashMap::new(),
+            com_object_sites: HashMap::new(),
+            com_service_map: HashMap::new(),
+            com_connection_points: HashMap::new(),
+            com_enum_variants: HashMap::new(),
+            com_bind_ctx_params: HashMap::new(),
+            com_moniker_names: HashMap::new(),
+            com_server_lock_count: 0,
+            com_class_objects_suspended: false,
+            com_message_filter: 0,
+            com_disconnected_objects: std::collections::HashSet::new(),
+            com_next_context_token: 1,
+            com_ps_clsids: HashMap::new(),
+            com_type_libraries: HashMap::new(),
+            com_next_conn_cookie: 1,
+            mf_runtime: MfRuntimeState::default(),
+            mf_media_types: HashMap::new(),
+            mf_media_buffers: HashMap::new(),
+            mf_samples: HashMap::new(),
+            mf_event_queues: HashMap::new(),
+            mf_sessions: HashMap::new(),
+            mf_clocks: HashMap::new(),
+            mf_sink_writers: HashMap::new(),
+            mf_source_readers: HashMap::new(),
+            mf_byte_streams: HashMap::new(),
+            mf_topologies: HashMap::new(),
+            mf_topology_nodes: HashMap::new(),
+            mf_sinks: HashMap::new(),
+            mf_async_results: HashMap::new(),
+            mf_media_sources: HashMap::new(),
+            mf_media_events: HashMap::new(),
+            mf_presentation_descriptors: HashMap::new(),
+            mf_buffer_locks: HashMap::new(),
             ads_handles: HashMap::new(),
             xapo_manager: {
                 let mut mgr = crate::real_audio::XapoManager::new();
@@ -1593,24 +1960,24 @@ impl PeHostRuntime {
                 mgr
             },
             xapo_effect_instances: HashMap::new(),
-            // ── WMI State ──────────────────────────────────────────────────────
+            // ──
             wmi_services: HashMap::new(),
             wmi_class_objects: HashMap::new(),
             wmi_enums: HashMap::new(),
-            // ── Direct2D / DirectWrite State ──────────────────────────────────────
+            // ──
             d2d_factory: None,
             dwrite_factory: None,
             d2d_brushes: HashMap::new(),
             d2d_bitmaps: HashMap::new(),
             dwrite_formats: HashMap::new(),
             dwrite_layouts: HashMap::new(),
-            // ── Print Subsystem ─────────────────────────────────────────────────
+            // ──
             print_subsystem: crate::print::PrintSubsystem::new(),
-            // ── WebView2 Runtime ───────────────────────────────────────────────
+            // ──
             webview2_runtime: crate::webview2::WebView2Runtime::new(),
-            // ── SEH / VEH Exception Handling ───────────────────────────────────
+            // ──
             seh: crate::seh::SehSubsystem::new(),
-            // ── D3D9 Basic Rendering (Phase 1.5) ───────────────────────────────
+            // ──
             d3d9_shim: None,
             d3d9_devices: HashMap::new(),
             d3d9_vertex_buffers: HashMap::new(),
@@ -1619,26 +1986,26 @@ impl PeHostRuntime {
             d3d9_queries: HashMap::new(),
             d3d9_swapchains: HashMap::new(),
             d3d9_factories: HashSet::new(),
-            // ── Steam API (Phase B3) ────────────────────────────────────────────────
+            // ──
             steam_api_initialized: false,
             steam_callbacks: BTreeMap::new(),
             steam_call_results: BTreeMap::new(),
             steam_interface_pointers: BTreeMap::new(),
             next_steam_interface_address: 0x7f0000000000,
-            // ── Phase M4: SxS Activation Context state ──────────────────────
+            // ──
             activation_contexts: BTreeMap::new(),
             activation_context_stack: Vec::new(),
             next_activation_context_handle: 0xE0000001,
             comctl32_v6_active: false,
             local_redirect_active: false,
             shell_item_paths: HashMap::new(),
-            // ── Phase L1: Shell folder paths / EnumIDList state ───────────────
+            // ──
             shell_folder_paths: HashMap::new(),
             enum_id_lists: HashMap::new(),
-            // ── Phase L4: Context menu paths ─────────────────────────────────
+            // ──
             context_menu_paths: HashMap::new(),
             menu_context_help_ids: HashMap::new(),
-            // ── Phase 1 sub-agent fields ──────────────────────────────────────
+            // ──
             dxgi_window_assoc: None,
             dxgi_private_data: HashMap::new(),
             dwrite_font_collection_loaders: HashSet::new(),
@@ -1651,7 +2018,7 @@ impl PeHostRuntime {
             cef_cross_origin_whitelist: HashSet::new(),
             dwm_blur_states: HashMap::new(),
             dwm_margins: HashMap::new(),
-            // ── advapi32: tokens, SCM, CryptoAPI ──────────────────────────
+            // ──
             tokens: BTreeMap::new(),
             process_token_handle: None,
             next_token_handle: 0xE1000001,

@@ -6389,6 +6389,14 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    /// The apartment model currently assigned to a thread, if any
+    /// (CoGetApartmentType reads this).
+    pub fn thread_apartment(&self, thread_handle: Handle) -> Option<ApartmentModel> {
+        self.thread_id(thread_handle)
+            .ok()
+            .and_then(|thread_id| self.com_apartments.get(&thread_id).copied())
+    }
+
     pub fn co_create_instance(&self, thread_handle: Handle, clsid: &str) -> AppResult<ComInstance> {
         let thread_id = self.thread_id(thread_handle)?;
         let apartment = self
