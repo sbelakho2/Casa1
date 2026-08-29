@@ -129,45 +129,44 @@ impl RuntimeObserver for RecordingObserver {
 
 #[test]
 fn runtime_emits_file_opened_on_create_file_w() {
-    // thunk_drive* dispatches through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-        let _cleanup = gate_setup();
-        let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
-        let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
+    let _cleanup = gate_setup();
+    let events = Arc::new(Mutex::new(Vec::<RuntimeEvent>::new()));
+    let observer = Box::new(RecordingObserver::new(Arc::clone(&events)));
 
-        let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), vec![observer])
-            .expect("manifest gate through the thunk layer");
+    let result = thunk_drive_manifest_gate_with_observers(open_gate_ge(), vec![observer])
+        .expect("manifest gate through the thunk layer");
 
-        assert!(
-            result.manifest_open_ok,
-            "CreateFileW must open the manifest"
-        );
-        assert!(result.manifest_read_ok, "ReadFile must succeed");
-        let received = events.lock().unwrap();
-        let file_opened = received
+    assert!(
+        result.manifest_open_ok,
+        "CreateFileW must open the manifest"
+    );
+    assert!(result.manifest_read_ok, "ReadFile must succeed");
+    let received = events.lock().unwrap();
+    let file_opened = received
+        .iter()
+        .find(|event| matches!(event, RuntimeEvent::FileOpened { .. }));
+    assert!(
+        file_opened.is_some(),
+        "an observer attached to the runtime must receive FileOpened, got: {received:?}"
+    );
+    assert!(
+        received.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::FileOpened { path, .. } if path == r"C:\package\steam_client_win32.installed"
+        )),
+        "the manifest open must be reported with its normalized path, got: {received:?}"
+    );
+    assert!(
+        received
             .iter()
-            .find(|event| matches!(event, RuntimeEvent::FileOpened { .. }));
-        assert!(
-            file_opened.is_some(),
-            "an observer attached to the runtime must receive FileOpened, got: {received:?}"
-        );
-        assert!(
-            received.iter().any(|event| matches!(
-                event,
-                RuntimeEvent::FileOpened { path, .. } if path == r"C:\package\steam_client_win32.installed"
-            )),
-            "the manifest open must be reported with its normalized path, got: {received:?}"
-        );
-        assert!(
-            received
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::FileRead { path, .. } if path == r"C:\package\steam_client_win32.installed")),
-            "the manifest read must be reported as FileRead, got: {received:?}"
-        );
-
+            .any(|event| matches!(event, RuntimeEvent::FileRead { path, .. } if path == r"C:\package\steam_client_win32.installed")),
+        "the manifest read must be reported as FileRead, got: {received:?}"
+    );
         })
         .expect("spawn big-stack thread")
         .join()
@@ -180,8 +179,8 @@ fn runtime_emits_file_opened_on_create_file_w() {
 
 #[test]
 fn runtime_works_with_no_observer() {
-    // thunk_drive* dispatches through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -298,8 +297,8 @@ fn steam_observer_infers_manifest_milestones_from_generic_events() {
 
 #[test]
 fn unsupported_call_event_fires_for_unknown_thunk() {
-    // The unknown-thunk path dispatches through the host-thunk match,
-    // whose debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {

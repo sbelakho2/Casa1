@@ -27,42 +27,129 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
         handle: u32,
         io_code: u32,
-        _in_buffer: u64,
-        _in_size: u32,
+        in_buffer: u64,
+        in_size: u32,
         out_buffer: u64,
         out_size: u32,
         bytes_ret_ptr: u64,
     ) -> AppResult<()> {
+        // The handle must be a live kernel object (Windows fails IOCTLs on
+        // invalid handles with ERROR_INVALID_HANDLE before touching the
+        // control code).
+        if handle == 0 || self.win32.handle_object_type(handle).is_err() {
+            if bytes_ret_ptr != 0 {
+                write_u32(memory, bytes_ret_ptr, 0);
+            }
+            self.last_error = ERROR_INVALID_HANDLE;
+            state.set(Register::Rax, 0); // FALSE
+            return Ok(());
+        }
+        // Helper: report success with N bytes returned.
+        macro_rules! done {
+            ($returned:expr) => {{
+                if bytes_ret_ptr != 0 {
+                    write_u32(memory, bytes_ret_ptr, $returned);
+                }
+                self.last_error = 0;
+                state.set(Register::Rax, 1); // TRUE
+                return Ok(());
+            }};
+        }
+        // The guest disk geometry the runtime models: 512 GB fixed disk,
+        // 512-byte sectors, 32 sectors per track, 64 tracks per cylinder.
+        const DISK_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+        const SECTORS_PER_TRACK: u32 = 32;
+        const TRACKS_PER_CYLINDER: u32 = 64;
+        const BYTES_PER_SECTOR: u32 = 512;
+        const CYLINDERS: u64 = DISK_BYTES
+            / (BYTES_PER_SECTOR as u64 * SECTORS_PER_TRACK as u64 * TRACKS_PER_CYLINDER as u64);
         // Common IOCTL codes used by applications in VM context
         match io_code {
             // FSCTL_SET_SPARSE (mark file as sparse)
-            0x000900C4 => {
-                if bytes_ret_ptr != 0 {
-                    write_u32(memory, bytes_ret_ptr, 0);
-                }
-                state.set(Register::Rax, 1); // TRUE
-            }
+            0x000900C4 => done!(0),
             // FSCTL_SET_ZERO_DATA (zero a range in sparse file)
-            0x000980C8 => {
-                if bytes_ret_ptr != 0 {
-                    write_u32(memory, bytes_ret_ptr, 0);
+            0x000980C8 => done!(0),
+            // FSCTL_GET_COMPRESSION — the file's compression state (u16).
+            0x0009003C => {
+                if out_buffer != 0 && out_size >= 2 {
+                    write_u16(memory, out_buffer, 0); // COMPRESSION_FORMAT_NONE
+                    done!(2);
                 }
-                state.set(Register::Rax, 1); // TRUE
+                done!(0);
+            }
+            // FSCTL_SET_COMPRESSION — set the compression state.
+            0x0009C040 => done!(0),
+            // FSCTL_IS_VOLUME_DIRTY — BOOL (0 = clean).
+            0x00090078 => {
+                if out_buffer != 0 && out_size >= 4 {
+                    write_u32(memory, out_buffer, 0);
+                    done!(4);
+                }
+                done!(0);
+            }
+            // FSCTL_LOCK_VOLUME / FSCTL_UNLOCK_VOLUME — the guest volume is
+            // exclusively owned by this process; both succeed.
+            0x00090018 | 0x0009001C => done!(0),
+            // FSCTL_QUERY_ALLOCATED_RANGES — every byte of the sparse file
+            // is allocated (one full-range entry).
+            0x000940CF => {
+                if out_buffer != 0 && out_size >= 16 {
+                    write_u64(memory, out_buffer, 0); // FileOffset
+                    write_u64(memory, out_buffer + 8, DISK_BYTES); // Length
+                    done!(16);
+                }
+                done!(0);
             }
             // IOCTL_DISK_GET_DRIVE_GEOMETRY
             0x00070000 => {
                 // DISK_GEOMETRY: Cylinders(8), MediaType(4), TracksPerCylinder(4), SectorsPerTrack(4), BytesPerSector(4) = 24 bytes
                 if out_buffer != 0 && out_size >= 24 {
-                    write_u64(memory, out_buffer, 1000); // Cylinders
+                    write_u64(memory, out_buffer, CYLINDERS);
                     write_u32(memory, out_buffer + 8, 0x07); // FixedMedia = 7
-                    write_u32(memory, out_buffer + 12, 64); // TracksPerCylinder
-                    write_u32(memory, out_buffer + 16, 32); // SectorsPerTrack
-                    write_u32(memory, out_buffer + 20, 512); // BytesPerSector
-                    if bytes_ret_ptr != 0 {
-                        write_u32(memory, bytes_ret_ptr, 24);
-                    }
+                    write_u32(memory, out_buffer + 12, TRACKS_PER_CYLINDER);
+                    write_u32(memory, out_buffer + 16, SECTORS_PER_TRACK);
+                    write_u32(memory, out_buffer + 20, BYTES_PER_SECTOR);
+                    done!(24);
                 }
-                state.set(Register::Rax, 1); // TRUE
+                done!(0);
+            }
+            // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
+            0x00070050 => {
+                // DISK_GEOMETRY_EX: DISK_GEOMETRY (24) + DiskSize (8) + 4 pad.
+                if out_buffer != 0 && out_size >= 36 {
+                    write_u64(memory, out_buffer, CYLINDERS);
+                    write_u32(memory, out_buffer + 8, 0x07); // FixedMedia
+                    write_u32(memory, out_buffer + 12, TRACKS_PER_CYLINDER);
+                    write_u32(memory, out_buffer + 16, SECTORS_PER_TRACK);
+                    write_u32(memory, out_buffer + 20, BYTES_PER_SECTOR);
+                    write_u64(memory, out_buffer + 24, DISK_BYTES); // DiskSize
+                    memory.map_bytes(out_buffer + 32, &[0_u8; 4]); // pad
+                    done!(36);
+                }
+                done!(0);
+            }
+            // IOCTL_DISK_GET_LENGTH_INFO — the disk size in bytes.
+            0x0007405C => {
+                if out_buffer != 0 && out_size >= 8 {
+                    write_u64(memory, out_buffer, DISK_BYTES);
+                    done!(8);
+                }
+                done!(0);
+            }
+            // IOCTL_DISK_GET_PARTITION_INFO_EX — one primary partition.
+            0x00070048 => {
+                // PARTITION_INFORMATION_EX: PartitionStyle(4) + union
+                // (MBR: 16 bytes — starting offset 8, length 8, partition
+                // type 1, boot indicator 1, hidden sectors 4) + 4 pad = 24.
+                if out_buffer != 0 && out_size >= 24 {
+                    write_u32(memory, out_buffer, 0); // PARTITION_STYLE_MBR
+                    write_u64(memory, out_buffer + 4, 0); // StartingOffset
+                    write_u64(memory, out_buffer + 12, DISK_BYTES); // PartitionLength
+                    memory.write_u8(out_buffer + 20, 0x07); // MBR type NTFS
+                    memory.map_bytes(out_buffer + 21, &[0_u8; 3]);
+                    done!(24);
+                }
+                done!(0);
             }
             // IOCTL_CDROM_GET_DRIVE_GEOMETRY
             0x00070004 => {
@@ -72,19 +159,26 @@ impl PeHostRuntime {
                     write_u32(memory, out_buffer + 12, 1); // TracksPerCylinder
                     write_u32(memory, out_buffer + 16, 1); // SectorsPerTrack
                     write_u32(memory, out_buffer + 20, 2048); // BytesPerSector (CD-ROM)
-                    if bytes_ret_ptr != 0 {
-                        write_u32(memory, bytes_ret_ptr, 24);
-                    }
+                    done!(24);
                 }
-                state.set(Register::Rax, 1); // TRUE
+                done!(0);
+            }
+            // IOCTL_CDROM_GET_DRIVE_GEOMETRY_EX
+            0x0007004F => {
+                if out_buffer != 0 && out_size >= 36 {
+                    write_u64(memory, out_buffer, 0);
+                    write_u32(memory, out_buffer + 8, 0x02); // RemovableMedia
+                    write_u32(memory, out_buffer + 12, 1);
+                    write_u32(memory, out_buffer + 16, 1);
+                    write_u32(memory, out_buffer + 20, 2048);
+                    write_u64(memory, out_buffer + 24, 470 * 1024 * 1024); // 470 MB disc
+                    memory.map_bytes(out_buffer + 32, &[0_u8; 4]);
+                    done!(36);
+                }
+                done!(0);
             }
             // IOCTL_STORAGE_CHECK_VERIFY2 (check if media is present)
-            0x00074000 => {
-                if bytes_ret_ptr != 0 {
-                    write_u32(memory, bytes_ret_ptr, 0);
-                }
-                state.set(Register::Rax, 1); // TRUE (media is present)
-            }
+            0x00074000 => done!(0),
             // IOCTL_STORAGE_GET_DEVICE_NUMBER
             0x002D0000 => {
                 // STORAGE_DEVICE_NUMBER: DeviceType(4), DeviceNumber(4), PartitionNumber(4) = 12 bytes
@@ -92,11 +186,19 @@ impl PeHostRuntime {
                     write_u32(memory, out_buffer, 0x07); // FILE_DEVICE_DISK
                     write_u32(memory, out_buffer + 4, 0); // DeviceNumber
                     write_u32(memory, out_buffer + 8, 1); // PartitionNumber
-                    if bytes_ret_ptr != 0 {
-                        write_u32(memory, bytes_ret_ptr, 12);
-                    }
+                    done!(12);
                 }
-                state.set(Register::Rax, 1); // TRUE
+                done!(0);
+            }
+            // IOCTL_STORAGE_GET_DEVICE_NUMBER_EX
+            0x002D5000 => {
+                if out_buffer != 0 && out_size >= 12 {
+                    write_u32(memory, out_buffer, 0x07); // DeviceType
+                    write_u32(memory, out_buffer + 4, 0); // DeviceNumber
+                    write_u32(memory, out_buffer + 8, 1); // PartitionNumber
+                    done!(12);
+                }
+                done!(0);
             }
             // IOCTL_STORAGE_GET_MEDIA_TYPES_EX
             0x000D0004 => {
@@ -104,11 +206,63 @@ impl PeHostRuntime {
                 if out_buffer != 0 && out_size >= 8 {
                     write_u32(memory, out_buffer, 0x0B); // StorageMediaType = FixedMedium
                     write_u32(memory, out_buffer + 4, 0); // DeviceSpecific
-                    if bytes_ret_ptr != 0 {
-                        write_u32(memory, bytes_ret_ptr, 8);
+                    done!(8);
+                }
+                done!(0);
+            }
+            // IOCTL_STORAGE_QUERY_PROPERTY — the property-query family:
+            // STORAGE_DEVICE_DESCRIPTOR (0) and STORAGE_DEVICE_NUMBER_PROPERTY (2).
+            0x002D1400 => {
+                let property_id = if in_buffer != 0 && in_size >= 4 {
+                    read_guest_u32(memory, in_buffer).unwrap_or(0)
+                } else {
+                    0
+                };
+                match property_id {
+                    0 => {
+                        // STORAGE_DEVICE_DESCRIPTOR (no strings attached).
+                        if out_buffer != 0 && out_size >= 64 {
+                            write_u32(memory, out_buffer, 48); // Version
+                            write_u32(memory, out_buffer + 4, 48); // Size
+                            memory.write_u8(out_buffer + 8, 0x07); // DeviceType: FILE_DEVICE_DISK
+                            memory.write_u8(out_buffer + 9, 0); // DeviceTypeModifier
+                            memory.write_u8(out_buffer + 10, 0); // RemovableMedia
+                            memory.write_u8(out_buffer + 11, 1); // CommandQueueing
+                            memory.map_bytes(out_buffer + 12, &[0_u8; 36]);
+                            done!(48);
+                        }
+                        done!(0);
+                    }
+                    2 => {
+                        // STORAGE_DEVICE_NUMBER_PROPERTY.
+                        if out_buffer != 0 && out_size >= 12 {
+                            write_u32(memory, out_buffer, 0x07); // DeviceType
+                            write_u32(memory, out_buffer + 4, 0); // DeviceNumber
+                            write_u32(memory, out_buffer + 8, 1); // PartitionNumber
+                            done!(12);
+                        }
+                        done!(0);
+                    }
+                    _ => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        state.set(Register::Rax, 0);
+                        if bytes_ret_ptr != 0 {
+                            write_u32(memory, bytes_ret_ptr, 0);
+                        }
                     }
                 }
-                state.set(Register::Rax, 1); // TRUE
+            }
+            // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS — the volume spans the
+            // whole disk partition.
+            0x00560000 => {
+                if out_buffer != 0 && out_size >= 24 {
+                    write_u32(memory, out_buffer, 1); // NumberOfDiskExtents
+                    write_u32(memory, out_buffer + 4, 0); // DiskNumber
+                    write_u64(memory, out_buffer + 8, 0); // StartingOffset
+                    write_u64(memory, out_buffer + 16, DISK_BYTES); // ExtentLength
+                    done!(24);
+                }
+                done!(0);
             }
             // Unknown/unsupported IOCTL — return FALSE with ERROR_INVALID_FUNCTION
             _ => {
@@ -2781,7 +2935,7 @@ impl PeHostRuntime {
             return Ok(None);
         }
         let handled = if self.guest_arch == GuestArch::X86 {
-            self.dispatch_x86_exception(state, memory, code, 0, "RtlRaiseException")?
+            self.dispatch_x86_exception(state, memory, code, 0, "RtlRaiseException", &[])?
         } else if self.guest_arch == GuestArch::X64 {
             let ctx = x64_context_from_state(state);
             let mem_ref: &MemoryImage = memory;

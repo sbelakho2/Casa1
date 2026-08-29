@@ -905,12 +905,12 @@ fn decode_frame_buffer_into(frame: &LiveFrame, buffer: &mut Vec<u32>) -> AppResu
     buffer.reserve(frame.width as usize * frame.height as usize);
     match frame.format {
         DxgiFormat::B8G8R8A8Unorm => {
-            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in frame.bytes[..expected_bytes].as_chunks::<4>().0 {
                 buffer.push(((chunk[2] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[0] as u32);
             }
         }
         DxgiFormat::R8G8B8A8Unorm => {
-            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in frame.bytes[..expected_bytes].as_chunks::<4>().0 {
                 buffer.push(((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32);
             }
         }
@@ -957,12 +957,12 @@ fn export_live_frame(frame: &LiveFrame, path: &Path) -> AppResult<()> {
     ppm.reserve(frame.width as usize * frame.height as usize * 3);
     match frame.format {
         DxgiFormat::B8G8R8A8Unorm => {
-            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in frame.bytes[..expected_bytes].as_chunks::<4>().0 {
                 ppm.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
             }
         }
         DxgiFormat::R8G8B8A8Unorm => {
-            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+            for chunk in frame.bytes[..expected_bytes].as_chunks::<4>().0 {
                 ppm.extend_from_slice(&chunk[..3]);
             }
         }

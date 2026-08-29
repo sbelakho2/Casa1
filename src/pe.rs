@@ -2325,7 +2325,9 @@ fn decode_utf16(bytes: &[u8]) -> AppResult<String> {
         return invalid("UTF-16 payload has an odd byte length");
     }
     let words = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&words).map_err(|error| {
@@ -3335,6 +3337,191 @@ pub fn extract_all_icons_from_pe(pe_data: &[u8]) -> AppResult<Vec<IconImage>> {
 }
 
 // ── Internal helpers for resource-tree traversal ────────────────────────────
+
+/// A resource name key for [`find_resource_data_entry_by_key`]: either a
+/// numeric resource ID (`MAKEINTRESOURCE` form) or a string name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceName {
+    Id(u32),
+    Str(String),
+}
+
+/// Find ONE resource data entry by numeric type ID and numeric-or-string
+/// name, returning `(data_rva, data_size)`.
+///
+/// The Windows resource tree is three levels: type → name → language.  The
+/// name level may hold numeric IDs or named (string) entries; this walker
+/// matches the requested key against both forms and returns the first
+/// language's data entry below the match.
+pub fn find_resource_data_entry_by_key(
+    bytes: &[u8],
+    sections: &[PeSection],
+    directories: &[DataDirectory],
+    type_id: u32,
+    name: &ResourceName,
+) -> AppResult<Option<(u32, u32)>> {
+    let directory = directories
+        .get(IMAGE_DIRECTORY_ENTRY_RESOURCE)
+        .copied()
+        .unwrap_or_default();
+    if directory.virtual_address == 0 || directory.size == 0 {
+        return Ok(None);
+    }
+    let resource_section = section_for_rva(sections, directory.virtual_address, 1, true)
+        .ok_or_else(|| pe_error("resource directory RVA is not covered by any section"))?;
+    let section_bytes = slice(
+        bytes,
+        resource_section.raw_data_ptr as usize,
+        resource_section.raw_data_size as usize,
+        "resource section raw bytes",
+    )?;
+    let section_rva = resource_section.virtual_address;
+    let root_rva = directory.virtual_address;
+
+    // Level 1: the type entry (numeric IDs only — types are always numeric).
+    let type_subdir_rva = resource_child_directory(
+        section_bytes,
+        section_rva,
+        root_rva,
+        root_rva,
+        &ResourceName::Id(type_id),
+    )?;
+    if type_subdir_rva == 0 {
+        return Ok(None);
+    }
+    // Level 2: the name entry.
+    let name_subdir_rva =
+        resource_child_directory(section_bytes, section_rva, root_rva, type_subdir_rva, name)?;
+    if name_subdir_rva == 0 {
+        return Ok(None);
+    }
+    // Level 3: any language — return the first data entry.
+    let relative = directory_relative(section_rva, name_subdir_rva)?;
+    let named = resource_entry_count(section_bytes, relative, true)?;
+    let ids = resource_entry_count(section_bytes, relative, false)?;
+    for index in 0..(named + ids) {
+        let entry_offset = relative + 16 + index * 8;
+        checked_range(section_bytes, entry_offset, 8, "resource language entry")?;
+        let payload = read_u32(
+            section_bytes,
+            entry_offset + 4,
+            "resource language entry payload",
+        )?;
+        if payload & 0x8000_0000 != 0 {
+            continue; // language level must point at data entries
+        }
+        let data_entry_rva = root_rva
+            .checked_add(payload & 0x7fff_ffff)
+            .ok_or_else(|| pe_error("resource data entry overflow"))?;
+        return read_resource_data_rva_size(section_bytes, section_rva, data_entry_rva).map(Some);
+    }
+    Ok(None)
+}
+
+/// The subdirectory RVA for the first entry matching `key` inside the
+/// directory at `directory_rva`.  Returns `Ok(0)` when no entry matches.
+fn resource_child_directory(
+    section_bytes: &[u8],
+    section_rva: u32,
+    root_rva: u32,
+    directory_rva: u32,
+    key: &ResourceName,
+) -> AppResult<u32> {
+    let relative = directory_relative(section_rva, directory_rva)?;
+    let named = resource_entry_count(section_bytes, relative, true)?;
+    let ids = resource_entry_count(section_bytes, relative, false)?;
+    for index in 0..(named + ids) {
+        let entry_offset = relative + 16 + index * 8;
+        checked_range(section_bytes, entry_offset, 8, "resource entry")?;
+        let name_field = read_u32(section_bytes, entry_offset, "resource entry name")?;
+        let matches = if name_field & 0x8000_0000 != 0 {
+            // Named entry: the low 31 bits are an RVA to a UTF-16 string.
+            match key {
+                ResourceName::Str(expected) => {
+                    let string_rva = root_rva
+                        .checked_add(name_field & 0x7fff_ffff)
+                        .ok_or_else(|| pe_error("resource name string overflow"))?;
+                    let string_relative = directory_relative(section_rva, string_rva)?;
+                    let mut offset = string_relative;
+                    let mut units = Vec::new();
+                    loop {
+                        checked_range(section_bytes, offset, 2, "resource name string")?;
+                        let unit = read_u16(section_bytes, offset, "resource name unit")?;
+                        offset += 2;
+                        if unit == 0 {
+                            break;
+                        }
+                        units.push(unit);
+                        if units.len() > 256 {
+                            break;
+                        }
+                    }
+                    String::from_utf16_lossy(&units).eq_ignore_ascii_case(expected)
+                }
+                ResourceName::Id(_) => false,
+            }
+        } else {
+            matches!(key, ResourceName::Id(id) if (name_field & 0xffff) == *id)
+        };
+        if !matches {
+            continue;
+        }
+        let payload = read_u32(section_bytes, entry_offset + 4, "resource entry payload")?;
+        if payload & 0x8000_0000 == 0 {
+            // A data entry at this level: nothing to descend into.
+            return Ok(0);
+        }
+        return root_rva
+            .checked_add(payload & 0x7fff_ffff)
+            .ok_or_else(|| pe_error("resource subdirectory overflow"));
+    }
+    Ok(0)
+}
+
+/// Read the raw payload bytes of a resource at `data_rva` (the value
+/// `find_resource_data_entry_by_key` returns) from the PE file bytes.
+pub fn extract_resource_payload(
+    bytes: &[u8],
+    sections: &[PeSection],
+    data_rva: u32,
+    data_size: u32,
+) -> AppResult<Option<Vec<u8>>> {
+    if data_size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let offset = rva_to_file_offset(data_rva, data_size, sections, 0)?;
+    Ok(Some(
+        slice(bytes, offset, data_size as usize, "resource payload")?.to_vec(),
+    ))
+}
+
+/// RVA-relative offset of a directory inside the resource section.
+fn directory_relative(section_rva: u32, directory_rva: u32) -> AppResult<usize> {
+    directory_rva
+        .checked_sub(section_rva)
+        .map(|value| value as usize)
+        .ok_or_else(|| pe_error("resource directory underflow"))
+}
+
+/// Named (index 0) or ID (index 1) entry count of a resource directory.
+fn resource_entry_count(section_bytes: &[u8], relative: usize, named: bool) -> AppResult<usize> {
+    checked_range(section_bytes, relative, 16, "resource directory")?;
+    let offset = if named { 12 } else { 14 };
+    Ok(read_u16(section_bytes, relative + offset, "resource entry count")? as usize)
+}
+
+/// Read `(data_rva, size)` from a resource data entry.
+fn read_resource_data_rva_size(
+    section_bytes: &[u8],
+    section_rva: u32,
+    data_entry_rva: u32,
+) -> AppResult<(u32, u32)> {
+    let relative = directory_relative(section_rva, data_entry_rva)?;
+    checked_range(section_bytes, relative, 16, "resource data entry")?;
+    let offset_to_data = read_u32(section_bytes, relative, "resource OffsetToData")?;
+    let size = read_u32(section_bytes, relative + 4, "resource Size")?;
+    Ok((offset_to_data, size))
+}
 
 #[derive(Debug)]
 struct ResourceDataEntry {

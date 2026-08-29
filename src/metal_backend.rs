@@ -4480,7 +4480,7 @@ pub fn create_mesh_pipeline(
     let full_source = format!(
         "#include <metal_stdlib>\nusing namespace metal;\n{}\n{}\n{}",
         desc.object_function.as_deref().unwrap_or(""),
-        &desc.mesh_function,
+        desc.mesh_function,
         desc.fragment_function.as_deref().unwrap_or(""),
     );
 

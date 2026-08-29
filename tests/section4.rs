@@ -891,7 +891,7 @@ fn reference_parity(value: u8) -> bool {
 fn reference_pdep(mut source: u64, mut mask: u64) -> u64 {
     let mut result = 0_u64;
     while mask != 0 {
-        let lowest = mask & mask.wrapping_neg();
+        let lowest = mask.isolate_lowest_one();
         if source & 1 != 0 {
             result |= lowest;
         }
@@ -905,7 +905,7 @@ fn reference_pext(source: u64, mut mask: u64) -> u64 {
     let mut result = 0_u64;
     let mut bit = 0_u32;
     while mask != 0 {
-        let lowest = mask & mask.wrapping_neg();
+        let lowest = mask.isolate_lowest_one();
         if source & lowest != 0 {
             result |= 1_u64 << bit;
         }

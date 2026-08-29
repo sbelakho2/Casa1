@@ -813,10 +813,9 @@ fn manifest_content_is_stable() {
 /// the cycle runs.
 #[test]
 fn manifest_gate_via_host_thunk_dispatch() {
-    // The host-thunk dispatch match has a large debug-build frame (the
-    // same hazard the runtime's `with_big_stack` helper addresses): run
-    // the gate on an 8 MiB thread so the nested guest dispatch cannot
-    // overflow libtest's default 2 MiB test-thread stack.
+    // The dispatch match frame exceeds libtest's 2 MiB test-thread stack in
+    // debug builds (same reason every dispatch-heavy runtime test runs on
+    // the 8 MiB big-stack thread).
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {

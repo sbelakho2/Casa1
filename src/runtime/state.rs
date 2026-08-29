@@ -575,6 +575,23 @@ pub(crate) struct PeHostRuntime {
     pub(crate) next_bcrypt_secret_id: u64,
     /// Manages certificate stores for crypt32.dll operations.
     pub(crate) cert_store_manager: crate::security::CertificateStoreManager,
+    pub(crate) cert_parsed: BTreeMap<u64, ParsedCertificate>,
+    pub(crate) console: ConsoleState,
+    pub(crate) console_input_handles: BTreeSet<u32>,
+    pub(crate) console_output_handles: BTreeSet<u32>,
+    pub(crate) debugger_present: bool,
+    pub(crate) process_affinity_mask: u64,
+    pub(crate) thread_affinity_masks: BTreeMap<u32, u64>,
+    pub(crate) std_handle_overrides: BTreeMap<u32, u64>,
+    pub(crate) heap_walk_cursors: BTreeMap<u64, usize>,
+    pub(crate) heap_locked: BTreeSet<u64>,
+    pub(crate) heap_information: BTreeMap<u64, u32>,
+    pub(crate) resource_entries: BTreeMap<u64, ResourceEntry>,
+    pub(crate) next_resource_handle: u64,
+    pub(crate) font_mem_resources: BTreeMap<u64, Vec<u8>>,
+    pub(crate) next_font_resource_handle: u64,
+    pub(crate) dc_pixel_formats: BTreeMap<u64, u32>,
+    pub(crate) foreground_grants: BTreeSet<u32>,
     /// Maps store handle -> store name for synthetic cert stores opened via CertOpenStore.
     pub(crate) cert_store_names: BTreeMap<u64, String>,
     /// Maps cert context handle → raw DER bytes for certificates created via CertCreateCertificateContext.
@@ -1140,6 +1157,57 @@ pub(crate) struct GdiRegion {
     pub(crate) bottom: i32,
 }
 
+pub(crate) struct ConsoleState {
+    /// `GetConsoleCP` answer (defaults to the OEM code page 437).
+    pub(crate) input_cp: u32,
+    /// `GetConsoleOutputCP` answer (defaults to the OEM code page 437).
+    #[allow(dead_code)] // console output-codepage state (future console APIs)
+    pub(crate) output_cp: u32,
+    /// Input-buffer mode (`GetConsoleMode` on an input handle).
+    pub(crate) input_mode: u32,
+    /// Output-buffer mode (`GetConsoleMode` on an output handle).
+    pub(crate) output_mode: u32,
+    /// Pending console input characters (UTF-16 units), consumed by
+    /// `ReadConsoleA`/`ReadConsoleW`.
+    #[allow(dead_code)] // consumed by the ReadConsole thunks through console.input_queue
+    pub(crate) input_queue: VecDeque<u16>,
+    /// `SetConsoleCtrlHandler` guest callbacks (PHANDLER_ROUTINE addresses).
+    pub(crate) control_handlers: Vec<u64>,
+    /// Whether `SetConsoleCtrlHandler(NULL, TRUE)` has installed the
+    /// ignore-default flag (the handler list is then preserved).
+    pub(crate) ignore_ctrl_c: bool,
+}
+
+pub(crate) struct ResourceEntry {
+    /// Guest pointer to the resource bytes (0 until `LoadResource` for
+    /// non-mapped modules).
+    pub(crate) data_ptr: u64,
+    /// Byte size of the resource payload.
+    pub(crate) size: u32,
+    /// Host path of the module the resource came from.
+    pub(crate) module_path: String,
+    /// RVA of the payload inside the module image.
+    pub(crate) load_rva: u32,
+    /// True when the module image (including .rsrc) is mapped in guest
+    /// memory — `data_ptr` is then valid immediately.
+    pub(crate) mapped: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParsedCertificate {
+    pub(crate) subject: String,
+    pub(crate) issuer: String,
+    #[allow(dead_code)] // parsed metadata for CertGetCertificateChain consumers
+    pub(crate) serial_number: String,
+    #[allow(dead_code)] // parsed metadata for CertGetCertificateChain consumers
+    pub(crate) thumbprint: Vec<u8>,
+    pub(crate) is_root: bool,
+    /// Unix seconds of `notBefore` (0 when the DER had no parseable validity).
+    pub(crate) not_before: i64,
+    /// Unix seconds of `notAfter` (0 when the DER had no parseable validity).
+    pub(crate) not_after: i64,
+}
+
 impl GdiRegion {
     pub(crate) fn is_empty(self) -> bool {
         self.left >= self.right || self.top >= self.bottom
@@ -1345,6 +1413,31 @@ impl PeHostRuntime {
             next_bcrypt_key_id: 0xB2000001,
             next_bcrypt_secret_id: 0xB3000001,
             cert_store_manager: crate::security::CertificateStoreManager::new(),
+            cert_parsed: BTreeMap::new(),
+            console: ConsoleState {
+                input_cp: 437,
+                output_cp: 437,
+                input_mode: 0x1A1, // ENABLE_PROCESSED_INPUT|ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_INSERT_MODE|ENABLE_QUICK_EDIT_MODE
+                output_mode: 0x1,  // ENABLE_PROCESSED_OUTPUT
+                input_queue: VecDeque::new(),
+                control_handlers: Vec::new(),
+                ignore_ctrl_c: false,
+            },
+            console_input_handles: BTreeSet::new(),
+            console_output_handles: BTreeSet::new(),
+            debugger_present: false,
+            process_affinity_mask: 0xFF,
+            thread_affinity_masks: BTreeMap::new(),
+            std_handle_overrides: BTreeMap::new(),
+            heap_walk_cursors: BTreeMap::new(),
+            heap_locked: BTreeSet::new(),
+            heap_information: BTreeMap::new(),
+            resource_entries: BTreeMap::new(),
+            next_resource_handle: 0x52000001,
+            font_mem_resources: BTreeMap::new(),
+            next_font_resource_handle: 0x51000001,
+            dc_pixel_formats: BTreeMap::new(),
+            foreground_grants: BTreeSet::new(),
             cert_store_names: BTreeMap::new(),
             cert_contexts: BTreeMap::new(),
             cert_enum_cursors: BTreeMap::new(),

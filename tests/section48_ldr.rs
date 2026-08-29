@@ -214,488 +214,562 @@ fn run_on_big_stack(test: impl FnOnce() + Send + 'static) {
 
 #[test]
 fn ldr_load_dll_returns_handle_fires_attach_and_second_load_does_not_refire() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let handle_ptr = ARENA;
-        session.map_guest(handle_ptr, &[0_u8; 8]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let handle_ptr = ARENA;
+                session.map_guest(handle_ptr, &[0_u8; 8]);
 
-        // A real DLL staged into the GE: LdrLoadDll resolves it through the
-        // loader machinery and queues DLL_PROCESS_ATTACH (DllMain + TLS).
-        let dll = build_minimal_dll("SampleExport", "first_fixture.dll");
-        let guest_path = format!(r"{FIXTURE_DIR}\first_fixture.dll");
-        write_guest_pe(&session, &guest_path, &dll);
-        map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
+                // A real DLL staged into the GE: LdrLoadDll resolves it through the
+                // loader machinery and queues DLL_PROCESS_ATTACH (DllMain + TLS).
+                let dll = build_minimal_dll("SampleExport", "first_fixture.dll");
+                let guest_path = format!(r"{FIXTURE_DIR}\first_fixture.dll");
+                write_guest_pe(&session, &guest_path, &dll);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
 
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(
-            NtStatus::from_raw(rax as u32),
-            STATUS_SUCCESS,
-            "rax={rax:#x}"
-        );
-        let handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        assert_ne!(handle, 0, "LdrLoadDll returns a module handle");
-        assert!(session.is_module_loaded(handle));
-        assert_eq!(session.real_dll_refcount("first_fixture.dll"), Some(1));
-        assert_eq!(session.dll_info_load_count(handle), Some(1));
-        // DLL_PROCESS_ATTACH (reason 1) for the new module is queued in load order.
-        assert_eq!(
-            session.pending_dll_main_calls(),
-            vec![(handle, 0x1000, 1)],
-            "the first load queues DllMain(DLL_PROCESS_ATTACH)"
-        );
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(
+                    NtStatus::from_raw(rax as u32),
+                    STATUS_SUCCESS,
+                    "rax={rax:#x}"
+                );
+                let handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                assert_ne!(handle, 0, "LdrLoadDll returns a module handle");
+                assert!(session.is_module_loaded(handle));
+                assert_eq!(session.real_dll_refcount("first_fixture.dll"), Some(1));
+                assert_eq!(session.dll_info_load_count(handle), Some(1));
+                // DLL_PROCESS_ATTACH (reason 1) for the new module is queued in load order.
+                assert_eq!(
+                    session.pending_dll_main_calls(),
+                    vec![(handle, 0x1000, 1)],
+                    "the first load queues DllMain(DLL_PROCESS_ATTACH)"
+                );
 
-        // A SECOND LdrLoadDll returns the SAME handle with a refcount increment
-        // ONLY — no re-fired DllMain.
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let handle2 = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        assert_eq!(handle2, handle, "the same module returns the same handle");
-        assert_eq!(session.real_dll_refcount("first_fixture.dll"), Some(2));
-        assert_eq!(session.dll_info_load_count(handle), Some(2));
-        assert_eq!(
-            session.pending_dll_main_calls(),
-            vec![(handle, 0x1000, 1)],
-            "a second load must NOT re-fire DllMain"
-        );
+                // A SECOND LdrLoadDll returns the SAME handle with a refcount increment
+                // ONLY — no re-fired DllMain.
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let handle2 =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                assert_eq!(handle2, handle, "the same module returns the same handle");
+                assert_eq!(session.real_dll_refcount("first_fixture.dll"), Some(2));
+                assert_eq!(session.dll_info_load_count(handle), Some(2));
+                assert_eq!(
+                    session.pending_dll_main_calls(),
+                    vec![(handle, 0x1000, 1)],
+                    "a second load must NOT re-fire DllMain"
+                );
 
-        // Synthetic modules behave the same way (same handle, count only).
-        let synth_name = "kernel32.dll";
-        map_unicode_string(&mut session, ARENA2, ARENA3, synth_name);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let synth_handle =
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let synth_handle2 =
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        assert_eq!(synth_handle, synth_handle2);
-        assert_eq!(session.dll_info_load_count(synth_handle), Some(2));
+                // Synthetic modules behave the same way (same handle, count only).
+                let synth_name = "kernel32.dll";
+                map_unicode_string(&mut session, ARENA2, ARENA3, synth_name);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let synth_handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let synth_handle2 =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                assert_eq!(synth_handle, synth_handle2);
+                assert_eq!(session.dll_info_load_count(synth_handle), Some(2));
 
-        // An unknown module fails with STATUS_DLL_NOT_FOUND.
-        map_unicode_string(&mut session, ARENA2, ARENA3, "absent_module.dll");
-        session.map_guest(handle_ptr, &[0_u8; 8]);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
-        assert_eq!(
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
-            0,
-            "the out handle is cleared on failure"
-        );
-    });
+                // An unknown module fails with STATUS_DLL_NOT_FOUND.
+                map_unicode_string(&mut session, ARENA2, ARENA3, "absent_module.dll");
+                session.map_guest(handle_ptr, &[0_u8; 8]);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
+                assert_eq!(
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
+                    0,
+                    "the out handle is cleared on failure"
+                );
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── Test (b): LdrGetDllHandle — lookup only, never loads ──────────────────
 
 #[test]
 fn ldr_get_dll_handle_finds_loaded_modules_and_fails_for_unknown() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let get_handle = session.alloc_thunk(HostThunk::LdrGetDllHandle);
-        let handle_ptr = ARENA;
-        session.map_guest(handle_ptr, &[0_u8; 8]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let get_handle = session.alloc_thunk(HostThunk::LdrGetDllHandle);
+                let handle_ptr = ARENA;
+                session.map_guest(handle_ptr, &[0_u8; 8]);
 
-        let dll = build_minimal_dll("SampleExport", "second_fixture.dll");
-        let guest_path = format!(r"{FIXTURE_DIR}\second_fixture.dll");
-        write_guest_pe(&session, &guest_path, &dll);
-        map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                let dll = build_minimal_dll("SampleExport", "second_fixture.dll");
+                let guest_path = format!(r"{FIXTURE_DIR}\second_fixture.dll");
+                write_guest_pe(&session, &guest_path, &dll);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
 
-        // Case-insensitive lookup of the loaded module (path and bare name).
-        for probe in [
-            &guest_path,
-            r"{FIXTURE_DIR}\SECOND_FIXTURE.DLL",
-            "second_fixture.dll",
-            "SECOND_FIXTURE.DLL",
-        ] {
-            map_unicode_string(&mut session, ARENA2, ARENA3, probe);
-            session.map_guest(handle_ptr, &[0_u8; 8]);
-            let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
-            assert_eq!(
-                NtStatus::from_raw(rax as u32),
-                STATUS_SUCCESS,
-                "probe {probe}"
-            );
-            assert_eq!(
-                u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
-                handle,
-                "probe {probe}"
-            );
-        }
+                // Case-insensitive lookup of the loaded module (path and bare name).
+                for probe in [
+                    &guest_path,
+                    r"{FIXTURE_DIR}\SECOND_FIXTURE.DLL",
+                    "second_fixture.dll",
+                    "SECOND_FIXTURE.DLL",
+                ] {
+                    map_unicode_string(&mut session, ARENA2, ARENA3, probe);
+                    session.map_guest(handle_ptr, &[0_u8; 8]);
+                    let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
+                    assert_eq!(
+                        NtStatus::from_raw(rax as u32),
+                        STATUS_SUCCESS,
+                        "probe {probe}"
+                    );
+                    assert_eq!(
+                        u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
+                        handle,
+                        "probe {probe}"
+                    );
+                }
 
-        // An unknown module is STATUS_DLL_NOT_FOUND and NEVER loads anything.
-        map_unicode_string(&mut session, ARENA2, ARENA3, "not_loaded.dll");
-        session.map_guest(handle_ptr, &[0xFF; 8]);
-        let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
-        assert_eq!(
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
-            0,
-            "the out handle is cleared"
-        );
-        assert!(!session.is_module_loaded(0), "nothing was loaded");
-    });
+                // An unknown module is STATUS_DLL_NOT_FOUND and NEVER loads anything.
+                map_unicode_string(&mut session, ARENA2, ARENA3, "not_loaded.dll");
+                session.map_guest(handle_ptr, &[0xFF; 8]);
+                let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
+                assert_eq!(
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap()),
+                    0,
+                    "the out handle is cleared"
+                );
+                assert!(!session.is_module_loaded(0), "nothing was loaded");
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── Test (c): LdrGetProcedureAddress — name + ordinal resolution ──────────
 
 #[test]
 fn ldr_get_procedure_address_resolves_by_name_and_ordinal() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let get_proc = session.alloc_thunk(HostThunk::LdrGetProcedureAddress);
-        let handle_ptr = ARENA;
-        let proc_ptr = ARENA + 8;
-        session.map_guest(handle_ptr, &[0_u8; 16]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let get_proc = session.alloc_thunk(HostThunk::LdrGetProcedureAddress);
+                let handle_ptr = ARENA;
+                let proc_ptr = ARENA + 8;
+                session.map_guest(handle_ptr, &[0_u8; 16]);
 
-        // Real DLL export by NAME.
-        let dll = build_minimal_dll("SampleExport", "third_fixture.dll");
-        let guest_path = format!(r"{FIXTURE_DIR}\third_fixture.dll");
-        write_guest_pe(&session, &guest_path, &dll);
-        map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                // Real DLL export by NAME.
+                let dll = build_minimal_dll("SampleExport", "third_fixture.dll");
+                let guest_path = format!(r"{FIXTURE_DIR}\third_fixture.dll");
+                write_guest_pe(&session, &guest_path, &dll);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
 
-        map_ansi_string(&mut session, ARENA2, ARENA3, "SampleExport");
-        let rax = session.call(get_proc, &[handle, ARENA2, 0, proc_ptr]);
-        assert_eq!(
-            NtStatus::from_raw(rax as u32),
-            STATUS_SUCCESS,
-            "rax={rax:#x}"
-        );
-        let address = u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap());
-        assert_ne!(address, 0, "the export resolves to a thunk address");
+                map_ansi_string(&mut session, ARENA2, ARENA3, "SampleExport");
+                let rax = session.call(get_proc, &[handle, ARENA2, 0, proc_ptr]);
+                assert_eq!(
+                    NtStatus::from_raw(rax as u32),
+                    STATUS_SUCCESS,
+                    "rax={rax:#x}"
+                );
+                let address =
+                    u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap());
+                assert_ne!(address, 0, "the export resolves to a thunk address");
 
-        // Unknown export name → STATUS_ENTRYPOINT_NOT_FOUND.
-        map_ansi_string(&mut session, ARENA2, ARENA3, "MissingExport");
-        let rax = session.call(get_proc, &[handle, ARENA2, 0, proc_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_ENTRYPOINT_NOT_FOUND);
-        assert_eq!(
-            u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap()),
-            0
-        );
+                // Unknown export name → STATUS_ENTRYPOINT_NOT_FOUND.
+                map_ansi_string(&mut session, ARENA2, ARENA3, "MissingExport");
+                let rax = session.call(get_proc, &[handle, ARENA2, 0, proc_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_ENTRYPOINT_NOT_FOUND);
+                assert_eq!(
+                    u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap()),
+                    0
+                );
 
-        // Ordinal resolution through the loader's ordinal machinery: a
-        // synthetic module with an ordinal-mapped export (oleaut32 ordinal 9 →
-        // VariantClear, the same arm static ordinal imports use).
-        map_unicode_string(&mut session, ARENA2, ARENA3, "oleaut32.dll");
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let ole_handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        let rax = session.call(get_proc, &[ole_handle, 0, 9, proc_ptr]);
-        assert_eq!(
-            NtStatus::from_raw(rax as u32),
-            STATUS_SUCCESS,
-            "rax={rax:#x}"
-        );
-        let ordinal_addr = u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap());
-        assert_ne!(
-            ordinal_addr, 0,
-            "ordinal 9 resolves like a static ordinal import"
-        );
+                // Ordinal resolution through the loader's ordinal machinery: a
+                // synthetic module with an ordinal-mapped export (oleaut32 ordinal 9 →
+                // VariantClear, the same arm static ordinal imports use).
+                map_unicode_string(&mut session, ARENA2, ARENA3, "oleaut32.dll");
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let ole_handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                let rax = session.call(get_proc, &[ole_handle, 0, 9, proc_ptr]);
+                assert_eq!(
+                    NtStatus::from_raw(rax as u32),
+                    STATUS_SUCCESS,
+                    "rax={rax:#x}"
+                );
+                let ordinal_addr =
+                    u64::from_le_bytes(session.read_guest(proc_ptr, 8).try_into().unwrap());
+                assert_ne!(
+                    ordinal_addr, 0,
+                    "ordinal 9 resolves like a static ordinal import"
+                );
 
-        // A name lookup on the same synthetic module also resolves (VariantClear
-        // is the ordinal 9 export).
-        map_ansi_string(&mut session, ARENA2, ARENA3, "VariantClear");
-        let rax = session.call(get_proc, &[ole_handle, ARENA2, 0, proc_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                // A name lookup on the same synthetic module also resolves (VariantClear
+                // is the ordinal 9 export).
+                map_ansi_string(&mut session, ARENA2, ARENA3, "VariantClear");
+                let rax = session.call(get_proc, &[ole_handle, ARENA2, 0, proc_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
 
-        // Unknown ordinal → STATUS_ENTRYPOINT_NOT_FOUND.
-        let rax = session.call(get_proc, &[ole_handle, 0, 0x7FFF, proc_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_ENTRYPOINT_NOT_FOUND);
+                // Unknown ordinal → STATUS_ENTRYPOINT_NOT_FOUND.
+                let rax = session.call(get_proc, &[ole_handle, 0, 0x7FFF, proc_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_ENTRYPOINT_NOT_FOUND);
 
-        // Unknown MODULE → STATUS_DLL_NOT_FOUND (Wine behavior).
-        map_ansi_string(&mut session, ARENA2, ARENA3, "SampleExport");
-        let rax = session.call(get_proc, &[0x1234_5678, ARENA2, 0, proc_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
+                // Unknown MODULE → STATUS_DLL_NOT_FOUND (Wine behavior).
+                map_ansi_string(&mut session, ARENA2, ARENA3, "SampleExport");
+                let rax = session.call(get_proc, &[0x1234_5678, ARENA2, 0, proc_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
 
-        // No name AND no ordinal → STATUS_INVALID_PARAMETER.
-        let rax = session.call(get_proc, &[ole_handle, 0, 0, proc_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-    });
+                // No name AND no ordinal → STATUS_INVALID_PARAMETER.
+                let rax = session.call(get_proc, &[ole_handle, 0, 0, proc_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── Test (d): LdrUnloadDll — DETACH, module removal, main-module refusal ──
 
 #[test]
 fn ldr_unload_dll_fires_detach_removes_module_and_refuses_the_main_module() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let unload = session.alloc_thunk(HostThunk::LdrUnloadDll);
-        let get_handle = session.alloc_thunk(HostThunk::LdrGetDllHandle);
-        let handle_ptr = ARENA;
-        session.map_guest(handle_ptr, &[0_u8; 8]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let unload = session.alloc_thunk(HostThunk::LdrUnloadDll);
+                let get_handle = session.alloc_thunk(HostThunk::LdrGetDllHandle);
+                let handle_ptr = ARENA;
+                session.map_guest(handle_ptr, &[0_u8; 8]);
 
-        let dll = build_minimal_dll("SampleExport", "fourth_fixture.dll");
-        let guest_path = format!(r"{FIXTURE_DIR}\fourth_fixture.dll");
-        write_guest_pe(&session, &guest_path, &dll);
-        map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                let dll = build_minimal_dll("SampleExport", "fourth_fixture.dll");
+                let guest_path = format!(r"{FIXTURE_DIR}\fourth_fixture.dll");
+                write_guest_pe(&session, &guest_path, &dll);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &guest_path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
 
-        // One refcount held: unload succeeds, DLL_PROCESS_DETACH (reason 0) is
-        // queued and the module is removed.
-        let rax = session.call(unload, &[handle]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(session.dll_info_load_count(handle), Some(0));
-        assert_eq!(
-            session.real_dll_refcount("fourth_fixture.dll"),
-            None,
-            "the RealDllState moved out of the loaded table"
-        );
-        assert_eq!(
-            session.detached_real_dll_count(),
-            1,
-            "the host-backed state is parked in the detach-only list"
-        );
-        assert_eq!(
-            session.pending_dll_main_calls(),
-            vec![(handle, 0x1000, 1), (handle, 0x1000, 0)],
-            "the load queued ATTACH; the last unload appends DllMain(DLL_PROCESS_DETACH)"
-        );
-        assert!(
-            !session.is_module_loaded(handle),
-            "the module handle is gone after the last unload"
-        );
-        assert!(
-            session.module_handle("fourth_fixture.dll").is_none(),
-            "LdrGetDllHandle can no longer find the module"
-        );
+                // One refcount held: unload succeeds, DLL_PROCESS_DETACH (reason 0) is
+                // queued and the module is removed.
+                let rax = session.call(unload, &[handle]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(session.dll_info_load_count(handle), Some(0));
+                assert_eq!(
+                    session.real_dll_refcount("fourth_fixture.dll"),
+                    None,
+                    "the RealDllState moved out of the loaded table"
+                );
+                assert_eq!(
+                    session.detached_real_dll_count(),
+                    1,
+                    "the host-backed state is parked in the detach-only list"
+                );
+                assert_eq!(
+                    session.pending_dll_main_calls(),
+                    vec![(handle, 0x1000, 1), (handle, 0x1000, 0)],
+                    "the load queued ATTACH; the last unload appends DllMain(DLL_PROCESS_DETACH)"
+                );
+                assert!(
+                    !session.is_module_loaded(handle),
+                    "the module handle is gone after the last unload"
+                );
+                assert!(
+                    session.module_handle("fourth_fixture.dll").is_none(),
+                    "LdrGetDllHandle can no longer find the module"
+                );
 
-        // LdrGetDllHandle now reports STATUS_DLL_NOT_FOUND.
-        map_unicode_string(&mut session, ARENA2, ARENA3, "fourth_fixture.dll");
-        session.map_guest(handle_ptr, &[0_u8; 8]);
-        let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
+                // LdrGetDllHandle now reports STATUS_DLL_NOT_FOUND.
+                map_unicode_string(&mut session, ARENA2, ARENA3, "fourth_fixture.dll");
+                session.map_guest(handle_ptr, &[0_u8; 8]);
+                let rax = session.call(get_handle, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
 
-        // A second unload of the same handle fails (module already gone).
-        let rax = session.call(unload, &[handle]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
+                // A second unload of the same handle fails (module already gone).
+                let rax = session.call(unload, &[handle]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_DLL_NOT_FOUND);
 
-        // The MAIN module can never be unloaded (STATUS_INVALID_PARAMETER —
-        // documented in crate::ntdll::ldr: real Windows pins the main image;
-        // no authoritative NTSTATUS is documented, so the wrapper refuses).
-        session.install_main_module(0x400000, "game.exe");
-        let rax = session.call(unload, &[0x400000]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-        assert!(
-            !session
-                .pending_dll_main_calls()
-                .iter()
-                .any(|(base, _, _)| *base == 0x400000),
-            "the main module unload must never fire DLL_PROCESS_DETACH"
-        );
-        assert!(
-            session.is_module_loaded(0x400000),
-            "the main module stays loaded"
-        );
-    });
+                // The MAIN module can never be unloaded (STATUS_INVALID_PARAMETER —
+                // documented in crate::ntdll::ldr: real Windows pins the main image;
+                // no authoritative NTSTATUS is documented, so the wrapper refuses).
+                session.install_main_module(0x400000, "game.exe");
+                let rax = session.call(unload, &[0x400000]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                assert!(
+                    !session
+                        .pending_dll_main_calls()
+                        .iter()
+                        .any(|(base, _, _)| *base == 0x400000),
+                    "the main module unload must never fire DLL_PROCESS_DETACH"
+                );
+                assert!(
+                    session.is_module_loaded(0x400000),
+                    "the main module stays loaded"
+                );
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── Test (e): loader-lock protocol — cookie sanity + reentrancy depth ─────
 
 #[test]
 fn ldr_loader_lock_round_trips_with_cookie_sanity_and_reentrancy() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let lock = session.alloc_thunk(HostThunk::LdrLockLoaderLock);
-        let unlock = session.alloc_thunk(HostThunk::LdrUnlockLoaderLock);
-        let disposition = ARENA;
-        let cookie_ptr = ARENA + 4;
-        session.map_guest(ARENA, &[0_u8; 16]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let lock = session.alloc_thunk(HostThunk::LdrLockLoaderLock);
+                let unlock = session.alloc_thunk(HostThunk::LdrUnlockLoaderLock);
+                let disposition = ARENA;
+                let cookie_ptr = ARENA + 4;
+                session.map_guest(ARENA, &[0_u8; 16]);
 
-        // Acquire: STATUS_SUCCESS, disposition LOCK_ACQUIRED, cookie minted.
-        let rax = session.call(lock, &[0, disposition, cookie_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(
-            u32::from_le_bytes(session.read_guest(disposition, 4).try_into().unwrap()),
-            LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED
-        );
-        let cookie1 = u64::from_le_bytes(session.read_guest(cookie_ptr, 8).try_into().unwrap());
-        assert_ne!(cookie1, 0);
-        assert_eq!(session.loader_lock_depth(), 1);
+                // Acquire: STATUS_SUCCESS, disposition LOCK_ACQUIRED, cookie minted.
+                let rax = session.call(lock, &[0, disposition, cookie_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(
+                    u32::from_le_bytes(session.read_guest(disposition, 4).try_into().unwrap()),
+                    LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED
+                );
+                let cookie1 =
+                    u64::from_le_bytes(session.read_guest(cookie_ptr, 8).try_into().unwrap());
+                assert_ne!(cookie1, 0);
+                assert_eq!(session.loader_lock_depth(), 1);
 
-        // Reentrant acquire succeeds (real LdrLockLoaderLock is reentrant).
-        let rax = session.call(lock, &[0, disposition, cookie_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let cookie2 = u64::from_le_bytes(session.read_guest(cookie_ptr, 8).try_into().unwrap());
-        assert_ne!(cookie2, 0);
-        assert_eq!(session.loader_lock_depth(), 2);
+                // Reentrant acquire succeeds (real LdrLockLoaderLock is reentrant).
+                let rax = session.call(lock, &[0, disposition, cookie_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let cookie2 =
+                    u64::from_le_bytes(session.read_guest(cookie_ptr, 8).try_into().unwrap());
+                assert_ne!(cookie2, 0);
+                assert_eq!(session.loader_lock_depth(), 2);
 
-        // Unlock both levels; the depth returns to 0.
-        let rax = session.call(unlock, &[0, cookie2]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(session.loader_lock_depth(), 1);
-        let rax = session.call(unlock, &[0, cookie1]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(session.loader_lock_depth(), 0);
+                // Unlock both levels; the depth returns to 0.
+                let rax = session.call(unlock, &[0, cookie2]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(session.loader_lock_depth(), 1);
+                let rax = session.call(unlock, &[0, cookie1]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(session.loader_lock_depth(), 0);
 
-        // A NULL cookie is a no-op success; a bogus cookie is rejected.
-        let rax = session.call(unlock, &[0, 0]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let rax = session.call(unlock, &[0, 0x1234_5678]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                // A NULL cookie is a no-op success; a bogus cookie is rejected.
+                let rax = session.call(unlock, &[0, 0]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let rax = session.call(unlock, &[0, 0x1234_5678]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
 
-        // Protocol validation: NULL cookie pointer, TRY_ONLY without a
-        // disposition pointer, and invalid flags all fail.
-        let rax = session.call(lock, &[0, 0, 0]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-        let rax = session.call(
-            lock,
-            &[u64::from(LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY), 0, cookie_ptr],
-        );
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-        let rax = session.call(lock, &[0x40, disposition, cookie_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-        let rax = session.call(unlock, &[0x40, 0]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
-        assert_eq!(
-            session.loader_lock_depth(),
-            0,
-            "failed calls change nothing"
-        );
-    });
+                // Protocol validation: NULL cookie pointer, TRY_ONLY without a
+                // disposition pointer, and invalid flags all fail.
+                let rax = session.call(lock, &[0, 0, 0]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                let rax = session.call(
+                    lock,
+                    &[u64::from(LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY), 0, cookie_ptr],
+                );
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                let rax = session.call(lock, &[0x40, disposition, cookie_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                let rax = session.call(unlock, &[0x40, 0]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_INVALID_PARAMETER);
+                assert_eq!(
+                    session.loader_lock_depth(),
+                    0,
+                    "failed calls change nothing"
+                );
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 #[test]
 fn single_dll_drain_runs_tls_then_dllmain() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let handle_ptr = ARENA;
-        session.map_guest(handle_ptr, &[0_u8; 8]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let handle_ptr = ARENA;
+                session.map_guest(handle_ptr, &[0_u8; 8]);
 
-        let dll = build_minimal_dll("ExportA", "solo.dll");
-        let path = format!(r"{FIXTURE_DIR}\solo.dll");
-        write_guest_pe(&session, &path, &dll);
-        map_unicode_string(&mut session, ARENA2, ARENA3, &path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let handle = u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                let dll = build_minimal_dll("ExportA", "solo.dll");
+                let path = format!(r"{FIXTURE_DIR}\solo.dll");
+                write_guest_pe(&session, &path, &dll);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
 
-        session.vm_register_commit(handle, 0x3000);
-        let len_slot = 0x40_000;
-        let buf = 0x40_008;
-        session.map_guest(len_slot, &[0_u8; 16]);
-        session.map_guest(
-            handle + u64::from(TLS_CB_RVA),
-            &record_marker_code(0x41, len_slot, buf),
-        );
-        session.map_guest(
-            handle + u64::from(EP_RVA),
-            &record_marker_code(0x44, len_slot, buf),
-        );
-        let drained = session.drain_dll_main_calls();
-        assert_eq!(drained, 1);
-        assert_eq!(session.read_guest(buf, 2), vec![0x41, 0x44]);
-    });
+                session.vm_register_commit(handle, 0x3000);
+                let len_slot = 0x40_000;
+                let buf = 0x40_008;
+                session.map_guest(len_slot, &[0_u8; 16]);
+                session.map_guest(
+                    handle + u64::from(TLS_CB_RVA),
+                    &record_marker_code(0x41, len_slot, buf),
+                );
+                session.map_guest(
+                    handle + u64::from(EP_RVA),
+                    &record_marker_code(0x44, len_slot, buf),
+                );
+                let drained = session.drain_dll_main_calls();
+                assert_eq!(drained, 1);
+                assert_eq!(session.read_guest(buf, 2), vec![0x41, 0x44]);
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }
 
 // ── Test (f): load-order — TLS callbacks fire in the order loaded ─────────
 
 #[test]
 fn two_ldr_load_dll_calls_fire_tls_callbacks_in_load_order() {
-    run_on_big_stack(|| {
-        let (_tmp, mut session) = setup_session();
-        let load = session.alloc_thunk(HostThunk::LdrLoadDll);
-        let handle_ptr = ARENA;
-        session.map_guest(handle_ptr, &[0_u8; 8]);
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            run_on_big_stack(|| {
+                let (_tmp, mut session) = setup_session();
+                let load = session.alloc_thunk(HostThunk::LdrLoadDll);
+                let handle_ptr = ARENA;
+                session.map_guest(handle_ptr, &[0_u8; 8]);
 
-        // Two REAL DLLs, each with a DllMain entry point and one TLS
-        // callback that appends its marker to a shared record buffer.
-        // The loader queues each module's DLL_PROCESS_ATTACH at the
-        // TAIL of the FIFO, so the drain fires TLS callbacks (before
-        // each DllMain) in load order.
-        let first = build_minimal_dll("ExportA", "order_first.dll");
-        let second = build_minimal_dll("ExportB", "order_second.dll");
-        let first_path = format!(r"{FIXTURE_DIR}\order_first.dll");
-        let second_path = format!(r"{FIXTURE_DIR}\order_second.dll");
-        write_guest_pe(&session, &first_path, &first);
-        write_guest_pe(&session, &second_path, &second);
+                // Two REAL DLLs, each with a DllMain entry point and one TLS
+                // callback that appends its marker to a shared record buffer.
+                // The loader queues each module's DLL_PROCESS_ATTACH at the
+                // TAIL of the FIFO, so the drain fires TLS callbacks (before
+                // each DllMain) in load order.
+                let first = build_minimal_dll("ExportA", "order_first.dll");
+                let second = build_minimal_dll("ExportB", "order_second.dll");
+                let first_path = format!(r"{FIXTURE_DIR}\order_first.dll");
+                let second_path = format!(r"{FIXTURE_DIR}\order_second.dll");
+                write_guest_pe(&session, &first_path, &first);
+                write_guest_pe(&session, &second_path, &second);
 
-        map_unicode_string(&mut session, ARENA2, ARENA3, &first_path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let first_handle =
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        map_unicode_string(&mut session, ARENA2, ARENA3, &second_path);
-        let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        let second_handle =
-            u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
-        assert_ne!(first_handle, second_handle);
+                map_unicode_string(&mut session, ARENA2, ARENA3, &first_path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let first_handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                map_unicode_string(&mut session, ARENA2, ARENA3, &second_path);
+                let rax = session.call(load, &[0, 0, ARENA2, handle_ptr]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                let second_handle =
+                    u64::from_le_bytes(session.read_guest(handle_ptr, 8).try_into().unwrap());
+                assert_ne!(first_handle, second_handle);
 
-        // The pending queue pins the load order: FIRST then SECOND.
-        assert_eq!(
-            session.pending_dll_main_calls(),
-            vec![(first_handle, 0x1000, 1), (second_handle, 0x1000, 1),],
-            "a later LdrLoadDll appends AFTER the currently loaded modules"
-        );
+                // The pending queue pins the load order: FIRST then SECOND.
+                assert_eq!(
+                    session.pending_dll_main_calls(),
+                    vec![(first_handle, 0x1000, 1), (second_handle, 0x1000, 1),],
+                    "a later LdrLoadDll appends AFTER the currently loaded modules"
+                );
 
-        // Make the module regions guest-executable and place real code
-        // at the entry-point / TLS-callback RVAs.
-        for handle in [first_handle, second_handle] {
-            session.vm_register_commit(handle, 0x3000);
-            session.map_guest(handle + u64::from(EP_RVA), &[0xC3]); // DllMain: ret
-        }
-        // TLS callbacks append their marker; DllMains append 0x44 so
-        // the full interleave (TLS before DllMain on attach) is
-        // observable.
-        let len_slot = 0x40_000;
-        let buf = 0x40_008;
-        session.map_guest(len_slot, &[0_u8; 16]);
-        session.map_guest(
-            first_handle + u64::from(TLS_CB_RVA),
-            &record_marker_code(0x41, len_slot, buf),
-        );
-        session.map_guest(
-            second_handle + u64::from(TLS_CB_RVA),
-            &record_marker_code(0x42, len_slot, buf),
-        );
-        session.map_guest(
-            first_handle + u64::from(EP_RVA),
-            &record_marker_code(0x44, len_slot, buf),
-        );
-        session.map_guest(
-            second_handle + u64::from(EP_RVA),
-            &record_marker_code(0x44, len_slot, buf),
-        );
+                // Make the module regions guest-executable and place real code
+                // at the entry-point / TLS-callback RVAs.
+                for handle in [first_handle, second_handle] {
+                    session.vm_register_commit(handle, 0x3000);
+                    session.map_guest(handle + u64::from(EP_RVA), &[0xC3]); // DllMain: ret
+                }
+                // TLS callbacks append their marker; DllMains append 0x44 so
+                // the full interleave (TLS before DllMain on attach) is
+                // observable.
+                let len_slot = 0x40_000;
+                let buf = 0x40_008;
+                session.map_guest(len_slot, &[0_u8; 16]);
+                session.map_guest(
+                    first_handle + u64::from(TLS_CB_RVA),
+                    &record_marker_code(0x41, len_slot, buf),
+                );
+                session.map_guest(
+                    second_handle + u64::from(TLS_CB_RVA),
+                    &record_marker_code(0x42, len_slot, buf),
+                );
+                session.map_guest(
+                    first_handle + u64::from(EP_RVA),
+                    &record_marker_code(0x44, len_slot, buf),
+                );
+                session.map_guest(
+                    second_handle + u64::from(EP_RVA),
+                    &record_marker_code(0x44, len_slot, buf),
+                );
 
-        // Drain: TLS(first), DllMain(first), TLS(second),
-        // DllMain(second) — the order the loader queued them.
-        let drained = session.drain_dll_main_calls();
-        assert_eq!(drained, 2, "both queued entry points ran");
-        assert_eq!(
-            session.read_guest(buf, 4),
-            vec![0x41, 0x44, 0x42, 0x44],
-            "TLS callbacks fire in load order, TLS before DllMain on attach"
-        );
+                // Drain: TLS(first), DllMain(first), TLS(second),
+                // DllMain(second) — the order the loader queued them.
+                let drained = session.drain_dll_main_calls();
+                assert_eq!(drained, 2, "both queued entry points ran");
+                assert_eq!(
+                    session.read_guest(buf, 4),
+                    vec![0x41, 0x44, 0x42, 0x44],
+                    "TLS callbacks fire in load order, TLS before DllMain on attach"
+                );
 
-        // LdrAddRefDll / LdrRemoveRefDll are the same refcount
-        // primitives the Win32 path counts with: pin, then unpin, then
-        // unload to 0.
-        let add_ref = session.alloc_thunk(HostThunk::LdrAddRefDll);
-        let remove_ref = session.alloc_thunk(HostThunk::LdrRemoveRefDll);
-        let unload = session.alloc_thunk(HostThunk::LdrUnloadDll);
-        let rax = session.call(add_ref, &[u64::from(LDR_ADDREF_DLL_PIN), first_handle]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(session.dll_info_load_count(first_handle), Some(u32::MAX));
-        let rax = session.call(
-            remove_ref,
-            &[u64::from(LDR_REMOVE_REF_DLL_PIN), first_handle],
-        );
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert_eq!(session.dll_info_load_count(first_handle), Some(1));
-        let rax = session.call(unload, &[first_handle]);
-        assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
-        assert!(!session.is_module_loaded(first_handle));
-    });
+                // LdrAddRefDll / LdrRemoveRefDll are the same refcount
+                // primitives the Win32 path counts with: pin, then unpin, then
+                // unload to 0.
+                let add_ref = session.alloc_thunk(HostThunk::LdrAddRefDll);
+                let remove_ref = session.alloc_thunk(HostThunk::LdrRemoveRefDll);
+                let unload = session.alloc_thunk(HostThunk::LdrUnloadDll);
+                let rax = session.call(add_ref, &[u64::from(LDR_ADDREF_DLL_PIN), first_handle]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(session.dll_info_load_count(first_handle), Some(u32::MAX));
+                let rax = session.call(
+                    remove_ref,
+                    &[u64::from(LDR_REMOVE_REF_DLL_PIN), first_handle],
+                );
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert_eq!(session.dll_info_load_count(first_handle), Some(1));
+                let rax = session.call(unload, &[first_handle]);
+                assert_eq!(NtStatus::from_raw(rax as u32), STATUS_SUCCESS);
+                assert!(!session.is_module_loaded(first_handle));
+            });
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }

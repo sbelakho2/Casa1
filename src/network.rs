@@ -1624,6 +1624,17 @@ impl NetworkStack {
     }
 
     pub fn recv(&mut self, socket: SocketId, length: usize) -> AppResult<Vec<u8>> {
+        self.recv_flags(socket, length, false)
+    }
+
+    /// `recv` with the MSG_PEEK flag: the queued bytes are returned WITHOUT
+    /// consuming them (Windows peek semantics).
+    pub fn recv_flags(
+        &mut self,
+        socket: SocketId,
+        length: usize,
+        peek: bool,
+    ) -> AppResult<Vec<u8>> {
         self.ensure_wsa_started()?;
         // A zero-length recv must return immediately without touching the
         // stream (Windows returns 0 without blocking).
@@ -1669,17 +1680,83 @@ impl NetworkStack {
             self.last_wsa_error = 0;
             return Ok(Vec::new());
         }
-        let record = self.socket_record_mut(socket)?;
-        let count = length.min(record.recv_queue.len());
+        let count = length.min(self.socket_record(socket)?.recv_queue.len());
         let mut bytes = Vec::with_capacity(count);
         for _ in 0..count {
-            match record.recv_queue.pop_front() {
+            match self.socket_record_mut(socket)?.recv_queue.pop_front() {
                 Some(byte) => bytes.push(byte),
                 None => break,
             }
         }
+        if peek {
+            // Peek: put the bytes back on the FRONT of the queue (they were
+            // popped to read them; re-queue in order).
+            let record = self.socket_record_mut(socket)?;
+            for byte in bytes.iter().rev() {
+                record.recv_queue.push_front(*byte);
+            }
+        }
         self.last_wsa_error = 0;
         Ok(bytes)
+    }
+
+    /// The source address a `recvfrom`-style operation reports: the
+    /// connected peer's bound address when connected, otherwise the
+    /// socket's own bound address (the model's loopback-only transport
+    /// means the sender is always a peer in the same runtime).
+    pub fn peer_address(&self, socket: SocketId) -> AppResult<SockAddr> {
+        let record = self.socket_record(socket)?;
+        match &record.state {
+            SocketState::Connected { peer } => {
+                let peer_record = self.socket_record(*peer)?;
+                Ok(peer_record
+                    .bound_addr
+                    .clone()
+                    .unwrap_or_else(|| default_sockaddr(peer_record.family)))
+            }
+            _ => Ok(record
+                .bound_addr
+                .clone()
+                .unwrap_or_else(|| default_sockaddr(record.family))),
+        }
+    }
+
+    /// `sendto`-style delivery: route the bytes to the socket bound to
+    /// `dest` (the model's loopback transport — every socket lives in this
+    /// runtime).  When no socket is bound to the destination, the datagram
+    /// is silently dropped (UDP semantics: success, nothing listens).
+    pub fn send_to(&mut self, socket: SocketId, bytes: &[u8], dest: &SockAddr) -> AppResult<usize> {
+        self.ensure_wsa_started()?;
+        self.maybe_finish_connect(socket)?;
+        let target = self
+            .bound_socket_matching(dest)
+            .filter(|target| *target != socket);
+        if let Some(target) = target {
+            let record = self.socket_record_mut(target)?;
+            let new_len = record.recv_queue.len().saturating_add(bytes.len());
+            if new_len > MAX_SOCKET_RECEIVE_QUEUE {
+                return Err(AppError::new(
+                    ReasonCode::RcSocketReceiveQueueFull,
+                    format!(
+                        "socket receive queue full: {} + {} > {}",
+                        record.recv_queue.len(),
+                        bytes.len(),
+                        MAX_SOCKET_RECEIVE_QUEUE
+                    ),
+                ));
+            }
+            record.recv_queue.extend(bytes.iter().copied());
+        }
+        self.last_wsa_error = 0;
+        Ok(bytes.len())
+    }
+
+    /// The socket whose bound address matches `addr` (host + port), if any.
+    fn bound_socket_matching(&self, addr: &SockAddr) -> Option<SocketId> {
+        self.sockets.iter().find_map(|(id, record)| {
+            let bound = record.bound_addr.as_ref()?;
+            (bound.host == addr.host && bound.port == addr.port).then_some(*id)
+        })
     }
 
     pub fn setsockopt(

@@ -1025,8 +1025,8 @@ fn cpu_flags_runtime_executor_matches_the_known_x86_truth_table() {
 /// the unmapped-address query — all with session-relative addresses.
 #[test]
 fn virtual_memory_corpus_is_the_documented_session_sequence() {
-    // Oracle sessions dispatch the Nt* thunk surface, whose debug-build
-    // dispatch frame overflows libtest's default 2 MiB test-thread stack.
+    // The runtime executor runs the real dispatch match, whose debug-build
+    // frame exceeds libtest's 2 MiB test-thread stack.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -1073,7 +1073,8 @@ fn virtual_memory_corpus_is_the_documented_session_sequence() {
 /// region-relative bases and sizes).
 #[test]
 fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
-    // Oracle sessions dispatch the Nt* thunk surface (big debug frame).
+    // The runtime executor runs the real dispatch match, whose debug-build
+    // frame exceeds libtest's 2 MiB test-thread stack.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -1130,7 +1131,6 @@ fn virtual_memory_runtime_executor_matches_reference_derived_truth() {
             vector.id
         );
     }
-
         })
         .expect("spawn big-stack thread")
         .join()

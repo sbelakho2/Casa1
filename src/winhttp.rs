@@ -3967,7 +3967,7 @@ pub fn ntlm_parse_authenticate_msg(data: &[u8]) -> Option<(String, String, [u8; 
             return String::new();
         }
         let mut units = Vec::with_capacity(len / 2);
-        for chunk in data[off..off + len].chunks_exact(2) {
+        for chunk in data[off..off + len].as_chunks::<2>().0 {
             units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
         String::from_utf16_lossy(&units)

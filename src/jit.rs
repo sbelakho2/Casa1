@@ -7524,7 +7524,9 @@ mod tests {
             .expect("compile block");
         let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
         let words: Vec<u32> = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -7627,7 +7629,9 @@ mod tests {
             .expect("compile load+store block");
         let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
         let words: Vec<u32> = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -7722,7 +7726,9 @@ mod tests {
             .expect("compile block");
         let code = unsafe { std::slice::from_raw_parts(block.entry, block.code_size) };
         let words: Vec<u32> = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 

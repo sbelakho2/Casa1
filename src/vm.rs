@@ -397,6 +397,20 @@ impl VirtualMemory {
         first_old
     }
 
+    /// Total committed bytes across every region (the guest's resident
+    /// memory footprint — the `WorkingSetSize` answer family).
+    pub fn committed_bytes(&self) -> u64 {
+        let mut total = 0_u64;
+        for region in self.regions.values() {
+            for state in region.pages.values() {
+                if state.committed {
+                    total = total.saturating_add(VM_PAGE_SIZE);
+                }
+            }
+        }
+        total
+    }
+
     /// Coalesced page-granular query: reports the run of adjacent pages
     /// with identical state — and, for committed pages, identical
     /// protection and guard — starting at the page containing `address`,

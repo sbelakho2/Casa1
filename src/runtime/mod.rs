@@ -313,6 +313,393 @@ const PAGE_GUARD: u32 = 0x100;
 
 /// Translate Windows page-protection flags to the canonical VM protection
 /// model.
+fn civil_day_of_week(year: u16, month: u16, day: u16) -> u16 {
+    // 1970-01-01 was a Thursday (4).
+    let days = days_since_1970(i64::from(year), i64::from(month), i64::from(day));
+    ((days + 4).rem_euclid(7)) as u16
+}
+
+fn days_since_1970(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn current_guest_utc_components() -> AppResult<(u16, u16, u16, u16, u16, u16)> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let days = duration.as_secs() / 86400;
+    let mut year = 1970_i64;
+    let mut remaining = days as i64;
+    loop {
+        let days_in_year = if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: [i64; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1_i64;
+    for &days_in_month in &month_days {
+        if remaining < days_in_month {
+            break;
+        }
+        remaining -= days_in_month;
+        month += 1;
+    }
+    let secs_of_day = duration.as_secs() % 86400;
+    Ok((
+        year as u16,
+        month as u16,
+        (remaining + 1) as u16,
+        (secs_of_day / 3600) as u16,
+        ((secs_of_day % 3600) / 60) as u16,
+        (secs_of_day % 60) as u16,
+    ))
+}
+
+fn write_date_time_result(
+    memory: &mut MemoryImage,
+    state: &mut CpuState,
+    text: &str,
+    buffer_ptr: u64,
+    buffer_size: i32,
+    last_error: &mut u32,
+) {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let required = utf16.len() + 1;
+    if buffer_ptr == 0 || buffer_size <= 0 {
+        state.set(Register::Rax, required as u64);
+        return;
+    }
+    if (buffer_size as usize) < required {
+        state.set(Register::Rax, 0);
+        *last_error = ERROR_INSUFFICIENT_BUFFER;
+        return;
+    }
+    for (i, &unit) in utf16.iter().enumerate() {
+        memory.write_u16(buffer_ptr + i as u64 * 2, unit);
+    }
+    memory.write_u16(buffer_ptr + utf16.len() as u64 * 2, 0);
+    state.set(Register::Rax, utf16.len() as u64);
+    *last_error = 0;
+}
+
+const ERROR_RESOURCE_NOT_FOUND: u32 = 1_815;
+
+const FULL_WEEKDAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+const ABBR_WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+const FULL_MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+const ABBR_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn guest_pointer_size(guest_arch: GuestArch) -> u64 {
+    if guest_arch == GuestArch::X86 { 4 } else { 8 }
+}
+
+fn resource_name_from_arg(memory: &MemoryImage, arg: u64) -> AppResult<crate::pe::ResourceName> {
+    if arg >> 16 == 0 {
+        Ok(crate::pe::ResourceName::Id(arg as u32 & 0xffff))
+    } else if arg == 0 {
+        Ok(crate::pe::ResourceName::Id(0))
+    } else {
+        Ok(crate::pe::ResourceName::Str(read_c_string(memory, arg)?))
+    }
+}
+
+fn resource_type_id(name: &crate::pe::ResourceName) -> u32 {
+    match name {
+        crate::pe::ResourceName::Id(id) => *id,
+        crate::pe::ResourceName::Str(text) => match text.to_ascii_uppercase().as_str() {
+            "RT_CURSOR" => 1,
+            "RT_BITMAP" => 2,
+            "RT_ICON" => 3,
+            "RT_MENU" => 4,
+            "RT_DIALOG" => 5,
+            "RT_STRING" => 6,
+            "RT_FONTDIR" => 7,
+            "RT_FONT" => 8,
+            "RT_ACCELERATOR" => 9,
+            "RT_RCDATA" => 10,
+            "RT_MESSAGETABLE" => 11,
+            "RT_GROUP_CURSOR" => 12,
+            "RT_GROUP_ICON" => 14,
+            "RT_VERSION" => 16,
+            "RT_DLGINCLUDE" => 17,
+            "RT_PLUGPLAY" => 19,
+            "RT_HTML" => 23,
+            "RT_MANIFEST" => 24,
+            _ => 0,
+        },
+    }
+}
+
+fn format_time_tokens(
+    memory: &MemoryImage,
+    format_ptr: u64,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    force24: bool,
+) -> AppResult<String> {
+    let format = read_utf16_string(memory, format_ptr)?;
+    let units: Vec<u16> = format.encode_utf16().collect();
+    let meridian = if hour < 12 { "AM" } else { "PM" };
+    let hour12 = hour % 12;
+    let hour12_display = if hour12 == 0 { 12 } else { hour12 };
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < units.len() {
+        let unit = units[index];
+        let ch = char::from_u32(u32::from(unit)).unwrap_or('?');
+        match ch {
+            '\'' => {
+                index += 1;
+                let mut closed = false;
+                while index < units.len() {
+                    let current = units[index];
+                    if current == b'\'' as u16 {
+                        if index + 1 < units.len() && units[index + 1] == b'\'' as u16 {
+                            out.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        closed = true;
+                        index += 1;
+                        break;
+                    }
+                    out.push(char::from_u32(u32::from(current)).unwrap_or('?'));
+                    index += 1;
+                }
+                if !closed {
+                    break;
+                }
+            }
+            'h' | 'H' => {
+                let mut count = 0usize;
+                while index + count < units.len()
+                    && (units[index + count] == b'h' as u16 || units[index + count] == b'H' as u16)
+                {
+                    count += 1;
+                }
+                let value = if unit == b'h' as u16 && !force24 {
+                    hour12_display
+                } else {
+                    hour
+                };
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", value));
+                } else {
+                    out.push_str(&value.to_string());
+                }
+                index += count;
+            }
+            'm' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'm' as u16 {
+                    count += 1;
+                }
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", minute));
+                } else {
+                    out.push_str(&minute.to_string());
+                }
+                index += count;
+            }
+            's' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b's' as u16 {
+                    count += 1;
+                }
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", second));
+                } else {
+                    out.push_str(&second.to_string());
+                }
+                index += count;
+            }
+            't' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b't' as u16 {
+                    count += 1;
+                }
+                if force24 {
+                    // TIME_FORCE24HOURFORMAT: the meridian token renders empty.
+                } else if count >= 2 {
+                    out.push_str(meridian);
+                } else {
+                    out.push_str(&meridian[..1]);
+                }
+                index += count;
+            }
+            other => {
+                out.push(char::from_u32(u32::from(other)).unwrap_or('?'));
+                index += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn format_date_tokens(
+    memory: &MemoryImage,
+    format_ptr: u64,
+    year: u16,
+    month: u16,
+    day: u16,
+    dow: u16,
+) -> AppResult<String> {
+    let format = read_utf16_string(memory, format_ptr)?;
+    let units: Vec<u16> = format.encode_utf16().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < units.len() {
+        let unit = units[index];
+        let ch = char::from_u32(u32::from(unit)).unwrap_or('?');
+        match ch {
+            '\'' => {
+                // Quoted literal: copy until the closing quote; '' is an
+                // escaped quote.
+                index += 1;
+                let mut closed = false;
+                while index < units.len() {
+                    let current = units[index];
+                    if current == b'\'' as u16 {
+                        if index + 1 < units.len() && units[index + 1] == b'\'' as u16 {
+                            out.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        closed = true;
+                        index += 1;
+                        break;
+                    }
+                    out.push(char::from_u32(u32::from(current)).unwrap_or('?'));
+                    index += 1;
+                }
+                if !closed {
+                    break;
+                }
+            }
+            'd' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'd' as u16 {
+                    count += 1;
+                }
+                match count {
+                    1 => out.push_str(&day.to_string()),
+                    2 => out.push_str(&format!("{:02}", day)),
+                    3 => out.push_str(ABBR_WEEKDAYS[dow as usize]),
+                    _ => out.push_str(FULL_WEEKDAYS[dow as usize]),
+                }
+                index += count;
+            }
+            'M' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'M' as u16 {
+                    count += 1;
+                }
+                let month_index = (month as usize).saturating_sub(1);
+                match count {
+                    1 => out.push_str(&month.to_string()),
+                    2 => out.push_str(&format!("{:02}", month)),
+                    3 => out.push_str(ABBR_MONTHS[month_index]),
+                    _ => out.push_str(FULL_MONTHS[month_index]),
+                }
+                index += count;
+            }
+            'y' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'y' as u16 {
+                    count += 1;
+                }
+                match count {
+                    1 => out.push_str(&format!("{}", year % 100)),
+                    2 => out.push_str(&format!("{:02}", year % 100)),
+                    _ => out.push_str(&format!("{:04}", year)),
+                }
+                index += count;
+            }
+            other => {
+                out.push(char::from_u32(u32::from(other)).unwrap_or('?'));
+                index += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn file_type_description(path: &str, attributes: u32) -> String {
+    if attributes & 0x10 != 0 {
+        return "File folder".to_string();
+    }
+    let extension = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "txt" | "log" | "ini" | "md" | "csv" => "Text Document".to_string(),
+        "exe" | "com" | "bat" | "cmd" | "msi" => "Application".to_string(),
+        "dll" | "sys" | "drv" => "Application Extension".to_string(),
+        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "tif" | "tiff" | "webp" => {
+            "Image File".to_string()
+        }
+        "mp3" | "wav" | "flac" | "ogg" | "aac" | "wma" => "Audio File".to_string(),
+        "mp4" | "avi" | "mov" | "mkv" | "wmv" | "webm" => "Video File".to_string(),
+        "pdf" => "PDF Document".to_string(),
+        "zip" | "rar" | "7z" | "tar" | "gz" => "Compressed Folder".to_string(),
+        "html" | "htm" | "xml" | "css" | "js" => "Web Document".to_string(),
+        "doc" | "docx" => "Word Document".to_string(),
+        "xls" | "xlsx" => "Excel Sheet".to_string(),
+        "ppt" | "pptx" => "PowerPoint Presentation".to_string(),
+        "" if path.ends_with(['\\', '/']) => "File folder".to_string(),
+        _ => "Unknown File Type".to_string(),
+    }
+}
+
 fn protection_from_page_flags(flags: u32) -> crate::vm::VmProtection {
     let flags = flags & !PAGE_GUARD;
     crate::vm::VmProtection {
@@ -474,7 +861,6 @@ const FILE_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1FF;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-const DEFAULT_OEM_CODE_PAGE: u32 = 437;
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
 const OPEN_EXISTING: u32 = 3;
@@ -11138,7 +11524,9 @@ impl PeHostRuntime {
             // String property (REG_SZ): the buffer is a NUL-terminated
             // UTF-16 string.
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .take_while(|unit| *unit != 0)
                 .collect::<Vec<_>>();
@@ -22084,16 +22472,104 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::GetSystemMetrics => {
+                // GetSystemMetrics(index) — the documented SM_* indices over
+                // the runtime's virtual display.  Screen dimensions and DPI
+                // come from the primary monitor (the same state
+                // GetMonitorInfoW/EnumDisplayMonitors serve); window metrics
+                // are the virtual-topology constants every other metric
+                // family (GetDeviceCaps LOGPIXELS etc.) agrees with.
                 let index = guest_call_arg(state, memory, 0)? as i32;
+                let primary = self.user32.primary_monitor_id();
+                let monitor = self.user32.monitor_info(primary);
+                let (screen_w, screen_h) = monitor
+                    .as_ref()
+                    .map(|m| {
+                        (
+                            (m.bounds.right - m.bounds.left).max(0) as u32,
+                            (m.bounds.bottom - m.bounds.top).max(0) as u32,
+                        )
+                    })
+                    .unwrap_or((2560, 1600));
+                let dpi = monitor.as_ref().map(|m| m.dpi_x).unwrap_or(96);
                 let value = match index {
-                    0 => 1024,
-                    1 => 768,
-                    2 | 3 | 11 | 12 => 17,
-                    4 => 23,
-                    5 | 6 => 1,
-                    7 | 8 => 4,
-                    32 | 33 => 32,
-                    49 | 50 => 16,
+                    0 => screen_w,  // SM_CXSCREEN
+                    1 => screen_h,  // SM_CYSCREEN
+                    2 | 3 => 17,    // SM_CXVSCROLL / SM_CYHSCROLL
+                    4 => 23,        // SM_CYCAPTION
+                    5 | 6 => 1,     // SM_CXBORDER / SM_CYBORDER
+                    7 | 8 => 4,     // SM_CXDLGFRAME / SM_CYDLGFRAME
+                    9 => 17,        // SM_CYVTHUMB
+                    10 => 17,       // SM_CXHTHUMB
+                    11 | 12 => 32,  // SM_CXICON / SM_CYICON
+                    13 | 14 => 32,  // SM_CXCURSOR / SM_CYCURSOR
+                    15 => 19,       // SM_CYMENU
+                    16 => screen_w, // SM_CXFULLSCREEN
+                    17 => screen_h, // SM_CYFULLSCREEN
+                    18 => 0,        // SM_CYKANJIWINDOW
+                    19 => 1,        // SM_MOUSEPRESENT
+                    20 => 17,       // SM_CYVSCROLL
+                    21 => 17,       // SM_CXHSCROLL
+                    22 => 0,        // SM_DEBUG
+                    23 => 0,        // SM_SWAPBUTTON
+                    24 | 25 => 0,   // SM_RESERVED1 / SM_RESERVED2
+                    26 | 27 => 0,   // SM_RESERVED3 / SM_RESERVED4
+                    28 => 80,       // SM_CXMIN
+                    29 => 80,       // SM_CYMIN
+                    30 | 31 => 16,  // SM_CXSIZE / SM_CYSIZE
+                    32 | 33 => 4,   // SM_CXFRAME / SM_CYFRAME
+                    34 => 80,       // SM_CXMINTRACK
+                    35 => 80,       // SM_CYMINTRACK
+                    36 | 37 => 4,   // SM_CXDOUBLECLK / SM_CYDOUBLECLK
+                    38 | 39 => 75,  // SM_CXICONSPACING / SM_CYICONSPACING
+                    40 => 0,        // SM_MENUDROPALIGNMENT
+                    41 => 0,        // SM_PENWINDOWS
+                    42 => 0,        // SM_DBCSENABLED
+                    43 => 5,        // SM_CMOUSEBUTTONS
+                    44 => 0,        // SM_SECURE
+                    45 | 46 => 2,   // SM_CXEDGE / SM_CYEDGE
+                    47 | 48 => 28,  // SM_CXMINSPACING / SM_CYMINSPACING
+                    49 | 50 => 16,  // SM_CXSMICON / SM_CYSMICON
+                    51 => 18,       // SM_CYSMCAPTION
+                    52 | 53 => 12,  // SM_CXSMSIZE / SM_CYSMSIZE
+                    54 | 55 => 16,  // SM_CXMENUSIZE / SM_CYMENUSIZE
+                    56 => 0,        // SM_ARRANGE
+                    57 => 160,      // SM_CXMINIMIZED
+                    58 => 28,       // SM_CYMINIMIZED
+                    59 => 2560,     // SM_CXMAXTRACK
+                    60 => 1600,     // SM_CYMAXTRACK
+                    61 => 2560,     // SM_CXMAXIMIZED
+                    62 => 1600,     // SM_CYMAXIMIZED
+                    63 => 0,        // SM_NETWORK
+                    67 => 0,        // SM_CLEANBOOT
+                    68 | 69 => 4,   // SM_CXDRAG / SM_CYDRAG
+                    70 => 0,        // SM_SHOWSOUNDS
+                    71 | 72 => 13,  // SM_CXMENUCHECK / SM_CYMENUCHECK
+                    73 => 0,        // SM_SLOWMACHINE
+                    74 => 0,        // SM_MIDEASTENABLED
+                    75 => 1,        // SM_MOUSEWHEELPRESENT
+                    76 => 0,        // SM_XVIRTUALSCREEN
+                    77 => 0,        // SM_YVIRTUALSCREEN
+                    78 => screen_w, // SM_CXVIRTUALSCREEN
+                    79 => screen_h, // SM_CYVIRTUALSCREEN
+                    80 => self.user32.monitor_count(), // SM_CMONITORS
+                    81 => 1,        // SM_SAMEDISPLAYFORMAT
+                    82 => 1,        // SM_IMMENABLED
+                    83 | 84 => 1,   // SM_CXFOCUSBORDER / SM_CYFOCUSBORDER
+                    86 => 0,        // SM_TABLETPC
+                    87 => 0,        // SM_MEDIACENTER
+                    88 => 0,        // SM_STARTER
+                    89 => 0,        // SM_SERVERR2
+                    90 => dpi,      // SM_CMETRICS (legacy: DPI of the primary display)
+                    91 => 1,        // SM_MOUSEHORIZONTALWHEELPRESENT
+                    92 => 4,        // SM_CXPADDEDBORDER
+                    94 => 0,        // SM_DIGITIZER
+                    95 => 0,        // SM_MAXIMUMTOUCHES
+                    0x1000 => 0,    // SM_REMOTESESSION
+                    0x2000 => 0,    // SM_SHUTTINGDOWN
+                    0x2001 => 0,    // SM_REMOTECONTROL
+                    0x2002 => 1,    // SM_CARETBLINKINGENABLED
+                    0x2003 => 0,    // SM_CONVERTIBLESLATEMODE
+                    0x2004 => 0,    // SM_SYSTEMDOCKED
                     _ => 0,
                 };
                 state.set(Register::Rax, value as u64);
@@ -23817,15 +24293,77 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::GetDeviceCaps => {
+                // GetDeviceCaps(hdc, index) — the documented capability
+                // indices over the runtime's virtual display: pixel
+                // dimensions and DPI derive from the primary monitor (the
+                // same state GetMonitorInfoW/GetSystemMetrics serve), the
+                // color model is 32-bit true color, and the raster caps
+                // describe what the GDI blit engine actually supports.
                 let hdc = guest_call_arg(state, memory, 0)?;
                 let index = guest_call_arg(state, memory, 1)? as i32;
+                let primary = self.user32.primary_monitor_id();
+                let monitor = self.user32.monitor_info(primary);
+                let (screen_w, screen_h) = monitor
+                    .as_ref()
+                    .map(|m| {
+                        (
+                            (m.bounds.right - m.bounds.left).max(0) as u32,
+                            (m.bounds.bottom - m.bounds.top).max(0) as u32,
+                        )
+                    })
+                    .unwrap_or((2560, 1600));
+                let dpi = monitor.as_ref().map(|m| m.dpi_x).unwrap_or(96);
                 let value = if self.device_contexts.contains_key(&hdc) {
                     match index {
-                        8 => 2560,
-                        10 => 1600,
-                        12 => 32,
-                        14 => 1,
-                        88 | 90 => 144,
+                        0 => 5,               // DRIVERVERSION
+                        2 => 1,               // TECHNOLOGY: DT_RASDISPLAY
+                        4 => {
+                            // HORZSIZE in mm (25.4 mm per inch at the DPI).
+                            (screen_w.saturating_mul(254) / (dpi.saturating_mul(10))).max(1) as i32
+                        }
+                        6 => {
+                            (screen_h.saturating_mul(254) / (dpi.saturating_mul(10))).max(1) as i32
+                        }
+                        8 => screen_w as i32,  // HORZRES
+                        10 => screen_h as i32, // VERTRES
+                        12 => 32,              // BITSPIXEL
+                        14 => 1,               // PLANES
+                        16 => 0xFFFF_FFFFu32 as i32, // NUMBRUSHES (device-independent)
+                        18 => 0xFFFF_FFFFu32 as i32, // NUMPENS
+                        20 => 0,               // NUMMARKERS
+                        22 => 0,               // NUMFONTS (no device fonts)
+                        24 => 0xFFFF_FFFFu32 as i32, // NUMCOLORS (true color)
+                        26 => 0,               // PDEVICESIZE
+                        28 => 0,               // CURVECAPS
+                        30 => 0,               // LINECAPS
+                        32 => 0,               // POLYGONALCAPS
+                        34 => 0,               // TEXTCAPS
+                        36 => 1,               // CLIPCAPS: CP_RECTANGLE
+                        38 => {
+                            // RASTERCAPS: bitblt, dibitmap, dib-to-device,
+                            // floodfill, stretchblt, stretchdib, bitmap64.
+                            0x0001 | 0x0080 | 0x0200 | 0x1000 | 0x2000 | 0x4000 | 0x0008
+                        }
+                        40 => 36, // ASPECTX
+                        42 => 36, // ASPECTY
+                        44 => 51, // ASPECTXY
+                        45 => 0x2000, // SHADEBLENDCAPS: SB_CONST_ALPHA
+                        46 => 0,      // COLORMGMTCAPS
+                        88 => dpi as i32,  // LOGPIXELSX
+                        90 => dpi as i32,  // LOGPIXELSY
+                        104 => 0,          // SIZEPALETTE
+                        106 => 0,          // NUMRESERVED
+                        108 => 32,         // COLORRES
+                        110 => screen_w as i32, // PHYSICALWIDTH
+                        111 => screen_h as i32, // PHYSICALHEIGHT
+                        112 => 0,              // PHYSICALOFFSETX
+                        113 => 0,              // PHYSICALOFFSETY
+                        114 => (dpi as u64 * 1000 / 96) as i32, // SCALINGFACTORX
+                        115 => (dpi as u64 * 1000 / 96) as i32, // SCALINGFACTORY
+                        116 => 60,         // VREFRESH
+                        117 => screen_h as i32, // DESKTOPVERTRES
+                        118 => screen_w as i32, // DESKTOPHORZRES
+                        119 => 0,          // BLTALIGNMENT
                         _ => 0,
                     }
                 } else {
@@ -24306,7 +24844,7 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
-            HostThunk::CreateRoundRectRgn => {
+                        HostThunk::CreateRoundRectRgn => {
                 let left = guest_call_arg(state, memory, 0)? as i32;
                 let top = guest_call_arg(state, memory, 1)? as i32;
                 let right = guest_call_arg(state, memory, 2)? as i32;
@@ -24341,7 +24879,7 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
-            HostThunk::SetMapMode => {
+                        HostThunk::SetMapMode => {
                 let _hdc = guest_call_arg(state, memory, 0)?;
                 let _mode = guest_call_arg(state, memory, 1)? as i32;
                 // MM_TEXT = 1 is the default; return it as previous mode
@@ -25124,7 +25662,7 @@ impl PeHostRuntime {
                     json!(bytes_written),
                 );
             }
-            HostThunk::GetCharWidthW => {
+                        HostThunk::GetCharWidthW => {
                 // GetCharWidthW(hdc, iFirst, iLast, lpBuffer) — advance
                 // widths of the character range in the DC's selected font,
                 // from the same text-metrics machinery as
@@ -25596,26 +26134,68 @@ impl PeHostRuntime {
                 let max_filter = guest_call_arg(state, memory, 3)? as u32;
                 let thread_id = self.win32.current_thread_id();
                 loop {
-                    match self.get_message_pump(state, memory, msg_ptr, thread_id)? {
-                        GetMessagePumpOutcome::ProcessExit(code) => return Ok(Some(code)),
-                        GetMessagePumpOutcome::Idle => {}
-                        GetMessagePumpOutcome::Retrieved(message) => {
-                            let result =
-                                if message.kind == MessageKind::Quit { 0_u64 } else { 1_u64 };
-                            state.set(Register::Rax, result);
-                            self.last_error = 0;
-                            self.push_trace(
-                                "input",
-                                "GetMessageW",
-                                BTreeMap::from([
-                                    ("hwnd".to_string(), json!(hwnd)),
-                                    ("min_filter".to_string(), json!(min_filter)),
-                                    ("max_filter".to_string(), json!(max_filter)),
-                                ]),
-                                json!(message_id(message.kind)),
-                            );
-                            break;
+                    self.poll_live_input()?;
+                    // Drain all XAudio2 engines to keep audio playing during
+                    // the message loop even when no Windows messages arrive.
+                    let engine_keys: Vec<u64> = self.xaudio_engines.keys().copied().collect();
+                    for &engine_object in &engine_keys {
+                        let _ = self.drain_xaudio2_engine(engine_object);
+                    }
+                    if let Some(message) = self.user32.get_message_for_thread(thread_id) {
+                        match state.arch {
+                            GuestArch::X64 => write_win64_msg(memory, msg_ptr, &message)?,
+                            GuestArch::X86 => write_win32_msg(memory, msg_ptr, &message)?,
                         }
+                        let result = if message.kind == MessageKind::Quit { 0_u64 } else { 1_u64 };
+                        state.set(Register::Rax, result);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "input",
+                            "GetMessageW",
+                            BTreeMap::from([
+                                ("hwnd".to_string(), json!(hwnd)),
+                                ("min_filter".to_string(), json!(min_filter)),
+                                ("max_filter".to_string(), json!(max_filter)),
+                            ]),
+                            json!(message_id(message.kind)),
+                        );
+                        break;
+                    }
+                    let pump_outcome = self.pump_pending_guest_thread(memory)?;
+                    if let Some(code) = pump_outcome.process_exit {
+                        // A pumped thread requested process exit — propagate
+                        // the code so the main loop terminates the run.
+                        return Ok(Some(code));
+                    }
+                    if pump_outcome.did_work {
+                        continue;
+                    }
+                    // Poll due SetTimer timers and post WM_TIMER messages so
+                    // guest timers fire during message-loop idle — not only
+                    // at block-dispatch safepoints.
+                    if self.poll_guest_timers()? {
+                        continue;
+                    }
+                    // Drain expired timer and wait callbacks from the
+                    // background timer_work_sink (filled by CreateTimerQueueTimer
+                    // and RegisterWaitForSingleObject background threads).
+                    if self.drain_timer_work_queue(state, memory)? {
+                        // A timer callback may have requested process exit —
+                        // propagate the code so the main loop ends the run.
+                        if let Some(code) = self.process_exit_requested {
+                            return Ok(Some(code as i32));
+                        }
+                        continue;
+                    }
+                    self.win32.sleep_ex(16, false, None)?;
+                    // Always yield the CPU between GetMessageW polls to prevent
+                    // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
+                    // session is active so audio/frame processing isn't starved;
+                    // use a longer sleep (16 ms) when fully idle.
+                    if self.live_session.is_some() || self.dtm {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(16));
                     }
                 }
             }
@@ -26893,52 +27473,60 @@ impl PeHostRuntime {
                 write_guest_pointer(memory, object_ptr, 0, self.guest_arch)?;
                 let clsid = read_guid_string(memory, clsid_ptr)?;
                 let iid = read_guid_string(memory, iid_ptr)?;
-                if outer == 0 {
-                    if let Some(object) = self.try_create_com_object(memory, &clsid, &iid, clsctx)? {
-                        write_guest_pointer(memory, object_ptr, object, self.guest_arch)?;
+                if outer != 0 {
+                    // Aggregation contract: a non-NULL outer unknown requires
+                    // IID_IUnknown and delegates the interface; any other
+                    // IID fails E_NOINTERFACE (the exact Windows behavior).
+                    if iid.eq_ignore_ascii_case(IID_IUNKNOWN) {
+                        write_guest_pointer(memory, object_ptr, outer, self.guest_arch)?;
                         state.set(Register::Rax, 0);
                         self.last_error = 0;
-                        self.push_trace(
-                            "ole32",
-                            "CoCreateInstance",
-                            BTreeMap::from([
-                                ("clsid".to_string(), json!(clsid)),
-                                ("iid".to_string(), json!(iid)),
-                                ("clsctx".to_string(), json!(clsctx)),
-                            ]),
-                            json!(0),
-                        );
                     } else {
-                        // CLSID not recognised — return CLASS_E_CLASSNOTAVAILABLE
-                        state.set(Register::Rax, CLASS_E_CLASSNOTAVAILABLE);
+                        state.set(Register::Rax, E_NOINTERFACE);
                         self.last_error = ERROR_INVALID_PARAMETER;
-                        self.push_trace(
-                            "ole32",
-                            "CoCreateInstance(not-available)",
-                            BTreeMap::from([
-                                ("clsid".to_string(), json!(clsid)),
-                                ("iid".to_string(), json!(iid)),
-                                ("clsctx".to_string(), json!(clsctx)),
-                            ]),
-                            json!(CLASS_E_CLASSNOTAVAILABLE),
-                        );
                     }
+                    return Ok(None);
+                }
+                if let Some(object) = self.try_create_com_object(memory, &clsid, &iid, clsctx)? {
+                    write_guest_pointer(memory, object_ptr, object, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "ole32",
+                        "CoCreateInstance",
+                        BTreeMap::from([
+                            ("clsid".to_string(), json!(clsid)),
+                            ("iid".to_string(), json!(iid)),
+                            ("clsctx".to_string(), json!(clsctx)),
+                        ]),
+                        json!(0),
+                    );
                 } else {
-                    // Aggregation not supported
+                    // CLSID not recognised — return CLASS_E_CLASSNOTAVAILABLE
                     state.set(Register::Rax, CLASS_E_CLASSNOTAVAILABLE);
                     self.last_error = ERROR_INVALID_PARAMETER;
                     self.push_trace(
                         "ole32",
-                        "CoCreateInstance(aggregation)",
+                        "CoCreateInstance(not-available)",
                         BTreeMap::from([
                             ("clsid".to_string(), json!(clsid)),
-                            ("outer".to_string(), json!(format!("{outer:#x}"))),
+                            ("iid".to_string(), json!(iid)),
+                            ("clsctx".to_string(), json!(clsctx)),
                         ]),
                         json!(CLASS_E_CLASSNOTAVAILABLE),
                     );
                 }
             }
             HostThunk::CoTaskMemFree => {
+                // CoTaskMemFree(pv) — release task-memory allocations.  The
+                // COM task allocator is the runtime heap: a tracked
+                // allocation is released; NULL and unknown pointers are
+                // safe no-ops (the Windows contract — CoTaskMemFree never
+                // fails and never crashes on stale pointers).
+                let pv = guest_call_arg(state, memory, 0)?;
+                if pv != 0 {
+                    self.heap_allocations.remove(&pv);
+                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("ole32", "CoTaskMemFree", BTreeMap::new(), json!(0));
@@ -27559,28 +28147,88 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::IsUserAnAdmin => {
-                state.set(Register::Rax, 0);
+                // IsUserAnAdmin() — whether the guest user's token carries
+                // administrator membership.  The runtime models the guest as
+                // a standard (non-elevated) user — the same identity
+                // GetUserNameW / the guest network configuration report —
+                // so the answer is FALSE unless the guest identity is
+                // configured as an administrator.
+                let is_admin = self.win32.guest_user_is_admin();
+                state.set(Register::Rax, u64::from(is_admin));
                 self.last_error = 0;
-                self.push_trace("shell32", "IsUserAnAdmin", BTreeMap::new(), json!(0));
+                self.push_trace("shell32", "IsUserAnAdmin", BTreeMap::new(), json!(is_admin));
             }
             HostThunk::SHGetFileInfoW => {
+                // SHGetFileInfoW(path, attrs, info, info_size, flags) —
+                // fill the SHFILEINFOW fields the flags request: display
+                // name (SHGFI_DISPLAYNAME), file attributes (SHGFI_ATTRIBUTES),
+                // and the file-type description (SHGFI_TYPENAME).  The icon
+                // fields (SHGFI_ICON/SYSICONINDEX) are not modeled (no
+                // system image list) and report 0.  The return value is the
+                // icon handle (0 without SHGFI_ICON), matching the documented
+                // contract.
                 let path = guest_call_arg(state, memory, 0)?;
+                let _file_attrs = guest_call_arg_u32(state, memory, 1)?;
                 let info_ptr = guest_call_arg(state, memory, 2)?;
                 let info_size = guest_call_arg_u32(state, memory, 3)? as usize;
                 let flags = guest_call_arg_u32(state, memory, 4)?;
-                if info_ptr != 0 && info_size != 0 {
-                    memory.map_bytes(info_ptr, &vec![0; info_size]);
+                const SHGFI_DISPLAYNAME: u32 = 0x0000_0200;
+                const SHGFI_TYPENAME: u32 = 0x0000_0400;
+                const SHGFI_ATTRIBUTES: u32 = 0x0000_0800;
+                const SHGFI_ICON: u32 = 0x0000_0100;
+                const SHGFI_SYSICONINDEX: u32 = 0x0000_4000;
+                const SHGFI_USEFILEATTRIBUTES: u32 = 0x0000_0010;
+                const SHGFI_EXETYPE: u32 = 0x0000_2000;
+                const MAX_PATH: usize = 260;
+                if info_ptr == 0 || info_size < 680 {
+                    // SHFILEINFOW needs 680 bytes; Windows fails with 0.
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
-                state.set(Register::Rax, 0);
+                let path_text = if path != 0 {
+                    read_utf16_string(memory, path).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let use_attrs = flags & SHGFI_USEFILEATTRIBUTES != 0;
+                let attributes = if use_attrs || path_text.is_empty() {
+                    _file_attrs
+                } else {
+                    self.win32.file_attributes_for_display(&path_text)
+                };
+                memory.map_bytes(info_ptr, &vec![0_u8; 680]);
+                if flags & SHGFI_DISPLAYNAME != 0 {
+                    let display = path_text
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&path_text)
+                        .to_string();
+                    write_utf16_fixed_buffer(memory, info_ptr + 8, MAX_PATH, &display);
+                }
+                if flags & SHGFI_TYPENAME != 0 {
+                    let type_name = file_type_description(&path_text, attributes);
+                    write_utf16_fixed_buffer(memory, info_ptr + 528, 80, &type_name);
+                }
+                if flags & SHGFI_ATTRIBUTES != 0 {
+                    write_u32(memory, info_ptr + 648, attributes);
+                }
+                let result = if flags & (SHGFI_ICON | SHGFI_SYSICONINDEX | SHGFI_EXETYPE) != 0 {
+                    0
+                } else {
+                    1
+                };
+                state.set(Register::Rax, result);
                 self.last_error = 0;
                 self.push_trace(
                     "shell32",
                     "SHGetFileInfoW",
                     BTreeMap::from([
-                        ("path".to_string(), json!(if path == 0 { String::new() } else { read_utf16_string(memory, path).unwrap_or_default() })),
+                        ("path".to_string(), json!(path_text)),
                         ("flags".to_string(), json!(flags)),
+                        ("attributes".to_string(), json!(attributes)),
                     ]),
-                    json!(0),
+                    json!(result),
                 );
             }
             HostThunk::SHGetFolderPathW => {
@@ -28412,11 +29060,16 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GetACP => {
-                state.set(Register::Rax, u64::from(DEFAULT_ANSI_CODE_PAGE));
+                // GetACP() — the configured ANSI code page, served from the
+                // subsystem locale state (the same state MultiByteToWideChar
+                // / WideCharToMultiByte consult for CP_ACP).
+                state.set(Register::Rax, u64::from(self.win32.acp()));
                 self.last_error = 0;
             }
             HostThunk::GetOEMCP => {
-                state.set(Register::Rax, u64::from(DEFAULT_OEM_CODE_PAGE));
+                // GetOEMCP() — the configured OEM code page, served from the
+                // subsystem locale state.
+                state.set(Register::Rax, u64::from(self.win32.oemcp()));
                 self.last_error = 0;
             }
             HostThunk::IsValidCodePage => {
@@ -29455,7 +30108,10 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::IsDebuggerPresent => {
-                state.set(Register::Rax, 0);
+                // IsDebuggerPresent() — the runtime's debugger flag (the
+                // model of the PEB BeingDebugged byte).  The guest runs
+                // undebugged unless a debugger attaches.
+                state.set(Register::Rax, u64::from(self.debugger_present));
                 self.last_error = 0;
             }
             HostThunk::InitOnceBeginInitialize => {
@@ -36304,6 +36960,15 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::WsaRecv => {
+                // WSARecv(socket, buffers, count, bytes_received, flags,
+                // overlapped, routine) — the WSABUF scatter/gather receive
+                // through the NetworkStack: the payload is distributed
+                // across the buffer array in order, MSG_PEEK leaves the
+                // queue intact, and an overlapped request completes
+                // synchronously (the model's pump never blocks) with the
+                // OVERLAPPED Internal/InternalHigh fields written and the
+                // event signaled.  APC completion routines are not
+                // delivered (documented).
                 let socket = guest_call_arg(state, memory, 0)?;
                 let buffers_ptr = guest_call_arg(state, memory, 1)?;
                 let buffer_count = guest_call_arg_u32(state, memory, 2)?;
@@ -36312,7 +36977,7 @@ impl PeHostRuntime {
                 let overlapped = guest_call_arg(state, memory, 5)?;
                 let completion_routine = guest_call_arg(state, memory, 6)?;
                 let result = (|| -> AppResult<u32> {
-                    if overlapped != 0 || completion_routine != 0 {
+                    if overlapped != 0 && completion_routine != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
@@ -36321,24 +36986,43 @@ impl PeHostRuntime {
                     } else {
                         read_guest_u32(memory, flags_ptr)?
                     };
-                    if flags != 0 {
+                    // MSG_PEEK (0x2) | MSG_WAITALL (0x8) are honored; any
+                    // other flag combination is invalid like WinSock.
+                    if flags & !0x0A != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     let total_len = total_wsabuf_len(memory, buffers_ptr, buffer_count, self.guest_arch)?;
-                    let bytes = self.network.recv(socket, total_len)?;
-                    write_wsabuf_bytes(memory, buffers_ptr, buffer_count, self.guest_arch, &bytes)?;
+                    let bytes = self
+                        .network
+                        .recv_flags(socket, total_len, flags & 0x2 != 0)?;
+                    let written = write_wsabuf_bytes(memory, buffers_ptr, buffer_count, self.guest_arch, &bytes)?;
+                    let completed = if flags & 0x2 != 0 { bytes.len() } else { written };
                     if bytes_received_ptr != 0 {
-                        write_u32(memory, bytes_received_ptr, bytes.len() as u32);
+                        write_u32(memory, bytes_received_ptr, completed as u32);
                     }
                     if flags_ptr != 0 {
                         write_u32(memory, flags_ptr, 0);
+                    }
+                    if overlapped != 0 {
+                        // Synchronous completion: Internal = 0 (STATUS_SUCCESS),
+                        // InternalHigh = bytes transferred, event signaled.
+                        write_guest_pointer(memory, overlapped, 0, self.guest_arch)?;
+                        write_guest_pointer(
+                            memory,
+                            overlapped + guest_pointer_size(self.guest_arch),
+                            completed as u64,
+                            self.guest_arch,
+                        )?;
+                        if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
+                            let _ = self.win32.set_event(event);
+                        }
                     }
                     self.push_trace(
                         "network",
                         "WSARecv",
                         BTreeMap::from([("socket".to_string(), json!(socket))]),
-                        json!(bytes.len()),
+                        json!(completed),
                     );
                     Ok(0)
                 })();
@@ -36361,6 +37045,10 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::WsaRecvFrom => {
+                // WSARecvFrom — the scatter/gather receive plus the source
+                // address: the peer's bound address is written into the
+                // caller's sockaddr (with its length), the from-length
+                // pointer is always updated, and MSG_PEEK keeps the queue.
                 let socket = guest_call_arg(state, memory, 0)?;
                 let buffers_ptr = guest_call_arg(state, memory, 1)?;
                 let buffer_count = guest_call_arg_u32(state, memory, 2)?;
@@ -36371,7 +37059,7 @@ impl PeHostRuntime {
                 let overlapped = guest_call_arg(state, memory, 7)?;
                 let completion_routine = guest_call_arg(state, memory, 8)?;
                 let result = (|| -> AppResult<u32> {
-                    if overlapped != 0 || completion_routine != 0 {
+                    if overlapped != 0 && completion_routine != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
@@ -36380,31 +37068,59 @@ impl PeHostRuntime {
                     } else {
                         read_guest_u32(memory, flags_ptr)?
                     };
-                    if flags != 0 {
+                    if flags & !0x0A != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     let total_len = total_wsabuf_len(memory, buffers_ptr, buffer_count, self.guest_arch)?;
-                    let bytes = self.network.recv(socket, total_len)?;
-                    write_wsabuf_bytes(memory, buffers_ptr, buffer_count, self.guest_arch, &bytes)?;
+                    let bytes = self
+                        .network
+                        .recv_flags(socket, total_len, flags & 0x2 != 0)?;
+                    let written = write_wsabuf_bytes(memory, buffers_ptr, buffer_count, self.guest_arch, &bytes)?;
+                    let completed = if flags & 0x2 != 0 { bytes.len() } else { written };
                     if bytes_received_ptr != 0 {
-                        write_u32(memory, bytes_received_ptr, bytes.len() as u32);
+                        write_u32(memory, bytes_received_ptr, completed as u32);
                     }
                     if flags_ptr != 0 {
                         write_u32(memory, flags_ptr, 0);
                     }
-                    if from_len_ptr != 0 {
-                        write_u32(memory, from_len_ptr, 0);
-                    }
+                    // Source address: the peer's bound address (the model's
+                    // loopback transport).  The from-length pointer is
+                    // required whenever from is provided (WSAEFAULT).
                     if from_ptr != 0 && from_len_ptr == 0 {
                         self.network.wsa_set_last_error(WSAEFAULT);
                         return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    let source = self.network.peer_address(socket)?;
+                    if from_ptr != 0 {
+                        let mut capacity = read_guest_u32(memory, from_len_ptr)?;
+                        if capacity < 16 {
+                            self.network.wsa_set_last_error(WSAEFAULT);
+                            return Ok(INVALID_HANDLE_VALUE as u32);
+                        }
+                        write_guest_sockaddr(memory, from_ptr, &source)?;
+                        capacity = 16;
+                        write_u32(memory, from_len_ptr, capacity);
+                    } else if from_len_ptr != 0 {
+                        write_u32(memory, from_len_ptr, 0);
+                    }
+                    if overlapped != 0 {
+                        write_guest_pointer(memory, overlapped, 0, self.guest_arch)?;
+                        write_guest_pointer(
+                            memory,
+                            overlapped + guest_pointer_size(self.guest_arch),
+                            completed as u64,
+                            self.guest_arch,
+                        )?;
+                        if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
+                            let _ = self.win32.set_event(event);
+                        }
                     }
                     self.push_trace(
                         "network",
                         "WSARecvFrom",
                         BTreeMap::from([("socket".to_string(), json!(socket))]),
-                        json!(bytes.len()),
+                        json!(completed),
                     );
                     Ok(0)
                 })();
@@ -36427,6 +37143,12 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::WsaSend => {
+                // WSASend(socket, buffers, count, bytes_sent, flags,
+                // overlapped, routine) — the scatter/gather send: every
+                // WSABUF is read in order and pushed through the
+                // NetworkStack.  MSG_DONTROUTE is accepted (the loopback
+                // transport has no routes); overlapped requests complete
+                // synchronously with the event signaled.
                 let socket = guest_call_arg(state, memory, 0)?;
                 let buffers_ptr = guest_call_arg(state, memory, 1)?;
                 let buffer_count = guest_call_arg_u32(state, memory, 2)?;
@@ -36435,7 +37157,12 @@ impl PeHostRuntime {
                 let overlapped = guest_call_arg(state, memory, 5)?;
                 let completion_routine = guest_call_arg(state, memory, 6)?;
                 let result = (|| -> AppResult<u32> {
-                    if overlapped != 0 || completion_routine != 0 || flags != 0 {
+                    if overlapped != 0 && completion_routine != 0 {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    if flags & !0x10 != 0 {
+                        // Only MSG_DONTROUTE is meaningful for send.
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
@@ -36443,6 +37170,18 @@ impl PeHostRuntime {
                     let written = self.network.send(socket, &bytes)? as u32;
                     if bytes_sent_ptr != 0 {
                         write_u32(memory, bytes_sent_ptr, written);
+                    }
+                    if overlapped != 0 {
+                        write_guest_pointer(memory, overlapped, 0, self.guest_arch)?;
+                        write_guest_pointer(
+                            memory,
+                            overlapped + guest_pointer_size(self.guest_arch),
+                            u64::from(written),
+                            self.guest_arch,
+                        )?;
+                        if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
+                            let _ = self.win32.set_event(event);
+                        }
                     }
                     self.push_trace(
                         "network",
@@ -36471,24 +37210,51 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::WsaSendTo => {
+                // WSASendTo(socket, buffers, count, bytes_sent, flags, to,
+                // to_len, overlapped, routine) — the scatter/gather send to
+                // an explicit destination: the sockaddr is resolved against
+                // the runtime's bound sockets and the payload is routed
+                // there (a datagram to a socket nobody bound is silently
+                // dropped, like UDP).
                 let socket = guest_call_arg(state, memory, 0)?;
                 let buffers_ptr = guest_call_arg(state, memory, 1)?;
                 let buffer_count = guest_call_arg_u32(state, memory, 2)?;
                 let bytes_sent_ptr = guest_call_arg(state, memory, 3)?;
                 let flags = guest_call_arg_u32(state, memory, 4)?;
-                let _to_ptr = guest_call_arg(state, memory, 5)?;
-                let _to_len = guest_call_arg_u32(state, memory, 6)?;
+                let to_ptr = guest_call_arg(state, memory, 5)?;
+                let to_len = guest_call_arg_u32(state, memory, 6)?;
                 let overlapped = guest_call_arg(state, memory, 7)?;
                 let completion_routine = guest_call_arg(state, memory, 8)?;
                 let result = (|| -> AppResult<u32> {
-                    if overlapped != 0 || completion_routine != 0 || flags != 0 {
+                    if overlapped != 0 && completion_routine != 0 {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        return Ok(INVALID_HANDLE_VALUE as u32);
+                    }
+                    if flags & !0x10 != 0 {
                         self.network.wsa_set_last_error(WSAEINVAL);
                         return Ok(INVALID_HANDLE_VALUE as u32);
                     }
                     let bytes = read_wsabuf_bytes(memory, buffers_ptr, buffer_count, self.guest_arch)?;
-                    let written = self.network.send(socket, &bytes)? as u32;
+                    let written = if to_ptr != 0 {
+                        let dest = read_guest_sockaddr(memory, to_ptr, to_len)?;
+                        self.network.send_to(socket, &bytes, &dest)? as u32
+                    } else {
+                        self.network.send(socket, &bytes)? as u32
+                    };
                     if bytes_sent_ptr != 0 {
                         write_u32(memory, bytes_sent_ptr, written);
+                    }
+                    if overlapped != 0 {
+                        write_guest_pointer(memory, overlapped, 0, self.guest_arch)?;
+                        write_guest_pointer(
+                            memory,
+                            overlapped + guest_pointer_size(self.guest_arch),
+                            u64::from(written),
+                            self.guest_arch,
+                        )?;
+                        if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
+                            let _ = self.win32.set_event(event);
+                        }
                     }
                     self.push_trace(
                         "network",
@@ -38803,7 +39569,7 @@ impl PeHostRuntime {
                     json!(bytes_needed),
                 );
             }
-            HostThunk::EnumProcessModules => {
+                        HostThunk::EnumProcessModules => {
                 let process_handle = guest_call_arg(state, memory, 0)?;
                 let modules_ptr = guest_call_arg(state, memory, 1)?;
                 let buffer_bytes = guest_call_arg_u32(state, memory, 2)?;
@@ -39265,12 +40031,19 @@ impl PeHostRuntime {
             }
             HostThunk::GetStdHandle => {
                 let which = guest_call_arg_u32(state, memory, 0)?;
+                // SetStdHandle overrides win: the std-handle table serves the
+                // last value SetStdHandle stored for the slot, otherwise the
+                // pseudo-handle itself (the runtime's default console).
                 let handle = match which {
-                    STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => which,
-                    _ => INVALID_HANDLE_VALUE as u32,
+                    STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => self
+                        .std_handle_overrides
+                        .get(&which)
+                        .copied()
+                        .unwrap_or(u64::from(which)),
+                    _ => u64::from(INVALID_HANDLE_VALUE as u32),
                 };
-                state.set(Register::Rax, u64::from(handle));
-                self.last_error = if handle == INVALID_HANDLE_VALUE as u32 {
+                state.set(Register::Rax, handle);
+                self.last_error = if handle == u64::from(INVALID_HANDLE_VALUE as u32) {
                     ERROR_INVALID_PARAMETER
                 } else {
                     0
@@ -40637,7 +41410,7 @@ impl PeHostRuntime {
                 } else {
                     let text = if string_len > 0 {
                         let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
-                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let text_u16: Vec<u16> = text_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                         String::from_utf16_lossy(&text_u16)
                     } else {
                         String::new()
@@ -41367,7 +42140,7 @@ impl PeHostRuntime {
                 } else {
                     let text = if string_len > 0 {
                         let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
-                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let text_u16: Vec<u16> = text_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                         String::from_utf16_lossy(&text_u16)
                     } else {
                         String::new()
@@ -47826,29 +48599,222 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::HeapValidate => {
-                state.set(Register::Rax, 1); // TRUE — heap is valid
+                // HeapValidate(heap, flags, mem) — validate every live block
+                // of the process heap (or the single block at `mem`).  The
+                // runtime's bump allocator tracks each block's address and
+                // size; a block is valid iff its bytes are still mapped in
+                // guest memory (unmapped pages = the corruption Windows
+                // detects on the free-list walk).
+                let heap = arg(0);
+                let _flags = arg(1) as u32;
+                let mem = arg(2);
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                let valid = if mem != 0 {
+                    match self.heap_allocations.get(&mem) {
+                        Some(&size) => memory.is_range_mapped(mem, size),
+                        None => false,
+                    }
+                } else {
+                    self.heap_allocations
+                        .iter()
+                        .all(|(&address, &size)| memory.is_range_mapped(address, size))
+                };
+                state.set(Register::Rax, u64::from(valid));
+                self.last_error = if valid { 0 } else { ERROR_INVALID_PARAMETER };
             }
             HostThunk::HeapSetInformation => {
-                state.set(Register::Rax, 1); // TRUE
+                // HeapSetInformation(heap, class, info, info_size) — store
+                // the heap-compatibility setting (HeapCompatibilityInformation
+                // 0) or latch the termination-on-corruption flag (class 1).
+                let heap = arg(0);
+                let class = arg(1) as u32;
+                let info = arg(2);
+                let info_size = arg(3) as u32;
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                let result = (|| -> AppResult<bool> {
+                    match class {
+                        // HeapCompatibilityInformation: a ULONG (0 = default,
+                        // 1 = LFH).  The runtime records the request; the
+                        // bump allocator has no LFH, but the setting is
+                        // observable through HeapQueryInformation.
+                        0 => {
+                            if info == 0 || info_size < 4 {
+                                return Ok(false);
+                            }
+                            let value = read_guest_u32(memory, info)?;
+                            self.heap_information.insert(heap, value);
+                            Ok(true)
+                        }
+                        // HeapEnableTerminationOnCorruption: no info buffer.
+                        1 => {
+                            self.heap_information.insert(heap, 0x8000_0000);
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    }
+                })();
+                match result {
+                    Ok(ok) => {
+                        state.set(Register::Rax, u64::from(ok));
+                        self.last_error = if ok { 0 } else { ERROR_INVALID_PARAMETER };
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::HeapLock => {
-                state.set(Register::Rax, 1); // TRUE
+                // HeapLock(heap) — take the heap serialization token.  The
+                // cooperative pump already serializes all guest code, so the
+                // lock is a token the runtime records; HeapUnlock clears it.
+                let heap = arg(0);
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                self.heap_locked.insert(heap);
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::HeapUnlock => {
-                state.set(Register::Rax, 1); // TRUE
+                let heap = arg(0);
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                self.heap_locked.remove(&heap);
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::HeapWalk => {
-                state.set(Register::Rax, 0); // FALSE — no more entries
+                // HeapWalk(heap, entry) — enumerate the process heap's live
+                // blocks as PROCESS_HEAP_ENTRY records, one per call, in
+                // ascending address order.  Exhaustion reports FALSE with
+                // ERROR_NO_MORE_ITEMS (the Windows contract for a completed
+                // walk); a fresh heap reports FALSE + ERROR_NO_MORE_ITEMS on
+                // the first call.
+                let heap = arg(0);
+                let entry = arg(1);
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if entry == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let blocks: Vec<(u64, usize)> = self
+                    .heap_allocations
+                    .iter()
+                    .map(|(&address, &size)| (address, size))
+                    .collect();
+                let cursor = self.heap_walk_cursors.entry(heap).or_default();
+                if *cursor >= blocks.len() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_NO_MORE_ITEMS;
+                    return Ok(None);
+                }
+                let (address, size) = blocks[*cursor];
+                *cursor += 1;
+                let pointer_size = if self.guest_arch == GuestArch::X86 { 4_u64 } else { 8_u64 };
+                // PROCESS_HEAP_ENTRY: lpData (ptr), cbData (u32), cbOverhead
+                // (u8), iRegionIndex (u8), wFlags (u16), then the Block
+                // union (hMem ptr + dwReserved[3]).
+                write_guest_pointer(memory, entry, address, self.guest_arch)?;
+                write_u32(memory, entry + pointer_size, size as u32);
+                let union_offset = if self.guest_arch == GuestArch::X86 { 12 } else { 16 };
+                memory.write_u8(entry + union_offset, 0); // cbOverhead
+                memory.write_u8(entry + union_offset + 1, 0); // iRegionIndex
+                write_u16(memory, entry + union_offset + 2, 0x0004); // PROCESS_HEAP_ENTRY_BUSY
+                write_guest_pointer(memory, entry + union_offset + 4, address, self.guest_arch)?;
+                memory.map_bytes(
+                    entry + union_offset + 4 + pointer_size,
+                    &[0_u8; 12],
+                ); // dwReserved[3]
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::HeapQueryInformation => {
-                state.set(Register::Rax, 1); // TRUE
+                // HeapQueryInformation(heap, class, info, info_size, ret_len)
+                // — read back the HeapCompatibilityInformation setting.
+                let heap = arg(0);
+                let class = arg(1) as u32;
+                let info = arg(2);
+                let info_size = arg(3) as u32;
+                let ret_len = arg(4);
+                if heap != PROCESS_HEAP_HANDLE {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                match class {
+                    0 => {
+                        if info == 0 || info_size < 4 {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INVALID_PARAMETER;
+                            return Ok(None);
+                        }
+                        let value = self.heap_information.get(&heap).copied().unwrap_or(0);
+                        write_u32(memory, info, value);
+                        if ret_len != 0 {
+                            write_u32(memory, ret_len, 4);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    _ => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::IsBadWritePtr => {
-                state.set(Register::Rax, 0); // FALSE — all memory is valid
+                // IsBadWritePtr(ptr, size) — 0 when the range is fully
+                // mapped (writable), non-zero when it is not.  A zero length
+                // is always valid; pointer overflow is invalid.
+                let ptr = arg(0);
+                let size = arg(1) as usize;
+                let bad = size != 0
+                    && (ptr.checked_add(size as u64).is_none()
+                        || !memory.is_range_mapped(ptr, size));
+                state.set(Register::Rax, u64::from(bad));
+                self.last_error = 0;
             }
             HostThunk::SwitchToThread => {
-                // Yield — always return FALSE (no other thread was ready)
-                state.set(Register::Rax, 0);
+                // SwitchToThread() — yield the current pump slice.  TRUE when
+                // another guest thread is ready to run (a pending thread that
+                // is not suspended), FALSE otherwise.
+                let other_ready = self.pending_guest_threads.iter().any(|thread| {
+                    thread.suspended == 0
+                        && !self.win32.thread_has_exited(thread.thread_id)
+                        && matches!(
+                            thread.state_machine,
+                            GuestThreadState::Runnable
+                                | GuestThreadState::Waiting
+                                | GuestThreadState::AlertableWaiting
+                        )
+                });
+                if other_ready {
+                    // Yield the current thread: the pump loop re-checks
+                    // readiness, so a requeue with a zero wake tick is all
+                    // the cooperative model needs.
+                    self.yield_pumped_guest_thread = true;
+                }
+                state.set(Register::Rax, u64::from(other_ready));
+                self.last_error = 0;
             }
             HostThunk::OpenThread => {
                 let desired_access = arg(0) as u32;
@@ -48005,7 +48971,36 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::SetThreadAffinityMask => {
-                state.set(Register::Rax, 1); // previous affinity mask (non-zero = success)
+                // SetThreadAffinityMask(thread, mask) — restrict a thread to
+                // a subset of the runtime's fixed 8-core topology (system
+                // mask 0xFF, the mask GetSystemInfo reports).  Returns the
+                // PREVIOUS mask; 0 with ERROR_INVALID_PARAMETER for a
+                // zero/oversized mask and ERROR_INVALID_HANDLE for an
+                // unknown thread handle.
+                let handle = arg(0) as u32;
+                let mask = arg(1);
+                let thread_id = if handle == 0 {
+                    None
+                } else {
+                    self.win32.thread_id_for_handle(handle).ok()
+                };
+                if thread_id.is_none() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if mask == 0 || mask & !0xFF != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let thread_id = thread_id.unwrap();
+                let previous = self
+                    .thread_affinity_masks
+                    .insert(thread_id, mask)
+                    .unwrap_or(self.process_affinity_mask);
+                state.set(Register::Rax, previous);
+                self.last_error = 0;
             }
             HostThunk::GetProcessAffinityMask => {
                 let process_handle = arg(0);
@@ -48032,7 +49027,7 @@ impl PeHostRuntime {
                     self.last_error = ERROR_INVALID_PARAMETER;
                     return Ok(None);
                 }
-                write_guest_pointer(memory, affinity_ptr, 0xFF, self.guest_arch)?; // 8 cores
+                write_guest_pointer(memory, affinity_ptr, self.process_affinity_mask, self.guest_arch)?;
                 write_guest_pointer(memory, system_ptr, 0xFF, self.guest_arch)?;
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
@@ -48109,6 +49104,16 @@ impl PeHostRuntime {
                 ));
             }
             HostThunk::RaiseException => {
+                // RaiseException(code, flags, args_count, args) — dispatch
+                // through the thread's exception chain with the FULL Windows
+                // contract: the raise arguments ride the EXCEPTION_RECORD
+                // ExceptionInformation array, the EH_NONCONTINUABLE flag
+                // (0x01) forbids handler continuation (a claimed
+                // non-continuable exception terminates the process with
+                // STATUS_NONCONTINUABLE_EXCEPTION), and EH_UNWINDING (0x02)
+                // is a signal, not a dispatch.  Vectored handlers run on
+                // BOTH guest arches (x64 via the SEH subsystem, x86 via the
+                // guest VEH queue drained after the FS:0 chain walk).
                 let code = arg(0) as u32;
                 let flags = arg(1) as u32;
                 // EH_UNWINDING (0x02) means this is called during stack
@@ -48119,13 +49124,49 @@ impl PeHostRuntime {
                     self.last_error = 0;
                     return Ok(None);
                 }
+                let raise_args_count = guest_call_arg_u32(state, memory, 2)?;
+                let raise_args_ptr = guest_call_arg(state, memory, 3)?;
+                let mut raise_parameters = Vec::with_capacity(raise_args_count.min(15) as usize);
+                if raise_args_ptr != 0 {
+                    for index in 0..raise_args_count.min(15) {
+                        if let Ok(value) = read_guest_u32(memory, raise_args_ptr + (index as u64 * 4))
+                        {
+                            raise_parameters.push(value);
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
                 // Windows semantics: dispatch through the thread's SEH chain
                 // (VEH first, then SEH).  A claimed exception returns to the
                 // caller; an unhandled exception terminates the process with
                 // the exception code.
+                let noncontinuable = flags & 0x01 != 0;
                 let handled = if self.guest_arch == GuestArch::X86 {
-                    self.dispatch_x86_exception(state, memory, code, 0, "RaiseException")?
+                    let handled = self.dispatch_x86_exception(
+                        state,
+                        memory,
+                        code,
+                        0,
+                        "RaiseException",
+                        &raise_parameters,
+                    )?;
+                    // The vectored handlers the SEH subsystem queued for
+                    // this thread (AddVectoredExceptionHandler registers a
+                    // chain the x64 path drains inline; the x86 path must
+                    // drain the same queue after the FS:0 walk).
+                    let pending_veh = crate::seh::drain_pending_guest_veh();
+                    for (veh_callback, veh_record, veh_context) in &pending_veh {
+                        self.invoke_guest_veh_callback(
+                            state,
+                            memory,
+                            *veh_callback,
+                            veh_record,
+                            veh_context,
+                        )?;
+                    }
+                    handled
                 } else if self.guest_arch == GuestArch::X64 {
                     let ctx = crate::seh::X64Context {
                         rax: state.gpr[0],
@@ -48178,6 +49219,22 @@ impl PeHostRuntime {
                 } else {
                     false
                 };
+                // A non-continuable exception can never be continued: a
+                // handler claiming it terminates the process with
+                // STATUS_NONCONTINUABLE_EXCEPTION (Windows raises that code
+                // instead of resuming).
+                if noncontinuable && handled {
+                    let termination_code = 0xC000_0025; // STATUS_NONCONTINUABLE_EXCEPTION
+                    self.unhandled_guest_exception = Some(termination_code);
+                    self.emit_event(crate::runtime_events::RuntimeEvent::GuestException {
+                        code: termination_code,
+                        guest_pc: state.rip,
+                        thread_id: self.win32.current_thread_id(),
+                    });
+                    state.set(Register::Rax, u64::from(termination_code));
+                    self.process_exit_requested = Some(termination_code);
+                    return Ok(Some(termination_code as i32));
+                }
                 if handled {
                     // A handler claimed the exception: RaiseException
                     // returns to the caller with the code as the result.
@@ -48197,8 +49254,6 @@ impl PeHostRuntime {
                     // the arguments carry the throw-info pointer and the
                     // exception object; the caller's return address on the
                     // guest stack identifies the throwing function.
-                    let raise_args_count = guest_call_arg_u32(state, memory, 2)?;
-                    let raise_args_ptr = guest_call_arg(state, memory, 3)?;
                     let mut throw_info = 0u32;
                     if raise_args_count >= 1 && raise_args_ptr != 0 {
                         throw_info = read_u32(memory, raise_args_ptr).unwrap_or(0);
@@ -48246,22 +49301,77 @@ impl PeHostRuntime {
                 state.set(Register::Rax, retval);
             }
             HostThunk::GetConsoleMode => {
-                let _handle = arg(0);
+                // GetConsoleMode(handle, mode) — the console state's input or
+                // output mode, selected by the handle kind: the std input
+                // pseudo-handle (or any handle in the console input-buffer
+                // table) reads the input mode, everything else the output
+                // mode.  Non-console handles fail ERROR_INVALID_HANDLE like
+                // Windows.
+                let handle = arg(0) as u32;
                 let mode_ptr = arg(1);
-                if mode_ptr != 0 {
-                    write_u32(memory, mode_ptr, 0x1A1); // ENABLE_PROCESSED_INPUT | ENABLE_ECHO_INPUT | etc.
+                if mode_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
+                let input_handle = handle == STD_INPUT_HANDLE
+                    || self.console_input_handles.contains(&handle);
+                if !input_handle
+                    && handle != STD_OUTPUT_HANDLE
+                    && handle != STD_ERROR_HANDLE
+                    && !self.console_output_handles.contains(&handle)
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                let mode = if input_handle {
+                    self.console.input_mode
+                } else {
+                    self.console.output_mode
+                };
+                write_u32(memory, mode_ptr, mode);
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::SetConsoleMode => {
-                state.set(Register::Rax, 1); // TRUE
+                // SetConsoleMode(handle, mode) — store the input or output
+                // mode in the console state.
+                let handle = arg(0) as u32;
+                let mode = arg(1) as u32;
+                let input_handle = handle == STD_INPUT_HANDLE
+                    || self.console_input_handles.contains(&handle);
+                if !input_handle
+                    && handle != STD_OUTPUT_HANDLE
+                    && handle != STD_ERROR_HANDLE
+                    && !self.console_output_handles.contains(&handle)
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if input_handle {
+                    self.console.input_mode = mode;
+                } else {
+                    self.console.output_mode = mode;
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::WriteConsoleW => {
-                let _handle = arg(0);
+                let handle = arg(0) as u32;
                 let buffer_ptr = arg(1);
                 let chars = arg(2) as usize;
                 let written_ptr = arg(3);
                 let _reserved = arg(4);
+                if !self.console_output_handles.contains(&handle)
+                    && handle != STD_OUTPUT_HANDLE
+                    && handle != STD_ERROR_HANDLE
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
                 let text = if buffer_ptr != 0 && chars > 0 {
                     let mut utf16 = Vec::with_capacity(chars);
                     for i in 0..chars {
@@ -48274,6 +49384,7 @@ impl PeHostRuntime {
                     write_u32(memory, written_ptr, chars as u32);
                 }
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::ReadConsoleA | HostThunk::ReadConsoleW => {
                 // Console input is not available in VM mode — return FALSE (no input read).
@@ -48281,12 +49392,30 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
             }
             HostThunk::GetConsoleCP => {
-                state.set(Register::Rax, 437); // OEM code page
+                // GetConsoleCP() — the console state's input code page (the
+                // runtime default is the OEM code page 437, matching a
+                // default Windows console).
+                state.set(Register::Rax, u64::from(self.console.input_cp));
+                self.last_error = 0;
             }
             HostThunk::SetStdHandle => {
-                let _which = arg(0) as u32;
-                let _handle = arg(1);
+                // SetStdHandle(which, handle) — override the std-handle
+                // table.  GetStdHandle serves the override; SetStdHandle on
+                // an unknown `which` fails ERROR_INVALID_PARAMETER like
+                // Windows.
+                let which = arg(0) as u32;
+                let handle = arg(1);
+                if !matches!(
+                    which,
+                    STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE
+                ) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                self.std_handle_overrides.insert(which, handle);
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::DeviceIoControl => {
                 // DeviceIoControl(handle, io_control_code, in_buffer, in_size, out_buffer, out_size, bytes_returned, overlapped)
@@ -48312,7 +49441,31 @@ impl PeHostRuntime {
                 )?;
             }
             HostThunk::SetProcessAffinityMask => {
+                // SetProcessAffinityMask(process, mask) — restrict the
+                // process to a subset of the fixed 8-core topology (0xFF).
+                // The mask is recorded in the runtime's affinity state (the
+                // same state SetThreadAffinityMask defaults from).
+                let process_handle = arg(0);
+                let mask = arg(1);
+                let valid_process = process_handle != 0
+                    && (process_handle == u64::from(self.win32.current_process_handle())
+                        || matches!(
+                            self.win32.handle_object_type(process_handle as u32),
+                            Ok(crate::win32::ObjectType::Process)
+                        ));
+                if !valid_process {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if mask == 0 || mask & !0xFF != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                self.process_affinity_mask = mask;
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::InterlockedPushEntrySList => {
                 // InterlockedPushEntrySList(ListHead, ListEntry) — push an
@@ -48335,52 +49488,150 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::FindResourceA => {
-                // FindResourceA(module, name, type) — look up resource in PE.
-                // For VM execution, allocate a tracking entry and return a non-zero handle.
-                let _module_handle = arg(0);
-                let _name = arg(1);
-                let _res_type = arg(2);
-                // Allocate a resource tracking entry on the heap
-                let resource_handle = self.alloc_heap(memory, 64, true)?;
-                // Store the resource type info in the first bytes as a marker
-                write_u32(memory, resource_handle, 0x52455352); // "RSRC" magic
-                write_guest_pointer(memory, resource_handle + 8, 0, self.guest_arch)?; // data ptr (set by LoadResource)
-                write_u32(memory, resource_handle + if self.guest_arch == GuestArch::X86 { 12 } else { 16 }, 0); // size (set by SizeofResource)
-                state.set(Register::Rax, resource_handle);
-            }
-            HostThunk::SizeofResource => {
-                // SizeofResource(module, res_handle) — return a reasonable size
-                let _module = arg(0);
-                let res_handle = arg(1);
-                if res_handle != 0 {
-                    // Return a plausible resource size (4KB is typical for icons/small resources)
-                    let size = 4096u32;
-                    write_u32(memory, res_handle + if self.guest_arch == GuestArch::X86 { 12 } else { 16 }, size);
-                    state.set(Register::Rax, size as u64);
-                } else {
-                    state.set(Register::Rax, 0);
+                // FindResourceA(module, name, type) — resolve (type, name)
+                // against the module's .rsrc resource directory and return a
+                // runtime resource handle.  The main module's resource bytes
+                // live in the mapped image (the handle's data pointer is
+                // image_base + data_rva); real DLLs are loaded on demand by
+                // LoadResource.
+                let module_handle = arg(0);
+                let name_arg = arg(1);
+                let type_arg = arg(2);
+                let resource = (|| -> AppResult<Option<(u32, u32, String, bool)>> {
+                    // (data_rva, size, module_path, mapped)
+                    let (module_path, mapped_base) = self.module_for_resource(module_handle)?;
+                    let bytes = std::fs::read(&module_path).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("cannot read module {module_path} for FindResourceA"),
+                        )
+                    })?;
+                    let parsed = crate::pe::parse(&bytes).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("cannot parse module {module_path}"),
+                        )
+                    })?;
+                    let name = resource_name_from_arg(memory, name_arg)?;
+                    let res_type = resource_name_from_arg(memory, type_arg)?;
+                    let Some((data_rva, size)) = crate::pe::find_resource_data_entry_by_key(
+                        &bytes,
+                        &parsed.sections,
+                        &parsed.data_directories,
+                        resource_type_id(&res_type),
+                        &name,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let mapped = module_handle == 0
+                        || module_handle == self.mapped_image_base
+                        || mapped_base.is_some();
+                    Ok(Some((data_rva, size, module_path, mapped)))
+                })();
+                match resource {
+                    Ok(Some((data_rva, size, module_path, mapped))) => {
+                        let handle = self.next_resource_handle;
+                        self.next_resource_handle = self.next_resource_handle.wrapping_add(1);                        self.resource_entries.insert(
+                            handle,
+                            ResourceEntry {
+                                data_ptr: if mapped {
+                                    self.mapped_image_base
+                                        .saturating_add(u64::from(data_rva))
+                                } else {
+                                    0
+                                },
+                                size,
+                                module_path,
+                                load_rva: data_rva,
+                                mapped,
+                            },
+                        );
+                        state.set(Register::Rax, handle);
+                        self.last_error = 0;
+                    }
+                    Ok(None) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_RESOURCE_NOT_FOUND;
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MOD_NOT_FOUND;
+                    }
                 }
             }
-            HostThunk::LoadResource => {
-                // LoadResource(module, res_handle) — prepare resource data.
-                // Allocate memory for the resource data and store the pointer.
+            HostThunk::SizeofResource => {
+                // SizeofResource(module, res_handle) — the byte size of the
+                // resource behind the handle (0 for unknown handles).
                 let _module = arg(0);
                 let res_handle = arg(1);
-                if res_handle != 0 {
-                    // Allocate 4KB of zeroed memory for resource data
-                    let data_ptr = self.alloc_heap(memory, 4096, true)?;
-                    // Store data pointer in the resource handle
-                    write_guest_pointer(memory, res_handle + 8, data_ptr, self.guest_arch)?;
-                    state.set(Register::Rax, data_ptr);
-                } else {
-                    state.set(Register::Rax, 0);
+                let size = self
+                    .resource_entries
+                    .get(&res_handle)
+                    .map(|entry| entry.size)
+                    .unwrap_or(0);
+                state.set(Register::Rax, u64::from(size));
+                self.last_error = 0;
+            }
+            HostThunk::LoadResource => {
+                // LoadResource(module, res_handle) — the resource data
+                // pointer.  Main-module resources are already mapped in the
+                // image; real-DLL resources are copied into the runtime heap
+                // on first load (the Windows "load the resource" step).
+                let _module = arg(0);
+                let res_handle = arg(1);
+                let loaded = (|| -> AppResult<Option<u64>> {
+                    let Some(entry) = self.resource_entries.get(&res_handle) else {
+                        return Ok(None);
+                    };
+                    if entry.mapped || entry.data_ptr != 0 {
+                        return Ok(Some(entry.data_ptr));
+                    }
+                    let bytes = std::fs::read(&entry.module_path).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("cannot read module {} for LoadResource", entry.module_path),
+                        )
+                    })?;
+                    let parsed = crate::pe::parse(&bytes).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("cannot parse module {} for LoadResource", entry.module_path),
+                        )
+                    })?;
+                    let Some(payload) = crate::pe::extract_resource_payload(
+                        &bytes,
+                        &parsed.sections,
+                        entry.load_rva,
+                        entry.size,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let data_ptr = self.alloc_heap(memory, payload.len(), true)?;
+                    memory.map_bytes(data_ptr, &payload);
+                    if let Some(entry) = self.resource_entries.get_mut(&res_handle) {
+                        entry.data_ptr = data_ptr;
+                    }
+                    Ok(Some(data_ptr))
+                })();
+                match loaded {
+                    Ok(Some(data_ptr)) => {
+                        state.set(Register::Rax, data_ptr);
+                        self.last_error = 0;
+                    }
+                    _ => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_RESOURCE_NOT_FOUND;
+                    }
                 }
             }
             HostThunk::LockResource => {
-                // LockResource(res_data) — return pointer to resource data.
-                // LoadResource already returned the data pointer, so we return it as-is.
+                // LockResource(res_data) — the resource data pointer as-is
+                // (the handle returned by LoadResource IS the pointer).
                 let res_data = arg(0);
                 state.set(Register::Rax, res_data);
+                self.last_error = 0;
             }
             HostThunk::SystemTimeToFileTime => {
                 let system_time_ptr = arg(0);
@@ -48501,91 +49752,114 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::GetDateFormatW => {
+                // GetDateFormatW(locale, flags, date, format, buffer, size) —
+                // format a SYSTEMTIME (or today) through the documented
+                // format-token set (d/dd/ddd/dddd, M/MM/MMM/MMMM, y/yy/yyyy,
+                // quoted literals) or the DATE_SHORTDATE / DATE_LONGDATE
+                // pictures.  The runtime's locale model is en-US.
                 let _locale = arg(0);
                 let flags = arg(1) as u32;
                 let date_ptr = arg(2);
-                let _format_ptr = arg(3);
+                let format_ptr = arg(3);
                 let buffer_ptr = arg(4);
                 let buffer_size = arg(5) as i32;
-                if buffer_ptr == 0 || buffer_size <= 0 {
-                    state.set(Register::Rax, 0);
+                let (year, month, day, dow) = if date_ptr != 0 {
+                    let y = memory.read_u16(date_ptr).unwrap_or(0);
+                    let m = memory.read_u16(date_ptr + 2).unwrap_or(0);
+                    let d = memory.read_u16(date_ptr + 6).unwrap_or(0);
+                    (y, m, d, civil_day_of_week(y, m, d))
                 } else {
-                    // If date_ptr is non-zero, read the SYSTEMTIME from guest memory
-                    let (year, month, day) = if date_ptr != 0 {
-                        let y = memory.read_u16(date_ptr).unwrap_or(0);
-                        let m = memory.read_u16(date_ptr + 2).unwrap_or(0);
-                        let d = memory.read_u16(date_ptr + 6).unwrap_or(0);
-                        (y, m, d)
-                    } else {
-                        // Use current date
-                        let duration = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        let days = duration.as_secs() / 86400;
-                        let mut y = 1970u16;
-                        let mut remaining = days;
-                        loop {
-                            let diy = if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) { 366 } else { 365 };
-                            if remaining < diy { break; }
-                            remaining -= diy;
-                            y += 1;
-                        }
-                        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-                        let md: [u64; 12] = if leap { [31,29,31,30,31,30,31,31,30,31,30,31] } else { [31,28,31,30,31,30,31,31,30,31,30,31] };
-                        let mut m = 1u16;
-                        for &days_in_m in &md {
-                            if remaining < days_in_m { break; }
-                            remaining -= days_in_m;
-                            m += 1;
-                        }
-                        (y, m, (remaining + 1) as u16)
-                    };
-                    // Format: DATE_SHORTDATE (0x01) or default "yyyy-MM-dd"
-                    let date_str = if flags & 0x01 != 0 {
-                        format!("{}/{}/{}", month, day, year)
-                    } else {
-                        format!("{:04}-{:02}-{:02}", year, month, day)
-                    };
-                    let utf16: Vec<u16> = date_str.encode_utf16().collect();
-                    let write_len = (buffer_size as usize).min(utf16.len());
-                    for (i, &c) in utf16.iter().take(write_len).enumerate() {
-                        memory.write_u16(buffer_ptr + i as u64 * 2, c);
-                    }
-                    memory.write_u16(buffer_ptr + write_len as u64 * 2, 0);
-                    state.set(Register::Rax, write_len as u64);
-                }
+                    let now = current_guest_utc_components()?;
+                    (
+                        now.0,
+                        now.1,
+                        now.2,
+                        civil_day_of_week(now.0, now.1, now.2),
+                    )
+                };
+                let date_str = if format_ptr != 0 {
+                    format_date_tokens(memory, format_ptr, year, month, day, dow)?
+                } else if flags & 0x02 != 0 {
+                    // DATE_LONGDATE: "dddd, MMMM d, yyyy"
+                    format!(
+                        "{}, {} {}, {}",
+                        FULL_WEEKDAYS[dow as usize],
+                        FULL_MONTHS[(month as usize).saturating_sub(1)],
+                        day,
+                        year
+                    )
+                } else {
+                    // DATE_SHORTDATE (and the default picture): "M/d/yyyy"
+                    format!("{}/{}/{}", month, day, year)
+                };
+                write_date_time_result(
+                    memory,
+                    state,
+                    &date_str,
+                    buffer_ptr,
+                    buffer_size,
+                    &mut self.last_error,
+                );
             }
             HostThunk::GetTimeFormatW => {
+                // GetTimeFormatW(locale, flags, time, format, buffer, size) —
+                // the documented time format tokens (h/hh/H/HH, m/mm, s/ss,
+                // t/tt) and the TIME_* flag pictures (24-hour forcing drops
+                // the AM/PM marker).
                 let _locale = arg(0);
-                let _flags = arg(1) as u32;
+                let flags = arg(1) as u32;
                 let time_ptr = arg(2);
-                let _format_ptr = arg(3);
+                let format_ptr = arg(3);
                 let buffer_ptr = arg(4);
                 let buffer_size = arg(5) as i32;
-                if buffer_ptr == 0 || buffer_size <= 0 {
-                    state.set(Register::Rax, 0);
+                let (hour, minute, second) = if time_ptr != 0 {
+                    let h = memory.read_u16(time_ptr + 8).unwrap_or(0);
+                    let m = memory.read_u16(time_ptr + 10).unwrap_or(0);
+                    let s = memory.read_u16(time_ptr + 12).unwrap_or(0);
+                    (h, m, s)
                 } else {
-                    let (hour, minute, second) = if time_ptr != 0 {
-                        let h = memory.read_u16(time_ptr + 8).unwrap_or(0);
-                        let m = memory.read_u16(time_ptr + 10).unwrap_or(0);
-                        let s = memory.read_u16(time_ptr + 12).unwrap_or(0);
-                        (h, m, s)
+                    let now = current_guest_utc_components()?;
+                    (now.3, now.4, now.5)
+                };
+                let force24 = flags & 0x08 != 0; // TIME_FORCE24HOURFORMAT
+                let no_marker = flags & 0x04 != 0; // TIME_NOTIMEMARKER
+                let time_str = if format_ptr != 0 {
+                    format_time_tokens(memory, format_ptr, hour, minute, second, force24)?
+                } else {
+                    let (h12, meridian) = if force24 || no_marker {
+                        (hour, "")
                     } else {
-                        let duration = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        let secs = duration.as_secs() % 86400;
-                        ((secs / 3600) as u16, ((secs % 3600) / 60) as u16, (secs % 60) as u16)
+                        let h12 = hour % 12;
+                        (if h12 == 0 { 12 } else { h12 }, if hour < 12 { "AM" } else { "PM" })
                     };
-                    let time_str = format!("{:02}:{:02}:{:02}", hour, minute, second);
-                    let utf16: Vec<u16> = time_str.encode_utf16().collect();
-                    let write_len = (buffer_size as usize).min(utf16.len());
-                    for (i, &c) in utf16.iter().take(write_len).enumerate() {
-                        memory.write_u16(buffer_ptr + i as u64 * 2, c);
+                    let mut text = format!(
+                        "{}{}{:02}",
+                        if force24 || no_marker {
+                            format!("{:02}", h12)
+                        } else {
+                            h12.to_string()
+                        },
+                        ":",
+                        minute,
+                    );
+                    if flags & 0x02 == 0 {
+                        // TIME_NOSECONDS keeps the seconds out.
+                        text.push_str(&format!(":{:02}", second));
                     }
-                    memory.write_u16(buffer_ptr + write_len as u64 * 2, 0);
-                    state.set(Register::Rax, write_len as u64);
-                }
+                    if !meridian.is_empty() {
+                        text.push(' ');
+                        text.push_str(meridian);
+                    }
+                    text
+                };
+                write_date_time_result(
+                    memory,
+                    state,
+                    &time_str,
+                    buffer_ptr,
+                    buffer_size,
+                    &mut self.last_error,
+                );
             }
             HostThunk::WaitForSingleObjectEx => {
                 let handle = arg(0) as u32;
@@ -48732,7 +50006,30 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::SetConsoleCtrlHandler => {
-                state.set(Register::Rax, 1); // TRUE
+                // SetConsoleCtrlHandler(handler, add) — register (add=TRUE)
+                // or deregister (add=FALSE) a PHANDLER_ROUTINE for console
+                // control events, or install the ignore-Ctrl-C flag when the
+                // handler is NULL.  The headless runtime never delivers
+                // control events, so the registration is what matters.
+                let handler = arg(0);
+                let add = arg(1) != 0;
+                if handler == 0 {
+                    // NULL + TRUE installs the ignore-Ctrl-C behavior;
+                    // NULL + FALSE restores the default.
+                    self.console.ignore_ctrl_c = add;
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                if add {
+                    if !self.console.control_handlers.contains(&handler) {
+                        self.console.control_handlers.push(handler);
+                    }
+                } else {
+                    self.console.control_handlers.retain(|h| *h != handler);
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::ConvertThreadToFiber => {
                 let mut mgr = FIBER_MANAGER.lock().unwrap();
@@ -49433,7 +50730,12 @@ impl PeHostRuntime {
                 state.set(Register::Rax, len as u64);
             }
             HostThunk::GetProcessWindowStation => {
-                state.set(Register::Rax, 1); // fake handle
+                // GetProcessWindowStation() — the handle of the process
+                // window station: a real tracked kernel object (WinSta0),
+                // minted once for the process lifetime.
+                let handle = self.win32.process_window_station();
+                state.set(Register::Rax, handle as u64);
+                self.last_error = 0;
             }
             HostThunk::EnumWindows => {
                 // EnumWindows(lpEnumFunc, lParam) — enumerate all top-level
@@ -49685,14 +50987,85 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GetUserObjectInformationW => {
-                state.set(Register::Rax, 0); // FALSE
+                // GetUserObjectInformationW(handle, index, info, len, ret) —
+                // the USEROBJECTFLAGS (UOI_FLAGS, index 1) of the window
+                // station: fInherit (4), fReserved (4), dwFlags (4) — the
+                // runtime's window station is not inheritable and has no
+                // special flags.  Invalid handles fail ERROR_INVALID_HANDLE.
+                let handle = arg(0) as u32;
+                let index = arg(1) as u32;
+                let info = arg(2);
+                let info_len = arg(3) as u32;
+                let ret_len = arg(4);
+                if self.win32.window_station_name(handle).is_err() {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                match index {
+                    1 => {
+                        // UOI_FLAGS: USEROBJECTFLAGS { fInherit, fReserved,
+                        // dwFlags } = 12 bytes.
+                        if info == 0 || info_len < 12 {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                            return Ok(None);
+                        }
+                        memory.map_bytes(info, &[0_u8; 12]);
+                        if ret_len != 0 {
+                            write_u32(memory, ret_len, 12);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    _ => {
+                        // UOI_TYPE etc. are not modeled.
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::AllowSetForegroundWindow => {
-                state.set(Register::Rax, 1); // TRUE
+                // AllowSetForegroundWindow(pid) — grant another process the
+                // right to set the foreground window.  0 grants the calling
+                // process (already granted); any other pid is recorded.
+                // Windows returns TRUE when the grant succeeds (the calling
+                // process must hold the activation right — the runtime
+                // always does).
+                let pid = arg(0) as u32;
+                if pid != 0 {
+                    self.foreground_grants.insert(pid);
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::MessageBoxA => {
-                // Return IDOK
-                state.set(Register::Rax, 1);
+                // MessageBoxA(hwnd, text, caption, type) — a modal message
+                // box.  The headless runtime has no interactive dialog: the
+                // text is surfaced through the live debug channel and IDOK
+                // (1) is returned, which is the answer a dismissed
+                // OK-only box produces.  The button style never includes
+                // IDOK-less combinations, so IDOK is always a legal answer.
+                let hwnd = arg(0) as u32;
+                let text_ptr = arg(1);
+                let caption_ptr = arg(2);
+                let _type = arg(3) as u32;
+                let text = if text_ptr != 0 {
+                    read_c_string(memory, text_ptr).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let caption = if caption_ptr != 0 {
+                    read_c_string(memory, caption_ptr).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                emit_live_ui_debug(format!(
+                    "[MessageBoxA hwnd={hwnd:#x}] {caption}: {text}"
+                ));
+                let _ = hwnd;
+                state.set(Register::Rax, 1); // IDOK
+                self.last_error = 0;
             }
             // --- I3: Scrollbars ---
             HostThunk::SetScrollInfo => {
@@ -50026,18 +51399,57 @@ impl PeHostRuntime {
             }
             // -- Phase 1.3.3: gdi32.dll implementations ---------------------------------
             HostThunk::AddFontMemResourceEx => {
-                state.set(Register::Rax, 1); // fake handle (non-zero = success)
+                // AddFontMemResourceEx(font_data, size, reserved, count) —
+                // register font bytes in the GDI font-resource table.  The
+                // handle IS the font-data base address (Windows semantics);
+                // the bytes are retained so the font table can serve them.
+                // An empty buffer fails with 0 + ERROR_INVALID_PARAMETER.
+                let font_data = arg(0);
+                let size = arg(1) as u32;
+                let _reserved = arg(2);
+                let count_ptr = arg(3);
+                if font_data == 0 || size == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let bytes = read_guest_bytes(memory, font_data, size as usize)?;
+                self.font_mem_resources.insert(font_data, bytes);
+                if count_ptr != 0 {
+                    write_u32(memory, count_ptr, 1);
+                }
+                state.set(Register::Rax, font_data);
+                self.last_error = 0;
             }
             HostThunk::RemoveFontMemResourceEx => {
+                // RemoveFontMemResourceEx(handle) — drop the font-bytes
+                // registration (the handle value is the data address
+                // AddFontMemResourceEx returned).  Unknown handles are
+                // removed as no-ops (TRUE), like Windows' tolerant close.
+                let handle = arg(0);
+                if handle != 0 {
+                    self.font_mem_resources.remove(&handle);
+                }
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::TextOutW => {
+                // TextOutW(hdc, x, y, text, len) — render at (x, y) and
+                // succeed for any tracked DC.  The text extent comes from the
+                // SAME metric source as GetTextExtentPoint32W (the selected
+                // font's height and the shared text measurer), so both APIs
+                // can never disagree about where glyphs land.  Unknown DCs
+                // fail FALSE + ERROR_INVALID_HANDLE like Windows.
                 let hdc = arg(0);
                 let x = arg(1) as i32;
                 let y = arg(2) as i32;
                 let text_ptr = arg(3);
                 let text_len = arg(4) as i32;
-                // Read the text and render it to the HDC's target window if available
+                if !self.device_contexts.contains_key(&hdc) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
                 let text = if text_ptr != 0 && text_len > 0 {
                     let mut utf16 = Vec::with_capacity(text_len as usize);
                     for i in 0..text_len as usize {
@@ -50046,20 +51458,19 @@ impl PeHostRuntime {
                     String::from_utf16_lossy(&utf16)
                 } else { String::new() };
                 if !text.is_empty() {
-                    // Approximate text extent so draw_text_to_hdc places glyphs.
-                    // Each char cell ≈ 8px wide / 16px tall at the default scale.
-                    let cell_w = 8usize;
-                    let cell_h = 16usize;
+                    let scale = self.selected_text_scale(hdc);
+                    let (text_width, text_height) = measure_text_bgra(&text, scale);
                     let rect = PreviewRect {
                         x: x.max(0) as usize,
                         y: y.max(0) as usize,
-                        width: (text.chars().count() * cell_w).max(cell_w),
-                        height: cell_h,
+                        width: text_width.max(1),
+                        height: text_height.max(1),
                     };
                     self.draw_text_to_hdc(hdc, rect, &text, 0);
                     self.publish_live_window_preview_if_needed();
                 }
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::CreateDIBSection => {
                 // CreateDIBSection(hdc, pbmi, usage, ppvBits, section, offset)
@@ -50230,13 +51641,84 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::SwapBuffers => {
+                // SwapBuffers(hdc) — present the DC's back buffer.  The
+                // runtime's pixel model is a single composited surface: any
+                // DC with a pixel format set presents it (TRUE); unknown
+                // DCs fail like Windows (FALSE + ERROR_INVALID_HANDLE).
+                let hdc = arg(0);
+                if !self.device_contexts.contains_key(&hdc)
+                    || !self.dc_pixel_formats.contains_key(&hdc)
+                {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                self.publish_live_window_preview_if_needed();
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::SetPixelFormat => {
-                state.set(Register::Rax, 1); // TRUE
+                // SetPixelFormat(hdc, index, ppfd) — bind a pixel format to
+                // the DC.  The runtime models ONE fixed format (index 1:
+                // 32-bit, double-buffered, composited); any other index is
+                // ERROR_INVALID_PARAMETER like Windows.
+                let hdc = arg(0);
+                let index = arg(1) as i32;
+                let _ppfd = arg(2);
+                if !self.device_contexts.contains_key(&hdc) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if index != 1 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                self.dc_pixel_formats.insert(hdc, index as u32);
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
             }
             HostThunk::ChoosePixelFormat => {
-                state.set(Register::Rax, 1); // pixel format index 1
+                // ChoosePixelFormat(hdc, ppfd) — validate the caller's
+                // PIXELFORMATDESCRIPTOR against the runtime's single fixed
+                // format (32-bit, double-buffered, composited — index 1).
+                // A malformed descriptor (bad nSize/nVersion) is rejected
+                // with 0 + ERROR_INVALID_PARAMETER; an otherwise unsupported
+                // format request (depth < 24, single-buffered) also fails.
+                let hdc = arg(0);
+                let ppfd = arg(1);
+                if !self.device_contexts.contains_key(&hdc) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                    return Ok(None);
+                }
+                if ppfd == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                }
+                let size = memory.read_u16(ppfd).unwrap_or(0);
+                let version = memory.read_u16(ppfd + 2).unwrap_or(0);
+                let flags = memory.read_u32(ppfd + 4).unwrap_or(0);
+                let color_bits = memory.read_u8(ppfd + 8).unwrap_or(0);
+
+                // PFD_DOUBLEBUFFER 0x01 | PFD_DRAW_TO_WINDOW 0x04 |
+                // PFD_SUPPORT_OPENGL 0x20 | PFD_TYPE_RGBA 0x40.
+                let supported_flags = 0x01 | 0x04 | 0x20 | 0x40;
+                let compatible = size >= 40
+                    && version == 1
+                    && (flags & supported_flags) == flags
+                    && (flags & 0x01) != 0
+                    && color_bits >= 24
+;
+                if compatible {
+                    state.set(Register::Rax, 1); // the single fixed format
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
             }
             // -- Phase 1.3.3: advapi32.dll implementations --------------------------------
             HostThunk::RegisterEventSourceW => {
@@ -50356,7 +51838,7 @@ impl PeHostRuntime {
                     );
                 }
             }
-            HostThunk::GetModuleInformation => {
+                        HostThunk::GetModuleInformation => {
                 let _process_handle = arg(0) as u32;
                 let module_handle = arg(1);
                 let info_ptr = arg(2);
@@ -50440,8 +51922,7 @@ impl PeHostRuntime {
                     );
                 }
             }
-            // -- setupapi.dll: device-info-set machinery -------------------------
-            HostThunk::SetupDiGetClassDevsW => {
+                        HostThunk::SetupDiGetClassDevsW => {
                 // SetupDiGetClassDevsW(ClassGuid, Enumerator, hwndParent,
                 // Flags) — build a device information set from the guest
                 // registry's device store (HKLM\SYSTEM\CurrentControlSet\
@@ -51128,58 +52609,189 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::CertGetCertificateChain => {
-                // CertGetCertificateChain(engine, context, time, store, chain_params, flags, reserved, chain)
-                // Return a minimal certificate chain indicating success.
+                // CertGetCertificateChain(engine, context, time, store,
+                // params, flags, reserved, chain) — build the issuer chain
+                // for the certificate context: walk subject→issuer links
+                // through the runtime's certificate stores, materialize a
+                // CERT_CHAIN_CONTEXT with one CERT_SIMPLE_CHAIN and one
+                // CERT_CHAIN_ELEMENT per certificate, and evaluate the
+                // trust status against the requested time (expiry /
+                // not-yet-valid are real trust errors).
                 let _engine = arg(0);
-                let _context = arg(1);
-                let _time = arg(2);
-                let _store = arg(3);
+                let context = arg(1);
+                let time_ptr = arg(2);
+                let store = arg(3);
                 let _chain_params = arg(4);
                 let _flags = arg(5) as u32;
                 let _reserved = arg(6);
                 let chain_ptr = arg(7);
-                if chain_ptr != 0 {
-                    // Write a minimal CERT_CHAIN_CONTEXT: cbSize(4), trustStatus(4), chainCount(4)...
-                    write_u32(memory, chain_ptr, 16); // cbSize
-                    write_u32(memory, chain_ptr + 4, 0); // dwError (trustStatus = no error)
-                    write_u32(memory, chain_ptr + 8, 0); // info (trustStatus)
-                    write_u32(memory, chain_ptr + 12, 0); // cChain = 0 (empty chain)
-                    write_guest_pointer(memory, chain_ptr + if self.guest_arch == GuestArch::X86 { 16 } else { 24 }, 0, self.guest_arch)?; // rgpChain = NULL
+                if chain_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
+                let Some(leaf_der) = self.cert_contexts.get(&context).cloned() else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
+                };
+                let time_secs = if time_ptr != 0 {
+                    let ticks = read_filetime(memory, time_ptr).unwrap_or(0);
+                    Some((ticks / 10_000_000).saturating_sub(11_644_473_600) as i64)
+                } else {
+                    None
+                };
+                // Build the chain: leaf → issuer → ... → root (subject ==
+                // issuer), capped at 16 links.  Issuers resolve through the
+                // target store first, then every certificate context the
+                // runtime knows (the memory store).
+                let mut chain_ders = vec![leaf_der.clone()];
+                let mut current = self.cert_parsed.get(&context).cloned();
+                let mut guard = 0usize;
+                while let Some(parsed) = current {
+                    if parsed.is_root || parsed.issuer.is_empty() || guard >= 16 {
+                        break;
+                    }
+                    let issuer_der = self
+                        .find_issuer_certificate(store, &parsed.issuer)
+                        .or_else(|| {
+                            self.cert_contexts
+                                .iter()
+                                .find(|(handle, der)| {
+                                    **handle != context
+                                        && self
+                                            .cert_parsed
+                                            .get(handle)
+                                            .is_some_and(|candidate| {
+                                                candidate.subject.eq_ignore_ascii_case(&parsed.issuer)
+                                            })
+                                        && der.len() != leaf_der.len()
+                                })
+                                .map(|(_, der)| der.clone())
+                        });
+                    let Some(issuer_der) = issuer_der else {
+                        break;
+                    };
+                    let issuer_handle = self.create_cert_context(memory, &issuer_der)?;
+                    chain_ders.push(issuer_der);
+                    current = self.cert_parsed.get(&issuer_handle).cloned();
+                    guard += 1;
+                }
+                // Allocate the element contexts (guest-visible handles).
+                let mut element_contexts = Vec::with_capacity(chain_ders.len());
+                for der in &chain_ders {
+                    let handle = if der.len() == leaf_der.len() && *der == leaf_der {
+                        context
+                    } else {
+                        self.create_cert_context(memory, der)?
+                    };
+                    element_contexts.push(handle);
+                }
+                // Trust evaluation: leaf validity vs the requested time.
+                let mut error_status = 0_u32;
+                let mut info_status = 0_u32;
+                if let (Some(time), Some(parsed)) = (
+                    time_secs,
+                    self.cert_parsed.get(&context).cloned(),
+                ) {
+                    if parsed.not_after != 0 && time > parsed.not_after {
+                        error_status |= 0x800B0101; // CERT_E_EXPIRED
+                    }
+                    if parsed.not_before != 0 && time < parsed.not_before {
+                        error_status |= 0x800B0102; // CERT_E_NOT_TIME_VALID
+                    }
+                    if parsed.is_root {
+                        info_status |= 0x00000001; // CERT_TRUST_IS_SELF_SIGNED
+                    }
+                }
+                let pointer_size = if self.guest_arch == GuestArch::X86 { 4_u64 } else { 8_u64 };
+                let chain_size = if self.guest_arch == GuestArch::X86 { 44 } else { 48 };
+                let simple_size = if self.guest_arch == GuestArch::X86 { 32 } else { 40 };
+                let element_size = if self.guest_arch == GuestArch::X86 { 44 } else { 80 };
+                let element_ptrs = self.alloc_pointer_array(
+                    memory,
+                    &element_contexts.to_vec(),
+                )?;
+                // CERT_CHAIN_ELEMENT array + CERT_SIMPLE_CHAIN +
+                // CERT_CHAIN_CONTEXT, laid out back-to-front so every
+                // forward pointer targets lower addresses.
+                let elements_base =
+                    self.alloc_zeroed(memory, chain_ders.len() * element_size, 8)?;
+                for (index, handle) in element_contexts.iter().enumerate() {
+                    let base = elements_base + (index as u64 * element_size as u64);
+                    write_guest_pointer(memory, base, *handle, self.guest_arch)?; // pCertContext
+                    write_u32(memory, base + pointer_size, element_size as u32); // cbSize
+                    write_u32(memory, base + pointer_size + 4, error_status); // dwErrorStatus
+                    write_guest_pointer(
+                        memory,
+                        base + pointer_size + 8,
+                        0,
+                        self.guest_arch,
+                    )?; // pwszExtendedErrorInfo
+                    write_u32(memory, base + pointer_size + 16, error_status); // TrustStatus.dwErrorStatus
+                    write_u32(memory, base + pointer_size + 20, info_status); // TrustStatus.dwInfoStatus
+                }
+                let simple_base = self.alloc_zeroed(memory, simple_size, 8)?;
+                write_u32(memory, simple_base, simple_size as u32); // cbSize
+                write_u32(memory, simple_base + 4, error_status); // TrustStatus
+                write_u32(memory, simple_base + 8, info_status);
+                write_u32(memory, simple_base + 12, chain_ders.len() as u32); // cElement
+                write_guest_pointer(
+                    memory,
+                    simple_base + 12 + pointer_size,
+                    elements_base,
+                    self.guest_arch,
+                )?; // rgpElement
+                let chain_base = self.alloc_zeroed(memory, chain_size, 8)?;
+                write_u32(memory, chain_base, chain_size as u32); // cbSize
+                write_u32(memory, chain_base + 4, error_status); // TrustStatus
+                write_u32(memory, chain_base + 8, info_status);
+                write_u32(memory, chain_base + 12, 1); // cChain
+                write_guest_pointer(
+                    memory,
+                    chain_base + 12 + pointer_size,
+                    simple_base,
+                    self.guest_arch,
+                )?; // rgpChain
+                memory.map_bytes(chain_ptr, &vec![0_u8; chain_size]);
+                write_u32(memory, chain_ptr, chain_size as u32);
+                write_u32(memory, chain_ptr + 4, error_status);
+                write_u32(memory, chain_ptr + 8, info_status);
+                write_u32(memory, chain_ptr + 12, 1); // cChain
+                write_guest_pointer(
+                    memory,
+                    chain_ptr + 12 + pointer_size,
+                    simple_base,
+                    self.guest_arch,
+                )?; // rgpChain
+                let _ = element_ptrs;
                 state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
             }
             HostThunk::CertCreateCertificateContext => {
-                // CertCreateCertificateContext(encoding_type, data, data_size)
-                // Create a certificate context from raw data. Allocate a minimal context.
+                // CertCreateCertificateContext(encoding_type, data, size) —
+                // parse the DER certificate (subject, issuer, serial,
+                // thumbprint, validity) and materialize a context the chain
+                // builder and store APIs consume.  The raw DER bytes live at
+                // context+64; the parsed fields are tracked alongside.
                 let _encoding_type = arg(0) as u32;
                 let data_ptr = arg(1);
                 let data_size = arg(2) as u32;
-                if data_ptr != 0 && data_size > 0 {
-                    // Read the raw DER bytes from guest memory
-                    let mut der_bytes = Vec::with_capacity(data_size as usize);
-                    for i in 0..data_size as usize {
-                        der_bytes.push(memory.read_u8(data_ptr + i as u64)?);
-                    }
-                    // Allocate a certificate context with space for the raw cert data
-                    let ctx_size = 64 + data_size as usize;
-                    let ctx_handle = self.alloc_heap(memory, ctx_size, true)?;
-                    write_u32(memory, ctx_handle, 0x43455254); // "CERT" magic
-                    write_u32(memory, ctx_handle + 4, data_size);
-                    // Copy the raw certificate data into guest memory
-                    for (i, &byte) in der_bytes.iter().enumerate() {
-                        memory.write_u8(ctx_handle + 64 + i as u64, byte);
-                    }
-                    // Track the DER bytes by context handle for later use
-                    self.cert_contexts.insert(ctx_handle, der_bytes);
-                    state.set(Register::Rax, ctx_handle);
-                } else {
+                if data_ptr == 0 || data_size == 0 {
                     state.set(Register::Rax, 0); // NULL
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    return Ok(None);
                 }
+                let der_bytes = read_guest_bytes(memory, data_ptr, data_size as usize)?;
+                let ctx_handle = self.create_cert_context(memory, &der_bytes)?;
+                state.set(Register::Rax, ctx_handle);
+                self.last_error = 0;
             }
             HostThunk::CertFreeCertificateContext => {
                 // CertFreeCertificateContext(cert_context) — free certificate context.
                 let cert_context = arg(0);
                 self.cert_contexts.remove(&cert_context);
+                self.cert_parsed.remove(&cert_context);
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::CertAddCertificateContextToStore => {
@@ -52478,7 +54090,7 @@ impl PeHostRuntime {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
                     if byte_len > 0
                         && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let rust_str = String::from_utf16_lossy(&utf16_units);
@@ -52518,7 +54130,7 @@ impl PeHostRuntime {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
                     if byte_len > 0
                         && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let rust_str = String::from_utf16_lossy(&utf16_units);
@@ -52601,7 +54213,7 @@ impl PeHostRuntime {
                     let spec_len = memory.read_u64(parts_ptr + 8).unwrap_or(0) as usize;
                     if spec_str_ptr != 0 && spec_len > 0
                         && let Ok(raw) = memory.read_bytes(spec_str_ptr, spec_len.checked_mul(2).unwrap_or(0)) {
-                            let utf16_units: Vec<u16> = raw.chunks_exact(2)
+                            let utf16_units: Vec<u16> = raw.as_chunks::<2>().0.iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let url = String::from_utf16_lossy(&utf16_units);
@@ -56543,8 +58155,7 @@ impl PeHostRuntime {
                 state.set(Register::Rax, rc as u64);
                 self.last_error = 0;
             }
-            // midiOutClose(hmio)
-            HostThunk::MidiOutClose => {
+                        HostThunk::MidiOutClose => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
                 let rc = self.audio.winmm.write().unwrap().midi_out_close(handle);
                 state.set(Register::Rax, rc as u64);
@@ -56633,8 +58244,7 @@ impl PeHostRuntime {
                 state.set(Register::Rax, rc as u64);
                 self.last_error = 0;
             }
-            // midiInClose(hmi)
-            HostThunk::MidiInClose => {
+                        HostThunk::MidiInClose => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
                 let rc = self.audio.winmm.write().unwrap().midi_in_close(handle);
                 state.set(Register::Rax, rc as u64);
@@ -59315,12 +60925,13 @@ impl PeHostRuntime {
             crate::cpu::EXCEPTION_ACCESS_VIOLATION,
             fault_address,
             label,
+            &[],
         )
     }
 
     /// Walk the guest's x86 FS:0 SEH chain and invoke handlers for `code`
     /// (an access violation fault or an explicit RaiseException).  Returns
-    /// true when a handler claimed the exception (the guest resumed).
+    /// (capped at 15 entries, the Windows limit).
     fn dispatch_x86_exception(
         &mut self,
         state: &mut CpuState,
@@ -59328,6 +60939,7 @@ impl PeHostRuntime {
         code: u32,
         fault_address: u64,
         label: &str,
+        parameters: &[u32],
     ) -> AppResult<bool> {
         if self.delivering_guest_exception {
             return Ok(false);
@@ -59390,6 +61002,7 @@ impl PeHostRuntime {
                 code,
                 fault_address,
                 state.rip as u32,
+                parameters,
             );
             write_x86_context(memory, context_record, state);
             let saved_state = state.clone();
@@ -60267,7 +61880,7 @@ impl PeHostRuntime {
     ) -> AppResult<Option<i32>> {
         let code = 0xE06D_7363;
         let handled = if self.guest_arch == GuestArch::X86 {
-            self.dispatch_x86_exception(state, memory, code, throw_info, api_name)?
+            self.dispatch_x86_exception(state, memory, code, throw_info, api_name, &[])?
         } else if self.guest_arch == GuestArch::X64 {
             let ctx = crate::seh::X64Context {
                 rax: state.gpr[0],
@@ -71908,6 +73521,93 @@ impl PeHostRuntime {
         let target_bitmap = gfx.target_bitmap?;
         Some((target_bitmap, gfx.compositing_mode, gfx.smoothing_mode))
     }
+    fn overlapped_event_handle(&self, memory: &MemoryImage, overlapped: u64) -> Option<u32> {
+        if overlapped == 0 {
+            return None;
+        }
+        let h_event = if self.guest_arch == GuestArch::X64 {
+            read_u64(memory, overlapped + 24).ok()? as u32
+        } else {
+            read_u32(memory, overlapped + 16).ok()?
+        };
+        (h_event != 0
+            && self
+                .win32
+                .handle_object_type(h_event)
+                .is_ok_and(|object_type| object_type == crate::win32::ObjectType::Event))
+        .then_some(h_event)
+    }
+    fn create_cert_context(
+        &mut self,
+        memory: &mut MemoryImage,
+        der_bytes: &[u8],
+    ) -> AppResult<u64> {
+        let ctx_size = 64 + der_bytes.len();
+        let ctx_handle = self.alloc_heap(memory, ctx_size, true)?;
+        write_u32(memory, ctx_handle, 0x43455254); // "CERT" magic
+        write_u32(memory, ctx_handle + 4, der_bytes.len() as u32);
+        for (i, &byte) in der_bytes.iter().enumerate() {
+            memory.write_u8(ctx_handle + 64 + i as u64, byte);
+        }
+        self.cert_contexts.insert(ctx_handle, der_bytes.to_vec());
+        if let Some(cert) = crate::security::Certificate::from_der(der_bytes.to_vec()) {
+            let (not_before, not_after) =
+                crate::security::parse_x509_validity(der_bytes).unwrap_or((0, 0));
+            self.cert_parsed.insert(
+                ctx_handle,
+                ParsedCertificate {
+                    subject: cert.subject,
+                    issuer: cert.issuer,
+                    serial_number: cert.serial_number,
+                    thumbprint: cert.thumbprint,
+                    is_root: cert.is_root,
+                    not_before,
+                    not_after,
+                },
+            );
+        }
+        Ok(ctx_handle)
+    }
+    fn find_issuer_certificate(&self, store_handle: u64, issuer: &str) -> Option<Vec<u8>> {
+        let certificates: Vec<Vec<u8>> = if store_handle == 0 {
+            Vec::new()
+        } else {
+            self.cert_store_manager
+                .get_store(store_handle)
+                .map(|store| {
+                    store
+                        .certificates
+                        .iter()
+                        .map(|cert| cert.der.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        certificates.into_iter().find(|der| {
+            crate::security::Certificate::from_der(der.clone())
+                .is_some_and(|cert| cert.subject.eq_ignore_ascii_case(issuer))
+        })
+    }
+
+    fn module_for_resource(&self, module_handle: u64) -> AppResult<(String, Option<u64>)> {
+        if module_handle == 0 || module_handle == self.mapped_image_base {
+            return Ok((self.main_module_path.clone(), Some(self.mapped_image_base)));
+        }
+        if let Some(state) = self
+            .loaded_real_dlls
+            .values()
+            .find(|state| state.handle == module_handle)
+        {
+            return Ok((state.path.display().to_string(), None));
+        }
+        if let Some(path) = self.module_paths_by_handle.get(&module_handle) {
+            return Ok((path.clone(), None));
+        }
+        Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            format!("unknown module handle {module_handle:#x}"),
+        ))
+    }
 }
 
 impl Drop for PeHostRuntime {
@@ -80065,14 +81765,19 @@ fn write_x86_exception_record(
     code: u32,
     fault_address: u64,
     exception_rip: u32,
+    parameters: &[u32],
 ) {
     write_u32(memory, base, code);
     write_u32(memory, base + 4, 0);
     write_u32(memory, base + 8, 0);
     write_u32(memory, base + 12, exception_rip);
-    write_u32(memory, base + 16, 2);
+    let count = parameters.len().min(15);
+    write_u32(memory, base + 16, count as u32);
     write_u32(memory, base + 20, 0);
     write_u32(memory, base + 24, fault_address as u32);
+    for (index, parameter) in parameters.iter().take(count).enumerate() {
+        write_u32(memory, base + 28 + (index as u64 * 4), *parameter);
+    }
 }
 
 fn write_x86_context(memory: &mut MemoryImage, base: u64, state: &CpuState) {
@@ -80462,7 +82167,9 @@ fn decode_registry_value_data(
     match value_type {
         REG_SZ | REG_EXPAND_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let trimmed = units
@@ -80509,7 +82216,9 @@ fn decode_registry_value_data(
         )),
         REG_MULTI_SZ => {
             let units = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let mut items = Vec::new();
@@ -82625,7 +84334,9 @@ fn read_xaudio2_buffer(
                 ));
             }
             let values = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             AudioSamples::Pcm16(values)
@@ -82641,7 +84352,9 @@ fn read_xaudio2_buffer(
                 ));
             }
             let values = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>();
             AudioSamples::Float32(values)
@@ -97264,8 +98977,8 @@ mod tests {
             );
             let sorted = memory.read_bytes(base, 24).expect("sorted");
             let mut values = Vec::new();
-            for chunk in sorted.chunks_exact(4) {
-                values.push(i32::from_le_bytes(chunk.try_into().expect("chunk")));
+            for chunk in sorted.as_chunks::<4>().0 {
+                values.push(i32::from_le_bytes(*chunk));
             }
             assert_eq!(values, vec![1, 2, 3, 5, 8, 9]);
         })
@@ -106412,7 +108125,9 @@ mod tests {
                 .expect("value bytes");
             let value = String::from_utf16_lossy(
                 &value_bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<_>>(),
             );
@@ -120988,7 +122703,7 @@ fn read_guest_auth_identity(
         }
         let units = read_guest_bytes(memory, ptr, len as usize)?;
         let mut code_units = Vec::with_capacity(units.len() / 2);
-        for chunk in units.chunks_exact(2) {
+        for chunk in units.as_chunks::<2>().0 {
             code_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
         Ok(String::from_utf16_lossy(&code_units))
@@ -122492,7 +124207,9 @@ fn read_ini_document(host_path: &Path) -> AppResult<(Vec<IniSection>, bool)> {
 fn parse_ini_document(bytes: &[u8]) -> (Vec<IniSection>, bool) {
     let (text, prefer_utf16) = if bytes.starts_with(&[0xFF, 0xFE]) {
         let units = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         (String::from_utf16_lossy(&units), true)

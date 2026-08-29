@@ -45,8 +45,8 @@ const ARENA3: u64 = 0x50_000;
 
 #[test]
 fn nt_allocate_virtual_memory_reserves_and_commits_through_the_canonical_vm() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -106,8 +106,8 @@ fn nt_allocate_virtual_memory_reserves_and_commits_through_the_canonical_vm() {
 
 #[test]
 fn nt_write_virtual_memory_to_unmapped_memory_returns_access_violation_and_never_creates_pages() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -168,8 +168,8 @@ fn nt_write_virtual_memory_to_unmapped_memory_returns_access_violation_and_never
 
 #[test]
 fn nt_create_event_wait_and_set_wake_the_waiter_via_the_scheduler() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -249,8 +249,8 @@ fn nt_create_event_wait_and_set_wake_the_waiter_via_the_scheduler() {
 
 #[test]
 fn nt_close_on_an_invalid_handle_is_status_invalid_handle() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -280,8 +280,8 @@ fn nt_close_on_an_invalid_handle_is_status_invalid_handle() {
 
 #[test]
 fn nt_query_information_process_reports_the_guest_pid_never_the_host_pid() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -328,8 +328,8 @@ fn nt_query_information_process_reports_the_guest_pid_never_the_host_pid() {
 
 #[test]
 fn nt_set_value_key_and_nt_query_value_key_round_trip_through_the_registry_store() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -476,8 +476,8 @@ fn nt_set_value_key_and_nt_query_value_key_round_trip_through_the_registry_store
 
 #[test]
 fn ntstatus_mapping_functions_round_trip_known_values() {
-    // Nt* thunks dispatch through the host-thunk match, whose
-    // debug-build frame overflows libtest's default 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -519,59 +519,68 @@ fn ntstatus_mapping_functions_round_trip_known_values() {
 
 #[test]
 fn rtl_and_native_helpers_exercise_the_canonical_layouts() {
-    // The x64 CONTEXT GPR offsets follow the canonical winnt.h layout.
-    assert_eq!(X64_CONTEXT_GPR_OFFSETS[0], 0x20); // Rax
-    assert_eq!(X64_CONTEXT_GPR_OFFSETS[4], 0x40); // Rsp
-    assert_eq!(X64_CONTEXT_GPR_OFFSETS[15], 0x98); // R15
-    assert_eq!(X64_CONTEXT_RIP_OFFSET, 0xA0);
-    // The pure sync layer round-trips through the shared event namespace.
-    let (_tmp, mut session) = setup_session();
-    let (handle, _) = nt_create_event(
-        session.win32_mut(),
-        casa1::ntdll::EVENT_TYPE_SYNCHRONIZATION,
-        false,
-        None,
-    )
-    .expect("create event");
-    assert_eq!(nt_set_event(session.win32_mut(), handle), Ok(false));
-    assert_eq!(nt_set_event(session.win32_mut(), handle), Ok(true));
-    // The registry layer round-trips through the shared store.
-    let (handle, _) = nt_create_key(
-        session.win32_mut(),
-        HKEY_CURRENT_USER,
-        "Software\\Casa1Stage4Direct",
-        0x20019,
-        true,
-    )
-    .expect("create key");
-    let mut data = "direct"
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect::<Vec<_>>();
-    data.extend_from_slice(&0u16.to_le_bytes());
-    assert_eq!(
-        nt_set_value_key(
-            session.win32_mut(),
-            handle,
-            "K",
-            casa1::ntdll::REG_SZ,
-            &data
-        ),
-        STATUS_SUCCESS
-    );
-    let (body, _, too_small) = nt_query_value_key(
-        session.win32(),
-        handle,
-        "K",
-        KEY_VALUE_FULL_INFORMATION_CLASS,
-        4096,
-    )
-    .expect("query");
-    assert!(!too_small);
-    let data_offset = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
-    let data_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
-    assert_eq!(
-        &body[data_offset..data_offset + data_len],
-        b"d\0i\0r\0e\0c\0t\0\0\0"
-    );
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            // The x64 CONTEXT GPR offsets follow the canonical winnt.h layout.
+            assert_eq!(X64_CONTEXT_GPR_OFFSETS[0], 0x20); // Rax
+            assert_eq!(X64_CONTEXT_GPR_OFFSETS[4], 0x40); // Rsp
+            assert_eq!(X64_CONTEXT_GPR_OFFSETS[15], 0x98); // R15
+            assert_eq!(X64_CONTEXT_RIP_OFFSET, 0xA0);
+            // The pure sync layer round-trips through the shared event namespace.
+            let (_tmp, mut session) = setup_session();
+            let (handle, _) = nt_create_event(
+                session.win32_mut(),
+                casa1::ntdll::EVENT_TYPE_SYNCHRONIZATION,
+                false,
+                None,
+            )
+            .expect("create event");
+            assert_eq!(nt_set_event(session.win32_mut(), handle), Ok(false));
+            assert_eq!(nt_set_event(session.win32_mut(), handle), Ok(true));
+            // The registry layer round-trips through the shared store.
+            let (handle, _) = nt_create_key(
+                session.win32_mut(),
+                HKEY_CURRENT_USER,
+                "Software\\Casa1Stage4Direct",
+                0x20019,
+                true,
+            )
+            .expect("create key");
+            let mut data = "direct"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<_>>();
+            data.extend_from_slice(&0u16.to_le_bytes());
+            assert_eq!(
+                nt_set_value_key(
+                    session.win32_mut(),
+                    handle,
+                    "K",
+                    casa1::ntdll::REG_SZ,
+                    &data
+                ),
+                STATUS_SUCCESS
+            );
+            let (body, _, too_small) = nt_query_value_key(
+                session.win32(),
+                handle,
+                "K",
+                KEY_VALUE_FULL_INFORMATION_CLASS,
+                4096,
+            )
+            .expect("query");
+            assert!(!too_small);
+            let data_offset = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+            let data_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+            assert_eq!(
+                &body[data_offset..data_offset + data_len],
+                b"d\0i\0r\0e\0c\0t\0\0\0"
+            );
+        })
+        .expect("spawn big-stack thread")
+        .join()
+        .expect("big-stack thread panicked");
 }

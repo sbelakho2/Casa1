@@ -110,8 +110,8 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 #[test]
 fn virtual_alloc_and_nt_query_virtual_memory_share_one_vm() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -203,47 +203,48 @@ fn virtual_alloc_and_nt_query_virtual_memory_share_one_vm() {
 
 #[test]
 fn tick_count_and_nt_query_system_time_advance_in_lockstep() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-        let (_tmp, mut session) = setup_session();
-        let get_tick = session.alloc_thunk(HostThunk::GetTickCount);
-        let get_system_time = session.alloc_thunk(HostThunk::GetSystemTimeAsFileTime);
-        let nt_query_system_time = session.alloc_thunk(HostThunk::NtQuerySystemTime);
 
-        let filetime_ptr = ARENA;
-        let win32_filetime_ptr = ARENA + 8;
-        session.map_guest(filetime_ptr, &[0_u8; 16]);
+    let (_tmp, mut session) = setup_session();
+    let get_tick = session.alloc_thunk(HostThunk::GetTickCount);
+    let get_system_time = session.alloc_thunk(HostThunk::GetSystemTimeAsFileTime);
+    let nt_query_system_time = session.alloc_thunk(HostThunk::NtQuerySystemTime);
 
-        let ticks_before = session.call(get_tick, &[]);
-        let _ = session.call(nt_query_system_time, &[filetime_ptr]);
-        let _ = session.call(get_system_time, &[win32_filetime_ptr]);
-        let filetime_before = read_u64(&session.read_guest(filetime_ptr, 8), 0);
-        assert_eq!(
-            read_u64(&session.read_guest(win32_filetime_ptr, 8), 0),
-            filetime_before,
-            "GetSystemTimeAsFileTime and NtQuerySystemTime share ONE derivation"
-        );
+    let filetime_ptr = ARENA;
+    let win32_filetime_ptr = ARENA + 8;
+    session.map_guest(filetime_ptr, &[0_u8; 16]);
 
-        // A guest sleep advances the guest clock...
-        session.advance_guest_clock(2000);
+    let ticks_before = session.call(get_tick, &[]);
+    let _ = session.call(nt_query_system_time, &[filetime_ptr]);
+    let _ = session.call(get_system_time, &[win32_filetime_ptr]);
+    let filetime_before = read_u64(&session.read_guest(filetime_ptr, 8), 0);
+    assert_eq!(
+        read_u64(&session.read_guest(win32_filetime_ptr, 8), 0),
+        filetime_before,
+        "GetSystemTimeAsFileTime and NtQuerySystemTime share ONE derivation"
+    );
 
-        let ticks_after = session.call(get_tick, &[]);
-        let _ = session.call(nt_query_system_time, &[filetime_ptr]);
-        let _ = session.call(get_system_time, &[win32_filetime_ptr]);
-        let filetime_after = read_u64(&session.read_guest(filetime_ptr, 8), 0);
-        assert_eq!(
-            ticks_after - ticks_before,
-            2000,
-            "GetTickCount64 advances by the slept duration"
-        );
-        assert_eq!(
-            filetime_after - filetime_before,
-            20_000_000,
-            "NtQuerySystemTime advanced 2000 ms × 10_000 (100 ns) — in lockstep with the tick counter"
-        );
+    // A guest sleep advances the guest clock...
+    session.advance_guest_clock(2000);
+
+    let ticks_after = session.call(get_tick, &[]);
+    let _ = session.call(nt_query_system_time, &[filetime_ptr]);
+    let _ = session.call(get_system_time, &[win32_filetime_ptr]);
+    let filetime_after = read_u64(&session.read_guest(filetime_ptr, 8), 0);
+    assert_eq!(
+        ticks_after - ticks_before,
+        2000,
+        "GetTickCount64 advances by the slept duration"
+    );
+    assert_eq!(
+        filetime_after - filetime_before,
+        20_000_000,
+        "NtQuerySystemTime advanced 2000 ms × 10_000 (100 ns) — in lockstep with the tick counter"
+    );
 
         })
         .expect("spawn big-stack thread")
@@ -255,8 +256,8 @@ fn tick_count_and_nt_query_system_time_advance_in_lockstep() {
 
 #[test]
 fn system_info_topology_equals_nt_query_system_information() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -301,8 +302,8 @@ fn system_info_topology_equals_nt_query_system_information() {
 
 #[test]
 fn get_version_ex_w_and_rtl_get_version_report_the_same_version() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -351,8 +352,8 @@ fn get_version_ex_w_and_rtl_get_version_report_the_same_version() {
 
 #[test]
 fn handle_information_duplication_and_close_share_the_handle_table() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -458,8 +459,8 @@ fn handle_information_duplication_and_close_share_the_handle_table() {
 
 #[test]
 fn event_wait_signal_and_auto_reset_consumption_are_shared() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -515,8 +516,8 @@ fn event_wait_signal_and_auto_reset_consumption_are_shared() {
 
 #[test]
 fn suspend_resume_and_priority_surfaces_share_one_thread_state() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -641,8 +642,8 @@ fn suspend_resume_and_priority_surfaces_share_one_thread_state() {
 
 #[test]
 fn current_process_id_and_nt_query_information_process_share_the_guest_pid() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -683,8 +684,8 @@ fn current_process_id_and_nt_query_information_process_share_the_guest_pid() {
 
 #[test]
 fn reg_set_value_ex_w_and_nt_query_value_key_share_the_registry_store() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -841,8 +842,8 @@ fn reg_set_value_ex_w_and_nt_query_value_key_share_the_registry_store() {
 
 #[test]
 fn create_file_w_and_nt_create_file_resolve_the_same_normalized_path() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -981,8 +982,8 @@ fn create_file_w_and_nt_create_file_resolve_the_same_normalized_path() {
 
 #[test]
 fn file_mapping_and_nt_section_share_the_section_object() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -1056,8 +1057,8 @@ fn file_mapping_and_nt_section_share_the_section_object() {
 
 #[test]
 fn error_domains_round_trip_in_both_directions() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -1111,8 +1112,8 @@ fn error_domains_round_trip_in_both_directions() {
 
 #[test]
 fn system_time_and_timer_resolution_domains_are_consistent() {
-    // Consistency thunks dispatch through the host-thunk match,
-    // whose debug-build frame overflows libtest's 2 MiB stack.
+    // The host-thunk dispatch match frame exceeds libtest's 2 MiB
+    // test-thread stack in debug builds — run on the 8 MiB big-stack thread.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {

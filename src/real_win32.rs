@@ -11431,7 +11431,9 @@ impl HtmlPersistStream {
             // UTF-16 with BOM (common for real MSHTML streams)
             let little_endian = data.starts_with(&[0xFF, 0xFE]);
             let units: Vec<u16> = data[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if little_endian {
                         u16::from_le_bytes([c[0], c[1]])

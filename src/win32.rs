@@ -7,7 +7,7 @@ pub use crate::runtime::object_manager::ObjectType;
 use crate::runtime::object_manager::{
     DirectorySearchObject, EventObject, FileHandleObject, FileObject, IoCompletionPortObject,
     KernelObject, KeyObject, MutexObject, NamedPipeState, ObjectId, ObjectManager, PipeObject,
-    ProcessObject, SectionObject, SemaphoreObject, ThreadObject, TimerObject,
+    ProcessObject, SectionObject, SemaphoreObject, ThreadObject, TimerObject, WindowStationObject,
 };
 use crate::runtime::process::{GuestProcess, allocate_guest_pid};
 use crate::vm::{VmProtection, VmRegionKind, VmState};
@@ -713,6 +713,7 @@ struct TimeState {
 #[derive(Debug, Clone)]
 struct LocaleState {
     acp: u32,
+    oemcp: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +784,9 @@ pub struct Win32Subsystem {
     /// SetLastError semantics; the PE runtime keeps its own per-call slot).
     last_error: u32,
     current_thread_id: u32,
+    /// The process window-station handle (minted once by
+    /// [`Win32Subsystem::process_window_station`]; `None` until first use).
+    window_station_handle: Option<Handle>,
     /// Shared runtime-event observer list (set by the PE runtime; `None`
     /// when this subsystem is driven standalone, e.g. in oracle sessions or
     /// direct tests — event emission is a no-op then).
@@ -883,7 +887,10 @@ impl Win32Subsystem {
                 ticks_ms: 0,
                 drift_log: Vec::new(),
             },
-            locale: LocaleState { acp: 1252 },
+            locale: LocaleState {
+                acp: 1252,
+                oemcp: 437,
+            },
             thread_apcs: BTreeMap::new(),
             com_apartments: BTreeMap::new(),
             com_registrations: BTreeMap::new(),
@@ -892,6 +899,7 @@ impl Win32Subsystem {
             last_config_save_wall_ms: 0,
             last_error: 0,
             current_thread_id,
+            window_station_handle: None,
             event_observers: None,
         }
     }
@@ -5840,7 +5848,7 @@ impl Win32Subsystem {
 
     pub fn tls_free(&mut self, slot: u32) {
         // Remove the TLS slot from all thread states
-        for (_tid, state) in self.threads.iter_mut() {
+        for state in self.threads.values_mut() {
             state.tls.remove(&slot);
         }
         // Make the slot index available for reuse.
@@ -6102,6 +6110,83 @@ impl Win32Subsystem {
         &self.time.drift_log
     }
 
+    /// The configured ANSI code page (the `GetACP` answer — the runtime's
+    /// locale state, never the host's).
+    pub fn acp(&self) -> u32 {
+        self.locale.acp
+    }
+
+    /// Whether the guest user's token carries administrator membership
+    /// (`IsUserAnAdmin`).  The runtime models the guest as a standard,
+    /// non-elevated user — the same identity the guest network
+    /// configuration and `GetUserNameW` report — so this is `false` unless
+    /// the guest identity is configured as an administrator.
+    pub fn guest_user_is_admin(&self) -> bool {
+        false
+    }
+
+    /// The guest-visible `FILE_ATTRIBUTE_*` mask for a path (the
+    /// `SHGetFileInfoW(SHGFI_ATTRIBUTES)` answer).  Derives from the
+    /// canonical attribute strings the GE metadata reports.
+    pub fn file_attributes_for_display(&self, path: &str) -> u32 {
+        match self.ge.get_file_metadata(path) {
+            Ok(metadata) => {
+                let mut mask = 0x80u32; // FILE_ATTRIBUTE_NORMAL
+                for attribute in &metadata.attributes {
+                    let bit = match attribute.to_ascii_lowercase().as_str() {
+                        "readonly" => 0x1,
+                        "hidden" => 0x2,
+                        "system" => 0x4,
+                        "directory" => 0x10,
+                        "archive" => 0x20,
+                        "compressed" => 0x800,
+                        _ => 0,
+                    };
+                    mask |= bit;
+                }
+                mask
+            }
+            Err(_) => 0x80, // FILE_ATTRIBUTE_NORMAL for unknown paths
+        }
+    }
+    /// The configured OEM code page (the `GetOEMCP` answer).
+    pub fn oemcp(&self) -> u32 {
+        self.locale.oemcp
+    }
+
+    /// The process window station (`GetProcessWindowStation`): the single
+    /// interactive `WinSta0` station the runtime models.  The handle is
+    /// minted once and lives for the process lifetime (Windows keeps the
+    /// station handle open for the life of the process).
+    pub fn process_window_station(&mut self) -> Handle {
+        if let Some(handle) = self.window_station_handle {
+            return handle;
+        }
+        let handle = self.insert_object(
+            ObjectType::WindowStation,
+            0x2000C, // WINSTA_ALL_ACCESS
+            false,
+            KernelObject::WindowStation(WindowStationObject {
+                name: "WinSta0".to_string(),
+            }),
+        );
+        self.window_station_handle = Some(handle);
+        handle
+    }
+
+    /// The station name behind a window-station handle, or an invalid-handle
+    /// error for anything else.
+    pub fn window_station_name(&self, handle: Handle) -> AppResult<String> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::WindowStation(station) => Ok(station.name.clone()),
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("handle {handle} is not a window station"),
+            )),
+        }
+    }
+
     pub fn multi_byte_to_wide_char(&self, code_page: u32, bytes: &[u8]) -> AppResult<Vec<u16>> {
         let cp = if code_page == CP_ACP || code_page == CP_THREAD_ACP {
             self.locale.acp
@@ -6156,6 +6241,14 @@ impl Win32Subsystem {
                 }
             }
         }
+    }
+
+    /// Encode a wide string in the configured ANSI code page (the
+    /// `WideCharToMultiByte(CP_ACP, ...)` contract; used by the console
+    /// input path).
+    pub fn unicode_to_acp_bytes(&self, text: &str) -> Vec<u8> {
+        self.wide_char_to_multi_byte(CP_ACP, &text.encode_utf16().collect::<Vec<_>>())
+            .unwrap_or_else(|_| text.as_bytes().to_vec())
     }
 
     pub fn open_registry_key(

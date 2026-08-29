@@ -4959,7 +4959,9 @@ mod tests {
         // non-zero.
         let non_zero = output
             .buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .any(|s| u16::from_le_bytes([s[0], s[1]]) != 0);
         assert!(non_zero, "decoded PCM must contain non-zero samples");
 

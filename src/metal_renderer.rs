@@ -866,7 +866,7 @@ fn release_io_surface(_surface: *mut std::ffi::c_void) {}
 /// and blue channels), so the CPU upload path matches the IOSurface path's
 /// BGRA byte order and both paths sample identical colours.
 fn rgba_to_bgra_in_place(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
 }

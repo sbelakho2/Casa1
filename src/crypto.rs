@@ -209,8 +209,8 @@ fn des_cbc(key: &[u8], iv: &[u8; 8], data: &[u8], encrypt: bool) -> Vec<u8> {
     let round_keys = des_key_schedule(key_64);
     let mut chain = u64::from_be_bytes(*iv);
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(8) {
-        let block = u64::from_be_bytes(chunk.try_into().expect("8-byte DES block"));
+    for chunk in data.as_chunks::<8>().0 {
+        let block = u64::from_be_bytes(*chunk);
         let result = if encrypt {
             let xored = block ^ chain;
             let encrypted = des_block(xored, &round_keys, true);
@@ -421,8 +421,8 @@ pub fn rc2_cbc(
     let expanded = rc2_expand(key, effective_bits);
     let mut chain = *iv;
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(8) {
-        let block: [u8; 8] = chunk.try_into().expect("8-byte RC2 block");
+    for chunk in data.as_chunks::<8>().0 {
+        let block: [u8; 8] = *chunk;
         let result = if encrypt {
             let xored: [u8; 8] = std::array::from_fn(|index| block[index] ^ chain[index]);
             let encrypted = rc2_block(&expanded, &xored, true);

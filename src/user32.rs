@@ -3803,6 +3803,11 @@ impl User32Subsystem {
             .unwrap_or(0)
     }
 
+    /// Number of tracked monitors (GetSystemMetrics(SM_CMONITORS)).
+    pub fn monitor_count(&self) -> u32 {
+        self.monitors.len() as u32
+    }
+
     pub fn monitor_info(&self, monitor_id: u32) -> Option<MonitorInfo> {
         self.monitors.get(&monitor_id).cloned()
     }
