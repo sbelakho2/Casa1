@@ -518,11 +518,7 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "LoadIconW",
         "casa1-conformance:evidence_ui_gdi_focus_and_message_a_thunks",
     ),
-    evidence_conformance(
-        "user32.dll",
-        "MessageBoxW",
-        "casa1-conformance:section1",
-    ),
+    evidence_conformance("user32.dll", "MessageBoxW", "casa1-conformance:section1"),
     evidence_conformance(
         "user32.dll",
         "MonitorFromPoint",
@@ -1206,7 +1202,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "_endthreadex",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "atof", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "atof",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "qsort",
@@ -1262,9 +1262,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "abort",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "abs", "casa1-conformance:evidence_math_crt_math"),
-    conformance("msvcrt.dll", "atoi", "casa1-conformance:evidence_math_crt_math"),
-    conformance("msvcrt.dll", "atol", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "abs",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "atoi",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "atol",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "bsearch",
@@ -1275,14 +1287,26 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "calloc",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "exit", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "exit",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "fflush",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "free", "casa1-conformance:evidence_math_crt_math"),
-    conformance("msvcrt.dll", "labs", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "free",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
+    conformance(
+        "msvcrt.dll",
+        "labs",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "memcpy",
@@ -1298,7 +1322,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "memset",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "rand", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "rand",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "realloc",
@@ -1334,7 +1362,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "strlen",
         "casa1-conformance:evidence_math_crt_math",
     ),
-    conformance("msvcrt.dll", "time", "casa1-conformance:evidence_math_crt_math"),
+    conformance(
+        "msvcrt.dll",
+        "time",
+        "casa1-conformance:evidence_math_crt_math",
+    ),
     conformance(
         "msvcrt.dll",
         "__C_specific_handler",
@@ -3627,14 +3659,22 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "evidence_core_srw_lock_thunks_round_trip"
     ),
     conformance_evidence!("kernel32.dll", "Beep", "evidence_core_misc_kernel32_thunks"),
-    conformance_evidence!("kernel32.dll", "CallNamedPipeW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "CallNamedPipeW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!("kernel32.dll", "CloseHandle", "section38_manifest_gate"),
     conformance_evidence!(
         "kernel32.dll",
         "CompareFileTime",
         "evidence_core_time_and_filetime_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "ConnectNamedPipe", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "ConnectNamedPipe",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "ConvertFiberToThread",
@@ -3650,7 +3690,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "CopyFileW",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "CreateDirectoryW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "CreateDirectoryW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "CreateEventA",
@@ -3661,13 +3705,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "CreateFiber",
         "evidence_core_fiber_manager_create_switch_delete"
     ),
-    conformance_evidence!("kernel32.dll", "CreateFileA", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "CreateFileA",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "CreateIoCompletionPort",
         "evidence_core_iocp_thunks_round_trip"
     ),
-    conformance_evidence!("kernel32.dll", "CreateNamedPipeW", "code_page_conversion_empty_input"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "CreateNamedPipeW",
+        "code_page_conversion_empty_input"
+    ),
     conformance_evidence!("kernel32.dll", "CreateProcessW", "section29_process"),
     conformance_evidence!("kernel32.dll", "CreateThread", "section49_thread_semantics"),
     conformance_evidence!(
@@ -3680,7 +3732,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "DecodePointer",
         "evidence_core_misc_kernel32_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "DeleteCriticalSection", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "DeleteCriticalSection",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "DeleteFiber",
@@ -3692,9 +3748,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "EncodePointer",
         "evidence_core_misc_kernel32_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "EnterCriticalSection", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "ExitProcess", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "ExitThread", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "EnterCriticalSection",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "ExitProcess",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "ExitThread",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "FileTimeToSystemTime",
@@ -3705,14 +3773,26 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "FindFirstFileExW",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "FlushFileBuffers", "section38_manifest_gate"),
-    conformance_evidence!("kernel32.dll", "Forwarded", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "FlushFileBuffers",
+        "section38_manifest_gate"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "Forwarded",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "FreeEnvironmentStringsW",
         "evidence_core_loader_and_process_info_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "FreeLibrary", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "FreeLibrary",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetCommandLineA",
@@ -3723,22 +3803,46 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetCommandLineW",
         "evidence_core_loader_and_process_info_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetCurrentDirectoryA", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetCurrentDirectoryA",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetCurrentDirectoryW",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetCurrentProcess", "section50_win32_nt_consistency"),
-    conformance_evidence!("kernel32.dll", "GetCurrentProcessId", "section50_win32_nt_consistency"),
-    conformance_evidence!("kernel32.dll", "GetCurrentThread", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "GetCurrentThreadId", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetCurrentProcess",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetCurrentProcessId",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetCurrentThread",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetCurrentThreadId",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetDiskFreeSpaceA",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetDiskFreeSpaceExW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetDiskFreeSpaceExW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetDiskFreeSpaceW",
@@ -3749,13 +3853,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetExitCodeProcess",
         "evidence_core_misc_kernel32_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetExitCodeThread", "section49_thread_semantics"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetExitCodeThread",
+        "section49_thread_semantics"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetFileAttributesA",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetFileAttributesExW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetFileAttributesExW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetFileInformationByHandle",
@@ -3771,10 +3883,26 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetFileTime",
         "evidence_core_time_and_filetime_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetFileType", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "GetModuleFileNameA", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "GetModuleFileNameW", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "GetModuleHandleA", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetFileType",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetModuleFileNameA",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetModuleFileNameW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetModuleHandleA",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetModuleHandleExA",
@@ -3785,7 +3913,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetModuleHandleExW",
         "evidence_core_loader_and_process_info_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetOverlappedResult", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetOverlappedResult",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetProcessHeap",
@@ -3831,7 +3963,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetSystemDirectoryW",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetSystemInfo", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetSystemInfo",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetSystemTime",
@@ -3847,8 +3983,16 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "GetTempPathW",
         "evidence_core_filesystem_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "GetTickCount", "section50_win32_nt_consistency"),
-    conformance_evidence!("kernel32.dll", "GetTimeZoneInformation", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetTickCount",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "GetTimeZoneInformation",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "GetVersion",
@@ -3899,7 +4043,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "InitOnceExecuteOnce",
         "evidence_core_init_once_thunks_round_trip"
     ),
-    conformance_evidence!("kernel32.dll", "InitializeCriticalSection", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "InitializeCriticalSection",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "InitializeCriticalSectionAndSpinCount",
@@ -3930,7 +4078,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "LCMapStringW",
         "evidence_core_string_and_codepage_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "LeaveCriticalSection", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "LeaveCriticalSection",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "LoadLibraryA",
@@ -3951,9 +4103,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "LoadLibraryW",
         "evidence_core_loader_and_process_info_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "LocalAlloc", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "LocalFree", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "MoveFileExW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "LocalAlloc",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "LocalFree",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "MoveFileExW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "MulDiv",
@@ -3985,7 +4149,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "OpenSemaphoreW",
         "evidence_core_event_and_semaphore_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "OpenThread", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "OpenThread",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "OutputDebugStringA",
@@ -3996,7 +4164,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "OutputDebugStringW",
         "evidence_core_string_and_codepage_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "PeekNamedPipe", "code_page_conversion_empty_input"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "PeekNamedPipe",
+        "code_page_conversion_empty_input"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "PostQueuedCompletionStatus",
@@ -4023,16 +4195,32 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "ReleaseSemaphore",
         "evidence_core_event_and_semaphore_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "RemoveDirectoryA", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "RemoveDirectoryW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "RemoveDirectoryA",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "RemoveDirectoryW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "ResetEvent",
         "evidence_core_event_and_semaphore_thunks"
     ),
     conformance_evidence!("kernel32.dll", "ResumeThread", "section49_thread_semantics"),
-    conformance_evidence!("kernel32.dll", "SetCurrentDirectoryW", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "SetEndOfFile", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "SetCurrentDirectoryW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "SetEndOfFile",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "SetEnvironmentVariableW",
@@ -4059,14 +4247,26 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "SetFileTime",
         "evidence_core_time_and_filetime_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "SetHandleInformation", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "SetHandleInformation",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "SetUnhandledExceptionFilter",
         "evidence_core_misc_kernel32_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "Sleep", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "SleepEx", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "Sleep",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "SleepEx",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "SwitchToFiber",
@@ -4082,11 +4282,31 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "SystemTimeToTzSpecificLocalTime",
         "evidence_core_time_and_filetime_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "TerminateProcess", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "TerminateThread", "section49_thread_semantics"),
-    conformance_evidence!("kernel32.dll", "TlsFree", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "TlsGetValue", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "TlsSetValue", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TerminateProcess",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TerminateThread",
+        "section49_thread_semantics"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TlsFree",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TlsGetValue",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TlsSetValue",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "TryAcquireSRWLockExclusive",
@@ -4097,19 +4317,51 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "TryAcquireSRWLockShared",
         "evidence_core_srw_lock_thunks_round_trip"
     ),
-    conformance_evidence!("kernel32.dll", "TryEnterCriticalSection", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "TryEnterCriticalSection",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "UnhandledExceptionFilter",
         "evidence_core_misc_kernel32_thunks"
     ),
-    conformance_evidence!("kernel32.dll", "VerSetConditionMask", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "VerifyVersionInfoW", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "VirtualFree", "section50_win32_nt_consistency"),
-    conformance_evidence!("kernel32.dll", "VirtualProtect", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "VirtualQuery", "section50_win32_nt_consistency"),
-    conformance_evidence!("kernel32.dll", "WaitForMultipleObjects", "allocate_reserves_and_commits_through_the_canonical_vm"),
-    conformance_evidence!("kernel32.dll", "WaitForSingleObjectEx", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "VerSetConditionMask",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "VerifyVersionInfoW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "VirtualFree",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "VirtualProtect",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "VirtualQuery",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "WaitForMultipleObjects",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
+    conformance_evidence!(
+        "kernel32.dll",
+        "WaitForSingleObjectEx",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "WideCharToMultiByte",
@@ -4121,7 +4373,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "evidence_core_misc_kernel32_thunks"
     ),
     conformance_evidence!("kernel32.dll", "WriteFile", "section38_manifest_gate"),
-    conformance_evidence!("kernel32.dll", "WritePrivateProfileStringW", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "kernel32.dll",
+        "WritePrivateProfileStringW",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!(
         "kernel32.dll",
         "lstrcatW",
@@ -4151,12 +4407,24 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance_evidence!("ntdll.dll", "LdrUnloadDll", "section48_ldr"),
     conformance_evidence!("ntdll.dll", "LdrUnlockLoaderLock", "section48_ldr"),
     conformance_evidence!("ntdll.dll", "NtAllocateVirtualMemory", "section47_ntdll"),
-    conformance_evidence!("ntdll.dll", "NtClearEvent", "create_set_clear_event_round_trip_through_the_object_manager"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtClearEvent",
+        "create_set_clear_event_round_trip_through_the_object_manager"
+    ),
     conformance_evidence!("ntdll.dll", "NtClose", "section50_win32_nt_consistency"),
     conformance_evidence!("ntdll.dll", "NtCreateEvent", "section47_ntdll"),
-    conformance_evidence!("ntdll.dll", "NtCreateFile", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtCreateFile",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!("ntdll.dll", "NtCreateKey", "section47_ntdll"),
-    conformance_evidence!("ntdll.dll", "NtCreateSection", "create_section_and_query_basic_information"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtCreateSection",
+        "create_section_and_query_basic_information"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "NtCreateThreadEx",
@@ -4174,35 +4442,75 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "NtDeviceIoControlFile",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "NtDuplicateObject", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtDuplicateObject",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!("ntdll.dll", "NtEnumerateKey", "open_key_and_enumerate"),
     conformance_evidence!(
         "ntdll.dll",
         "NtEnumerateValueKey",
         "evidence_core_nt_enumerate_value_key_lists_values_in_order"
     ),
-    conformance_evidence!("ntdll.dll", "NtFreeVirtualMemory", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtFreeVirtualMemory",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "NtGetContextThread",
         "evidence_core_nt_thread_and_process_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "NtMapViewOfSection", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtMapViewOfSection",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!("ntdll.dll", "NtOpenKey", "open_key_and_enumerate"),
-    conformance_evidence!("ntdll.dll", "NtProtectVirtualMemory", "allocate_reserves_and_commits_through_the_canonical_vm"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtProtectVirtualMemory",
+        "allocate_reserves_and_commits_through_the_canonical_vm"
+    ),
     conformance_evidence!("ntdll.dll", "NtQueryInformationProcess", "section47_ntdll"),
-    conformance_evidence!("ntdll.dll", "NtQueryInformationThread", "section49_thread_semantics"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQueryInformationThread",
+        "section49_thread_semantics"
+    ),
     conformance_evidence!("ntdll.dll", "NtQueryKey", "open_key_and_enumerate"),
-    conformance_evidence!("ntdll.dll", "NtQueryObject", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQueryObject",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "NtQueryPerformanceCounter",
         "evidence_core_nt_memory_and_wait_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "NtQuerySection", "section50_win32_nt_consistency"),
-    conformance_evidence!("ntdll.dll", "NtQuerySystemInformation", "section50_win32_nt_consistency"),
-    conformance_evidence!("ntdll.dll", "NtQuerySystemTime", "section50_win32_nt_consistency"),
-    conformance_evidence!("ntdll.dll", "NtQueryTimerResolution", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQuerySection",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQuerySystemInformation",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQuerySystemTime",
+        "section50_win32_nt_consistency"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtQueryTimerResolution",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!("ntdll.dll", "NtQueryValueKey", "section47_ntdll"),
     conformance_evidence!("ntdll.dll", "NtQueryVirtualMemory", "section47_ntdll"),
     conformance_evidence!(
@@ -4217,8 +4525,16 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "evidence_core_nt_thread_and_process_thunks"
     ),
     conformance_evidence!("ntdll.dll", "NtSetEvent", "section47_ntdll"),
-    conformance_evidence!("ntdll.dll", "NtSetInformationThread", "section49_thread_semantics"),
-    conformance_evidence!("ntdll.dll", "NtSetTimerResolution", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtSetInformationThread",
+        "section49_thread_semantics"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtSetTimerResolution",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!("ntdll.dll", "NtSetValueKey", "section47_ntdll"),
     conformance_evidence!("ntdll.dll", "NtSuspendThread", "section49_thread_semantics"),
     conformance_evidence!(
@@ -4231,13 +4547,21 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "NtTerminateThread",
         "evidence_core_nt_thread_and_process_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "NtUnmapViewOfSection", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtUnmapViewOfSection",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "NtWaitForMultipleObjects",
         "evidence_core_nt_memory_and_wait_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "NtWaitForSingleObject", "section49_thread_semantics"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "NtWaitForSingleObject",
+        "section49_thread_semantics"
+    ),
     conformance_evidence!("ntdll.dll", "NtWriteVirtualMemory", "section47_ntdll"),
     conformance_evidence!(
         "ntdll.dll",
@@ -4249,8 +4573,16 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "RtlCaptureContext",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "RtlCompareUnicodeString", "compare_and_equal_implement_the_nt_contract"),
-    conformance_evidence!("ntdll.dll", "RtlEqualUnicodeString", "compare_and_equal_implement_the_nt_contract"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "RtlCompareUnicodeString",
+        "compare_and_equal_implement_the_nt_contract"
+    ),
+    conformance_evidence!(
+        "ntdll.dll",
+        "RtlEqualUnicodeString",
+        "compare_and_equal_implement_the_nt_contract"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "RtlFreeAnsiString",
@@ -4266,19 +4598,31 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "RtlFreeUnicodeString",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "RtlGetVersion", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "RtlGetVersion",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "RtlInitAnsiString",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "RtlInitUnicodeString", "compare_and_equal_implement_the_nt_contract"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "RtlInitUnicodeString",
+        "compare_and_equal_implement_the_nt_contract"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "RtlLookupFunctionEntry",
         "evidence_core_nt_rtl_and_io_thunks"
     ),
-    conformance_evidence!("ntdll.dll", "RtlNtStatusToDosError", "section50_win32_nt_consistency"),
+    conformance_evidence!(
+        "ntdll.dll",
+        "RtlNtStatusToDosError",
+        "section50_win32_nt_consistency"
+    ),
     conformance_evidence!(
         "ntdll.dll",
         "RtlRaiseException",
@@ -5930,54 +6274,58 @@ pub fn coverage_evidence_for(
 }
 
 #[cfg(test)]
-    /// Resolve a `casa1-conformance:<suite>` evidence id to a REAL test
-    /// target: either a test file `tests/<suite>.rs` or a test function
-    /// `fn <suite>(` inside the crate sources.  Returns the unresolved ids.
-    ///
-    /// KNOWN_SUITES is documentation only — it NEVER bypasses this check
-    /// (a registry row must name something that exists and runs).
-    fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut unresolved = Vec::new();
-        for row in rows {
-            let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") else {
+/// Resolve a `casa1-conformance:<suite>` evidence id to a REAL test
+/// target: either a test file `tests/<suite>.rs` or a test function
+/// `fn <suite>(` inside the crate sources.  Returns the unresolved ids.
+///
+/// KNOWN_SUITES is documentation only — it NEVER bypasses this check
+/// (a registry row must name something that exists and runs).
+fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut unresolved = Vec::new();
+    for row in rows {
+        let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") else {
+            continue;
+        };
+        if manifest_dir
+            .join("tests")
+            .join(format!("{suite}.rs"))
+            .is_file()
+        {
+            continue;
+        }
+        let mut found = false;
+        let mut stack = vec![manifest_dir.join("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            if manifest_dir.join("tests").join(format!("{suite}.rs")).is_file() {
-                continue;
-            }
-            let mut found = false;
-            let mut stack = vec![manifest_dir.join("src")];
-            while let Some(dir) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if path.extension().is_some_and(|e| e == "rs") {
-                        if let Ok(text) = std::fs::read_to_string(&path) {
-                            if text.contains(&format!("fn {suite}(")) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if found {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path)
+                        .is_ok_and(|text| text.contains(&format!("fn {suite}(")))
+                {
+                    found = true;
                     break;
                 }
             }
-            if !found {
-                unresolved.push(row.evidence_id.to_string());
+            if found {
+                break;
             }
         }
-        unresolved.sort();
-        unresolved.dedup();
-        unresolved
+        if !found {
+            unresolved.push(row.evidence_id.to_string());
+        }
     }
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved
+}
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -6095,10 +6443,10 @@ mod tests {
             if row.evidence_id.starts_with("windows-oracle:") {
                 assert_eq!(row.level, CoverageLevel::Differential);
             } else if let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") {
-                assert_eq!(row.level, CoverageLevel::Conformance);
                 // The suite must RESOLVE to a real test target; the
                 // KNOWN_SUITES list is documentation only and never
                 // satisfies this check.
+                assert_eq!(row.level, CoverageLevel::Conformance);
                 assert!(
                     unresolved_conformance_suites(std::slice::from_ref(row)).is_empty(),
                     "conformance evidence must resolve to a real test target, got {suite}"
@@ -6119,7 +6467,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn conformance_suites_exist_as_test_files() {
         // Every casa1-conformance suite must resolve to a real test file in
@@ -6161,10 +6508,13 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut suites = Vec::new();
         for row in COVERAGE_EVIDENCE {
-            if let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") {
-                if !manifest_dir.join("tests").join(format!("{suite}.rs")).is_file() {
-                    suites.push(suite.to_string());
-                }
+            if let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:")
+                && !manifest_dir
+                    .join("tests")
+                    .join(format!("{suite}.rs"))
+                    .is_file()
+            {
+                suites.push(suite.to_string());
             }
         }
         if suites.is_empty() {

@@ -89,8 +89,9 @@ fn database_seeds_from_thunk_metadata_with_levels() {
     );
     assert_eq!(
         find_resource.semantic_test_coverage,
-        CoverageLevel::Conformance,
-        "FindResourceA is proven by the resources-and-ioctl suite"
+        CoverageLevel::None,
+        "FindResourceA's phantom resources-and-ioctl evidence was removed by the \
+         evidence-chain audit fix; no verified suite covers it yet"
     );
     let version_ex_a = database
         .lookup("kernel32.dll", "GetVersionExA")
@@ -593,24 +594,25 @@ fn seeded_deliberately_unsupported_entries_carry_compatibility_errors() {
     assert_eq!(is_debugger.implementation, ImplementationLevel::Implemented);
     assert_eq!(
         is_debugger.semantic_test_coverage,
-        CoverageLevel::Conformance,
-        "IsDebuggerPresent is proven by the debugger/affinity/switch suite"
+        CoverageLevel::None,
+        "IsDebuggerPresent's phantom evidence was removed; no verified suite covers it"
     );
-    // Implemented + conformance: no shipping violation and NO completeness
-    // violation.
+    // Implemented without verified evidence (its phantom suite was removed
+    // by the evidence-chain audit fix): a shipping violation AND a
+    // completeness violation — the honest state until a real test exists.
     assert!(
-        !database
+        database
             .shipping_gate()
             .iter()
             .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
-        "an implemented, evidenced IsDebuggerPresent is not a shipping violation"
+        "an implemented but uncovered IsDebuggerPresent IS a shipping violation"
     );
     assert!(
-        !database
+        database
             .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
             .iter()
             .any(|v| v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent"),
-        "an implemented, evidenced IsDebuggerPresent is not a completeness violation"
+        "an implemented but uncovered IsDebuggerPresent IS a completeness violation"
     );
 }
 
@@ -1058,36 +1060,36 @@ fn coverage_registry_maps_suite_evidenced_apis_to_conformance_levels() {
         (
             "kernel32.dll",
             "CreateProcessW",
-            "casa1-conformance:section29",
+            "casa1-conformance:section29_process",
         ),
         (
             "kernel32.dll",
             "GetSystemInfo",
-            "casa1-conformance:section50",
+            "casa1-conformance:section50_win32_nt_consistency",
         ),
         (
             "kernel32.dll",
             "GetTickCount",
-            "casa1-conformance:section50",
+            "casa1-conformance:section50_win32_nt_consistency",
         ),
-        ("kernel32.dll", "CloseHandle", "casa1-conformance:section38"),
-        ("ntdll.dll", "LdrLoadDll", "casa1-conformance:section48"),
-        ("ntdll.dll", "NtCreateEvent", "casa1-conformance:section47"),
-        ("ntdll.dll", "NtSetEvent", "casa1-conformance:section47"),
+        ("kernel32.dll", "CloseHandle", "casa1-conformance:section38_manifest_gate"),
+        ("ntdll.dll", "LdrLoadDll", "casa1-conformance:section48_ldr"),
+        ("ntdll.dll", "NtCreateEvent", "casa1-conformance:section47_ntdll"),
+        ("ntdll.dll", "NtSetEvent", "casa1-conformance:section47_ntdll"),
         (
             "ntdll.dll",
             "NtQuerySystemTime",
-            "casa1-conformance:section50",
+            "casa1-conformance:section50_win32_nt_consistency",
         ),
         (
             "ntdll.dll",
             "NtAllocateVirtualMemory",
-            "casa1-conformance:section47",
+            "casa1-conformance:section47_ntdll",
         ),
         (
             "kernel32.dll",
             "GetCurrentDirectoryA",
-            "casa1-conformance:runtime_unit",
+            "casa1-conformance:allocate_reserves_and_commits_through_the_canonical_vm",
         ),
         (
             "kernel32.dll",
@@ -1142,15 +1144,17 @@ fn coverage_registry_merges_conformance_only_where_suite_evidence_exists() {
         CoverageLevel::None,
         "no evidence row exists for DialogBoxParamA"
     );
-    // FindResourceA now HAS evidence (the resources-and-ioctl suite drives
-    // the module resource table through the thunks).
+    // FindResourceA's former evidence row named the phantom
+    // evidence_ps3_resources_and_ioctl suite (removed by the evidence-chain
+    // audit fix) — the API is Implemented but currently has NO verified
+    // semantic coverage, and must stay that way until a real test exists.
     let find_resource = database
         .lookup("kernel32.dll", "FindResourceA")
         .expect("FindResourceA entry");
     assert_eq!(
         find_resource.semantic_test_coverage,
-        CoverageLevel::Conformance,
-        "FindResourceA is proven by the resources-and-ioctl suite"
+        CoverageLevel::None,
+        "FindResourceA lost its phantom evidence and must not claim coverage"
     );
 }
 
