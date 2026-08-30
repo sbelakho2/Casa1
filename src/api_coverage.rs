@@ -6336,6 +6336,56 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     conformance(
         "mf.dll",
+        "MFGetService",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFGetService",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mf.dll",
+        "MFRequireProtectedEnvironment",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mf.dll",
+        "MFTEnumEx",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFTEnumEx",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mf.dll",
+        "MFEnumDeviceSources",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFAddPeriodicCallback",
+        "casa1-conformance:evidence_mf_periodic_callbacks_and_system_time",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFCancelPeriodicCallback",
+        "casa1-conformance:evidence_mf_periodic_callbacks_and_system_time",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFGetSystemTime",
+        "casa1-conformance:evidence_mf_periodic_callbacks_and_system_time",
+    ),
+    conformance(
+        "mfplat.dll",
+        "MFCreateDXGIDeviceManager",
+        "casa1-conformance:evidence_mf_dxgi_device_manager_handles_and_reset",
+    ),
+    conformance(
+        "mf.dll",
         "MFCreateSourceReaderFromURL",
         "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
     ),
@@ -6578,6 +6628,7 @@ mod tests {
         "evidence_ps3_shell32_psapi_and_task_memory",
         "evidence_ps3_ole32_co_create_instance",
         "evidence_mf_periodic_callbacks_and_system_time",
+        "evidence_mf_dxgi_device_manager_handles_and_reset",
         "evidence_mf_source_reader_and_sink_writer_objects",
         "evidence_mf_startup_media_type_attributes_and_sample",
         "evidence_ps3_crypt32_certificates",

@@ -12877,6 +12877,17 @@ pub static THUNK_METADATA: &[ThunkMetadata] = &[
     ),
     meta(
         "mfplat.dll",
+        "MFCreateDXGIDeviceManager",
+        0,
+        Subsystem::Audio,
+        LastErrorBehavior::UndefinedOnSuccess,
+        ImplementationLevel::Implemented,
+        ArchMask::ANY,
+        WindowsVersion::Any,
+        SupportPolicy::OptionalFeature,
+    ),
+    meta(
+        "mfplat.dll",
         "MFGetSystemTime",
         0,
         Subsystem::Audio,

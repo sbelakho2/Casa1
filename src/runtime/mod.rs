@@ -5035,6 +5035,14 @@ pub enum HostThunk {
     MfCreatePresentationDescriptor,
     MfCreateMfByteStreamOnStream,
     MfCreateMediaBufferFromMediaType,
+    MfCreateDxgiDeviceManager,
+    MfDxgiDeviceManagerResetDevice,
+    MfDxgiDeviceManagerOpenDeviceHandle,
+    MfDxgiDeviceManagerCloseDeviceHandle,
+    MfDxgiDeviceManagerTestDevice,
+    MfDxgiDeviceManagerLockDevice,
+    MfDxgiDeviceManagerUnlockDevice,
+    MfDxgiDeviceManagerGetVideoService,
     MftEnumEx,
     MfEnumDeviceSources,
     MfCreateSinkWriterFromMediaSink,
@@ -27845,7 +27853,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType) => {
+            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -63755,7 +63763,8 @@ impl PeHostRuntime {
             | GuestObjectKind::ImfAsyncResult
             | GuestObjectKind::ImfMediaSource
             | GuestObjectKind::ImfByteStream
-            | GuestObjectKind::ImfTopologyNode) => {
+            | GuestObjectKind::ImfTopologyNode
+            | GuestObjectKind::ImfDxgiDeviceManager) => {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
@@ -120728,6 +120737,134 @@ mod tests {
 
             dispatch_x86_thunk(&mut runtime, &mut memory, cancel, &[key]);
             assert!(runtime.mf_runtime.periodic_callbacks.is_empty());
+        })
+    }
+
+    #[test]
+    fn evidence_mf_dxgi_device_manager_handles_and_reset() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mf-dxgi");
+            let mut memory = MemoryImage::default();
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateDxgiDeviceManager);
+            let open_handle: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerOpenDeviceHandle);
+            let test_device: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerTestDevice);
+            let close_handle: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerCloseDeviceHandle);
+            let reset: u64 = runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerResetDevice);
+            let lock: u64 = runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerLockDevice);
+            let get_service: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfDxgiDeviceManagerGetVideoService);
+
+            let obj_out = 0x41_000;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create,
+                &[0x1122_3344, obj_out as u32],
+            );
+            assert_eq!(hr, 0);
+            let manager = read_guest_pointer(&memory, obj_out, GuestArch::X86).unwrap();
+            assert_ne!(manager, 0);
+            assert_eq!(
+                runtime
+                    .mf_dxgi_device_managers
+                    .get(&manager)
+                    .unwrap()
+                    .reset_token,
+                0x1122_3344
+            );
+
+            let handle_out = 0x41_100;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_handle,
+                &[manager as u32, handle_out as u32],
+            );
+            assert_eq!(hr, 0);
+            let handle = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap();
+            assert_eq!(handle, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    test_device,
+                    &[manager as u32, handle as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    test_device,
+                    &[manager as u32, 0x7fff]
+                ),
+                0x8007_0057
+            );
+
+            let lock_out = 0x41_200;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lock,
+                    &[manager as u32, handle as u32, 0, lock_out as u32]
+                ),
+                0x8000_4002
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, lock_out, GuestArch::X86).unwrap(),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[manager as u32, handle as u32, 0, lock_out as u32]
+                ),
+                0xC00D_36C8
+            );
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    close_handle,
+                    &[manager as u32, handle as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    test_device,
+                    &[manager as u32, handle as u32]
+                ),
+                0x8007_0057
+            );
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    reset,
+                    &[manager as u32, 0x5566_7788]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime
+                    .mf_dxgi_device_managers
+                    .get(&manager)
+                    .unwrap()
+                    .reset_token,
+                0x5566_7788
+            );
         })
     }
 }

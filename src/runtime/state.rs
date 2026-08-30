@@ -207,6 +207,7 @@ pub(crate) enum GuestObjectKind {
     ImfMediaSource,
     ImfByteStream,
     ImfTopologyNode,
+    ImfDxgiDeviceManager,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +580,18 @@ pub(crate) struct MfRuntimeState {
     pub(crate) periodic_callbacks: std::collections::HashMap<u32, MfPeriodicCallback>,
     /// Next periodic-callback key.
     pub(crate) next_periodic_callback_key: u32,
+}
+
+/// A guest IMFDXGIDeviceManager object (MFCreateDXGIDeviceManager).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // device-manager state read by the MF DXGI dispatch paths
+pub(crate) struct MfDxgiDeviceManagerState {
+    /// The reset token (updated by ResetDevice).
+    pub(crate) reset_token: u32,
+    /// Handles returned by OpenDeviceHandle that are still open.
+    pub(crate) open_handles: std::collections::HashSet<u64>,
+    /// Next handle value to hand out.
+    pub(crate) next_handle: u64,
 }
 
 /// A guest MFPERIODICCALLBACK registration.
@@ -1311,6 +1324,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_source_readers: HashMap<u64, crate::media::SourceReader>,
     /// Guest IMFByteStream object -> byte stream state.
     pub(crate) mf_byte_streams: HashMap<u64, ImfByteStreamState>,
+    /// Guest IMFDXGIDeviceManager object -> device manager state.
+    pub(crate) mf_dxgi_device_managers: HashMap<u64, MfDxgiDeviceManagerState>,
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
@@ -1880,6 +1895,7 @@ impl PeHostRuntime {
             mf_sink_writers: HashMap::new(),
             mf_source_readers: HashMap::new(),
             mf_byte_streams: HashMap::new(),
+            mf_dxgi_device_managers: HashMap::new(),
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),

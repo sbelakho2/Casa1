@@ -684,6 +684,178 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// `MFCreateDXGIDeviceManager(resetToken, ppManager)` — an
+    /// IMFDXGIDeviceManager with a reset token; device handles are
+    /// allocated through OpenDeviceHandle and validated by the handle
+    /// methods.
+    pub(crate) fn dispatch_mf_create_dxgi_device_manager(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let reset_token = guest_call_arg_u32(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_dxgi_device_manager_methods())?;
+        let object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfDxgiDeviceManager, vtable)
+            .unwrap_or(0);
+        if object == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_dxgi_device_managers.insert(
+            object,
+            MfDxgiDeviceManagerState {
+                reset_token,
+                ..Default::default()
+            },
+        );
+        write_guest_pointer(memory, out, object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::ResetDevice(resetToken)` — replace the reset
+    /// token and invalidate the open device handles.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_reset_device(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let token = guest_call_arg_u32(state, memory, 1)?;
+        let Some(manager) = self.mf_dxgi_device_managers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        manager.reset_token = token;
+        manager.open_handles.clear();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::OpenDeviceHandle(phDevice)` — allocate a
+    /// device handle.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_open_device_handle(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(manager) = self.mf_dxgi_device_managers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let handle = manager.next_handle;
+        manager.next_handle = manager.next_handle.wrapping_add(1);
+        manager.open_handles.insert(handle);
+        write_guest_pointer(memory, out, handle, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::CloseDeviceHandle(hDevice)` — release a
+    /// device handle.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_close_device_handle(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let handle = guest_call_arg(state, memory, 1)?;
+        let Some(manager) = self.mf_dxgi_device_managers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let removed = manager.open_handles.remove(&handle);
+        state.set(
+            Register::Rax,
+            u64::from(if removed { S_OK } else { E_INVALIDARG }),
+        );
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::TestDevice(hDevice)` — S_OK when the handle
+    /// is open.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_test_device(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let handle = guest_call_arg(state, memory, 1)?;
+        let Some(manager) = self.mf_dxgi_device_managers.get(&this) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let valid = manager.open_handles.contains(&handle);
+        state.set(
+            Register::Rax,
+            u64::from(if valid { S_OK } else { E_INVALIDARG }),
+        );
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::LockDevice(hDevice, riid, ppUnlockDevice)` —
+    /// no D3D device is registered in the MF runtime — E_NOINTERFACE with a
+    /// null output.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_lock_device(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let _handle = guest_call_arg(state, memory, 1)?;
+        let _riid = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::UnlockDevice(hDevice)` — no locked device —
+    /// S_OK.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_unlock_device(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let _handle = guest_call_arg(state, memory, 1)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFDXGIDeviceManager::GetVideoService(hDevice, riid, ppService)` —
+    /// no video service provider in the MF runtime —
+    /// `MF_E_UNSUPPORTED_SERVICE` with a null output.
+    pub(crate) fn dispatch_mf_dxgi_device_manager_get_video_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let _handle = guest_call_arg(state, memory, 1)?;
+        let _riid = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+        Ok(())
+    }
+
     /// `MFTEnumEx(category, flags, pInputType, pOutputType, pppMFTActivate,
     /// pnumMFTActivate)` — no third-party MFTs are registered — the
     /// documented empty enumeration.
@@ -2119,6 +2291,28 @@ impl PeHostRuntime {
             MfCreateMediaBufferFromMediaType => {
                 self.dispatch_mf_create_media_buffer_from_media_type(state, memory)
             }
+            MfCreateDxgiDeviceManager => self.dispatch_mf_create_dxgi_device_manager(state, memory),
+            MfDxgiDeviceManagerResetDevice => {
+                self.dispatch_mf_dxgi_device_manager_reset_device(state, memory)
+            }
+            MfDxgiDeviceManagerOpenDeviceHandle => {
+                self.dispatch_mf_dxgi_device_manager_open_device_handle(state, memory)
+            }
+            MfDxgiDeviceManagerCloseDeviceHandle => {
+                self.dispatch_mf_dxgi_device_manager_close_device_handle(state, memory)
+            }
+            MfDxgiDeviceManagerTestDevice => {
+                self.dispatch_mf_dxgi_device_manager_test_device(state, memory)
+            }
+            MfDxgiDeviceManagerLockDevice => {
+                self.dispatch_mf_dxgi_device_manager_lock_device(state, memory)
+            }
+            MfDxgiDeviceManagerUnlockDevice => {
+                self.dispatch_mf_dxgi_device_manager_unlock_device(state, memory)
+            }
+            MfDxgiDeviceManagerGetVideoService => {
+                self.dispatch_mf_dxgi_device_manager_get_video_service(state, memory)
+            }
             MftEnumEx => self.dispatch_mf_enum_ex(state, memory),
             MfEnumDeviceSources => self.dispatch_mf_enum_device_sources(state, memory),
             MfCreateSourceReaderFromMfByteStream => {
@@ -2341,6 +2535,20 @@ fn mf_topology_node_methods() -> Vec<HostThunk> {
 fn mf_source_resolver_methods() -> Vec<HostThunk> {
     let mut methods = mf_unknown_preamble();
     methods.push(HostThunk::MfSourceResolverCreateObjectFromUrl);
+    methods
+}
+
+/// The IMFDXGIDeviceManager vtable (IUnknown preamble + the 7 device
+/// methods).
+fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
+    let mut methods = mf_unknown_preamble();
+    methods.push(HostThunk::MfDxgiDeviceManagerResetDevice);
+    methods.push(HostThunk::MfDxgiDeviceManagerOpenDeviceHandle);
+    methods.push(HostThunk::MfDxgiDeviceManagerCloseDeviceHandle);
+    methods.push(HostThunk::MfDxgiDeviceManagerTestDevice);
+    methods.push(HostThunk::MfDxgiDeviceManagerLockDevice);
+    methods.push(HostThunk::MfDxgiDeviceManagerUnlockDevice);
+    methods.push(HostThunk::MfDxgiDeviceManagerGetVideoService);
     methods
 }
 
