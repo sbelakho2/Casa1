@@ -6289,7 +6289,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "CoGetInterfaceAndReleaseStream",
         "casa1-conformance:evidence_com_marshal_stream_round_trip",
     ),
-
 ];
 
 /// Evidence-ui-mm: conformance-backed rows (additive; the differential
