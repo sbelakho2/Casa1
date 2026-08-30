@@ -189,6 +189,24 @@ pub(crate) enum GuestObjectKind {
     ComStorageObject,
     ComStream,
     ComTypeInfo,
+    ImfAttributes,
+    ImfMediaType,
+    ImfMediaBuffer,
+    ImfSample,
+    ImfMediaEventQueue,
+    ImfMediaSession,
+    ImfPresentationClock,
+    ImfSinkWriter,
+    ImfSourceReader,
+    ImfSourceResolver,
+    ImfTopology,
+    ImfPresentationDescriptor,
+    ImfMediaEvent,
+    ImfMediaSink,
+    ImfAsyncResult,
+    ImfMediaSource,
+    ImfByteStream,
+    ImfTopologyNode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -557,6 +575,23 @@ pub(crate) struct MfRuntimeState {
     pub(crate) started: bool,
     /// The MF_SDK_VERSION passed to MFStartup.
     pub(crate) version: u32,
+}
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // topology-node state (consumed by the MF topology thunk paths)
+pub(crate) struct TopologyNodeState {
+    pub(crate) node_type: u32,
+    pub(crate) object: u64,
+    pub(crate) inputs: Vec<u64>,
+    pub(crate) outputs: Vec<u64>,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // media-event state (consumed by the MF event thunk paths)
+pub(crate) struct MfMediaEventState {
+    pub(crate) event_type: u32,
+    pub(crate) status: u32,
+    pub(crate) value: u64,
 }
 
 #[allow(dead_code)] // pending-surface state: COM/MF fields populated by runtime/dispatch/com.rs
@@ -1265,17 +1300,25 @@ pub(crate) struct PeHostRuntime {
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
-    pub(crate) mf_topology_nodes: HashMap<u64, crate::media::TopologyNode>,
     /// Guest IMFMediaSink object -> sink state.
     pub(crate) mf_sinks: HashMap<u64, ImfMediaSinkState>,
     /// Guest IMFAsyncResult object -> result state.
     pub(crate) mf_async_results: HashMap<u64, ImfAsyncResultState>,
     /// Guest IMFMediaSource object -> source state.
     pub(crate) mf_media_sources: HashMap<u64, ImfMediaSourceState>,
+    /// IMFTopologyNode object -> node state.
+    pub(crate) mf_topology_nodes: HashMap<u64, TopologyNodeState>,
+    /// IMFMediaEvent object -> event state.
+    pub(crate) mf_media_events: HashMap<u64, MfMediaEventState>,
+    /// IMFMediaBuffer Lock'd guest payload -> the buffer object (read back at
+    /// Unlock).
+    pub(crate) mf_locked_buffer_data: HashMap<u64, u64>,
+    /// IMFSourceResolver object -> resolver (stateless).
+    pub(crate) mf_source_resolvers: HashMap<u64, ()>,
+    /// IMFPresentationDescriptor object -> descriptor.
+    pub(crate) mf_presentation_descriptors: HashMap<u64, ()>,
     /// Guest IMFMediaEvent object -> (type, status).
-    pub(crate) mf_media_events: HashMap<u64, (u32, u32)>,
     /// Guest IMFPresentationDescriptor object -> stream count.
-    pub(crate) mf_presentation_descriptors: HashMap<u64, u32>,
     /// Guest IMFMediaBuffer object -> locked guest pointer (Lock/Unlock).
     pub(crate) mf_buffer_locks: HashMap<u64, u64>,
     /// Whether CoInitializeSecurity has been called (once-only contract).
@@ -1824,10 +1867,12 @@ impl PeHostRuntime {
             mf_source_readers: HashMap::new(),
             mf_byte_streams: HashMap::new(),
             mf_topologies: HashMap::new(),
-            mf_topology_nodes: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
             mf_media_sources: HashMap::new(),
+            mf_topology_nodes: HashMap::new(),
+            mf_locked_buffer_data: HashMap::new(),
+            mf_source_resolvers: HashMap::new(),
             mf_media_events: HashMap::new(),
             mf_presentation_descriptors: HashMap::new(),
             mf_buffer_locks: HashMap::new(),

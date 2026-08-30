@@ -151,7 +151,7 @@ impl MfSessionState {
 // ===========================================================================
 
 /// A simplified GUID (128-bit) for MF attribute keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Guid {
     pub data1: u32,
     pub data2: u16,
@@ -367,6 +367,7 @@ pub const MFAudioFormat_Float: Guid = Guid::new(
 pub enum MediaTypeValue {
     Uint32(u32),
     Uint64(u64),
+    Double(f64),
     Guid(Guid),
     String(String),
     Blob(Vec<u8>),
@@ -388,6 +389,39 @@ impl ImfMediaType {
         Self {
             attributes: HashMap::new(),
         }
+    }
+
+    /// The attribute at an index (the IMFAttributes::GetItemByIndex order —
+    /// the map's insertion order is not Windows-defined; the deterministic
+    /// sorted order by key is used).
+    pub fn attribute_at(&self, index: usize) -> Option<(Guid, Guid)> {
+        let mut keys: Vec<&Guid> = self.attributes.keys().collect();
+        keys.sort();
+        keys.get(index).map(|key| (**key, **key))
+    }
+
+    /// Get a DOUBLE attribute.
+    pub fn get_double(&self, key: &Guid) -> Option<f64> {
+        match self.attributes.get(key) {
+            Some(MediaTypeValue::Double(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Set a DOUBLE attribute.
+    pub fn set_double(&mut self, key: Guid, value: f64) {
+        self.attributes.insert(key, MediaTypeValue::Double(value));
+    }
+
+    /// The number of attributes in the store.
+    pub fn attribute_count(&self) -> usize {
+        self.attributes.len()
+    }
+
+    /// Remove an attribute (the documented IMFAttributes::DeleteItem
+    /// contract — removing an absent key succeeds).
+    pub fn delete_item(&mut self, key: &Guid) {
+        self.attributes.remove(key);
     }
 
     /// Set a UINT32 attribute.
@@ -504,6 +538,7 @@ impl Default for ImfMediaType {
 
 /// Media Session event types, mirroring `MediaEventType` from MF API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MediaEventType {
     /// Session has started playing.
     SessionStarted,
@@ -527,6 +562,26 @@ pub enum MediaEventType {
     TopologyLoaded,
     /// Rate change (slow motion, fast forward, etc.).
     RateChanged,
+}
+
+impl MediaEventType {
+    /// Convert from the MF event-type number (the MF_EVENT_TYPE_* values the
+    /// guest passes; unknown values map to the generic Error event).
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::SessionStarted,
+            1 => Self::SessionPaused,
+            2 => Self::SessionStopped,
+            3 => Self::SessionEnded,
+            4 => Self::BufferingStarted,
+            5 => Self::BufferingStopped,
+            6 => Self::Error,
+            7 => Self::SessionShutdown,
+            8 => Self::TopologySet,
+            9 => Self::TopologyLoaded,
+            _ => Self::Error,
+        }
+    }
 }
 
 impl MediaEventType {
@@ -2249,6 +2304,9 @@ impl Topology {
 
     /// Add a node to the topology.
     pub fn add_node(&mut self, node_type: TopologyNodeType, name: impl Into<String>) -> u64 {
+        // Placeholder-compatible: the runtime dispatch records the node
+        // object id in the node's own state; the topology's node table is
+        // the id-keyed node list.
         let id = self.next_id;
         self.next_id += 1;
         let node = TopologyNode::new(id, node_type, name);
@@ -3428,6 +3486,16 @@ pub struct SourceReader {
 }
 
 impl SourceReader {
+    /// An empty source reader (no data — the deterministic headless
+    /// source model).
+    pub fn empty() -> Self {
+        Self {
+            demuxer: Mp4Demuxer::new(Vec::new()),
+            selected_streams: Vec::new(),
+            decoder: None,
+        }
+    }
+
     /// Create a new source reader from a file path.
     pub fn from_url(url: &str) -> AppResult<Self> {
         let data = std::fs::read(url).map_err(|e| {

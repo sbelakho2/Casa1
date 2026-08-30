@@ -5012,6 +5012,91 @@ pub enum HostThunk {
     LHashValOfNameSys,
     VariantChangeTypeEx,
     VariantCopyInd,
+    MfStartup,
+    MfShutdown,
+    MfRequireProtectedEnvironment,
+    MfGetService,
+    MfCreateAttributes,
+    MfCreateMediaType,
+    MfCreateMemoryBuffer,
+    MfCreateSample,
+    MfCreateEventQueue,
+    MfCreatePresentationClock,
+    MfCreateTopology,
+    MfCreateTopologyNode,
+    MfCreateSourceResolver,
+    MfCreateMediaSession,
+    MfCreateSourceReaderFromUrl,
+    MfCreateSourceReaderFromByteStream,
+    MfCreateSinkWriterFromUrl,
+    MfCreatePresentationDescriptor,
+    MfCreateMfByteStreamOnStream,
+    MfCreateMediaBufferFromMediaType,
+    MftEnumEx,
+    MfEnumDeviceSources,
+    MfCreateSinkWriterFromMediaSink,
+    MfCreateSourceReaderFromMfByteStream,
+    MfAttrGetCount,
+    MfAttrGetItemByIndex,
+    MfAttrGetUint32,
+    MfAttrGetUint64,
+    MfAttrGetDouble,
+    MfAttrGetGuid,
+    MfAttrGetStringLength,
+    MfAttrGetString,
+    MfAttrGetBlobSize,
+    MfAttrGetBlob,
+    MfAttrSetUint32,
+    MfAttrSetUint64,
+    MfAttrSetDouble,
+    MfAttrSetGuid,
+    MfAttrSetString,
+    MfAttrSetBlob,
+    MfAttrDeleteItem,
+    MfMediaTypeGetMajorType,
+    MfMediaTypeIsCompressedFormat,
+    MfBufferGetMaxLength,
+    MfBufferLock,
+    MfBufferUnlock,
+    MfBufferGetCurrentLength,
+    MfBufferSetCurrentLength,
+    MfSampleGetBufferCount,
+    MfSampleGetBufferByIndex,
+    MfSampleAddBuffer,
+    MfSampleRemoveBufferByIndex,
+    MfSampleRemoveAllBuffers,
+    MfSampleGetSampleTime,
+    MfSampleSetSampleTime,
+    MfSampleGetSampleDuration,
+    MfSampleSetSampleDuration,
+    MfEventQueueGetEvent,
+    MfEventQueueQueueEvent,
+    MfClockGetTime,
+    MfClockStart,
+    MfClockStop,
+    MfSessionGetClock,
+    MfSessionStart,
+    MfSessionPause,
+    MfSessionStop,
+    MfSessionClose,
+    MfSessionShutdown,
+    MfSourceReaderGetCurrentMediaType,
+    MfSourceReaderGetNativeMediaType,
+    MfSourceReaderReadSample,
+    MfSinkWriterAddStream,
+    MfSinkWriterBeginWriting,
+    MfSinkWriterWriteSample,
+    MfSinkWriterEndWriting,
+    MfByteStreamGetCurrentPosition,
+    MfByteStreamRead,
+    MfByteStreamGetLength,
+    MfTopologyAddNode,
+    MfTopologyGetNodeCount,
+    MfTopologyNodeGetObject,
+    MfTopologyNodeSetObject,
+    MfSourceResolverCreateObjectFromUrl,
+    MfPresentationDescriptorGetStreamDescriptorCount,
+    MfEventGetType,
 }
 
 /// Outcome of one [`PeHostRuntime::get_message_pump`] iteration — the
@@ -27757,6 +27842,11 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
+            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType) => {
+
+                self.dispatch_mf_or_com(thunk, state, memory)?;
+            }
+
             HostThunk::ClsidFromString => {
                 self.dispatch_com_clsid_from_string(state, memory)?;
             }
@@ -63645,6 +63735,27 @@ impl PeHostRuntime {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
+            kind @ (GuestObjectKind::ImfAttributes
+            | GuestObjectKind::ImfMediaType
+            | GuestObjectKind::ImfMediaBuffer
+            | GuestObjectKind::ImfSample
+            | GuestObjectKind::ImfMediaEventQueue
+            | GuestObjectKind::ImfMediaSession
+            | GuestObjectKind::ImfPresentationClock
+            | GuestObjectKind::ImfSinkWriter
+            | GuestObjectKind::ImfSourceReader
+            | GuestObjectKind::ImfSourceResolver
+            | GuestObjectKind::ImfTopology
+            | GuestObjectKind::ImfPresentationDescriptor
+            | GuestObjectKind::ImfMediaEvent
+            | GuestObjectKind::ImfMediaSink
+            | GuestObjectKind::ImfAsyncResult
+            | GuestObjectKind::ImfMediaSource
+            | GuestObjectKind::ImfByteStream
+            | GuestObjectKind::ImfTopologyNode) => {
+                self.guest_objects.remove(&address);
+                let _ = kind;
+            }
             GuestObjectKind::DxgiFactory => self.destroy_dxgi_factory_object(address)?,
             GuestObjectKind::DxgiAdapter => self.destroy_dxgi_adapter_object(address)?,
             GuestObjectKind::D3d11Device => self.destroy_d3d11_device_object(address)?,
@@ -74917,6 +75028,356 @@ impl HostThunk {
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoCreateGuid" => {
                 Self::CoCreateGuid
             }
+
+            ("CLSIDFromString", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::ClsidFromString
+            }
+            ("StringFromCLSID", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::StringFromClsid
+            }
+            ("StringFromGUID2", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::StringFromGuid2
+            }
+            ("ProgIDFromCLSID", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::ProgidFromClsid
+            }
+            ("CLSIDFromProgID", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::ClsidFromProgid
+            }
+            ("CoTaskMemAlloc", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoTaskMemAlloc
+            }
+            ("CoTaskMemFree", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoTaskMemFree
+            }
+            ("CoTaskMemRealloc", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoTaskMemRealloc
+            }
+            ("CoFileTimeNow", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoFileTimeNow
+            }
+            ("CoDosDateTimeToFileTime", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoDosDateTimeToFileTime
+            }
+            ("CoAddRefServerProcess", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoAddRefServerProcess
+            }
+            ("CoReleaseServerProcess", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoReleaseServerProcess
+            }
+            ("CoSuspendClassObjects", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoSuspendClassObjects
+            }
+            ("CoResumeClassObjects", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoResumeClassObjects
+            }
+            ("CoGetCurrentProcess", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetCurrentProcess
+            }
+            ("CoGetApartmentType", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetApartmentType
+            }
+            ("CoInitialize", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoInitialize
+            }
+            ("CoInitializeSecurity", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoInitializeSecurity
+            }
+            ("CoImpersonateClient", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoImpersonateClient
+            }
+            ("CoRevertToSelf", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoRevertToSelf
+            }
+            ("CoAllowSetForegroundWindow", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoAllowSetForegroundWindow
+            }
+            ("CoDisconnectObject", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoDisconnectObject
+            }
+            ("CoLockObjectExternal", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoLockObjectExternal
+            }
+            ("CoRegisterMessageFilter", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoRegisterMessageFilter
+            }
+            ("CoRegisterPSClsid", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoRegisterPsClsid
+            }
+            ("CoGetPSClsid", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetPsClsid
+            }
+            ("CoGetTreatAsClass", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetTreatAsClass
+            }
+            ("CoGetCallContext", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetCallContext
+            }
+            ("CoSetProxyBlanket", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoSetProxyBlanket
+            }
+            ("CoCopyProxy", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoCopyProxy
+            }
+            ("CoLoadLibrary", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoLoadLibrary
+            }
+            ("CoFreeLibrary", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoFreeLibrary
+            }
+            ("CoFreeUnusedLibraries", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoFreeUnusedLibraries
+            }
+            ("CoFreeAllLibraries", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoFreeAllLibraries
+            }
+            ("DllCanUnloadNow", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::DllCanUnloadNow
+            }
+            ("DllRegisterServer", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::DllRegisterServer
+            }
+            ("DllUnregisterServer", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::DllUnregisterServer
+            }
+            ("DllGetClassObject", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::DllGetClassObject
+            }
+            ("CoMarshalInterThreadInterfaceInStream", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoMarshalInterThreadInterfaceInStream
+            }
+            ("CoGetInterfaceAndReleaseStream", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoGetInterfaceAndReleaseStream
+            }
+            ("CreateBindCtx", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CreateBindCtx
+            }
+            ("MkParseDisplayName", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::MkParseDisplayName
+            }
+            ("OleDuplicateData", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::OleDuplicateData
+            }
+            ("OleSetMenuDescriptor", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::OleSetMenuDescriptor
+            }
+            ("CoGetClassObjectFromUrl", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoGetClassObjectFromUrl
+            }
+            ("CoGetInstanceFromFile", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoGetInstanceFromFile
+            }
+            ("CoGetInstanceFromIStorage", ImportSymbol::ByName { name, .. })
+                if name == "ole32.dll" =>
+            {
+                Self::CoGetInstanceFromIStorage
+            }
+            ("CoInstall", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoInstall
+            }
+            ("CoIsHandlerConnected", ImportSymbol::ByName { name, .. }) if name == "ole32.dll" => {
+                Self::CoIsHandlerConnected
+            }
+            ("SysStringByteLen", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::SysStringByteLen
+            }
+            ("SafeArrayGetDim", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::SafeArrayGetDim
+            }
+            ("BSTR_UserSize", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::BstrUserSize
+            }
+            ("BSTR_UserMarshal", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::BstrUserMarshal
+            }
+            ("BSTR_UserUnmarshal", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::BstrUserUnmarshal
+            }
+            ("BSTR_UserFree", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::BstrUserFree
+            }
+            ("LHashValOfNameSys", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::LHashValOfNameSys
+            }
+            ("VariantChangeTypeEx", ImportSymbol::ByName { name, .. })
+                if name == "oleaut32.dll" =>
+            {
+                Self::VariantChangeTypeEx
+            }
+            ("VariantCopyInd", ImportSymbol::ByName { name, .. }) if name == "oleaut32.dll" => {
+                Self::VariantCopyInd
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFStartup" => Self::MfStartup,
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFShutdown" => {
+                Self::MfShutdown
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFRequireProtectedEnvironment" =>
+            {
+                Self::MfRequireProtectedEnvironment
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFGetService" => {
+                Self::MfGetService
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateAttributes" => {
+                Self::MfCreateAttributes
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMediaType" => {
+                Self::MfCreateMediaType
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMemoryBuffer" => {
+                Self::MfCreateMemoryBuffer
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateSample" => {
+                Self::MfCreateSample
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateEventQueue" => {
+                Self::MfCreateEventQueue
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreatePresentationClock" =>
+            {
+                Self::MfCreatePresentationClock
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateTopology" => {
+                Self::MfCreateTopology
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateTopologyNode" => {
+                Self::MfCreateTopologyNode
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateSourceResolver" => {
+                Self::MfCreateSourceResolver
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMediaSession" => {
+                Self::MfCreateMediaSession
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromURL" =>
+            {
+                Self::MfCreateSourceReaderFromUrl
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromByteStream" =>
+            {
+                Self::MfCreateSourceReaderFromByteStream
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSinkWriterFromURL" =>
+            {
+                Self::MfCreateSinkWriterFromUrl
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreatePresentationDescriptor" =>
+            {
+                Self::MfCreatePresentationDescriptor
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateMFByteStreamOnStream" =>
+            {
+                Self::MfCreateMfByteStreamOnStream
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateMediaBufferFromMediaType" =>
+            {
+                Self::MfCreateMediaBufferFromMediaType
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFTEnumEx" => Self::MftEnumEx,
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "MFEnumDeviceSources" => {
+                Self::MfEnumDeviceSources
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFStartup" => {
+                Self::MfStartup
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFShutdown" => {
+                Self::MfShutdown
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFGetService" => {
+                Self::MfGetService
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMediaType" => {
+                Self::MfCreateMediaType
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMemoryBuffer" => {
+                Self::MfCreateMemoryBuffer
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateSample" => {
+                Self::MfCreateSample
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreatePresentationClock" =>
+            {
+                Self::MfCreatePresentationClock
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreatePresentationDescriptor" =>
+            {
+                Self::MfCreatePresentationDescriptor
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateTopology" => {
+                Self::MfCreateTopology
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromByteStream" =>
+            {
+                Self::MfCreateSourceReaderFromByteStream
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromURL" =>
+            {
+                Self::MfCreateSourceReaderFromUrl
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFTEnumEx" => {
+                Self::MftEnumEx
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateMFByteStreamOnStream" =>
+            {
+                Self::MfCreateMfByteStreamOnStream
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateMediaBufferFromMediaType" =>
+            {
+                Self::MfCreateMediaBufferFromMediaType
+            }
+            ("mfreadwrite.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromByteStream" =>
+            {
+                Self::MfCreateSourceReaderFromByteStream
+            }
+            ("mfreadwrite.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromURL" =>
+            {
+                Self::MfCreateSourceReaderFromUrl
+            }
+            ("mfreadwrite.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSinkWriterFromMediaSink" =>
+            {
+                Self::MfCreateSinkWriterFromMediaSink
+            }
+            ("mfreadwrite.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSinkWriterFromURL" =>
+            {
+                Self::MfCreateSinkWriterFromUrl
+            }
+            ("mfreadwrite.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSourceReaderFromMFByteStream" =>
+            {
+                Self::MfCreateSourceReaderFromMfByteStream
+            }
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CLSIDFromString" => {
                 Self::ClsidFromString
             }
@@ -84880,7 +85341,7 @@ mod tests {
         state.set(Register::Rsp, stack);
         runtime
             .dispatch_import(thunk, &mut state, memory)
-            .expect("dispatch x86 thunk");
+            .unwrap_or_else(|e| panic!("dispatch x86 thunk: {e}"));
         state.get(Register::Rax)
     }
 
@@ -120118,6 +120579,113 @@ mod tests {
             );
             let recovered = read_guest_pointer(&memory, iface_out, GuestArch::X86).unwrap();
             assert_eq!(recovered, object, "the marshaled interface round-trips");
+        })
+    }
+
+    #[test]
+    fn evidence_mf_startup_media_type_attributes_and_sample() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mf");
+            let mut memory = MemoryImage::default();
+            let startup: u64 = runtime.alloc_host_thunk(HostThunk::MfStartup);
+            let shutdown: u64 = runtime.alloc_host_thunk(HostThunk::MfShutdown);
+            let create_type: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaType);
+            let create_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMemoryBuffer);
+            let create_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSample);
+
+            dispatch_x86_thunk(&mut runtime, &mut memory, startup, &[0x0007_0000, 0]);
+            assert!(runtime.mf_runtime.started);
+
+            let mt_out = 0x41_000;
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[mt_out as u32]);
+            let mt = read_guest_pointer(&memory, mt_out, GuestArch::X86).unwrap();
+            assert_ne!(mt, 0);
+            assert!(runtime.mf_media_types.contains_key(&mt));
+
+            let buf_out = 0x41_100;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_buffer,
+                &[128, buf_out as u32],
+            );
+            let buffer = read_guest_pointer(&memory, buf_out, GuestArch::X86).unwrap();
+            assert_ne!(buffer, 0);
+            assert_eq!(
+                runtime
+                    .mf_media_buffers
+                    .get(&buffer)
+                    .map(|b| b.get_max_length()),
+                Some(128)
+            );
+
+            let sample_out = 0x41_200;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_sample,
+                &[sample_out as u32],
+            );
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            assert_ne!(sample, 0);
+
+            dispatch_x86_thunk(&mut runtime, &mut memory, shutdown, &[]);
+            assert!(!runtime.mf_runtime.started);
+        })
+    }
+
+    #[test]
+    fn evidence_mf_source_reader_and_sink_writer_objects() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mf-rw");
+            let mut memory = MemoryImage::default();
+            let create_reader: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSourceReaderFromByteStream);
+            let create_writer: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSinkWriterFromMediaSink);
+            let get_current_type: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSourceReaderGetCurrentMediaType);
+
+            let stream_obj = 0x42_000_u64;
+            runtime.com_streams.insert(
+                stream_obj,
+                ComStreamState {
+                    data: b"fake-mp4".to_vec(),
+                    position: 0,
+                },
+            );
+            let reader_out = 0x41_000;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_reader,
+                &[stream_obj as u32, 0, reader_out as u32],
+            );
+            let reader = read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap();
+            assert_ne!(reader, 0);
+            assert!(runtime.mf_source_readers.contains_key(&reader));
+
+            let type_out = 0x41_100;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_current_type,
+                &[reader as u32, 0, type_out as u32],
+            );
+            let mt = read_guest_pointer(&memory, type_out, GuestArch::X86).unwrap();
+            assert_ne!(mt, 0);
+            assert!(runtime.mf_media_types.contains_key(&mt));
+
+            let writer_out = 0x41_200;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_writer,
+                &[0, 0, writer_out as u32],
+            );
+            let writer = read_guest_pointer(&memory, writer_out, GuestArch::X86).unwrap();
+            assert_ne!(writer, 0);
+            assert!(runtime.mf_sink_writers.contains_key(&writer));
         })
     }
 }
