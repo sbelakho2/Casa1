@@ -84,7 +84,10 @@ pub struct GuestProcess {
     pub peb: u64,
     /// THE canonical guest address space: the SAME `VirtualMemory` instance
     /// the interpreter and the JIT validate every access through.
-    pub address_space: VirtualMemory,
+    /// The canonical address space — BOXED so its address is stable across
+    /// moves of the enclosing process/runtime (the MemoryImage's VM
+    /// attachment is a raw pointer and must not dangle).
+    pub address_space: Box<VirtualMemory>,
     /// THE canonical handle table of this process.
     pub handle_table: HandleTable,
     pub modules: ModuleList,
@@ -121,7 +124,7 @@ impl GuestProcess {
             cwd,
             arch,
             peb: 0,
-            address_space: VirtualMemory::new(private_region_cursor),
+            address_space: Box::new(VirtualMemory::new(private_region_cursor)),
             handle_table: HandleTable::new(),
             modules: Vec::new(),
             primary_thread: 1,
@@ -145,7 +148,9 @@ impl GuestProcess {
     /// Replace the address space (arch switches rebuild the canonical VM
     /// with the arch's private-pages cursor).
     pub fn reset_address_space(&mut self, private_region_cursor: u64) {
-        self.address_space = VirtualMemory::new(private_region_cursor);
+        // A fresh Box keeps the heap address stable (the MemoryImage's VM
+        // attachment must never dangle across the process/runtime moves).
+        *self.address_space = VirtualMemory::new(private_region_cursor);
     }
 }
 
