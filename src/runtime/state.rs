@@ -569,12 +569,26 @@ pub(crate) struct ImfMediaSourceState {
 }
 
 /// The Media Foundation runtime state managed by MFStartup/MFShutdown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MfRuntimeState {
     /// Whether MFStartup has been called (and MFShutdown has not).
     pub(crate) started: bool,
     /// The MF_SDK_VERSION passed to MFStartup.
     pub(crate) version: u32,
+    /// MFAddPeriodicCallback registrations (key -> guest callback fn + context).
+    pub(crate) periodic_callbacks: std::collections::HashMap<u32, MfPeriodicCallback>,
+    /// Next periodic-callback key.
+    pub(crate) next_periodic_callback_key: u32,
+}
+
+/// A guest MFPERIODICCALLBACK registration.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // periodic-callback payload read by the evidence test + future work-queue dispatch
+pub(crate) struct MfPeriodicCallback {
+    /// Guest function pointer invoked on each period.
+    pub(crate) callback: u64,
+    /// Guest context pointer passed through to the callback.
+    pub(crate) context: u64,
 }
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // topology-node state (consumed by the MF topology thunk paths)

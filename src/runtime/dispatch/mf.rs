@@ -10,7 +10,7 @@
 
 use super::super::*;
 use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MediaEventType, MfEventQueue};
-use crate::runtime::state::{ComStreamState, ImfByteStreamState, MfRuntimeState};
+use crate::runtime::state::{ComStreamState, ImfByteStreamState};
 
 // ── Media Foundation HRESULT codes (the documented MF_E_* family) ─────────
 
@@ -59,10 +59,8 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let version = guest_call_arg_u32(state, memory, 0)?;
         let _flags = guest_call_arg_u32(state, memory, 1)?;
-        self.mf_runtime = MfRuntimeState {
-            started: true,
-            version,
-        };
+        self.mf_runtime.started = true;
+        self.mf_runtime.version = version;
         state.set(Register::Rax, u64::from(S_OK));
         let _ = memory;
         Ok(())
@@ -107,6 +105,67 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// `MFAddPeriodicCallback(Callback, pContext, pdwKey)` — register a guest
+    /// periodic callback; the key lets `MFCancelPeriodicCallback` remove it.
+    pub(crate) fn dispatch_mf_add_periodic_callback(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let callback = guest_call_arg(state, memory, 0)?;
+        let context = guest_call_arg(state, memory, 1)?;
+        let key_out = guest_call_arg(state, memory, 2)?;
+        let key = self.mf_runtime.next_periodic_callback_key;
+        self.mf_runtime.next_periodic_callback_key = key.wrapping_add(1);
+        self.mf_runtime
+            .periodic_callbacks
+            .insert(key, MfPeriodicCallback { callback, context });
+        if key_out != 0 {
+            write_guest_u32(memory, key_out, key).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `MFCancelPeriodicCallback(dwKey)` — remove a registered callback.
+    pub(crate) fn dispatch_mf_cancel_periodic_callback(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let key = guest_call_arg_u32(state, memory, 0)?;
+        let removed = self.mf_runtime.periodic_callbacks.remove(&key);
+        state.set(
+            Register::Rax,
+            u64::from(if removed.is_some() {
+                S_OK
+            } else {
+                E_INVALIDARG
+            }),
+        );
+        Ok(())
+    }
+
+    /// `MFGetSystemTime(pSystemTime)` — the 100-nanosecond interval since
+    /// 1601-01-01 (the same basis as FILETIME).
+    pub(crate) fn dispatch_mf_get_system_time(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 0)?;
+        if out != 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ticks = 116_444_736_000_000_000_u64
+                + now.as_secs().saturating_mul(10_000_000)
+                + u64::from(now.subsec_nanos()) / 100;
+            write_guest_u64(memory, out, ticks).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
     // ── Object creation exports ────────────────────────────────────────────
 
     /// `MFCreateAttributes(ppMFAttributes, cInitialSize)` — an IMFAttributes
@@ -2026,6 +2085,9 @@ impl PeHostRuntime {
                 self.dispatch_mf_require_protected_environment(state, memory)
             }
             MfGetService => self.dispatch_mf_get_service(state, memory),
+            MfAddPeriodicCallback => self.dispatch_mf_add_periodic_callback(state, memory),
+            MfCancelPeriodicCallback => self.dispatch_mf_cancel_periodic_callback(state, memory),
+            MfGetSystemTime => self.dispatch_mf_get_system_time(state, memory),
             MfCreateAttributes => self.dispatch_mf_create_attributes(state, memory),
             MfCreateMediaType => self.dispatch_mf_create_media_type(state, memory),
             MfCreateMemoryBuffer => self.dispatch_mf_create_memory_buffer(state, memory),
