@@ -4955,6 +4955,63 @@ pub enum HostThunk {
         dll: String,
         symbol: String,
     },
+    ClsidFromString,
+    StringFromClsid,
+    StringFromGuid2,
+    ProgidFromClsid,
+    ClsidFromProgid,
+    CoTaskMemAlloc,
+    CoTaskMemRealloc,
+    CoFileTimeNow,
+    CoDosDateTimeToFileTime,
+    CoAddRefServerProcess,
+    CoReleaseServerProcess,
+    CoSuspendClassObjects,
+    CoResumeClassObjects,
+    CoGetCurrentProcess,
+    CoGetApartmentType,
+    CoInitialize,
+    CoInitializeSecurity,
+    CoImpersonateClient,
+    CoRevertToSelf,
+    CoAllowSetForegroundWindow,
+    CoDisconnectObject,
+    CoLockObjectExternal,
+    CoRegisterMessageFilter,
+    CoRegisterPsClsid,
+    CoGetPsClsid,
+    CoGetTreatAsClass,
+    CoGetCallContext,
+    CoSetProxyBlanket,
+    CoCopyProxy,
+    CoLoadLibrary,
+    CoFreeLibrary,
+    CoFreeUnusedLibraries,
+    CoFreeAllLibraries,
+    DllCanUnloadNow,
+    DllRegisterServer,
+    DllUnregisterServer,
+    DllGetClassObject,
+    CoMarshalInterThreadInterfaceInStream,
+    CoGetInterfaceAndReleaseStream,
+    CreateBindCtx,
+    MkParseDisplayName,
+    OleDuplicateData,
+    OleSetMenuDescriptor,
+    CoGetClassObjectFromUrl,
+    CoGetInstanceFromFile,
+    CoGetInstanceFromIStorage,
+    CoInstall,
+    CoIsHandlerConnected,
+    SysStringByteLen,
+    SafeArrayGetDim,
+    BstrUserSize,
+    BstrUserMarshal,
+    BstrUserUnmarshal,
+    BstrUserFree,
+    LHashValOfNameSys,
+    VariantChangeTypeEx,
+    VariantCopyInd,
 }
 
 /// Outcome of one [`PeHostRuntime::get_message_pump`] iteration — the
@@ -11316,7 +11373,7 @@ impl PeHostRuntime {
     /// Format a Windows GUID struct (16 bytes, little-endian Data1/Data2/
     /// Data3 followed by the 8 Data4 bytes) as the canonical
     /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` string.
-    fn guid_bytes_to_string(bytes: &[u8; 16]) -> String {
+    pub(crate) fn guid_bytes_to_string(bytes: &[u8; 16]) -> String {
         let data1 = u32::from_le_bytes(bytes[0..4].try_into().expect("guid data1"));
         let data2 = u16::from_le_bytes(bytes[4..6].try_into().expect("guid data2"));
         let data3 = u16::from_le_bytes(bytes[6..8].try_into().expect("guid data3"));
@@ -11339,7 +11396,7 @@ impl PeHostRuntime {
     /// Parse a GUID string (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`) into
     /// the 16-byte Windows GUID struct layout; returns `None` for strings
     /// that do not follow the canonical form.
-    fn parse_guid_string(guid: &str) -> Option<[u8; 16]> {
+    pub(crate) fn parse_guid_string(guid: &str) -> Option<[u8; 16]> {
         let trimmed = guid.trim().trim_start_matches('{').trim_end_matches('}');
         let hex = trimmed.replace('-', "");
         if hex.len() != 32 {
@@ -27519,18 +27576,7 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::CoTaskMemFree => {
-                // CoTaskMemFree(pv) — release task-memory allocations.  The
-                // COM task allocator is the runtime heap: a tracked
-                // allocation is released; NULL and unknown pointers are
-                // safe no-ops (the Windows contract — CoTaskMemFree never
-                // fails and never crashes on stale pointers).
-                let pv = guest_call_arg(state, memory, 0)?;
-                if pv != 0 {
-                    self.heap_allocations.remove(&pv);
-                }
-                state.set(Register::Rax, 0);
-                self.last_error = 0;
-                self.push_trace("ole32", "CoTaskMemFree", BTreeMap::new(), json!(0));
+                self.dispatch_com_task_mem_free(state, memory)?;
             }
             HostThunk::VariantClear => {
                 let variant_ptr = guest_call_arg(state, memory, 0)?;
@@ -27711,6 +27757,178 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
+            HostThunk::ClsidFromString => {
+                self.dispatch_com_clsid_from_string(state, memory)?;
+            }
+            HostThunk::StringFromClsid => {
+                self.dispatch_com_string_from_clsid(state, memory)?;
+            }
+            HostThunk::StringFromGuid2 => {
+                self.dispatch_com_string_from_guid2(state, memory)?;
+            }
+            HostThunk::ProgidFromClsid => {
+                self.dispatch_com_progid_from_clsid(state, memory)?;
+            }
+            HostThunk::ClsidFromProgid => {
+                self.dispatch_com_clsid_from_progid(state, memory)?;
+            }
+            HostThunk::CoTaskMemAlloc => {
+                self.dispatch_com_task_mem_alloc(state, memory)?;
+            }
+            HostThunk::CoTaskMemRealloc => {
+                self.dispatch_com_task_mem_realloc(state, memory)?;
+            }
+            HostThunk::CoFileTimeNow => {
+                self.dispatch_com_file_time_now(state, memory)?;
+            }
+            HostThunk::CoDosDateTimeToFileTime => {
+                self.dispatch_com_dos_date_time_to_file_time(state, memory)?;
+            }
+            HostThunk::CoAddRefServerProcess => {
+                self.dispatch_com_add_ref_server_process(state, memory)?;
+            }
+            HostThunk::CoReleaseServerProcess => {
+                self.dispatch_com_release_server_process(state, memory)?;
+            }
+            HostThunk::CoSuspendClassObjects => {
+                self.dispatch_com_suspend_class_objects(state, memory)?;
+            }
+            HostThunk::CoResumeClassObjects => {
+                self.dispatch_com_resume_class_objects(state, memory)?;
+            }
+            HostThunk::CoGetCurrentProcess => {
+                self.dispatch_com_get_current_process(state, memory)?;
+            }
+            HostThunk::CoGetApartmentType => {
+                self.dispatch_com_get_apartment_type(state, memory)?;
+            }
+            HostThunk::CoInitialize => {
+                self.dispatch_com_initialize(state, memory)?;
+            }
+            HostThunk::CoInitializeSecurity => {
+                self.dispatch_com_initialize_security(state, memory)?;
+            }
+            HostThunk::CoImpersonateClient => {
+                self.dispatch_com_impersonate_client(state, memory)?;
+            }
+            HostThunk::CoRevertToSelf => {
+                self.dispatch_com_revert_to_self(state, memory)?;
+            }
+            HostThunk::CoAllowSetForegroundWindow => {
+                self.dispatch_com_allow_set_foreground_window(state, memory)?;
+            }
+            HostThunk::CoDisconnectObject => {
+                self.dispatch_com_disconnect_object(state, memory)?;
+            }
+            HostThunk::CoLockObjectExternal => {
+                self.dispatch_com_lock_object_external(state, memory)?;
+            }
+            HostThunk::CoRegisterMessageFilter => {
+                self.dispatch_com_register_message_filter(state, memory)?;
+            }
+            HostThunk::CoRegisterPsClsid => {
+                self.dispatch_com_register_ps_clsid(state, memory)?;
+            }
+            HostThunk::CoGetPsClsid => {
+                self.dispatch_com_get_ps_clsid(state, memory)?;
+            }
+            HostThunk::CoGetTreatAsClass => {
+                self.dispatch_com_get_treat_as_class(state, memory)?;
+            }
+            HostThunk::CoGetCallContext => {
+                self.dispatch_com_get_call_context(state, memory)?;
+            }
+            HostThunk::CoSetProxyBlanket => {
+                self.dispatch_com_set_proxy_blanket(state, memory)?;
+            }
+            HostThunk::CoCopyProxy => {
+                self.dispatch_com_copy_proxy(state, memory)?;
+            }
+            HostThunk::CoLoadLibrary => {
+                self.dispatch_com_load_library(state, memory)?;
+            }
+            HostThunk::CoFreeLibrary => {
+                self.dispatch_com_free_library(state, memory)?;
+            }
+            HostThunk::CoFreeUnusedLibraries => {
+                self.dispatch_com_free_unused_libraries(state, memory)?;
+            }
+            HostThunk::CoFreeAllLibraries => {
+                self.dispatch_com_free_all_libraries(state, memory)?;
+            }
+            HostThunk::DllCanUnloadNow => {
+                self.dispatch_com_dll_can_unload_now(state, memory)?;
+            }
+            HostThunk::DllRegisterServer => {
+                self.dispatch_com_dll_register_server(state, memory)?;
+            }
+            HostThunk::DllUnregisterServer => {
+                self.dispatch_com_dll_unregister_server(state, memory)?;
+            }
+            HostThunk::DllGetClassObject => {
+                self.dispatch_com_dll_get_class_object(state, memory)?;
+            }
+            HostThunk::CoMarshalInterThreadInterfaceInStream => {
+                self.dispatch_com_marshal_inter_thread_interface_in_stream(state, memory)?;
+            }
+            HostThunk::CoGetInterfaceAndReleaseStream => {
+                self.dispatch_com_get_interface_and_release_stream(state, memory)?;
+            }
+            HostThunk::CreateBindCtx => {
+                self.dispatch_com_create_bind_ctx(state, memory)?;
+            }
+            HostThunk::MkParseDisplayName => {
+                self.dispatch_com_mk_parse_display_name(state, memory)?;
+            }
+            HostThunk::OleDuplicateData => {
+                self.dispatch_com_ole_duplicate_data(state, memory)?;
+            }
+            HostThunk::OleSetMenuDescriptor => {
+                self.dispatch_com_ole_set_menu_descriptor(state, memory)?;
+            }
+            HostThunk::CoGetClassObjectFromUrl => {
+                self.dispatch_com_get_class_object_from_url(state, memory)?;
+            }
+            HostThunk::CoGetInstanceFromFile => {
+                self.dispatch_com_get_instance_from_file(state, memory)?;
+            }
+            HostThunk::CoGetInstanceFromIStorage => {
+                self.dispatch_com_get_instance_from_i_storage(state, memory)?;
+            }
+            HostThunk::CoInstall => {
+                self.dispatch_com_install(state, memory)?;
+            }
+            HostThunk::CoIsHandlerConnected => {
+                self.dispatch_com_is_handler_connected(state, memory)?;
+            }
+            HostThunk::SysStringByteLen => {
+                self.dispatch_com_sys_string_byte_len(state, memory)?;
+            }
+            HostThunk::SafeArrayGetDim => {
+                self.dispatch_com_safe_array_get_dim(state, memory)?;
+            }
+            HostThunk::BstrUserSize => {
+                self.dispatch_com_bstr_user_size(state, memory)?;
+            }
+            HostThunk::BstrUserMarshal => {
+                self.dispatch_com_bstr_user_marshal(state, memory)?;
+            }
+            HostThunk::BstrUserUnmarshal => {
+                self.dispatch_com_bstr_user_unmarshal(state, memory)?;
+            }
+            HostThunk::BstrUserFree => {
+                self.dispatch_com_bstr_user_free(state, memory)?;
+            }
+            HostThunk::LHashValOfNameSys => {
+                self.dispatch_com_l_hash_val_of_name_sys(state, memory)?;
+            }
+            HostThunk::VariantChangeTypeEx => {
+                self.dispatch_com_variant_change_type_ex(state, memory)?;
+            }
+            HostThunk::VariantCopyInd => {
+                self.dispatch_com_variant_copy_ind(state, memory)?;
+            }
+
             HostThunk::ComFactoryCreateInstance => {
                 let this = guest_call_arg(state, memory, 0)?;
                 let _p_unk_outer = guest_call_arg(state, memory, 1)?;
@@ -63409,6 +63627,24 @@ impl PeHostRuntime {
             GuestObjectKind::XAudio2MasteringVoice | GuestObjectKind::XAudio2SourceVoice => {
                 self.destroy_xaudio2_voice_object(address)?
             }
+            kind @ (GuestObjectKind::ComStream
+            | GuestObjectKind::ComStorage
+            | GuestObjectKind::ComStorageObject
+            | GuestObjectKind::ComDataObject
+            | GuestObjectKind::ComOleObject
+            | GuestObjectKind::ComOleInPlaceObject
+            | GuestObjectKind::ComObjectWithSite
+            | GuestObjectKind::ComServiceProvider
+            | GuestObjectKind::ComBindCtx
+            | GuestObjectKind::ComFileMoniker
+            | GuestObjectKind::ComEnumVariant
+            | GuestObjectKind::ComConnectionPoint
+            | GuestObjectKind::ComStdDispatch
+            | GuestObjectKind::ComTypeInfo
+            | GuestObjectKind::ComPropertyBag) => {
+                self.guest_objects.remove(&address);
+                let _ = kind;
+            }
             GuestObjectKind::DxgiFactory => self.destroy_dxgi_factory_object(address)?,
             GuestObjectKind::DxgiAdapter => self.destroy_dxgi_adapter_object(address)?,
             GuestObjectKind::D3d11Device => self.destroy_d3d11_device_object(address)?,
@@ -74680,6 +74916,198 @@ impl HostThunk {
             }
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoCreateGuid" => {
                 Self::CoCreateGuid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CLSIDFromString" => {
+                Self::ClsidFromString
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "StringFromCLSID" => {
+                Self::StringFromClsid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "StringFromIID" => {
+                Self::StringFromClsid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "StringFromGUID2" => {
+                Self::StringFromGuid2
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "ProgIDFromCLSID" => {
+                Self::ProgidFromClsid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CLSIDFromProgID" => {
+                Self::ClsidFromProgid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoTaskMemAlloc" => {
+                Self::CoTaskMemAlloc
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoTaskMemRealloc" => {
+                Self::CoTaskMemRealloc
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoFileTimeNow" => {
+                Self::CoFileTimeNow
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoDosDateTimeToFileTime" =>
+            {
+                Self::CoDosDateTimeToFileTime
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoAddRefServerProcess" => {
+                Self::CoAddRefServerProcess
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoReleaseServerProcess" =>
+            {
+                Self::CoReleaseServerProcess
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoSuspendClassObjects" => {
+                Self::CoSuspendClassObjects
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoResumeClassObjects" => {
+                Self::CoResumeClassObjects
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetCurrentProcess" => {
+                Self::CoGetCurrentProcess
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetApartmentType" => {
+                Self::CoGetApartmentType
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoInitialize" => {
+                Self::CoInitialize
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoInitializeSecurity" => {
+                Self::CoInitializeSecurity
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoImpersonateClient" => {
+                Self::CoImpersonateClient
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoRevertToSelf" => {
+                Self::CoRevertToSelf
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoAllowSetForegroundWindow" =>
+            {
+                Self::CoAllowSetForegroundWindow
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoDisconnectObject" => {
+                Self::CoDisconnectObject
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoLockObjectExternal" => {
+                Self::CoLockObjectExternal
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoRegisterMessageFilter" =>
+            {
+                Self::CoRegisterMessageFilter
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoRegisterPSClsid" => {
+                Self::CoRegisterPsClsid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetPSClsid" => {
+                Self::CoGetPsClsid
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetTreatAsClass" => {
+                Self::CoGetTreatAsClass
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetCallContext" => {
+                Self::CoGetCallContext
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoSetProxyBlanket" => {
+                Self::CoSetProxyBlanket
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoCopyProxy" => {
+                Self::CoCopyProxy
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoLoadLibrary" => {
+                Self::CoLoadLibrary
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoFreeLibrary" => {
+                Self::CoFreeLibrary
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoFreeUnusedLibraries" => {
+                Self::CoFreeUnusedLibraries
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoFreeAllLibraries" => {
+                Self::CoFreeAllLibraries
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoMarshalInterThreadInterfaceInStream" =>
+            {
+                Self::CoMarshalInterThreadInterfaceInStream
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoGetInterfaceAndReleaseStream" =>
+            {
+                Self::CoGetInterfaceAndReleaseStream
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateBindCtx" => {
+                Self::CreateBindCtx
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "MkParseDisplayName" => {
+                Self::MkParseDisplayName
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "OleDuplicateData" => {
+                Self::OleDuplicateData
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "OleSetMenuDescriptor" => {
+                Self::OleSetMenuDescriptor
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoGetClassObjectFromUrl" =>
+            {
+                Self::CoGetClassObjectFromUrl
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoGetInstanceFromFile" => {
+                Self::CoGetInstanceFromFile
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoGetInstanceFromIStorage" =>
+            {
+                Self::CoGetInstanceFromIStorage
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoInstall" => {
+                Self::CoInstall
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoIsHandlerConnected" => {
+                Self::CoIsHandlerConnected
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SysStringByteLen" => {
+                Self::SysStringByteLen
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SafeArrayGetDim" => {
+                Self::SafeArrayGetDim
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "BSTR_UserSize" => {
+                Self::BstrUserSize
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "BSTR_UserMarshal" => {
+                Self::BstrUserMarshal
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "BSTR_UserUnmarshal" => {
+                Self::BstrUserUnmarshal
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "BSTR_UserFree" => {
+                Self::BstrUserFree
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "LHashValOfNameSys" => {
+                Self::LHashValOfNameSys
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. })
+                if name == "VariantChangeTypeEx" =>
+            {
+                Self::VariantChangeTypeEx
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "VariantCopyInd" => {
+                Self::VariantCopyInd
             }
             ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SysAllocString" => {
                 Self::SysAllocString
@@ -119585,6 +120013,113 @@ mod tests {
         pe.extend_from_slice(&rsrc_bytes);
         pe
     }
+
+    #[test]
+    fn evidence_com_guid_string_conversions_and_task_allocator() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-com-guid");
+            let mut memory = MemoryImage::default();
+            let clsid_from_string: u64 = runtime.alloc_host_thunk(HostThunk::ClsidFromString);
+            let task_alloc: u64 = runtime.alloc_host_thunk(HostThunk::CoTaskMemAlloc);
+            let task_free: u64 = runtime.alloc_host_thunk(HostThunk::CoTaskMemFree);
+
+            let text_ptr = 0x41_000;
+            let out_ptr = 0x41_100;
+            write_utf16_fixed_buffer(
+                &mut memory,
+                text_ptr,
+                64,
+                "{12345678-1234-1234-1234-123456789ABC}",
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                clsid_from_string,
+                &[text_ptr as u32, out_ptr as u32],
+            );
+            assert_eq!(memory.read_u8(out_ptr).unwrap(), 0x78);
+            assert_eq!(memory.read_u8(out_ptr + 1).unwrap(), 0x56);
+            assert_eq!(memory.read_u8(out_ptr + 3).unwrap(), 0x12);
+
+            let ptr = dispatch_x86_thunk(&mut runtime, &mut memory, task_alloc, &[64]);
+            assert_ne!(ptr, 0);
+            assert!(runtime.com_task_allocations.contains_key(&ptr));
+            dispatch_x86_thunk(&mut runtime, &mut memory, task_free, &[ptr as u32]);
+            assert!(!runtime.com_task_allocations.contains_key(&ptr));
+        })
+    }
+
+    #[test]
+    fn evidence_com_server_lock_and_time_helpers() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-com-server");
+            let mut memory = MemoryImage::default();
+            let add_ref: u64 = runtime.alloc_host_thunk(HostThunk::CoAddRefServerProcess);
+            let release: u64 = runtime.alloc_host_thunk(HostThunk::CoReleaseServerProcess);
+            let file_time_now: u64 = runtime.alloc_host_thunk(HostThunk::CoFileTimeNow);
+
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, add_ref, &[]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, add_ref, &[]),
+                2
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release, &[]),
+                1
+            );
+
+            let ft_ptr = 0x41_200;
+            dispatch_x86_thunk(&mut runtime, &mut memory, file_time_now, &[ft_ptr as u32]);
+            let low = memory.read_u32(ft_ptr).unwrap();
+            let high = memory.read_u32(ft_ptr + 4).unwrap();
+            assert!(
+                ((high as u64) << 32 | low as u64) > 0,
+                "FILETIME must be nonzero"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_com_marshal_stream_round_trip() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-com-marshal");
+            let mut memory = MemoryImage::default();
+            let marshal: u64 =
+                runtime.alloc_host_thunk(HostThunk::CoMarshalInterThreadInterfaceInStream);
+            let unmarshal: u64 =
+                runtime.alloc_host_thunk(HostThunk::CoGetInterfaceAndReleaseStream);
+
+            let iid_ptr = 0x41_000;
+            let object = 0x42_000_u64;
+            let stream_out = 0x41_100;
+            let iface_out = 0x41_200;
+            for (index, byte) in [0x11u8, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                .iter()
+                .enumerate()
+            {
+                memory.write_u8(iid_ptr + index as u64, *byte);
+            }
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                marshal,
+                &[iid_ptr as u32, object as u32, stream_out as u32],
+            );
+            let stream = read_guest_pointer(&memory, stream_out, GuestArch::X86).unwrap();
+            assert_ne!(stream, 0);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                unmarshal,
+                &[stream as u32, 0, iface_out as u32],
+            );
+            let recovered = read_guest_pointer(&memory, iface_out, GuestArch::X86).unwrap();
+            assert_eq!(recovered, object, "the marshaled interface round-trips");
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -125888,6 +126423,9 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         100,
         0x61e0,
         &[
+            "StringFromCLSID",
+            "StringFromIID",
+            "StringFromGUID2",
             "CoGetInstanceFromFile",
             "CoGetInstanceFromIStorage",
             "CoRegisterMessageFilter",

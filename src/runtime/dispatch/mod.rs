@@ -5,4 +5,5 @@
 //! the guest scheduler) and are wired into the main `dispatch_import` match
 //! in `crate::runtime`.
 
+pub(crate) mod com;
 pub(crate) mod ntdll;

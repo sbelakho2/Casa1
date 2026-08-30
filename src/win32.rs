@@ -6397,6 +6397,17 @@ impl Win32Subsystem {
             .and_then(|thread_id| self.com_apartments.get(&thread_id).copied())
     }
 
+    /// The apartment model recorded for a guest thread (CoGetApartmentType
+    /// reads this).
+    pub fn com_apartment_for_thread(&self, thread_id: u32) -> Option<ApartmentModel> {
+        self.com_apartments.get(&thread_id).copied()
+    }
+
+    /// Record a thread's apartment model (CoInitialize/CoInitializeEx).
+    pub fn com_apartments_insert(&mut self, thread_id: u32, model: ApartmentModel) {
+        self.com_apartments.insert(thread_id, model);
+    }
+
     pub fn co_create_instance(&self, thread_handle: Handle, clsid: &str) -> AppResult<ComInstance> {
         let thread_id = self.thread_id(thread_handle)?;
         let apartment = self

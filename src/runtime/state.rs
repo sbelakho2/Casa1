@@ -52,6 +52,7 @@ impl MsvcpMtxState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // guest object kinds: constructed by the pending COM/MF surface (runtime/dispatch/com.rs)
 pub(crate) enum GuestObjectKind {
     XAudio2Engine,
     XAudio2MasteringVoice,
@@ -173,6 +174,21 @@ pub(crate) enum GuestObjectKind {
     D2d1Bitmap,
     /// ID2D1RenderTarget COM object.
     D2d1RenderTarget,
+    ComBindCtx,
+    ComConnectionPoint,
+    ComDataObject,
+    ComEnumVariant,
+    ComFileMoniker,
+    ComObjectWithSite,
+    ComOleInPlaceObject,
+    ComOleObject,
+    ComPropertyBag,
+    ComServiceProvider,
+    ComStdDispatch,
+    ComStorage,
+    ComStorageObject,
+    ComStream,
+    ComTypeInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,6 +461,105 @@ pub(crate) struct DllInfo {
 }
 
 #[allow(dead_code)] // runtime state retained for future import paths
+/// helpers and `IStorage::CreateStream`).
+#[derive(Debug, Clone)]
+pub(crate) struct ComStreamState {
+    /// The stream bytes.
+    #[allow(dead_code)] // consumed by the IStream thunks through the storage map
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) data: Vec<u8>,
+    /// Current read/write position.
+    #[allow(dead_code)] // consumed by the IStream thunks
+    pub(crate) position: u64,
+}
+
+/// State for a guest IStorage object.
+#[derive(Debug, Clone)]
+pub(crate) struct ComStorageState {
+    /// Streams inside this storage: name -> bytes.
+    #[allow(dead_code)] // consumed by the IStorage thunks
+    pub(crate) streams: HashMap<String, Vec<u8>>,
+}
+
+/// State for a guest IDataObject (drag-and-drop payload holder).
+#[derive(Debug, Clone)]
+pub(crate) struct ComDataObjectState {
+    /// Format (CF_*) -> payload bytes.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) formats: HashMap<u32, Vec<u8>>,
+}
+
+/// State for a guest IConnectionPoint (OLE sink connection point).
+#[derive(Debug, Clone)]
+pub(crate) struct ComConnectionPointState {
+    /// Sink interface pointers registered via Advise.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) sinks: Vec<u64>,
+}
+
+/// State for a guest IEnumVARIANT.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // COM/MF state (consumed by the thunk paths)
+pub(crate) struct ComEnumVariantState {
+    /// The enumerated VARIANTs (raw guest-format bytes, 16 bytes x86 /
+    /// 24 bytes x64 at dispatch time).
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) items: Vec<Vec<u8>>,
+    /// Current position.
+    pub(crate) current: usize,
+}
+
+/// State for a guest IMFByteStream.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // MF byte-stream state (consumed by the MF thunk paths)
+pub(crate) struct ImfByteStreamState {
+    /// Stream bytes.
+    pub(crate) data: Vec<u8>,
+    /// Current position.
+    pub(crate) position: u64,
+}
+
+/// State for a guest IMFMediaSink.
+#[derive(Debug, Clone)]
+pub(crate) struct ImfMediaSinkState {
+    /// Stream sinks inside the sink (name -> sink object).
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) stream_sinks: Vec<u64>,
+    /// Characteristics flags returned by GetCharacteristics.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) characteristics: u32,
+}
+
+/// State for a guest IMFAsyncResult.
+#[derive(Debug, Clone)]
+pub(crate) struct ImfAsyncResultState {
+    /// The state object (IUnknown pointer) passed at creation.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) state_object: u64,
+    /// The HRESULT status.
+    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
+    pub(crate) status: u32,
+}
+
+/// State for a guest IMFMediaSource (created by the source resolver).
+#[derive(Debug, Clone)]
+pub(crate) struct ImfMediaSourceState {
+    /// The underlying source reader the source wraps.
+    #[allow(dead_code)] // MF source-reader state (consumed by the MF thunk paths)
+    pub(crate) source_reader: u64,
+}
+
+/// The Media Foundation runtime state managed by MFStartup/MFShutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct MfRuntimeState {
+    /// Whether MFStartup has been called (and MFShutdown has not).
+    pub(crate) started: bool,
+    /// The MF_SDK_VERSION passed to MFStartup.
+    pub(crate) version: u32,
+}
+
+#[allow(dead_code)] // pending-surface state: COM/MF fields populated by runtime/dispatch/com.rs
 pub(crate) struct PeHostRuntime {
     pub(crate) audio: AudioSubsystem,
     pub(crate) win32: Win32Subsystem,
@@ -1077,6 +1192,96 @@ pub(crate) struct PeHostRuntime {
     pub(crate) icons: BTreeMap<u64, crate::icon::IconImage>,
     /// Next HICON handle value.
     pub(crate) next_icon_handle: u64,
+
+    /// The COM task allocator: allocation base -> size (CoTaskMemAlloc/
+    /// CoTaskMemRealloc/CoTaskMemFree route through it).
+    pub(crate) com_task_allocations: HashMap<u64, usize>,
+    /// The COM task allocator's running allocation pointer.
+    pub(crate) com_task_next: u64,
+    /// OID token -> (iid string, interface pointer) for in-process marshaled
+    /// interfaces (CoMarshalInterface/CoUnmarshalInterface).
+    pub(crate) com_marshal_records: HashMap<u64, (String, u64)>,
+    /// Next marshaling OID token.
+    pub(crate) com_marshal_next_oid: u64,
+    /// Guest IStream object -> stream state.
+    pub(crate) com_streams: HashMap<u64, ComStreamState>,
+    /// Guest IStorage object -> storage state.
+    pub(crate) com_storages: HashMap<u64, ComStorageState>,
+    /// Guest IDataObject -> payload state.
+    pub(crate) com_data_objects: HashMap<u64, ComDataObjectState>,
+    /// Guest IOleObject/IOleInPlaceObject -> client-site pointer.
+    pub(crate) com_ole_sites: HashMap<u64, u64>,
+    /// Guest IObjectWithSite -> site pointer.
+    pub(crate) com_object_sites: HashMap<u64, u64>,
+    /// Guest IServiceProvider -> service GUID -> object pointer.
+    pub(crate) com_service_map: HashMap<String, u64>,
+    /// Guest IConnectionPoint -> sink list.
+    pub(crate) com_connection_points: HashMap<u64, ComConnectionPointState>,
+    /// Guest IEnumVARIANT -> enumeration state.
+    pub(crate) com_enum_variants: HashMap<u64, ComEnumVariantState>,
+    /// Guest IBindCtx -> object-param name -> pointer.
+    pub(crate) com_bind_ctx_params: HashMap<u64, HashMap<String, u64>>,
+    /// Guest moniker objects (MkParseDisplayName) -> display-name string.
+    pub(crate) com_moniker_names: HashMap<u64, String>,
+    /// The process-global class-object lock count (CoAddRefServerProcess/
+    /// CoReleaseServerProcess).
+    pub(crate) com_server_lock_count: u32,
+    /// Whether class objects are suspended (CoSuspendClassObjects/
+    /// CoResumeClassObjects).
+    pub(crate) com_class_objects_suspended: bool,
+    /// The active message filter (CoRegisterMessageFilter).
+    pub(crate) com_message_filter: u64,
+    /// Objects marked disconnected by CoDisconnectObject.
+    pub(crate) com_disconnected_objects: std::collections::HashSet<u64>,
+    /// Next CoGetContextToken token value.
+    pub(crate) com_next_context_token: u32,
+    /// Registered proxy/stub CLSIDs (CoRegisterPSClsid): iid -> clsid bytes.
+    pub(crate) com_ps_clsids: HashMap<String, [u8; 16]>,
+    /// Type-library registrations (RegisterTypeLib): guid string -> path.
+    pub(crate) com_type_libraries: HashMap<String, String>,
+    /// Next connection-point cookie.
+    pub(crate) com_next_conn_cookie: u32,
+    // ──
+    /// MFStartup/MFShutdown runtime state.
+    pub(crate) mf_runtime: MfRuntimeState,
+    /// Guest IMFAttributes/IMFMediaType object -> attribute store.
+    pub(crate) mf_media_types: HashMap<u64, crate::media::ImfMediaType>,
+    /// Guest IMFMediaBuffer object -> buffer.
+    pub(crate) mf_media_buffers: HashMap<u64, crate::media::ImfMediaBuffer>,
+    /// Guest IMFSample object -> sample.
+    pub(crate) mf_samples: HashMap<u64, crate::media::ImfSample>,
+    /// Guest IMFMediaEventQueue object -> queue.
+    pub(crate) mf_event_queues: HashMap<u64, crate::media::MfEventQueue>,
+    /// Guest IMFMediaSession object -> session.
+    pub(crate) mf_sessions: HashMap<u64, crate::media::MfMediaSession>,
+    /// Guest IMFPresentationClock object -> clock.
+    pub(crate) mf_clocks: HashMap<u64, crate::media::PresentationClock>,
+    /// Guest IMFSinkWriter object -> sink writer.
+    pub(crate) mf_sink_writers: HashMap<u64, crate::media::SinkWriter>,
+    /// Guest IMFSourceReader object -> source reader.
+    pub(crate) mf_source_readers: HashMap<u64, crate::media::SourceReader>,
+    /// Guest IMFByteStream object -> byte stream state.
+    pub(crate) mf_byte_streams: HashMap<u64, ImfByteStreamState>,
+    /// Guest IMFTopology object -> topology.
+    pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
+    /// Guest IMFTopologyNode object -> topology node.
+    pub(crate) mf_topology_nodes: HashMap<u64, crate::media::TopologyNode>,
+    /// Guest IMFMediaSink object -> sink state.
+    pub(crate) mf_sinks: HashMap<u64, ImfMediaSinkState>,
+    /// Guest IMFAsyncResult object -> result state.
+    pub(crate) mf_async_results: HashMap<u64, ImfAsyncResultState>,
+    /// Guest IMFMediaSource object -> source state.
+    pub(crate) mf_media_sources: HashMap<u64, ImfMediaSourceState>,
+    /// Guest IMFMediaEvent object -> (type, status).
+    pub(crate) mf_media_events: HashMap<u64, (u32, u32)>,
+    /// Guest IMFPresentationDescriptor object -> stream count.
+    pub(crate) mf_presentation_descriptors: HashMap<u64, u32>,
+    /// Guest IMFMediaBuffer object -> locked guest pointer (Lock/Unlock).
+    pub(crate) mf_buffer_locks: HashMap<u64, u64>,
+    /// Whether CoInitializeSecurity has been called (once-only contract).
+    pub(crate) com_security_initialized: bool,
+    /// Libraries queued by CoFreeLibrary for the CoFreeUnusedLibraries sweep.
+    pub(crate) com_libraries_to_free: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -1586,6 +1791,49 @@ impl PeHostRuntime {
             com_registration_tokens: HashMap::new(),
             com_next_token: 1,
             com_apartment: None,
+            com_task_allocations: HashMap::new(),
+            com_task_next: 0x5_0000,
+            com_marshal_records: HashMap::new(),
+            com_marshal_next_oid: 1,
+            com_streams: HashMap::new(),
+            com_storages: HashMap::new(),
+            com_data_objects: HashMap::new(),
+            com_ole_sites: HashMap::new(),
+            com_object_sites: HashMap::new(),
+            com_service_map: HashMap::new(),
+            com_connection_points: HashMap::new(),
+            com_enum_variants: HashMap::new(),
+            com_bind_ctx_params: HashMap::new(),
+            com_moniker_names: HashMap::new(),
+            com_server_lock_count: 0,
+            com_class_objects_suspended: false,
+            com_message_filter: 0,
+            com_disconnected_objects: std::collections::HashSet::new(),
+            com_next_context_token: 1,
+            com_ps_clsids: HashMap::new(),
+            com_type_libraries: HashMap::new(),
+            com_next_conn_cookie: 1,
+            mf_runtime: MfRuntimeState::default(),
+            mf_media_types: HashMap::new(),
+            mf_media_buffers: HashMap::new(),
+            mf_samples: HashMap::new(),
+            mf_event_queues: HashMap::new(),
+            mf_sessions: HashMap::new(),
+            mf_clocks: HashMap::new(),
+            mf_sink_writers: HashMap::new(),
+            mf_source_readers: HashMap::new(),
+            mf_byte_streams: HashMap::new(),
+            mf_topologies: HashMap::new(),
+            mf_topology_nodes: HashMap::new(),
+            mf_sinks: HashMap::new(),
+            mf_async_results: HashMap::new(),
+            mf_media_sources: HashMap::new(),
+            mf_media_events: HashMap::new(),
+            mf_presentation_descriptors: HashMap::new(),
+            mf_buffer_locks: HashMap::new(),
+
+            com_security_initialized: false,
+            com_libraries_to_free: Vec::new(),
             ads_handles: HashMap::new(),
             xapo_manager: {
                 let mut mgr = crate::real_audio::XapoManager::new();

@@ -178,10 +178,8 @@ fn interleaved_win32_and_nt_suspend_resume_keep_counters_equal() {
                 STATUS_SUCCESS.raw()
             );
             assert_counters_equal(&session);
-            assert!(
-                session.pump_pending_guest_thread(),
-                "starts after the final resume"
-            );
+            let pumped = session.pump_pending_guest_thread();
+            assert!(pumped, "starts after the final resume");
             assert_eq!(
                 u32::from_le_bytes(session.read_guest(FLAG_PTR, 4).try_into().unwrap()),
                 1,

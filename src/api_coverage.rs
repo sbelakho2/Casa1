@@ -6219,6 +6219,77 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "waveOutWrite",
         "casa1-conformance:evidence_mid_winmmbase_device_thunks",
     ),
+    conformance(
+        "ole32.dll",
+        "CLSIDFromString",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "StringFromCLSID",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "StringFromGUID2",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "ProgIDFromCLSID",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "CLSIDFromProgID",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoTaskMemAlloc",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoTaskMemFree",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoTaskMemRealloc",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoFileTimeNow",
+        "casa1-conformance:evidence_com_server_lock_and_time_helpers",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoDosDateTimeToFileTime",
+        "casa1-conformance:evidence_com_server_lock_and_time_helpers",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoAddRefServerProcess",
+        "casa1-conformance:evidence_com_server_lock_and_time_helpers",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoReleaseServerProcess",
+        "casa1-conformance:evidence_com_server_lock_and_time_helpers",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoMarshalInterThreadInterfaceInStream",
+        "casa1-conformance:evidence_com_marshal_stream_round_trip",
+    ),
+    conformance(
+        "ole32.dll",
+        "CoGetInterfaceAndReleaseStream",
+        "casa1-conformance:evidence_com_marshal_stream_round_trip",
+    ),
+
 ];
 
 /// Evidence-ui-mm: conformance-backed rows (additive; the differential
