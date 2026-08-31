@@ -13,6 +13,16 @@ use super::unknown_preamble;
 use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MediaEventType, MfEventQueue};
 use crate::runtime::state::{ComStreamState, ImfByteStreamState};
 
+/// MFT_CATEGORY_VIDEO_DECODER {d6c02d4b-6833-45b4-971a-05a4b04bab91}
+/// (the guest little-endian byte form).
+const MFT_CATEGORY_VIDEO_DECODER: [u8; 16] = [
+    0x4b, 0x2d, 0xc0, 0xd6, 0x33, 0x68, 0xb4, 0x45, 0x97, 0x1a, 0x05, 0xa4, 0xb0, 0x4b, 0xab, 0x91,
+];
+/// CLSID_Casa1VideoDecoderMFT {c1a1d2e3-5a5a-4b4b-9a9a-001122334455}
+/// (the guest little-endian byte form).
+const MFT_CASA1_VIDEO_DECODER_CLSID: [u8; 16] = [
+    0xe3, 0xd2, 0xa1, 0xc1, 0x5a, 0x5a, 0x4b, 0x4b, 0x9a, 0x9a, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+];
 // ── Media Foundation HRESULT codes (the documented MF_E_* family) ─────────
 
 const S_OK: u32 = 0x0000_0000;
@@ -856,24 +866,746 @@ impl PeHostRuntime {
     /// `MFTEnumEx(category, flags, pInputType, pOutputType, pppMFTActivate,
     /// pnumMFTActivate)` — no third-party MFTs are registered — the
     /// documented empty enumeration.
+    /// `MFTEnumEx(category, flags, pInputType, pOutputType, pppMFTActivate,
+    /// pnumMFTActivate)` — the Casa1 Video Decoder MFT is registered in the
+    /// video-decoder category; the enumeration hands out its activation
+    /// object.
     pub(crate) fn dispatch_mf_enum_ex(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _category = guest_call_arg(state, memory, 0)?;
+        let category = guest_call_arg(state, memory, 0)?;
         let _flags = guest_call_arg_u32(state, memory, 1)?;
         let _input = guest_call_arg(state, memory, 2)?;
         let _output = guest_call_arg(state, memory, 3)?;
         let out = guest_call_arg(state, memory, 4)?;
         let count = guest_call_arg(state, memory, 5)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let category_guid = memory.read_bytes(category, 16).unwrap_or_default();
+        if category_guid != MFT_CATEGORY_VIDEO_DECODER {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            }
+            if count != 0 {
+                write_u32(memory, count, 0);
+            }
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
         }
-        if count != 0 {
-            write_u32(memory, count, 0);
+        if out == 0 || count == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mft_activate_methods())?;
+        let activate = self
+            .alloc_guest_object(memory, GuestObjectKind::MftActivate, vtable)
+            .unwrap_or(0);
+        if activate == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_activates.insert(activate, 0_u32);
+        write_guest_pointer(memory, out, activate, self.guest_arch).ok();
+        write_u32(memory, count, 1);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    // ── The MFT surface ────────────────────────────────────────────────────
+
+    /// `IMFActivate::ActivateObject(riid, ppv)` — create the transform.
+    pub(crate) fn dispatch_mf_activate_activate_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _riid = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if !self.mf_activates.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mft_transform_methods())?;
+        let transform = self
+            .alloc_guest_object(memory, GuestObjectKind::MftTransform, vtable)
+            .unwrap_or(0);
+        if transform == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_transforms
+            .insert(transform, MftTransformState::default());
+        if out != 0 {
+            write_guest_pointer(memory, out, transform, self.guest_arch).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFActivate::GetGUID(guidKey, guidValue)` — the transform CLSID.
+    pub(crate) fn dispatch_mf_activate_get_guid(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _key = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if !self.mf_activates.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if out != 0 {
+            memory.map_bytes(out, &MFT_CASA1_VIDEO_DECODER_CLSID);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFActivate::GetString(stringKey, pwszValue, cchBufSize,
+    /// pchLen)` — the friendly name.
+    pub(crate) fn dispatch_mf_activate_get_string(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _key = guest_call_arg(state, memory, 1)?;
+        let buffer = guest_call_arg(state, memory, 2)?;
+        let capacity = guest_call_arg_u32(state, memory, 3)?;
+        let length = guest_call_arg(state, memory, 4)?;
+        if !self.mf_activates.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let name = "Casa1 Video Decoder MFT";
+        let units = name.encode_utf16().count() as u32;
+        if buffer != 0 {
+            if capacity < units + 1 {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            for (i, unit) in name.encode_utf16().enumerate() {
+                write_guest_u16(memory, buffer + (i as u64 * 2), unit).ok();
+            }
+            write_guest_u16(memory, buffer + (units as u64 * 2), 0).ok();
+        }
+        if length != 0 {
+            write_guest_u32(memory, length, units).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFActivate::ShutdownObject()` — the activation is released.
+    pub(crate) fn dispatch_mf_activate_shutdown_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        self.mf_activates.remove(&this);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFActivate::GetCount(pcItems)` — the activation attribute count.
+    pub(crate) fn dispatch_mf_activate_get_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_activates.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_u32(memory, out, 1).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFActivate::GetItem(guidKey, pValue)` — the MFT_TRANSFORM_CLSID
+    /// item.
+    pub(crate) fn dispatch_mf_activate_get_item(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _key = guest_call_arg(state, memory, 1)?;
+        let value = guest_call_arg(state, memory, 2)?;
+        if !self.mf_activates.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if value != 0 {
+            write_guest_u32(memory, value, 0x2000).ok(); // VT_CLSID
+            memory.map_bytes(value + 8, &MFT_CASA1_VIDEO_DECODER_CLSID);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn mft_media_type_supported(mt: &crate::media::ImfMediaType) -> bool {
+        let Some(major) = mt.get_guid(&crate::media::MF_MT_MAJOR_TYPE) else {
+            return false;
+        };
+        if major != crate::media::MFMediaType_Video {
+            return false;
+        }
+        let Some(subtype) = mt.get_guid(&crate::media::MF_MT_SUBTYPE) else {
+            return false;
+        };
+        matches!(
+            subtype,
+            crate::media::MFVideoFormat_H264
+                | crate::media::MFVideoFormat_H265
+                | crate::media::MFVideoFormat_VP90
+                | crate::media::MFVideoFormat_WMV3
+                | crate::media::MFVideoFormat_NV12
+        )
+    }
+
+    /// `IMFTransform::GetStreamLimits(pInputMinimum, pInputMaximum,
+    /// pOutputMinimum, pOutputMaximum)` — 1/1/1/1.
+    pub(crate) fn dispatch_mf_transform_get_stream_limits(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let input_min = guest_call_arg(state, memory, 1)?;
+        let input_max = guest_call_arg(state, memory, 2)?;
+        let output_min = guest_call_arg(state, memory, 3)?;
+        let output_max = guest_call_arg(state, memory, 4)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        for (slot, value) in [
+            (input_min, 1_u32),
+            (input_max, 1),
+            (output_min, 1),
+            (output_max, 1),
+        ] {
+            if slot != 0 {
+                write_guest_u32(memory, slot, value).ok();
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetStreamCounts(pcInputStreams, pcOutputStreams)`.
+    pub(crate) fn dispatch_mf_transform_get_stream_counts(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let inputs = guest_call_arg(state, memory, 1)?;
+        let outputs = guest_call_arg(state, memory, 2)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if inputs != 0 {
+            write_guest_u32(memory, inputs, 1).ok();
+        }
+        if outputs != 0 {
+            write_guest_u32(memory, outputs, 1).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetStreamIDs(dwInputIDArraySize, pdwInputIDs,
+    /// dwOutputIDArraySize, pdwOutputIDs)`.
+    pub(crate) fn dispatch_mf_transform_get_stream_ids(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let input_size = guest_call_arg_u32(state, memory, 1)?;
+        let input_ids = guest_call_arg(state, memory, 2)?;
+        let output_size = guest_call_arg_u32(state, memory, 3)?;
+        let output_ids = guest_call_arg(state, memory, 4)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if input_size < 1 || output_size < 1 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        write_guest_u32(memory, input_ids, 0).ok();
+        write_guest_u32(memory, output_ids, 0).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetStreamInfo(dwStreamID, pStreamInfo)` — the whole
+    /// samples stream info.
+    pub(crate) fn dispatch_mf_transform_get_stream_info(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let info = guest_call_arg(state, memory, 2)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if info != 0 {
+            // MFT_STREAM_INFO: hnsMaxLatency(0), dwFlags(8),
+            // cbSize(12), cbMaxLookahead(16), cbAlignment(20),
+            // pguidMajorType(24), pguidMinorType(32), pMediaType(40).
+            write_guest_u32(memory, info + 8, 0x1).ok(); // WHOLE_SAMPLES
+            let major = self.mft_video_major_type_scratch(memory)?;
+            write_guest_pointer(memory, info + 24, major, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The guest-resident video major-type GUID.
+    fn mft_video_major_type_scratch(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let address = self.alloc_zeroed(memory, 32, 8)?;
+        let guid = crate::media::MFMediaType_Video;
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&guid.data1.to_le_bytes());
+        bytes.extend_from_slice(&guid.data2.to_le_bytes());
+        bytes.extend_from_slice(&guid.data3.to_le_bytes());
+        bytes.extend_from_slice(&guid.data4);
+        memory.map_bytes(address, &bytes);
+        Ok(address)
+    }
+
+    /// `IMFTransform::GetAttributes(pAttributes)` — the transform
+    /// attribute store.
+    pub(crate) fn dispatch_mf_transform_get_attributes(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
+        let store = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if store == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        let mut mt = crate::media::ImfMediaType::new();
+        mt.set_guid(
+            crate::media::MFT_TRANSFORM_CLSID_Attribute,
+            crate::media::Guid::new(
+                0xc1a1d2e3,
+                0x5a5a,
+                0x4b4b,
+                [0x9a, 0x9a, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            ),
+        );
+        self.mf_media_types.insert(store, mt);
+        if out != 0 {
+            write_guest_pointer(memory, out, store, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetInputAvailableType(dwStreamID, dwTypeIndex,
+    /// ppType)` — the supported video input types.
+    pub(crate) fn dispatch_mf_transform_get_input_available_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let index = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let subtypes = [
+            crate::media::MFVideoFormat_H264,
+            crate::media::MFVideoFormat_H265,
+            crate::media::MFVideoFormat_VP90,
+            crate::media::MFVideoFormat_WMV3,
+        ];
+        let Some(subtype) = subtypes.get(index as usize) else {
+            state.set(Register::Rax, 0xc00d_36d6); // MF_E_NO_MORE_TYPES
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
+        let mt_object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if mt_object == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        let mut mt = crate::media::ImfMediaType::new();
+        mt.set_guid(
+            crate::media::MF_MT_MAJOR_TYPE,
+            crate::media::MFMediaType_Video,
+        );
+        mt.set_guid(crate::media::MF_MT_SUBTYPE, *subtype);
+        self.mf_media_types.insert(mt_object, mt);
+        if out != 0 {
+            write_guest_pointer(memory, out, mt_object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetOutputAvailableType` — the NV12/RGB32 outputs.
+    pub(crate) fn dispatch_mf_transform_get_output_available_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let index = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let subtypes = [
+            crate::media::MFVideoFormat_NV12,
+            crate::media::MFVideoFormat_RGB32,
+        ];
+        let Some(subtype) = subtypes.get(index as usize) else {
+            state.set(Register::Rax, 0xc00d_36d6);
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
+        let mt_object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if mt_object == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        let mut mt = crate::media::ImfMediaType::new();
+        mt.set_guid(
+            crate::media::MF_MT_MAJOR_TYPE,
+            crate::media::MFMediaType_Video,
+        );
+        mt.set_guid(crate::media::MF_MT_SUBTYPE, *subtype);
+        self.mf_media_types.insert(mt_object, mt);
+        if out != 0 {
+            write_guest_pointer(memory, out, mt_object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetInputCurrentType(dwStreamID, ppType)` — the
+    /// negotiated type.
+    pub(crate) fn dispatch_mf_transform_get_input_current_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mft_current_type(state, memory, true)
+    }
+
+    pub(crate) fn dispatch_mf_transform_get_output_current_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mft_current_type(state, memory, false)
+    }
+
+    fn dispatch_mft_current_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        is_input: bool,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(transform) = self.mf_transforms.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let negotiated = if is_input {
+            transform.input_type.clone()
+        } else {
+            transform.output_type.clone()
+        };
+        let Some(negotiated) = negotiated else {
+            state.set(Register::Rax, 0xc00d_36d5); // MF_E_TRANSFORM_TYPE_NOT_SET
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
+        let mt_object = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if mt_object == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_media_types.insert(mt_object, negotiated);
+        if out != 0 {
+            write_guest_pointer(memory, out, mt_object, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::SetInputType(dwStreamID, pType, dwFlags)` — the
+    /// video-type negotiation.
+    pub(crate) fn dispatch_mf_transform_set_input_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let type_ptr = guest_call_arg(state, memory, 2)?;
+        let flags = guest_call_arg_u32(state, memory, 3)?;
+        let Some(transform) = self.mf_transforms.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if type_ptr == 0 {
+            transform.input_type = None;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let Some(mt) = self.mf_media_types.get(&type_ptr).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if flags & 0x2 == 0 && !Self::mft_media_type_supported(&mt) {
+            state.set(Register::Rax, 0xc00d_36b8); // MF_E_INVALIDMEDIATYPE
+            return Ok(());
+        }
+        transform.input_type = Some(mt);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::SetOutputType` — the NV12/RGB32 output negotiation.
+    pub(crate) fn dispatch_mf_transform_set_output_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let type_ptr = guest_call_arg(state, memory, 2)?;
+        let flags = guest_call_arg_u32(state, memory, 3)?;
+        let Some(transform) = self.mf_transforms.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if type_ptr == 0 {
+            transform.output_type = None;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let Some(mt) = self.mf_media_types.get(&type_ptr).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if flags & 0x2 == 0 && !Self::mft_media_type_supported(&mt) {
+            state.set(Register::Rax, 0xc00d_36b8);
+            return Ok(());
+        }
+        transform.output_type = Some(mt);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetInputStatus(dwStreamID, pdwFlags)` — accepts data
+    /// when no sample is buffered.
+    pub(crate) fn dispatch_mf_transform_get_input_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(transform) = self.mf_transforms.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if out != 0 {
+            let accepts = if transform.buffered.is_none() { 1 } else { 0 };
+            write_guest_u32(memory, out, accepts).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::GetOutputStatus(pdwFlags)` — the pending output
+    /// sample count.
+    pub(crate) fn dispatch_mf_transform_get_output_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(transform) = self.mf_transforms.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if out != 0 {
+            let pending = if transform.buffered.is_some() { 1 } else { 0 };
+            write_guest_u32(memory, out, pending).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::ProcessInput(dwInputStreamID, pSample, dwFlags)` —
+    /// buffer the input sample.
+    pub(crate) fn dispatch_mf_transform_process_input(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let sample = guest_call_arg(state, memory, 2)?;
+        let _flags = guest_call_arg_u32(state, memory, 3)?;
+        let Some(transform) = self.mf_transforms.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if transform.input_type.is_none() || transform.output_type.is_none() {
+            state.set(Register::Rax, 0xc00d_36d5); // MF_E_TRANSFORM_TYPE_NOT_SET
+            return Ok(());
+        }
+        if transform.buffered.is_some() {
+            state.set(Register::Rax, 0xc00d_36d8); // MF_E_NOTACCEPTING
+            return Ok(());
+        }
+        let Some(sample_state) = self.mf_samples.get(&sample).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        transform.buffered = Some(sample_state);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::ProcessOutput(dwFlags, cOutputBufferCount,
+    /// pOutputSamples, pdwStatus)` — produce the output sample.
+    pub(crate) fn dispatch_mf_transform_process_output(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _flags = guest_call_arg_u32(state, memory, 1)?;
+        let count = guest_call_arg_u32(state, memory, 2)?;
+        let samples = guest_call_arg(state, memory, 3)?;
+        let status_out = guest_call_arg(state, memory, 4)?;
+        let Some(transform) = self.mf_transforms.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if count == 0 || samples == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(buffered) = transform.buffered.take() else {
+            state.set(Register::Rax, 0xc00d_36d7); // MF_E_TRANSFORM_NEED_MORE_INPUT
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
+        let output = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfSample, vtable)
+            .unwrap_or(0);
+        if output == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_samples.insert(output, buffered);
+        // The MFT_OUTPUT_DATA_BUFFER: {dwStreamID(0), pSample(8),
+        // dwStatus(16), pEvents(24)}.
+        write_guest_u32(memory, samples, 0).ok();
+        write_guest_pointer(memory, samples + 8, output, self.guest_arch).ok();
+        write_guest_u32(memory, samples + 16, 0x1).ok(); // MF_SAMPLE_SAMPLE_READY
+        write_guest_pointer(memory, samples + 24, 0, self.guest_arch).ok();
+        if status_out != 0 {
+            write_guest_u32(memory, status_out, 0).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::ProcessMessage(MFT_MESSAGE_TYPE eMessage, ULONG_PTR
+    /// ulParam)` — the flush/streaming state.
+    pub(crate) fn dispatch_mf_transform_process_message(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let message = guest_call_arg_u32(state, memory, 1)?;
+        let _param = guest_call_arg(state, memory, 2)?;
+        let Some(transform) = self.mf_transforms.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        match message {
+            0x0000_0001 => {
+                // MFT_MESSAGE_COMMAND_FLUSH
+                transform.buffered = None;
+            }
+            0x0000_0002 => {
+                // MFT_MESSAGE_COMMAND_DRAIN
+                transform.streaming = true;
+            }
+            0x0000_0011 => {
+                // MFT_MESSAGE_NOTIFY_BEGIN_STREAMING
+                transform.streaming = true;
+            }
+            0x0000_0012 => {
+                // MFT_MESSAGE_NOTIFY_END_STREAMING
+                transform.streaming = false;
+            }
+            _ => {}
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The unsupported IMFTransform methods.
+    pub(crate) fn dispatch_mft_unsupported(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, 0xc00d_36c4); // MF_E_INVALID_STREAM_DATA
         Ok(())
     }
 
@@ -2390,6 +3122,43 @@ impl PeHostRuntime {
                 self.dispatch_mf_presentation_descriptor_get_stream_descriptor_count(state, memory)
             }
             MfEventGetType => self.dispatch_mf_event_get_type(state, memory),
+            MfActivateGetCount => self.dispatch_mf_activate_get_count(state, memory),
+            MfActivateGetItem => self.dispatch_mf_activate_get_item(state, memory),
+            MfActivateGetGuid => self.dispatch_mf_activate_get_guid(state, memory),
+            MfActivateGetString => self.dispatch_mf_activate_get_string(state, memory),
+            MfActivateActivateObject => self.dispatch_mf_activate_activate_object(state, memory),
+            MfActivateShutdownObject => self.dispatch_mf_activate_shutdown_object(state, memory),
+            MfTransformGetStreamLimits => {
+                self.dispatch_mf_transform_get_stream_limits(state, memory)
+            }
+            MfTransformGetStreamCounts => {
+                self.dispatch_mf_transform_get_stream_counts(state, memory)
+            }
+            MfTransformGetStreamIds => self.dispatch_mf_transform_get_stream_ids(state, memory),
+            MfTransformGetStreamInfo => self.dispatch_mf_transform_get_stream_info(state, memory),
+            MfTransformGetAttributes => self.dispatch_mf_transform_get_attributes(state, memory),
+            MfTransformGetInputAvailableType => {
+                self.dispatch_mf_transform_get_input_available_type(state, memory)
+            }
+            MfTransformGetOutputAvailableType => {
+                self.dispatch_mf_transform_get_output_available_type(state, memory)
+            }
+            MfTransformSetInputType => self.dispatch_mf_transform_set_input_type(state, memory),
+            MfTransformSetOutputType => self.dispatch_mf_transform_set_output_type(state, memory),
+            MfTransformGetInputCurrentType => {
+                self.dispatch_mf_transform_get_input_current_type(state, memory)
+            }
+            MfTransformGetOutputCurrentType => {
+                self.dispatch_mf_transform_get_output_current_type(state, memory)
+            }
+            MfTransformGetInputStatus => self.dispatch_mf_transform_get_input_status(state, memory),
+            MfTransformGetOutputStatus => {
+                self.dispatch_mf_transform_get_output_status(state, memory)
+            }
+            MfTransformProcessInput => self.dispatch_mf_transform_process_input(state, memory),
+            MfTransformProcessOutput => self.dispatch_mf_transform_process_output(state, memory),
+            MfTransformProcessMessage => self.dispatch_mf_transform_process_message(state, memory),
+            MftTransformUnsupported => self.dispatch_mft_unsupported(state, memory),
             _ => Err(AppError::new(
                 ReasonCode::RcUnimplInsn,
                 format!("unrouted MF/COM thunk {thunk:?}"),
@@ -2599,4 +3368,43 @@ fn write_guest_guid(memory: &mut MemoryImage, address: u64, guid: Guid) {
     for (index, byte) in bytes.iter().enumerate() {
         memory.write_u8(address + index as u64, *byte);
     }
+}
+
+/// The IMFActivate vtable: the IUnknown preamble + the key attribute and
+/// activation methods.
+#[allow(dead_code)] // the activation vtable builder
+fn mft_activate_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfActivateGetCount);
+    methods.push(HostThunk::MfActivateGetItem);
+    methods.push(HostThunk::MfActivateGetGuid);
+    methods.push(HostThunk::MfActivateGetString);
+    methods.push(HostThunk::MfActivateActivateObject);
+    methods.push(HostThunk::MfActivateShutdownObject);
+    methods
+}
+
+/// The IMFTransform vtable: the IUnknown preamble + the 17 transform
+/// methods.
+#[allow(dead_code)] // the transform vtable builder
+fn mft_transform_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfTransformGetStreamLimits);
+    methods.push(HostThunk::MfTransformGetStreamCounts);
+    methods.push(HostThunk::MfTransformGetStreamIds);
+    methods.push(HostThunk::MfTransformGetStreamInfo);
+    methods.push(HostThunk::MfTransformGetAttributes);
+    methods.push(HostThunk::MfTransformGetInputAvailableType);
+    methods.push(HostThunk::MfTransformGetOutputAvailableType);
+    methods.push(HostThunk::MfTransformSetInputType);
+    methods.push(HostThunk::MfTransformSetOutputType);
+    methods.push(HostThunk::MfTransformGetInputCurrentType);
+    methods.push(HostThunk::MfTransformGetOutputCurrentType);
+    methods.push(HostThunk::MfTransformGetInputStatus);
+    methods.push(HostThunk::MfTransformGetOutputStatus);
+    methods.push(HostThunk::MfTransformProcessInput);
+    methods.push(HostThunk::MfTransformProcessOutput);
+    methods.push(HostThunk::MfTransformProcessMessage);
+    methods.push(HostThunk::MftTransformUnsupported);
+    methods
 }

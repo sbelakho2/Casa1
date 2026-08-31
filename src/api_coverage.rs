@@ -6295,6 +6295,11 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_mf_startup_media_type_attributes_and_sample",
     ),
     conformance(
+        "mfplat.dll",
+        "MFTEnumEx",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    conformance(
         "mf.dll",
         "MFShutdown",
         "casa1-conformance:evidence_mf_startup_media_type_attributes_and_sample",
@@ -6351,11 +6356,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     conformance(
         "mf.dll",
-        "MFTEnumEx",
-        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
-    ),
-    conformance(
-        "mfplat.dll",
         "MFTEnumEx",
         "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
     ),
@@ -11026,6 +11026,7 @@ mod tests {
         "evidence_mscoree_clr_absent_semantics",
         "evidence_mf_source_reader_and_sink_writer_objects",
         "evidence_mf_startup_media_type_attributes_and_sample",
+        "evidence_mf_transform_pipeline",
         "evidence_ps3_crypt32_certificates",
         "evidence_ps3_ws2_buffered_io",
         "cef-unit-tests",

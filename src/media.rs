@@ -291,6 +291,22 @@ pub const MFMediaType_Audio: Guid = Guid::new(
 );
 
 // Subtype GUIDs (FOURCC-based)
+
+/// MFT_CATEGORY_VIDEO_DECODER {d6c02d4b-6833-45b4-971a-05a4b04bab91}.
+pub const MFT_CATEGORY_VIDEO_DECODER: Guid = Guid::new(
+    0xd6c02d4b,
+    0x6833,
+    0x45b4,
+    [0x97, 0x1a, 0x05, 0xa4, 0xb0, 0x4b, 0xab, 0x91],
+);
+
+/// MFT_TRANSFORM_CLSID_Attribute {7bbee931-7029-4cd5-a4bd-97f377ff87c4}.
+pub const MFT_TRANSFORM_CLSID_Attribute: Guid = Guid::new(
+    0x7bbee931,
+    0x7029,
+    0x4cd5,
+    [0xa4, 0xbd, 0x97, 0xf3, 0x77, 0xff, 0x87, 0xc4],
+);
 pub const MFVideoFormat_H264: Guid = Guid::new(
     0x34363248,
     0x0000,

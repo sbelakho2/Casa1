@@ -265,6 +265,8 @@ pub(crate) enum GuestObjectKind {
     CspKey,
     VssBackup,
     GdiPlusGraphics,
+    MftActivate,
+    MftTransform,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -664,6 +666,23 @@ pub(crate) struct LdapSessionState {
 #[allow(dead_code)] // the CSP private key is stored for the key lifecycle
 pub(crate) struct CspKeyState {
     pub(crate) private_key: Option<rsa::RsaPrivateKey>,
+}
+
+/// A Media Foundation transform (MFT) object — the audit's transform
+/// pipeline — consumed by `runtime/dispatch/mf.rs`.  The Casa1 Video
+/// Decoder is a passthrough transform: it negotiates the video media types,
+/// buffers input samples, and copies them to the output.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // the MFT state is consumed by the transform dispatch
+pub(crate) struct MftTransformState {
+    /// The negotiated input media type.
+    pub(crate) input_type: Option<crate::media::ImfMediaType>,
+    /// The negotiated output media type.
+    pub(crate) output_type: Option<crate::media::ImfMediaType>,
+    /// The buffered input sample (ProcessInput -> ProcessOutput).
+    pub(crate) buffered: Option<crate::media::ImfSample>,
+    /// Whether MFT_MESSAGE_NOTIFY_BEGIN_STREAMING has been processed.
+    pub(crate) streaming: bool,
 }
 
 /// A CNG key object (NCryptCreatePersistedKey) — consumed by
@@ -1666,6 +1685,10 @@ pub(crate) struct PeHostRuntime {
     pub(crate) msi_databases: HashMap<u64, u32>,
     /// The MSI view handles.
     pub(crate) msi_views: HashMap<u64, String>,
+    /// The Media Foundation transform objects.
+    pub(crate) mf_transforms: HashMap<u64, MftTransformState>,
+    /// The MFT activation objects (MFTEnumEx).
+    pub(crate) mf_activates: HashMap<u64, u32>,
     /// The CNG storage providers.
     pub(crate) ncrypt_providers: HashMap<u64, String>,
     /// The CNG key objects.
@@ -2302,6 +2325,8 @@ impl PeHostRuntime {
             hid_preparsed: HashMap::new(),
             msi_databases: HashMap::new(),
             msi_views: HashMap::new(),
+            mf_transforms: HashMap::new(),
+            mf_activates: HashMap::new(),
             ncrypt_providers: HashMap::new(),
             ncrypt_keys: HashMap::new(),
             rpc_bindings: HashMap::new(),
