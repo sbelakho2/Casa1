@@ -232,6 +232,15 @@ pub(crate) enum GuestObjectKind {
     TsfThreadManager,
     TsfCategoryManager,
     TsfDisplayAttributeManager,
+    LdapSession,
+    HttpRequestQueue,
+    PdhQuery,
+    EvtSession,
+    EvtLog,
+    EvtQuery,
+    EvtSubscription,
+    EvtBookmark,
+    WlanClient,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -616,6 +625,14 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) open_handles: std::collections::HashSet<u64>,
     /// Next handle value to hand out.
     pub(crate) next_handle: u64,
+}
+
+/// An LDAP session (ldap_init) — consumed by `runtime/dispatch/ldap.rs`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // the LDAP session state (host/port) is recorded on init
+pub(crate) struct LdapSessionState {
+    pub(crate) host: String,
+    pub(crate) port: u32,
 }
 
 /// A CNG key object (NCryptCreatePersistedKey) — consumed by
@@ -1632,6 +1649,20 @@ pub(crate) struct PeHostRuntime {
     pub(crate) tsf_thread_managers: Vec<u64>,
     /// Whether TF_InitSystem has run.
     pub(crate) tsf_initialized: bool,
+    /// The LDAP sessions.
+    pub(crate) ldap_sessions: HashMap<u64, LdapSessionState>,
+    /// The LDAP result messages (empty).
+    pub(crate) ldap_messages: HashMap<u64, u32>,
+    /// Whether HttpInitialize has run.
+    pub(crate) http_initialized: bool,
+    /// The HTTP request queues (queue -> registered URLs).
+    pub(crate) http_queues: HashMap<u64, Vec<String>>,
+    /// The PDH queries (query -> counter paths).
+    pub(crate) pdh_queries: HashMap<u64, Vec<String>>,
+    /// The event handles.
+    pub(crate) evt_handles: HashMap<u64, u32>,
+    /// The WLAN client handles.
+    pub(crate) wlan_clients: HashMap<u64, u32>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2221,6 +2252,13 @@ impl PeHostRuntime {
             userenv_blocks: HashMap::new(),
             tsf_thread_managers: Vec::new(),
             tsf_initialized: false,
+            ldap_sessions: HashMap::new(),
+            ldap_messages: HashMap::new(),
+            http_initialized: false,
+            http_queues: HashMap::new(),
+            pdh_queries: HashMap::new(),
+            evt_handles: HashMap::new(),
+            wlan_clients: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),

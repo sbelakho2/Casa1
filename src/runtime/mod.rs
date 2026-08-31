@@ -5247,6 +5247,53 @@ pub enum HostThunk {
     TfInitSystem,
     TfUninitSystem,
     BasicClassAddRef,
+    LdapBindS,
+    LdapCountEntries,
+    LdapFirstEntry,
+    LdapGetDn,
+    LdapGetValues,
+    LdapInit,
+    LdapMemfree,
+    LdapMsgfree,
+    LdapNextEntry,
+    LdapResult,
+    LdapSearch,
+    LdapSearchS,
+    LdapUnbind,
+    LdapValueFreeLen,
+    HttpAddUrl,
+    HttpCreateHttpHandle,
+    HttpInitialize,
+    HttpReceiveHttpRequest,
+    HttpRemoveUrl,
+    HttpSendHttpResponse,
+    HttpSendResponseEntityBody,
+    HttpTerminate,
+    HttpWaitForDisconnect,
+    PdhAddCounter,
+    PdhCloseQuery,
+    PdhCollectQueryData,
+    PdhEnumCounters,
+    PdhEnumObjects,
+    PdhGetFormattedCounterValue,
+    PdhOpenQuery,
+    PdhRemoveCounter,
+    EvtClose,
+    EvtCreateBookmark,
+    EvtNext,
+    EvtOpenLog,
+    EvtOpenSession,
+    EvtQuery,
+    EvtRender,
+    EvtSubscribe,
+    WlanCloseHandle,
+    WlanConnect,
+    WlanDisconnect,
+    WlanEnumInterfaces,
+    WlanGetAvailableNetworkList,
+    WlanOpenHandle,
+    WlanQueryInterface,
+    WlanScan,
     BasicClassGetIDsOfNames,
     BasicClassInvoke,
     BasicClassQueryInterface,
@@ -28348,6 +28395,21 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
                 self.dispatch_msvbvm(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
+                self.dispatch_ldap(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::HttpInitialize | HostThunk::HttpTerminate | HostThunk::HttpCreateHttpHandle | HostThunk::HttpAddUrl | HostThunk::HttpRemoveUrl | HostThunk::HttpReceiveHttpRequest | HostThunk::HttpSendHttpResponse | HostThunk::HttpSendResponseEntityBody | HostThunk::HttpWaitForDisconnect) => {
+                self.dispatch_httpapi(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::PdhAddCounter | HostThunk::PdhCloseQuery | HostThunk::PdhCollectQueryData | HostThunk::PdhEnumCounters | HostThunk::PdhEnumObjects | HostThunk::PdhGetFormattedCounterValue | HostThunk::PdhOpenQuery | HostThunk::PdhRemoveCounter) => {
+                self.dispatch_pdh(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::EvtClose | HostThunk::EvtCreateBookmark | HostThunk::EvtNext | HostThunk::EvtOpenLog | HostThunk::EvtOpenSession | HostThunk::EvtQuery | HostThunk::EvtRender | HostThunk::EvtSubscribe) => {
+                self.dispatch_wevtapi(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WlanCloseHandle | HostThunk::WlanConnect | HostThunk::WlanDisconnect | HostThunk::WlanEnumInterfaces | HostThunk::WlanGetAvailableNetworkList | HostThunk::WlanOpenHandle | HostThunk::WlanQueryInterface | HostThunk::WlanScan) => {
+                self.dispatch_wlanapi(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -64492,7 +64554,16 @@ impl PeHostRuntime {
             | GuestObjectKind::RpcBinding
             | GuestObjectKind::TsfThreadManager
             | GuestObjectKind::TsfCategoryManager
-            | GuestObjectKind::TsfDisplayAttributeManager => {
+            | GuestObjectKind::TsfDisplayAttributeManager
+            | GuestObjectKind::LdapSession
+            | GuestObjectKind::HttpRequestQueue
+            | GuestObjectKind::PdhQuery
+            | GuestObjectKind::EvtSession
+            | GuestObjectKind::EvtLog
+            | GuestObjectKind::EvtQuery
+            | GuestObjectKind::EvtSubscription
+            | GuestObjectKind::EvtBookmark
+            | GuestObjectKind::WlanClient => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -81837,6 +81908,161 @@ impl HostThunk {
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
                 Self::FindTextW
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_bind_s" => {
+                Self::LdapBindS
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_count_entries" => {
+                Self::LdapCountEntries
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_first_entry" => {
+                Self::LdapFirstEntry
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_get_dn" => {
+                Self::LdapGetDn
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_get_values" => {
+                Self::LdapGetValues
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_init" => {
+                Self::LdapInit
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_memfree" => {
+                Self::LdapMemfree
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_msgfree" => {
+                Self::LdapMsgfree
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_next_entry" => {
+                Self::LdapNextEntry
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_result" => {
+                Self::LdapResult
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_search" => {
+                Self::LdapSearch
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_search_s" => {
+                Self::LdapSearchS
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_unbind" => {
+                Self::LdapUnbind
+            }
+            ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_value_free_len" => {
+                Self::LdapValueFreeLen
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. }) if name == "HttpAddUrl" => {
+                Self::HttpAddUrl
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpCreateHttpHandle" =>
+            {
+                Self::HttpCreateHttpHandle
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. }) if name == "HttpInitialize" => {
+                Self::HttpInitialize
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpReceiveHttpRequest" =>
+            {
+                Self::HttpReceiveHttpRequest
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. }) if name == "HttpRemoveUrl" => {
+                Self::HttpRemoveUrl
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpSendHttpResponse" =>
+            {
+                Self::HttpSendHttpResponse
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpSendResponseEntityBody" =>
+            {
+                Self::HttpSendResponseEntityBody
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. }) if name == "HttpTerminate" => {
+                Self::HttpTerminate
+            }
+            ("httpapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpWaitForDisconnect" =>
+            {
+                Self::HttpWaitForDisconnect
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhAddCounter" => {
+                Self::PdhAddCounter
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhCloseQuery" => {
+                Self::PdhCloseQuery
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhCollectQueryData" => {
+                Self::PdhCollectQueryData
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhEnumCounters" => {
+                Self::PdhEnumCounters
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhEnumObjects" => {
+                Self::PdhEnumObjects
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. })
+                if name == "PdhGetFormattedCounterValue" =>
+            {
+                Self::PdhGetFormattedCounterValue
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhOpenQuery" => {
+                Self::PdhOpenQuery
+            }
+            ("pdh.dll", ImportSymbol::ByName { name, .. }) if name == "PdhRemoveCounter" => {
+                Self::PdhRemoveCounter
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtClose" => {
+                Self::EvtClose
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtCreateBookmark" => {
+                Self::EvtCreateBookmark
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtNext" => {
+                Self::EvtNext
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtOpenLog" => {
+                Self::EvtOpenLog
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtOpenSession" => {
+                Self::EvtOpenSession
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtQuery" => {
+                Self::EvtQuery
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtRender" => {
+                Self::EvtRender
+            }
+            ("wevtapi.dll", ImportSymbol::ByName { name, .. }) if name == "EvtSubscribe" => {
+                Self::EvtSubscribe
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanCloseHandle" => {
+                Self::WlanCloseHandle
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanConnect" => {
+                Self::WlanConnect
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanDisconnect" => {
+                Self::WlanDisconnect
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanEnumInterfaces" => {
+                Self::WlanEnumInterfaces
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "WlanGetAvailableNetworkList" =>
+            {
+                Self::WlanGetAvailableNetworkList
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanOpenHandle" => {
+                Self::WlanOpenHandle
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanQueryInterface" => {
+                Self::WlanQueryInterface
+            }
+            ("wlanapi.dll", ImportSymbol::ByName { name, .. }) if name == "WlanScan" => {
+                Self::WlanScan
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "GetOpenFileNameW" => {
                 Self::GetOpenFileNameW
@@ -124458,6 +124684,233 @@ mod tests {
                 ),
                 0x8002_0003,
                 "no members"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_ldap_http_pdh_evt_wlan_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-svc");
+            let mut memory = MemoryImage::default();
+
+            // ── wldap32 ──
+            let ldap_init: u64 = runtime.alloc_host_thunk(HostThunk::LdapInit);
+            let ldap_search_s: u64 = runtime.alloc_host_thunk(HostThunk::LdapSearchS);
+            let ldap_count: u64 = runtime.alloc_host_thunk(HostThunk::LdapCountEntries);
+            let ldap_unbind: u64 = runtime.alloc_host_thunk(HostThunk::LdapUnbind);
+            let host_ptr = 0x41_000_u64;
+            let host_wide: Vec<u16> = "localhost".encode_utf16().chain([0]).collect();
+            for (i, unit) in host_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, host_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let session = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                ldap_init,
+                &[host_ptr as u32, 389],
+            );
+            assert_ne!(session, 0);
+            let msg_out = 0x41_100_u64;
+            let message = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                ldap_search_s,
+                &[session as u32, 0, 2, 0, 0, 0, msg_out as u32],
+            );
+            assert_ne!(message, 0, "the empty search result message");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    ldap_count,
+                    &[session as u32, message as u32]
+                ),
+                0,
+                "zero entries"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ldap_unbind, &[session as u32]),
+                0
+            );
+
+            // ── httpapi ──
+            let http_init: u64 = runtime.alloc_host_thunk(HostThunk::HttpInitialize);
+            let http_handle: u64 = runtime.alloc_host_thunk(HostThunk::HttpCreateHttpHandle);
+            let http_add_url: u64 = runtime.alloc_host_thunk(HostThunk::HttpAddUrl);
+            let http_receive: u64 = runtime.alloc_host_thunk(HostThunk::HttpReceiveHttpRequest);
+            let http_term: u64 = runtime.alloc_host_thunk(HostThunk::HttpTerminate);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, http_init, &[0x0001_0000, 1, 0]),
+                0
+            );
+            let queue_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    http_handle,
+                    &[queue_out as u32, 0]
+                ),
+                0
+            );
+            let queue = read_guest_pointer(&memory, queue_out, GuestArch::X86).unwrap();
+            assert_ne!(queue, 0);
+            let url_ptr = 0x41_210_u64;
+            let url_wide: Vec<u16> = "http://+:8080/".encode_utf16().chain([0]).collect();
+            for (i, unit) in url_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, url_ptr + (i as u64 * 2), *unit).ok();
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    http_add_url,
+                    &[queue as u32, url_ptr as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.http_queues.get(&queue).unwrap().len(),
+                1,
+                "URL registered"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    http_receive,
+                    &[queue as u32, 0, 0, 0, 0, 0, 0]
+                ),
+                997,
+                "ERROR_IO_PENDING"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, http_term, &[1]),
+                0
+            );
+
+            // ── pdh ──
+            let pdh_open: u64 = runtime.alloc_host_thunk(HostThunk::PdhOpenQuery);
+            let pdh_add: u64 = runtime.alloc_host_thunk(HostThunk::PdhAddCounter);
+            let pdh_format: u64 = runtime.alloc_host_thunk(HostThunk::PdhGetFormattedCounterValue);
+            let pdh_close: u64 = runtime.alloc_host_thunk(HostThunk::PdhCloseQuery);
+            let query_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    pdh_open,
+                    &[0, 0, query_out as u32]
+                ),
+                0
+            );
+            let query = read_guest_pointer(&memory, query_out, GuestArch::X86).unwrap();
+            let counter_path = 0x41_310_u64;
+            let path_wide: Vec<u16> = "\\Server\\Processor(_Total)\\% Processor Time"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in path_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, counter_path + (i as u64 * 2), *unit).ok();
+            }
+            let counter_out = 0x41_320_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    pdh_add,
+                    &[query as u32, counter_path as u32, 0, counter_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    pdh_format,
+                    &[0x8000_0000, 0, 0x41_330, 0x41_340]
+                ),
+                0x8000_07d5,
+                "PDH_CSTATUS_NO_DATA"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, pdh_close, &[query as u32]),
+                0
+            );
+
+            // ── wevtapi ──
+            let evt_query: u64 = runtime.alloc_host_thunk(HostThunk::EvtQuery);
+            let evt_next: u64 = runtime.alloc_host_thunk(HostThunk::EvtNext);
+            let evt_close: u64 = runtime.alloc_host_thunk(HostThunk::EvtClose);
+            let evt_out = 0x41_400_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    evt_query,
+                    &[0, 0x41_410, 0x41_420, 1, evt_out as u32]
+                ),
+                0
+            );
+            let evt = read_guest_pointer(&memory, evt_out, GuestArch::X86).unwrap();
+            assert_ne!(evt, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    evt_next,
+                    &[evt as u32, 1, 0x41_430, 0, 0]
+                ),
+                259,
+                "ERROR_NO_MORE_ITEMS"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, evt_close, &[evt as u32]),
+                0
+            );
+
+            // ── wlanapi ──
+            let wlan_open: u64 = runtime.alloc_host_thunk(HostThunk::WlanOpenHandle);
+            let wlan_enum: u64 = runtime.alloc_host_thunk(HostThunk::WlanEnumInterfaces);
+            let wlan_close: u64 = runtime.alloc_host_thunk(HostThunk::WlanCloseHandle);
+            let version_out = 0x41_500_u64;
+            let client_out = 0x41_510_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wlan_open,
+                    &[2, 0, version_out as u32, client_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, version_out).unwrap(), 2);
+            let client = read_guest_pointer(&memory, client_out, GuestArch::X86).unwrap();
+            assert_ne!(client, 0);
+            let list_out = 0x41_520_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wlan_enum,
+                    &[client as u32, 0, list_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, list_out).unwrap(),
+                8,
+                "interface list header"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, list_out + 4).unwrap(),
+                0,
+                "zero interfaces"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wlan_close, &[client as u32, 0]),
+                0
             );
         })
     }
