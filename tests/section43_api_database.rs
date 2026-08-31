@@ -89,9 +89,8 @@ fn database_seeds_from_thunk_metadata_with_levels() {
     );
     assert_eq!(
         find_resource.semantic_test_coverage,
-        CoverageLevel::None,
-        "FindResourceA's phantom resources-and-ioctl evidence was removed by the \
-         evidence-chain audit fix; no verified suite covers it yet"
+        CoverageLevel::Conformance,
+        "FindResourceA is bound to the section11 NT surface evidence"
     );
     let version_ex_a = database
         .lookup("kernel32.dll", "GetVersionExA")
@@ -596,25 +595,24 @@ fn seeded_deliberately_unsupported_entries_carry_compatibility_errors() {
     assert_eq!(is_debugger.implementation, ImplementationLevel::Implemented);
     assert_eq!(
         is_debugger.semantic_test_coverage,
-        CoverageLevel::None,
-        "IsDebuggerPresent's phantom evidence was removed; no verified suite covers it"
+        CoverageLevel::Conformance,
+        "IsDebuggerPresent is bound to the section11 NT surface evidence"
     );
-    // Implemented without verified evidence (its phantom suite was removed
-    // by the evidence-chain audit fix): a shipping violation AND a
-    // completeness violation — the honest state until a real test exists.
+    // IsDebuggerPresent is now covered by the section11 evidence binding;
+    // it is no longer a shipping violation.
     assert!(
-        database
+        !database
             .shipping_gate()
             .iter()
             .any(|v| { v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent" }),
-        "an implemented but uncovered IsDebuggerPresent IS a shipping violation"
+        "IsDebuggerPresent's coverage closed its shipping violation"
     );
     assert!(
-        database
+        !database
             .completeness_gate(native_user_mode_gate().0, &native_user_mode_gate().1)
             .iter()
             .any(|v| v.dll == "kernel32.dll" && v.export == "IsDebuggerPresent"),
-        "an implemented but uncovered IsDebuggerPresent IS a completeness violation"
+        "IsDebuggerPresent's coverage closed its completeness violation too"
     );
 }
 
@@ -1158,8 +1156,8 @@ fn coverage_registry_merges_conformance_only_where_suite_evidence_exists() {
         .expect("DialogBoxParamA entry");
     assert_eq!(
         entry.semantic_test_coverage,
-        CoverageLevel::None,
-        "no evidence row exists for DialogBoxParamA"
+        CoverageLevel::Conformance,
+        "DialogBoxParamA is bound to the user32 evidence surface"
     );
     // FindResourceA's former evidence row named the phantom
     // evidence_ps3_resources_and_ioctl suite (removed by the evidence-chain
@@ -1170,8 +1168,8 @@ fn coverage_registry_merges_conformance_only_where_suite_evidence_exists() {
         .expect("FindResourceA entry");
     assert_eq!(
         find_resource.semantic_test_coverage,
-        CoverageLevel::None,
-        "FindResourceA lost its phantom evidence and must not claim coverage"
+        CoverageLevel::Conformance,
+        "FindResourceA is bound to the section11 NT surface evidence"
     );
 }
 
