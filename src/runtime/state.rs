@@ -229,6 +229,9 @@ pub(crate) enum GuestObjectKind {
     NcryptProvider,
     NcryptKey,
     RpcBinding,
+    TsfThreadManager,
+    TsfCategoryManager,
+    TsfDisplayAttributeManager,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1621,6 +1624,14 @@ pub(crate) struct PeHostRuntime {
     pub(crate) ncrypt_keys: HashMap<u64, NcryptKeyState>,
     /// The RPC binding handles.
     pub(crate) rpc_bindings: HashMap<u64, String>,
+    /// The last common-dialog error (CommDlgExtendedError).
+    pub(crate) comdlg_last_error: u32,
+    /// The userenv environment blocks.
+    pub(crate) userenv_blocks: HashMap<u64, u32>,
+    /// The TSF thread managers.
+    pub(crate) tsf_thread_managers: Vec<u64>,
+    /// Whether TF_InitSystem has run.
+    pub(crate) tsf_initialized: bool,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2206,6 +2217,10 @@ impl PeHostRuntime {
             ncrypt_providers: HashMap::new(),
             ncrypt_keys: HashMap::new(),
             rpc_bindings: HashMap::new(),
+            comdlg_last_error: 0,
+            userenv_blocks: HashMap::new(),
+            tsf_thread_managers: Vec::new(),
+            tsf_initialized: false,
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),

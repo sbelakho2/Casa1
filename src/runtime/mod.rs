@@ -5214,6 +5214,48 @@ pub enum HostThunk {
     ImmReleaseContext,
     ImmSetCompositionStringW,
     ImmSimulateHotKey,
+    GetOpenFileNameW,
+    GetSaveFileNameW,
+    ChooseColorW,
+    ChooseFontW,
+    FindTextW,
+    ReplaceTextW,
+    PageSetupDlgW,
+    PrintDlgW,
+    PrintDlgExW,
+    CommDlgExtendedError,
+    GetProfilesDirectoryW,
+    GetProfileType,
+    CreateEnvironmentBlock,
+    DestroyEnvironmentBlock,
+    LoadUserProfileW,
+    UnloadUserProfile,
+    CreateAppContainerProfile,
+    DeleteAppContainerProfile,
+    GetAppContainerProfilePath,
+    WNetAddConnection2W,
+    WNetCancelConnection2W,
+    WNetCloseEnum,
+    WNetEnumResourceW,
+    WNetGetConnectionW,
+    WNetGetUserW,
+    WNetOpenEnumW,
+    TfCreateCategoryMgr,
+    TfCreateDisplayAttributeMgr,
+    TfCreateThreadMgr,
+    TfGetThreadMgr,
+    TfInitSystem,
+    TfUninitSystem,
+    BasicClassAddRef,
+    BasicClassGetIDsOfNames,
+    BasicClassInvoke,
+    BasicClassQueryInterface,
+    BasicClassRelease,
+    BasicDispatchInvoke,
+    DllCall,
+    DllFunc,
+    DllMain,
+    DllProc,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28291,6 +28333,21 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::ImmGetCompositionStringW | HostThunk::ImmGetOpenStatus | HostThunk::ImmGetContext | HostThunk::ImmGetDefaultIMEWnd | HostThunk::ImmGetVirtualKey | HostThunk::ImmIsIME | HostThunk::ImmNotifyIME | HostThunk::ImmReleaseContext | HostThunk::ImmSetCompositionStringW | HostThunk::ImmSimulateHotKey) => {
                 self.dispatch_imm(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::GetOpenFileNameW | HostThunk::GetSaveFileNameW | HostThunk::ChooseColorW | HostThunk::ChooseFontW | HostThunk::FindTextW | HostThunk::ReplaceTextW | HostThunk::PageSetupDlgW | HostThunk::PrintDlgW | HostThunk::PrintDlgExW | HostThunk::CommDlgExtendedError) => {
+                self.dispatch_comdlg(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::GetProfilesDirectoryW | HostThunk::GetProfileType | HostThunk::CreateEnvironmentBlock | HostThunk::DestroyEnvironmentBlock | HostThunk::LoadUserProfileW | HostThunk::UnloadUserProfile | HostThunk::CreateAppContainerProfile | HostThunk::DeleteAppContainerProfile | HostThunk::GetAppContainerProfilePath) => {
+                self.dispatch_userenv(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WNetAddConnection2W | HostThunk::WNetCancelConnection2W | HostThunk::WNetCloseEnum | HostThunk::WNetEnumResourceW | HostThunk::WNetGetConnectionW | HostThunk::WNetGetUserW | HostThunk::WNetOpenEnumW) => {
+                self.dispatch_mpr(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::TfCreateCategoryMgr | HostThunk::TfCreateDisplayAttributeMgr | HostThunk::TfCreateThreadMgr | HostThunk::TfGetThreadMgr | HostThunk::TfInitSystem | HostThunk::TfUninitSystem) => {
+                self.dispatch_msctf(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
+                self.dispatch_msvbvm(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -64432,7 +64489,10 @@ impl PeHostRuntime {
             }
             GuestObjectKind::NcryptProvider
             | GuestObjectKind::NcryptKey
-            | GuestObjectKind::RpcBinding => {
+            | GuestObjectKind::RpcBinding
+            | GuestObjectKind::TsfThreadManager
+            | GuestObjectKind::TsfCategoryManager
+            | GuestObjectKind::TsfDisplayAttributeManager => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -81763,6 +81823,168 @@ impl HostThunk {
                 if name == "D3DX11SaveTextureToFileW" =>
             {
                 Self::D3dx11SaveTextureToFileW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "ChooseColorW" => {
+                Self::ChooseColorW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "ChooseFontW" => {
+                Self::ChooseFontW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CommDlgExtendedError" =>
+            {
+                Self::CommDlgExtendedError
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
+                Self::FindTextW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "GetOpenFileNameW" => {
+                Self::GetOpenFileNameW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "GetSaveFileNameW" => {
+                Self::GetSaveFileNameW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "PageSetupDlgW" => {
+                Self::PageSetupDlgW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "PrintDlgExW" => {
+                Self::PrintDlgExW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "PrintDlgW" => {
+                Self::PrintDlgW
+            }
+            ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "ReplaceTextW" => {
+                Self::ReplaceTextW
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateAppContainerProfile" =>
+            {
+                Self::CreateAppContainerProfile
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateEnvironmentBlock" =>
+            {
+                Self::CreateEnvironmentBlock
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "DeleteAppContainerProfile" =>
+            {
+                Self::DeleteAppContainerProfile
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "DestroyEnvironmentBlock" =>
+            {
+                Self::DestroyEnvironmentBlock
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetAppContainerProfilePath" =>
+            {
+                Self::GetAppContainerProfilePath
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. }) if name == "GetProfileType" => {
+                Self::GetProfileType
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetProfilesDirectoryW" =>
+            {
+                Self::GetProfilesDirectoryW
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. }) if name == "LoadUserProfileW" => {
+                Self::LoadUserProfileW
+            }
+            ("userenv.dll", ImportSymbol::ByName { name, .. }) if name == "UnloadUserProfile" => {
+                Self::UnloadUserProfile
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetAddConnection2W" => {
+                Self::WNetAddConnection2W
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetCancelConnection2W" => {
+                Self::WNetCancelConnection2W
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetCloseEnum" => {
+                Self::WNetCloseEnum
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetEnumResourceW" => {
+                Self::WNetEnumResourceW
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetGetConnectionW" => {
+                Self::WNetGetConnectionW
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetGetUserW" => {
+                Self::WNetGetUserW
+            }
+            ("mpr.dll", ImportSymbol::ByName { name, .. }) if name == "WNetOpenEnumW" => {
+                Self::WNetOpenEnumW
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "TF_CreateCategoryMgr" => {
+                Self::TfCreateCategoryMgr
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. })
+                if name == "TF_CreateDisplayAttributeMgr" =>
+            {
+                Self::TfCreateDisplayAttributeMgr
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "TF_CreateThreadMgr" => {
+                Self::TfCreateThreadMgr
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "TF_GetThreadMgr" => {
+                Self::TfGetThreadMgr
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "TF_InitSystem" => {
+                Self::TfInitSystem
+            }
+            ("msctf.dll", ImportSymbol::ByName { name, .. }) if name == "TF_UninitSystem" => {
+                Self::TfUninitSystem
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "BASIC_CLASS_AddRef" => {
+                Self::BasicClassAddRef
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. })
+                if name == "BASIC_CLASS_GetIDsOfNames" =>
+            {
+                Self::BasicClassGetIDsOfNames
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "BASIC_CLASS_Invoke" => {
+                Self::BasicClassInvoke
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. })
+                if name == "BASIC_CLASS_QueryInterface" =>
+            {
+                Self::BasicClassQueryInterface
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. })
+                if name == "BASIC_CLASS_Release" =>
+            {
+                Self::BasicClassRelease
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. })
+                if name == "BASIC_DISPINTERFACE_Invoke" =>
+            {
+                Self::BasicDispatchInvoke
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "DllCall" => {
+                Self::DllCall
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "DllFunc" => {
+                Self::DllFunc
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "DllMain" => {
+                Self::DllMain
+            }
+            ("msvbvm60.dll", ImportSymbol::ByName { name, .. }) if name == "DllProc" => {
+                Self::DllProc
             }
             ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "CLRCreateInstance" => {
                 Self::ClrCreateInstance
@@ -124090,6 +124312,152 @@ mod tests {
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, imm_release, &[0x1000, 0]),
                 1
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_dialogs_profiles_netprov_tsf_vb_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-dialog-sys");
+            let mut memory = MemoryImage::default();
+
+            // ── comdlg32: the dialog failure + error reporting ──
+            let open_file: u64 = runtime.alloc_host_thunk(HostThunk::GetOpenFileNameW);
+            let dialog_error: u64 = runtime.alloc_host_thunk(HostThunk::CommDlgExtendedError);
+            let open_struct = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, open_file, &[open_struct as u32]),
+                0,
+                "no dialog host"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, dialog_error, &[]),
+                0x0004,
+                "CDERR_INITIALIZATION"
+            );
+
+            // ── userenv: the profile directory + environment block ──
+            let profiles_dir: u64 = runtime.alloc_host_thunk(HostThunk::GetProfilesDirectoryW);
+            let create_block: u64 = runtime.alloc_host_thunk(HostThunk::CreateEnvironmentBlock);
+            let destroy_block: u64 = runtime.alloc_host_thunk(HostThunk::DestroyEnvironmentBlock);
+            let dir_out = 0x41_100_u64;
+            let dir_len = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                profiles_dir,
+                &[dir_out as u32, 512],
+            );
+            assert!(dir_len > 0);
+            let path = read_utf16_string(&memory, dir_out).unwrap();
+            assert!(!path.is_empty(), "profiles dir");
+            let block_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_block,
+                    &[block_out as u32, 0, 0]
+                ),
+                1
+            );
+            let block = read_guest_pointer(&memory, block_out, GuestArch::X86).unwrap();
+            assert_ne!(block, 0);
+            let first = read_utf16_string(&memory, block).unwrap();
+            assert!(first.contains('='), "environment entry {first}");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, destroy_block, &[block as u32]),
+                1
+            );
+
+            // ── mpr: the no-network answers ──
+            let get_connection: u64 = runtime.alloc_host_thunk(HostThunk::WNetGetConnectionW);
+            let open_enum: u64 = runtime.alloc_host_thunk(HostThunk::WNetOpenEnumW);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_connection,
+                    &[0x41_300, 0x41_310, 0x41_320]
+                ),
+                0x0248,
+                "WN_NOT_CONNECTED"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_enum,
+                    &[0, 0, 0, 0, 0x41_330]
+                ),
+                0x0249,
+                "WN_NO_NETWORK"
+            );
+
+            // ── msctf: the TSF manager round trip ──
+            let init_system: u64 = runtime.alloc_host_thunk(HostThunk::TfInitSystem);
+            let create_mgr: u64 = runtime.alloc_host_thunk(HostThunk::TfCreateThreadMgr);
+            let get_mgr: u64 = runtime.alloc_host_thunk(HostThunk::TfGetThreadMgr);
+            let create_category: u64 = runtime.alloc_host_thunk(HostThunk::TfCreateCategoryMgr);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, init_system, &[0]),
+                0
+            );
+            let mgr_out = 0x41_400_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create_mgr, &[mgr_out as u32]),
+                0
+            );
+            let manager = read_guest_pointer(&memory, mgr_out, GuestArch::X86).unwrap();
+            assert_ne!(manager, 0);
+            let fetched_out = 0x41_410_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_mgr, &[fetched_out as u32]),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, fetched_out, GuestArch::X86).unwrap(),
+                manager
+            );
+            let category_out = 0x41_420_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_category,
+                    &[category_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, category_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // ── msvbvm60: the reference-counting pair ──
+            let vb_addref: u64 = runtime.alloc_host_thunk(HostThunk::BasicClassAddRef);
+            let vb_release: u64 = runtime.alloc_host_thunk(HostThunk::BasicClassRelease);
+            let vb_invoke: u64 = runtime.alloc_host_thunk(HostThunk::BasicClassInvoke);
+            let obj = runtime
+                .alloc_guest_object(&mut memory, GuestObjectKind::ComStream, 0)
+                .unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, vb_addref, &[obj as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, vb_release, &[obj as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    vb_invoke,
+                    &[obj as u32, 0, 0, 0, 0, 0, 0, 0]
+                ),
+                0x8002_0003,
+                "no members"
             );
         })
     }
