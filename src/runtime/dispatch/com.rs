@@ -797,6 +797,453 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    // ── The interface-identity exports (ole32/oleaut32) ───────────────────
+
+    /// The interface-identity exports (IMoniker, IStream, ...): ole32
+    /// exports these as the interface's IID data; the export hands out a
+    /// guest-resident copy of the GUID and returns its pointer in EAX.
+    fn dispatch_interface_iid(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        iid: &[u8; 16],
+    ) -> AppResult<()> {
+        let slot = self.com_interface_iid_slots[0];
+        let address = if slot == 0 {
+            let address = self.alloc_zeroed(memory, 64, 8)?;
+            self.com_interface_iid_slots[0] = address;
+            address
+        } else {
+            slot
+        };
+        for (i, byte) in iid.iter().enumerate() {
+            memory.write_u8(address + i as u64, *byte);
+        }
+        state.set(Register::Rax, address);
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_ole_iid_moniker(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_storage(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_malloc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_persist(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x0c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_drop_target(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_data_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x0e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_ole_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_in_place_object(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x13, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_object_with_site(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0xa3, 0x01, 0x48, 0xfc, 0xa9, 0x2b, 0xcf, 0x11, 0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d,
+                0x73, 0x52,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_service_provider(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0xc1, 0x40, 0x51, 0x6d, 0x36, 0x74, 0xce, 0x11, 0x80, 0x34, 0x00, 0xaa, 0x00, 0x60,
+                0x09, 0xfa,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_enum_variant(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x04, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ],
+        )
+    }
+
+    pub(crate) fn dispatch_ole_iid_connection_point(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_interface_iid(
+            state,
+            memory,
+            &[
+                0x86, 0xb2, 0x96, 0xb1, 0xb4, 0xba, 0x1a, 0x10, 0xb6, 0x9c, 0x00, 0xaa, 0x00, 0x34,
+                0x1d, 0x07,
+            ],
+        )
+    }
+
+    // ── The OLE Automation remainder ───────────────────────────────────────
+
+    /// `DispGetParam(pdispparams, position, vt, pvarResult, pvtInOut)` —
+    /// extract the argument at `position` from the DISPPARAMS (the
+    /// rgvarg array is stored reversed).
+    pub(crate) fn dispatch_ole_disp_get_param(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let dispparams = guest_call_arg(state, memory, 0)?;
+        let position = guest_call_arg_u32(state, memory, 1)?;
+        let vt = guest_call_arg_u32(state, memory, 2)?;
+        let result = guest_call_arg(state, memory, 3)?;
+        let _in_out = guest_call_arg(state, memory, 4)?;
+        if dispparams == 0 || result == 0 {
+            state.set(Register::Rax, 0x8002_0008); // DISP_E_BADVARTYPE
+            return Ok(());
+        }
+        let c_args = read_guest_u32(memory, dispparams).unwrap_or(0);
+        let rgvarg = read_guest_pointer(memory, dispparams + 8, self.guest_arch).unwrap_or(0);
+        if position >= c_args || rgvarg == 0 {
+            state.set(Register::Rax, 0x8002_0004); // DISP_E_PARAMNOTFOUND
+            return Ok(());
+        }
+        // rgvarg[0] is the LAST argument; position 0 is the rightmost.
+        let index = c_args - 1 - position;
+        let variant = rgvarg + (index as u64 * 24);
+        let source_vt = read_guest_u32(memory, variant).unwrap_or(0);
+        let source_value = read_guest_pointer(memory, variant + 8, self.guest_arch).unwrap_or(0);
+        match (vt, source_vt) {
+            (2, 2) => {
+                // VT_I4 -> VT_I4
+                write_guest_u32(memory, result + 8, source_value as u32).ok();
+            }
+            (2, 3) => {
+                // VT_I4 <- VT_I2
+                write_guest_u32(memory, result + 8, (source_value as i16) as i32 as u32).ok();
+            }
+            (3, 2) => {
+                // VT_I2 <- VT_I4
+                write_guest_u32(
+                    memory,
+                    result + 8,
+                    (source_value as i32 as i16) as u16 as u32,
+                )
+                .ok();
+            }
+            (11, 2) => {
+                // VT_BOOL <- VT_I4
+                write_guest_u32(
+                    memory,
+                    result + 8,
+                    if source_value != 0 { 0xffff } else { 0 },
+                )
+                .ok();
+            }
+            (3, 3) => {
+                write_guest_u32(memory, result + 8, source_value as u32).ok();
+            }
+            _ => {
+                state.set(Register::Rax, 0x8002_0008);
+                return Ok(());
+            }
+        }
+        write_guest_u32(memory, result, vt).ok();
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    /// `DispGetIDsOfNames` — no typeinfo is registered: every name is
+    /// unknown.
+    pub(crate) fn dispatch_ole_disp_get_ids_of_names(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _dispatch = guest_call_arg(state, memory, 0)?;
+        let _riid = guest_call_arg(state, memory, 1)?;
+        let _names = guest_call_arg(state, memory, 2)?;
+        let count = guest_call_arg_u32(state, memory, 3)?;
+        let ids = guest_call_arg(state, memory, 4)?;
+        let _flags = guest_call_arg_u32(state, memory, 5)?;
+        for i in 0..count {
+            write_guest_u32(memory, ids + (i as u64 * 4), 0xffff_ffff).ok();
+        }
+        state.set(Register::Rax, 0x8002_0006); // DISP_E_UNKNOWNNAME
+        Ok(())
+    }
+
+    /// `DispInvoke` — no members are registered.
+    pub(crate) fn dispatch_ole_disp_invoke(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _dispatch = guest_call_arg(state, memory, 0)?;
+        let _dispid = guest_call_arg_u32(state, memory, 1)?;
+        let _riid = guest_call_arg(state, memory, 2)?;
+        let _lcid = guest_call_arg_u32(state, memory, 3)?;
+        let _flags = guest_call_arg_u32(state, memory, 4)?;
+        let _params = guest_call_arg(state, memory, 5)?;
+        let result = guest_call_arg(state, memory, 6)?;
+        if result != 0 {
+            write_guest_u32(memory, result, 0).ok();
+        }
+        state.set(Register::Rax, 0x8002_0003); // DISP_E_MEMBERNOTFOUND
+        Ok(())
+    }
+
+    /// `CreateDispTypeInfo` — the typeinfo format is not supported.
+    pub(crate) fn dispatch_ole_create_disp_type_info(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _type_desc = guest_call_arg(state, memory, 0)?;
+        let _iid = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0x8002_9c83); // TYPE_E_UNSUPFORMAT
+        Ok(())
+    }
+
+    /// `CreateStdDispatch` — no typeinfo support.
+    pub(crate) fn dispatch_ole_create_std_dispatch(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _outer = guest_call_arg(state, memory, 0)?;
+        let _unk = guest_call_arg(state, memory, 1)?;
+        let _type_info = guest_call_arg(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0x8002_9c83); // TYPE_E_UNSUPFORMAT
+        Ok(())
+    }
+
+    /// `LoadTypeLib` / `LoadRegTypeLib` — no typelib can be loaded.
+    pub(crate) fn dispatch_ole_load_type_lib(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _file = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0x8002_9c4a); // TYPE_E_CANTLOADLIBRARY
+        Ok(())
+    }
+
+    /// `RegisterTypeLib` / `UnRegisterTypeLib` / `QueryPathOfRegTypeLib` —
+    /// no registry access.
+    pub(crate) fn dispatch_ole_typelib_registry(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _type_lib = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0x8002_9c40); // TYPE_E_REGISTRYACCESS
+        Ok(())
+    }
+
+    /// Route the ole32/oleaut32 interface-identity and OLE-Automation
+    /// remainder thunks.
+    pub(crate) fn dispatch_com_ole_extra(
+        &mut self,
+        thunk: &HostThunk,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        match thunk {
+            HostThunk::OleIidMoniker => self.dispatch_ole_iid_moniker(state, memory),
+            HostThunk::OleIidStream => self.dispatch_ole_iid_stream(state, memory),
+            HostThunk::OleIidStorage => self.dispatch_ole_iid_storage(state, memory),
+            HostThunk::OleIidMalloc => self.dispatch_ole_iid_malloc(state, memory),
+            HostThunk::OleIidPersist => self.dispatch_ole_iid_persist(state, memory),
+            HostThunk::OleIidDropTarget => self.dispatch_ole_iid_drop_target(state, memory),
+            HostThunk::OleIidDataObject => self.dispatch_ole_iid_data_object(state, memory),
+            HostThunk::OleIidOleObject => self.dispatch_ole_iid_ole_object(state, memory),
+            HostThunk::OleIidInPlaceObject => self.dispatch_ole_iid_in_place_object(state, memory),
+            HostThunk::OleIidObjectWithSite => {
+                self.dispatch_ole_iid_object_with_site(state, memory)
+            }
+            HostThunk::OleIidServiceProvider => {
+                self.dispatch_ole_iid_service_provider(state, memory)
+            }
+            HostThunk::OleIidEnumVariant => self.dispatch_ole_iid_enum_variant(state, memory),
+            HostThunk::OleIidConnectionPoint => {
+                self.dispatch_ole_iid_connection_point(state, memory)
+            }
+            HostThunk::OleDispGetParam => self.dispatch_ole_disp_get_param(state, memory),
+            HostThunk::OleDispGetIdsOfNames => {
+                self.dispatch_ole_disp_get_ids_of_names(state, memory)
+            }
+            HostThunk::OleDispInvoke => self.dispatch_ole_disp_invoke(state, memory),
+            HostThunk::OleCreateDispTypeInfo => {
+                self.dispatch_ole_create_disp_type_info(state, memory)
+            }
+            HostThunk::OleCreateStdDispatch => self.dispatch_ole_create_std_dispatch(state, memory),
+            HostThunk::OleLoadTypeLib | HostThunk::OleLoadRegTypeLib => {
+                self.dispatch_ole_load_type_lib(state, memory)
+            }
+            HostThunk::OleRegisterTypeLib
+            | HostThunk::OleUnRegisterTypeLib
+            | HostThunk::OleQueryPathOfRegTypeLib => {
+                self.dispatch_ole_typelib_registry(state, memory)
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("unrouted OLE-extra thunk {thunk:?}"),
+            )),
+        }
+    }
+
     // ── Stream marshaling ───────────────────────────────────────────────────
 
     /// `CoMarshalInterThreadInterfaceInStream(riid, pUnk, ppStm)` — mints a

@@ -5065,6 +5065,109 @@ pub enum HostThunk {
     D3dx11LoadTextureFromTexture,
     D3dx11SaveTextureToFileW,
     D3dx11SaveTextureToMemory,
+    IsAppThemed,
+    IsThemeActive,
+    OpenThemeData,
+    CloseThemeData,
+    SetWindowTheme,
+    GetThemeColor,
+    GetThemeSysColor,
+    GetThemeSysFont,
+    GetThemePartSize,
+    GetThemeBackgroundContentRect,
+    GetThemeTextExtent,
+    GetThemeFont,
+    DrawThemeBackground,
+    DrawThemeText,
+    EnableThemeDialogTexture,
+    BufferedPaintInit,
+    BufferedPaintUnInit,
+    BeginBufferedPaint,
+    EndBufferedPaint,
+    BeginPanningFeedback,
+    EndPanningFeedback,
+    ImagehlpApiVersion,
+    MapAndLoad,
+    ImageLoad,
+    UnMapAndLoad,
+    ImageUnload,
+    BindImage,
+    BindImageEx,
+    CheckSumMappedFile,
+    ImageGetDigestStream,
+    ImageEnumerateCertificates,
+    ImageGetCertificateHeader,
+    ImageGetCertificateData,
+    ImageAddCertificate,
+    ImageRemoveCertificate,
+    HidDGetHidGuid,
+    HidDGetAttributes,
+    HidDGetProductString,
+    HidDGetManufacturerString,
+    HidDGetPreparsedData,
+    HidDFreePreparsedData,
+    HidPGetCaps,
+    HidPGetButtonCaps,
+    HidPGetValueCaps,
+    HidPGetUsageValue,
+    HidPGetUsages,
+    HidPSetUsages,
+    AcmDriverClose,
+    AcmDriverEnum,
+    AcmDriverMessage,
+    AcmDriverOpen,
+    AcmFormatDetails,
+    AcmFormatDetailsW,
+    AcmFormatEnum,
+    AcmFormatEnumW,
+    AcmFormatSuggest,
+    AcmMetrics,
+    AcmStreamClose,
+    AcmStreamConvert,
+    AcmStreamOpen,
+    AcmStreamSize,
+    MsiCloseAllHandles,
+    MsiCloseHandle,
+    MsiConfigureProductW,
+    MsiDatabaseOpenViewW,
+    MsiEnumProductsW,
+    MsiGetProductInfoW,
+    MsiGetPropertyW,
+    MsiInstallProductW,
+    MsiOpenDatabaseW,
+    MsiOpenPackageW,
+    MsiQueryProductInfoW,
+    MsiRecordDataSize,
+    MsiRecordGetStringW,
+    MsiRecordSetStringW,
+    MsiReinstallProductW,
+    MsiSetPropertyW,
+    MsiViewClose,
+    MsiViewExecute,
+    MsiViewFetch,
+    OleIidMoniker,
+    OleIidStream,
+    OleIidStorage,
+    OleIidMalloc,
+    OleIidPersist,
+    OleIidDropTarget,
+    OleIidDataObject,
+    OleIidOleObject,
+    OleIidInPlaceObject,
+    OleIidObjectWithSite,
+    OleIidServiceProvider,
+    OleIidEnumVariant,
+    OleIidConnectionPoint,
+    OleDispGetParam,
+    OleDispGetIdsOfNames,
+    OleDispInvoke,
+    OleCreateDispTypeInfo,
+    OleCreateStdDispatch,
+    OleLoadTypeLib,
+    OleLoadRegTypeLib,
+    OleQueryPathOfRegTypeLib,
+    OleRegisterTypeLib,
+    OleUnRegisterTypeLib,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28112,6 +28215,24 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::DirectDrawCreate | HostThunk::DirectDrawCreateEx | HostThunk::DirectDrawEnumerateW | HostThunk::DirectDrawEnumerateExW | HostThunk::DirectDrawGetCaps | HostThunk::DirectDrawSetCooperativeLevel | HostThunk::DirectDrawSetDisplayMode | HostThunk::DirectDrawCreateSurface | HostThunk::DirectDrawEnumSurfaces | HostThunk::DirectDrawGetVerticalBlankStatus | HostThunk::DirectDrawSurfaceBlt | HostThunk::DirectDrawSurfaceFlip | HostThunk::DirectDrawSurfaceLock | HostThunk::DirectDrawSurfaceUnlock | HostThunk::DirectDrawSurfaceGetSurfaceDesc | HostThunk::D3dPerfBeginEvent | HostThunk::D3dPerfEndEvent | HostThunk::D3dPerfGetStatus | HostThunk::D3dPerfQueryRepeatFrame | HostThunk::D3dPerfSetMarker | HostThunk::D3dPerfSetOptions | HostThunk::DebugSetLevel | HostThunk::DebugSetMute | HostThunk::D3d10CreateDevice | HostThunk::D3d10CreateDeviceAndSwapChain | HostThunk::D3d10CoreCreateDevice | HostThunk::D3d10CoreCreateLayeredDevice | HostThunk::D3d10CoreGetSupportedVersions | HostThunk::D3d10CoreRegisterLayers | HostThunk::D3d10Level9CreateDevice | HostThunk::D3d10Level9GetSupportedVersions | HostThunk::D3d10CreateEffectFromMemory | HostThunk::D3d10CreateStateBlock | HostThunk::D3dCreateBlob | HostThunk::D3dBlobGetBufferPointer | HostThunk::D3dBlobGetBufferSize | HostThunk::D3dCompile | HostThunk::D3dCompile2 | HostThunk::D3dCompileFromFile | HostThunk::D3dDisassemble | HostThunk::D3dGetBlobPart | HostThunk::D3dGetTraceInstructionOffsets | HostThunk::D3dLoadModule | HostThunk::D3dReflect | HostThunk::D3dSetBlobPart | HostThunk::D3dSetTraceInstructionOffsets | HostThunk::D3dStripShader | HostThunk::D3dCreateLinker | HostThunk::D3dx11CompileFromFile | HostThunk::D3dx11CompileFromFileW | HostThunk::D3dx11CreateAsyncShaderResourceViewProcessor | HostThunk::D3dx11CreateShaderResourceViewFromFile | HostThunk::D3dx11CreateShaderResourceViewFromFileW | HostThunk::D3dx11CreateTextureFromFileW | HostThunk::D3dx11CreateTextureFromMemory | HostThunk::D3dx11FilterTexture | HostThunk::D3dx11GetImageInfoFromFile | HostThunk::D3dx11GetImageInfoFromFileW | HostThunk::D3dx11LoadTextureFromTexture | HostThunk::D3dx11SaveTextureToFileW | HostThunk::D3dx11SaveTextureToMemory) => {
                 self.dispatch_legacy_gfx(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::IsAppThemed | HostThunk::IsThemeActive | HostThunk::OpenThemeData | HostThunk::CloseThemeData | HostThunk::SetWindowTheme | HostThunk::GetThemeColor | HostThunk::GetThemeSysColor | HostThunk::GetThemeSysFont | HostThunk::GetThemePartSize | HostThunk::GetThemeBackgroundContentRect | HostThunk::GetThemeTextExtent | HostThunk::GetThemeFont | HostThunk::DrawThemeBackground | HostThunk::DrawThemeText | HostThunk::EnableThemeDialogTexture | HostThunk::BufferedPaintInit | HostThunk::BufferedPaintUnInit | HostThunk::BeginBufferedPaint | HostThunk::EndBufferedPaint | HostThunk::BeginPanningFeedback | HostThunk::EndPanningFeedback) => {
+                self.dispatch_theme(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::ImagehlpApiVersion | HostThunk::MapAndLoad | HostThunk::ImageLoad | HostThunk::UnMapAndLoad | HostThunk::ImageUnload | HostThunk::BindImage | HostThunk::BindImageEx | HostThunk::CheckSumMappedFile | HostThunk::ImageGetDigestStream | HostThunk::ImageEnumerateCertificates | HostThunk::ImageGetCertificateHeader | HostThunk::ImageGetCertificateData | HostThunk::ImageAddCertificate | HostThunk::ImageRemoveCertificate) => {
+                self.dispatch_imagehlp(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::HidDGetHidGuid | HostThunk::HidDGetAttributes | HostThunk::HidDGetProductString | HostThunk::HidDGetManufacturerString | HostThunk::HidDGetPreparsedData | HostThunk::HidDFreePreparsedData | HostThunk::HidPGetCaps | HostThunk::HidPGetButtonCaps | HostThunk::HidPGetValueCaps | HostThunk::HidPGetUsageValue | HostThunk::HidPGetUsages | HostThunk::HidPSetUsages) => {
+                self.dispatch_hid(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::AcmDriverClose | HostThunk::AcmDriverEnum | HostThunk::AcmDriverMessage | HostThunk::AcmDriverOpen | HostThunk::AcmFormatDetails | HostThunk::AcmFormatDetailsW | HostThunk::AcmFormatEnum | HostThunk::AcmFormatEnumW | HostThunk::AcmFormatSuggest | HostThunk::AcmMetrics | HostThunk::AcmStreamClose | HostThunk::AcmStreamConvert | HostThunk::AcmStreamOpen | HostThunk::AcmStreamSize) => {
+                self.dispatch_acm(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::MsiCloseAllHandles | HostThunk::MsiCloseHandle | HostThunk::MsiConfigureProductW | HostThunk::MsiDatabaseOpenViewW | HostThunk::MsiEnumProductsW | HostThunk::MsiGetProductInfoW | HostThunk::MsiGetPropertyW | HostThunk::MsiInstallProductW | HostThunk::MsiOpenDatabaseW | HostThunk::MsiOpenPackageW | HostThunk::MsiQueryProductInfoW | HostThunk::MsiRecordDataSize | HostThunk::MsiRecordGetStringW | HostThunk::MsiRecordSetStringW | HostThunk::MsiReinstallProductW | HostThunk::MsiSetPropertyW | HostThunk::MsiViewClose | HostThunk::MsiViewExecute | HostThunk::MsiViewFetch) => {
+                self.dispatch_msi(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::OleIidMoniker | HostThunk::OleIidStream | HostThunk::OleIidStorage | HostThunk::OleIidMalloc | HostThunk::OleIidPersist | HostThunk::OleIidDropTarget | HostThunk::OleIidDataObject | HostThunk::OleIidOleObject | HostThunk::OleIidInPlaceObject | HostThunk::OleIidObjectWithSite | HostThunk::OleIidServiceProvider | HostThunk::OleIidEnumVariant | HostThunk::OleIidConnectionPoint | HostThunk::OleDispGetParam | HostThunk::OleDispGetIdsOfNames | HostThunk::OleDispInvoke | HostThunk::OleCreateDispTypeInfo | HostThunk::OleCreateStdDispatch | HostThunk::OleLoadTypeLib | HostThunk::OleLoadRegTypeLib | HostThunk::OleQueryPathOfRegTypeLib | HostThunk::OleRegisterTypeLib | HostThunk::OleUnRegisterTypeLib) => {
+                self.dispatch_com_ole_extra(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -64035,7 +64156,10 @@ impl PeHostRuntime {
             | GuestObjectKind::WicComponentInfo
             | GuestObjectKind::DirectDraw7
             | GuestObjectKind::DirectDrawSurface
-            | GuestObjectKind::D3dBlob) => {
+            | GuestObjectKind::D3dBlob
+            | GuestObjectKind::Theme
+            | GuestObjectKind::MsiDatabase
+            | GuestObjectKind::MsiView) => {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
@@ -80778,6 +80902,358 @@ impl HostThunk {
                 if name == "MFCreateDXGIDeviceManager" =>
             {
                 Self::MfCreateDxgiDeviceManager
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "BeginBufferedPaint" => {
+                Self::BeginBufferedPaint
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. })
+                if name == "BeginPanningFeedback" =>
+            {
+                Self::BeginPanningFeedback
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "BufferedPaintInit" => {
+                Self::BufferedPaintInit
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "BufferedPaintUnInit" => {
+                Self::BufferedPaintUnInit
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "CloseThemeData" => {
+                Self::CloseThemeData
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "DrawThemeBackground" => {
+                Self::DrawThemeBackground
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "DrawThemeText" => {
+                Self::DrawThemeText
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. })
+                if name == "EnableThemeDialogTexture" =>
+            {
+                Self::EnableThemeDialogTexture
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "EndBufferedPaint" => {
+                Self::EndBufferedPaint
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetThemeBackgroundContentRect" =>
+            {
+                Self::GetThemeBackgroundContentRect
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemeColor" => {
+                Self::GetThemeColor
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemeFont" => {
+                Self::GetThemeFont
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemePartSize" => {
+                Self::GetThemePartSize
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemeSysColor" => {
+                Self::GetThemeSysColor
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemeSysFont" => {
+                Self::GetThemeSysFont
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "GetThemeTextExtent" => {
+                Self::GetThemeTextExtent
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "IsAppThemed" => {
+                Self::IsAppThemed
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "IsThemeActive" => {
+                Self::IsThemeActive
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "OpenThemeData" => {
+                Self::OpenThemeData
+            }
+            ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "SetWindowTheme" => {
+                Self::SetWindowTheme
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "BindImage" => {
+                Self::BindImage
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "BindImageEx" => {
+                Self::BindImageEx
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "CheckSumMappedFile" => {
+                Self::CheckSumMappedFile
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageAddCertificate" =>
+            {
+                Self::ImageAddCertificate
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageEnumerateCertificates" =>
+            {
+                Self::ImageEnumerateCertificates
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageGetCertificateData" =>
+            {
+                Self::ImageGetCertificateData
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageGetCertificateHeader" =>
+            {
+                Self::ImageGetCertificateHeader
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageGetDigestStream" =>
+            {
+                Self::ImageGetDigestStream
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "ImageLoad" => {
+                Self::ImageLoad
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageRemoveCertificate" =>
+            {
+                Self::ImageRemoveCertificate
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "ImageUnload" => {
+                Self::ImageUnload
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "ImagehlpApiVersion" => {
+                Self::ImagehlpApiVersion
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "MapAndLoad" => {
+                Self::MapAndLoad
+            }
+            ("imagehlp.dll", ImportSymbol::ByName { name, .. }) if name == "UnMapAndLoad" => {
+                Self::UnMapAndLoad
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidD_FreePreparsedData" => {
+                Self::HidDFreePreparsedData
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidD_GetAttributes" => {
+                Self::HidDGetAttributes
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidD_GetHidGuid" => {
+                Self::HidDGetHidGuid
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. })
+                if name == "HidD_GetManufacturerString" =>
+            {
+                Self::HidDGetManufacturerString
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidD_GetPreparsedData" => {
+                Self::HidDGetPreparsedData
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidD_GetProductString" => {
+                Self::HidDGetProductString
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_GetButtonCaps" => {
+                Self::HidPGetButtonCaps
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_GetCaps" => {
+                Self::HidPGetCaps
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_GetUsageValue" => {
+                Self::HidPGetUsageValue
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_GetUsages" => {
+                Self::HidPGetUsages
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_GetValueCaps" => {
+                Self::HidPGetValueCaps
+            }
+            ("hid.dll", ImportSymbol::ByName { name, .. }) if name == "HidP_SetUsages" => {
+                Self::HidPSetUsages
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmDriverClose" => {
+                Self::AcmDriverClose
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmDriverEnum" => {
+                Self::AcmDriverEnum
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmDriverOpen" => {
+                Self::AcmDriverOpen
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmFormatDetailsW" => {
+                Self::AcmFormatDetailsW
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmFormatEnumW" => {
+                Self::AcmFormatEnumW
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmFormatSuggest" => {
+                Self::AcmFormatSuggest
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmMetrics" => {
+                Self::AcmMetrics
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmStreamClose" => {
+                Self::AcmStreamClose
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmStreamConvert" => {
+                Self::AcmStreamConvert
+            }
+            ("msacm32.dll", ImportSymbol::ByName { name, .. }) if name == "acmStreamOpen" => {
+                Self::AcmStreamOpen
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmDriverClose" => {
+                Self::AcmDriverClose
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmDriverEnum" => {
+                Self::AcmDriverEnum
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmDriverMessage" => {
+                Self::AcmDriverMessage
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmDriverOpen" => {
+                Self::AcmDriverOpen
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmFormatDetails" => {
+                Self::AcmFormatDetails
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmFormatEnum" => {
+                Self::AcmFormatEnum
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmFormatSuggest" => {
+                Self::AcmFormatSuggest
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmMetrics" => {
+                Self::AcmMetrics
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmStreamClose" => {
+                Self::AcmStreamClose
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmStreamConvert" => {
+                Self::AcmStreamConvert
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmStreamOpen" => {
+                Self::AcmStreamOpen
+            }
+            ("msacm32.drv", ImportSymbol::ByName { name, .. }) if name == "acmStreamSize" => {
+                Self::AcmStreamSize
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiCloseAllHandles" => {
+                Self::MsiCloseAllHandles
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiCloseHandle" => {
+                Self::MsiCloseHandle
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiConfigureProductW" => {
+                Self::MsiConfigureProductW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiDatabaseOpenViewW" => {
+                Self::MsiDatabaseOpenViewW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiEnumProductsW" => {
+                Self::MsiEnumProductsW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiGetProductInfoW" => {
+                Self::MsiGetProductInfoW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiGetPropertyW" => {
+                Self::MsiGetPropertyW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiInstallProductW" => {
+                Self::MsiInstallProductW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiOpenDatabaseW" => {
+                Self::MsiOpenDatabaseW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiOpenPackageW" => {
+                Self::MsiOpenPackageW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiQueryProductInfoW" => {
+                Self::MsiQueryProductInfoW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordDataSize" => {
+                Self::MsiRecordDataSize
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordGetStringW" => {
+                Self::MsiRecordGetStringW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiRecordSetStringW" => {
+                Self::MsiRecordSetStringW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiReinstallProductW" => {
+                Self::MsiReinstallProductW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiSetPropertyW" => {
+                Self::MsiSetPropertyW
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewClose" => {
+                Self::MsiViewClose
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewExecute" => {
+                Self::MsiViewExecute
+            }
+            ("msi.dll", ImportSymbol::ByName { name, .. }) if name == "MsiViewFetch" => {
+                Self::MsiViewFetch
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IMoniker" => {
+                Self::OleIidMoniker
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IPersist" => {
+                Self::OleIidPersist
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IStream" => {
+                Self::OleIidStream
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IStorage" => {
+                Self::OleIidStorage
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IMalloc" => {
+                Self::OleIidMalloc
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IDropTarget" => {
+                Self::OleIidDropTarget
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IDataObject" => {
+                Self::OleIidDataObject
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IOleObject" => {
+                Self::OleIidOleObject
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IOleInPlaceObject" => {
+                Self::OleIidInPlaceObject
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IObjectWithSite" => {
+                Self::OleIidObjectWithSite
+            }
+            ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "IServiceProvider" => {
+                Self::OleIidServiceProvider
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateDispTypeInfo" => {
+                Self::OleCreateDispTypeInfo
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateStdDispatch" => {
+                Self::OleCreateStdDispatch
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "DispGetIDsOfNames" => {
+                Self::OleDispGetIdsOfNames
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "DispGetParam" => {
+                Self::OleDispGetParam
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "DispInvoke" => {
+                Self::OleDispInvoke
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadRegTypeLib" => {
+                Self::OleLoadRegTypeLib
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadTypeLib" => {
+                Self::OleLoadTypeLib
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. })
+                if name == "QueryPathOfRegTypeLib" =>
+            {
+                Self::OleQueryPathOfRegTypeLib
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "RegisterTypeLib" => {
+                Self::OleRegisterTypeLib
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "UnRegisterTypeLib" => {
+                Self::OleUnRegisterTypeLib
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "IEnumVARIANT" => {
+                Self::OleIidEnumVariant
+            }
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "IConnectionPoint" => {
+                Self::OleIidConnectionPoint
             }
             ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DirectDrawCreate" => {
                 Self::DirectDrawCreate
@@ -122849,6 +123325,307 @@ mod tests {
             std::fs::remove_file(&dds_path).ok();
         })
     }
+
+    #[test]
+    fn evidence_theme_imagehlp_hid_acm_msi_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-extras");
+            let mut memory = MemoryImage::default();
+
+            // ── uxtheme ──
+            let is_app_themed: u64 = runtime.alloc_host_thunk(HostThunk::IsAppThemed);
+            let open_theme: u64 = runtime.alloc_host_thunk(HostThunk::OpenThemeData);
+            let theme_color: u64 = runtime.alloc_host_thunk(HostThunk::GetThemeColor);
+            let theme_sys_color: u64 = runtime.alloc_host_thunk(HostThunk::GetThemeSysColor);
+            let close_theme: u64 = runtime.alloc_host_thunk(HostThunk::CloseThemeData);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, is_app_themed, &[]),
+                1
+            );
+            let class_ptr = 0x41_000_u64;
+            let class_wide: Vec<u16> = "BUTTON".encode_utf16().chain([0]).collect();
+            for (i, unit) in class_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, class_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let theme = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_theme,
+                &[0x1000, class_ptr as u32],
+            );
+            assert_ne!(theme, 0);
+            let color_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    theme_color,
+                    &[theme as u32, 0, 0, 0x0d00, color_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, color_out).unwrap(),
+                0,
+                "TMT_TEXTCOLOR"
+            );
+            let sys_out = 0x41_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    theme_sys_color,
+                    &[theme as u32, 4, sys_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, sys_out).unwrap(),
+                0x00ff_ffff,
+                "COLOR_BTNFACE"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close_theme, &[theme as u32]),
+                0
+            );
+            assert!(!runtime.theme_handles.contains_key(&theme));
+
+            // ── imagehlp: MapAndLoad a real PE-ish image + checksum ──
+            let map_and_load: u64 = runtime.alloc_host_thunk(HostThunk::MapAndLoad);
+            let checksum: u64 = runtime.alloc_host_thunk(HostThunk::CheckSumMappedFile);
+            let mut pe = vec![0_u8; 0x200];
+            pe[..2].copy_from_slice(b"MZ");
+            pe[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+            pe[0x40..0x44].copy_from_slice(&0x4550_u32.to_le_bytes());
+            pe[0x90..0x94].copy_from_slice(&0x1000_u32.to_le_bytes()); // SizeOfImage
+            pe[0x94..0x98].copy_from_slice(&0x200_u32.to_le_bytes()); // SizeOfHeaders
+            pe[0x80..0x84].copy_from_slice(&[1, 0, 0, 0]); // Magic PE32
+            let pe_path = std::env::temp_dir().join("casa1-evidence-pe.bin");
+            std::fs::write(&pe_path, &pe).unwrap();
+            let name_ptr = 0x41_200_u64;
+            let wide: Vec<u16> = pe_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in wide.iter().enumerate() {
+                write_guest_u16(&mut memory, name_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let loaded_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    map_and_load,
+                    &[name_ptr as u32, 0, loaded_out as u32, 0, 0]
+                ),
+                1
+            );
+            let mapped = read_guest_pointer(&memory, loaded_out + 16, GuestArch::X86).unwrap();
+            assert_ne!(mapped, 0);
+            assert_eq!(
+                read_guest_u32(&memory, loaded_out + 24).unwrap(),
+                0x1000,
+                "SizeOfImage"
+            );
+            let sum_out = 0x41_400_u64;
+            let checksum_value = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                checksum,
+                &[mapped as u32, 0x200, 0, sum_out as u32],
+            );
+            assert_ne!(checksum_value, 0);
+            assert_eq!(
+                read_guest_u32(&memory, sum_out).unwrap(),
+                checksum_value as u32
+            );
+            std::fs::remove_file(&pe_path).ok();
+
+            // ── hid: the preparsed-data descriptor parse ──
+            let get_guid: u64 = runtime.alloc_host_thunk(HostThunk::HidDGetHidGuid);
+            let get_caps: u64 = runtime.alloc_host_thunk(HostThunk::HidPGetCaps);
+            let guid_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_guid, &[guid_out as u32]),
+                1
+            );
+            assert_eq!(
+                memory.read_bytes(guid_out, 16).unwrap()[0],
+                0xb2,
+                "HID GUID"
+            );
+            // A 3-button mouse descriptor: usage page 1, usage 2, one input
+            // report with 3 buttons (1 bit each) + x/y (8 bits each).
+            let descriptor: Vec<u8> = vec![
+                0x05, 0x01, // Usage Page (Generic Desktop)
+                0x09, 0x02, // Usage (Mouse)
+                0xa1, 0x01, // Collection (Application)
+                0x09, 0x01, // Usage (Pointer)
+                0xa1, 0x00, // Collection (Physical)
+                0x05, 0x09, // Usage Page (Button)
+                0x19, 0x01, // Usage Minimum (1)
+                0x29, 0x03, // Usage Maximum (3)
+                0x15, 0x00, // Logical Minimum (0)
+                0x25, 0x01, // Logical Maximum (1)
+                0x95, 0x03, // Report Count (3)
+                0x75, 0x01, // Report Size (1)
+                0x81, 0x02, // Input (Data,Var,Abs)
+                0x95, 0x01, // Report Count (1)
+                0x75, 0x05, // Report Size (5)
+                0x81, 0x03, // Input (Const,Var,Abs) — padding
+                0x05, 0x01, // Usage Page (Generic Desktop)
+                0x09, 0x30, // Usage (X)
+                0x09, 0x31, // Usage (Y)
+                0x15, 0x81, // Logical Minimum (-127)
+                0x25, 0x7f, // Logical Maximum (127)
+                0x75, 0x08, // Report Size (8)
+                0x95, 0x02, // Report Count (2)
+                0x81, 0x06, // Input (Data,Var,Rel)
+                0xc0, // End Collection
+                0xc0, // End Collection
+            ];
+            let preparsed = 0x41_600_u64;
+            runtime.hid_preparsed.insert(preparsed, descriptor);
+            let caps_out = 0x41_700_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_caps,
+                    &[preparsed as u32, caps_out as u32]
+                ),
+                0x0011_0000
+            );
+            assert_eq!(
+                read_guest_u16(&memory, caps_out + 2).unwrap(),
+                1,
+                "usage page"
+            );
+            assert_eq!(
+                read_guest_u16(&memory, caps_out + 4).unwrap(),
+                3,
+                "input report bytes (3 buttons + 5 pad + 16 = 24 bits = 3 bytes)"
+            );
+            assert_eq!(
+                read_guest_u16(&memory, caps_out + 14).unwrap(),
+                1,
+                "button caps (the 3 buttons)"
+            );
+            assert_eq!(
+                read_guest_u16(&memory, caps_out + 16).unwrap(),
+                1,
+                "value caps (x/y)"
+            );
+
+            // ── msacm: the no-driver surface ──
+            let driver_enum: u64 = runtime.alloc_host_thunk(HostThunk::AcmDriverEnum);
+            let metrics: u64 = runtime.alloc_host_thunk(HostThunk::AcmMetrics);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, driver_enum, &[0, 0, 0]),
+                0
+            );
+            let count_out = 0x41_800_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    metrics,
+                    &[0, 1, count_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, count_out).unwrap(),
+                0,
+                "no ACM drivers"
+            );
+
+            // ── msi: the database surface ──
+            let open_db: u64 = runtime.alloc_host_thunk(HostThunk::MsiOpenDatabaseW);
+            let enum_products: u64 = runtime.alloc_host_thunk(HostThunk::MsiEnumProductsW);
+            let open_view: u64 = runtime.alloc_host_thunk(HostThunk::MsiDatabaseOpenViewW);
+            let view_fetch: u64 = runtime.alloc_host_thunk(HostThunk::MsiViewFetch);
+            let close_handle: u64 = runtime.alloc_host_thunk(HostThunk::MsiCloseHandle);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, enum_products, &[0, 0]),
+                259,
+                "no products"
+            );
+            let msi_path = std::env::temp_dir().join("casa1-evidence.msi");
+            let mut msi = vec![0_u8; 512];
+            msi[..8].copy_from_slice(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+            std::fs::write(&msi_path, &msi).unwrap();
+            let msi_name = 0x41_900_u64;
+            let wide: Vec<u16> = msi_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in wide.iter().enumerate() {
+                write_guest_u16(&mut memory, msi_name + (i as u64 * 2), *unit).ok();
+            }
+            let db_out = 0x41_a00_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_db,
+                    &[msi_name as u32, 0, db_out as u32]
+                ),
+                0
+            );
+            let db = read_guest_pointer(&memory, db_out, GuestArch::X86).unwrap();
+            assert_ne!(db, 0);
+            let query_ptr = 0x41_b00_u64;
+            let query_wide: Vec<u16> = "SELECT * FROM `_Columns`"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in query_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, query_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let view_out = 0x41_c00_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_view,
+                    &[db as u32, query_ptr as u32, view_out as u32]
+                ),
+                0
+            );
+            let view = read_guest_pointer(&memory, view_out, GuestArch::X86).unwrap();
+            assert_ne!(view, 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, view_fetch, &[view as u32, 0]),
+                259,
+                "no records"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close_handle, &[db as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close_handle, &[view as u32]),
+                0
+            );
+            std::fs::remove_file(&msi_path).ok();
+
+            // ── ole32: the interface-IID export ──
+            let iid_moniker: u64 = runtime.alloc_host_thunk(HostThunk::OleIidMoniker);
+            let iid_ptr = dispatch_x86_thunk(&mut runtime, &mut memory, iid_moniker, &[]);
+            assert_ne!(iid_ptr, 0);
+            assert_eq!(
+                memory.read_bytes(iid_ptr, 16).unwrap(),
+                vec![
+                    0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46
+                ],
+                "IID_IMoniker"
+            );
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -128906,6 +129683,7 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x1100),
         },
     ];
+
     extend_named_exports(
         &mut kernel32_exports,
         0x0200,
@@ -129166,6 +129944,61 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x61d0),
         },
     ];
+    ole32_exports.push(ExportSymbol {
+        ordinal: 1,
+        name: Some("IMoniker".to_string()),
+        target: ExportTarget::Rva(0x2a000),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 2,
+        name: Some("IPersist".to_string()),
+        target: ExportTarget::Rva(0x2a010),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 3,
+        name: Some("IStream".to_string()),
+        target: ExportTarget::Rva(0x2a020),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 4,
+        name: Some("IStorage".to_string()),
+        target: ExportTarget::Rva(0x2a030),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 5,
+        name: Some("IMalloc".to_string()),
+        target: ExportTarget::Rva(0x2a040),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 6,
+        name: Some("IDropTarget".to_string()),
+        target: ExportTarget::Rva(0x2a050),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 7,
+        name: Some("IDataObject".to_string()),
+        target: ExportTarget::Rva(0x2a060),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 8,
+        name: Some("IOleObject".to_string()),
+        target: ExportTarget::Rva(0x2a070),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 9,
+        name: Some("IOleInPlaceObject".to_string()),
+        target: ExportTarget::Rva(0x2a080),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 10,
+        name: Some("IObjectWithSite".to_string()),
+        target: ExportTarget::Rva(0x2a090),
+    });
+    ole32_exports.push(ExportSymbol {
+        ordinal: 11,
+        name: Some("IServiceProvider".to_string()),
+        target: ExportTarget::Rva(0x2a0a0),
+    });
     extend_named_exports(
         &mut ole32_exports,
         100,
@@ -132155,6 +132988,16 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ordinal: 37,
             name: Some("LHashValOfNameSys".to_string()),
             target: ExportTarget::Rva(0x1d240),
+        },
+        ExportSymbol {
+            ordinal: 1,
+            name: Some("IEnumVARIANT".to_string()),
+            target: ExportTarget::Rva(0x2b000),
+        },
+        ExportSymbol {
+            ordinal: 2,
+            name: Some("IConnectionPoint".to_string()),
+            target: ExportTarget::Rva(0x2b010),
         },
     ];
 

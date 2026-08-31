@@ -15,9 +15,14 @@ pub(crate) fn unknown_preamble() -> Vec<HostThunk> {
 
 pub(crate) mod com;
 pub(crate) mod dshow;
+pub(crate) mod hid;
+pub(crate) mod imagehlp;
 pub(crate) mod legacy_gfx;
 pub(crate) mod mf;
+pub(crate) mod msacm;
 pub(crate) mod mscoree;
+pub(crate) mod msi;
 pub(crate) mod ntdll;
 pub(crate) mod opengl;
+pub(crate) mod uxtheme;
 pub(crate) mod wic;

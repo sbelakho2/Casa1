@@ -223,6 +223,9 @@ pub(crate) enum GuestObjectKind {
     DirectDraw7,
     DirectDrawSurface,
     D3dBlob,
+    Theme,
+    MsiDatabase,
+    MsiView,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -609,6 +612,14 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) next_handle: u64,
 }
 
+/// A mapped PE image (MapAndLoad/ImageLoad) — consumed by
+/// `runtime/dispatch/imagehlp.rs`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ImageLoadState {
+    pub(crate) mapped: u64,
+    pub(crate) bytes: u32,
+}
+
 /// The DirectDraw7 object state (consumed by `runtime/dispatch/legacy_gfx.rs`).
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // DirectDraw object state consumed by legacy_gfx.rs
@@ -642,6 +653,8 @@ pub(crate) struct WicState {
     pub(crate) objects: HashMap<u64, WicObjectState>,
     /// Next WIC bitmap name (unused; kept for the object surface).
     pub(crate) next_name: u32,
+    /// Guest-resident scratch strings (the imagehlp version string).
+    pub(crate) string_slots: [u64; 5],
 }
 
 /// The per-object WIC state.
@@ -1574,6 +1587,18 @@ pub(crate) struct PeHostRuntime {
     pub(crate) ddraw_surfaces: HashMap<u64, DirectDrawSurfaceState>,
     /// The ID3D10Blob allocations (D3DCreateBlob).
     pub(crate) d3d_blobs: HashMap<u64, Vec<u8>>,
+    /// The open theme handles (OpenThemeData).
+    pub(crate) theme_handles: HashMap<u64, String>,
+    /// The mapped PE images (MapAndLoad/ImageLoad).
+    pub(crate) image_loads: HashMap<u64, ImageLoadState>,
+    /// The HID preparsed-data objects (the report descriptors).
+    pub(crate) hid_preparsed: HashMap<u64, Vec<u8>>,
+    /// The MSI database handles.
+    pub(crate) msi_databases: HashMap<u64, u32>,
+    /// The MSI view handles.
+    pub(crate) msi_views: HashMap<u64, String>,
+    /// The guest-resident interface-IID slot (the ole32 IID exports).
+    pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
@@ -2149,6 +2174,12 @@ impl PeHostRuntime {
             ddraw_objects: HashMap::new(),
             ddraw_surfaces: HashMap::new(),
             d3d_blobs: HashMap::new(),
+            theme_handles: HashMap::new(),
+            image_loads: HashMap::new(),
+            hid_preparsed: HashMap::new(),
+            msi_databases: HashMap::new(),
+            msi_views: HashMap::new(),
+            com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
