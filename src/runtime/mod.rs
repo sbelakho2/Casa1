@@ -5168,6 +5168,52 @@ pub enum HostThunk {
     OleQueryPathOfRegTypeLib,
     OleRegisterTypeLib,
     OleUnRegisterTypeLib,
+    NCryptCreatePersistedKey,
+    NCryptDecrypt,
+    NCryptDeleteKey,
+    NCryptDeriveKey,
+    NCryptEncrypt,
+    NCryptExportKey,
+    NCryptFinalizeKey,
+    NCryptFreeBuffer,
+    NCryptGetProperty,
+    NCryptImportKey,
+    NCryptIsAlgSupported,
+    NCryptOpenKey,
+    NCryptOpenStorageProvider,
+    NCryptSecretAgreement,
+    NCryptSetProperty,
+    NCryptSignHash,
+    NCryptVerifySignature,
+    IRpcExceptionFilter,
+    RpcBindingFree,
+    RpcBindingFromStringBindingW,
+    RpcStringBindingComposeW,
+    RpcStringBindingFromStringBindingW,
+    RpcStringFreeW,
+    UuidCreate,
+    UuidCreateSequential,
+    UuidFromStringW,
+    UuidToStringW,
+    InitPropVariantFromGUIDAsString,
+    InitPropVariantFromString,
+    PSGetNameFromPropertyKey,
+    PSGetPropertyDescriptionFromName,
+    PSGetPropertyKeyFromName,
+    PSPropertyKeyFromString,
+    PSStringFromPropertyKey,
+    PropVariantClear,
+    PropVariantCopy,
+    ImmGetCompositionStringW,
+    ImmGetOpenStatus,
+    ImmGetContext,
+    ImmGetDefaultIMEWnd,
+    ImmGetVirtualKey,
+    ImmIsIME,
+    ImmNotifyIME,
+    ImmReleaseContext,
+    ImmSetCompositionStringW,
+    ImmSimulateHotKey,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28233,6 +28279,18 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::OleIidMoniker | HostThunk::OleIidStream | HostThunk::OleIidStorage | HostThunk::OleIidMalloc | HostThunk::OleIidPersist | HostThunk::OleIidDropTarget | HostThunk::OleIidDataObject | HostThunk::OleIidOleObject | HostThunk::OleIidInPlaceObject | HostThunk::OleIidObjectWithSite | HostThunk::OleIidServiceProvider | HostThunk::OleIidEnumVariant | HostThunk::OleIidConnectionPoint | HostThunk::OleDispGetParam | HostThunk::OleDispGetIdsOfNames | HostThunk::OleDispInvoke | HostThunk::OleCreateDispTypeInfo | HostThunk::OleCreateStdDispatch | HostThunk::OleLoadTypeLib | HostThunk::OleLoadRegTypeLib | HostThunk::OleQueryPathOfRegTypeLib | HostThunk::OleRegisterTypeLib | HostThunk::OleUnRegisterTypeLib) => {
                 self.dispatch_com_ole_extra(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::NCryptCreatePersistedKey | HostThunk::NCryptDecrypt | HostThunk::NCryptDeleteKey | HostThunk::NCryptDeriveKey | HostThunk::NCryptEncrypt | HostThunk::NCryptExportKey | HostThunk::NCryptFinalizeKey | HostThunk::NCryptFreeBuffer | HostThunk::NCryptGetProperty | HostThunk::NCryptImportKey | HostThunk::NCryptIsAlgSupported | HostThunk::NCryptOpenKey | HostThunk::NCryptOpenStorageProvider | HostThunk::NCryptSecretAgreement | HostThunk::NCryptSetProperty | HostThunk::NCryptSignHash | HostThunk::NCryptVerifySignature) => {
+                self.dispatch_ncrypt(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::IRpcExceptionFilter | HostThunk::RpcBindingFree | HostThunk::RpcBindingFromStringBindingW | HostThunk::RpcStringBindingComposeW | HostThunk::RpcStringBindingFromStringBindingW | HostThunk::RpcStringFreeW | HostThunk::UuidCreate | HostThunk::UuidCreateSequential | HostThunk::UuidFromStringW | HostThunk::UuidToStringW) => {
+                self.dispatch_rpc(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::InitPropVariantFromGUIDAsString | HostThunk::InitPropVariantFromString | HostThunk::PSGetNameFromPropertyKey | HostThunk::PSGetPropertyDescriptionFromName | HostThunk::PSGetPropertyKeyFromName | HostThunk::PSPropertyKeyFromString | HostThunk::PSStringFromPropertyKey | HostThunk::PropVariantClear | HostThunk::PropVariantCopy) => {
+                self.dispatch_propsys(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::ImmGetCompositionStringW | HostThunk::ImmGetOpenStatus | HostThunk::ImmGetContext | HostThunk::ImmGetDefaultIMEWnd | HostThunk::ImmGetVirtualKey | HostThunk::ImmIsIME | HostThunk::ImmNotifyIME | HostThunk::ImmReleaseContext | HostThunk::ImmSetCompositionStringW | HostThunk::ImmSimulateHotKey) => {
+                self.dispatch_imm(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -64372,6 +64430,11 @@ impl PeHostRuntime {
                 // refcount (tracked in guest_objects).
                 self.guest_objects.remove(&address);
             }
+            GuestObjectKind::NcryptProvider
+            | GuestObjectKind::NcryptKey
+            | GuestObjectKind::RpcBinding => {
+                self.guest_objects.remove(&address);
+            }
         }
         Ok(0)
     }
@@ -80902,6 +80965,168 @@ impl HostThunk {
                 if name == "MFCreateDXGIDeviceManager" =>
             {
                 Self::MfCreateDxgiDeviceManager
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. })
+                if name == "NCryptCreatePersistedKey" =>
+            {
+                Self::NCryptCreatePersistedKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptDecrypt" => {
+                Self::NCryptDecrypt
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptDeleteKey" => {
+                Self::NCryptDeleteKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptDeriveKey" => {
+                Self::NCryptDeriveKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptEncrypt" => {
+                Self::NCryptEncrypt
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptExportKey" => {
+                Self::NCryptExportKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptFinalizeKey" => {
+                Self::NCryptFinalizeKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptFreeBuffer" => {
+                Self::NCryptFreeBuffer
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptGetProperty" => {
+                Self::NCryptGetProperty
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptImportKey" => {
+                Self::NCryptImportKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptIsAlgSupported" => {
+                Self::NCryptIsAlgSupported
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptOpenKey" => {
+                Self::NCryptOpenKey
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. })
+                if name == "NCryptOpenStorageProvider" =>
+            {
+                Self::NCryptOpenStorageProvider
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. })
+                if name == "NCryptSecretAgreement" =>
+            {
+                Self::NCryptSecretAgreement
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptSetProperty" => {
+                Self::NCryptSetProperty
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. }) if name == "NCryptSignHash" => {
+                Self::NCryptSignHash
+            }
+            ("ncrypt.dll", ImportSymbol::ByName { name, .. })
+                if name == "NCryptVerifySignature" =>
+            {
+                Self::NCryptVerifySignature
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "I_RpcExceptionFilter" => {
+                Self::IRpcExceptionFilter
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "RpcBindingFree" => {
+                Self::RpcBindingFree
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. })
+                if name == "RpcBindingFromStringBindingW" =>
+            {
+                Self::RpcBindingFromStringBindingW
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. })
+                if name == "RpcStringBindingComposeW" =>
+            {
+                Self::RpcStringBindingComposeW
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "RpcStringFreeW" => {
+                Self::RpcStringFreeW
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "UuidCreate" => {
+                Self::UuidCreate
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "UuidCreateSequential" => {
+                Self::UuidCreateSequential
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "UuidFromStringW" => {
+                Self::UuidFromStringW
+            }
+            ("rpcrt4.dll", ImportSymbol::ByName { name, .. }) if name == "UuidToStringW" => {
+                Self::UuidToStringW
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "InitPropVariantFromGUIDAsString" =>
+            {
+                Self::InitPropVariantFromGUIDAsString
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "InitPropVariantFromString" =>
+            {
+                Self::InitPropVariantFromString
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "PSGetNameFromPropertyKey" =>
+            {
+                Self::PSGetNameFromPropertyKey
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "PSGetPropertyDescriptionFromName" =>
+            {
+                Self::PSGetPropertyDescriptionFromName
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "PSGetPropertyKeyFromName" =>
+            {
+                Self::PSGetPropertyKeyFromName
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "PSPropertyKeyFromString" =>
+            {
+                Self::PSPropertyKeyFromString
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. })
+                if name == "PSStringFromPropertyKey" =>
+            {
+                Self::PSStringFromPropertyKey
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. }) if name == "PropVariantClear" => {
+                Self::PropVariantClear
+            }
+            ("propsys.dll", ImportSymbol::ByName { name, .. }) if name == "PropVariantCopy" => {
+                Self::PropVariantCopy
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImmGetCompositionStringW" =>
+            {
+                Self::ImmGetCompositionStringW
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmGetContext" => {
+                Self::ImmGetContext
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmGetDefaultIMEWnd" => {
+                Self::ImmGetDefaultIMEWnd
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmGetVirtualKey" => {
+                Self::ImmGetVirtualKey
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmIsIME" => {
+                Self::ImmIsIME
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmNotifyIME" => {
+                Self::ImmNotifyIME
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmReleaseContext" => {
+                Self::ImmReleaseContext
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImmSetCompositionStringW" =>
+            {
+                Self::ImmSetCompositionStringW
+            }
+            ("imm32.dll", ImportSymbol::ByName { name, .. }) if name == "ImmSimulateHotKey" => {
+                Self::ImmSimulateHotKey
             }
             ("uxtheme.dll", ImportSymbol::ByName { name, .. }) if name == "BeginBufferedPaint" => {
                 Self::BeginBufferedPaint
@@ -123623,6 +123848,248 @@ mod tests {
                     0x00, 0x00, 0x46
                 ],
                 "IID_IMoniker"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_cng_rpc_propsys_imm_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-crypto-sys");
+            let mut memory = MemoryImage::default();
+
+            // ── ncrypt: the full key lifecycle ──
+            let open_provider: u64 = runtime.alloc_host_thunk(HostThunk::NCryptOpenStorageProvider);
+            let create_key: u64 = runtime.alloc_host_thunk(HostThunk::NCryptCreatePersistedKey);
+            let set_property: u64 = runtime.alloc_host_thunk(HostThunk::NCryptSetProperty);
+            let finalize: u64 = runtime.alloc_host_thunk(HostThunk::NCryptFinalizeKey);
+            let sign: u64 = runtime.alloc_host_thunk(HostThunk::NCryptSignHash);
+            let verify: u64 = runtime.alloc_host_thunk(HostThunk::NCryptVerifySignature);
+            let get_property: u64 = runtime.alloc_host_thunk(HostThunk::NCryptGetProperty);
+            let is_alg: u64 = runtime.alloc_host_thunk(HostThunk::NCryptIsAlgSupported);
+            let provider_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    open_provider,
+                    &[0, 0, provider_out as u32]
+                ),
+                0
+            );
+            let provider = read_guest_pointer(&memory, provider_out, GuestArch::X86).unwrap();
+            assert_ne!(provider, 0);
+            // The RSA algorithm name.
+            let alg_ptr = 0x41_010_u64;
+            let alg_wide: Vec<u16> = "RSA".encode_utf16().chain([0]).collect();
+            for (i, unit) in alg_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, alg_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let key_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_key,
+                    &[provider as u32, key_out as u32, alg_ptr as u32, 0, 0, 0]
+                ),
+                0
+            );
+            let key = read_guest_pointer(&memory, key_out, GuestArch::X86).unwrap();
+            assert_ne!(key, 0);
+            // The key length property (1024 for speed).
+            let length_ptr = 0x41_110_u64;
+            let length_wide: Vec<u16> = "Length".encode_utf16().chain([0]).collect();
+            for (i, unit) in length_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, length_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let length_value = 0x41_120_u64;
+            write_guest_u32(&mut memory, length_value, 1024).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_property,
+                    &[key as u32, length_ptr as u32, length_value as u32, 4, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, finalize, &[key as u32, 0]),
+                0
+            );
+            assert!(runtime.ncrypt_keys.get(&key).unwrap().finalized);
+
+            // The property round trip.
+            let alg_name_out = 0x41_200_u64;
+            let name_size_out = 0x41_210_u64;
+            let alg_prop = 0x41_220_u64;
+            let prop_wide: Vec<u16> = "Algorithm Name".encode_utf16().chain([0]).collect();
+            for (i, unit) in prop_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, alg_prop + (i as u64 * 2), *unit).ok();
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_property,
+                    &[
+                        key as u32,
+                        alg_prop as u32,
+                        alg_name_out as u32,
+                        64,
+                        name_size_out as u32,
+                        0
+                    ]
+                ),
+                0
+            );
+            let alg = memory.read_bytes(alg_name_out, 8).unwrap();
+            assert_eq!(&alg[..4], &[0x52, 0x00, 0x53, 0x00], "RSA");
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, is_alg, &[alg_ptr as u32, 0]),
+                0
+            );
+
+            // Sign + verify a digest.
+            let digest_ptr = 0x41_300_u64;
+            let digest: Vec<u8> = (0..32).map(|i| i as u8).collect();
+            memory.map_bytes(digest_ptr, &digest);
+            let signature_out = 0x41_400_u64;
+            let signature_size_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    sign,
+                    &[
+                        key as u32,
+                        0,
+                        digest_ptr as u32,
+                        32,
+                        signature_out as u32,
+                        256,
+                        signature_size_out as u32,
+                        0
+                    ]
+                ),
+                0
+            );
+            let sig_len = read_guest_u32(&memory, signature_size_out).unwrap();
+            assert_eq!(sig_len, 128, "1024-bit RSA signature");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    verify,
+                    &[
+                        key as u32,
+                        0,
+                        digest_ptr as u32,
+                        32,
+                        signature_out as u32,
+                        sig_len,
+                        0
+                    ]
+                ),
+                0
+            );
+
+            // ── rpcrt4: the UUID surface ──
+            let uuid_create: u64 = runtime.alloc_host_thunk(HostThunk::UuidCreate);
+            let uuid_to_string: u64 = runtime.alloc_host_thunk(HostThunk::UuidToStringW);
+            let uuid_from_string: u64 = runtime.alloc_host_thunk(HostThunk::UuidFromStringW);
+            let uuid_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, uuid_create, &[uuid_out as u32]),
+                0
+            );
+            let uuid_bytes = memory.read_bytes(uuid_out, 16).unwrap();
+            assert!(uuid_bytes.iter().any(|b| *b != 0), "non-nil UUID");
+            let string_out = 0x41_510_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    uuid_to_string,
+                    &[uuid_out as u32, string_out as u32]
+                ),
+                0
+            );
+            let string_ptr = read_guest_pointer(&memory, string_out, GuestArch::X86).unwrap();
+            let text = read_utf16_string(&memory, string_ptr).unwrap();
+            assert_eq!(text.len(), 36, "canonical UUID string");
+            let roundtrip_out = 0x41_520_u64;
+            let text_ptr = 0x41_530_u64;
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            for (i, unit) in wide.iter().enumerate() {
+                write_guest_u16(&mut memory, text_ptr + (i as u64 * 2), *unit).ok();
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    uuid_from_string,
+                    &[text_ptr as u32, roundtrip_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                memory.read_bytes(roundtrip_out, 16).unwrap(),
+                uuid_bytes,
+                "UUID round trip"
+            );
+
+            // ── propsys: the property-key registry ──
+            let key_from_name: u64 = runtime.alloc_host_thunk(HostThunk::PSGetPropertyKeyFromName);
+            let name_from_key: u64 = runtime.alloc_host_thunk(HostThunk::PSGetNameFromPropertyKey);
+            let name_ptr = 0x41_600_u64;
+            let name_wide: Vec<u16> = "System.Title".encode_utf16().chain([0]).collect();
+            for (i, unit) in name_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, name_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let key_out = 0x41_610_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    key_from_name,
+                    &[name_ptr as u32, key_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, key_out + 16).unwrap(),
+                2,
+                "PKEY System.Title pid"
+            );
+            let reverse_out = 0x41_620_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    name_from_key,
+                    &[key_out as u32, reverse_out as u32]
+                ),
+                0
+            );
+            let reverse_ptr = read_guest_pointer(&memory, reverse_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_utf16_string(&memory, reverse_ptr).unwrap(),
+                "System.Title"
+            );
+
+            // ── imm32: the no-IME surface ──
+            let imm_context: u64 = runtime.alloc_host_thunk(HostThunk::ImmGetContext);
+            let imm_release: u64 = runtime.alloc_host_thunk(HostThunk::ImmReleaseContext);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, imm_context, &[0x1000]),
+                0,
+                "no IME context"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, imm_release, &[0x1000, 0]),
+                1
             );
         })
     }

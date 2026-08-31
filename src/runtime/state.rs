@@ -226,6 +226,9 @@ pub(crate) enum GuestObjectKind {
     Theme,
     MsiDatabase,
     MsiView,
+    NcryptProvider,
+    NcryptKey,
+    RpcBinding,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -610,6 +613,21 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) open_handles: std::collections::HashSet<u64>,
     /// Next handle value to hand out.
     pub(crate) next_handle: u64,
+}
+
+/// A CNG key object (NCryptCreatePersistedKey) — consumed by
+/// `runtime/dispatch/ncrypt.rs`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // CNG key state consumed by ncrypt.rs
+pub(crate) struct NcryptKeyState {
+    pub(crate) algorithm: String,
+    pub(crate) key_name: String,
+    pub(crate) finalized: bool,
+    pub(crate) private_key: Option<rsa::RsaPrivateKey>,
+    pub(crate) public_key: Option<rsa::RsaPublicKey>,
+    pub(crate) length: u32,
+    pub(crate) key_type: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// A mapped PE image (MapAndLoad/ImageLoad) — consumed by
@@ -1597,6 +1615,12 @@ pub(crate) struct PeHostRuntime {
     pub(crate) msi_databases: HashMap<u64, u32>,
     /// The MSI view handles.
     pub(crate) msi_views: HashMap<u64, String>,
+    /// The CNG storage providers.
+    pub(crate) ncrypt_providers: HashMap<u64, String>,
+    /// The CNG key objects.
+    pub(crate) ncrypt_keys: HashMap<u64, NcryptKeyState>,
+    /// The RPC binding handles.
+    pub(crate) rpc_bindings: HashMap<u64, String>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2179,6 +2203,9 @@ impl PeHostRuntime {
             hid_preparsed: HashMap::new(),
             msi_databases: HashMap::new(),
             msi_views: HashMap::new(),
+            ncrypt_providers: HashMap::new(),
+            ncrypt_keys: HashMap::new(),
+            rpc_bindings: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
