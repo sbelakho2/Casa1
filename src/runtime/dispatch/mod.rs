@@ -13,6 +13,7 @@ pub(crate) fn unknown_preamble() -> Vec<HostThunk> {
     vec![HostThunk::GuestObjectAddRef, HostThunk::GuestObjectRelease]
 }
 
+pub(crate) mod codecs;
 pub(crate) mod com;
 pub(crate) mod comdlg32;
 pub(crate) mod d3d8thk;

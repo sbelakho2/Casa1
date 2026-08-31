@@ -2537,7 +2537,7 @@ fn mf_source_resolver_methods() -> Vec<HostThunk> {
 
 /// The IMFDXGIDeviceManager vtable (IUnknown preamble + the 7 device
 /// methods).
-fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
+pub(crate) fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
     let mut methods = unknown_preamble();
     methods.push(HostThunk::MfDxgiDeviceManagerResetDevice);
     methods.push(HostThunk::MfDxgiDeviceManagerOpenDeviceHandle);

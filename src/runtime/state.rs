@@ -247,6 +247,20 @@ pub(crate) enum GuestObjectKind {
     EsentDatabase,
     WinInetRequest,
     DirectInput,
+    WmCodec,
+    WmEditor,
+    WmIndexer,
+    WmProfileManager,
+    WmReader,
+    WmSyncReader,
+    WmWriter,
+    EvrVideoMediaType,
+    EvrVideoMixer,
+    EvrVideoPresenter,
+    EvrVideoRenderer,
+    EvrSampleAllocator,
+    ComErrorInfo,
+    Dxva2VideoService,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1683,6 +1697,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) wininet_requests: HashMap<u64, String>,
     /// The DirectInput objects.
     pub(crate) dinput_objects: HashMap<u64, u32>,
+    /// The codec-component objects.
+    pub(crate) codec_objects: HashMap<u64, u32>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2286,6 +2302,7 @@ impl PeHostRuntime {
             wsp_started: false,
             wininet_requests: HashMap::new(),
             dinput_objects: HashMap::new(),
+            codec_objects: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),

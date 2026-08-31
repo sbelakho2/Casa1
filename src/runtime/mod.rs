@@ -64,6 +64,7 @@ use crate::real_fs::{RealFilesystem, WindowsPathResolver, parse_ntfs_path};
 use crate::real_win32::BCryptContext;
 use crate::reason::ReasonCode;
 use crate::runtime::dispatch::dshow::dshow_filter_graph_methods;
+use crate::runtime::dispatch::mf::mf_dxgi_device_manager_methods;
 use crate::shader::parse_dxil_container;
 use crate::telemetry::TelemetryCollector;
 use crate::threads::{
@@ -5360,6 +5361,41 @@ pub enum HostThunk {
     DirectInputCreateEx,
     DirectInputCreateW,
     DirectInputCreateDevice,
+    WmcdspCreateAudioDecoder,
+    WmcdspCreateAudioEncoder,
+    WmcdspCreateConverter,
+    WmcdspCreateDecoder,
+    WmcdspCreateEncoder,
+    WmcdspCreateProcessor,
+    WmcdspCreateResampler,
+    WmCreateEditor,
+    WmCreateIndexer,
+    WmCreateProfileManager,
+    WmCreateReader,
+    WmCreateSyncReader,
+    WmCreateWriter,
+    WmIsContentProtected,
+    AudioSessionFromGuid,
+    AudioSessionFromHwnd,
+    AudioSessionFromString,
+    AudioSessionize,
+    DmoEnum,
+    DmoGetName,
+    DmoGetTypes,
+    DmoGuidToStr,
+    DmoStrToGuid,
+    MoFree,
+    MfCreateVideoMediaType,
+    MfCreateVideoMixer,
+    MfCreateVideoPresenter,
+    MfCreateVideoRenderer,
+    MfCreateVideoSampleAllocator,
+    AmGetErrorText,
+    CreateErrorInfo,
+    CreateFilter,
+    Dxva2CreateDirect3DDeviceManager9,
+    Dxva2CreateVideoService,
+    Dxva2GetVideoProcessorCaps,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28470,6 +28506,9 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::DirectInputCreateEx | HostThunk::DirectInputCreateW | HostThunk::DirectInputCreateDevice) => {
                 self.dispatch_dinput(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WmcdspCreateAudioDecoder | HostThunk::WmcdspCreateAudioEncoder | HostThunk::WmcdspCreateConverter | HostThunk::WmcdspCreateDecoder | HostThunk::WmcdspCreateEncoder | HostThunk::WmcdspCreateProcessor | HostThunk::WmcdspCreateResampler | HostThunk::WmCreateEditor | HostThunk::WmCreateIndexer | HostThunk::WmCreateProfileManager | HostThunk::WmCreateReader | HostThunk::WmCreateSyncReader | HostThunk::WmCreateWriter | HostThunk::WmIsContentProtected | HostThunk::AudioSessionFromGuid | HostThunk::AudioSessionFromHwnd | HostThunk::AudioSessionFromString | HostThunk::AudioSessionize | HostThunk::DmoEnum | HostThunk::DmoGetName | HostThunk::DmoGetTypes | HostThunk::DmoGuidToStr | HostThunk::DmoStrToGuid | HostThunk::MoFree | HostThunk::MfCreateVideoMediaType | HostThunk::MfCreateVideoMixer | HostThunk::MfCreateVideoPresenter | HostThunk::MfCreateVideoRenderer | HostThunk::MfCreateVideoSampleAllocator | HostThunk::AmGetErrorText | HostThunk::CreateErrorInfo | HostThunk::CreateFilter | HostThunk::Dxva2CreateDirect3DDeviceManager9 | HostThunk::Dxva2CreateVideoService | HostThunk::Dxva2GetVideoProcessorCaps) => {
+                self.dispatch_codecs(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -64644,7 +64683,21 @@ impl PeHostRuntime {
             | GuestObjectKind::D3dkmtSyncObject
             | GuestObjectKind::EsentDatabase
             | GuestObjectKind::WinInetRequest
-            | GuestObjectKind::DirectInput => {
+            | GuestObjectKind::DirectInput
+            | GuestObjectKind::WmCodec
+            | GuestObjectKind::WmEditor
+            | GuestObjectKind::WmIndexer
+            | GuestObjectKind::WmProfileManager
+            | GuestObjectKind::WmReader
+            | GuestObjectKind::WmSyncReader
+            | GuestObjectKind::WmWriter
+            | GuestObjectKind::EvrVideoMediaType
+            | GuestObjectKind::EvrVideoMixer
+            | GuestObjectKind::EvrVideoPresenter
+            | GuestObjectKind::EvrVideoRenderer
+            | GuestObjectKind::EvrSampleAllocator
+            | GuestObjectKind::ComErrorInfo
+            | GuestObjectKind::Dxva2VideoService => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -81989,6 +82042,289 @@ impl HostThunk {
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
                 Self::FindTextW
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateAudioDecoder" =>
+            {
+                Self::WmcdspCreateAudioDecoder
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateAudioEncoder" =>
+            {
+                Self::WmcdspCreateAudioEncoder
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateConverter" =>
+            {
+                Self::WmcdspCreateConverter
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateDecoder" =>
+            {
+                Self::WmcdspCreateDecoder
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateEncoder" =>
+            {
+                Self::WmcdspCreateEncoder
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateProcessor" =>
+            {
+                Self::WmcdspCreateProcessor
+            }
+            ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCDSPCreateResampler" =>
+            {
+                Self::WmcdspCreateResampler
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. }) if name == "WMCreateEditor" => {
+                Self::WmCreateEditor
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. }) if name == "WMCreateIndexer" => {
+                Self::WmCreateIndexer
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMCreateProfileManager" =>
+            {
+                Self::WmCreateProfileManager
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. }) if name == "WMCreateReader" => {
+                Self::WmCreateReader
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. }) if name == "WMCreateSyncReader" => {
+                Self::WmCreateSyncReader
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. }) if name == "WMCreateWriter" => {
+                Self::WmCreateWriter
+            }
+            ("wmvcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "WMIsContentProtected" =>
+            {
+                Self::WmIsContentProtected
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. })
+                if name == "AudioSessionFromGuid" =>
+            {
+                Self::AudioSessionFromGuid
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. })
+                if name == "AudioSessionFromHWND" =>
+            {
+                Self::AudioSessionFromHwnd
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. })
+                if name == "AudioSessionFromString" =>
+            {
+                Self::AudioSessionFromString
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. }) if name == "AudioSessionize" => {
+                Self::AudioSessionize
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("audioses.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "DMOEnum" => Self::DmoEnum,
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "DMOGetName" => {
+                Self::DmoGetName
+            }
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "DMOGetTypes" => {
+                Self::DmoGetTypes
+            }
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "DMOGuidToStr" => {
+                Self::DmoGuidToStr
+            }
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "DMOStrToGuid" => {
+                Self::DmoStrToGuid
+            }
+            ("msdmo.dll", ImportSymbol::ByName { name, .. }) if name == "MOFree" => Self::MoFree,
+            ("colorcnv.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("colorcnv.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("colorcnv.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mfaacenc.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("mfaacenc.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mfaacenc.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mfh264enc.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("mfh264enc.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mfh264enc.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mfmpeg2src.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("mfmpeg2src.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("mfmpeg2src.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mfvpxdec.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("mfvpxdec.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mfvpxdec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mp3dmod.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("mp3dmod.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mp3dmod.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("mpg4decdmod.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("mpg4decdmod.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("mpg4decdmod.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("msmpeg2adec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("msmpeg2adec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("msmpeg2adec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("msmpeg2vdec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("msmpeg2vdec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("msmpeg2vdec.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("resampledmo.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("resampledmo.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("resampledmo.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("evr.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateVideoMediaType" => {
+                Self::MfCreateVideoMediaType
+            }
+            ("evr.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateVideoMixer" => {
+                Self::MfCreateVideoMixer
+            }
+            ("evr.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateVideoPresenter" => {
+                Self::MfCreateVideoPresenter
+            }
+            ("evr.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateVideoRenderer" => {
+                Self::MfCreateVideoRenderer
+            }
+            ("evr.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateVideoSampleAllocator" =>
+            {
+                Self::MfCreateVideoSampleAllocator
+            }
+            ("amstream.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("amstream.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("amstream.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("amstream.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("qedit.dll", ImportSymbol::ByName { name, .. }) if name == "AMGetErrorText" => {
+                Self::AmGetErrorText
+            }
+            ("qedit.dll", ImportSymbol::ByName { name, .. }) if name == "CreateErrorInfo" => {
+                Self::CreateErrorInfo
+            }
+            ("qedit.dll", ImportSymbol::ByName { name, .. }) if name == "CreateFilter" => {
+                Self::CreateFilter
+            }
+            ("dxva2.dll", ImportSymbol::ByName { name, .. })
+                if name == "DXVA2CreateDirect3DDeviceManager9" =>
+            {
+                Self::Dxva2CreateDirect3DDeviceManager9
+            }
+            ("dxva2.dll", ImportSymbol::ByName { name, .. })
+                if name == "DXVA2CreateVideoService" =>
+            {
+                Self::Dxva2CreateVideoService
+            }
+            ("dxva2.dll", ImportSymbol::ByName { name, .. })
+                if name == "DXVA2GetVideoProcessorCaps" =>
+            {
+                Self::Dxva2GetVideoProcessorCaps
             }
             ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTCloseAdapter" => {
                 Self::D3DKMTCloseAdapter
@@ -125402,6 +125738,196 @@ mod tests {
                 ),
                 0x8007_0012,
                 "DIERR_DEVICENOTREG"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_codec_components_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-codecs");
+            let mut memory = MemoryImage::default();
+
+            // ── wmcodecdsp: the codec factory ──
+            let create_decoder: u64 = runtime.alloc_host_thunk(HostThunk::WmcdspCreateDecoder);
+            let decoder_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_decoder,
+                    &[0, decoder_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, decoder_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // ── wmvcore: the reader/writer factories ──
+            let create_reader: u64 = runtime.alloc_host_thunk(HostThunk::WmCreateReader);
+            let create_writer: u64 = runtime.alloc_host_thunk(HostThunk::WmCreateWriter);
+            let is_protected: u64 = runtime.alloc_host_thunk(HostThunk::WmIsContentProtected);
+            let reader_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_reader,
+                    &[0, 0, reader_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, reader_out, GuestArch::X86).unwrap(),
+                0
+            );
+            let writer_out = 0x41_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_writer,
+                    &[0, writer_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, writer_out, GuestArch::X86).unwrap(),
+                0
+            );
+            let protected_out = 0x41_120_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    is_protected,
+                    &[0x41_130, protected_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, protected_out).unwrap(),
+                0,
+                "not protected"
+            );
+
+            // ── msdmo: the DMO registry ──
+            let dmo_enum: u64 = runtime.alloc_host_thunk(HostThunk::DmoEnum);
+            let dmo_to_str: u64 = runtime.alloc_host_thunk(HostThunk::DmoGuidToStr);
+            let count_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    dmo_enum,
+                    &[0, 0, count_out as u32, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, count_out).unwrap(), 0, "no DMOs");
+            let guid_ptr = 0x41_210_u64;
+            memory.map_bytes(
+                guid_ptr,
+                &[
+                    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46,
+                ],
+            );
+            let str_out = 0x41_220_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    dmo_to_str,
+                    &[guid_ptr as u32, str_out as u32]
+                ),
+                0
+            );
+            let str_ptr = read_guest_pointer(&memory, str_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_utf16_string(&memory, str_ptr).unwrap(),
+                "{0000000c-0000-0000-c000-000000000046}"
+            );
+
+            // ── evr: the video factories ──
+            let create_media_type: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateVideoMediaType);
+            let create_renderer: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateVideoRenderer);
+            let mt_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_media_type,
+                    &[0, mt_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, mt_out, GuestArch::X86).unwrap(),
+                0
+            );
+            let renderer_out = 0x41_310_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_renderer,
+                    &[0, renderer_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, renderer_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // ── dxva2: the device manager reuses the DXGI machinery ──
+            let dxva2_create: u64 =
+                runtime.alloc_host_thunk(HostThunk::Dxva2CreateDirect3DDeviceManager9);
+            let manager_out = 0x41_400_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    dxva2_create,
+                    &[1, manager_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, manager_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // ── qedit: the ANSI error text ──
+            let am_error: u64 = runtime.alloc_host_thunk(HostThunk::AmGetErrorText);
+            let text_out = 0x41_500_u64;
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                am_error,
+                &[0x8004_0227, text_out as u32, 64],
+            );
+            assert!(written > 0);
+            let text = memory.read_bytes(text_out, written as usize).unwrap();
+            assert!(String::from_utf8_lossy(&text).contains("No filters"));
+
+            // ── a codec module's DllGetClassObject (the shared server
+            //    contract: no codec classes are registered) ──
+            let dll_class: u64 = runtime.alloc_host_thunk(HostThunk::DllGetClassObject);
+            let clsid_out = 0x41_600_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                dll_class,
+                &[0x41_610, 0x41_620, clsid_out as u32],
+            );
+            assert_eq!(
+                hr, 0,
+                "the shared class-object contract answers every CLSID"
             );
         })
     }
