@@ -6385,6 +6385,116 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_mf_dxgi_device_manager_handles_and_reset",
     ),
     conformance(
+        "opengl32.dll",
+        "glBegin",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glEnd",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glVertex3f",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glColor3f",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glClearColor",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glClear",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glViewport",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glOrtho",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glReadPixels",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glGetError",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glGenTextures",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glBindTexture",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glTexImage2D",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glTexCoord2f",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "glEnable",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "wglCreateContext",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "wglMakeCurrent",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "wglChoosePixelFormat",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "wglSetPixelFormat",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "opengl32.dll",
+        "wglGetPixelFormat",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "glu32.dll",
+        "gluPerspective",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
+        "glu32.dll",
+        "gluLookAt",
+        "casa1-conformance:evidence_gl_fixed_function_pipeline_renders_and_reads_back",
+    ),
+    conformance(
         "mf.dll",
         "MFCreateSourceReaderFromURL",
         "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
@@ -6629,6 +6739,7 @@ mod tests {
         "evidence_ps3_ole32_co_create_instance",
         "evidence_mf_periodic_callbacks_and_system_time",
         "evidence_mf_dxgi_device_manager_handles_and_reset",
+        "evidence_gl_fixed_function_pipeline_renders_and_reads_back",
         "evidence_mf_source_reader_and_sink_writer_objects",
         "evidence_mf_startup_media_type_attributes_and_sample",
         "evidence_ps3_crypt32_certificates",

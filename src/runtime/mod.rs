@@ -5108,6 +5108,83 @@ pub enum HostThunk {
     MfSourceResolverCreateObjectFromUrl,
     MfPresentationDescriptorGetStreamDescriptorCount,
     MfEventGetType,
+    GlBegin,
+    GlBindTexture,
+    GlBlendFunc,
+    GlClear,
+    GlClearColor,
+    GlColor3f,
+    GlColor4f,
+    GlColorPointer,
+    GlCullFace,
+    GlDeleteTextures,
+    GlDepthFunc,
+    GlDisable,
+    GlDisableClientState,
+    GlDrawArrays,
+    GlDrawElements,
+    GlEnable,
+    GlEnableClientState,
+    GlEnd,
+    GlFinish,
+    GlFlush,
+    GlFogf,
+    GlFogi,
+    GlFrontFace,
+    GlGenTextures,
+    GlGetError,
+    GlGetString,
+    GlHint,
+    GlLightfv,
+    GlLoadIdentity,
+    GlMaterialfv,
+    GlMatrixMode,
+    GlNormalPointer,
+    GlOrtho,
+    GlPopMatrix,
+    GlPushMatrix,
+    GlReadPixels,
+    GlRotatef,
+    GlScalef,
+    GlShadeModel,
+    GlTexCoord2f,
+    GlTexCoordPointer,
+    GlTexImage2D,
+    GlTexParameterf,
+    GlTexParameteri,
+    GlTranslatef,
+    GlVertex2f,
+    GlVertex3f,
+    GlVertexPointer,
+    GlViewport,
+    GluBuild2DMipmaps,
+    GluCylinder,
+    GluDeleteQuadric,
+    GluDisk,
+    GluErrorString,
+    GluLookAt,
+    GluNewQuadric,
+    GluNewTess,
+    GluOrtho2D,
+    GluPartialDisk,
+    GluPerspective,
+    GluPickMatrix,
+    GluProject,
+    GluScaleImage,
+    GluSphere,
+    GluTessBeginPolygon,
+    GluTessEndPolygon,
+    GluTessVertex,
+    GluUnProject,
+    WglChoosePixelFormat,
+    WglCreateContext,
+    WglDeleteContext,
+    WglDescribePixelFormat,
+    WglGetPixelFormat,
+    WglGetProcAddress,
+    WglMakeCurrent,
+    WglSetPixelFormat,
+    WglSwapBuffers,
 }
 
 /// Outcome of one [`PeHostRuntime::get_message_pump`] iteration — the
@@ -27856,6 +27933,9 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::GlBegin | HostThunk::GlBindTexture | HostThunk::GlBlendFunc | HostThunk::GlClear | HostThunk::GlClearColor | HostThunk::GlColor3f | HostThunk::GlColor4f | HostThunk::GlColorPointer | HostThunk::GlCullFace | HostThunk::GlDeleteTextures | HostThunk::GlDepthFunc | HostThunk::GlDisable | HostThunk::GlDisableClientState | HostThunk::GlDrawArrays | HostThunk::GlDrawElements | HostThunk::GlEnable | HostThunk::GlEnableClientState | HostThunk::GlEnd | HostThunk::GlFinish | HostThunk::GlFlush | HostThunk::GlFogf | HostThunk::GlFogi | HostThunk::GlFrontFace | HostThunk::GlGenTextures | HostThunk::GlGetError | HostThunk::GlGetString | HostThunk::GlHint | HostThunk::GlLightfv | HostThunk::GlLoadIdentity | HostThunk::GlMaterialfv | HostThunk::GlMatrixMode | HostThunk::GlNormalPointer | HostThunk::GlOrtho | HostThunk::GlPopMatrix | HostThunk::GlPushMatrix | HostThunk::GlReadPixels | HostThunk::GlRotatef | HostThunk::GlScalef | HostThunk::GlShadeModel | HostThunk::GlTexCoord2f | HostThunk::GlTexCoordPointer | HostThunk::GlTexImage2D | HostThunk::GlTexParameterf | HostThunk::GlTexParameteri | HostThunk::GlTranslatef | HostThunk::GlVertex2f | HostThunk::GlVertex3f | HostThunk::GlVertexPointer | HostThunk::GlViewport | HostThunk::GluBuild2DMipmaps | HostThunk::GluCylinder | HostThunk::GluDeleteQuadric | HostThunk::GluDisk | HostThunk::GluErrorString | HostThunk::GluLookAt | HostThunk::GluNewQuadric | HostThunk::GluNewTess | HostThunk::GluOrtho2D | HostThunk::GluPartialDisk | HostThunk::GluPerspective | HostThunk::GluPickMatrix | HostThunk::GluProject | HostThunk::GluScaleImage | HostThunk::GluSphere | HostThunk::GluTessBeginPolygon | HostThunk::GluTessEndPolygon | HostThunk::GluTessVertex | HostThunk::GluUnProject | HostThunk::WglChoosePixelFormat | HostThunk::WglCreateContext | HostThunk::WglDeleteContext | HostThunk::WglDescribePixelFormat | HostThunk::WglGetPixelFormat | HostThunk::WglGetProcAddress | HostThunk::WglMakeCurrent | HostThunk::WglSetPixelFormat | HostThunk::WglSwapBuffers) => {
+                self.dispatch_gl_or_glu(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -80475,6 +80555,492 @@ impl HostThunk {
             ("shlwapi.dll", ImportSymbol::ByName { name, .. }) if name == "UrlCombineW" => {
                 Self::UrlCombineW
             }
+            ("mf.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateSinkWriterFromMediaSink" =>
+            {
+                Self::MfCreateSinkWriterFromMediaSink
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFCreateMediaSession" => {
+                Self::MfCreateMediaSession
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFAddPeriodicCallback" =>
+            {
+                Self::MfAddPeriodicCallback
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCancelPeriodicCallback" =>
+            {
+                Self::MfCancelPeriodicCallback
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "MFGetSystemTime" => {
+                Self::MfGetSystemTime
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. })
+                if name == "MFCreateDXGIDeviceManager" =>
+            {
+                Self::MfCreateDxgiDeviceManager
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glBegin" => {
+                Self::GlBegin
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glBegin" => Self::GlBegin,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glBindTexture" => {
+                Self::GlBindTexture
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glBindTexture" => {
+                Self::GlBindTexture
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glBlendFunc" => {
+                Self::GlBlendFunc
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glBlendFunc" => {
+                Self::GlBlendFunc
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glClear" => {
+                Self::GlClear
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glClear" => Self::GlClear,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glClearColor" => {
+                Self::GlClearColor
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glClearColor" => {
+                Self::GlClearColor
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glColor3f" => {
+                Self::GlColor3f
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glColor3f" => {
+                Self::GlColor3f
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glColor4f" => {
+                Self::GlColor4f
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glColor4f" => {
+                Self::GlColor4f
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glColorPointer" => {
+                Self::GlColorPointer
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glColorPointer" => {
+                Self::GlColorPointer
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glCullFace" => {
+                Self::GlCullFace
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glCullFace" => {
+                Self::GlCullFace
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glDeleteTextures" => {
+                Self::GlDeleteTextures
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDeleteTextures" => {
+                Self::GlDeleteTextures
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glDepthFunc" => {
+                Self::GlDepthFunc
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDepthFunc" => {
+                Self::GlDepthFunc
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glDisable" => {
+                Self::GlDisable
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDisable" => {
+                Self::GlDisable
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "glDisableClientState" =>
+            {
+                Self::GlDisableClientState
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDisableClientState" => {
+                Self::GlDisableClientState
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glDrawArrays" => {
+                Self::GlDrawArrays
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDrawArrays" => {
+                Self::GlDrawArrays
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glDrawElements" => {
+                Self::GlDrawElements
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glDrawElements" => {
+                Self::GlDrawElements
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glEnable" => {
+                Self::GlEnable
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glEnable" => {
+                Self::GlEnable
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "glEnableClientState" =>
+            {
+                Self::GlEnableClientState
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glEnableClientState" => {
+                Self::GlEnableClientState
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glEnd" => Self::GlEnd,
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glEnd" => Self::GlEnd,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glFinish" => {
+                Self::GlFinish
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glFinish" => {
+                Self::GlFinish
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glFlush" => {
+                Self::GlFlush
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glFlush" => Self::GlFlush,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glFogf" => Self::GlFogf,
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glFogf" => Self::GlFogf,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glFogi" => Self::GlFogi,
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glFogi" => Self::GlFogi,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glFrontFace" => {
+                Self::GlFrontFace
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glFrontFace" => {
+                Self::GlFrontFace
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glGenTextures" => {
+                Self::GlGenTextures
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glGenTextures" => {
+                Self::GlGenTextures
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glGetError" => {
+                Self::GlGetError
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glGetError" => {
+                Self::GlGetError
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glGetString" => {
+                Self::GlGetString
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glGetString" => {
+                Self::GlGetString
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glHint" => Self::GlHint,
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glHint" => Self::GlHint,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glLightfv" => {
+                Self::GlLightfv
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glLightfv" => {
+                Self::GlLightfv
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glLoadIdentity" => {
+                Self::GlLoadIdentity
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glLoadIdentity" => {
+                Self::GlLoadIdentity
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glMaterialfv" => {
+                Self::GlMaterialfv
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glMaterialfv" => {
+                Self::GlMaterialfv
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glMatrixMode" => {
+                Self::GlMatrixMode
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glMatrixMode" => {
+                Self::GlMatrixMode
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glNormalPointer" => {
+                Self::GlNormalPointer
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glNormalPointer" => {
+                Self::GlNormalPointer
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glOrtho" => {
+                Self::GlOrtho
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glOrtho" => Self::GlOrtho,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glPopMatrix" => {
+                Self::GlPopMatrix
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glPopMatrix" => {
+                Self::GlPopMatrix
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glPushMatrix" => {
+                Self::GlPushMatrix
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glPushMatrix" => {
+                Self::GlPushMatrix
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glReadPixels" => {
+                Self::GlReadPixels
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glReadPixels" => {
+                Self::GlReadPixels
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glRotatef" => {
+                Self::GlRotatef
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glRotatef" => {
+                Self::GlRotatef
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glScalef" => {
+                Self::GlScalef
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glScalef" => {
+                Self::GlScalef
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glShadeModel" => {
+                Self::GlShadeModel
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glShadeModel" => {
+                Self::GlShadeModel
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexCoord2f" => {
+                Self::GlTexCoord2f
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexCoord2f" => {
+                Self::GlTexCoord2f
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexCoordPointer" => {
+                Self::GlTexCoordPointer
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexCoordPointer" => {
+                Self::GlTexCoordPointer
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexImage2D" => {
+                Self::GlTexImage2D
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexImage2D" => {
+                Self::GlTexImage2D
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexParameterf" => {
+                Self::GlTexParameterf
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexParameterf" => {
+                Self::GlTexParameterf
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexParameteri" => {
+                Self::GlTexParameteri
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTexParameteri" => {
+                Self::GlTexParameteri
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glTranslatef" => {
+                Self::GlTranslatef
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glTranslatef" => {
+                Self::GlTranslatef
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertex2f" => {
+                Self::GlVertex2f
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertex2f" => {
+                Self::GlVertex2f
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertex3f" => {
+                Self::GlVertex3f
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertex3f" => {
+                Self::GlVertex3f
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertexPointer" => {
+                Self::GlVertexPointer
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glVertexPointer" => {
+                Self::GlVertexPointer
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glViewport" => {
+                Self::GlViewport
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "glViewport" => {
+                Self::GlViewport
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluBuild2DMipmaps" => {
+                Self::GluBuild2DMipmaps
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluBuild2DMipmaps" => {
+                Self::GluBuild2DMipmaps
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluCylinder" => {
+                Self::GluCylinder
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluCylinder" => {
+                Self::GluCylinder
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluDeleteQuadric" => {
+                Self::GluDeleteQuadric
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluDeleteQuadric" => {
+                Self::GluDeleteQuadric
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluDisk" => {
+                Self::GluDisk
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluDisk" => Self::GluDisk,
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluErrorString" => {
+                Self::GluErrorString
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluErrorString" => {
+                Self::GluErrorString
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluLookAt" => {
+                Self::GluLookAt
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluLookAt" => {
+                Self::GluLookAt
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluLookAt" => {
+                Self::GluLookAt
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluLookAt" => {
+                Self::GluLookAt
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluNewQuadric" => {
+                Self::GluNewQuadric
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluNewQuadric" => {
+                Self::GluNewQuadric
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluNewTess" => {
+                Self::GluNewTess
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluNewTess" => {
+                Self::GluNewTess
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluOrtho2D" => {
+                Self::GluOrtho2D
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluOrtho2D" => {
+                Self::GluOrtho2D
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPartialDisk" => {
+                Self::GluPartialDisk
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPartialDisk" => {
+                Self::GluPartialDisk
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPerspective" => {
+                Self::GluPerspective
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPerspective" => {
+                Self::GluPerspective
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPerspective" => {
+                Self::GluPerspective
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPerspective" => {
+                Self::GluPerspective
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPickMatrix" => {
+                Self::GluPickMatrix
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluPickMatrix" => {
+                Self::GluPickMatrix
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluProject" => {
+                Self::GluProject
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluProject" => {
+                Self::GluProject
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluScaleImage" => {
+                Self::GluScaleImage
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluScaleImage" => {
+                Self::GluScaleImage
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluSphere" => {
+                Self::GluSphere
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluSphere" => {
+                Self::GluSphere
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "gluTessBeginPolygon" =>
+            {
+                Self::GluTessBeginPolygon
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluTessBeginPolygon" => {
+                Self::GluTessBeginPolygon
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluTessEndPolygon" => {
+                Self::GluTessEndPolygon
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluTessEndPolygon" => {
+                Self::GluTessEndPolygon
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluTessVertex" => {
+                Self::GluTessVertex
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluTessVertex" => {
+                Self::GluTessVertex
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "gluUnProject" => {
+                Self::GluUnProject
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "gluUnProject" => {
+                Self::GluUnProject
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "wglChoosePixelFormat" =>
+            {
+                Self::WglChoosePixelFormat
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglChoosePixelFormat" => {
+                Self::WglChoosePixelFormat
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglCreateContext" => {
+                Self::WglCreateContext
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglCreateContext" => {
+                Self::WglCreateContext
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglDeleteContext" => {
+                Self::WglDeleteContext
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglDeleteContext" => {
+                Self::WglDeleteContext
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "wglDescribePixelFormat" =>
+            {
+                Self::WglDescribePixelFormat
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. })
+                if name == "wglDescribePixelFormat" =>
+            {
+                Self::WglDescribePixelFormat
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglGetPixelFormat" => {
+                Self::WglGetPixelFormat
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglGetPixelFormat" => {
+                Self::WglGetPixelFormat
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglGetProcAddress" => {
+                Self::WglGetProcAddress
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglGetProcAddress" => {
+                Self::WglGetProcAddress
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglMakeCurrent" => {
+                Self::WglMakeCurrent
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglMakeCurrent" => {
+                Self::WglMakeCurrent
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglSetPixelFormat" => {
+                Self::WglSetPixelFormat
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglSetPixelFormat" => {
+                Self::WglSetPixelFormat
+            }
+            ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "wglSwapBuffers" => {
+                Self::WglSwapBuffers
+            }
+            ("glu32.dll", ImportSymbol::ByName { name, .. }) if name == "wglSwapBuffers" => {
+                Self::WglSwapBuffers
+            }
             (_, ImportSymbol::ByName { name, .. }) => Self::Unsupported {
                 dll: import.resolved_module.clone(),
                 symbol: name.clone(),
@@ -120867,6 +121433,244 @@ mod tests {
             );
         })
     }
+
+    #[test]
+    fn evidence_gl_fixed_function_pipeline_renders_and_reads_back() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-gl");
+            let mut memory = MemoryImage::default();
+            let create_ctx: u64 = runtime.alloc_host_thunk(HostThunk::WglCreateContext);
+            let make_current: u64 = runtime.alloc_host_thunk(HostThunk::WglMakeCurrent);
+            let ctx = dispatch_x86_thunk(&mut runtime, &mut memory, create_ctx, &[0x1000]);
+            assert_ne!(ctx, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    make_current,
+                    &[0x1000, ctx as u32]
+                ),
+                1
+            );
+
+            let viewport: u64 = runtime.alloc_host_thunk(HostThunk::GlViewport);
+            let clear_color: u64 = runtime.alloc_host_thunk(HostThunk::GlClearColor);
+            let clear: u64 = runtime.alloc_host_thunk(HostThunk::GlClear);
+            let read: u64 = runtime.alloc_host_thunk(HostThunk::GlReadPixels);
+            dispatch_x86_thunk(&mut runtime, &mut memory, viewport, &[0, 0, 16, 16]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                clear_color,
+                &[
+                    0.25f32.to_bits(),
+                    0.5f32.to_bits(),
+                    0.75f32.to_bits(),
+                    1.0f32.to_bits(),
+                ],
+            );
+            dispatch_x86_thunk(&mut runtime, &mut memory, clear, &[0x0000_4000]);
+            let pixels_out = 0x41_000_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                read,
+                &[0, 0, 1, 1, 0x1908, 0x1401, pixels_out as u32],
+            );
+            let px = memory.read_bytes(pixels_out, 4).unwrap();
+            assert_eq!(&px[..3], &[64, 128, 191], "clear color readback got {px:?}");
+
+            // Projection: glOrtho(-1, 1, -1, 1, -1, 1) — the doubles live on
+            // the x86 stack at 8-byte offsets.
+            let ortho: u64 = runtime.alloc_host_thunk(HostThunk::GlOrtho);
+            let ortho_stack = 0x50_000_u64;
+            memory.map_bytes(ortho_stack, &[0_u8; 0x200]);
+            for (index, value) in [-1.0f64, 1.0, -1.0, 1.0, -1.0, 1.0].iter().enumerate() {
+                for (b, byte) in value.to_le_bytes().iter().enumerate() {
+                    memory.write_u8(ortho_stack + 4 + (index as u64 * 8) + b as u64, *byte);
+                }
+            }
+            let mut ortho_state = CpuState::new(GuestArch::X86);
+            ortho_state.set(Register::Rsp, ortho_stack);
+            runtime
+                .dispatch_import(ortho, &mut ortho_state, &mut memory)
+                .unwrap();
+
+            // A red triangle in immediate mode.
+            let begin: u64 = runtime.alloc_host_thunk(HostThunk::GlBegin);
+            let end: u64 = runtime.alloc_host_thunk(HostThunk::GlEnd);
+            let color3f: u64 = runtime.alloc_host_thunk(HostThunk::GlColor3f);
+            let vertex3f: u64 = runtime.alloc_host_thunk(HostThunk::GlVertex3f);
+            dispatch_x86_thunk(&mut runtime, &mut memory, begin, &[0x0004]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                color3f,
+                &[1.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                vertex3f,
+                &[0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                vertex3f,
+                &[1.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                vertex3f,
+                &[0.5f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(&mut runtime, &mut memory, end, &[]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                read,
+                &[12, 10, 1, 1, 0x1908, 0x1401, pixels_out as u32],
+            );
+            let px = memory.read_bytes(pixels_out, 4).unwrap();
+            assert_eq!(px[0], 255, "triangle interior is red got {px:?}");
+            assert_eq!(px[1], 0);
+            assert_eq!(px[2], 0);
+
+            // Texture object + texel upload + textured draw.
+            let gen_textures: u64 = runtime.alloc_host_thunk(HostThunk::GlGenTextures);
+            let bind: u64 = runtime.alloc_host_thunk(HostThunk::GlBindTexture);
+            let tex_image: u64 = runtime.alloc_host_thunk(HostThunk::GlTexImage2D);
+            let enable: u64 = runtime.alloc_host_thunk(HostThunk::GlEnable);
+            let texcoord2f: u64 = runtime.alloc_host_thunk(HostThunk::GlTexCoord2f);
+            let name_out = 0x41_100_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                gen_textures,
+                &[1, name_out as u32],
+            );
+            let tex_name = read_guest_u32(&memory, name_out).unwrap();
+            assert_eq!(tex_name, 1);
+            dispatch_x86_thunk(&mut runtime, &mut memory, bind, &[0x0DE1, tex_name]);
+            let texel_out = 0x41_200_u64;
+            let red_texels: Vec<u8> = vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ];
+            memory.map_bytes(texel_out, &red_texels);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                tex_image,
+                &[0x0DE1, 0, 0x1908, 2, 2, 0, 0x1908, 0x1401, texel_out as u32],
+            );
+            dispatch_x86_thunk(&mut runtime, &mut memory, enable, &[0x0DE1]);
+            dispatch_x86_thunk(&mut runtime, &mut memory, begin, &[0x0004]);
+            dispatch_x86_thunk(&mut runtime, &mut memory, color3f, &[1.0f32.to_bits(); 3]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                texcoord2f,
+                &[0.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(&mut runtime, &mut memory, vertex3f, &[0.0f32.to_bits(); 3]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                texcoord2f,
+                &[1.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                vertex3f,
+                &[1.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                texcoord2f,
+                &[0.5f32.to_bits(), 1.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                vertex3f,
+                &[0.5f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits()],
+            );
+            dispatch_x86_thunk(&mut runtime, &mut memory, end, &[]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                read,
+                &[12, 10, 1, 1, 0x1908, 0x1401, pixels_out as u32],
+            );
+            let px = memory.read_bytes(pixels_out, 4).unwrap();
+            assert_eq!(px[0], 255, "textured triangle samples the red texel");
+
+            // GLU math on the same matrices.
+            let perspective: u64 = runtime.alloc_host_thunk(HostThunk::GluPerspective);
+            let look_at: u64 = runtime.alloc_host_thunk(HostThunk::GluLookAt);
+            let doubles_stack = 0x51_000_u64;
+            memory.map_bytes(doubles_stack, &[0_u8; 0x400]);
+            let doubles = [45.0f64, 1.0, 0.1, 100.0];
+            for (index, value) in doubles.iter().enumerate() {
+                for (b, byte) in value.to_le_bytes().iter().enumerate() {
+                    memory.write_u8(doubles_stack + 4 + (index as u64 * 8) + b as u64, *byte);
+                }
+            }
+            let mut gl_state = CpuState::new(GuestArch::X86);
+            gl_state.set(Register::Rsp, doubles_stack);
+            runtime
+                .dispatch_import(perspective, &mut gl_state, &mut memory)
+                .unwrap();
+            let eye_doubles = [0.0f64, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            let la_stack = 0x51_400_u64;
+            memory.map_bytes(la_stack, &[0_u8; 0x400]);
+            for (index, value) in eye_doubles.iter().enumerate() {
+                for (b, byte) in value.to_le_bytes().iter().enumerate() {
+                    memory.write_u8(la_stack + 4 + (index as u64 * 8) + b as u64, *byte);
+                }
+            }
+            let mut gl_state = CpuState::new(GuestArch::X86);
+            gl_state.set(Register::Rsp, la_stack);
+            runtime
+                .dispatch_import(look_at, &mut gl_state, &mut memory)
+                .unwrap();
+
+            // WGL pixel format round trip.
+            let choose: u64 = runtime.alloc_host_thunk(HostThunk::WglChoosePixelFormat);
+            let set_format: u64 = runtime.alloc_host_thunk(HostThunk::WglSetPixelFormat);
+            let get_format: u64 = runtime.alloc_host_thunk(HostThunk::WglGetPixelFormat);
+            let format_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    choose,
+                    &[0x2000, 0, 1, format_out as u32]
+                ),
+                1
+            );
+            assert_eq!(read_guest_u32(&memory, format_out).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_format, &[0x2000, 1, 0]),
+                1
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_format, &[0x2000]),
+                1
+            );
+
+            // The whole sequence leaves no GL error pending.
+            let get_error: u64 = runtime.alloc_host_thunk(HostThunk::GlGetError);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, get_error, &[]),
+                0
+            );
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -122936,6 +123740,11 @@ fn write_guest_u64(memory: &mut MemoryImage, address: u64, value: u64) -> AppRes
     Ok(())
 }
 
+fn write_guest_f64(memory: &mut MemoryImage, address: u64, value: f64) -> AppResult<()> {
+    memory.write_u64(address, value.to_bits());
+    Ok(())
+}
+
 fn write_guest_f32(memory: &mut MemoryImage, address: u64, value: f32) -> AppResult<()> {
     memory.write_u32(address, value.to_bits());
     Ok(())
@@ -122943,6 +123752,10 @@ fn write_guest_f32(memory: &mut MemoryImage, address: u64, value: f32) -> AppRes
 
 fn read_guest_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
     memory.read_u64(address)
+}
+
+fn read_guest_f64(memory: &MemoryImage, address: u64) -> AppResult<f64> {
+    Ok(f64::from_bits(memory.read_u64(address)?))
 }
 
 fn read_guest_bytes(memory: &MemoryImage, address: u64, len: usize) -> AppResult<Vec<u8>> {
@@ -130560,6 +131373,26 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ordinal: 15,
             name: Some("MFCreatePresentationClock".to_string()),
             target: ExportTarget::Rva(0x240e0),
+        },
+        ExportSymbol {
+            ordinal: 16,
+            name: Some("MFAddPeriodicCallback".to_string()),
+            target: ExportTarget::Rva(0x240f0),
+        },
+        ExportSymbol {
+            ordinal: 17,
+            name: Some("MFCancelPeriodicCallback".to_string()),
+            target: ExportTarget::Rva(0x24100),
+        },
+        ExportSymbol {
+            ordinal: 18,
+            name: Some("MFGetSystemTime".to_string()),
+            target: ExportTarget::Rva(0x24110),
+        },
+        ExportSymbol {
+            ordinal: 19,
+            name: Some("MFCreateDXGIDeviceManager".to_string()),
+            target: ExportTarget::Rva(0x24120),
         },
     ];
 

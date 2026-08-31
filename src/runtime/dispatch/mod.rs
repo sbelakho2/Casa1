@@ -8,3 +8,4 @@
 pub(crate) mod com;
 pub(crate) mod mf;
 pub(crate) mod ntdll;
+pub(crate) mod opengl;

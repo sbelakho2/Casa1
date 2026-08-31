@@ -594,6 +594,142 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) next_handle: u64,
 }
 
+/// The OpenGL 1.1 fixed-function guest state: per-context matrix stacks,
+/// texture objects, the software framebuffer, and the WGL context surface
+/// (consumed by `runtime/dispatch/opengl.rs`).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // OpenGL guest state consumed by runtime/dispatch/opengl.rs
+pub(crate) struct OpenGlGuestState {
+    /// Context handle -> context.
+    pub(crate) contexts: HashMap<u64, OpenGlContext>,
+    /// The current context handle (0 = none).
+    pub(crate) current_context: u64,
+    /// Next context handle to hand out.
+    pub(crate) next_context: u64,
+    /// Next texture name to hand out (glGenTextures).
+    pub(crate) next_texture: u32,
+    /// HDC -> chosen pixel format (wglSetPixelFormat).
+    pub(crate) dc_pixel_formats: HashMap<u64, i32>,
+    /// The pending GL error (glGetError reads and clears it).
+    pub(crate) error: u32,
+    /// Guest-resident scratch slots for glGetString + gluErrorString.
+    pub(crate) string_slots: [u64; 5],
+    /// The active GLU tessellation object (gluNewTess).
+    pub(crate) glu_tess: u64,
+    /// Vertices collected between gluTessBeginPolygon/gluTessEndPolygon.
+    pub(crate) glu_tess_vertices: Vec<GlVertexState>,
+}
+
+/// One OpenGL rendering context.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // OpenGL context state consumed by runtime/dispatch/opengl.rs
+pub(crate) struct OpenGlContext {
+    /// GL_MODELVIEW / GL_PROJECTION / GL_TEXTURE.
+    pub(crate) matrix_mode: u32,
+    /// Model-view matrix stack (top = current).
+    pub(crate) modelview: Vec<[f32; 16]>,
+    /// Projection matrix stack.
+    pub(crate) projection: Vec<[f32; 16]>,
+    /// Texture matrix stack.
+    pub(crate) texture: Vec<[f32; 16]>,
+    /// glViewport(x, y, w, h).
+    pub(crate) viewport: [i32; 4],
+    /// glClearColor.
+    pub(crate) clear_color: [f32; 4],
+    /// The current color (glColor*).
+    pub(crate) current_color: [f32; 4],
+    /// Enabled capabilities bitmask (GL_DEPTH_TEST / GL_CULL_FACE /
+    /// GL_LIGHTING / GL_TEXTURE_2D / GL_BLEND).
+    pub(crate) enabled: u32,
+    /// Client-side array enables (GL_VERTEX_ARRAY / ...).
+    pub(crate) client_enabled: u32,
+    /// glDepthFunc parameter.
+    pub(crate) depth_func: u32,
+    /// glCullFace parameter.
+    pub(crate) cull_face: u32,
+    /// glFrontFace parameter.
+    pub(crate) front_face: u32,
+    /// glShadeModel parameter.
+    pub(crate) shade_model: u32,
+    /// glBlendFunc parameters.
+    pub(crate) blend_src: u32,
+    pub(crate) blend_dst: u32,
+    /// The texture bound to GL_TEXTURE_2D.
+    pub(crate) bound_texture: u32,
+    /// Texture objects by name.
+    pub(crate) textures: HashMap<u32, GlTextureState>,
+    /// The software color+depth framebuffer.
+    pub(crate) framebuffer: GlFramebufferState,
+    /// glBegin mode (0 = no begin/end block).
+    pub(crate) begin_mode: u32,
+    /// Vertices collected inside begin/end.
+    pub(crate) immediate: Vec<GlVertexState>,
+    /// The current texture coordinate.
+    pub(crate) current_tex_coord: [f32; 2],
+    /// The current normal.
+    pub(crate) current_normal: [f32; 3],
+    /// The client-side array bindings.
+    pub(crate) arrays: GlArraysState,
+    /// GL_LIGHT0..7 position parameters.
+    pub(crate) light_positions: Vec<[f32; 4]>,
+    /// The current material ambient/diffuse.
+    pub(crate) material: [f32; 4],
+}
+
+/// A texture object (RGBA8 texels, nearest-neighbor sampling).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // texture state consumed by the OpenGL rasterizer
+pub(crate) struct GlTextureState {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) texels: Vec<u8>,
+    pub(crate) min_filter: u32,
+    pub(crate) mag_filter: u32,
+}
+
+/// The software framebuffer a GL context renders into.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // framebuffer state consumed by the OpenGL rasterizer
+pub(crate) struct GlFramebufferState {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) depth: Vec<f32>,
+}
+
+/// A vertex collected during glBegin/glEnd.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlVertexState {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) z: f32,
+    pub(crate) color: [f32; 4],
+    pub(crate) tex: [f32; 2],
+}
+
+/// The four client-side array bindings.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // array bindings consumed by glDrawArrays/glDrawElements
+pub(crate) struct GlArraysState {
+    pub(crate) vertex: GlArrayBinding,
+    pub(crate) color: GlArrayBinding,
+    pub(crate) normal: GlArrayBinding,
+    pub(crate) texcoord: GlArrayBinding,
+}
+
+/// One client-side array binding.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GlArrayBinding {
+    /// GL_FLOAT or GL_UNSIGNED_BYTE.
+    pub(crate) kind: u32,
+    /// Components per element.
+    pub(crate) size: u32,
+    /// Byte stride (0 = tightly packed).
+    pub(crate) stride: u32,
+    /// Guest pointer to the element data.
+    pub(crate) pointer: u64,
+}
+
 /// A guest MFPERIODICCALLBACK registration.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // periodic-callback payload read by the evidence test + future work-queue dispatch
@@ -1326,6 +1462,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_byte_streams: HashMap<u64, ImfByteStreamState>,
     /// Guest IMFDXGIDeviceManager object -> device manager state.
     pub(crate) mf_dxgi_device_managers: HashMap<u64, MfDxgiDeviceManagerState>,
+    /// The OpenGL 1.1 fixed-function guest state.
+    pub(crate) opengl: OpenGlGuestState,
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
@@ -1896,6 +2034,7 @@ impl PeHostRuntime {
             mf_source_readers: HashMap::new(),
             mf_byte_streams: HashMap::new(),
             mf_dxgi_device_managers: HashMap::new(),
+            opengl: OpenGlGuestState::default(),
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
