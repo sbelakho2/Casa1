@@ -263,6 +263,7 @@ pub(crate) enum GuestObjectKind {
     Dxva2VideoService,
     CspContext,
     CspKey,
+    VssBackup,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1714,6 +1715,10 @@ pub(crate) struct PeHostRuntime {
     pub(crate) csp_keys: HashMap<u64, CspKeyState>,
     /// The security packages (QuerySecurityPackageInfoW).
     pub(crate) sec_packages: HashMap<u64, String>,
+    /// The WIM file handles.
+    pub(crate) wim_handles: HashMap<u64, u32>,
+    /// The WMI connection handles.
+    pub(crate) wmi_handles: HashMap<u64, String>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2321,6 +2326,8 @@ impl PeHostRuntime {
             csp_contexts: HashMap::new(),
             csp_keys: HashMap::new(),
             sec_packages: HashMap::new(),
+            wim_handles: HashMap::new(),
+            wmi_handles: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),

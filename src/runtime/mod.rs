@@ -5420,6 +5420,101 @@ pub enum HostThunk {
     InitSecurityInterfaceW,
     SslGetDataToWrite,
     SslLoadCertificate,
+    ImageListGetIcon,
+    ImageListGetIconSize,
+    ImageListSetIconSize,
+    PropertySheetW,
+    CmFreeDeviceIdList,
+    CmGetDevNodeStatus,
+    CmGetDeviceIdListW,
+    CmGetDeviceIdListSizeW,
+    CmLocateDevNodeW,
+    PowerGetActiveScheme,
+    PowerReadACValue,
+    PowerReadDCValue,
+    PowerSetActiveScheme,
+    WimApplyImage,
+    WimCloseHandle,
+    WimCreateFile,
+    WimLoadImage,
+    WimUnmountImageHandle,
+    RoActivateInstance,
+    RoGetActivationFactory,
+    RoInitialize,
+    RoUninitialize,
+    CreateXmlReader,
+    CreateXmlReaderInputWithEncoding,
+    CreateXmlWriter,
+    CreateXmlWriterOutputWithEncoding,
+    CoInternetIsFeatureEnabled,
+    CoInternetSetFeatureEnabled,
+    ObtainUserAgentString,
+    UrlDownloadToCacheFileW,
+    UrlDownloadToFileW,
+    WinHttpCrackUrl,
+    WinHttpCreateUrl,
+    WinHttpDetectAutoProxyConfigUrl,
+    WinHttpTimeFromSystemTime,
+    WinHttpTimeToSystemTime,
+    SpCreateObjectFromKey,
+    SpCreateObjectFromToken,
+    SpEnumTokens,
+    SpGetCategoryFromId,
+    SpGetDescription,
+    RasDial,
+    RasEnumConnections,
+    RasGetConnectionStatus,
+    RasGetErrorString,
+    RasHangUp,
+    RasSetEntryProperties,
+    WmiClose,
+    WmiConnect,
+    WmiInitialize,
+    WmiQuery,
+    UiaGetPatternProvider,
+    UiaGetRuntimeId,
+    UiaGetUpdatedCache,
+    UiaLookupId,
+    UiaNavigate,
+    UiaRaiseAutomationEvent,
+    UiaRaiseAutomationPropertyChangedEvent,
+    AccessibleObjectFromEvent,
+    AccessibleObjectFromPoint,
+    AccessibleObjectFromWindow,
+    GetAccessibleObjectFromWindow,
+    GetOleaccVersionInfo,
+    WindowFromAccessibleObject,
+    DhcpCApiCleanup,
+    DhcpCApiInitialize,
+    DhcpReleaseParams,
+    DhcpRenewParams,
+    DhcpRequestParams,
+    DnsFlushResolverCache,
+    DnsQueryConfig,
+    DnsQueryW,
+    DnsRecordListFree,
+    DiInstallDevice,
+    DiInstallDriverW,
+    DiUninstallDevice,
+    UpdateDriverForPlugAndPlayDevicesW,
+    WtsEnumerateSessionsW,
+    WtsFreeMemory,
+    WtsQuerySessionInformationW,
+    WtsQueryUserToken,
+    CreateVssBackupComponents,
+    VssFreeComponent,
+    VssFreeSnapshotProperties,
+    VssFreeWriterMetadata,
+    CreateTextServices,
+    ITextDocument,
+    RichEdit10AnsiWndClass,
+    ShutdownTextServices,
+    Dp8spCreate,
+    DirectPlay8Create,
+    DirectSoundCaptureCreate8,
+    DirectSoundCaptureEnumerateW,
+    DirectSoundCreate8,
+    DirectSoundEnumerateW,
     CryptUiDlgCertMgr,
     CryptUiDlgSelectCertificateW,
     CryptUiDlgSelectStoreW,
@@ -28546,6 +28641,9 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::WtGetSignatureInfo | HostThunk::WtHelperGetProvPrivateDataFromChain | HostThunk::WtHelperGetProvSignerFromChain | HostThunk::WtHelperProvDataFromStateData | HostThunk::CryptDecodeObject | HostThunk::CryptEncodeObject | HostThunk::CryptExportPkcs8 | HostThunk::FreeContextBuffer | HostThunk::QuerySecurityPackageInfoW | HostThunk::SspiInitialize | HostThunk::InitSecurityInterfaceW | HostThunk::SslGetDataToWrite | HostThunk::SslLoadCertificate | HostThunk::CryptUiDlgCertMgr | HostThunk::CryptUiDlgSelectCertificateW | HostThunk::CryptUiDlgSelectStoreW | HostThunk::CryptUiDlgViewCertificateW) => {
                 self.dispatch_trust(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::ImageListGetIcon | HostThunk::ImageListGetIconSize | HostThunk::ImageListSetIconSize | HostThunk::PropertySheetW | HostThunk::CmFreeDeviceIdList | HostThunk::CmGetDevNodeStatus | HostThunk::CmGetDeviceIdListW | HostThunk::CmGetDeviceIdListSizeW | HostThunk::CmLocateDevNodeW | HostThunk::PowerGetActiveScheme | HostThunk::PowerReadACValue | HostThunk::PowerReadDCValue | HostThunk::PowerSetActiveScheme | HostThunk::WimApplyImage | HostThunk::WimCloseHandle | HostThunk::WimCreateFile | HostThunk::WimLoadImage | HostThunk::WimUnmountImageHandle | HostThunk::RoActivateInstance | HostThunk::RoGetActivationFactory | HostThunk::RoInitialize | HostThunk::RoUninitialize | HostThunk::CreateXmlReader | HostThunk::CreateXmlReaderInputWithEncoding | HostThunk::CreateXmlWriter | HostThunk::CreateXmlWriterOutputWithEncoding | HostThunk::CoInternetIsFeatureEnabled | HostThunk::CoInternetSetFeatureEnabled | HostThunk::ObtainUserAgentString | HostThunk::UrlDownloadToCacheFileW | HostThunk::UrlDownloadToFileW | HostThunk::WinHttpCrackUrl | HostThunk::WinHttpCreateUrl | HostThunk::WinHttpDetectAutoProxyConfigUrl | HostThunk::WinHttpTimeFromSystemTime | HostThunk::WinHttpTimeToSystemTime | HostThunk::SpCreateObjectFromKey | HostThunk::SpCreateObjectFromToken | HostThunk::SpEnumTokens | HostThunk::SpGetCategoryFromId | HostThunk::SpGetDescription | HostThunk::RasDial | HostThunk::RasEnumConnections | HostThunk::RasGetConnectionStatus | HostThunk::RasGetErrorString | HostThunk::RasHangUp | HostThunk::RasSetEntryProperties | HostThunk::WmiClose | HostThunk::WmiConnect | HostThunk::WmiInitialize | HostThunk::WmiQuery | HostThunk::UiaGetPatternProvider | HostThunk::UiaGetRuntimeId | HostThunk::UiaGetUpdatedCache | HostThunk::UiaLookupId | HostThunk::UiaNavigate | HostThunk::UiaRaiseAutomationEvent | HostThunk::UiaRaiseAutomationPropertyChangedEvent | HostThunk::AccessibleObjectFromEvent | HostThunk::AccessibleObjectFromPoint | HostThunk::AccessibleObjectFromWindow | HostThunk::GetAccessibleObjectFromWindow | HostThunk::GetOleaccVersionInfo | HostThunk::WindowFromAccessibleObject | HostThunk::DhcpCApiCleanup | HostThunk::DhcpCApiInitialize | HostThunk::DhcpReleaseParams | HostThunk::DhcpRenewParams | HostThunk::DhcpRequestParams | HostThunk::DnsFlushResolverCache | HostThunk::DnsQueryConfig | HostThunk::DnsQueryW | HostThunk::DnsRecordListFree | HostThunk::DiInstallDevice | HostThunk::DiInstallDriverW | HostThunk::DiUninstallDevice | HostThunk::UpdateDriverForPlugAndPlayDevicesW | HostThunk::WtsEnumerateSessionsW | HostThunk::WtsFreeMemory | HostThunk::WtsQuerySessionInformationW | HostThunk::WtsQueryUserToken | HostThunk::CreateVssBackupComponents | HostThunk::VssFreeComponent | HostThunk::VssFreeSnapshotProperties | HostThunk::VssFreeWriterMetadata | HostThunk::CreateTextServices | HostThunk::ITextDocument | HostThunk::RichEdit10AnsiWndClass | HostThunk::ShutdownTextServices | HostThunk::Dp8spCreate | HostThunk::DirectPlay8Create | HostThunk::DirectSoundCaptureCreate8 | HostThunk::DirectSoundCaptureEnumerateW | HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundEnumerateW) => {
+                self.dispatch_system_sweep(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -64736,7 +64834,8 @@ impl PeHostRuntime {
             | GuestObjectKind::ComErrorInfo
             | GuestObjectKind::Dxva2VideoService
             | GuestObjectKind::CspContext
-            | GuestObjectKind::CspKey => {
+            | GuestObjectKind::CspKey
+            | GuestObjectKind::VssBackup => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -82081,6 +82180,424 @@ impl HostThunk {
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
                 Self::FindTextW
+            }
+            ("comctl32.dll", ImportSymbol::ByName { name, .. }) if name == "ImageList_GetIcon" => {
+                Self::ImageListGetIcon
+            }
+            ("comctl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageList_GetIconSize" =>
+            {
+                Self::ImageListGetIconSize
+            }
+            ("comctl32.dll", ImportSymbol::ByName { name, .. })
+                if name == "ImageList_SetIconSize" =>
+            {
+                Self::ImageListSetIconSize
+            }
+            ("comctl32.dll", ImportSymbol::ByName { name, .. }) if name == "InitCommonControls" => {
+                Self::InitCommonControls
+            }
+            ("comctl32.dll", ImportSymbol::ByName { name, .. }) if name == "PropertySheetW" => {
+                Self::PropertySheetW
+            }
+            ("cfgmgr32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CM_Free_Device_ID_List" =>
+            {
+                Self::CmFreeDeviceIdList
+            }
+            ("cfgmgr32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CM_Get_DevNode_Status" =>
+            {
+                Self::CmGetDevNodeStatus
+            }
+            ("cfgmgr32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CM_Get_Device_ID_ListW" =>
+            {
+                Self::CmGetDeviceIdListW
+            }
+            ("cfgmgr32.dll", ImportSymbol::ByName { name, .. })
+                if name == "CM_Get_Device_ID_List_SizeW" =>
+            {
+                Self::CmGetDeviceIdListSizeW
+            }
+            ("cfgmgr32.dll", ImportSymbol::ByName { name, .. }) if name == "CM_Locate_DevNodeW" => {
+                Self::CmLocateDevNodeW
+            }
+            ("powrprof.dll", ImportSymbol::ByName { name, .. })
+                if name == "PowerGetActiveScheme" =>
+            {
+                Self::PowerGetActiveScheme
+            }
+            ("powrprof.dll", ImportSymbol::ByName { name, .. }) if name == "PowerReadACValue" => {
+                Self::PowerReadACValue
+            }
+            ("powrprof.dll", ImportSymbol::ByName { name, .. }) if name == "PowerReadDCValue" => {
+                Self::PowerReadDCValue
+            }
+            ("powrprof.dll", ImportSymbol::ByName { name, .. })
+                if name == "PowerSetActiveScheme" =>
+            {
+                Self::PowerSetActiveScheme
+            }
+            ("wimgapi.dll", ImportSymbol::ByName { name, .. }) if name == "WIMApplyImage" => {
+                Self::WimApplyImage
+            }
+            ("wimgapi.dll", ImportSymbol::ByName { name, .. }) if name == "WIMCloseHandle" => {
+                Self::WimCloseHandle
+            }
+            ("wimgapi.dll", ImportSymbol::ByName { name, .. }) if name == "WIMCreateFile" => {
+                Self::WimCreateFile
+            }
+            ("wimgapi.dll", ImportSymbol::ByName { name, .. }) if name == "WIMLoadImage" => {
+                Self::WimLoadImage
+            }
+            ("wimgapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "WIMUnmountImageHandle" =>
+            {
+                Self::WimUnmountImageHandle
+            }
+            ("wintypes.dll", ImportSymbol::ByName { name, .. }) if name == "RoActivateInstance" => {
+                Self::RoActivateInstance
+            }
+            ("wintypes.dll", ImportSymbol::ByName { name, .. })
+                if name == "RoGetActivationFactory" =>
+            {
+                Self::RoGetActivationFactory
+            }
+            ("wintypes.dll", ImportSymbol::ByName { name, .. }) if name == "RoInitialize" => {
+                Self::RoInitialize
+            }
+            ("wintypes.dll", ImportSymbol::ByName { name, .. }) if name == "RoUninitialize" => {
+                Self::RoUninitialize
+            }
+            ("xmllite.dll", ImportSymbol::ByName { name, .. }) if name == "CreateXmlReader" => {
+                Self::CreateXmlReader
+            }
+            ("xmllite.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateXmlReaderInputWithEncoding" =>
+            {
+                Self::CreateXmlReaderInputWithEncoding
+            }
+            ("xmllite.dll", ImportSymbol::ByName { name, .. }) if name == "CreateXmlWriter" => {
+                Self::CreateXmlWriter
+            }
+            ("xmllite.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateXmlWriterOutputWithEncoding" =>
+            {
+                Self::CreateXmlWriterOutputWithEncoding
+            }
+            ("urlmon.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoInternetIsFeatureEnabled" =>
+            {
+                Self::CoInternetIsFeatureEnabled
+            }
+            ("urlmon.dll", ImportSymbol::ByName { name, .. })
+                if name == "CoInternetSetFeatureEnabled" =>
+            {
+                Self::CoInternetSetFeatureEnabled
+            }
+            ("urlmon.dll", ImportSymbol::ByName { name, .. })
+                if name == "ObtainUserAgentString" =>
+            {
+                Self::ObtainUserAgentString
+            }
+            ("urlmon.dll", ImportSymbol::ByName { name, .. })
+                if name == "URLDownloadToCacheFileW" =>
+            {
+                Self::UrlDownloadToCacheFileW
+            }
+            ("urlmon.dll", ImportSymbol::ByName { name, .. }) if name == "URLDownloadToFileW" => {
+                Self::UrlDownloadToFileW
+            }
+            ("winhttp.dll", ImportSymbol::ByName { name, .. }) if name == "WinHttpCrackUrl" => {
+                Self::WinHttpCrackUrl
+            }
+            ("winhttp.dll", ImportSymbol::ByName { name, .. }) if name == "WinHttpCreateUrl" => {
+                Self::WinHttpCreateUrl
+            }
+            ("winhttp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WinHttpDetectAutoProxyConfigUrl" =>
+            {
+                Self::WinHttpDetectAutoProxyConfigUrl
+            }
+            ("winhttp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WinHttpTimeFromSystemTime" =>
+            {
+                Self::WinHttpTimeFromSystemTime
+            }
+            ("winhttp.dll", ImportSymbol::ByName { name, .. })
+                if name == "WinHttpTimeToSystemTime" =>
+            {
+                Self::WinHttpTimeToSystemTime
+            }
+            ("sapi.dll", ImportSymbol::ByName { name, .. }) if name == "SpCreateObjectFromKey" => {
+                Self::SpCreateObjectFromKey
+            }
+            ("sapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "SpCreateObjectFromToken" =>
+            {
+                Self::SpCreateObjectFromToken
+            }
+            ("sapi.dll", ImportSymbol::ByName { name, .. }) if name == "SpEnumTokens" => {
+                Self::SpEnumTokens
+            }
+            ("sapi.dll", ImportSymbol::ByName { name, .. }) if name == "SpGetCategoryFromId" => {
+                Self::SpGetCategoryFromId
+            }
+            ("sapi.dll", ImportSymbol::ByName { name, .. }) if name == "SpGetDescription" => {
+                Self::SpGetDescription
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RasDial" => {
+                Self::RasDial
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RasEnumConnections" => {
+                Self::RasEnumConnections
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "RasGetConnectionStatus" =>
+            {
+                Self::RasGetConnectionStatus
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RasGetErrorString" => {
+                Self::RasGetErrorString
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RasHangUp" => {
+                Self::RasHangUp
+            }
+            ("rasapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "RasSetEntryProperties" =>
+            {
+                Self::RasSetEntryProperties
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. }) if name == "WMIClose" => {
+                Self::WmiClose
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. }) if name == "WMIConnect" => {
+                Self::WmiConnect
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. }) if name == "WMIInitialize" => {
+                Self::WmiInitialize
+            }
+            ("wbemprox.dll", ImportSymbol::ByName { name, .. }) if name == "WMIQuery" => {
+                Self::WmiQuery
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaGetPatternProvider" =>
+            {
+                Self::UiaGetPatternProvider
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaGetRuntimeId" =>
+            {
+                Self::UiaGetRuntimeId
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaGetUpdatedCache" =>
+            {
+                Self::UiaGetUpdatedCache
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaLookupId" =>
+            {
+                Self::UiaLookupId
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaNavigate" =>
+            {
+                Self::UiaNavigate
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaRaiseAutomationEvent" =>
+            {
+                Self::UiaRaiseAutomationEvent
+            }
+            ("uiautomationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "UiaRaiseAutomationPropertyChangedEvent" =>
+            {
+                Self::UiaRaiseAutomationPropertyChangedEvent
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. })
+                if name == "AccessibleObjectFromEvent" =>
+            {
+                Self::AccessibleObjectFromEvent
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. })
+                if name == "AccessibleObjectFromPoint" =>
+            {
+                Self::AccessibleObjectFromPoint
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. })
+                if name == "AccessibleObjectFromWindow" =>
+            {
+                Self::AccessibleObjectFromWindow
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetAccessibleObjectFromWindow" =>
+            {
+                Self::GetAccessibleObjectFromWindow
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. }) if name == "GetOleaccVersionInfo" => {
+                Self::GetOleaccVersionInfo
+            }
+            ("oleacc.dll", ImportSymbol::ByName { name, .. })
+                if name == "WindowFromAccessibleObject" =>
+            {
+                Self::WindowFromAccessibleObject
+            }
+            ("dhcpcsvc.dll", ImportSymbol::ByName { name, .. }) if name == "DhcpCApiCleanup" => {
+                Self::DhcpCApiCleanup
+            }
+            ("dhcpcsvc.dll", ImportSymbol::ByName { name, .. }) if name == "DhcpCApiInitialize" => {
+                Self::DhcpCApiInitialize
+            }
+            ("dhcpcsvc.dll", ImportSymbol::ByName { name, .. }) if name == "DhcpReleaseParams" => {
+                Self::DhcpReleaseParams
+            }
+            ("dhcpcsvc.dll", ImportSymbol::ByName { name, .. }) if name == "DhcpRenewParams" => {
+                Self::DhcpRenewParams
+            }
+            ("dhcpcsvc.dll", ImportSymbol::ByName { name, .. }) if name == "DhcpRequestParams" => {
+                Self::DhcpRequestParams
+            }
+            ("dnsapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "DnsFlushResolverCache" =>
+            {
+                Self::DnsFlushResolverCache
+            }
+            ("dnsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DnsQueryConfig" => {
+                Self::DnsQueryConfig
+            }
+            ("dnsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DnsQuery_W" => {
+                Self::DnsQueryW
+            }
+            ("dnsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DnsRecordListFree" => {
+                Self::DnsRecordListFree
+            }
+            ("newdev.dll", ImportSymbol::ByName { name, .. }) if name == "DiInstallDevice" => {
+                Self::DiInstallDevice
+            }
+            ("newdev.dll", ImportSymbol::ByName { name, .. }) if name == "DiInstallDriverW" => {
+                Self::DiInstallDriverW
+            }
+            ("newdev.dll", ImportSymbol::ByName { name, .. }) if name == "DiUninstallDevice" => {
+                Self::DiUninstallDevice
+            }
+            ("newdev.dll", ImportSymbol::ByName { name, .. })
+                if name == "UpdateDriverForPlugAndPlayDevicesW" =>
+            {
+                Self::UpdateDriverForPlugAndPlayDevicesW
+            }
+            ("wtsapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "WTSEnumerateSessionsW" =>
+            {
+                Self::WtsEnumerateSessionsW
+            }
+            ("wtsapi32.dll", ImportSymbol::ByName { name, .. }) if name == "WTSFreeMemory" => {
+                Self::WtsFreeMemory
+            }
+            ("wtsapi32.dll", ImportSymbol::ByName { name, .. })
+                if name == "WTSQuerySessionInformationW" =>
+            {
+                Self::WtsQuerySessionInformationW
+            }
+            ("wtsapi32.dll", ImportSymbol::ByName { name, .. }) if name == "WTSQueryUserToken" => {
+                Self::WtsQueryUserToken
+            }
+            ("vssapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateVssBackupComponents" =>
+            {
+                Self::CreateVssBackupComponents
+            }
+            ("vssapi.dll", ImportSymbol::ByName { name, .. }) if name == "VssFreeComponent" => {
+                Self::VssFreeComponent
+            }
+            ("vssapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "VssFreeSnapshotProperties" =>
+            {
+                Self::VssFreeSnapshotProperties
+            }
+            ("vssapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "VssFreeWriterMetadata" =>
+            {
+                Self::VssFreeWriterMetadata
+            }
+            ("comsvcs.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("comsvcs.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("comsvcs.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("comsvcs.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("riched20.dll", ImportSymbol::ByName { name, .. }) if name == "CreateTextServices" => {
+                Self::CreateTextServices
+            }
+            ("riched20.dll", ImportSymbol::ByName { name, .. }) if name == "ITextDocument" => {
+                Self::ITextDocument
+            }
+            ("riched20.dll", ImportSymbol::ByName { name, .. })
+                if name == "RichEdit10ANSIWndClass" =>
+            {
+                Self::RichEdit10AnsiWndClass
+            }
+            ("riched20.dll", ImportSymbol::ByName { name, .. })
+                if name == "ShutdownTextServices" =>
+            {
+                Self::ShutdownTextServices
+            }
+            ("dpnet.dll", ImportSymbol::ByName { name, .. }) if name == "DP8SPCreate" => {
+                Self::Dp8spCreate
+            }
+            ("dpnet.dll", ImportSymbol::ByName { name, .. }) if name == "DirectPlay8Create" => {
+                Self::DirectPlay8Create
+            }
+            ("dpnet.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("dpnet.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("dsound.dll", ImportSymbol::ByName { name, .. })
+                if name == "DirectSoundCaptureCreate8" =>
+            {
+                Self::DirectSoundCaptureCreate8
+            }
+            ("dsound.dll", ImportSymbol::ByName { name, .. })
+                if name == "DirectSoundCaptureEnumerateW" =>
+            {
+                Self::DirectSoundCaptureEnumerateW
+            }
+            ("dsound.dll", ImportSymbol::ByName { name, .. }) if name == "DirectSoundCreate8" => {
+                Self::DirectSoundCreate8
+            }
+            ("dsound.dll", ImportSymbol::ByName { name, .. })
+                if name == "DirectSoundEnumerateW" =>
+            {
+                Self::DirectSoundEnumerateW
+            }
+            ("msxml6.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("msxml6.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("msxml6.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msxml6.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
             }
             ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPAcquireContext" => {
                 Self::CpAcquireContext
@@ -126253,6 +126770,162 @@ mod tests {
             assert_ne!(info, 0);
             let name_ptr = read_guest_pointer(&memory, info + 12, GuestArch::X86).unwrap();
             assert_eq!(read_utf16_string(&memory, name_ptr).unwrap(), "NTLM");
+        })
+    }
+
+    #[test]
+    fn evidence_system_sweep_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-sweep");
+            let mut memory = MemoryImage::default();
+
+            // ── comctl32: the image-list metrics ──
+            let icon_size: u64 = runtime.alloc_host_thunk(HostThunk::ImageListGetIconSize);
+            let width_out = 0x41_000_u64;
+            let height_out = 0x41_010_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    icon_size,
+                    &[0x2000, width_out as u32, height_out as u32]
+                ),
+                1
+            );
+            assert_eq!(read_guest_u32(&memory, width_out).unwrap(), 16);
+            assert_eq!(read_guest_u32(&memory, height_out).unwrap(), 16);
+
+            // ── cfgmgr32: the device list ──
+            let device_list: u64 = runtime.alloc_host_thunk(HostThunk::CmGetDeviceIdListW);
+            let buffer = 0x41_100_u64;
+            let size_out = 0x41_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    device_list,
+                    &[0, buffer as u32, size_out as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, size_out).unwrap(),
+                2,
+                "empty device list"
+            );
+
+            // ── powrprof: the active scheme ──
+            let active_scheme: u64 = runtime.alloc_host_thunk(HostThunk::PowerGetActiveScheme);
+            let scheme_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    active_scheme,
+                    &[0, scheme_out as u32]
+                ),
+                0
+            );
+            let scheme = read_guest_pointer(&memory, scheme_out, GuestArch::X86).unwrap();
+            assert_ne!(scheme, 0);
+
+            // ── wintypes ──
+            let ro_init: u64 = runtime.alloc_host_thunk(HostThunk::RoInitialize);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ro_init, &[0]),
+                0
+            );
+
+            // ── winhttp: the time format round trip ──
+            let time_from: u64 = runtime.alloc_host_thunk(HostThunk::WinHttpTimeFromSystemTime);
+            let system_time = 0x41_300_u64;
+            write_guest_u16(&mut memory, system_time, 2026).ok();
+            write_guest_u16(&mut memory, system_time + 2, 1).ok();
+            write_guest_u16(&mut memory, system_time + 6, 15).ok();
+            write_guest_u16(&mut memory, system_time + 8, 10).ok();
+            write_guest_u16(&mut memory, system_time + 10, 30).ok();
+            write_guest_u16(&mut memory, system_time + 12, 45).ok();
+            let time_buffer = 0x41_400_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    time_from,
+                    &[system_time as u32, time_buffer as u32, 64]
+                ),
+                1
+            );
+            let text = memory.read_bytes(time_buffer, 23).unwrap();
+            let text = String::from_utf8_lossy(&text).to_string();
+            assert!(
+                text.contains("15, 01 2026 10:30:45"),
+                "the HTTP time format: {text}"
+            );
+
+            // ── urlmon: the user agent ──
+            let user_agent: u64 = runtime.alloc_host_thunk(HostThunk::ObtainUserAgentString);
+            let agent_buffer = 0x41_500_u64;
+            let agent_size = 0x41_520_u64;
+            write_guest_u32(&mut memory, agent_size, 64).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    user_agent,
+                    &[0, agent_buffer as u32, agent_size as u32]
+                ),
+                0
+            );
+            let len = read_guest_u32(&memory, agent_size).unwrap() as usize;
+            let agent_bytes = memory
+                .read_bytes(agent_buffer, len.saturating_sub(1))
+                .unwrap();
+            let agent = String::from_utf8_lossy(&agent_bytes).to_string();
+            assert!(agent.contains("Casa1"), "the user agent: {agent}");
+
+            // ── rasapi32: the honest no-connections ──
+            let ras_enum: u64 = runtime.alloc_host_thunk(HostThunk::RasEnumConnections);
+            let count_out = 0x41_600_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                ras_enum,
+                &[0, 0x41_610, count_out as u32],
+            );
+            assert_eq!(hr, 0x60b, "ERROR_BUFFER_TOO_SMALL (no connections)");
+
+            // ── wbemprox: the WMI session ──
+            let wmi_connect: u64 = runtime.alloc_host_thunk(HostThunk::WmiConnect);
+            let wmi_query: u64 = runtime.alloc_host_thunk(HostThunk::WmiQuery);
+            let wmi_close: u64 = runtime.alloc_host_thunk(HostThunk::WmiClose);
+            let handle = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wmi_connect,
+                &[0, 0x41_620, 0, 0, 0, 0],
+            );
+            assert_ne!(handle, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    wmi_query,
+                    &[handle as u32, 0x41_630, 0, 0, 0x41_640]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wmi_close, &[handle as u32]),
+                0
+            );
+
+            // ── dsound: the no-driver answer ──
+            let ds_create: u64 = runtime.alloc_host_thunk(HostThunk::DirectSoundCreate8);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ds_create, &[0, 0x41_700, 0]),
+                0x8878_0007,
+                "DSERR_NODRIVER"
+            );
         })
     }
 }

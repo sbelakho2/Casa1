@@ -42,6 +42,7 @@ pub(crate) mod opengl;
 pub(crate) mod pdh;
 pub(crate) mod propsys;
 pub(crate) mod rpcrt4;
+pub(crate) mod system_sweep;
 pub(crate) mod trust;
 pub(crate) mod userenv;
 pub(crate) mod uxtheme;
