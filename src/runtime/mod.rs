@@ -63,6 +63,7 @@ use crate::pe::{self, ApiSetResolver, ExportSymbol, ExportTarget, ImportSymbol, 
 use crate::real_fs::{RealFilesystem, WindowsPathResolver, parse_ntfs_path};
 use crate::real_win32::BCryptContext;
 use crate::reason::ReasonCode;
+use crate::runtime::dispatch::dshow::dshow_filter_graph_methods;
 use crate::shader::parse_dxil_container;
 use crate::telemetry::TelemetryCollector;
 use crate::threads::{
@@ -4992,6 +4993,108 @@ pub enum HostThunk {
     DllRegisterServer,
     DllUnregisterServer,
     DllGetClassObject,
+    AmGetErrorTextW,
+    DshowClassFactoryCreateInstance,
+    DshowClassFactoryLockServer,
+    DshowFilterGraphRenderFile,
+    DshowFilterGraphRender,
+    ClrCreateInstance,
+    CorBindToRuntime,
+    CorBindToRuntimeEx,
+    GetCorSystemDirectory,
+    GetRequestedRuntimeInfo,
+    LoadLibraryShim,
+    WicCreateImagingFactory,
+    WicCreateImagingFactoryProxy,
+    WicCreateBitmapProxy,
+    WicCreateBitmapScalerProxy,
+    WicCreateBitmapClipperProxy,
+    WicCreateBitmapFlipRotatorProxy,
+    WicCreateFormatConverterProxy,
+    WicCreatePaletteProxy,
+    WicCreateStreamProxy,
+    WicCreateColorContextProxy,
+    WicCreateBitmapFromSectionProxy,
+    WicCreateComponentInfo,
+    WicGetMetadataContentSize,
+    WicMapSchemaToName,
+    WicMatchMetadataContent,
+    WicSerializeMetadataContent,
+    WicFactoryCreateDecoderFromFilename,
+    WicFactoryCreateDecoderFromStream,
+    WicFactoryCreateDecoderFromFileHandle,
+    WicFactoryCreateComponentInfo,
+    WicFactoryCreateDecoder,
+    WicFactoryCreateEncoder,
+    WicFactoryCreatePalette,
+    WicFactoryCreateFormatConverter,
+    WicFactoryCreateBitmapScaler,
+    WicFactoryCreateBitmapClipper,
+    WicFactoryCreateBitmapFlipRotator,
+    WicFactoryCreateStream,
+    WicFactoryCreateColorContext,
+    WicFactoryCreateColorTransformer,
+    WicFactoryCreateBitmap,
+    WicFactoryCreateBitmapFromSource,
+    WicFactoryCreateBitmapFromSourceRect,
+    WicFactoryCreateBitmapFromMemory,
+    WicFactoryCreateBitmapFromHbitmap,
+    WicFactoryCreateBitmapFromHicon,
+    WicFactoryCreateComponentEnumerator,
+    WicFactoryCreateFastMetadataEncoderFromFrameDecode,
+    WicFactoryCreateFastMetadataEncoderFromQueryWriter,
+    WicFactoryCreateQueryWriter,
+    WicFactoryCreateQueryWriterFromReader,
+    WicSourceGetSize,
+    WicSourceGetPixelFormat,
+    WicSourceGetResolution,
+    WicSourceCopyPalette,
+    WicSourceCopyPixels,
+    WicBitmapLock,
+    WicBitmapSetPalette,
+    WicBitmapSetResolution,
+    WicScalerInitialize,
+    WicScalerGetScaledWidth,
+    WicScalerGetScaledHeight,
+    WicScalerGetInterpolationMode,
+    WicScalerSetInterpolationMode,
+    WicClipperInitialize,
+    WicClipperGetClipRect,
+    WicClipperSetClipRect,
+    WicFlipRotatorInitialize,
+    WicFlipRotatorGetTransform,
+    WicFormatConverterInitialize,
+    WicFormatConverterCanConvert,
+    WicFormatConverterGetPixelFormat,
+    WicFormatConverterSetPixelFormat,
+    WicPaletteInitializeCustom,
+    WicPaletteInitializePredefined,
+    WicPaletteInitializeFromBitmap,
+    WicPaletteInitializeFromPalette,
+    WicPaletteGetType,
+    WicPaletteGetColorCount,
+    WicPaletteGetColors,
+    WicPaletteIsBlackWhite,
+    WicPaletteIsGrayscale,
+    WicPaletteHasAlpha,
+    WicStreamInitializeFromIStream,
+    WicStreamInitializeFromFilename,
+    WicStreamInitializeFromMemory,
+    WicStreamInitializeFromIStreamRegion,
+    WicColorContextInitializeFromFilename,
+    WicColorContextInitializeFromMemory,
+    WicColorContextGetProfileBytes,
+    WicColorContextGetType,
+    WicColorContextGetExifColorSpace,
+    WicColorContextSetExifColorSpace,
+    WicComponentInfoGetComponentType,
+    WicComponentInfoGetClsid,
+    WicComponentInfoGetSigningStatus,
+    WicComponentInfoGetAuthor,
+    WicComponentInfoGetVendorGuid,
+    WicComponentInfoGetVersion,
+    WicComponentInfoGetSpecVersion,
+    WicComponentInfoGetFriendlyName,
     CoMarshalInterThreadInterfaceInStream,
     CoGetInterfaceAndReleaseStream,
     CreateBindCtx,
@@ -27936,6 +28039,15 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::GlBegin | HostThunk::GlBindTexture | HostThunk::GlBlendFunc | HostThunk::GlClear | HostThunk::GlClearColor | HostThunk::GlColor3f | HostThunk::GlColor4f | HostThunk::GlColorPointer | HostThunk::GlCullFace | HostThunk::GlDeleteTextures | HostThunk::GlDepthFunc | HostThunk::GlDisable | HostThunk::GlDisableClientState | HostThunk::GlDrawArrays | HostThunk::GlDrawElements | HostThunk::GlEnable | HostThunk::GlEnableClientState | HostThunk::GlEnd | HostThunk::GlFinish | HostThunk::GlFlush | HostThunk::GlFogf | HostThunk::GlFogi | HostThunk::GlFrontFace | HostThunk::GlGenTextures | HostThunk::GlGetError | HostThunk::GlGetString | HostThunk::GlHint | HostThunk::GlLightfv | HostThunk::GlLoadIdentity | HostThunk::GlMaterialfv | HostThunk::GlMatrixMode | HostThunk::GlNormalPointer | HostThunk::GlOrtho | HostThunk::GlPopMatrix | HostThunk::GlPushMatrix | HostThunk::GlReadPixels | HostThunk::GlRotatef | HostThunk::GlScalef | HostThunk::GlShadeModel | HostThunk::GlTexCoord2f | HostThunk::GlTexCoordPointer | HostThunk::GlTexImage2D | HostThunk::GlTexParameterf | HostThunk::GlTexParameteri | HostThunk::GlTranslatef | HostThunk::GlVertex2f | HostThunk::GlVertex3f | HostThunk::GlVertexPointer | HostThunk::GlViewport | HostThunk::GluBuild2DMipmaps | HostThunk::GluCylinder | HostThunk::GluDeleteQuadric | HostThunk::GluDisk | HostThunk::GluErrorString | HostThunk::GluLookAt | HostThunk::GluNewQuadric | HostThunk::GluNewTess | HostThunk::GluOrtho2D | HostThunk::GluPartialDisk | HostThunk::GluPerspective | HostThunk::GluPickMatrix | HostThunk::GluProject | HostThunk::GluScaleImage | HostThunk::GluSphere | HostThunk::GluTessBeginPolygon | HostThunk::GluTessEndPolygon | HostThunk::GluTessVertex | HostThunk::GluUnProject | HostThunk::WglChoosePixelFormat | HostThunk::WglCreateContext | HostThunk::WglDeleteContext | HostThunk::WglDescribePixelFormat | HostThunk::WglGetPixelFormat | HostThunk::WglGetProcAddress | HostThunk::WglMakeCurrent | HostThunk::WglSetPixelFormat | HostThunk::WglSwapBuffers) => {
                 self.dispatch_gl_or_glu(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WicCreateImagingFactory | HostThunk::WicCreateImagingFactoryProxy | HostThunk::WicCreateBitmapProxy | HostThunk::WicCreateBitmapScalerProxy | HostThunk::WicCreateBitmapClipperProxy | HostThunk::WicCreateBitmapFlipRotatorProxy | HostThunk::WicCreateFormatConverterProxy | HostThunk::WicCreatePaletteProxy | HostThunk::WicCreateStreamProxy | HostThunk::WicCreateColorContextProxy | HostThunk::WicCreateBitmapFromSectionProxy | HostThunk::WicCreateComponentInfo | HostThunk::WicGetMetadataContentSize | HostThunk::WicMapSchemaToName | HostThunk::WicMatchMetadataContent | HostThunk::WicSerializeMetadataContent | HostThunk::WicFactoryCreateDecoderFromFilename | HostThunk::WicFactoryCreateDecoderFromStream | HostThunk::WicFactoryCreateDecoderFromFileHandle | HostThunk::WicFactoryCreateComponentInfo | HostThunk::WicFactoryCreateDecoder | HostThunk::WicFactoryCreateEncoder | HostThunk::WicFactoryCreatePalette | HostThunk::WicFactoryCreateFormatConverter | HostThunk::WicFactoryCreateBitmapScaler | HostThunk::WicFactoryCreateBitmapClipper | HostThunk::WicFactoryCreateBitmapFlipRotator | HostThunk::WicFactoryCreateStream | HostThunk::WicFactoryCreateColorContext | HostThunk::WicFactoryCreateColorTransformer | HostThunk::WicFactoryCreateBitmap | HostThunk::WicFactoryCreateBitmapFromSource | HostThunk::WicFactoryCreateBitmapFromSourceRect | HostThunk::WicFactoryCreateBitmapFromMemory | HostThunk::WicFactoryCreateBitmapFromHbitmap | HostThunk::WicFactoryCreateBitmapFromHicon | HostThunk::WicFactoryCreateComponentEnumerator | HostThunk::WicFactoryCreateFastMetadataEncoderFromFrameDecode | HostThunk::WicFactoryCreateFastMetadataEncoderFromQueryWriter | HostThunk::WicFactoryCreateQueryWriter | HostThunk::WicFactoryCreateQueryWriterFromReader | HostThunk::WicSourceGetSize | HostThunk::WicSourceGetPixelFormat | HostThunk::WicSourceGetResolution | HostThunk::WicSourceCopyPalette | HostThunk::WicSourceCopyPixels | HostThunk::WicBitmapLock | HostThunk::WicBitmapSetPalette | HostThunk::WicBitmapSetResolution | HostThunk::WicScalerInitialize | HostThunk::WicScalerGetScaledWidth | HostThunk::WicScalerGetScaledHeight | HostThunk::WicScalerGetInterpolationMode | HostThunk::WicScalerSetInterpolationMode | HostThunk::WicClipperInitialize | HostThunk::WicClipperGetClipRect | HostThunk::WicClipperSetClipRect | HostThunk::WicFlipRotatorInitialize | HostThunk::WicFlipRotatorGetTransform | HostThunk::WicFormatConverterInitialize | HostThunk::WicFormatConverterCanConvert | HostThunk::WicFormatConverterGetPixelFormat | HostThunk::WicFormatConverterSetPixelFormat | HostThunk::WicPaletteInitializeCustom | HostThunk::WicPaletteInitializePredefined | HostThunk::WicPaletteInitializeFromBitmap | HostThunk::WicPaletteInitializeFromPalette | HostThunk::WicPaletteGetType | HostThunk::WicPaletteGetColorCount | HostThunk::WicPaletteGetColors | HostThunk::WicPaletteIsBlackWhite | HostThunk::WicPaletteIsGrayscale | HostThunk::WicPaletteHasAlpha | HostThunk::WicStreamInitializeFromIStream | HostThunk::WicStreamInitializeFromFilename | HostThunk::WicStreamInitializeFromMemory | HostThunk::WicStreamInitializeFromIStreamRegion | HostThunk::WicColorContextInitializeFromFilename | HostThunk::WicColorContextInitializeFromMemory | HostThunk::WicColorContextGetProfileBytes | HostThunk::WicColorContextGetType | HostThunk::WicColorContextGetExifColorSpace | HostThunk::WicColorContextSetExifColorSpace | HostThunk::WicComponentInfoGetComponentType | HostThunk::WicComponentInfoGetClsid | HostThunk::WicComponentInfoGetSigningStatus | HostThunk::WicComponentInfoGetAuthor | HostThunk::WicComponentInfoGetVendorGuid | HostThunk::WicComponentInfoGetVersion | HostThunk::WicComponentInfoGetSpecVersion | HostThunk::WicComponentInfoGetFriendlyName) => {
+                self.dispatch_wic(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::AmGetErrorTextW | HostThunk::DshowClassFactoryCreateInstance | HostThunk::DshowClassFactoryLockServer | HostThunk::DshowFilterGraphRenderFile | HostThunk::DshowFilterGraphRender) => {
+                self.dispatch_dshow(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::ClrCreateInstance | HostThunk::CorBindToRuntime | HostThunk::CorBindToRuntimeEx | HostThunk::GetCorSystemDirectory | HostThunk::GetRequestedRuntimeInfo | HostThunk::LoadLibraryShim) => {
+                self.dispatch_mscoree(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -63844,7 +63956,19 @@ impl PeHostRuntime {
             | GuestObjectKind::ImfMediaSource
             | GuestObjectKind::ImfByteStream
             | GuestObjectKind::ImfTopologyNode
-            | GuestObjectKind::ImfDxgiDeviceManager) => {
+            | GuestObjectKind::ImfDxgiDeviceManager
+            | GuestObjectKind::DshowClassFactory
+            | GuestObjectKind::DshowFilterGraph
+            | GuestObjectKind::WicFactory
+            | GuestObjectKind::WicBitmap
+            | GuestObjectKind::WicPalette
+            | GuestObjectKind::WicScaler
+            | GuestObjectKind::WicClipper
+            | GuestObjectKind::WicFlipRotator
+            | GuestObjectKind::WicFormatConverter
+            | GuestObjectKind::WicStream
+            | GuestObjectKind::WicColorContext
+            | GuestObjectKind::WicComponentInfo) => {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
@@ -64085,6 +64209,13 @@ impl PeHostRuntime {
                 self.ensure_shell_link_persist_file_object(memory, shell_link_object)?
             };
             return Ok(Some(interface_object));
+        }
+        // CLSID_FilterGraph (DirectShow)
+        if clsid.eq_ignore_ascii_case("{E436EBB3-524F-11CE-9F53-0020AF0BA770}") {
+            let vtable = self.alloc_guest_vtable(memory, dshow_filter_graph_methods())?;
+            let object =
+                self.alloc_guest_object(memory, GuestObjectKind::DshowFilterGraph, vtable)?;
+            return Ok(Some(object));
         }
         // DirectSound8 CLSID
         if clsid.eq_ignore_ascii_case("{3901CC3F-84B5-4FA4-BA35-AA8172B8A6B2}") {
@@ -80580,6 +80711,123 @@ impl HostThunk {
                 if name == "MFCreateDXGIDeviceManager" =>
             {
                 Self::MfCreateDxgiDeviceManager
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "CLRCreateInstance" => {
+                Self::ClrCreateInstance
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "CorBindToRuntime" => {
+                Self::CorBindToRuntime
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "CorBindToRuntimeEx" => {
+                Self::CorBindToRuntimeEx
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetCORSystemDirectory" =>
+            {
+                Self::GetCorSystemDirectory
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetRequestedRuntimeInfo" =>
+            {
+                Self::GetRequestedRuntimeInfo
+            }
+            ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryShim" => {
+                Self::LoadLibraryShim
+            }
+            ("quartz.dll", ImportSymbol::ByName { name, .. }) if name == "AMGetErrorTextW" => {
+                Self::AmGetErrorTextW
+            }
+            ("quartz.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("quartz.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("quartz.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("quartz.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateBitmapClipper_Proxy" =>
+            {
+                Self::WicCreateBitmapClipperProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateBitmapFlipRotator_Proxy" =>
+            {
+                Self::WicCreateBitmapFlipRotatorProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateBitmapFromSection_Proxy" =>
+            {
+                Self::WicCreateBitmapFromSectionProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateBitmapScaler_Proxy" =>
+            {
+                Self::WicCreateBitmapScalerProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateBitmap_Proxy" =>
+            {
+                Self::WicCreateBitmapProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateColorContext_Proxy" =>
+            {
+                Self::WicCreateColorContextProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateComponentInfo" =>
+            {
+                Self::WicCreateComponentInfo
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateFormatConverter_Proxy" =>
+            {
+                Self::WicCreateFormatConverterProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateImagingFactory" =>
+            {
+                Self::WicCreateImagingFactory
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateImagingFactory_Proxy" =>
+            {
+                Self::WicCreateImagingFactoryProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreatePalette_Proxy" =>
+            {
+                Self::WicCreatePaletteProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateStream_Proxy" =>
+            {
+                Self::WicCreateStreamProxy
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICGetMetadataContentSize" =>
+            {
+                Self::WicGetMetadataContentSize
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICMapSchemaToName" =>
+            {
+                Self::WicMapSchemaToName
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICMatchMetadataContent" =>
+            {
+                Self::WicMatchMetadataContent
+            }
+            ("windowscodecs.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICSerializeMetadataContent" =>
+            {
+                Self::WicSerializeMetadataContent
             }
             ("opengl32.dll", ImportSymbol::ByName { name, .. }) if name == "glBegin" => {
                 Self::GlBegin
@@ -121671,6 +121919,389 @@ mod tests {
             );
         })
     }
+
+    #[test]
+    fn evidence_mscoree_clr_absent_semantics() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mscoree");
+            let mut memory = MemoryImage::default();
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::ClrCreateInstance);
+            let bind: u64 = runtime.alloc_host_thunk(HostThunk::CorBindToRuntimeEx);
+            let directory: u64 = runtime.alloc_host_thunk(HostThunk::GetCorSystemDirectory);
+            let requested: u64 = runtime.alloc_host_thunk(HostThunk::GetRequestedRuntimeInfo);
+            let shim: u64 = runtime.alloc_host_thunk(HostThunk::LoadLibraryShim);
+
+            let out = 0x41_000_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create,
+                &[0x41_010, 0x41_020, out as u32],
+            );
+            assert_eq!(hr, 0x8013_1013, "no CLR meta host");
+            assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    bind,
+                    &[0, 0, 0, 0, 0, out as u32]
+                ),
+                0x8013_1013
+            );
+            assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+
+            let buffer = 0x41_100_u64;
+            let length_out = 0x41_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    directory,
+                    &[buffer as u32, 260, length_out as u32]
+                ),
+                0x8000_4005
+            );
+            assert_eq!(
+                read_guest_u16(&memory, buffer).unwrap(),
+                0,
+                "empty CLR directory"
+            );
+            assert_eq!(read_guest_u32(&memory, length_out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    requested,
+                    &[0, 0, 0, 0, 0, 0, 0, 0, 0]
+                ),
+                0x8000_4005
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, shim, &[0, 0, 0, 0]),
+                0x8000_4005
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_dshow_module_server_surface() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-dshow");
+            let mut memory = MemoryImage::default();
+            assert_eq!(runtime.com_server_lock_count, 0, "fresh runtime lock count");
+            let get_class_object: u64 = runtime.alloc_host_thunk(HostThunk::DllGetClassObject);
+            let can_unload: u64 = runtime.alloc_host_thunk(HostThunk::DllCanUnloadNow);
+            let create_instance: u64 =
+                runtime.alloc_host_thunk(HostThunk::ComFactoryCreateInstance);
+            let render_file: u64 = runtime.alloc_host_thunk(HostThunk::DshowFilterGraphRenderFile);
+            let error_text: u64 = runtime.alloc_host_thunk(HostThunk::AmGetErrorTextW);
+
+            // CLSID_FilterGraph {e436ebb3-524f-11ce-9f53-0020af0ba770}
+            let clsid = 0x41_000_u64;
+            memory.map_bytes(
+                clsid,
+                &[
+                    0xb3, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf,
+                    0x0b, 0xa7, 0x70,
+                ],
+            );
+            // IID_IGraphBuilder {56a868a9-0ad4-11ce-b03a-0020af0ba770}
+            let iid = 0x41_100_u64;
+            memory.map_bytes(
+                iid,
+                &[
+                    0xa9, 0xa8, 0x68, 0x56, 0xd4, 0x0a, 0xce, 0x11, 0xb0, 0x3a, 0x00, 0x20, 0xaf,
+                    0x0b, 0xa7, 0x70,
+                ],
+            );
+            let out = 0x41_200_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_class_object,
+                &[clsid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0, "DllGetClassObject succeeds");
+            let factory = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_ne!(factory, 0);
+            assert_eq!(runtime.com_server_lock_count, 0, "after DllGetClassObject");
+
+            let graph_out = 0x41_300_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_instance,
+                &[factory as u32, 0, iid as u32, graph_out as u32],
+            );
+            assert_eq!(hr, 0, "IClassFactory::CreateInstance succeeds");
+            let graph = read_guest_pointer(&memory, graph_out, GuestArch::X86).unwrap();
+            assert_ne!(graph, 0);
+            assert_eq!(runtime.com_server_lock_count, 0, "after CreateInstance");
+
+            // No filters are registered: RenderFile answers VFW_E_NO_FILTERS.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    render_file,
+                    &[graph as u32, 0, 0]
+                ),
+                0x8004_0227
+            );
+
+            // AMGetErrorTextW formats that error.
+            let text = 0x41_400_u64;
+            let written = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                error_text,
+                &[0x8004_0227, text as u32, 64],
+            );
+            assert!(written > 0);
+            let bytes = memory.read_bytes(text, written as usize * 2).unwrap();
+            let decoded = String::from_utf16_lossy(
+                &bytes
+                    .as_chunks::<2>().0
+                    .iter()
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            );
+            assert!(decoded.contains("No filters"), "error text: {decoded}");
+            // The shared in-process server contract: the DLL stays resident
+            // (S_FALSE) — the runtime never unloads a loaded module.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, can_unload, &[]),
+                1,
+                "S_FALSE"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_wic_imaging_factory_and_bitmap_pipeline() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-wic");
+            let mut memory = MemoryImage::default();
+            let factory_thunk: u64 = runtime.alloc_host_thunk(HostThunk::WicCreateImagingFactory);
+            let create_bitmap: u64 =
+                runtime.alloc_host_thunk(HostThunk::WicFactoryCreateBitmapFromMemory);
+            let get_size: u64 = runtime.alloc_host_thunk(HostThunk::WicSourceGetSize);
+            let copy_pixels: u64 = runtime.alloc_host_thunk(HostThunk::WicSourceCopyPixels);
+            let create_scaler: u64 =
+                runtime.alloc_host_thunk(HostThunk::WicFactoryCreateBitmapScaler);
+            let scaler_initialize: u64 = runtime.alloc_host_thunk(HostThunk::WicScalerInitialize);
+            let create_palette: u64 = runtime.alloc_host_thunk(HostThunk::WicFactoryCreatePalette);
+            let palette_custom: u64 =
+                runtime.alloc_host_thunk(HostThunk::WicPaletteInitializeCustom);
+            let palette_colors: u64 = runtime.alloc_host_thunk(HostThunk::WicPaletteGetColors);
+            let map_schema: u64 = runtime.alloc_host_thunk(HostThunk::WicMapSchemaToName);
+            let decoder: u64 =
+                runtime.alloc_host_thunk(HostThunk::WicFactoryCreateDecoderFromFilename);
+
+            let factory_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    factory_thunk,
+                    &[0, factory_out as u32]
+                ),
+                0
+            );
+            let factory = read_guest_pointer(&memory, factory_out, GuestArch::X86).unwrap();
+            assert_ne!(factory, 0);
+
+            // GUID_WICPixelFormat32bppBGRA {6fddc344-4e03-4bfe-b185-3d77768dc90f}
+            let format = 0x41_100_u64;
+            memory.map_bytes(
+                format,
+                &[
+                    0x44, 0xc3, 0xdd, 0x6f, 0x03, 0x4e, 0xfe, 0x4b, 0xb1, 0x85, 0x3d, 0x77, 0x76,
+                    0x8d, 0xc9, 0x0f,
+                ],
+            );
+            let texels = 0x41_200_u64;
+            memory.map_bytes(
+                texels,
+                &[
+                    0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+                ],
+            );
+            let bitmap_out = 0x41_300_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_bitmap,
+                &[
+                    factory as u32,
+                    2,
+                    2,
+                    format as u32,
+                    8,
+                    16,
+                    texels as u32,
+                    1,
+                    bitmap_out as u32,
+                ],
+            );
+            assert_eq!(hr, 0, "CreateBitmapFromMemory");
+            let bitmap = read_guest_pointer(&memory, bitmap_out, GuestArch::X86).unwrap();
+            assert_ne!(bitmap, 0);
+
+            let width_out = 0x41_400_u64;
+            let height_out = 0x41_410_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_size,
+                    &[bitmap as u32, width_out as u32, height_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, width_out).unwrap(), 2);
+            assert_eq!(read_guest_u32(&memory, height_out).unwrap(), 2);
+
+            let pixels_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    copy_pixels,
+                    &[bitmap as u32, 0, 8, 16, pixels_out as u32]
+                ),
+                0
+            );
+            let pixels = memory.read_bytes(pixels_out, 16).unwrap();
+            assert_eq!(
+                &pixels[..4],
+                &[0, 0, 255, 255],
+                "first texel got {pixels:?}"
+            );
+
+            // The scaler chain: scale the 2x2 to 1x1.
+            let scaler_out = 0x41_600_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_scaler,
+                    &[factory as u32, scaler_out as u32]
+                ),
+                0
+            );
+            let scaler = read_guest_pointer(&memory, scaler_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    scaler_initialize,
+                    &[scaler as u32, bitmap as u32, 1, 1, 0]
+                ),
+                0
+            );
+            let scaled_out = 0x41_700_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    copy_pixels,
+                    &[scaler as u32, 0, 4, 4, scaled_out as u32]
+                ),
+                0
+            );
+            let scaled = memory.read_bytes(scaled_out, 4).unwrap();
+            assert_eq!(&scaled[..4], &[0, 0, 255, 255], "scaled texel");
+
+            // Palette round trip.
+            let palette_out = 0x41_800_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_palette,
+                    &[factory as u32, palette_out as u32]
+                ),
+                0
+            );
+            let palette = read_guest_pointer(&memory, palette_out, GuestArch::X86).unwrap();
+            let colors_in = 0x41_900_u64;
+            memory.map_bytes(colors_in, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    palette_custom,
+                    &[palette as u32, colors_in as u32, 2]
+                ),
+                0
+            );
+            let colors_out = 0x41_a00_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    palette_colors,
+                    &[palette as u32, 2, colors_out as u32, 0x41_b00]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, colors_out).unwrap(), 0x0403_0201);
+
+            // The schema mapping helper.
+            let schema = 0x41_c00_u64;
+            memory.map_bytes(
+                schema,
+                &[0x45, 0x00, 0x78, 0x00, 0x69, 0x00, 0x66, 0x00, 0x00, 0x00],
+            );
+            // GUID_MetadataFormatExif {1c4ad97e-2b73-4b3a-9238-0265d443a65c}
+            memory.map_bytes(
+                0x41_e00_u64,
+                &[
+                    0x7e, 0xd9, 0x4a, 0x1c, 0x73, 0x2b, 0x3a, 0x4b, 0x92, 0x38, 0x02, 0x65, 0xd4,
+                    0x43, 0xa6, 0x5c,
+                ],
+            );
+            let name_out = 0x41_d00_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    map_schema,
+                    &[0x41_e00, schema as u32, 64, name_out as u32, 0x41_f00]
+                ),
+                0
+            );
+            let name_bytes = memory.read_bytes(name_out, 10).unwrap();
+            let name = String::from_utf16_lossy(
+                &name_bytes
+                    .as_chunks::<2>().0
+                    .iter()
+                    .take_while(|c| c[0] != 0 || c[1] != 0)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(name, "Exif");
+
+            // No codecs: the decoder entry point answers WIC_E_CODECNOTFOUND.
+            let decoder_out = 0x41_f10_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    decoder,
+                    &[factory as u32, 0x41_f20, 0, 0, decoder_out as u32]
+                ),
+                0x8898_2f02
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, decoder_out, GuestArch::X86).unwrap(),
+                0
+            );
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -123737,6 +124368,11 @@ fn write_guest_u32(memory: &mut MemoryImage, address: u64, value: u32) -> AppRes
 
 fn write_guest_u64(memory: &mut MemoryImage, address: u64, value: u64) -> AppResult<()> {
     memory.write_u64(address, value);
+    Ok(())
+}
+
+fn write_guest_u16(memory: &mut MemoryImage, address: u64, value: u16) -> AppResult<()> {
+    memory.write_u16(address, value);
     Ok(())
 }
 

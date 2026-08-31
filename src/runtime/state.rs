@@ -208,6 +208,18 @@ pub(crate) enum GuestObjectKind {
     ImfByteStream,
     ImfTopologyNode,
     ImfDxgiDeviceManager,
+    DshowClassFactory,
+    DshowFilterGraph,
+    WicFactory,
+    WicBitmap,
+    WicPalette,
+    WicScaler,
+    WicClipper,
+    WicFlipRotator,
+    WicFormatConverter,
+    WicStream,
+    WicColorContext,
+    WicComponentInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -592,6 +604,70 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) open_handles: std::collections::HashSet<u64>,
     /// Next handle value to hand out.
     pub(crate) next_handle: u64,
+}
+
+/// The WIC (Windows Imaging Component) object state: the IWIC* objects the
+/// windowscodecs.dll exports create (consumed by
+/// `runtime/dispatch/wic.rs`).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // WIC object state consumed by runtime/dispatch/wic.rs
+pub(crate) struct WicState {
+    /// Guest object address -> WIC object state.
+    pub(crate) objects: HashMap<u64, WicObjectState>,
+    /// Next WIC bitmap name (unused; kept for the object surface).
+    pub(crate) next_name: u32,
+}
+
+/// The per-object WIC state.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // WIC object state consumed by runtime/dispatch/wic.rs
+pub(crate) struct WicObjectState {
+    /// What kind of WIC object this is.
+    pub(crate) kind: WicObjectKind,
+    /// Bitmap width (and the scaler/clipper target width).
+    pub(crate) width: u32,
+    /// Bitmap height (and the scaler/clipper target height).
+    pub(crate) height: u32,
+    /// The pixel format GUID (16 bytes).
+    pub(crate) pixel_format: [u8; 16],
+    /// The pixel buffer (the source-chain produces into this).
+    pub(crate) pixels: Vec<u8>,
+    /// The wrapped source object (scaler/clipper/flip/converter chains).
+    pub(crate) source: u64,
+    /// The clip rectangle (clipper).
+    pub(crate) clip: Option<[i32; 4]>,
+    /// The transform options bitmask (flip rotator).
+    pub(crate) transform: u32,
+    /// The interpolation mode (scaler).
+    pub(crate) interpolation: u32,
+    /// The palette colors (palette object; initialized from bitmap).
+    pub(crate) palette: Vec<u32>,
+    /// Whether the palette is premultiplied alpha.
+    pub(crate) palette_premultiplied: bool,
+    /// The stream bytes (stream object).
+    pub(crate) stream: Vec<u8>,
+    /// The color-profile bytes (color context).
+    pub(crate) profile: Vec<u8>,
+    /// The EXIF color space (color context).
+    pub(crate) exif_color_space: u32,
+    /// The component type (component info).
+    pub(crate) component_type: u32,
+}
+
+/// The WIC object kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WicObjectKind {
+    #[default]
+    Factory,
+    Bitmap,
+    Palette,
+    Scaler,
+    Clipper,
+    FlipRotator,
+    FormatConverter,
+    Stream,
+    ColorContext,
+    ComponentInfo,
 }
 
 /// The OpenGL 1.1 fixed-function guest state: per-context matrix stacks,
@@ -1464,6 +1540,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_dxgi_device_managers: HashMap<u64, MfDxgiDeviceManagerState>,
     /// The OpenGL 1.1 fixed-function guest state.
     pub(crate) opengl: OpenGlGuestState,
+    /// The WIC object state.
+    pub(crate) wic: WicState,
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
@@ -2035,6 +2113,7 @@ impl PeHostRuntime {
             mf_byte_streams: HashMap::new(),
             mf_dxgi_device_managers: HashMap::new(),
             opengl: OpenGlGuestState::default(),
+            wic: WicState::default(),
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),

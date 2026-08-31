@@ -9,6 +9,7 @@
 //! vtable whose method slots dispatch through `HostThunk::Mf*` variants.
 
 use super::super::*;
+use super::unknown_preamble;
 use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MediaEventType, MfEventQueue};
 use crate::runtime::state::{ComStreamState, ImfByteStreamState};
 
@@ -45,10 +46,6 @@ const MF_E_UNSUPPORTED_CHARACTERISTICS: u32 = 0xC00D_36B2;
 /// The standard MF interface vtable preamble: IUnknown + the first
 /// interface method slots that the runtime dispatches.  The remaining slots
 /// are filled with the interface's own methods.
-fn mf_unknown_preamble() -> Vec<HostThunk> {
-    vec![HostThunk::GuestObjectAddRef, HostThunk::GuestObjectRelease]
-}
-
 #[allow(dead_code)] // the MF dispatch surface (methods are reached via the grouped HostThunk arm)
 impl PeHostRuntime {
     /// `MFStartup(Version, dwFlags)` — initializes the MF runtime state.
@@ -2403,7 +2400,7 @@ impl PeHostRuntime {
 
 /// The IMFAttributes vtable (media types and attribute stores share it).
 fn mf_attributes_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfAttrGetCount);
     methods.push(HostThunk::MfAttrGetItemByIndex);
     methods.push(HostThunk::MfAttrGetUint32);
@@ -2434,7 +2431,7 @@ fn mf_media_type_methods() -> Vec<HostThunk> {
 
 /// The IMFMediaBuffer vtable.
 fn mf_media_buffer_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfBufferGetMaxLength);
     methods.push(HostThunk::MfBufferLock);
     methods.push(HostThunk::MfBufferUnlock);
@@ -2445,7 +2442,7 @@ fn mf_media_buffer_methods() -> Vec<HostThunk> {
 
 /// The IMFSample vtable.
 fn mf_sample_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSampleGetBufferCount);
     methods.push(HostThunk::MfSampleGetBufferByIndex);
     methods.push(HostThunk::MfSampleAddBuffer);
@@ -2460,7 +2457,7 @@ fn mf_sample_methods() -> Vec<HostThunk> {
 
 /// The IMFMediaEventQueue vtable.
 fn mf_event_queue_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfEventQueueGetEvent);
     methods.push(HostThunk::MfEventQueueQueueEvent);
     methods
@@ -2468,7 +2465,7 @@ fn mf_event_queue_methods() -> Vec<HostThunk> {
 
 /// The IMFPresentationClock vtable.
 fn mf_clock_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfClockGetTime);
     methods.push(HostThunk::MfClockStart);
     methods.push(HostThunk::MfClockStop);
@@ -2477,7 +2474,7 @@ fn mf_clock_methods() -> Vec<HostThunk> {
 
 /// The IMFMediaSession vtable.
 fn mf_session_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSessionGetClock);
     methods.push(HostThunk::MfSessionStart);
     methods.push(HostThunk::MfSessionPause);
@@ -2489,7 +2486,7 @@ fn mf_session_methods() -> Vec<HostThunk> {
 
 /// The IMFSourceReader vtable.
 fn mf_source_reader_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSourceReaderGetCurrentMediaType);
     methods.push(HostThunk::MfSourceReaderGetNativeMediaType);
     methods.push(HostThunk::MfSourceReaderReadSample);
@@ -2498,7 +2495,7 @@ fn mf_source_reader_methods() -> Vec<HostThunk> {
 
 /// The IMFSinkWriter vtable.
 fn mf_sink_writer_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSinkWriterAddStream);
     methods.push(HostThunk::MfSinkWriterBeginWriting);
     methods.push(HostThunk::MfSinkWriterWriteSample);
@@ -2508,7 +2505,7 @@ fn mf_sink_writer_methods() -> Vec<HostThunk> {
 
 /// The IMFByteStream vtable.
 fn mf_byte_stream_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfByteStreamGetCurrentPosition);
     methods.push(HostThunk::MfByteStreamRead);
     methods.push(HostThunk::MfByteStreamGetLength);
@@ -2517,7 +2514,7 @@ fn mf_byte_stream_methods() -> Vec<HostThunk> {
 
 /// The IMFTopology vtable.
 fn mf_topology_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfTopologyAddNode);
     methods.push(HostThunk::MfTopologyGetNodeCount);
     methods
@@ -2525,7 +2522,7 @@ fn mf_topology_methods() -> Vec<HostThunk> {
 
 /// The IMFTopologyNode vtable.
 fn mf_topology_node_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfTopologyNodeGetObject);
     methods.push(HostThunk::MfTopologyNodeSetObject);
     methods
@@ -2533,7 +2530,7 @@ fn mf_topology_node_methods() -> Vec<HostThunk> {
 
 /// The IMFSourceResolver vtable.
 fn mf_source_resolver_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSourceResolverCreateObjectFromUrl);
     methods
 }
@@ -2541,7 +2538,7 @@ fn mf_source_resolver_methods() -> Vec<HostThunk> {
 /// The IMFDXGIDeviceManager vtable (IUnknown preamble + the 7 device
 /// methods).
 fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfDxgiDeviceManagerResetDevice);
     methods.push(HostThunk::MfDxgiDeviceManagerOpenDeviceHandle);
     methods.push(HostThunk::MfDxgiDeviceManagerCloseDeviceHandle);
@@ -2554,7 +2551,7 @@ fn mf_dxgi_device_manager_methods() -> Vec<HostThunk> {
 
 /// The IMFPresentationDescriptor vtable.
 fn mf_presentation_descriptor_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfPresentationDescriptorGetStreamDescriptorCount);
     methods
 }
@@ -2562,7 +2559,7 @@ fn mf_presentation_descriptor_methods() -> Vec<HostThunk> {
 /// The IMFMediaEvent vtable.
 #[allow(dead_code)] // the event-object vtable builder
 fn mf_event_methods() -> Vec<HostThunk> {
-    let mut methods = mf_unknown_preamble();
+    let mut methods = unknown_preamble();
     methods.push(HostThunk::MfEventGetType);
     methods
 }
