@@ -28,6 +28,7 @@ pub(crate) mod imagehlp;
 pub(crate) mod imm32;
 pub(crate) mod ldap;
 pub(crate) mod legacy_gfx;
+pub(crate) mod long_tail;
 pub(crate) mod mf;
 pub(crate) mod mpr;
 pub(crate) mod msacm;

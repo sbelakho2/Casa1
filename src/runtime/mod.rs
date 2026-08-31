@@ -5513,6 +5513,105 @@ pub enum HostThunk {
     DirectPlay8Create,
     DirectSoundCaptureCreate8,
     DirectSoundCaptureEnumerateW,
+    AtlModuleAddTermFunc,
+    AtlModuleLoadTypeLib,
+    AtlModuleRegisterServer,
+    AtlModuleRegisterTypeLib,
+    AtlModuleUnregisterServer,
+    AtlModuleUnregisterTypeLib,
+    AtlModuleUpdateRegistryFromResource,
+    WicCreateAvifDecoder,
+    WicCreateAvifEncoder,
+    WicCreateHeifDecoder,
+    WicCreateHeifEncoder,
+    WicCreateWebpDecoder,
+    WicCreateWebpEncoder,
+    DllInstall,
+    OverlayCreateHook,
+    OverlayHookWindow,
+    OverlayPresent,
+    OverlayReset,
+    OverlayUnhookWindow,
+    CndInit,
+    MtxDestroy,
+    MtxInit,
+    MtxLock,
+    MtxUnlock,
+    SteamBGetSteamId,
+    SteamBIsSubscribedApp,
+    SteamBLoggedOn,
+    SteamNotifyOfLogin,
+    SteamNotifyOfLogoff,
+    CCSpecificHandler,
+    CurrentException,
+    CurrentExceptionContext,
+    ProcessingThrow,
+    Chkstk,
+    CertSrvBackupEnd,
+    CertSrvBackupPrepare,
+    CertSrvRestoreEnd,
+    CertSrvRestorePrepare,
+    D3dx10CompileFromFile,
+    D3dx10CreateTextureFromFileW,
+    D3dx10GetImageInfoFromFile,
+    D3dx10SaveTextureToMemory,
+    GameuxShfolderpath,
+    GameExplorerInitialize,
+    GameExplorerSetUserAccess,
+    GameExplorerVerifyAccess,
+    ClrCreateManagedInstance,
+    GetClrRuntimeHost,
+    CreateHtmlPropertyPage,
+    IeFrameFactoryConstructor,
+    ShowHtmlDialogEx,
+    IhtmlDocument2,
+    DsBind,
+    DsBindWithCred,
+    DsMakeSpnW,
+    DsUnbind,
+    AdsBuildEnumerator,
+    AdsGetObject,
+    AdsOpenObject,
+    CertSrvAdminGetCa,
+    CertSrvAdminGetCert,
+    CertSrvAdminSetCa,
+    D3d10CreateDevice1,
+    D3d10CreateDeviceAndSwapChain1,
+    Dhcpv6ReleaseParams,
+    Dhcpv6RenewParams,
+    Dhcpv6RequestParams,
+    GetdfDIJoystick,
+    FwpsFilter,
+    FwpsOpenToken,
+    FwpsQueryTokenInformation,
+    IeGetFrameComponent,
+    IeGetWriteableHlink,
+    IeHlink,
+    LoadPerfCounterTextStringsW,
+    SetServiceAsTrusted,
+    UnloadPerfCounterTextStringsW,
+    MsiFormatRecordW,
+    MsiGetLastErrorRecord,
+    MsiProcessMessage,
+    ApplyPatchToFileExW,
+    ApplyPatchToFileW,
+    GetPatchFileSignature,
+    PrintUiEntry,
+    PrintUiToDevice,
+    PrintUiToFile,
+    SamCloseHandle,
+    SamConnect,
+    SamOpenDomain,
+    ScGenerateRelativeName,
+    ScRemoveAllPrivileges,
+    ScSetSecurityDescriptor,
+    RnrCancelQuery,
+    RnrInitialize,
+    RnrQuery,
+    WinStationCloseServer,
+    WinStationEnumerate,
+    WinStationOpenServer,
+    CreateFx,
     DirectSoundCreate8,
     DirectSoundEnumerateW,
     CryptUiDlgCertMgr,
@@ -28644,6 +28743,9 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::ImageListGetIcon | HostThunk::ImageListGetIconSize | HostThunk::ImageListSetIconSize | HostThunk::PropertySheetW | HostThunk::CmFreeDeviceIdList | HostThunk::CmGetDevNodeStatus | HostThunk::CmGetDeviceIdListW | HostThunk::CmGetDeviceIdListSizeW | HostThunk::CmLocateDevNodeW | HostThunk::PowerGetActiveScheme | HostThunk::PowerReadACValue | HostThunk::PowerReadDCValue | HostThunk::PowerSetActiveScheme | HostThunk::WimApplyImage | HostThunk::WimCloseHandle | HostThunk::WimCreateFile | HostThunk::WimLoadImage | HostThunk::WimUnmountImageHandle | HostThunk::RoActivateInstance | HostThunk::RoGetActivationFactory | HostThunk::RoInitialize | HostThunk::RoUninitialize | HostThunk::CreateXmlReader | HostThunk::CreateXmlReaderInputWithEncoding | HostThunk::CreateXmlWriter | HostThunk::CreateXmlWriterOutputWithEncoding | HostThunk::CoInternetIsFeatureEnabled | HostThunk::CoInternetSetFeatureEnabled | HostThunk::ObtainUserAgentString | HostThunk::UrlDownloadToCacheFileW | HostThunk::UrlDownloadToFileW | HostThunk::WinHttpCrackUrl | HostThunk::WinHttpCreateUrl | HostThunk::WinHttpDetectAutoProxyConfigUrl | HostThunk::WinHttpTimeFromSystemTime | HostThunk::WinHttpTimeToSystemTime | HostThunk::SpCreateObjectFromKey | HostThunk::SpCreateObjectFromToken | HostThunk::SpEnumTokens | HostThunk::SpGetCategoryFromId | HostThunk::SpGetDescription | HostThunk::RasDial | HostThunk::RasEnumConnections | HostThunk::RasGetConnectionStatus | HostThunk::RasGetErrorString | HostThunk::RasHangUp | HostThunk::RasSetEntryProperties | HostThunk::WmiClose | HostThunk::WmiConnect | HostThunk::WmiInitialize | HostThunk::WmiQuery | HostThunk::UiaGetPatternProvider | HostThunk::UiaGetRuntimeId | HostThunk::UiaGetUpdatedCache | HostThunk::UiaLookupId | HostThunk::UiaNavigate | HostThunk::UiaRaiseAutomationEvent | HostThunk::UiaRaiseAutomationPropertyChangedEvent | HostThunk::AccessibleObjectFromEvent | HostThunk::AccessibleObjectFromPoint | HostThunk::AccessibleObjectFromWindow | HostThunk::GetAccessibleObjectFromWindow | HostThunk::GetOleaccVersionInfo | HostThunk::WindowFromAccessibleObject | HostThunk::DhcpCApiCleanup | HostThunk::DhcpCApiInitialize | HostThunk::DhcpReleaseParams | HostThunk::DhcpRenewParams | HostThunk::DhcpRequestParams | HostThunk::DnsFlushResolverCache | HostThunk::DnsQueryConfig | HostThunk::DnsQueryW | HostThunk::DnsRecordListFree | HostThunk::DiInstallDevice | HostThunk::DiInstallDriverW | HostThunk::DiUninstallDevice | HostThunk::UpdateDriverForPlugAndPlayDevicesW | HostThunk::WtsEnumerateSessionsW | HostThunk::WtsFreeMemory | HostThunk::WtsQuerySessionInformationW | HostThunk::WtsQueryUserToken | HostThunk::CreateVssBackupComponents | HostThunk::VssFreeComponent | HostThunk::VssFreeSnapshotProperties | HostThunk::VssFreeWriterMetadata | HostThunk::CreateTextServices | HostThunk::ITextDocument | HostThunk::RichEdit10AnsiWndClass | HostThunk::ShutdownTextServices | HostThunk::Dp8spCreate | HostThunk::DirectPlay8Create | HostThunk::DirectSoundCaptureCreate8 | HostThunk::DirectSoundCaptureEnumerateW | HostThunk::DirectSoundCreate8 | HostThunk::DirectSoundEnumerateW) => {
                 self.dispatch_system_sweep(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
+                self.dispatch_long_tail(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -75788,6 +75890,647 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::CreateFileW,
             ("comctl32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::InitCommonControls,
+            ("atl.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleAddTermFunc" => {
+                Self::AtlModuleAddTermFunc
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleLoadTypeLib" => {
+                Self::AtlModuleLoadTypeLib
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleRegisterServer" => {
+                Self::AtlModuleRegisterServer
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleRegisterTypeLib" =>
+            {
+                Self::AtlModuleRegisterTypeLib
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterServer" =>
+            {
+                Self::AtlModuleUnregisterServer
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterTypeLib" =>
+            {
+                Self::AtlModuleUnregisterTypeLib
+            }
+            ("atl.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUpdateRegistryFromResource" =>
+            {
+                Self::AtlModuleUpdateRegistryFromResource
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateAvifDecoder" =>
+            {
+                Self::WicCreateAvifDecoder
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateAvifEncoder" =>
+            {
+                Self::WicCreateAvifEncoder
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateHeifDecoder" =>
+            {
+                Self::WicCreateHeifDecoder
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateHeifEncoder" =>
+            {
+                Self::WicCreateHeifEncoder
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateWebpDecoder" =>
+            {
+                Self::WicCreateWebpDecoder
+            }
+            ("windowscodecsext.dll", ImportSymbol::ByName { name, .. })
+                if name == "WICCreateWebpEncoder" =>
+            {
+                Self::WicCreateWebpEncoder
+            }
+            ("actxprxy.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("actxprxy.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("actxprxy.dll", ImportSymbol::ByName { name, .. }) if name == "DllInstall" => {
+                Self::DllInstall
+            }
+            ("actxprxy.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("actxprxy.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("atl100.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleAddTermFunc" => {
+                Self::AtlModuleAddTermFunc
+            }
+            ("atl100.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleRegisterServer" =>
+            {
+                Self::AtlModuleRegisterServer
+            }
+            ("atl100.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleRegisterTypeLib" =>
+            {
+                Self::AtlModuleRegisterTypeLib
+            }
+            ("atl100.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterServer" =>
+            {
+                Self::AtlModuleUnregisterServer
+            }
+            ("atl100.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterTypeLib" =>
+            {
+                Self::AtlModuleUnregisterTypeLib
+            }
+            ("atl80.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleAddTermFunc" => {
+                Self::AtlModuleAddTermFunc
+            }
+            ("atl80.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleRegisterServer" =>
+            {
+                Self::AtlModuleRegisterServer
+            }
+            ("atl80.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleRegisterTypeLib" =>
+            {
+                Self::AtlModuleRegisterTypeLib
+            }
+            ("atl80.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterServer" =>
+            {
+                Self::AtlModuleUnregisterServer
+            }
+            ("atl80.dll", ImportSymbol::ByName { name, .. })
+                if name == "AtlModuleUnregisterTypeLib" =>
+            {
+                Self::AtlModuleUnregisterTypeLib
+            }
+            ("gameoverlayrenderer.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayCreateHook" =>
+            {
+                Self::OverlayCreateHook
+            }
+            ("gameoverlayrenderer.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayHookWindow" =>
+            {
+                Self::OverlayHookWindow
+            }
+            ("gameoverlayrenderer.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayPresent" =>
+            {
+                Self::OverlayPresent
+            }
+            ("gameoverlayrenderer.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayReset" =>
+            {
+                Self::OverlayReset
+            }
+            ("gameoverlayrenderer.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayUnhookWindow" =>
+            {
+                Self::OverlayUnhookWindow
+            }
+            ("gameoverlayrenderer64.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayCreateHook" =>
+            {
+                Self::OverlayCreateHook
+            }
+            ("gameoverlayrenderer64.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayHookWindow" =>
+            {
+                Self::OverlayHookWindow
+            }
+            ("gameoverlayrenderer64.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayPresent" =>
+            {
+                Self::OverlayPresent
+            }
+            ("gameoverlayrenderer64.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayReset" =>
+            {
+                Self::OverlayReset
+            }
+            ("gameoverlayrenderer64.dll", ImportSymbol::ByName { name, .. })
+                if name == "OverlayUnhookWindow" =>
+            {
+                Self::OverlayUnhookWindow
+            }
+            ("msvcp140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_Cnd_init" => {
+                Self::CndInit
+            }
+            ("msvcp140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_destroy" => {
+                Self::MtxDestroy
+            }
+            ("msvcp140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_init" => {
+                Self::MtxInit
+            }
+            ("msvcp140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_lock" => {
+                Self::MtxLock
+            }
+            ("msvcp140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_unlock" => {
+                Self::MtxUnlock
+            }
+            ("msvcp140_2.dll", ImportSymbol::ByName { name, .. }) if name == "_Cnd_init" => {
+                Self::CndInit
+            }
+            ("msvcp140_2.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_destroy" => {
+                Self::MtxDestroy
+            }
+            ("msvcp140_2.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_init" => {
+                Self::MtxInit
+            }
+            ("msvcp140_2.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_lock" => {
+                Self::MtxLock
+            }
+            ("msvcp140_2.dll", ImportSymbol::ByName { name, .. }) if name == "_Mtx_unlock" => {
+                Self::MtxUnlock
+            }
+            ("steam.dll", ImportSymbol::ByName { name, .. }) if name == "Steam_BGetSteamID" => {
+                Self::SteamBGetSteamId
+            }
+            ("steam.dll", ImportSymbol::ByName { name, .. })
+                if name == "Steam_BIsSubscribedApp" =>
+            {
+                Self::SteamBIsSubscribedApp
+            }
+            ("steam.dll", ImportSymbol::ByName { name, .. }) if name == "Steam_BLoggedOn" => {
+                Self::SteamBLoggedOn
+            }
+            ("steam.dll", ImportSymbol::ByName { name, .. }) if name == "Steam_NotifyOfLogin" => {
+                Self::SteamNotifyOfLogin
+            }
+            ("steam.dll", ImportSymbol::ByName { name, .. }) if name == "Steam_NotifyOfLogoff" => {
+                Self::SteamNotifyOfLogoff
+            }
+            ("vcruntime140_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "__C_specific_handler" =>
+            {
+                Self::CCSpecificHandler
+            }
+            ("vcruntime140_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "__current_exception" =>
+            {
+                Self::CurrentException
+            }
+            ("vcruntime140_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "__current_exception_context" =>
+            {
+                Self::CurrentExceptionContext
+            }
+            ("vcruntime140_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "__processing_throw" =>
+            {
+                Self::ProcessingThrow
+            }
+            ("vcruntime140_1.dll", ImportSymbol::ByName { name, .. }) if name == "_chkstk" => {
+                Self::Chkstk
+            }
+            ("certcli.dll", ImportSymbol::ByName { name, .. }) if name == "CertSrvBackupEnd" => {
+                Self::CertSrvBackupEnd
+            }
+            ("certcli.dll", ImportSymbol::ByName { name, .. })
+                if name == "CertSrvBackupPrepare" =>
+            {
+                Self::CertSrvBackupPrepare
+            }
+            ("certcli.dll", ImportSymbol::ByName { name, .. }) if name == "CertSrvRestoreEnd" => {
+                Self::CertSrvRestoreEnd
+            }
+            ("certcli.dll", ImportSymbol::ByName { name, .. })
+                if name == "CertSrvRestorePrepare" =>
+            {
+                Self::CertSrvRestorePrepare
+            }
+            ("d3dx10_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX10CompileFromFile" =>
+            {
+                Self::D3dx10CompileFromFile
+            }
+            ("d3dx10_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX10CreateTextureFromFileW" =>
+            {
+                Self::D3dx10CreateTextureFromFileW
+            }
+            ("d3dx10_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX10GetImageInfoFromFile" =>
+            {
+                Self::D3dx10GetImageInfoFromFile
+            }
+            ("d3dx10_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX10SaveTextureToMemory" =>
+            {
+                Self::D3dx10SaveTextureToMemory
+            }
+            ("gameux.dll", ImportSymbol::ByName { name, .. }) if name == "GAMEUX_SHFOLDERPATH" => {
+                Self::GameuxShfolderpath
+            }
+            ("gameux.dll", ImportSymbol::ByName { name, .. })
+                if name == "GameExplorer_Initialize" =>
+            {
+                Self::GameExplorerInitialize
+            }
+            ("gameux.dll", ImportSymbol::ByName { name, .. })
+                if name == "GameExplorer_SetUserAccess" =>
+            {
+                Self::GameExplorerSetUserAccess
+            }
+            ("gameux.dll", ImportSymbol::ByName { name, .. })
+                if name == "GameExplorer_VerifyAccess" =>
+            {
+                Self::GameExplorerVerifyAccess
+            }
+            ("jscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("jscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("jscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("jscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("mscorwks.dll", ImportSymbol::ByName { name, .. })
+                if name == "ClrCreateManagedInstance" =>
+            {
+                Self::ClrCreateManagedInstance
+            }
+            ("mscorwks.dll", ImportSymbol::ByName { name, .. }) if name == "CorBindToRuntime" => {
+                Self::CorBindToRuntime
+            }
+            ("mscorwks.dll", ImportSymbol::ByName { name, .. }) if name == "CorBindToRuntimeEx" => {
+                Self::CorBindToRuntimeEx
+            }
+            ("mscorwks.dll", ImportSymbol::ByName { name, .. }) if name == "GetCLRRuntimeHost" => {
+                Self::GetClrRuntimeHost
+            }
+            ("mshtml.dll", ImportSymbol::ByName { name, .. })
+                if name == "CreateHTMLPropertyPage" =>
+            {
+                Self::CreateHtmlPropertyPage
+            }
+            ("mshtml.dll", ImportSymbol::ByName { name, .. })
+                if name == "IEFrameFactory_Constructor" =>
+            {
+                Self::IeFrameFactoryConstructor
+            }
+            ("mshtml.dll", ImportSymbol::ByName { name, .. }) if name == "ShowHTMLDialogEx" => {
+                Self::ShowHtmlDialogEx
+            }
+            ("mshtml.dll", ImportSymbol::ByName { name, .. }) if name == "IHTMLDocument2" => {
+                Self::IhtmlDocument2
+            }
+            ("ntdsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DsBind" => Self::DsBind,
+            ("ntdsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DsBindWithCred" => {
+                Self::DsBindWithCred
+            }
+            ("ntdsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DsMakeSpnW" => {
+                Self::DsMakeSpnW
+            }
+            ("ntdsapi.dll", ImportSymbol::ByName { name, .. }) if name == "DsUnbind" => {
+                Self::DsUnbind
+            }
+            ("vbscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("vbscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("vbscript.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("vbscript.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("wbemcomn.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("wbemcomn.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("wbemcomn.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wbemcomn.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("activeds.dll", ImportSymbol::ByName { name, .. }) if name == "ADsBuildEnumerator" => {
+                Self::AdsBuildEnumerator
+            }
+            ("activeds.dll", ImportSymbol::ByName { name, .. }) if name == "ADsGetObject" => {
+                Self::AdsGetObject
+            }
+            ("activeds.dll", ImportSymbol::ByName { name, .. }) if name == "ADsOpenObject" => {
+                Self::AdsOpenObject
+            }
+            ("audioendpoint.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllGetClassObject" =>
+            {
+                Self::DllGetClassObject
+            }
+            ("audioendpoint.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("audioendpoint.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("certadm.dll", ImportSymbol::ByName { name, .. }) if name == "CertSrvAdminGetCA" => {
+                Self::CertSrvAdminGetCa
+            }
+            ("certadm.dll", ImportSymbol::ByName { name, .. }) if name == "CertSrvAdminGetCert" => {
+                Self::CertSrvAdminGetCert
+            }
+            ("certadm.dll", ImportSymbol::ByName { name, .. }) if name == "CertSrvAdminSetCA" => {
+                Self::CertSrvAdminSetCa
+            }
+            ("clbcatq.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("clbcatq.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("clbcatq.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("d3d10_1.dll", ImportSymbol::ByName { name, .. }) if name == "D3D10CreateDevice1" => {
+                Self::D3d10CreateDevice1
+            }
+            ("d3d10_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CreateDeviceAndSwapChain1" =>
+            {
+                Self::D3d10CreateDeviceAndSwapChain1
+            }
+            ("d3d10_1.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CreateEffectFromMemory" =>
+            {
+                Self::D3d10CreateEffectFromMemory
+            }
+            ("dhcpcsvc6.dll", ImportSymbol::ByName { name, .. })
+                if name == "Dhcpv6ReleaseParams" =>
+            {
+                Self::Dhcpv6ReleaseParams
+            }
+            ("dhcpcsvc6.dll", ImportSymbol::ByName { name, .. }) if name == "Dhcpv6RenewParams" => {
+                Self::Dhcpv6RenewParams
+            }
+            ("dhcpcsvc6.dll", ImportSymbol::ByName { name, .. })
+                if name == "Dhcpv6RequestParams" =>
+            {
+                Self::Dhcpv6RequestParams
+            }
+            ("dinput8.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("dinput8.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("dinput8.dll", ImportSymbol::ByName { name, .. }) if name == "GetdfDIJoystick" => {
+                Self::GetdfDIJoystick
+            }
+            ("encapi.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("encapi.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("encapi.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("fastprox.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("fastprox.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("fastprox.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("fwpuclnt.dll", ImportSymbol::ByName { name, .. }) if name == "FWPS_FILTER" => {
+                Self::FwpsFilter
+            }
+            ("fwpuclnt.dll", ImportSymbol::ByName { name, .. }) if name == "FwpsOpenToken" => {
+                Self::FwpsOpenToken
+            }
+            ("fwpuclnt.dll", ImportSymbol::ByName { name, .. })
+                if name == "FwpsQueryTokenInformation" =>
+            {
+                Self::FwpsQueryTokenInformation
+            }
+            ("ieframe.dll", ImportSymbol::ByName { name, .. }) if name == "IEGetFrameComponent" => {
+                Self::IeGetFrameComponent
+            }
+            ("ieframe.dll", ImportSymbol::ByName { name, .. }) if name == "IEGetWriteableHlink" => {
+                Self::IeGetWriteableHlink
+            }
+            ("ieframe.dll", ImportSymbol::ByName { name, .. }) if name == "IEHlink" => {
+                Self::IeHlink
+            }
+            ("loadperf.dll", ImportSymbol::ByName { name, .. })
+                if name == "LoadPerfCounterTextStringsW" =>
+            {
+                Self::LoadPerfCounterTextStringsW
+            }
+            ("loadperf.dll", ImportSymbol::ByName { name, .. })
+                if name == "SetServiceAsTrusted" =>
+            {
+                Self::SetServiceAsTrusted
+            }
+            ("loadperf.dll", ImportSymbol::ByName { name, .. })
+                if name == "UnloadPerfCounterTextStringsW" =>
+            {
+                Self::UnloadPerfCounterTextStringsW
+            }
+            ("msdart.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("msdart.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msdart.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("msdxm.ocx", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("msdxm.ocx", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msdxm.ocx", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("msimsg.dll", ImportSymbol::ByName { name, .. }) if name == "MsiFormatRecordW" => {
+                Self::MsiFormatRecordW
+            }
+            ("msimsg.dll", ImportSymbol::ByName { name, .. })
+                if name == "MsiGetLastErrorRecord" =>
+            {
+                Self::MsiGetLastErrorRecord
+            }
+            ("msimsg.dll", ImportSymbol::ByName { name, .. }) if name == "MsiProcessMessage" => {
+                Self::MsiProcessMessage
+            }
+            ("mspatcha.dll", ImportSymbol::ByName { name, .. })
+                if name == "ApplyPatchToFileExW" =>
+            {
+                Self::ApplyPatchToFileExW
+            }
+            ("mspatcha.dll", ImportSymbol::ByName { name, .. }) if name == "ApplyPatchToFileW" => {
+                Self::ApplyPatchToFileW
+            }
+            ("mspatcha.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetPatchFileSignature" =>
+            {
+                Self::GetPatchFileSignature
+            }
+            ("printui.dll", ImportSymbol::ByName { name, .. }) if name == "PrintUIEntry" => {
+                Self::PrintUiEntry
+            }
+            ("printui.dll", ImportSymbol::ByName { name, .. }) if name == "PrintUIToDevice" => {
+                Self::PrintUiToDevice
+            }
+            ("printui.dll", ImportSymbol::ByName { name, .. }) if name == "PrintUIToFile" => {
+                Self::PrintUiToFile
+            }
+            ("samlib.dll", ImportSymbol::ByName { name, .. }) if name == "SamCloseHandle" => {
+                Self::SamCloseHandle
+            }
+            ("samlib.dll", ImportSymbol::ByName { name, .. }) if name == "SamConnect" => {
+                Self::SamConnect
+            }
+            ("samlib.dll", ImportSymbol::ByName { name, .. }) if name == "SamOpenDomain" => {
+                Self::SamOpenDomain
+            }
+            ("scecli.dll", ImportSymbol::ByName { name, .. })
+                if name == "ScGenerateRelativeName" =>
+            {
+                Self::ScGenerateRelativeName
+            }
+            ("scecli.dll", ImportSymbol::ByName { name, .. })
+                if name == "ScRemoveAllPrivileges" =>
+            {
+                Self::ScRemoveAllPrivileges
+            }
+            ("scecli.dll", ImportSymbol::ByName { name, .. })
+                if name == "ScSetSecurityDescriptor" =>
+            {
+                Self::ScSetSecurityDescriptor
+            }
+            ("scrrun.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("scrrun.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("scrrun.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("winrnr.dll", ImportSymbol::ByName { name, .. }) if name == "RNRCancelQuery" => {
+                Self::RnrCancelQuery
+            }
+            ("winrnr.dll", ImportSymbol::ByName { name, .. }) if name == "RNRInitialize" => {
+                Self::RnrInitialize
+            }
+            ("winrnr.dll", ImportSymbol::ByName { name, .. }) if name == "RNRQuery" => {
+                Self::RnrQuery
+            }
+            ("winsta.dll", ImportSymbol::ByName { name, .. })
+                if name == "WinStationCloseServer" =>
+            {
+                Self::WinStationCloseServer
+            }
+            ("winsta.dll", ImportSymbol::ByName { name, .. }) if name == "WinStationEnumerate" => {
+                Self::WinStationEnumerate
+            }
+            ("winsta.dll", ImportSymbol::ByName { name, .. }) if name == "WinStationOpenServer" => {
+                Self::WinStationOpenServer
+            }
+            ("wmp.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("wmp.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wmp.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("xapofx1_5.dll", ImportSymbol::ByName { name, .. }) if name == "CreateFX" => {
+                Self::CreateFx
+            }
+            ("xapofx1_5.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("xapofx1_5.dll", ImportSymbol::ByName { name, .. }) if name == "XAudio2Create" => {
+                Self::XAudio2Create
+            }
+            ("xinput9_1_0.dll", ImportSymbol::ByName { name, .. })
+                if name == "XInputGetCapabilities" =>
+            {
+                Self::XInputGetCapabilities
+            }
+            ("xinput9_1_0.dll", ImportSymbol::ByName { name, .. }) if name == "XInputGetState" => {
+                Self::XInputGetState
+            }
+            ("xinput9_1_0.dll", ImportSymbol::ByName { name, .. }) if name == "XInputSetState" => {
+                Self::XInputSetState
+            }
             ("comctl32.dll", ImportSymbol::ByName { name, .. })
                 if name == "InitCommonControlsEx" =>
             {
@@ -126925,6 +127668,100 @@ mod tests {
                 dispatch_x86_thunk(&mut runtime, &mut memory, ds_create, &[0, 0x41_700, 0]),
                 0x8878_0007,
                 "DSERR_NODRIVER"
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_long_tail_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-tail");
+            let mut memory = MemoryImage::default();
+
+            // ── ATL module server ──
+            let atl_register: u64 = runtime.alloc_host_thunk(HostThunk::AtlModuleRegisterServer);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, atl_register, &[0]),
+                0
+            );
+
+            // ── the CRT sync primitives ──
+            let mtx_init: u64 = runtime.alloc_host_thunk(HostThunk::MtxInit);
+            let mtx_lock: u64 = runtime.alloc_host_thunk(HostThunk::MtxLock);
+            let mtx_unlock: u64 = runtime.alloc_host_thunk(HostThunk::MtxUnlock);
+            let mtx_destroy: u64 = runtime.alloc_host_thunk(HostThunk::MtxDestroy);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, mtx_init, &[0x41_000]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, mtx_lock, &[0x41_000]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, mtx_unlock, &[0x41_000]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, mtx_destroy, &[0x41_000]),
+                0
+            );
+
+            // ── steam session ──
+            let steam_logged: u64 = runtime.alloc_host_thunk(HostThunk::SteamBLoggedOn);
+            let steam_id: u64 = runtime.alloc_host_thunk(HostThunk::SteamBGetSteamId);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, steam_logged, &[]),
+                1
+            );
+            let id_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, steam_id, &[id_out as u32]),
+                1
+            );
+            assert_eq!(
+                read_guest_u64(&memory, id_out).unwrap(),
+                0x1100_0001_0000_0001
+            );
+
+            // ── mscorwks: the CLR-absent answers ──
+            let clr_managed: u64 = runtime.alloc_host_thunk(HostThunk::ClrCreateManagedInstance);
+            let out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, clr_managed, &[0, 0, out as u32]),
+                0x8013_1013
+            );
+            assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+
+            // ── ntdsapi: the no-domain answers ──
+            let ds_bind: u64 = runtime.alloc_host_thunk(HostThunk::DsBind);
+            let bind_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, ds_bind, &[0, bind_out as u32]),
+                0x8007_0e8d,
+                "ERROR_DS_NOT_AVAILABLE"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, bind_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // ── xinput9_1_0: the no-device answers ──
+            let xi_state: u64 = runtime.alloc_host_thunk(HostThunk::XInputGetState);
+            let xi_hr = dispatch_x86_thunk(&mut runtime, &mut memory, xi_state, &[0, 0x41_400]);
+            assert!(xi_hr != 0, "the xinput surface answers an honest failure");
+
+            // ── the WIC extensions: the no-codec answer ──
+            let wic_webp: u64 = runtime.alloc_host_thunk(HostThunk::WicCreateWebpDecoder);
+            let codec_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wic_webp, &[0, codec_out as u32]),
+                0x8898_2f02,
+                "WIC_E_CODECNOTFOUND"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, codec_out, GuestArch::X86).unwrap(),
+                0
             );
         })
     }
