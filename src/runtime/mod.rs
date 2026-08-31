@@ -5396,6 +5396,34 @@ pub enum HostThunk {
     Dxva2CreateDirect3DDeviceManager9,
     Dxva2CreateVideoService,
     Dxva2GetVideoProcessorCaps,
+    CpAcquireContext,
+    CpDecrypt,
+    CpEncrypt,
+    CpGenKey,
+    CpHashData,
+    CpReleaseContext,
+    CpVerifySignature,
+    CryptProtectData,
+    CryptProtectMemory,
+    CryptUnprotectData,
+    CryptUnprotectMemory,
+    WtGetSignatureInfo,
+    WtHelperGetProvPrivateDataFromChain,
+    WtHelperGetProvSignerFromChain,
+    WtHelperProvDataFromStateData,
+    CryptDecodeObject,
+    CryptEncodeObject,
+    CryptExportPkcs8,
+    FreeContextBuffer,
+    QuerySecurityPackageInfoW,
+    SspiInitialize,
+    InitSecurityInterfaceW,
+    SslGetDataToWrite,
+    SslLoadCertificate,
+    CryptUiDlgCertMgr,
+    CryptUiDlgSelectCertificateW,
+    CryptUiDlgSelectStoreW,
+    CryptUiDlgViewCertificateW,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28509,6 +28537,15 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::WmcdspCreateAudioDecoder | HostThunk::WmcdspCreateAudioEncoder | HostThunk::WmcdspCreateConverter | HostThunk::WmcdspCreateDecoder | HostThunk::WmcdspCreateEncoder | HostThunk::WmcdspCreateProcessor | HostThunk::WmcdspCreateResampler | HostThunk::WmCreateEditor | HostThunk::WmCreateIndexer | HostThunk::WmCreateProfileManager | HostThunk::WmCreateReader | HostThunk::WmCreateSyncReader | HostThunk::WmCreateWriter | HostThunk::WmIsContentProtected | HostThunk::AudioSessionFromGuid | HostThunk::AudioSessionFromHwnd | HostThunk::AudioSessionFromString | HostThunk::AudioSessionize | HostThunk::DmoEnum | HostThunk::DmoGetName | HostThunk::DmoGetTypes | HostThunk::DmoGuidToStr | HostThunk::DmoStrToGuid | HostThunk::MoFree | HostThunk::MfCreateVideoMediaType | HostThunk::MfCreateVideoMixer | HostThunk::MfCreateVideoPresenter | HostThunk::MfCreateVideoRenderer | HostThunk::MfCreateVideoSampleAllocator | HostThunk::AmGetErrorText | HostThunk::CreateErrorInfo | HostThunk::CreateFilter | HostThunk::Dxva2CreateDirect3DDeviceManager9 | HostThunk::Dxva2CreateVideoService | HostThunk::Dxva2GetVideoProcessorCaps) => {
                 self.dispatch_codecs(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::CpAcquireContext | HostThunk::CpDecrypt | HostThunk::CpEncrypt | HostThunk::CpGenKey | HostThunk::CpHashData | HostThunk::CpReleaseContext | HostThunk::CpVerifySignature) => {
+                self.dispatch_rsaenh(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::CryptProtectData | HostThunk::CryptProtectMemory | HostThunk::CryptUnprotectData | HostThunk::CryptUnprotectMemory) => {
+                self.dispatch_dpapi(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WtGetSignatureInfo | HostThunk::WtHelperGetProvPrivateDataFromChain | HostThunk::WtHelperGetProvSignerFromChain | HostThunk::WtHelperProvDataFromStateData | HostThunk::CryptDecodeObject | HostThunk::CryptEncodeObject | HostThunk::CryptExportPkcs8 | HostThunk::FreeContextBuffer | HostThunk::QuerySecurityPackageInfoW | HostThunk::SspiInitialize | HostThunk::InitSecurityInterfaceW | HostThunk::SslGetDataToWrite | HostThunk::SslLoadCertificate | HostThunk::CryptUiDlgCertMgr | HostThunk::CryptUiDlgSelectCertificateW | HostThunk::CryptUiDlgSelectStoreW | HostThunk::CryptUiDlgViewCertificateW) => {
+                self.dispatch_trust(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -64697,7 +64734,9 @@ impl PeHostRuntime {
             | GuestObjectKind::EvrVideoRenderer
             | GuestObjectKind::EvrSampleAllocator
             | GuestObjectKind::ComErrorInfo
-            | GuestObjectKind::Dxva2VideoService => {
+            | GuestObjectKind::Dxva2VideoService
+            | GuestObjectKind::CspContext
+            | GuestObjectKind::CspKey => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -82042,6 +82081,133 @@ impl HostThunk {
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
                 Self::FindTextW
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPAcquireContext" => {
+                Self::CpAcquireContext
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPDecrypt" => {
+                Self::CpDecrypt
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPEncrypt" => {
+                Self::CpEncrypt
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPGenKey" => {
+                Self::CpGenKey
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPHashData" => {
+                Self::CpHashData
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPReleaseContext" => {
+                Self::CpReleaseContext
+            }
+            ("rsaenh.dll", ImportSymbol::ByName { name, .. }) if name == "CPVerifySignature" => {
+                Self::CpVerifySignature
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. })
+                if name == "BCryptCloseAlgorithmProvider" =>
+            {
+                Self::BCryptCloseAlgorithmProvider
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. }) if name == "BCryptDecrypt" => {
+                Self::BCryptDecrypt
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. }) if name == "BCryptEncrypt" => {
+                Self::BCryptEncrypt
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. }) if name == "BCryptGenRandom" => {
+                Self::BCryptGenRandom
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. })
+                if name == "BCryptGenerateSymmetricKey" =>
+            {
+                Self::BCryptGenerateSymmetricKey
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. }) if name == "BCryptHash" => {
+                Self::BCryptHash
+            }
+            ("cryptng.dll", ImportSymbol::ByName { name, .. })
+                if name == "BCryptOpenAlgorithmProvider" =>
+            {
+                Self::BCryptOpenAlgorithmProvider
+            }
+            ("dpapi.dll", ImportSymbol::ByName { name, .. }) if name == "CryptProtectData" => {
+                Self::CryptProtectData
+            }
+            ("dpapi.dll", ImportSymbol::ByName { name, .. }) if name == "CryptProtectMemory" => {
+                Self::CryptProtectMemory
+            }
+            ("dpapi.dll", ImportSymbol::ByName { name, .. }) if name == "CryptUnprotectData" => {
+                Self::CryptUnprotectData
+            }
+            ("dpapi.dll", ImportSymbol::ByName { name, .. }) if name == "CryptUnprotectMemory" => {
+                Self::CryptUnprotectMemory
+            }
+            ("wintrust.dll", ImportSymbol::ByName { name, .. }) if name == "WTGetSignatureInfo" => {
+                Self::WtGetSignatureInfo
+            }
+            ("wintrust.dll", ImportSymbol::ByName { name, .. })
+                if name == "WTHelperGetProvPrivateDataFromChain" =>
+            {
+                Self::WtHelperGetProvPrivateDataFromChain
+            }
+            ("wintrust.dll", ImportSymbol::ByName { name, .. })
+                if name == "WTHelperGetProvSignerFromChain" =>
+            {
+                Self::WtHelperGetProvSignerFromChain
+            }
+            ("wintrust.dll", ImportSymbol::ByName { name, .. })
+                if name == "WTHelperProvDataFromStateData" =>
+            {
+                Self::WtHelperProvDataFromStateData
+            }
+            ("cryptdll.dll", ImportSymbol::ByName { name, .. }) if name == "CryptDecodeObject" => {
+                Self::CryptDecodeObject
+            }
+            ("cryptdll.dll", ImportSymbol::ByName { name, .. }) if name == "CryptEncodeObject" => {
+                Self::CryptEncodeObject
+            }
+            ("cryptdll.dll", ImportSymbol::ByName { name, .. }) if name == "CryptExportPKCS8" => {
+                Self::CryptExportPkcs8
+            }
+            ("sspicli.dll", ImportSymbol::ByName { name, .. }) if name == "FreeContextBuffer" => {
+                Self::FreeContextBuffer
+            }
+            ("sspicli.dll", ImportSymbol::ByName { name, .. })
+                if name == "QuerySecurityPackageInfoW" =>
+            {
+                Self::QuerySecurityPackageInfoW
+            }
+            ("sspicli.dll", ImportSymbol::ByName { name, .. }) if name == "SSPIInitialize" => {
+                Self::SspiInitialize
+            }
+            ("schannel.dll", ImportSymbol::ByName { name, .. })
+                if name == "InitSecurityInterfaceW" =>
+            {
+                Self::InitSecurityInterfaceW
+            }
+            ("schannel.dll", ImportSymbol::ByName { name, .. }) if name == "SslGetDataToWrite" => {
+                Self::SslGetDataToWrite
+            }
+            ("schannel.dll", ImportSymbol::ByName { name, .. }) if name == "SslLoadCertificate" => {
+                Self::SslLoadCertificate
+            }
+            ("cryptui.dll", ImportSymbol::ByName { name, .. }) if name == "CryptUIDlgCertMgr" => {
+                Self::CryptUiDlgCertMgr
+            }
+            ("cryptui.dll", ImportSymbol::ByName { name, .. })
+                if name == "CryptUIDlgSelectCertificateW" =>
+            {
+                Self::CryptUiDlgSelectCertificateW
+            }
+            ("cryptui.dll", ImportSymbol::ByName { name, .. })
+                if name == "CryptUIDlgSelectStoreW" =>
+            {
+                Self::CryptUiDlgSelectStoreW
+            }
+            ("cryptui.dll", ImportSymbol::ByName { name, .. })
+                if name == "CryptUIDlgViewCertificateW" =>
+            {
+                Self::CryptUiDlgViewCertificateW
             }
             ("wmcodecdsp.dll", ImportSymbol::ByName { name, .. })
                 if name == "WMCDSPCreateAudioDecoder" =>
@@ -125929,6 +126095,164 @@ mod tests {
                 hr, 0,
                 "the shared class-object contract answers every CLSID"
             );
+        })
+    }
+
+    #[test]
+    fn evidence_security_crypto_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-security");
+            let mut memory = MemoryImage::default();
+
+            // ── rsaenh: the CSP context + key ──
+            let acquire: u64 = runtime.alloc_host_thunk(HostThunk::CpAcquireContext);
+            let gen_key: u64 = runtime.alloc_host_thunk(HostThunk::CpGenKey);
+            let release: u64 = runtime.alloc_host_thunk(HostThunk::CpReleaseContext);
+            let ctx_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    acquire,
+                    &[0, 0, 1, 0, ctx_out as u32]
+                ),
+                0
+            );
+            let ctx = read_guest_pointer(&memory, ctx_out, GuestArch::X86).unwrap();
+            assert_ne!(ctx, 0);
+            let key_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    gen_key,
+                    &[ctx as u32, 1, 0, key_out as u32]
+                ),
+                0
+            );
+            let key = read_guest_pointer(&memory, key_out, GuestArch::X86).unwrap();
+            assert_ne!(key, 0);
+            assert!(runtime.csp_keys.get(&key).unwrap().private_key.is_some());
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, release, &[ctx as u32, 0]),
+                0
+            );
+
+            // ── cryptng: the legacy BCrypt surface (the existing suite) ──
+            let bcrypt_open: u64 = runtime.alloc_host_thunk(HostThunk::BCryptOpenAlgorithmProvider);
+            let bcrypt_hash: u64 = runtime.alloc_host_thunk(HostThunk::BCryptHash);
+            let alg_ptr = 0x41_200_u64;
+            let alg_wide: Vec<u16> = "SHA256".encode_utf16().chain([0]).collect();
+            for (i, unit) in alg_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, alg_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let provider_out = 0x41_210_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    bcrypt_open,
+                    &[provider_out as u32, alg_ptr as u32, 0, 0]
+                ),
+                0
+            );
+            let provider = read_guest_pointer(&memory, provider_out, GuestArch::X86).unwrap();
+            assert_ne!(provider, 0);
+            let input = 0x41_220_u64;
+            memory.map_bytes(input, b"abc");
+            let digest_out = 0x41_230_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    bcrypt_hash,
+                    &[
+                        provider as u32,
+                        0,
+                        0,
+                        input as u32,
+                        3,
+                        digest_out as u32,
+                        32
+                    ]
+                ),
+                0
+            );
+            let digest = memory.read_bytes(digest_out, 32).unwrap();
+            assert_eq!(
+                digest,
+                vec![
+                    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
+                    0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
+                    0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+                ],
+                "SHA-256 of abc"
+            );
+
+            // ── dpapi: the protect/unprotect round trip ──
+            let protect: u64 = runtime.alloc_host_thunk(HostThunk::CryptProtectData);
+            let unprotect: u64 = runtime.alloc_host_thunk(HostThunk::CryptUnprotectData);
+            let data_in = 0x41_300_u64;
+            let secret = 0x41_310_u64;
+            memory.map_bytes(secret, b"hello world");
+            write_guest_u32(&mut memory, data_in, 11).ok();
+            write_guest_pointer(&mut memory, data_in + 8, secret, GuestArch::X86).ok();
+            assert_eq!(
+                read_guest_u32(&memory, data_in).unwrap(),
+                11,
+                "cbData written"
+            );
+            let blob_out = 0x41_320_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    protect,
+                    &[data_in as u32, 0, 0, 0, 0, 0, blob_out as u32]
+                ),
+                1
+            );
+            let blob_size = read_guest_u32(&memory, blob_out).unwrap();
+            assert!(blob_size > 32, "blob size {blob_size}");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    unprotect,
+                    &[blob_out as u32, 0, 0, 0, 0, 0, data_in as u32]
+                ),
+                1
+            );
+            let restored = read_guest_u32(&memory, data_in).unwrap();
+            assert_eq!(restored, 11, "the round trip restores the length");
+            let restored_ptr = read_guest_pointer(&memory, data_in + 8, GuestArch::X86).unwrap();
+            assert_eq!(
+                memory.read_bytes(restored_ptr, 11).unwrap(),
+                b"hello world",
+                "the round trip restores the data"
+            );
+
+            // ── sspicli: the NTLM package info ──
+            let query_package: u64 = runtime.alloc_host_thunk(HostThunk::QuerySecurityPackageInfoW);
+            let package_ptr = 0x41_400_u64;
+            let package_wide: Vec<u16> = "NTLM".encode_utf16().chain([0]).collect();
+            for (i, unit) in package_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, package_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let info_out = 0x41_410_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    query_package,
+                    &[package_ptr as u32, info_out as u32]
+                ),
+                0
+            );
+            let info = read_guest_pointer(&memory, info_out, GuestArch::X86).unwrap();
+            assert_ne!(info, 0);
+            let name_ptr = read_guest_pointer(&memory, info + 12, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, name_ptr).unwrap(), "NTLM");
         })
     }
 }

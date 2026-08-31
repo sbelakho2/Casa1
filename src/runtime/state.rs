@@ -261,6 +261,8 @@ pub(crate) enum GuestObjectKind {
     EvrSampleAllocator,
     ComErrorInfo,
     Dxva2VideoService,
+    CspContext,
+    CspKey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -653,6 +655,13 @@ pub(crate) struct MfDxgiDeviceManagerState {
 pub(crate) struct LdapSessionState {
     pub(crate) host: String,
     pub(crate) port: u32,
+}
+
+/// An RSA-CSP key (CPGenKey) — consumed by `runtime/dispatch/crypto.rs`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // the CSP private key is stored for the key lifecycle
+pub(crate) struct CspKeyState {
+    pub(crate) private_key: Option<rsa::RsaPrivateKey>,
 }
 
 /// A CNG key object (NCryptCreatePersistedKey) — consumed by
@@ -1699,6 +1708,12 @@ pub(crate) struct PeHostRuntime {
     pub(crate) dinput_objects: HashMap<u64, u32>,
     /// The codec-component objects.
     pub(crate) codec_objects: HashMap<u64, u32>,
+    /// The RSA-CSP contexts.
+    pub(crate) csp_contexts: HashMap<u64, u32>,
+    /// The RSA-CSP keys.
+    pub(crate) csp_keys: HashMap<u64, CspKeyState>,
+    /// The security packages (QuerySecurityPackageInfoW).
+    pub(crate) sec_packages: HashMap<u64, String>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2303,6 +2318,9 @@ impl PeHostRuntime {
             wininet_requests: HashMap::new(),
             dinput_objects: HashMap::new(),
             codec_objects: HashMap::new(),
+            csp_contexts: HashMap::new(),
+            csp_keys: HashMap::new(),
+            sec_packages: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
