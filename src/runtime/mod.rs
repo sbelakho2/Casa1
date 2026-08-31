@@ -5303,6 +5303,63 @@ pub enum HostThunk {
     DllFunc,
     DllMain,
     DllProc,
+    D3DKMTCloseAdapter,
+    D3DKMTCreateAllocation,
+    D3DKMTCreateContext,
+    D3DKMTCreateDevice,
+    D3DKMTCreateSynchronizationObject,
+    D3DKMTDestroyContext,
+    D3DKMTDestroyDevice,
+    D3DKMTEnumAdapters,
+    D3DKMTGetDisplayModeList,
+    D3DKMTOpenAdapterFromHdc,
+    D3DKMTOpenKeyedMutex,
+    D3DKMTOpenResource,
+    D3DKMTPresent,
+    D3DKMTQueryAdapterInfo,
+    D3DKMTQueryAllocationResidency,
+    D3DKMTRender,
+    D3DKMTSetAllocationPriority,
+    D3DKMTSetDisplayPrivateDriverFormat,
+    JetAttachDatabase,
+    JetBeginTransaction,
+    JetCloseDatabase,
+    JetCloseTable,
+    JetCommitTransaction,
+    JetCreateDatabase,
+    JetDetachDatabase,
+    JetGetTableColumnInfo,
+    JetInit,
+    JetOpenDatabase,
+    JetOpenTable,
+    JetRollback,
+    JetTerm,
+    WSPAccept,
+    WSPBind,
+    WSPCleanup,
+    WSPConnect,
+    WSPListen,
+    WSPRecv,
+    WSPSend,
+    WSPSocket,
+    WSPStartup,
+    AcceptEx,
+    EnumProtocolsW,
+    GetAcceptExSockaddrs,
+    TransmitFile,
+    WSAGetOverlappedResult,
+    WSARecvEx,
+    WSASocketW,
+    HttpAddRequestHeadersW,
+    HttpQueryInfoW,
+    InternetAttemptConnect,
+    InternetOpenUrlW,
+    InternetQueryOptionW,
+    InternetReadFileExW,
+    InternetWriteFile,
+    DirectInputCreateEx,
+    DirectInputCreateW,
+    DirectInputCreateDevice,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28395,6 +28452,24 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::BasicClassAddRef | HostThunk::BasicClassGetIDsOfNames | HostThunk::BasicClassInvoke | HostThunk::BasicClassQueryInterface | HostThunk::BasicClassRelease | HostThunk::BasicDispatchInvoke | HostThunk::DllCall | HostThunk::DllFunc | HostThunk::DllMain | HostThunk::DllProc) => {
                 self.dispatch_msvbvm(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::D3DKMTCloseAdapter | HostThunk::D3DKMTCreateAllocation | HostThunk::D3DKMTCreateContext | HostThunk::D3DKMTCreateDevice | HostThunk::D3DKMTCreateSynchronizationObject | HostThunk::D3DKMTDestroyContext | HostThunk::D3DKMTDestroyDevice | HostThunk::D3DKMTEnumAdapters | HostThunk::D3DKMTGetDisplayModeList | HostThunk::D3DKMTOpenAdapterFromHdc | HostThunk::D3DKMTOpenKeyedMutex | HostThunk::D3DKMTOpenResource | HostThunk::D3DKMTPresent | HostThunk::D3DKMTQueryAdapterInfo | HostThunk::D3DKMTQueryAllocationResidency | HostThunk::D3DKMTRender | HostThunk::D3DKMTSetAllocationPriority | HostThunk::D3DKMTSetDisplayPrivateDriverFormat) => {
+                self.dispatch_d3d8thk(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::JetAttachDatabase | HostThunk::JetBeginTransaction | HostThunk::JetCloseDatabase | HostThunk::JetCloseTable | HostThunk::JetCommitTransaction | HostThunk::JetCreateDatabase | HostThunk::JetDetachDatabase | HostThunk::JetGetTableColumnInfo | HostThunk::JetInit | HostThunk::JetOpenDatabase | HostThunk::JetOpenTable | HostThunk::JetRollback | HostThunk::JetTerm) => {
+                self.dispatch_esent(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::WSPAccept | HostThunk::WSPBind | HostThunk::WSPCleanup | HostThunk::WSPConnect | HostThunk::WSPListen | HostThunk::WSPRecv | HostThunk::WSPSend | HostThunk::WSPSocket | HostThunk::WSPStartup) => {
+                self.dispatch_msafd(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::AcceptEx | HostThunk::EnumProtocolsW | HostThunk::GetAcceptExSockaddrs | HostThunk::TransmitFile | HostThunk::WSAGetOverlappedResult | HostThunk::WSARecvEx | HostThunk::WSASocketW) => {
+                self.dispatch_mswsock(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::HttpAddRequestHeadersW | HostThunk::HttpQueryInfoW | HostThunk::InternetAttemptConnect | HostThunk::InternetOpenUrlW | HostThunk::InternetQueryOptionW | HostThunk::InternetReadFileExW | HostThunk::InternetWriteFile) => {
+                self.dispatch_wininet(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::DirectInputCreateEx | HostThunk::DirectInputCreateW | HostThunk::DirectInputCreateDevice) => {
+                self.dispatch_dinput(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -64563,7 +64638,13 @@ impl PeHostRuntime {
             | GuestObjectKind::EvtQuery
             | GuestObjectKind::EvtSubscription
             | GuestObjectKind::EvtBookmark
-            | GuestObjectKind::WlanClient => {
+            | GuestObjectKind::WlanClient
+            | GuestObjectKind::D3dkmtDevice
+            | GuestObjectKind::D3dkmtContext
+            | GuestObjectKind::D3dkmtSyncObject
+            | GuestObjectKind::EsentDatabase
+            | GuestObjectKind::WinInetRequest
+            | GuestObjectKind::DirectInput => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -81908,6 +81989,206 @@ impl HostThunk {
             }
             ("comdlg32.dll", ImportSymbol::ByName { name, .. }) if name == "FindTextW" => {
                 Self::FindTextW
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTCloseAdapter" => {
+                Self::D3DKMTCloseAdapter
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTCreateAllocation" =>
+            {
+                Self::D3DKMTCreateAllocation
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTCreateContext" => {
+                Self::D3DKMTCreateContext
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTCreateDevice" => {
+                Self::D3DKMTCreateDevice
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTCreateSynchronizationObject" =>
+            {
+                Self::D3DKMTCreateSynchronizationObject
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTDestroyContext" =>
+            {
+                Self::D3DKMTDestroyContext
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTDestroyDevice" => {
+                Self::D3DKMTDestroyDevice
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTEnumAdapters" => {
+                Self::D3DKMTEnumAdapters
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTGetDisplayModeList" =>
+            {
+                Self::D3DKMTGetDisplayModeList
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenAdapterFromHdc" =>
+            {
+                Self::D3DKMTOpenAdapterFromHdc
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTOpenKeyedMutex" =>
+            {
+                Self::D3DKMTOpenKeyedMutex
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTOpenResource" => {
+                Self::D3DKMTOpenResource
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTPresent" => {
+                Self::D3DKMTPresent
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTQueryAdapterInfo" =>
+            {
+                Self::D3DKMTQueryAdapterInfo
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTQueryAllocationResidency" =>
+            {
+                Self::D3DKMTQueryAllocationResidency
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. }) if name == "D3DKMTRender" => {
+                Self::D3DKMTRender
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSetAllocationPriority" =>
+            {
+                Self::D3DKMTSetAllocationPriority
+            }
+            ("d3d8thk.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DKMTSetDisplayPrivateDriverFormat" =>
+            {
+                Self::D3DKMTSetDisplayPrivateDriverFormat
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetAttachDatabase" => {
+                Self::JetAttachDatabase
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetBeginTransaction" => {
+                Self::JetBeginTransaction
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetCloseDatabase" => {
+                Self::JetCloseDatabase
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetCloseTable" => {
+                Self::JetCloseTable
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetCommitTransaction" => {
+                Self::JetCommitTransaction
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetCreateDatabase" => {
+                Self::JetCreateDatabase
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetDetachDatabase" => {
+                Self::JetDetachDatabase
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetGetTableColumnInfo" => {
+                Self::JetGetTableColumnInfo
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetInit" => Self::JetInit,
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetOpenDatabase" => {
+                Self::JetOpenDatabase
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetOpenTable" => {
+                Self::JetOpenTable
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetRollback" => {
+                Self::JetRollback
+            }
+            ("esent.dll", ImportSymbol::ByName { name, .. }) if name == "JetTerm" => Self::JetTerm,
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPAccept" => {
+                Self::WSPAccept
+            }
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPBind" => Self::WSPBind,
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPCleanup" => {
+                Self::WSPCleanup
+            }
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPConnect" => {
+                Self::WSPConnect
+            }
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPListen" => {
+                Self::WSPListen
+            }
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPRecv" => Self::WSPRecv,
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPSend" => Self::WSPSend,
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPSocket" => {
+                Self::WSPSocket
+            }
+            ("msafd.dll", ImportSymbol::ByName { name, .. }) if name == "WSPStartup" => {
+                Self::WSPStartup
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. }) if name == "AcceptEx" => {
+                Self::AcceptEx
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. }) if name == "EnumProtocolsW" => {
+                Self::EnumProtocolsW
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. })
+                if name == "GetAcceptExSockaddrs" =>
+            {
+                Self::GetAcceptExSockaddrs
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. }) if name == "TransmitFile" => {
+                Self::TransmitFile
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. })
+                if name == "WSAGetOverlappedResult" =>
+            {
+                Self::WSAGetOverlappedResult
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. }) if name == "WSARecvEx" => {
+                Self::WSARecvEx
+            }
+            ("mswsock.dll", ImportSymbol::ByName { name, .. }) if name == "WSASocketW" => {
+                Self::WSASocketW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. })
+                if name == "HttpAddRequestHeadersW" =>
+            {
+                Self::HttpAddRequestHeadersW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. }) if name == "HttpQueryInfoW" => {
+                Self::HttpQueryInfoW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. })
+                if name == "InternetAttemptConnect" =>
+            {
+                Self::InternetAttemptConnect
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. }) if name == "InternetOpenUrlW" => {
+                Self::InternetOpenUrlW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. })
+                if name == "InternetQueryOptionW" =>
+            {
+                Self::InternetQueryOptionW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. }) if name == "InternetReadFileExW" => {
+                Self::InternetReadFileExW
+            }
+            ("wininet.dll", ImportSymbol::ByName { name, .. }) if name == "InternetWriteFile" => {
+                Self::InternetWriteFile
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DirectInputCreateEx" => {
+                Self::DirectInputCreateEx
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DirectInputCreateW" => {
+                Self::DirectInputCreateW
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("dinput.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
             }
             ("wldap32.dll", ImportSymbol::ByName { name, .. }) if name == "ldap_bind_s" => {
                 Self::LdapBindS
@@ -124911,6 +125192,216 @@ mod tests {
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, wlan_close, &[client as u32, 0]),
                 0
+            );
+        })
+    }
+
+    #[test]
+    fn evidence_d3d8thk_esent_wsp_wininet_dinput_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mixed");
+            let mut memory = MemoryImage::default();
+
+            // ── d3d8thk: the adapter/device/context lifecycle ──
+            let enum_adapters: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTEnumAdapters);
+            let open_adapter: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTOpenAdapterFromHdc);
+            let create_device: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTCreateDevice);
+            let present: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTPresent);
+            let close_adapter: u64 = runtime.alloc_host_thunk(HostThunk::D3DKMTCloseAdapter);
+            let enum_info = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_adapters,
+                    &[enum_info as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, enum_info).unwrap(),
+                1,
+                "one adapter"
+            );
+            let open_info = 0x41_010_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, open_adapter, &[open_info as u32]),
+                0
+            );
+            let adapter = read_guest_pointer(&memory, open_info + 8, GuestArch::X86).unwrap();
+            assert_ne!(adapter, 0);
+            let device_info = 0x41_020_u64;
+            write_guest_pointer(&mut memory, device_info, adapter, GuestArch::X86).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_device,
+                    &[device_info as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, device_info + 8, GuestArch::X86).unwrap(),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, present, &[0]),
+                0
+            );
+            let close_info = 0x41_030_u64;
+            write_guest_pointer(&mut memory, close_info, adapter, GuestArch::X86).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    close_adapter,
+                    &[close_info as u32]
+                ),
+                0
+            );
+
+            // ── esent: the engine lifecycle ──
+            let jet_init: u64 = runtime.alloc_host_thunk(HostThunk::JetInit);
+            let jet_create: u64 = runtime.alloc_host_thunk(HostThunk::JetCreateDatabase);
+            let jet_open_table: u64 = runtime.alloc_host_thunk(HostThunk::JetOpenTable);
+            let jet_close: u64 = runtime.alloc_host_thunk(HostThunk::JetCloseDatabase);
+            let jet_term: u64 = runtime.alloc_host_thunk(HostThunk::JetTerm);
+            let instance = 0x7000_0001_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, jet_init, &[instance as u32]),
+                0
+            );
+            let db_path = 0x41_100_u64;
+            let db_wide: Vec<u16> = std::env::temp_dir()
+                .join("casa1-evidence.edb")
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in db_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, db_path + (i as u64 * 2), *unit).ok();
+            }
+            let db_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    jet_create,
+                    &[instance as u32, 0, db_path as u32, 0, 0, db_out as u32]
+                ),
+                0
+            );
+            let db = read_guest_pointer(&memory, db_out, GuestArch::X86).unwrap();
+            assert_ne!(db, 0);
+            let table_ptr = 0x41_210_u64;
+            let table_wide: Vec<u16> = "Table1".encode_utf16().chain([0]).collect();
+            for (i, unit) in table_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, table_ptr + (i as u64 * 2), *unit).ok();
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    jet_open_table,
+                    &[instance as u32, 0, db as u32, table_ptr as u32, 0x41_220, 0]
+                ),
+                0xffff_fa8d,
+                "JET_errObjectNotFound"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    jet_close,
+                    &[instance as u32, db as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, jet_term, &[instance as u32, 0]),
+                0
+            );
+
+            // ── msafd: the provider socket ──
+            let wsp_startup: u64 = runtime.alloc_host_thunk(HostThunk::WSPStartup);
+            let wsp_socket: u64 = runtime.alloc_host_thunk(HostThunk::WSPSocket);
+            let wsp_cleanup: u64 = runtime.alloc_host_thunk(HostThunk::WSPCleanup);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsp_startup, &[0x0202, 0x41_300]),
+                0
+            );
+            let socket = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                wsp_socket,
+                &[2, 1, 6, 0, 0, 0, 0, 0],
+            );
+            assert_ne!(socket, 0xffff_ffff, "the provider socket");
+            assert!(
+                runtime.win32_is_socket(socket),
+                "socket {socket:#x} is a winsock handle"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, wsp_cleanup, &[]),
+                0
+            );
+
+            // ── wininet: the request object ──
+            let attempt_connect: u64 = runtime.alloc_host_thunk(HostThunk::InternetAttemptConnect);
+            let open_url: u64 = runtime.alloc_host_thunk(HostThunk::InternetOpenUrlW);
+            let read_file: u64 = runtime.alloc_host_thunk(HostThunk::InternetReadFileExW);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, attempt_connect, &[]),
+                0
+            );
+            let url_ptr = 0x41_400_u64;
+            let url_wide: Vec<u16> = "https://example.com/".encode_utf16().chain([0]).collect();
+            for (i, unit) in url_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, url_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let request = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_url,
+                &[0, url_ptr as u32, 0, 0, 0, 0],
+            );
+            assert_ne!(request, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    read_file,
+                    &[request as u32, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(runtime.last_error, 12029, "ERROR_INTERNET_CANNOT_CONNECT");
+
+            // ── dinput: the object + no devices ──
+            let di_create: u64 = runtime.alloc_host_thunk(HostThunk::DirectInputCreateW);
+            let di_device: u64 = runtime.alloc_host_thunk(HostThunk::DirectInputCreateDevice);
+            let di_out = 0x41_500_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    di_create,
+                    &[0, 0x0800, di_out as u32, 0]
+                ),
+                0
+            );
+            let di = read_guest_pointer(&memory, di_out, GuestArch::X86).unwrap();
+            assert_ne!(di, 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    di_device,
+                    &[di as u32, 0x41_510, 0x41_520]
+                ),
+                0x8007_0012,
+                "DIERR_DEVICENOTREG"
             );
         })
     }

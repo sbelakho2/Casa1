@@ -241,6 +241,12 @@ pub(crate) enum GuestObjectKind {
     EvtSubscription,
     EvtBookmark,
     WlanClient,
+    D3dkmtDevice,
+    D3dkmtContext,
+    D3dkmtSyncObject,
+    EsentDatabase,
+    WinInetRequest,
+    DirectInput,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1663,6 +1669,20 @@ pub(crate) struct PeHostRuntime {
     pub(crate) evt_handles: HashMap<u64, u32>,
     /// The WLAN client handles.
     pub(crate) wlan_clients: HashMap<u64, u32>,
+    /// The D3D8 kernel adapter handles.
+    pub(crate) d3dkmt_adapters: HashMap<u64, u32>,
+    /// The next D3D8 adapter handle.
+    pub(crate) d3dkmt_next_adapter: u64,
+    /// The ESE instances.
+    pub(crate) esent_instances: HashMap<u64, u32>,
+    /// The ESE databases.
+    pub(crate) esent_databases: HashMap<u64, String>,
+    /// Whether the WSP provider is started.
+    pub(crate) wsp_started: bool,
+    /// The WinInet request objects.
+    pub(crate) wininet_requests: HashMap<u64, String>,
+    /// The DirectInput objects.
+    pub(crate) dinput_objects: HashMap<u64, u32>,
     /// The guest-resident interface-IID slot (the ole32 IID exports).
     pub(crate) com_interface_iid_slots: [u64; 1],
     /// Guest IMFTopology object -> topology.
@@ -2259,6 +2279,13 @@ impl PeHostRuntime {
             pdh_queries: HashMap::new(),
             evt_handles: HashMap::new(),
             wlan_clients: HashMap::new(),
+            d3dkmt_adapters: HashMap::new(),
+            d3dkmt_next_adapter: 0,
+            esent_instances: HashMap::new(),
+            esent_databases: HashMap::new(),
+            wsp_started: false,
+            wininet_requests: HashMap::new(),
+            dinput_objects: HashMap::new(),
             com_interface_iid_slots: [0],
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
