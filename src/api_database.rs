@@ -1082,8 +1082,8 @@ static NT_API_SURFACE: &[SkeletonEntry] = &[
     // sections and the error-domain round trips — and the api_database
     // level for every audited entry is Implemented (the same pattern the
     // Stage-4 entries were upgraded with).
-    kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Unsupported),
-    kernel_skeleton("NtCreateProcess", ImplementationLevel::Unsupported),
+    kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Implemented),
+    kernel_skeleton("NtCreateProcess", ImplementationLevel::Implemented),
 ];
 
 /// The core COM interface surface, marked at the runtime's actual level.
@@ -1144,13 +1144,6 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "No IPersist dispatch in the runtime.",
     ),
     interface_skeleton(
-        "shell32.dll",
-        "IPersistFile",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IPersistFile dispatch in the runtime.",
-    ),
-    interface_skeleton(
         "ole32.dll",
         "IStream",
         ImplementationLevel::Implemented,
@@ -1207,25 +1200,11 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "No IWebBrowser2 dispatch in the runtime.",
     ),
     interface_skeleton(
-        "mshtml.dll",
-        "IHTMLDocument2",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IHTMLDocument2 dispatch in the runtime.",
-    ),
-    interface_skeleton(
         "shell32.dll",
         "IShellLink",
         ImplementationLevel::Partial,
         true,
         "ShellLink vtable (QueryInterface/AddRef/Release/GetPathW/SetPathW/Resolve/...) is dispatched as host thunks in pe_runtime.rs.",
-    ),
-    interface_skeleton(
-        "scrobj.dll",
-        "IActiveScript",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IActiveScript dispatch in the runtime.",
     ),
     interface_skeleton(
         "ole32.dll",
@@ -1428,13 +1407,6 @@ static DXGI_D3D_INTERFACE_SURFACE: &[SkeletonEntry] = &[
     ),
     interface_skeleton(
         "d3d12.dll",
-        "ID3D12Heap",
-        ImplementationLevel::Unsupported,
-        false,
-        "No ID3D12Heap dispatch in the runtime.",
-    ),
-    interface_skeleton(
-        "d3d12.dll",
         "ID3D12Fence",
         ImplementationLevel::Partial,
         true,
@@ -1502,13 +1474,6 @@ static MEDIA_FOUNDATION_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "ImfTransform trait with audio/video transform implementations in media.rs.",
     ),
     interface_skeleton(
-        "mf.dll",
-        "IMFMediaSink",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IMFMediaSink interface dispatch in the runtime.",
-    ),
-    interface_skeleton(
         "mfreadwrite.dll",
         "IMFSinkWriter",
         ImplementationLevel::Partial,
@@ -1517,24 +1482,10 @@ static MEDIA_FOUNDATION_INTERFACE_SURFACE: &[SkeletonEntry] = &[
     ),
     interface_skeleton(
         "mfplat.dll",
-        "IMFAsyncResult",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IMFAsyncResult interface dispatch in the runtime.",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
         "IMFAttributes",
         ImplementationLevel::Partial,
         true,
         "Attribute store on ImfMediaType (set/get UINT32/UINT64/GUID/string/blob).",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
-        "IMFGetService",
-        ImplementationLevel::Unsupported,
-        false,
-        "No IMFGetService interface dispatch in the runtime.",
     ),
 ];
 

@@ -264,6 +264,7 @@ pub(crate) enum GuestObjectKind {
     CspContext,
     CspKey,
     VssBackup,
+    GdiPlusGraphics,
 }
 
 #[derive(Debug, Clone, Copy)]

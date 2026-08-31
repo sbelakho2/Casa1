@@ -22,6 +22,7 @@ pub(crate) mod dinput;
 pub(crate) mod dpapi;
 pub(crate) mod dshow;
 pub(crate) mod esent;
+pub(crate) mod final_scraps;
 pub(crate) mod hid;
 pub(crate) mod httpapi;
 pub(crate) mod imagehlp;

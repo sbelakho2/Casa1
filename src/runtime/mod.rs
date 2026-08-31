@@ -5569,6 +5569,41 @@ pub enum HostThunk {
     DsBindWithCred,
     DsMakeSpnW,
     DsUnbind,
+    CredSspGetClientCredential,
+    CredSspGetServerCredential,
+    ShCreateExplorerTaskband,
+    ShOpenFolderWindow,
+    CertDigestDigest,
+    CertSelectCertificate,
+    DirectPlayCreate,
+    DirectPlayEnumerateW,
+    KerbLogon,
+    KerbRetrieveTicket,
+    NetGetAnyDcName,
+    NetGetDcName,
+    ShCreateLinks,
+    ShNavigateToFavorite,
+    NetWkstaSetInfo,
+    X3dAudioCalculate,
+    X3dAudioInitialize,
+    Xact3CreateEngine,
+    Xact3CreateEngineWithFlags,
+    NtCreateFileMapping,
+    NtCreateProcess,
+    ImfAsyncResult,
+    ImfGetService,
+    BrowserServerEnum,
+    CngAuditLog,
+    GdipCreateGraphics,
+    ActivateAudioInterfaceAsync,
+    MsftEditRegisterClass,
+    RichEditAnsiWndClass,
+    NetServerGetInfo,
+    DsBindToTopology,
+    IPersistFile,
+    IActiveScript,
+    ID3d12Heap,
+    ImfMediaSink,
     AdsBuildEnumerator,
     AdsGetObject,
     AdsOpenObject,
@@ -28746,6 +28781,9 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
                 self.dispatch_long_tail(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::ShCreateExplorerTaskband | HostThunk::ShOpenFolderWindow | HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::CertDigestDigest | HostThunk::CertSelectCertificate | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::ShCreateLinks | HostThunk::ShNavigateToFavorite | HostThunk::X3dAudioCalculate | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::NtCreateProcess | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::CngAuditLog | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::MsftEditRegisterClass | HostThunk::RichEditAnsiWndClass | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
+                self.dispatch_final_scraps(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -64937,7 +64975,8 @@ impl PeHostRuntime {
             | GuestObjectKind::Dxva2VideoService
             | GuestObjectKind::CspContext
             | GuestObjectKind::CspKey
-            | GuestObjectKind::VssBackup => {
+            | GuestObjectKind::VssBackup
+            | GuestObjectKind::GdiPlusGraphics => {
                 self.guest_objects.remove(&address);
             }
         }
@@ -75890,6 +75929,272 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::CreateFileW,
             ("comctl32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::InitCommonControls,
+            ("asycfilt.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("asycfilt.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("browseui.dll", ImportSymbol::ByName { name, .. })
+                if name == "SHCreateExplorerTaskband" =>
+            {
+                Self::ShCreateExplorerTaskband
+            }
+            ("browseui.dll", ImportSymbol::ByName { name, .. }) if name == "SHOpenFolderWindow" => {
+                Self::ShOpenFolderWindow
+            }
+            ("credssp.dll", ImportSymbol::ByName { name, .. })
+                if name == "CredSSPGetClientCredential" =>
+            {
+                Self::CredSspGetClientCredential
+            }
+            ("credssp.dll", ImportSymbol::ByName { name, .. })
+                if name == "CredSSPGetServerCredential" =>
+            {
+                Self::CredSspGetServerCredential
+            }
+            ("cryptdlg.dll", ImportSymbol::ByName { name, .. }) if name == "CertDigestDigest" => {
+                Self::CertDigestDigest
+            }
+            ("cryptdlg.dll", ImportSymbol::ByName { name, .. })
+                if name == "CertSelectCertificate" =>
+            {
+                Self::CertSelectCertificate
+            }
+            ("dplay.dll", ImportSymbol::ByName { name, .. }) if name == "DirectPlayCreate" => {
+                Self::DirectPlayCreate
+            }
+            ("dplay.dll", ImportSymbol::ByName { name, .. }) if name == "DirectPlayEnumerateW" => {
+                Self::DirectPlayEnumerateW
+            }
+            ("ir50_qc.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("ir50_qc.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("ir50_qcx.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("ir50_qcx.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("kerberos.dll", ImportSymbol::ByName { name, .. }) if name == "KerbLogon" => {
+                Self::KerbLogon
+            }
+            ("kerberos.dll", ImportSymbol::ByName { name, .. }) if name == "KerbRetrieveTicket" => {
+                Self::KerbRetrieveTicket
+            }
+            ("mscorlib.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mscorlib.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("msimtf.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msimtf.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("msmdlocal.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("msmdlocal.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("mtxdm.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("mtxdm.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("netutils.dll", ImportSymbol::ByName { name, .. }) if name == "NetGetAnyDCName" => {
+                Self::NetGetAnyDcName
+            }
+            ("netutils.dll", ImportSymbol::ByName { name, .. }) if name == "NetGetDCName" => {
+                Self::NetGetDcName
+            }
+            ("presentationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("presentationcore.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("presentationframework.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("presentationframework.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("sens.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("sens.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("shdocvw.dll", ImportSymbol::ByName { name, .. }) if name == "SHCreateLinks" => {
+                Self::ShCreateLinks
+            }
+            ("shdocvw.dll", ImportSymbol::ByName { name, .. })
+                if name == "SHNavigateToFavorite" =>
+            {
+                Self::ShNavigateToFavorite
+            }
+            ("wbemdisp.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wbemdisp.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("webview2.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("webview2.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("windowsbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllRegisterServer" =>
+            {
+                Self::DllRegisterServer
+            }
+            ("windowsbase.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("winrsmgr.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("winrsmgr.dll", ImportSymbol::ByName { name, .. })
+                if name == "DllUnregisterServer" =>
+            {
+                Self::DllUnregisterServer
+            }
+            ("wkssvc.dll", ImportSymbol::ByName { name, .. }) if name == "NetWkstaGetInfo" => {
+                Self::NetWkstaGetInfo
+            }
+            ("wkssvc.dll", ImportSymbol::ByName { name, .. }) if name == "NetWkstaSetInfo" => {
+                Self::NetWkstaSetInfo
+            }
+            ("wmi.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wmi.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("wuapi.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("wuapi.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("x3daudio1_7.dll", ImportSymbol::ByName { name, .. })
+                if name == "X3DAudioCalculate" =>
+            {
+                Self::X3dAudioCalculate
+            }
+            ("x3daudio1_7.dll", ImportSymbol::ByName { name, .. })
+                if name == "X3DAudioInitialize" =>
+            {
+                Self::X3dAudioInitialize
+            }
+            ("xactengine3_7.dll", ImportSymbol::ByName { name, .. })
+                if name == "XACT3CreateEngine" =>
+            {
+                Self::Xact3CreateEngine
+            }
+            ("xactengine3_7.dll", ImportSymbol::ByName { name, .. })
+                if name == "XACT3CreateEngineWithFlags" =>
+            {
+                Self::Xact3CreateEngineWithFlags
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateFileMapping" => {
+                Self::NtCreateFileMapping
+            }
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "NtCreateProcess" => {
+                Self::NtCreateProcess
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "IMFAsyncResult" => {
+                Self::ImfAsyncResult
+            }
+            ("mfplat.dll", ImportSymbol::ByName { name, .. }) if name == "IMFGetService" => {
+                Self::ImfGetService
+            }
+            ("wsock32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAStartup" => {
+                Self::WsaStartup
+            }
+            ("browser.dll", ImportSymbol::ByName { name, .. }) if name == "BrowserServerEnum" => {
+                Self::BrowserServerEnum
+            }
+            ("cngaudit.dll", ImportSymbol::ByName { name, .. }) if name == "CngAuditLog" => {
+                Self::CngAuditLog
+            }
+            ("dpaddr.dll", ImportSymbol::ByName { name, .. }) if name == "DP8SPCreate" => {
+                Self::Dp8spCreate
+            }
+            ("gdiplus.dll", ImportSymbol::ByName { name, .. }) if name == "GdipCreateGraphics" => {
+                Self::GdipCreateGraphics
+            }
+            ("mmdevapi.dll", ImportSymbol::ByName { name, .. })
+                if name == "ActivateAudioInterfaceAsync" =>
+            {
+                Self::ActivateAudioInterfaceAsync
+            }
+            ("msftedit.dll", ImportSymbol::ByName { name, .. })
+                if name == "MsftEditRegisterClass" =>
+            {
+                Self::MsftEditRegisterClass
+            }
+            ("riched32.dll", ImportSymbol::ByName { name, .. })
+                if name == "RichEditANSIWndClass" =>
+            {
+                Self::RichEditAnsiWndClass
+            }
+            ("srvsvc.dll", ImportSymbol::ByName { name, .. }) if name == "NetServerGetInfo" => {
+                Self::NetServerGetInfo
+            }
+            ("w32topl.dll", ImportSymbol::ByName { name, .. }) if name == "DsBindToTopology" => {
+                Self::DsBindToTopology
+            }
+            ("xaudio2_8.dll", ImportSymbol::ByName { name, .. }) if name == "XAudio2Create" => {
+                Self::XAudio2Create
+            }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "IPersistFile" => {
+                Self::IPersistFile
+            }
+            ("mshtml.dll", ImportSymbol::ByName { name, .. }) if name == "IHTMLDocument2" => {
+                Self::IhtmlDocument2
+            }
+            ("scrobj.dll", ImportSymbol::ByName { name, .. }) if name == "IActiveScript" => {
+                Self::IActiveScript
+            }
+            ("d3d12.dll", ImportSymbol::ByName { name, .. }) if name == "ID3D12Heap" => {
+                Self::ID3d12Heap
+            }
+            ("mf.dll", ImportSymbol::ByName { name, .. }) if name == "IMFMediaSink" => {
+                Self::ImfMediaSink
+            }
             ("atl.dll", ImportSymbol::ByName { name, .. }) if name == "AtlModuleAddTermFunc" => {
                 Self::AtlModuleAddTermFunc
             }
@@ -127765,6 +128070,100 @@ mod tests {
             );
         })
     }
+
+    #[test]
+    fn evidence_final_scraps_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-scraps");
+            let mut memory = MemoryImage::default();
+
+            let x3da_init: u64 = runtime.alloc_host_thunk(HostThunk::X3dAudioInitialize);
+            let x3da_calc: u64 = runtime.alloc_host_thunk(HostThunk::X3dAudioCalculate);
+            let handle_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    x3da_init,
+                    &[0x3, 343.0f32.to_bits(), handle_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    x3da_calc,
+                    &[0, 0, 0, 0, 0, 0x41_010]
+                ),
+                0
+            );
+
+            let persist: u64 = runtime.alloc_host_thunk(HostThunk::IPersistFile);
+            let iid_ptr = dispatch_x86_thunk(&mut runtime, &mut memory, persist, &[]);
+            assert_ne!(iid_ptr, 0);
+            assert_eq!(
+                memory.read_bytes(iid_ptr, 16).unwrap()[0],
+                0x0b,
+                "IID_IPersistFile data"
+            );
+            let d3d12_heap: u64 = runtime.alloc_host_thunk(HostThunk::ID3d12Heap);
+            assert_ne!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, d3d12_heap, &[]),
+                0
+            );
+
+            let net_dc: u64 = runtime.alloc_host_thunk(HostThunk::NetGetDcName);
+            let dc_out = 0x41_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, net_dc, &[0, 0, dc_out as u32]),
+                0x54b,
+                "NERR_DCNotFound"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, dc_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            let dp_create: u64 = runtime.alloc_host_thunk(HostThunk::DirectPlayCreate);
+            let dp_out = 0x41_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, dp_create, &[0, dp_out as u32, 0]),
+                0x8004_0153
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, dp_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            let gdip: u64 = runtime.alloc_host_thunk(HostThunk::GdipCreateGraphics);
+            let g_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, gdip, &[0, g_out as u32]),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, g_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            let nt_map: u64 = runtime.alloc_host_thunk(HostThunk::NtCreateFileMapping);
+            let section_out = 0x41_400_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    nt_map,
+                    &[0xffff_ffff, 0, 0, 0, 0x1000, section_out as u32]
+                ),
+                0
+            );
+            assert_ne!(
+                read_guest_pointer(&memory, section_out, GuestArch::X86).unwrap(),
+                0
+            );
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -134268,6 +134667,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             name: Some("ExtractIconExW".to_string()),
             target: ExportTarget::Rva(0x7110),
         },
+        ExportSymbol {
+            ordinal: 90,
+            name: Some("IPersistFile".to_string()),
+            target: ExportTarget::Rva(0x24400),
+        },
     ];
     extend_named_exports(
         &mut shell32_exports,
@@ -137559,6 +137963,16 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             name: Some("MFCreateDXGIDeviceManager".to_string()),
             target: ExportTarget::Rva(0x24120),
         },
+        ExportSymbol {
+            ordinal: 90,
+            name: Some("IMFAsyncResult".to_string()),
+            target: ExportTarget::Rva(0x24200),
+        },
+        ExportSymbol {
+            ordinal: 91,
+            name: Some("IMFGetService".to_string()),
+            target: ExportTarget::Rva(0x24210),
+        },
     ];
 
     let cfgmgr32_exports = vec![
@@ -137860,11 +138274,18 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         ),
         (
             "d3d12.dll".to_string(),
-            vec![ExportSymbol {
-                ordinal: 1,
-                name: Some("D3D12CreateDevice".to_string()),
-                target: ExportTarget::Rva(0x4200),
-            }],
+            vec![
+                ExportSymbol {
+                    ordinal: 1,
+                    name: Some("D3D12CreateDevice".to_string()),
+                    target: ExportTarget::Rva(0x4200),
+                },
+                ExportSymbol {
+                    ordinal: 2,
+                    name: Some("ID3D12Heap".to_string()),
+                    target: ExportTarget::Rva(0x4210),
+                },
+            ],
         ),
         ("dnsapi.dll".to_string(), dnsapi_exports),
         ("dsound.dll".to_string(), dsound_exports),
@@ -138627,6 +139048,16 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     name: Some("LdrRemoveRefDll".to_string()),
                     target: ExportTarget::Rva(0x2720),
                 },
+                ExportSymbol {
+                    ordinal: 99,
+                    name: Some("NtCreateFileMapping".to_string()),
+                    target: ExportTarget::Rva(0x23f0),
+                },
+                ExportSymbol {
+                    ordinal: 100,
+                    name: Some("NtCreateProcess".to_string()),
+                    target: ExportTarget::Rva(0x2400),
+                },
             ],
         ),
         ("ole32.dll".to_string(), ole32_exports),
@@ -138638,6 +139069,14 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         ("rpcrt4.dll".to_string(), rpcrt4_exports),
         ("secur32.dll".to_string(), secur32_exports),
         ("setupapi.dll".to_string(), setupapi_exports),
+        (
+            "scrobj.dll".to_string(),
+            vec![ExportSymbol {
+                ordinal: 1,
+                name: Some("IActiveScript".to_string()),
+                target: ExportTarget::Rva(0x24600),
+            }],
+        ),
         ("shell32.dll".to_string(), shell32_exports),
         ("shlwapi.dll".to_string(), shlwapi_exports),
         ("sspicli.dll".to_string(), sspicli_exports),
@@ -139946,6 +140385,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     name: Some("CreateHTMLPropertyPage".to_string()),
                     target: ExportTarget::Rva(0x46020),
                 },
+                ExportSymbol {
+                    ordinal: 90,
+                    name: Some("IHTMLDocument2".to_string()),
+                    target: ExportTarget::Rva(0x24500),
+                },
             ],
         ),
         (
@@ -141182,6 +141626,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 20,
                     name: Some("MFRequireProtectedEnvironment".to_string()),
                     target: ExportTarget::Rva(0x59130),
+                },
+                ExportSymbol {
+                    ordinal: 90,
+                    name: Some("IMFMediaSink".to_string()),
+                    target: ExportTarget::Rva(0x24300),
                 },
             ],
         ),

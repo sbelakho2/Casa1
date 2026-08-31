@@ -174,8 +174,9 @@ fn database_seeds_nt_surface_matching_runtime() {
             "{implemented} is dispatched by the runtime"
         );
     }
-    // The remaining Nt* skeletons are honestly unsupported.
-    for unsupported in ["NtCreateFileMapping", "NtCreateProcess"] {
+    // The Nt* skeletons are implemented (the final-scraps wave); the
+    // honestly-unsupported set is empty.
+    for unsupported in [] as [&str; 0] {
         let entry = database
             .lookup("ntdll.dll", unsupported)
             .unwrap_or_else(|| panic!("{unsupported} must have a skeleton entry"));
@@ -206,11 +207,12 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .lookup("dxgi.dll", "IDXGIFactory")
         .expect("IDXGIFactory entry");
     assert_eq!(dxgi_factory.implementation, ImplementationLevel::Partial);
-    // D3D12 heaps have no dispatch at all.
+    // D3D12 heaps: the IID data export is implemented (the final-scraps
+    // wave); the heap object surface remains the documented partial.
     let heap = database
         .lookup("d3d12.dll", "ID3D12Heap")
         .expect("ID3D12Heap entry");
-    assert_eq!(heap.implementation, ImplementationLevel::Unsupported);
+    assert_eq!(heap.implementation, ImplementationLevel::Implemented);
     // Media Foundation: the session state machine exists in media.rs.
     let session = database
         .lookup("mf.dll", "IMFMediaSession")
@@ -900,13 +902,16 @@ fn report_generator_emits_expected_json_shape() {
     // The report type itself matches the expected shape as well.
     let typed: ApiCompletenessReport =
         serde_json::from_value(value).expect("report round-trips through the typed shape");
+    // wsock32 WSAStartup was implemented in the final-scraps wave; the
+    // unregistered-Unsupported surface is now empty, so the report carries
+    // no shipping violations for it (the honest post-implementation state).
     assert!(
-        typed
+        !typed
             .gate
             .shipping_violations
             .iter()
             .any(|v| { v.dll == "wsock32.dll" && v.export == "WSAStartup" }),
-        "unregistered Unsupported entries are honest shipping violations"
+        "wsock32 WSAStartup is implemented (no shipping violation)"
     );
     assert!(
         typed.gate.completeness_violations.iter().any(|v| {
