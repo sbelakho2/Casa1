@@ -5004,6 +5004,67 @@ pub enum HostThunk {
     GetCorSystemDirectory,
     GetRequestedRuntimeInfo,
     LoadLibraryShim,
+    DirectDrawCreate,
+    DirectDrawCreateEx,
+    DirectDrawEnumerateW,
+    DirectDrawEnumerateExW,
+    DirectDrawGetCaps,
+    DirectDrawSetCooperativeLevel,
+    DirectDrawSetDisplayMode,
+    DirectDrawCreateSurface,
+    DirectDrawEnumSurfaces,
+    DirectDrawGetVerticalBlankStatus,
+    DirectDrawSurfaceBlt,
+    DirectDrawSurfaceFlip,
+    DirectDrawSurfaceLock,
+    DirectDrawSurfaceUnlock,
+    DirectDrawSurfaceGetSurfaceDesc,
+    D3dPerfBeginEvent,
+    D3dPerfEndEvent,
+    D3dPerfGetStatus,
+    D3dPerfQueryRepeatFrame,
+    D3dPerfSetMarker,
+    D3dPerfSetOptions,
+    DebugSetLevel,
+    DebugSetMute,
+    D3d10CreateDevice,
+    D3d10CreateDeviceAndSwapChain,
+    D3d10CoreCreateDevice,
+    D3d10CoreCreateLayeredDevice,
+    D3d10CoreGetSupportedVersions,
+    D3d10CoreRegisterLayers,
+    D3d10Level9CreateDevice,
+    D3d10Level9GetSupportedVersions,
+    D3d10CreateEffectFromMemory,
+    D3d10CreateStateBlock,
+    D3dCreateBlob,
+    D3dBlobGetBufferPointer,
+    D3dBlobGetBufferSize,
+    D3dCompile,
+    D3dCompile2,
+    D3dCompileFromFile,
+    D3dDisassemble,
+    D3dGetBlobPart,
+    D3dGetTraceInstructionOffsets,
+    D3dLoadModule,
+    D3dReflect,
+    D3dSetBlobPart,
+    D3dSetTraceInstructionOffsets,
+    D3dStripShader,
+    D3dCreateLinker,
+    D3dx11CompileFromFile,
+    D3dx11CompileFromFileW,
+    D3dx11CreateAsyncShaderResourceViewProcessor,
+    D3dx11CreateShaderResourceViewFromFile,
+    D3dx11CreateShaderResourceViewFromFileW,
+    D3dx11CreateTextureFromFileW,
+    D3dx11CreateTextureFromMemory,
+    D3dx11FilterTexture,
+    D3dx11GetImageInfoFromFile,
+    D3dx11GetImageInfoFromFileW,
+    D3dx11LoadTextureFromTexture,
+    D3dx11SaveTextureToFileW,
+    D3dx11SaveTextureToMemory,
     WicCreateImagingFactory,
     WicCreateImagingFactoryProxy,
     WicCreateBitmapProxy,
@@ -28048,6 +28109,9 @@ impl PeHostRuntime {
             }
             ref thunk @ (HostThunk::ClrCreateInstance | HostThunk::CorBindToRuntime | HostThunk::CorBindToRuntimeEx | HostThunk::GetCorSystemDirectory | HostThunk::GetRequestedRuntimeInfo | HostThunk::LoadLibraryShim) => {
                 self.dispatch_mscoree(thunk, state, memory)?;
+            }
+            ref thunk @ (HostThunk::DirectDrawCreate | HostThunk::DirectDrawCreateEx | HostThunk::DirectDrawEnumerateW | HostThunk::DirectDrawEnumerateExW | HostThunk::DirectDrawGetCaps | HostThunk::DirectDrawSetCooperativeLevel | HostThunk::DirectDrawSetDisplayMode | HostThunk::DirectDrawCreateSurface | HostThunk::DirectDrawEnumSurfaces | HostThunk::DirectDrawGetVerticalBlankStatus | HostThunk::DirectDrawSurfaceBlt | HostThunk::DirectDrawSurfaceFlip | HostThunk::DirectDrawSurfaceLock | HostThunk::DirectDrawSurfaceUnlock | HostThunk::DirectDrawSurfaceGetSurfaceDesc | HostThunk::D3dPerfBeginEvent | HostThunk::D3dPerfEndEvent | HostThunk::D3dPerfGetStatus | HostThunk::D3dPerfQueryRepeatFrame | HostThunk::D3dPerfSetMarker | HostThunk::D3dPerfSetOptions | HostThunk::DebugSetLevel | HostThunk::DebugSetMute | HostThunk::D3d10CreateDevice | HostThunk::D3d10CreateDeviceAndSwapChain | HostThunk::D3d10CoreCreateDevice | HostThunk::D3d10CoreCreateLayeredDevice | HostThunk::D3d10CoreGetSupportedVersions | HostThunk::D3d10CoreRegisterLayers | HostThunk::D3d10Level9CreateDevice | HostThunk::D3d10Level9GetSupportedVersions | HostThunk::D3d10CreateEffectFromMemory | HostThunk::D3d10CreateStateBlock | HostThunk::D3dCreateBlob | HostThunk::D3dBlobGetBufferPointer | HostThunk::D3dBlobGetBufferSize | HostThunk::D3dCompile | HostThunk::D3dCompile2 | HostThunk::D3dCompileFromFile | HostThunk::D3dDisassemble | HostThunk::D3dGetBlobPart | HostThunk::D3dGetTraceInstructionOffsets | HostThunk::D3dLoadModule | HostThunk::D3dReflect | HostThunk::D3dSetBlobPart | HostThunk::D3dSetTraceInstructionOffsets | HostThunk::D3dStripShader | HostThunk::D3dCreateLinker | HostThunk::D3dx11CompileFromFile | HostThunk::D3dx11CompileFromFileW | HostThunk::D3dx11CreateAsyncShaderResourceViewProcessor | HostThunk::D3dx11CreateShaderResourceViewFromFile | HostThunk::D3dx11CreateShaderResourceViewFromFileW | HostThunk::D3dx11CreateTextureFromFileW | HostThunk::D3dx11CreateTextureFromMemory | HostThunk::D3dx11FilterTexture | HostThunk::D3dx11GetImageInfoFromFile | HostThunk::D3dx11GetImageInfoFromFileW | HostThunk::D3dx11LoadTextureFromTexture | HostThunk::D3dx11SaveTextureToFileW | HostThunk::D3dx11SaveTextureToMemory) => {
+                self.dispatch_legacy_gfx(thunk, state, memory)?;
             }
 
             HostThunk::ClsidFromString => {
@@ -63968,7 +64032,10 @@ impl PeHostRuntime {
             | GuestObjectKind::WicFormatConverter
             | GuestObjectKind::WicStream
             | GuestObjectKind::WicColorContext
-            | GuestObjectKind::WicComponentInfo) => {
+            | GuestObjectKind::WicComponentInfo
+            | GuestObjectKind::DirectDraw7
+            | GuestObjectKind::DirectDrawSurface
+            | GuestObjectKind::D3dBlob) => {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
@@ -80711,6 +80778,290 @@ impl HostThunk {
                 if name == "MFCreateDXGIDeviceManager" =>
             {
                 Self::MfCreateDxgiDeviceManager
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DirectDrawCreate" => {
+                Self::DirectDrawCreate
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DirectDrawCreateEx" => {
+                Self::DirectDrawCreateEx
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. })
+                if name == "DirectDrawEnumerateExW" =>
+            {
+                Self::DirectDrawEnumerateExW
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DirectDrawEnumerateW" => {
+                Self::DirectDrawEnumerateW
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DllCanUnloadNow" => {
+                Self::DllCanUnloadNow
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DllGetClassObject" => {
+                Self::DllGetClassObject
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DllRegisterServer" => {
+                Self::DllRegisterServer
+            }
+            ("ddraw.dll", ImportSymbol::ByName { name, .. }) if name == "DllUnregisterServer" => {
+                Self::DllUnregisterServer
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "D3DPERF_BeginEvent" => {
+                Self::D3dPerfBeginEvent
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "D3DPERF_EndEvent" => {
+                Self::D3dPerfEndEvent
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "D3DPERF_GetStatus" => {
+                Self::D3dPerfGetStatus
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DPERF_QueryRepeatFrame" =>
+            {
+                Self::D3dPerfQueryRepeatFrame
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "D3DPERF_SetMarker" => {
+                Self::D3dPerfSetMarker
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "D3DPERF_SetOptions" => {
+                Self::D3dPerfSetOptions
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "DebugSetLevel" => {
+                Self::DebugSetLevel
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "DebugSetMute" => {
+                Self::DebugSetMute
+            }
+            ("d3d10.dll", ImportSymbol::ByName { name, .. }) if name == "D3D10CreateDevice" => {
+                Self::D3d10CreateDevice
+            }
+            ("d3d10.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CreateDeviceAndSwapChain" =>
+            {
+                Self::D3d10CreateDeviceAndSwapChain
+            }
+            ("d3d10.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CreateEffectFromMemory" =>
+            {
+                Self::D3d10CreateEffectFromMemory
+            }
+            ("d3d10.dll", ImportSymbol::ByName { name, .. }) if name == "D3D10CreateStateBlock" => {
+                Self::D3d10CreateStateBlock
+            }
+            ("d3d10.dll", ImportSymbol::ByName { name, .. }) if name == "D3D10RegisterLayers" => {
+                Self::D3d10CoreRegisterLayers
+            }
+            ("d3d10core.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CoreCreateDevice" =>
+            {
+                Self::D3d10CoreCreateDevice
+            }
+            ("d3d10core.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CoreCreateLayeredDevice" =>
+            {
+                Self::D3d10CoreCreateLayeredDevice
+            }
+            ("d3d10core.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CoreGetSupportedVersions" =>
+            {
+                Self::D3d10CoreGetSupportedVersions
+            }
+            ("d3d10core.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10CoreRegisterLayers" =>
+            {
+                Self::D3d10CoreRegisterLayers
+            }
+            ("d3d10level9.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10Level9CreateDevice" =>
+            {
+                Self::D3d10Level9CreateDevice
+            }
+            ("d3d10level9.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3D10Level9GetSupportedVersions" =>
+            {
+                Self::D3d10Level9GetSupportedVersions
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. }) if name == "D3DCompile" => {
+                Self::D3dCompile
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. }) if name == "D3DCompile2" => {
+                Self::D3dCompile2
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DCompileFromFile" =>
+            {
+                Self::D3dCompileFromFile
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DCreateLinker" =>
+            {
+                Self::D3dCreateLinker
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DDisassemble" =>
+            {
+                Self::D3dDisassemble
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DGetBlobPart" =>
+            {
+                Self::D3dGetBlobPart
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DGetTraceInstructionOffsets" =>
+            {
+                Self::D3dGetTraceInstructionOffsets
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DLoadModule" =>
+            {
+                Self::D3dLoadModule
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. }) if name == "D3DReflect" => {
+                Self::D3dReflect
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DSetBlobPart" =>
+            {
+                Self::D3dSetBlobPart
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DSetTraceInstructionOffsets" =>
+            {
+                Self::D3dSetTraceInstructionOffsets
+            }
+            ("d3dcompiler_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DStripShader" =>
+            {
+                Self::D3dStripShader
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. }) if name == "D3DCompile" => {
+                Self::D3dCompile
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. }) if name == "D3DCompile2" => {
+                Self::D3dCompile2
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DCompileFromFile" =>
+            {
+                Self::D3dCompileFromFile
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DCreateLinker" =>
+            {
+                Self::D3dCreateLinker
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DDisassemble" =>
+            {
+                Self::D3dDisassemble
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DGetBlobPart" =>
+            {
+                Self::D3dGetBlobPart
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DGetTraceInstructionOffsets" =>
+            {
+                Self::D3dGetTraceInstructionOffsets
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DLoadModule" =>
+            {
+                Self::D3dLoadModule
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. }) if name == "D3DReflect" => {
+                Self::D3dReflect
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DSetBlobPart" =>
+            {
+                Self::D3dSetBlobPart
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DSetTraceInstructionOffsets" =>
+            {
+                Self::D3dSetTraceInstructionOffsets
+            }
+            ("d3dcompiler_47.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DStripShader" =>
+            {
+                Self::D3dStripShader
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CompileFromFile" =>
+            {
+                Self::D3dx11CompileFromFile
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateAsyncShaderResourceViewProcessor" =>
+            {
+                Self::D3dx11CreateAsyncShaderResourceViewProcessor
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateShaderResourceViewFromFile" =>
+            {
+                Self::D3dx11CreateShaderResourceViewFromFile
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateTextureFromFileW" =>
+            {
+                Self::D3dx11CreateTextureFromFileW
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11FilterTexture" =>
+            {
+                Self::D3dx11FilterTexture
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11GetImageInfoFromFile" =>
+            {
+                Self::D3dx11GetImageInfoFromFile
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11SaveTextureToFileW" =>
+            {
+                Self::D3dx11SaveTextureToFileW
+            }
+            ("d3dx9_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11SaveTextureToMemory" =>
+            {
+                Self::D3dx11SaveTextureToMemory
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CompileFromFileW" =>
+            {
+                Self::D3dx11CompileFromFileW
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateShaderResourceViewFromFileW" =>
+            {
+                Self::D3dx11CreateShaderResourceViewFromFileW
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateTextureFromFileW" =>
+            {
+                Self::D3dx11CreateTextureFromFileW
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11CreateTextureFromMemory" =>
+            {
+                Self::D3dx11CreateTextureFromMemory
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11GetImageInfoFromFileW" =>
+            {
+                Self::D3dx11GetImageInfoFromFileW
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11LoadTextureFromTexture" =>
+            {
+                Self::D3dx11LoadTextureFromTexture
+            }
+            ("d3dx11_43.dll", ImportSymbol::ByName { name, .. })
+                if name == "D3DX11SaveTextureToFileW" =>
+            {
+                Self::D3dx11SaveTextureToFileW
             }
             ("mscoree.dll", ImportSymbol::ByName { name, .. }) if name == "CLRCreateInstance" => {
                 Self::ClrCreateInstance
@@ -122063,7 +122414,8 @@ mod tests {
             let bytes = memory.read_bytes(text, written as usize * 2).unwrap();
             let decoded = String::from_utf16_lossy(
                 &bytes
-                    .as_chunks::<2>().0
+                    .as_chunks::<2>()
+                    .0
                     .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<_>>(),
@@ -122277,7 +122629,8 @@ mod tests {
             let name_bytes = memory.read_bytes(name_out, 10).unwrap();
             let name = String::from_utf16_lossy(
                 &name_bytes
-                    .as_chunks::<2>().0
+                    .as_chunks::<2>()
+                    .0
                     .iter()
                     .take_while(|c| c[0] != 0 || c[1] != 0)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -122300,6 +122653,200 @@ mod tests {
                 read_guest_pointer(&memory, decoder_out, GuestArch::X86).unwrap(),
                 0
             );
+        })
+    }
+
+    #[test]
+    fn evidence_legacy_graphics_surfaces() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-gfx");
+            let mut memory = MemoryImage::default();
+            let create_ex: u64 = runtime.alloc_host_thunk(HostThunk::DirectDrawCreateEx);
+            let get_caps: u64 = runtime.alloc_host_thunk(HostThunk::DirectDrawGetCaps);
+            let create_surface: u64 = runtime.alloc_host_thunk(HostThunk::DirectDrawCreateSurface);
+            let surface_lock: u64 = runtime.alloc_host_thunk(HostThunk::DirectDrawSurfaceLock);
+            let get_desc: u64 =
+                runtime.alloc_host_thunk(HostThunk::DirectDrawSurfaceGetSurfaceDesc);
+            let perf_status: u64 = runtime.alloc_host_thunk(HostThunk::D3dPerfGetStatus);
+            let create_blob: u64 = runtime.alloc_host_thunk(HostThunk::D3dCreateBlob);
+            let blob_size: u64 = runtime.alloc_host_thunk(HostThunk::D3dBlobGetBufferSize);
+            let compile: u64 = runtime.alloc_host_thunk(HostThunk::D3dCompile);
+            let get_info: u64 = runtime.alloc_host_thunk(HostThunk::D3dx11GetImageInfoFromFileW);
+            let d3d10_create: u64 = runtime.alloc_host_thunk(HostThunk::D3d10CreateDevice);
+
+            // DirectDrawCreateEx -> IDirectDraw7.
+            let dd_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_ex,
+                    &[0, dd_out as u32, 0, 0]
+                ),
+                0
+            );
+            let dd = read_guest_pointer(&memory, dd_out, GuestArch::X86).unwrap();
+            assert_ne!(dd, 0);
+
+            // GetCaps writes the caps bitmasks.
+            let hw_out = 0x41_100_u64;
+            let sw_out = 0x41_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_caps,
+                    &[dd as u32, hw_out as u32, sw_out as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_u32(&memory, hw_out).unwrap(), 0);
+            assert_ne!(read_guest_u32(&memory, sw_out).unwrap(), 0);
+
+            // CreateSurface with a DDSURFACEDESC2 (width/height at offsets
+            // 24/20, caps at 4) -> a software surface.
+            let desc = 0x41_200_u64;
+            memory.map_bytes(desc, &[0_u8; 124]);
+            write_guest_u32(&mut memory, desc + 20, 64).ok();
+            write_guest_u32(&mut memory, desc + 24, 128).ok();
+            write_guest_u32(&mut memory, desc + 4, 0x1000).ok();
+            let surf_out = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_surface,
+                    &[dd as u32, desc as u32, surf_out as u32, 0]
+                ),
+                0
+            );
+            let surface = read_guest_pointer(&memory, surf_out, GuestArch::X86).unwrap();
+            assert_ne!(surface, 0);
+            assert_eq!(runtime.ddraw_surfaces.get(&surface).unwrap().width, 128);
+            assert_eq!(runtime.ddraw_surfaces.get(&surface).unwrap().height, 64);
+
+            // Lock fills the desc with the surface contract (the surface
+            // pointer at offset 48).
+            let lock_desc = 0x41_400_u64;
+            memory.map_bytes(lock_desc, &[0_u8; 124]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    surface_lock,
+                    &[surface as u32, 0, lock_desc as u32, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, lock_desc + 48, GuestArch::X86).unwrap(),
+                surface
+            );
+            assert_eq!(
+                read_guest_u32(&memory, lock_desc + 40).unwrap(),
+                128 * 4,
+                "pitch"
+            );
+
+            // GetSurfaceDesc reports the same geometry.
+            let desc_out = 0x41_500_u64;
+            memory.map_bytes(desc_out, &[0_u8; 124]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_desc,
+                    &[surface as u32, desc_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, desc_out + 20).unwrap(), 64);
+            assert_eq!(read_guest_u32(&memory, desc_out + 24).unwrap(), 128);
+
+            // D3DPERF is disabled.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, perf_status, &[]),
+                0
+            );
+
+            // D3DCreateBlob allocates a real blob.
+            let blob_out = 0x41_600_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_blob,
+                    &[256, blob_out as u32]
+                ),
+                0
+            );
+            let blob = read_guest_pointer(&memory, blob_out, GuestArch::X86).unwrap();
+            assert_ne!(blob, 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, blob_size, &[blob as u32]),
+                256
+            );
+
+            // D3DCompile answers E_FAIL with an error blob (no compiler).
+            let error_blob = 0x41_700_u64;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                compile,
+                &[0, 0, 0, 0, 0, error_blob as u32],
+            );
+            assert_eq!(hr, 0x8000_4005);
+            let error_blob_obj = read_guest_pointer(&memory, error_blob, GuestArch::X86).unwrap();
+            assert_ne!(error_blob_obj, 0, "the error blob is produced");
+
+            // D3D10CreateDevice builds the shared device machinery.
+            let device_out = 0x41_800_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    d3d10_create,
+                    &[0, 0, 0, 0, 0xa000, device_out as u32]
+                ),
+                0
+            );
+            let device = read_guest_pointer(&memory, device_out, GuestArch::X86).unwrap();
+            assert_ne!(device, 0);
+
+            // D3DX11GetImageInfoFromFileW parses a real DDS header.
+            let dds_path = std::env::temp_dir().join("casa1-evidence.dds");
+            let mut dds = vec![0_u8; 128];
+            dds[..4].copy_from_slice(b"DDS ");
+            dds[12..16].copy_from_slice(&32_u32.to_le_bytes());
+            dds[16..20].copy_from_slice(&64_u32.to_le_bytes());
+            dds[28..32].copy_from_slice(&1_u32.to_le_bytes());
+            std::fs::write(&dds_path, &dds).unwrap();
+            let name_ptr = 0x41_900_u64;
+            let wide: Vec<u16> = dds_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            for (i, unit) in wide.iter().enumerate() {
+                write_guest_u16(&mut memory, name_ptr + (i as u64 * 2), *unit).ok();
+            }
+            let info_out = 0x41_a00_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_info,
+                    &[name_ptr as u32, 0, info_out as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, info_out).unwrap(), 64, "DDS width");
+            assert_eq!(
+                read_guest_u32(&memory, info_out + 4).unwrap(),
+                32,
+                "DDS height"
+            );
+            std::fs::remove_file(&dds_path).ok();
         })
     }
 }

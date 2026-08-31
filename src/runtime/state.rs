@@ -220,6 +220,9 @@ pub(crate) enum GuestObjectKind {
     WicStream,
     WicColorContext,
     WicComponentInfo,
+    DirectDraw7,
+    DirectDrawSurface,
+    D3dBlob,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -604,6 +607,29 @@ pub(crate) struct MfDxgiDeviceManagerState {
     pub(crate) open_handles: std::collections::HashSet<u64>,
     /// Next handle value to hand out.
     pub(crate) next_handle: u64,
+}
+
+/// The DirectDraw7 object state (consumed by `runtime/dispatch/legacy_gfx.rs`).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // DirectDraw object state consumed by legacy_gfx.rs
+pub(crate) struct DirectDrawObjectState {
+    /// The cooperative level flags (SetCooperativeLevel).
+    pub(crate) cooperative_level: u32,
+    /// The display mode set through SetDisplayMode.
+    pub(crate) display_width: u32,
+    pub(crate) display_height: u32,
+    pub(crate) display_bpp: u32,
+}
+
+/// A DirectDraw software surface (consumed by `runtime/dispatch/legacy_gfx.rs`).
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // DirectDraw surface state consumed by legacy_gfx.rs
+pub(crate) struct DirectDrawSurfaceState {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pitch: u32,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) caps: u32,
 }
 
 /// The WIC (Windows Imaging Component) object state: the IWIC* objects the
@@ -1542,6 +1568,12 @@ pub(crate) struct PeHostRuntime {
     pub(crate) opengl: OpenGlGuestState,
     /// The WIC object state.
     pub(crate) wic: WicState,
+    /// The DirectDraw7 objects.
+    pub(crate) ddraw_objects: HashMap<u64, DirectDrawObjectState>,
+    /// The DirectDraw software surfaces.
+    pub(crate) ddraw_surfaces: HashMap<u64, DirectDrawSurfaceState>,
+    /// The ID3D10Blob allocations (D3DCreateBlob).
+    pub(crate) d3d_blobs: HashMap<u64, Vec<u8>>,
     /// Guest IMFTopology object -> topology.
     pub(crate) mf_topologies: HashMap<u64, crate::media::Topology>,
     /// Guest IMFTopologyNode object -> topology node.
@@ -2114,6 +2146,9 @@ impl PeHostRuntime {
             mf_dxgi_device_managers: HashMap::new(),
             opengl: OpenGlGuestState::default(),
             wic: WicState::default(),
+            ddraw_objects: HashMap::new(),
+            ddraw_surfaces: HashMap::new(),
+            d3d_blobs: HashMap::new(),
             mf_topologies: HashMap::new(),
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
