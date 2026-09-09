@@ -63,6 +63,18 @@ enum OracleCommand {
         #[arg(long, value_enum, default_value_t = ApiGateSelection::Shipping)]
         gate: ApiGateSelection,
     },
+    /// Emit the generated API-Compatibility Ledger (the semantic-truth part
+    /// of KNOWN_LIMITATIONS.md): every tracked export whose dispatch is not
+    /// exact or whose backing subsystem is not fully available, with the
+    /// fidelity/capability axes and per-entry reasons.  The document is
+    /// machine-generated from the registry so limitations can never drift
+    /// from the API database.
+    #[command(name = "api-limitations")]
+    ApiLimitations {
+        /// Destination path for the generated markdown fragment.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Write the deterministic differential vector corpus (schema_version 1).
     Vectors {
         /// Output path (defaults to stdout when omitted).
@@ -128,6 +140,15 @@ fn main() {
         write_api_report(out, *gate);
         return;
     }
+    if let OracleCommand::ApiLimitations { out } = &cli.command {
+        let database = ApiDatabase::from_thunk_metadata();
+        if let Err(error) = std::fs::write(out, database.compatibility_limitations_markdown()) {
+            eprintln!("failed to write {}: {error}", out.display());
+            std::process::exit(1);
+        }
+        eprintln!("wrote {}", out.display());
+        return;
+    }
     if run_env_driven_comparison() {
         return;
     }
@@ -135,6 +156,10 @@ fn main() {
         OracleCommand::ApiReport { .. } => {
             // Handled by the pre-match special case above.
             unreachable!("ApiReport is handled before the match")
+        }
+        OracleCommand::ApiLimitations { .. } => {
+            // Handled by the pre-match special case above.
+            unreachable!("ApiLimitations is handled before the match")
         }
         OracleCommand::Vectors {
             out,
@@ -215,6 +240,30 @@ fn write_api_report(out: &std::path::Path, gate: ApiGateSelection) {
         report.gate.shipping_violation_count,
         report.gate.completeness_violation_count
     );
+    let (exact, restricted, approximate, synthetic_environment, canned) = report
+        .per_dll
+        .values()
+        .fold((0, 0, 0, 0, 0), |(e, r, a, s, c), per| {
+            (
+                e + per.exact,
+                r + per.restricted,
+                a + per.approximate,
+                s + per.synthetic_environment,
+                c + per.canned_failure,
+            )
+        });
+    let (full, partial, absent) = report.per_dll.values().fold((0, 0, 0), |(f, p, a), per| {
+        (
+            f + per.capability_full,
+            p + per.capability_partial,
+            a + per.capability_absent,
+        )
+    });
+    eprintln!(
+        "  semantic fidelity: {exact} exact, {restricted} restricted, {approximate} \
+         approximate, {synthetic_environment} synthetic-environment, {canned} canned"
+    );
+    eprintln!("  subsystem capability: {full} full, {partial} partial, {absent} absent");
     match gate {
         ApiGateSelection::None => {}
         ApiGateSelection::Shipping => {

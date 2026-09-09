@@ -183,8 +183,12 @@ impl ArchMask {
 ///   Steam API, WebView2, ...).  Passes the profile-sensitive completeness
 ///   gate when the profile explicitly excludes the feature.
 /// - [`SupportPolicy::OutsideUserModeProfile`] — kernel/DRM/anti-cheat
-///   adjacent APIs (native `Nt*` layer, kernel thunk layers like d3d8thk,
-///   ...) that are exempt from the user-mode tier's completeness gate.
+///   adjacent APIs (kernel thunk layers like `d3d8thk`, display-mode
+///   surfaces, anti-cheat drivers, ...) that are exempt from the user-mode
+///   tier's completeness gate.  The `Nt*`/`Rtl*` ntdll surface is NOT here:
+///   the audit-fix wave classified the implemented ntdll user-mode APIs into
+///   the native user-mode profile (`OptionalFeature`), where the
+///   Win32-over-Nt audit verifies them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum SupportPolicy {
     /// Core user-mode API any application needs.

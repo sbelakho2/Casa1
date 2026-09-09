@@ -11,7 +11,7 @@
 use casa1::api_coverage::coverage_evidence_for;
 use casa1::api_database::{
     ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, ArchSet, CompatibilityTier,
-    CoverageLevel, WindowsVersion, global_database,
+    CoverageLevel, SemanticFidelity, SubsystemCapability, WindowsVersion, global_database,
 };
 use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::host_thunks::{ImplementationLevel, SupportPolicy};
@@ -215,6 +215,102 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .expect("IMFMediaSession entry");
     assert_eq!(session.implementation, ImplementationLevel::Implemented);
     assert!(!session.transitional);
+}
+
+#[test]
+fn semantic_axes_keep_callable_separate_from_exact() {
+    // The audit's "meaning of Implemented" regression: an export can be
+    // callable without being exact, and the registry must never claim real
+    // semantics its dispatch does not perform.  X3DAudioCalculate claims
+    // "real sound-cone math" but writes a zeroed DSP response — it is
+    // demoted to a documented Partial with the axes recording why.
+    let database = ApiDatabase::from_thunk_metadata();
+    let x3daudio_calculate = database
+        .lookup("x3daudio1_7.dll", "X3DAudioCalculate")
+        .expect("X3DAudioCalculate entry");
+    assert_eq!(
+        x3daudio_calculate.implementation,
+        ImplementationLevel::Partial,
+        "a canned zeroed-DSP dispatch must not be Implemented"
+    );
+    assert!(
+        x3daudio_calculate.transitional,
+        "the demotion carries its reason"
+    );
+    assert_eq!(
+        x3daudio_calculate.semantic_fidelity,
+        SemanticFidelity::CannedFailure,
+        "the fidelity axis records the canned response"
+    );
+    assert_eq!(
+        x3daudio_calculate.subsystem_capability,
+        SubsystemCapability::Absent,
+        "no X3DAudio engine exists behind the handle"
+    );
+    assert!(
+        x3daudio_calculate
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no sound-cone math")
+                || detail.to_ascii_lowercase().contains("sound-cone")),
+        "the specific documented limitation is recorded"
+    );
+
+    // The environment-model rows stay callable while the capability axis
+    // reports the absent subsystem: mscoree models a machine with no CLR.
+    let clr = database
+        .lookup("mscoree.dll", "CLRCreateInstance")
+        .expect("CLRCreateInstance entry");
+    assert_eq!(clr.implementation, ImplementationLevel::Implemented);
+    assert_eq!(
+        clr.semantic_fidelity,
+        SemanticFidelity::SyntheticEnvironment,
+        "the no-CLR failure contract is an exact environment model"
+    );
+    assert_eq!(
+        clr.subsystem_capability,
+        SubsystemCapability::Absent,
+        "export dispatch is callable; the CLR capability is zero"
+    );
+    let mf_service = database
+        .lookup("mfplat.dll", "MFGetService")
+        .expect("MFGetService entry");
+    assert_eq!(
+        mf_service.semantic_fidelity,
+        SemanticFidelity::Restricted,
+        "MF exists but no service provider is registered"
+    );
+    assert_eq!(
+        mf_service.subsystem_capability,
+        SubsystemCapability::Partial
+    );
+    let direct_play = database
+        .lookup("dplay.dll", "DirectPlayCreate")
+        .expect("DirectPlayCreate entry");
+    assert_eq!(
+        direct_play.semantic_fidelity,
+        SemanticFidelity::SyntheticEnvironment
+    );
+    assert_eq!(
+        direct_play.subsystem_capability,
+        SubsystemCapability::Absent
+    );
+    let dc_query = database
+        .lookup("netutils.dll", "NetGetDCName")
+        .expect("NetGetDCName entry");
+    assert_eq!(
+        dc_query.semantic_fidelity,
+        SemanticFidelity::SyntheticEnvironment
+    );
+    assert_eq!(dc_query.subsystem_capability, SubsystemCapability::Absent);
+
+    // Ordinary implemented APIs default to exact/full: the axes only downgrade
+    // where the dispatch is actually restricted.
+    let create_file = database
+        .lookup("kernel32.dll", "CreateFileW")
+        .expect("CreateFileW entry");
+    assert_eq!(create_file.semantic_fidelity, SemanticFidelity::Exact);
+    assert_eq!(create_file.subsystem_capability, SubsystemCapability::Full);
 }
 
 // ---------------------------------------------------------------------------
@@ -879,11 +975,29 @@ fn report_generator_emits_expected_json_shape() {
             .len() as u64
     );
     // The completeness-gate violation count is the total-compatibility
-    // progress number — the surface is fully implemented and evidenced, so
-    // the honest report carries no completeness violations.
+    // progress number.  The semantic-truth model (the audit's "meaning of
+    // Implemented" split) demoted X3DAudioCalculate — the dispatch that
+    // claimed "real sound-cone math" but writes a zeroed DSP response — to a
+    // documented Partial, so the honest report carries exactly that one
+    // completeness violation: an exact registry must never claim what the
+    // dispatch does not do.
     assert_eq!(
-        completeness_count, 0,
-        "the fully implemented registry has no completeness violations"
+        completeness_count, 1,
+        "the honest registry carries exactly one completeness violation: \
+         X3DAudioCalculate (no sound-cone math, zeroed DSP response)"
+    );
+    assert!(
+        gate["completeness_violations"]
+            .as_array()
+            .expect("completeness_violations")
+            .iter()
+            .any(|violation| {
+                violation["dll"] == "x3daudio1_7.dll"
+                    && violation["export"] == "X3DAudioCalculate"
+                    && violation["kind"]
+                        == serde_json::json!(ApiGateViolationKind::PartialNotCompletenessReady)
+            }),
+        "the single completeness violation must be the documented X3DAudioCalculate partial"
     );
     for violation in gate["completeness_violations"]
         .as_array()
@@ -980,14 +1094,21 @@ fn api_report_gate_enforces_violations_via_the_binary() {
         "the cleaned registry carries no shipping violations"
     );
 
-    // The completeness gate also passes on the seeded database (Partial
-    // never passes it — none remain; the Implemented surface is evidenced).
+    // The completeness gate fails on the seeded database exactly as the
+    // semantic-truth model requires: Partial never passes it, and
+    // X3DAudioCalculate (the canned "sound-cone math" dispatch) is the one
+    // honest Partial — the gate must exit non-zero until the real operation
+    // exists.
     let status = std::process::Command::new(binary)
         .args(["api-report", "--gate", "completeness", "--out"])
         .arg(&out)
         .status()
         .expect("invoke casa1-oracle api-report");
-    assert!(status.success());
+    assert!(
+        !status.success(),
+        "api-report --gate completeness must exit non-zero while the documented \
+         X3DAudioCalculate partial is unresolved"
+    );
 
     // --gate none never fails on violations.
     let status = std::process::Command::new(binary)

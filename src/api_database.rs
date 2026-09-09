@@ -13,6 +13,18 @@
 //!   test coverage ([`CoverageLevel`]), the workloads that reach the API, and
 //!   the transitional flag (a `Partial` entry is transitional ONLY when it
 //!   carries a specific, concrete documented reason in `detail`).
+//! - The semantic axes — [`SemanticFidelity`] (does the dispatch perform the
+//!   real documented operation, a restricted subset, an approximation, an
+//!   honest environment model, or a canned response?) and
+//!   [`SubsystemCapability`] (is the backing Windows subsystem available?).
+//!   The audit's "meaning of Implemented" problem: an export may be callable
+//!   without being exact (`mscoree` answers `COR_E_CLRNOTAVAILABLE` for a
+//!   machine with no CLR — dispatch callable, capability absent), and a
+//!   no-op must never claim real semantics (`X3DAudioCalculate` is demoted to
+//!   a documented `Partial`).  Seed-time overrides
+//!   ([`SEMANTIC_OVERRIDES`]) record the audited truth on both axes, and the
+//!   report and the generated `KNOWN_LIMITATIONS.compat.md` ledger surface
+//!   them.
 //! - [`ApiDatabase`] — the entry table with full-key lookup
 //!   ([`ApiDatabase::lookup_entry`]), the legacy (DLL, export) convenience
 //!   lookup ([`ApiDatabase::lookup`], `None` on ambiguity), workload
@@ -124,6 +136,88 @@ pub enum CompatibilityTier {
 }
 
 // ---------------------------------------------------------------------------
+// Semantic axes (the audit's "meaning of Implemented" split)
+// ---------------------------------------------------------------------------
+
+/// How closely the guest-visible behavior of an entry matches the documented
+/// Windows operation — the semantic-fidelity axis.
+///
+/// [`ImplementationLevel`] alone cannot answer both "is there a callable
+/// dispatch?" and "does it perform the real operation?".  An entry may be
+/// callable (level `Implemented`) while its behavior is an environment model
+/// (e.g. `mscoree` answering `COR_E_CLRNOTAVAILABLE` for a machine with no
+/// CLR installed), a restricted subset, or a canned response.  This axis
+/// carries that truth; [`SubsystemCapability`] carries whether the Windows
+/// subsystem the API belongs to is actually available in the runtime
+/// environment.  Together they let the registry report export-dispatch
+/// coverage, semantic fidelity, and subsystem capability independently.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum SemanticFidelity {
+    /// Performs the real documented operation against runtime state and
+    /// writes the genuine guest-visible results.
+    #[default]
+    Exact,
+    /// Performs the real operation for a documented subset (formats, codes,
+    /// inputs); unsupported inputs degrade gracefully.
+    Restricted,
+    /// Produces synthetic/plausible results that approximate the real
+    /// operation without performing it.
+    Approximate,
+    /// Faithfully models an environment state (a service absent, a machine
+    /// not domain-joined, no devices present, ...) and answers with the
+    /// behavior that state produces — the operation is exact for the
+    /// modeled environment.
+    SyntheticEnvironment,
+    /// Returns a deterministic canned response (a fixed value or error,
+    /// possibly with fixed outputs) without performing the operation.
+    CannedFailure,
+}
+
+/// Whether the Windows subsystem/facility an entry's operation belongs to is
+/// actually available in the runtime environment.
+///
+/// Independent from the entry's own dispatch status: `mscoree` exports can be
+/// callable with an honest failure contract while the CLR capability is
+/// absent; `NetGetDCName` can be callable while no domain controller is
+/// reachable.  "Implemented" never claims subsystem availability by itself.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum SubsystemCapability {
+    /// The subsystem is available with full semantics.
+    #[default]
+    Full,
+    /// The subsystem is available with documented limitations.
+    Partial,
+    /// The subsystem is absent from the modeled environment.
+    Absent,
+}
+
+/// The default semantic fidelity for an implementation level (used when no
+/// seed-time override documents otherwise).
+const fn default_fidelity_for(level: ImplementationLevel) -> SemanticFidelity {
+    match level {
+        ImplementationLevel::Implemented => SemanticFidelity::Exact,
+        ImplementationLevel::Partial => SemanticFidelity::Restricted,
+        ImplementationLevel::Stub | ImplementationLevel::Unsupported => {
+            SemanticFidelity::CannedFailure
+        }
+    }
+}
+
+/// The default subsystem capability for an implementation level.
+const fn default_capability_for(level: ImplementationLevel) -> SubsystemCapability {
+    match level {
+        ImplementationLevel::Implemented | ImplementationLevel::Partial => {
+            SubsystemCapability::Full
+        }
+        ImplementationLevel::Stub | ImplementationLevel::Unsupported => SubsystemCapability::Absent,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
 
@@ -167,6 +261,16 @@ pub struct ApiEntry {
     /// exempt from the user-mode completeness gate.
     #[serde(default)]
     pub support_policy: SupportPolicy,
+    /// Semantic fidelity of the guest-visible behavior (see
+    /// [`SemanticFidelity`]): whether the dispatch performs the real
+    /// documented operation, a restricted subset, a synthetic approximation,
+    /// an honest environment model, or a canned response.
+    #[serde(default)]
+    pub semantic_fidelity: SemanticFidelity,
+    /// Whether the Windows subsystem the operation belongs to is actually
+    /// available in the runtime environment (see [`SubsystemCapability`]).
+    #[serde(default)]
+    pub subsystem_capability: SubsystemCapability,
 }
 
 impl ApiEntry {
@@ -189,6 +293,8 @@ impl ApiEntry {
             transitional: false,
             detail: None,
             support_policy: SupportPolicy::Required,
+            semantic_fidelity: default_fidelity_for(implementation),
+            subsystem_capability: default_capability_for(implementation),
         }
     }
 
@@ -710,6 +816,8 @@ impl ApiDatabase {
                 transitional: reason.is_some(),
                 detail: reason.map(str::to_string),
                 support_policy: metadata.support_policy,
+                semantic_fidelity: default_fidelity_for(metadata.implementation),
+                subsystem_capability: default_capability_for(metadata.implementation),
             });
         }
 
@@ -755,6 +863,8 @@ impl ApiDatabase {
 
         database.apply_coverage_evidence();
 
+        database.apply_semantic_overrides();
+
         database
     }
 
@@ -792,6 +902,37 @@ impl ApiDatabase {
         }
     }
 
+    /// Apply the seed-time semantic-truth overrides ([`SEMANTIC_OVERRIDES`]).
+    ///
+    /// The metadata table classifies the dispatch quality; this pass records
+    /// what the dispatch actually delivers on the semantic axes: whether the
+    /// operation is exact, restricted, an approximation, an honest model of an
+    /// absent/limited environment, or a canned response — and whether the
+    /// backing Windows subsystem is available.  A row may also be demoted
+    /// here (e.g. `X3DAudioCalculate`, whose "sound-cone math" is a canned
+    /// zeroed response, is demoted to a documented `Partial`).
+    pub fn apply_semantic_overrides(&mut self) {
+        for seed in SEMANTIC_OVERRIDES {
+            let Some(entry) = self.entries.iter_mut().find(|entry| {
+                normalize_dll(&entry.dll) == normalize_dll(seed.dll)
+                    && entry.export.eq_ignore_ascii_case(seed.export)
+                    && entry.arch == ArchSet::Any
+                    && entry.win_version == WindowsVersion::Any
+            }) else {
+                continue;
+            };
+            entry.semantic_fidelity = seed.fidelity;
+            entry.subsystem_capability = seed.capability;
+            entry.detail = Some(seed.note.to_string());
+            if let Some(level) = seed.level {
+                entry.implementation = level;
+                // A demotion to Partial must carry its specific reason or the
+                // shipping gate rejects it as an undocumented partial.
+                entry.transitional = level == ImplementationLevel::Partial;
+            }
+        }
+    }
+
     /// The `api-completeness.json` report for this database.
     pub fn completeness_report(&self) -> ApiCompletenessReport {
         let mut per_dll: BTreeMap<String, DllCompletenessSummary> = BTreeMap::new();
@@ -817,6 +958,18 @@ impl ApiDatabase {
             }
             if entry.semantic_test_coverage == CoverageLevel::Conformance {
                 summary.conformance_tested += 1;
+            }
+            match entry.semantic_fidelity {
+                SemanticFidelity::Exact => summary.exact += 1,
+                SemanticFidelity::Restricted => summary.restricted += 1,
+                SemanticFidelity::Approximate => summary.approximate += 1,
+                SemanticFidelity::SyntheticEnvironment => summary.synthetic_environment += 1,
+                SemanticFidelity::CannedFailure => summary.canned_failure += 1,
+            }
+            match entry.subsystem_capability {
+                SubsystemCapability::Full => summary.capability_full += 1,
+                SubsystemCapability::Partial => summary.capability_partial += 1,
+                SubsystemCapability::Absent => summary.capability_absent += 1,
             }
         }
 
@@ -846,9 +999,89 @@ impl ApiDatabase {
                     implementation: entry.implementation,
                     semantic_test_coverage: entry.semantic_test_coverage,
                     support_policy: entry.support_policy,
+                    semantic_fidelity: entry.semantic_fidelity,
+                    subsystem_capability: entry.subsystem_capability,
+                    detail: entry.detail.clone(),
                 })
                 .collect(),
         }
+    }
+
+    /// Render the compatibility-limitations fragment (`KNOWN_LIMITATIONS`
+    /// generated section) from the database's semantic axes.
+    ///
+    /// The generated document is the authoritative per-API statement of what
+    /// is NOT exact: rows whose dispatch is restricted, approximate, an
+    /// environment model, or a canned response, rows whose backing subsystem
+    /// is absent or partial, and the documented `Partial` entries — with the
+    /// specific reason each carries.  It is emitted by
+    /// `casa1-oracle api-limitations` and included by `KNOWN_LIMITATIONS.md`
+    /// so the limitations document can never disagree with the registry.
+    pub fn compatibility_limitations_markdown(&self) -> String {
+        let mut entries: Vec<&ApiEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.semantic_fidelity != SemanticFidelity::Exact
+                    || entry.subsystem_capability != SubsystemCapability::Full
+            })
+            .collect();
+        entries.sort_by(|a, b| a.dll.cmp(&b.dll).then_with(|| a.export.cmp(&b.export)));
+
+        let mut total = 0usize;
+        let mut by_fidelity: BTreeMap<SemanticFidelity, usize> = BTreeMap::new();
+        let mut by_capability: BTreeMap<SubsystemCapability, usize> = BTreeMap::new();
+        for entry in &entries {
+            total += 1;
+            *by_fidelity.entry(entry.semantic_fidelity).or_default() += 1;
+            *by_capability.entry(entry.subsystem_capability).or_default() += 1;
+        }
+
+        let mut out = String::new();
+        out.push_str("<!-- GENERATED by `casa1-oracle api-limitations --out <file>`.\n");
+        out.push_str("     Do not edit by hand: regenerate after any dispatch/metadata change.\n");
+        out.push_str(
+            "     Source of truth: ApiDatabase::from_thunk_metadata + SEMANTIC_OVERRIDES. -->\n",
+        );
+        out.push_str("\n");
+        out.push_str("## API-Compatibility Ledger (generated)\n\n");
+        out.push_str("Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).\n\n");
+        out.push_str(&format!(
+            "**Counts**: {total} entries deviate from exact/full — fidelity {fidelity_counts}, capability {capability_counts}.\n\n",
+            fidelity_counts = by_fidelity
+                .iter()
+                .map(|(f, c)| format!("{f:?} {c}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            capability_counts = by_capability
+                .iter()
+                .map(|(c, n)| format!("{c:?} {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+
+        let mut current_dll = String::new();
+        for entry in &entries {
+            if entry.dll != current_dll {
+                current_dll = entry.dll.clone();
+                out.push_str(&format!("\n### {current_dll}\n\n"));
+            }
+            let note = entry.detail.as_deref().unwrap_or("");
+            out.push_str(&format!(
+                "- `{}` — level `{:?}`, fidelity `{:?}`, capability `{:?}`{}",
+                entry.export,
+                entry.implementation,
+                entry.semantic_fidelity,
+                entry.subsystem_capability,
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {note}")
+                },
+            ));
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -883,6 +1116,343 @@ fn classify_partial_reason(dll: &str, export: &str) -> Option<&'static str> {
 /// with one of these (or an equivalent specific reason in the skeleton
 /// tables' `detail`).
 static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[];
+
+// ---------------------------------------------------------------------------
+// Semantic-truth overrides
+// ---------------------------------------------------------------------------
+
+/// Seed-time semantic-truth row: (DLL, export) -> the fidelity and
+/// subsystem-capability truth of the dispatch, plus an optional level
+/// demotion.
+struct SemanticOverrideSeed {
+    dll: &'static str,
+    export: &'static str,
+    level: Option<ImplementationLevel>,
+    fidelity: SemanticFidelity,
+    capability: SubsystemCapability,
+    note: &'static str,
+}
+
+const fn semantic_override(
+    dll: &'static str,
+    export: &'static str,
+    level: Option<ImplementationLevel>,
+    fidelity: SemanticFidelity,
+    capability: SubsystemCapability,
+    note: &'static str,
+) -> SemanticOverrideSeed {
+    SemanticOverrideSeed {
+        dll,
+        export,
+        level,
+        fidelity,
+        capability,
+        note,
+    }
+}
+
+/// The audited semantic-truth overrides: exports whose dispatch does not
+/// perform the real Windows operation, either because the backing subsystem
+/// is absent from the modeled environment (the environment model is itself
+/// exact — `mscoree` answering `COR_E_CLRNOTAVAILABLE` on a machine with no
+/// CLR installed) or because the dispatch is a restricted/approximate/canned
+/// response.
+///
+/// These rows exist because the metadata level alone cannot distinguish
+/// "callable" from "exact": [`SemanticFidelity`] and
+/// [`SubsystemCapability`] carry that truth into the report, and the audit's
+/// regression case — `X3DAudioCalculate`, which claims "real sound-cone
+/// math" but writes a zeroed DSP response — is demoted to a documented
+/// `Partial` here.
+static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
+    // ── X3DAudio: the claimed spatial math is not performed ────────────────
+    semantic_override(
+        "x3daudio1_7.dll",
+        "X3DAudioCalculate",
+        Some(ImplementationLevel::Partial),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No listener/emitter sound-cone math is performed: the DSP settings are \
+         zeroed and S_OK is returned (a canned response).  The dispatch reads its \
+         arguments but never computes the X3DAUDIO_DSP_SETTINGS the comment claims.",
+    ),
+    semantic_override(
+        "x3daudio1_7.dll",
+        "X3DAudioInitialize",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Validates the output pointer and hands back an instance token derived from \
+         the channel mask, but the X3DAudio engine surface behind the handle is \
+         absent (calculate is a canned zeroed response).",
+    ),
+    // ── XACT3: no engine — the honest no-class environment model ───────────
+    semantic_override(
+        "xactengine3_7.dll",
+        "XACT3CreateEngine",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a machine with no XACT3 engine installed: the factory answers E_FAIL \
+         with a NULL engine.  The environment model is honest; no XACT subsystem is \
+         available.",
+    ),
+    semantic_override(
+        "xactengine3_7.dll",
+        "XACT3CreateEngineWithFlags",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a machine with no XACT3 engine installed: the factory answers E_FAIL \
+         with a NULL engine.  The environment model is honest; no XACT subsystem is \
+         available.",
+    ),
+    // ── DirectPlay: no sessions / class not registered ─────────────────────
+    semantic_override(
+        "dplay.dll",
+        "DirectPlayCreate",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a machine with no DirectPlay runtime: class creation answers \
+         REGDB_E_CLASSNOTREG.  No DirectPlay sessions can exist.",
+    ),
+    semantic_override(
+        "dplay.dll",
+        "DirectPlayEnumerateW",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No DirectPlay sessions exist in the modeled environment; enumeration \
+         completes with zero sessions.",
+    ),
+    semantic_override(
+        "dpnet.dll",
+        "DP8SPCreate",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No DirectPlay8 service provider: class creation answers \
+         REGDB_E_CLASSNOTREG.",
+    ),
+    semantic_override(
+        "dpaddr.dll",
+        "DP8SPCreate",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No DirectPlay8 service provider: class creation answers \
+         REGDB_E_CLASSNOTREG.",
+    ),
+    // ── directory/domain services: the workstation is not domain-joined ────
+    semantic_override(
+        "netutils.dll",
+        "NetGetDCName",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a workstation not joined to a domain: the domain-controller query \
+         answers NERR_DCNotFound.  The networking stack exists; no DC is \
+         reachable.",
+    ),
+    semantic_override(
+        "netutils.dll",
+        "NetGetAnyDCName",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a workstation not joined to a domain: the domain-controller query \
+         answers NERR_DCNotFound.",
+    ),
+    semantic_override(
+        "srvsvc.dll",
+        "NetServerGetInfo",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No domain server is reachable: the server-info query answers \
+         NERR_DCNotFound.",
+    ),
+    semantic_override(
+        "wkssvc.dll",
+        "NetWkstaSetInfo",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No domain server is reachable: the workstation-info update answers \
+         NERR_DCNotFound.",
+    ),
+    semantic_override(
+        "browser.dll",
+        "BrowserServerEnum",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No domain servers exist to enumerate: the enumeration answers \
+         NERR_DCNotFound.",
+    ),
+    // ── credentials / Kerberos: no credentials, no KDC ─────────────────────
+    semantic_override(
+        "credssp.dll",
+        "CredSSPGetClientCredential",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No credentials are available in the modeled environment: the query answers \
+         SEC_E_NO_CREDENTIALS.",
+    ),
+    semantic_override(
+        "credssp.dll",
+        "CredSSPGetServerCredential",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No credentials are available in the modeled environment: the query answers \
+         SEC_E_NO_CREDENTIALS.",
+    ),
+    semantic_override(
+        "kerberos.dll",
+        "KerbLogon",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No KDC is reachable: the logon answers SEC_E_NO_KERB_KEY.",
+    ),
+    semantic_override(
+        "kerberos.dll",
+        "KerbRetrieveTicket",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No KDC is reachable: the ticket retrieval answers SEC_E_NO_KERB_KEY.",
+    ),
+    // ── certificate dialogs / digest helpers: canned answers ───────────────
+    semantic_override(
+        "cryptdlg.dll",
+        "CertSelectCertificate",
+        None,
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No certificate-selection UI exists: the dialog answers FALSE (no \
+         selection) without showing a dialog.",
+    ),
+    semantic_override(
+        "cryptdlg.dll",
+        "CertDigestDigest",
+        None,
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No digest helper is available: the operation answers \
+         ERROR_NOT_FOUND.",
+    ),
+    // ── audio-session activation: the runtime audio is session-local ───────
+    semantic_override(
+        "mmdevapi.dll",
+        "ActivateAudioInterfaceAsync",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Partial,
+        "The runtime has an audio stack, but no device-activation endpoint: the \
+         activation answers AUDCLNT_E_DEVICE_INVALIDATED without invoking the \
+         callback.",
+    ),
+    // ── CLR: a machine with no CLR installed ───────────────────────────────
+    semantic_override(
+        "mscoree.dll",
+        "CLRCreateInstance",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a Windows machine with no .NET CLR installed: activation answers \
+         COR_E_CLRNOTAVAILABLE.  Export dispatch is callable; the CLR capability is \
+         absent (see KNOWN_LIMITATIONS: .NET applications do not run).",
+    ),
+    semantic_override(
+        "mscoree.dll",
+        "CorBindToRuntime",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a Windows machine with no .NET CLR installed: activation answers \
+         COR_E_CLRNOTAVAILABLE.",
+    ),
+    semantic_override(
+        "mscoree.dll",
+        "CorBindToRuntimeEx",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a Windows machine with no .NET CLR installed: activation answers \
+         COR_E_CLRNOTAVAILABLE.",
+    ),
+    semantic_override(
+        "mscoree.dll",
+        "GetCORSystemDirectory",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "Models a Windows machine with no .NET CLR installed: the directory query \
+         fails as it would without a runtime directory.",
+    ),
+    semantic_override(
+        "mscorwks.dll",
+        "CorBindToRuntime",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No CLR workhorse runtime exists in the modeled environment: activation \
+         answers COR_E_CLRNOTAVAILABLE.",
+    ),
+    semantic_override(
+        "mscorwks.dll",
+        "CorBindToRuntimeEx",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Absent,
+        "No CLR workhorse runtime exists in the modeled environment: activation \
+         answers COR_E_CLRNOTAVAILABLE.",
+    ),
+    // ── Media Foundation: MF exists, service providers do not ──────────────
+    semantic_override(
+        "mf.dll",
+        "MFGetService",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Media Foundation objects exist, but no service provider is registered: the \
+         query answers MF_E_UNSUPPORTED_SERVICE.",
+    ),
+    semantic_override(
+        "mfplat.dll",
+        "MFGetService",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Media Foundation objects exist, but no service provider is registered: the \
+         query answers MF_E_UNSUPPORTED_SERVICE.",
+    ),
+    // ── GDI+: a graphics object with no method surface ─────────────────────
+    semantic_override(
+        "gdiplus.dll",
+        "GdipCreateGraphics",
+        None,
+        SemanticFidelity::Approximate,
+        SubsystemCapability::Partial,
+        "Creates a real GDI+ graphics object, but the object carries an empty vtable \
+         (no drawing methods) — the handle is real, the drawing surface is not.",
+    ),
+    // ── NT native process creation: not creatable in this surface ──────────
+    semantic_override(
+        "ntdll.dll",
+        "NtCreateProcess",
+        None,
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Partial,
+        "No child processes are creatable through the native surface: the call \
+         answers STATUS_INVALID_HANDLE.  Process APIs exist through the Win32 \
+         layer; the native creation path is a canned failure.",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Skeleton tables
@@ -976,6 +1546,8 @@ fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
         transitional: skeleton.transitional,
         detail: (!skeleton.detail.is_empty()).then(|| skeleton.detail.to_string()),
         support_policy: skeleton.support_policy,
+        semantic_fidelity: default_fidelity_for(skeleton.implementation),
+        subsystem_capability: default_capability_for(skeleton.implementation),
     }
 }
 
@@ -1458,6 +2030,30 @@ pub struct DllCompletenessSummary {
     pub conformance_tested: usize,
     /// Partial entries flagged `transitional` (documented, gated-acceptable).
     pub transitional_partial: usize,
+    /// Entries whose dispatch performs the real documented operation
+    /// ([`SemanticFidelity::Exact`]).
+    pub exact: usize,
+    /// Entries whose dispatch covers a documented subset
+    /// ([`SemanticFidelity::Restricted`]).
+    pub restricted: usize,
+    /// Entries whose dispatch produces synthetic approximations
+    /// ([`SemanticFidelity::Approximate`]).
+    pub approximate: usize,
+    /// Entries modeling an environment state honestly
+    /// ([`SemanticFidelity::SyntheticEnvironment`]).
+    pub synthetic_environment: usize,
+    /// Entries returning a deterministic canned response
+    /// ([`SemanticFidelity::CannedFailure`]).
+    pub canned_failure: usize,
+    /// Entries whose backing subsystem is fully available
+    /// ([`SubsystemCapability::Full`]).
+    pub capability_full: usize,
+    /// Entries whose backing subsystem is available with limitations
+    /// ([`SubsystemCapability::Partial`]).
+    pub capability_partial: usize,
+    /// Entries whose backing subsystem is absent
+    /// ([`SubsystemCapability::Absent`]).
+    pub capability_absent: usize,
 }
 
 /// The gate section of the report: both gate results with counts.
@@ -1488,6 +2084,16 @@ pub struct ApiRegistryRow {
     pub semantic_test_coverage: CoverageLevel,
     /// User-mode support policy.
     pub support_policy: SupportPolicy,
+    /// Semantic fidelity of the dispatch (see [`SemanticFidelity`]).
+    #[serde(default)]
+    pub semantic_fidelity: SemanticFidelity,
+    /// Backing-subsystem availability (see [`SubsystemCapability`]).
+    #[serde(default)]
+    pub subsystem_capability: SubsystemCapability,
+    /// Per-API documentation note (transitional reasons, environment-model
+    /// explanations, canned-response notes).
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// The `api-completeness.json` report shape.

@@ -31,6 +31,13 @@ fn main() {
         let out = std::env::var("OUT_DIR").expect("OUT_DIR");
         let path = std::path::Path::new(&out).join("casa1-reference.manifest");
         std::fs::write(&path, manifest).expect("write reference manifest");
+        // /MANIFESTINPUT requires manifest embedding to be enabled: without
+        // /MANIFEST:EMBED the MSVC linker errors LNK1220 (and even if the
+        // manifest were generated, no mt.exe step runs under cargo, so the
+        // binary would ship manifestless and GetVersionExW would be shimmed
+        // to 6.2.9200).  Both flags are MSVC-only and this branch already
+        // runs only for windows targets.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", path.display());
     }
     println!("cargo:rerun-if-changed=build.rs");

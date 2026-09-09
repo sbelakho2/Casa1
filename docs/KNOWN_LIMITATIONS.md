@@ -131,14 +131,25 @@ Vulkan extensions.
 standard translation layer maintained by the Khronos Group.
 
 
-### OpenGL Requires ANGLE on macOS
+### OpenGL Is the Built-In Software Compatibility Implementation
 
-**Limitation**: OpenGL support on macOS is implemented via ANGLE (Almost Native
-Graphics Layer Engine), which translates OpenGL ES to Metal. Apple has
-deprecated native OpenGL on macOS.
+**Limitation**: Guest OpenGL is served by Casa1's own OpenGL 1.1 compatibility
+machine ([`src/runtime/dispatch/opengl.rs`](../src/runtime/dispatch/opengl.rs)):
+fixed-function state, matrix stacks, immediate mode, client arrays, texture
+state, WGL contexts, and GLU helpers — rendered by a software rasterizer into a
+per-context framebuffer. This is a real semantic implementation for legacy
+fixed-function OpenGL, not a translation of the host's (deprecated) OpenGL and
+not ANGLE.
 
-**Reason**: Apple removed OpenGL from macOS 14 (Sonoma). ANGLE provides a
-compatibility layer for applications that still require OpenGL.
+**Reason**: Apple deprecated native OpenGL on macOS. Casa1's software path is
+deterministic and testable; modern-OpenGL features (shader-based core profiles)
+and GPU-accelerated OpenGL performance are not provided by it. The final
+architecture targets OpenGL → Casa GPU IR → Metal, with the software rasterizer
+retained as the deterministic reference/fallback path.
+
+**Impact**: Legacy OpenGL 1.1 applications run semantically; performance is
+software-rasterized, and applications requiring OpenGL 2.0+ features do not
+have a working path through this surface.
 
 ## Media
 
@@ -155,24 +166,29 @@ without FFmpeg dependencies.
 
 ## Win32 API Coverage
 
-### Some Win32 APIs are Stubbed
+### The API-Compatibility Ledger Is the Authoritative Gap List
 
-**Limitation**: Some Windows API functions are stubbed — they return
-`ERROR_CALL_NOT_IMPLEMENTED` or a default value without performing the expected
-operation. This is tracked by the import coverage system in
-[`src/import_coverage.rs`](../src/import_coverage.rs).
+**Limitation**: Win32 compatibility is not binary — an export can be callable
+without being exact, and a subsystem can be absent even when its failure
+contract is implemented faithfully. The API database ([`src/api_database.rs`](../src/api_database.rs))
+now tracks this on independent axes per export — dispatch level, semantic
+fidelity (exact / restricted / approximate / synthetic-environment /
+canned-response) and subsystem capability (full / partial / absent) — and this
+document's authoritative, machine-generated part is the
+[API-Compatibility Ledger](KNOWN_LIMITATIONS.compat.md). The ledger is emitted
+from the registry itself, so the limitations document can never drift from the
+database:
 
-**Reason**: The Win32 API surface is enormous (tens of thousands of functions).
-Casa1 implements the most commonly used APIs and stubs the rest to prevent
-crashes.
+```bash
+cargo run --bin casa1-oracle -- api-limitations --out docs/KNOWN_LIMITATIONS.compat.md
+```
 
-**Impact**: Guest applications that call stubbed APIs may:
-- Return default values (often 0 or NULL)
-- Report success without performing the operation
-- Log a telemetry event for tracking
+**Impact**: Regenerate the ledger after any dispatch/metadata change that
+alters semantic truth. Hand-maintained sections below describe the same gaps
+in prose; the ledger is the precise per-API statement.
 
-**Checking coverage**: Run the import coverage report to see which functions
-are implemented vs. stubbed:
+**Checking coverage**: Run the import coverage report to see which guest
+imports reach implemented vs. canned/unsupported semantics:
 ```bash
 cargo run --bin macwin -- import-coverage
 ```
@@ -185,6 +201,12 @@ not run. Casa1 does not include a .NET runtime.
 **Reason**: .NET requires a full Common Language Runtime with JIT compilation,
 garbage collection, and a large class library. This is beyond the scope of
 Casa1's Win32 compatibility layer.
+
+**Modeled behavior**: `mscoree.dll`/`mscorwks.dll` export dispatch is callable
+and honest — activation answers `COR_E_CLRNOTAVAILABLE`, directory queries fail
+as they would on a Windows machine with no CLR installed — but the ledger
+records the CLR capability as **absent** (fidelity `synthetic-environment`).
+Six callable exports must never be read as ".NET support".
 
 
 ## Networking
