@@ -7789,32 +7789,32 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "x3daudio1_7.dll",
         "X3DAudioCalculate",
-        "casa1-conformance:runtime::tests::x3daudio_calculate_dispatch_writes_real_dsp_values",
+        "casa1-conformance:x3daudio_calculate_dispatch_writes_real_dsp_values",
     ),
     conformance(
         "ntdll.dll",
         "NtCreateProcess",
-        "casa1-conformance:runtime::tests::nt_create_process_creates_real_native_child",
+        "casa1-conformance:nt_create_process_creates_real_native_child",
     ),
     conformance(
         "cryptdlg.dll",
         "CertDigestDigest",
-        "casa1-conformance:runtime::tests::cert_digest_digest_dispatch_writes_known_digests",
+        "casa1-conformance:cert_digest_digest_dispatch_writes_known_digests",
     ),
     conformance(
         "cngaudit.dll",
         "CngAuditLog",
-        "casa1-conformance:runtime::tests::cng_audit_log_appends_real_records",
+        "casa1-conformance:cng_audit_log_appends_real_records",
     ),
     conformance(
         "msftedit.dll",
         "MsftEditRegisterClass",
-        "casa1-conformance:runtime::tests::rich_edit_register_entries_create_real_windows",
+        "casa1-conformance:rich_edit_register_entries_create_real_windows",
     ),
     conformance(
         "riched32.dll",
         "RichEditANSIWndClass",
-        "casa1-conformance:runtime::tests::rich_edit_register_entries_create_real_windows",
+        "casa1-conformance:rich_edit_register_entries_create_real_windows",
     ),
     conformance(
         "xactengine3_7.dll",
