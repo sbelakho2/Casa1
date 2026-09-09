@@ -6300,6 +6300,41 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_mf_transform_pipeline",
     ),
     conformance(
+        "ole32.dll",
+        "IUnknown",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "ole32.dll",
+        "IClassFactory",
+        "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",
+    ),
+    conformance(
+        "shell32.dll",
+        "IShellLink",
+        "casa1-conformance:evidence_mid_shell32_path_helpers_thunks",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFAttributes",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFMediaType",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFMediaBuffer",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFSample",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
         "kernel32.dll",
         "SetConsoleCtrlHandler",
         "casa1-conformance:section11",

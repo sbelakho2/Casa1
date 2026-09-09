@@ -5819,6 +5819,9 @@ pub enum HostThunk {
     MfAttrDeleteItem,
     MfMediaTypeGetMajorType,
     MfMediaTypeIsCompressedFormat,
+    MfMediaTypeIsEqual,
+    MfMediaTypeGetRepresentation,
+    MfMediaTypeFreeRepresentation,
     MfBufferGetMaxLength,
     MfBufferLock,
     MfBufferUnlock,
@@ -5861,6 +5864,24 @@ pub enum HostThunk {
     MfSourceResolverCreateObjectFromUrl,
     MfPresentationDescriptorGetStreamDescriptorCount,
     MfEventGetType,
+    MfAttrGetItem,
+    MfAttrGetItemType,
+    MfAttrCompareItem,
+    MfAttrCompare,
+    MfAttrGetAllocatedString,
+    MfAttrGetAllocatedBlob,
+    MfAttrGetUnknown,
+    MfAttrSetItem,
+    MfAttrSetUnknown,
+    MfAttrDeleteAllItems,
+    MfAttrLockStore,
+    MfAttrUnlockStore,
+    MfAttrCopyAllItems,
+    MfSampleSetSampleFlags,
+    MfSampleGetSampleFlags,
+    MfSampleGetTotalLength,
+    MfSampleCopyToBuffer,
+    MfSampleConvertToContiguousBuffer,
     MfActivateGetCount,
     MfActivateGetItem,
     MfActivateGetGuid,
@@ -28719,7 +28740,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MftTransformUnsupported) => {
+            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MftTransformUnsupported) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -128769,6 +128790,243 @@ mod tests {
                 0
             );
             assert!(!runtime.mf_activates.contains_key(&activate));
+        })
+    }
+
+    #[test]
+    fn evidence_mf_attributes_full_surface() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("evidence-mf-attrs");
+            let mut memory = MemoryImage::default();
+            let create_type: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaType);
+            let set_guid: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetGuid);
+            let set_string: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetString);
+            let get_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItem);
+            let get_item_type: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItemType);
+            let get_allocated_string: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfAttrGetAllocatedString);
+            let get_count: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetCount);
+            let delete_all: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrDeleteAllItems);
+            let lock: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrLockStore);
+            let sample_flags_get: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetSampleFlags);
+            let sample_flags_set: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleSetSampleFlags);
+            let total_length: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetTotalLength);
+            let to_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleCopyToBuffer);
+            let contiguous: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSampleConvertToContiguousBuffer);
+
+            let type_out = 0x41_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[type_out as u32]),
+                0
+            );
+            let mt = read_guest_pointer(&memory, type_out, GuestArch::X86).unwrap();
+            assert_ne!(mt, 0);
+
+            // SetItem: the major type GUID through the PROPVARIANT path.
+            let key = 0x41_100_u64;
+            memory.map_bytes(
+                key,
+                &[
+                    0x21, 0x27, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00,
+                    0x38, 0x9b, 0x71,
+                ],
+            );
+            let value = 0x41_200_u64;
+            write_guest_u32(&mut memory, value, 72).ok(); // VT_CLSID
+            let video: [u8; 16] = [
+                0x76, 0x69, 0x64, 0x73, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
+                0x9b, 0x71,
+            ];
+            memory.map_bytes(0x41_210_u64, &video);
+            write_guest_pointer(&mut memory, value + 8, 0x41_210_u64, GuestArch::X86).ok();
+            let set_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetItem);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_item,
+                    &[mt as u32, key as u32, value as u32]
+                ),
+                0
+            );
+
+            // GetItemType returns VT_CLSID; GetItem writes the GUID.
+            let type_out2 = 0x41_300_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item_type,
+                    &[mt as u32, key as u32, type_out2 as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, type_out2).unwrap(),
+                72,
+                "MF_ATTRIBUTE_GUID"
+            );
+            let item_out = 0x41_310_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item,
+                    &[mt as u32, key as u32, item_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, item_out).unwrap(), 72);
+
+            // A string attribute + the allocated copy.
+            let name_key = 0x41_400_u64;
+            memory.map_bytes(
+                name_key,
+                &[
+                    0x4a, 0x59, 0x4b, 0x5e, 0x78, 0x55, 0x9c, 0x44, 0x91, 0x53, 0x22, 0x55, 0x09,
+                    0x3c, 0x8c, 0x9a,
+                ],
+            );
+            let name = 0x41_410_u64;
+            let name_wide: Vec<u16> = "Test String".encode_utf16().chain([0]).collect();
+            for (i, unit) in name_wide.iter().enumerate() {
+                write_guest_u16(&mut memory, name + (i as u64 * 2), *unit).ok();
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_string,
+                    &[mt as u32, name_key as u32, name as u32]
+                ),
+                0
+            );
+            let alloc_out = 0x41_500_u64;
+            let len_out = 0x41_510_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_allocated_string,
+                    &[mt as u32, name_key as u32, alloc_out as u32, len_out as u32]
+                ),
+                0
+            );
+            let alloc_ptr = read_guest_pointer(&memory, alloc_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_utf16_string(&memory, alloc_ptr).unwrap(),
+                "Test String"
+            );
+            assert_eq!(read_guest_u32(&memory, len_out).unwrap(), 11);
+
+            // The store lock + count + delete-all.
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, lock, &[mt as u32]),
+                0
+            );
+            let count_out = 0x41_600_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_count,
+                    &[mt as u32, count_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, count_out).unwrap(),
+                2,
+                "two attributes"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete_all, &[mt as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_count,
+                    &[mt as u32, count_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, count_out).unwrap(),
+                0,
+                "empty after DeleteAllItems"
+            );
+
+            // The IMFSample flags/length/buffer-conversion surface.
+            let sample = runtime
+                .alloc_guest_object(&mut memory, GuestObjectKind::ImfSample, 0)
+                .unwrap();
+            runtime.mf_samples.insert(
+                sample,
+                crate::media::ImfSample {
+                    buffer: vec![1, 2, 3, 4],
+                    sample_time: 0,
+                    sample_duration: 0,
+                    flags: 0,
+                },
+            );
+            let flags_out = 0x41_700_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    sample_flags_set,
+                    &[sample as u32, 3]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    sample_flags_get,
+                    &[sample as u32, flags_out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, flags_out).unwrap(), 3);
+            let len_out2 = 0x41_710_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    total_length,
+                    &[sample as u32, len_out2 as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, len_out2).unwrap(), 4);
+            let buffer_out = 0x41_720_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    contiguous,
+                    &[sample as u32, buffer_out as u32]
+                ),
+                0
+            );
+            let buffer = read_guest_pointer(&memory, buffer_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime.mf_media_buffers.get(&buffer).unwrap().data,
+                vec![1, 2, 3, 4]
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    to_buffer,
+                    &[sample as u32, buffer as u32]
+                ),
+                0
+            );
         })
     }
 }

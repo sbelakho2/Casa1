@@ -434,6 +434,12 @@ impl ImfMediaType {
         self.attributes.len()
     }
 
+    /// Remove every attribute (the documented IMFAttributes::DeleteAllItems
+    /// contract).
+    pub fn delete_all(&mut self) {
+        self.attributes.clear();
+    }
+
     /// Remove an attribute (the documented IMFAttributes::DeleteItem
     /// contract — removing an absent key succeeds).
     pub fn delete_item(&mut self, key: &Guid) {

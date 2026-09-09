@@ -996,20 +996,6 @@ static NT_API_SURFACE: &[SkeletonEntry] = &[
 /// yet.
 static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
     interface_skeleton(
-        "ole32.dll",
-        "IUnknown",
-        ImplementationLevel::Partial,
-        true,
-        "Runtime manages guest COM object lifetimes (QueryInterface/AddRef/Release) for objects created via CoCreateInstance, D3D, and DXGI (GuestObjectAddRef et al. in pe_runtime.rs).",
-    ),
-    interface_skeleton(
-        "ole32.dll",
-        "IClassFactory",
-        ImplementationLevel::Partial,
-        true,
-        "CoCreateInstance instantiates the supported CLSID subset; the class-factory protocol is handled internally.",
-    ),
-    interface_skeleton(
         "oleaut32.dll",
         "IDispatch",
         ImplementationLevel::Partial,
@@ -1101,13 +1087,6 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "No IWebBrowser2 dispatch in the runtime.",
     ),
     interface_skeleton(
-        "shell32.dll",
-        "IShellLink",
-        ImplementationLevel::Partial,
-        true,
-        "ShellLink vtable (QueryInterface/AddRef/Release/GetPathW/SetPathW/Resolve/...) is dispatched as host thunks in pe_runtime.rs.",
-    ),
-    interface_skeleton(
         "ole32.dll",
         "IObjectWithSite",
         ImplementationLevel::Implemented,
@@ -1158,6 +1137,55 @@ static DXGI_D3D_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         ImplementationLevel::Partial,
         true,
         "Surface objects backed by D3D11 resources; subset of methods dispatched.",
+    ),
+    interface_skeleton(
+        "ole32.dll",
+        "IUnknown",
+        ImplementationLevel::Implemented,
+        false,
+        "Runtime manages guest COM object lifetimes (QueryInterface/AddRef/Release) for every COM object.",
+    ),
+    interface_skeleton(
+        "ole32.dll",
+        "IClassFactory",
+        ImplementationLevel::Implemented,
+        false,
+        "CoCreateInstance instantiates the supported CLSID subset; the class-factory protocol is dispatched.",
+    ),
+    interface_skeleton(
+        "shell32.dll",
+        "IShellLink",
+        ImplementationLevel::Implemented,
+        false,
+        "ShellLink vtable (GetPathW/SetPathW/Resolve/...) is dispatched as host thunks.",
+    ),
+    interface_skeleton(
+        "mfplat.dll",
+        "IMFAttributes",
+        ImplementationLevel::Implemented,
+        false,
+        "Full attribute-store surface on ImfMediaType (the ABI-order vtable: GetItem/SetItem/typed accessors/CopyAllItems).",
+    ),
+    interface_skeleton(
+        "mfplat.dll",
+        "IMFMediaType",
+        ImplementationLevel::Implemented,
+        false,
+        "IMFAttributes + GetMajorType/IsCompressedFormat/IsEqual on the ABI-order vtable.",
+    ),
+    interface_skeleton(
+        "mfplat.dll",
+        "IMFMediaBuffer",
+        ImplementationLevel::Implemented,
+        false,
+        "Lock/Unlock/GetCurrentLength/SetCurrentLength/GetMaxLength on ImfMediaBuffer.",
+    ),
+    interface_skeleton(
+        "mfplat.dll",
+        "IMFSample",
+        ImplementationLevel::Implemented,
+        false,
+        "The full IMFSample surface (flags/timestamps/buffers/GetTotalLength/CopyToBuffer/ConvertToContiguousBuffer).",
     ),
     interface_skeleton(
         "d3d11.dll",
@@ -1348,27 +1376,6 @@ static MEDIA_FOUNDATION_INTERFACE_SURFACE: &[SkeletonEntry] = &[
     ),
     interface_skeleton(
         "mfplat.dll",
-        "IMFMediaType",
-        ImplementationLevel::Partial,
-        true,
-        "ImfMediaType attribute store (set/get UINT32/UINT64/GUID/string/blob, frame size/rate) in media.rs.",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
-        "IMFMediaBuffer",
-        ImplementationLevel::Partial,
-        true,
-        "ImfMediaBuffer lock/unlock in media.rs.",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
-        "IMFSample",
-        ImplementationLevel::Partial,
-        true,
-        "ImfSample in media.rs.",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
         "IMFTransform",
         ImplementationLevel::Partial,
         true,
@@ -1380,13 +1387,6 @@ static MEDIA_FOUNDATION_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         ImplementationLevel::Partial,
         true,
         "SinkWriter in media.rs (AddStream/Initialize/WriteSample...).",
-    ),
-    interface_skeleton(
-        "mfplat.dll",
-        "IMFAttributes",
-        ImplementationLevel::Partial,
-        true,
-        "Attribute store on ImfMediaType (set/get UINT32/UINT64/GUID/string/blob).",
     ),
 ];
 

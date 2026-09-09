@@ -911,6 +911,434 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// `IMFAttributes::GetItem(guidKey, pValue)` — write the PROPVARIANT
+    /// for the attribute.
+    pub(crate) fn dispatch_mf_attr_get_item(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let value = guest_call_arg(state, memory, 2)?;
+        let Some(mt) = self.mf_media_types.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let Some((vt, bytes)) = mf_attribute_propvariant(&mt, key) else {
+            state.set(Register::Rax, 0xc00d_36e5); // MF_E_ATTRIBUTENOTFOUND
+            return Ok(());
+        };
+        if value != 0 {
+            write_guest_u32(memory, value, vt).ok();
+            if !bytes.is_empty() {
+                memory.map_bytes(value + 8, &bytes);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::GetItemType(guidKey, pType)` — the
+    /// MF_ATTRIBUTE_TYPE.
+    pub(crate) fn dispatch_mf_attr_get_item_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let Some(mt) = self.mf_media_types.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let Some((vt, _)) = mf_attribute_propvariant(mt, key) else {
+            state.set(Register::Rax, 0xc00d_36e5);
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_u32(memory, out, vt).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::CompareItem(guidKey, Value, pbResult)` — compare the
+    /// attribute's value to the PROPVARIANT.
+    pub(crate) fn dispatch_mf_attr_compare_item(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let value = guest_call_arg(state, memory, 2)?;
+        let result = guest_call_arg(state, memory, 3)?;
+        let Some(mt) = self.mf_media_types.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let Some((vt, bytes)) = mf_attribute_propvariant(mt, key) else {
+            state.set(Register::Rax, 0xc00d_36e5);
+            return Ok(());
+        };
+        if result != 0 {
+            let value_vt = read_guest_u32(memory, value).unwrap_or(0);
+            let value_bytes = memory.read_bytes(value + 8, 64).unwrap_or_default();
+            let equal = vt == value_vt
+                && (bytes.is_empty()
+                    || (value_bytes.len() >= bytes.len()
+                        && value_bytes[..bytes.len()] == bytes[..]));
+            write_guest_u32(memory, result, u32::from(equal)).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::GetAllocatedString(guidKey, ppwszValue,
+    /// pcchLength)` — the task-allocated string copy.
+    pub(crate) fn dispatch_mf_attr_get_allocated_string(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let length = guest_call_arg(state, memory, 3)?;
+        let Some(mt) = self.mf_media_types.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let Some(text) = mt.get_string(&key).map(str::to_string) else {
+            state.set(Register::Rax, 0xc00d_36e5);
+            return Ok(());
+        };
+        let address = self.alloc_zeroed(memory, text.len() * 2 + 2, 8)?;
+        for (i, unit) in text.encode_utf16().enumerate() {
+            write_guest_u16(memory, address + (i as u64 * 2), unit).ok();
+        }
+        write_guest_u16(
+            memory,
+            address + (text.encode_utf16().count() as u64 * 2),
+            0,
+        )
+        .ok();
+        if out != 0 {
+            write_guest_pointer(memory, out, address, self.guest_arch).ok();
+        }
+        if length != 0 {
+            write_guest_u32(memory, length, text.encode_utf16().count() as u32).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::GetAllocatedBlob(guidKey, ppBuffer, pcbSize)` — the
+    /// task-allocated blob copy.
+    pub(crate) fn dispatch_mf_attr_get_allocated_blob(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        let size = guest_call_arg(state, memory, 3)?;
+        let Some(mt) = self.mf_media_types.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let Some(bytes) = mt.get_blob(&key).map(|b| b.to_vec()) else {
+            state.set(Register::Rax, 0xc00d_36e5);
+            return Ok(());
+        };
+        let address = self.alloc_zeroed(memory, bytes.len().max(1), 8)?;
+        for (i, byte) in bytes.iter().enumerate() {
+            memory.write_u8(address + i as u64, *byte);
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, address, self.guest_arch).ok();
+        }
+        if size != 0 {
+            write_guest_u32(memory, size, bytes.len() as u32).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::SetItem(guidKey, Value)` — set from a PROPVARIANT.
+    pub(crate) fn dispatch_mf_attr_set_item(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key = guest_call_arg(state, memory, 1)?;
+        let value = guest_call_arg(state, memory, 2)?;
+        let Some(mt) = self.mf_media_types.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let key = read_mf_guid(memory, key);
+        let vt = read_guest_u32(memory, value).unwrap_or(0);
+        let payload = read_guest_pointer(memory, value + 8, self.guest_arch).unwrap_or(0);
+        match vt {
+            19 => {
+                // VT_UI4
+                mt.set_uint32(key, payload as u32);
+            }
+            21 => {
+                // VT_UI8
+                mt.set_uint64(key, payload);
+            }
+            5 => {
+                // VT_R8
+                let bits = read_guest_u64(memory, value + 8).unwrap_or(0);
+                mt.set_double(key, f64::from_bits(bits));
+            }
+            72 => {
+                // VT_CLSID
+                let guid_bytes = memory.read_bytes(payload, 16).unwrap_or_default();
+                mt.set_guid(key, mf_guid_from_bytes(&guid_bytes));
+            }
+            31 => {
+                // VT_LPWSTR
+                let text = read_utf16_string(memory, payload).unwrap_or_default();
+                mt.set_string(key, text);
+            }
+            _ => {
+                state.set(Register::Rax, 0xc00d_36b4); // MF_E_INVALIDTYPE
+                return Ok(());
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::DeleteAllItems()`.
+    pub(crate) fn dispatch_mf_attr_delete_all_items(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(mt) = self.mf_media_types.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        mt.delete_all();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::LockStore()` / `UnlockStore()` — the store is
+    /// single-threaded in the runtime.
+    pub(crate) fn dispatch_mf_attr_lock_store(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::CopyAllItems(pDest)` — copy the attribute store.
+    pub(crate) fn dispatch_mf_attr_copy_all_items(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let dest = guest_call_arg(state, memory, 1)?;
+        let Some(source) = self.mf_media_types.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(target) = self.mf_media_types.get_mut(&dest) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        for (key, value) in &source.attributes {
+            target.attributes.insert(*key, value.clone());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSample::GetSampleFlags(pdwSampleFlags)` / `SetSampleFlags`.
+    pub(crate) fn dispatch_mf_sample_get_sample_flags(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(sample) = self.mf_samples.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_u32(memory, out, sample.flags).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_mf_sample_set_sample_flags(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let flags = guest_call_arg_u32(state, memory, 1)?;
+        let Some(sample) = self.mf_samples.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        sample.flags = flags;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSample::GetTotalLength(pcbTotal)` — the sample's total byte
+    /// length.
+    pub(crate) fn dispatch_mf_sample_get_total_length(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(sample) = self.mf_samples.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if out != 0 {
+            write_guest_u32(memory, out, sample.buffer.len() as u32).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSample::CopyToBuffer(pBuffer)` — copy the sample's bytes into
+    /// the target media buffer.
+    pub(crate) fn dispatch_mf_sample_copy_to_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let buffer = guest_call_arg(state, memory, 1)?;
+        let Some(sample) = self.mf_samples.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(target) = self.mf_media_buffers.get_mut(&buffer) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let copy = sample.buffer.len().min(target.max_length as usize);
+        target.data = sample.buffer[..copy].to_vec();
+        target.current_length = copy as u32;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSample::ConvertToContiguousBuffer(ppBuffer)` — a new buffer
+    /// holding the sample's bytes.
+    pub(crate) fn dispatch_mf_sample_convert_to_contiguous_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        let Some(sample) = self.mf_samples.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, mf_media_buffer_methods())?;
+        let buffer = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaBuffer, vtable)
+            .unwrap_or(0);
+        if buffer == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        let length = sample.buffer.len() as u32;
+        self.mf_media_buffers.insert(
+            buffer,
+            ImfMediaBuffer {
+                data: sample.buffer,
+                max_length: length,
+                current_length: length,
+            },
+        );
+        if out != 0 {
+            write_guest_pointer(memory, out, buffer, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::Compare(pTheirs, pbResult)` — the deep store
+    /// comparison.
+    pub(crate) fn dispatch_mf_attr_compare(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let theirs = guest_call_arg(state, memory, 1)?;
+        let result = guest_call_arg(state, memory, 2)?;
+        let Some(mine) = self.mf_media_types.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(other) = self.mf_media_types.get(&theirs) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let equal = mine.attributes == other.attributes;
+        if result != 0 {
+            write_guest_u32(memory, result, u32::from(equal)).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFAttributes::GetUnknown` / `SetUnknown` — the stores hold no
+    /// unknown-valued attributes; the documented not-found/type errors.
+    pub(crate) fn dispatch_mf_attr_unknown(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        is_get: bool,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if is_get && out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(
+            Register::Rax,
+            if is_get {
+                0xc00d_36e5 // MF_E_ATTRIBUTENOTFOUND
+            } else {
+                0xc00d_36b4 // MF_E_INVALIDTYPE
+            },
+        );
+        Ok(())
+    }
+
     // ── The MFT surface ────────────────────────────────────────────────────
 
     /// `IMFActivate::ActivateObject(riid, ppv)` — create the transform.
@@ -2972,6 +3400,45 @@ impl PeHostRuntime {
     /// The grouped dispatch arm: match the thunk and route to the COM/MF
     /// dispatch fns (kept OUT of the giant match per the audit's
     /// modularity requirement).
+    /// `IMFMediaType::IsEqual(pIMediaType, pdwFlags)` — the attribute-store
+    /// equality.
+    pub(crate) fn dispatch_mf_media_type_is_equal(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let other = guest_call_arg(state, memory, 1)?;
+        let flags = guest_call_arg(state, memory, 2)?;
+        let Some(mine) = self.mf_media_types.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(theirs) = self.mf_media_types.get(&other) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let equal = mine.attributes == theirs.attributes;
+        if flags != 0 {
+            // MF_MEDIATYPE_EQUAL_MAJOR_TYPES etc. — the full equality.
+            write_guest_u32(memory, flags, if equal { 0x1f } else { 0 }).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaType::GetRepresentation` / `FreeRepresentation` — the video
+    /// representations are not exposed.
+    pub(crate) fn dispatch_mf_media_type_representation(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, 0xc00d_36b4); // MF_E_INVALIDTYPE
+        Ok(())
+    }
+
     pub(crate) fn dispatch_mf_or_com(
         &mut self,
         thunk: &HostThunk,
@@ -3048,6 +3515,18 @@ impl PeHostRuntime {
                 self.dispatch_mf_create_source_reader_from_byte_stream(state, memory)
             }
             MfAttrGetCount => self.dispatch_mf_attr_get_count(state, memory),
+            MfAttrGetItem => self.dispatch_mf_attr_get_item(state, memory),
+            MfAttrGetItemType => self.dispatch_mf_attr_get_item_type(state, memory),
+            MfAttrCompareItem => self.dispatch_mf_attr_compare_item(state, memory),
+            MfAttrCompare => self.dispatch_mf_attr_compare(state, memory),
+            MfAttrGetAllocatedString => self.dispatch_mf_attr_get_allocated_string(state, memory),
+            MfAttrGetAllocatedBlob => self.dispatch_mf_attr_get_allocated_blob(state, memory),
+            MfAttrGetUnknown => self.dispatch_mf_attr_unknown(state, memory, true),
+            MfAttrSetItem => self.dispatch_mf_attr_set_item(state, memory),
+            MfAttrSetUnknown => self.dispatch_mf_attr_unknown(state, memory, false),
+            MfAttrDeleteAllItems => self.dispatch_mf_attr_delete_all_items(state, memory),
+            MfAttrLockStore | MfAttrUnlockStore => self.dispatch_mf_attr_lock_store(state, memory),
+            MfAttrCopyAllItems => self.dispatch_mf_attr_copy_all_items(state, memory),
             MfAttrGetItemByIndex => self.dispatch_mf_attr_get_item_by_index(state, memory),
             MfAttrGetUint32 => self.dispatch_mf_attr_get_uint32(state, memory),
             MfAttrGetUint64 => self.dispatch_mf_attr_get_uint64(state, memory),
@@ -3068,6 +3547,10 @@ impl PeHostRuntime {
             MfMediaTypeIsCompressedFormat => {
                 self.dispatch_mf_media_type_is_compressed_format(state, memory)
             }
+            MfMediaTypeIsEqual => self.dispatch_mf_media_type_is_equal(state, memory),
+            MfMediaTypeGetRepresentation | MfMediaTypeFreeRepresentation => {
+                self.dispatch_mf_media_type_representation(state, memory)
+            }
             MfBufferGetMaxLength => self.dispatch_mf_buffer_get_max_length(state, memory),
             MfBufferLock => self.dispatch_mf_buffer_lock(state, memory),
             MfBufferUnlock => self.dispatch_mf_buffer_unlock(state, memory),
@@ -3083,6 +3566,13 @@ impl PeHostRuntime {
             MfSampleGetSampleTime => self.dispatch_mf_sample_get_sample_time(state, memory),
             MfSampleSetSampleTime => self.dispatch_mf_sample_set_sample_time(state, memory),
             MfSampleGetSampleDuration => self.dispatch_mf_sample_get_sample_duration(state, memory),
+            MfSampleSetSampleFlags => self.dispatch_mf_sample_set_sample_flags(state, memory),
+            MfSampleGetSampleFlags => self.dispatch_mf_sample_get_sample_flags(state, memory),
+            MfSampleGetTotalLength => self.dispatch_mf_sample_get_total_length(state, memory),
+            MfSampleCopyToBuffer => self.dispatch_mf_sample_copy_to_buffer(state, memory),
+            MfSampleConvertToContiguousBuffer => {
+                self.dispatch_mf_sample_convert_to_contiguous_buffer(state, memory)
+            }
             MfSampleSetSampleDuration => self.dispatch_mf_sample_set_sample_duration(state, memory),
             MfEventQueueGetEvent => self.dispatch_mf_event_queue_get_event(state, memory),
             MfEventQueueQueueEvent => self.dispatch_mf_event_queue_queue_event(state, memory),
@@ -3169,58 +3659,88 @@ impl PeHostRuntime {
 
 /// The IMFAttributes vtable (media types and attribute stores share it).
 fn mf_attributes_methods() -> Vec<HostThunk> {
+    // The true IMFAttributes vtable order: IUnknown + GetItem, GetItemType,
+    // CompareItem, Compare, the typed getters, the setters, the store
+    // management, GetCount/GetItemByIndex, CopyAllItems.
     let mut methods = unknown_preamble();
-    methods.push(HostThunk::MfAttrGetCount);
-    methods.push(HostThunk::MfAttrGetItemByIndex);
+    methods.push(HostThunk::MfAttrGetItem);
+    methods.push(HostThunk::MfAttrGetItemType);
+    methods.push(HostThunk::MfAttrCompareItem);
+    methods.push(HostThunk::MfAttrCompare);
     methods.push(HostThunk::MfAttrGetUint32);
     methods.push(HostThunk::MfAttrGetUint64);
     methods.push(HostThunk::MfAttrGetDouble);
     methods.push(HostThunk::MfAttrGetGuid);
     methods.push(HostThunk::MfAttrGetStringLength);
     methods.push(HostThunk::MfAttrGetString);
+    methods.push(HostThunk::MfAttrGetAllocatedString);
     methods.push(HostThunk::MfAttrGetBlobSize);
     methods.push(HostThunk::MfAttrGetBlob);
+    methods.push(HostThunk::MfAttrGetAllocatedBlob);
+    methods.push(HostThunk::MfAttrGetUnknown);
+    methods.push(HostThunk::MfAttrSetItem);
     methods.push(HostThunk::MfAttrSetUint32);
     methods.push(HostThunk::MfAttrSetUint64);
     methods.push(HostThunk::MfAttrSetDouble);
     methods.push(HostThunk::MfAttrSetGuid);
     methods.push(HostThunk::MfAttrSetString);
     methods.push(HostThunk::MfAttrSetBlob);
+    methods.push(HostThunk::MfAttrSetUnknown);
+    methods.push(HostThunk::MfAttrDeleteAllItems);
     methods.push(HostThunk::MfAttrDeleteItem);
+    methods.push(HostThunk::MfAttrLockStore);
+    methods.push(HostThunk::MfAttrUnlockStore);
+    methods.push(HostThunk::MfAttrGetCount);
+    methods.push(HostThunk::MfAttrGetItemByIndex);
+    methods.push(HostThunk::MfAttrCopyAllItems);
     methods
 }
 
 /// The IMFMediaType vtable (attributes + the media-type methods).
 fn mf_media_type_methods() -> Vec<HostThunk> {
+    // The true IMFMediaType order: the attributes + GetMajorType,
+    // IsCompressedFormat, IsEqual, GetRepresentation, FreeRepresentation.
     let mut methods = mf_attributes_methods();
     methods.push(HostThunk::MfMediaTypeGetMajorType);
     methods.push(HostThunk::MfMediaTypeIsCompressedFormat);
+    methods.push(HostThunk::MfMediaTypeIsEqual);
+    methods.push(HostThunk::MfMediaTypeGetRepresentation);
+    methods.push(HostThunk::MfMediaTypeFreeRepresentation);
     methods
 }
 
 /// The IMFMediaBuffer vtable.
 fn mf_media_buffer_methods() -> Vec<HostThunk> {
+    // The true IMFMediaBuffer order: Lock, Unlock, GetCurrentLength,
+    // SetCurrentLength, GetMaxLength.
     let mut methods = unknown_preamble();
-    methods.push(HostThunk::MfBufferGetMaxLength);
     methods.push(HostThunk::MfBufferLock);
     methods.push(HostThunk::MfBufferUnlock);
     methods.push(HostThunk::MfBufferGetCurrentLength);
     methods.push(HostThunk::MfBufferSetCurrentLength);
+    methods.push(HostThunk::MfBufferGetMaxLength);
     methods
 }
 
 /// The IMFSample vtable.
 fn mf_sample_methods() -> Vec<HostThunk> {
+    // The true IMFSample order: the flags, the timestamps, the buffers,
+    // and the contiguous conversion.
     let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfSampleSetSampleFlags);
+    methods.push(HostThunk::MfSampleGetSampleFlags);
+    methods.push(HostThunk::MfSampleSetSampleTime);
+    methods.push(HostThunk::MfSampleGetSampleTime);
+    methods.push(HostThunk::MfSampleSetSampleDuration);
+    methods.push(HostThunk::MfSampleGetSampleDuration);
     methods.push(HostThunk::MfSampleGetBufferCount);
     methods.push(HostThunk::MfSampleGetBufferByIndex);
     methods.push(HostThunk::MfSampleAddBuffer);
     methods.push(HostThunk::MfSampleRemoveBufferByIndex);
     methods.push(HostThunk::MfSampleRemoveAllBuffers);
-    methods.push(HostThunk::MfSampleGetSampleTime);
-    methods.push(HostThunk::MfSampleSetSampleTime);
-    methods.push(HostThunk::MfSampleGetSampleDuration);
-    methods.push(HostThunk::MfSampleSetSampleDuration);
+    methods.push(HostThunk::MfSampleGetTotalLength);
+    methods.push(HostThunk::MfSampleCopyToBuffer);
+    methods.push(HostThunk::MfSampleConvertToContiguousBuffer);
     methods
 }
 
@@ -3407,4 +3927,53 @@ fn mft_transform_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::MfTransformProcessMessage);
     methods.push(HostThunk::MftTransformUnsupported);
     methods
+}
+
+/// Read a GUID from a guest pointer.
+fn read_mf_guid(memory: &MemoryImage, pointer: u64) -> Guid {
+    let bytes = memory.read_bytes(pointer, 16).unwrap_or_default();
+    mf_guid_from_bytes(&bytes)
+}
+
+/// A GUID from the guest little-endian bytes (the data1..data4 fields).
+fn mf_guid_from_bytes(bytes: &[u8]) -> Guid {
+    if bytes.len() < 16 {
+        return Guid::new(0, 0, 0, [0; 8]);
+    }
+    Guid::new(
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        u16::from_le_bytes([bytes[6], bytes[7]]),
+        [
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ],
+    )
+}
+
+/// The PROPVARIANT (vt, bytes) for an attribute value.
+fn mf_attribute_propvariant(mt: &ImfMediaType, key: Guid) -> Option<(u32, Vec<u8>)> {
+    use crate::media::MediaTypeValue;
+    match mt.attributes.get(&key) {
+        Some(MediaTypeValue::Uint32(value)) => Some((19, value.to_le_bytes().to_vec())),
+        Some(MediaTypeValue::Uint64(value)) => Some((21, value.to_le_bytes().to_vec())),
+        Some(MediaTypeValue::Double(value)) => Some((5, value.to_bits().to_le_bytes().to_vec())),
+        Some(MediaTypeValue::Guid(guid)) => {
+            let mut bytes = Vec::with_capacity(16);
+            bytes.extend_from_slice(&guid.data1.to_le_bytes());
+            bytes.extend_from_slice(&guid.data2.to_le_bytes());
+            bytes.extend_from_slice(&guid.data3.to_le_bytes());
+            bytes.extend_from_slice(&guid.data4);
+            Some((72, bytes))
+        }
+        Some(MediaTypeValue::String(text)) => {
+            let mut bytes = Vec::new();
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            Some((31, bytes))
+        }
+        Some(MediaTypeValue::Blob(blob)) => Some((0x1011, blob.clone())),
+        None => None,
+    }
 }
