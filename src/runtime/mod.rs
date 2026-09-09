@@ -2177,6 +2177,10 @@ pub enum HostThunk {
     // -- D3D12 fence gap-fill (Phase 3.2) --
     D3D12FenceSetEventOnCompletion,
     D3D12FenceSignal,
+    D3D12FenceGetDevice,
+    D3D12DescriptorHeapGetDevice,
+    D3D12DescriptorHeapGetDesc,
+    D3D12DescriptorHeapGetGpuHandleForHeapStart,
     // -- D3D12 command queue gap-fill (Phase 3.2) --
     D3D12CommandQueueWait,
     D3D12CommandQueueGetDesc,
@@ -14101,6 +14105,43 @@ impl PeHostRuntime {
             // ── D3D12 fence gap-fill dispatchers (Phase 3.2) ────────────
             HostThunk::D3D12FenceSetEventOnCompletion => {
                 self.dispatch_d3d12_fence_set_event_on_completion(state)?;
+            }
+
+            HostThunk::D3D12FenceGetDevice | HostThunk::D3D12DescriptorHeapGetDevice => {
+                let this = state.get(Register::Rcx);
+                let out = state.get(Register::Rdx);
+                let device = if self.d3d12_fences.contains_key(&this) {
+                    self.d3d12_fences.get(&this).map(|f| f.device_object).unwrap_or(0)
+                } else {
+                    self.d3d12_descriptor_heaps.get(&this).map(|h| h.device_object).unwrap_or(0)
+                };
+                if out != 0 {
+                    write_guest_pointer(memory, out, device, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3D12DescriptorHeapGetDesc => {
+                let _this = state.get(Register::Rcx);
+                let desc = state.get(Register::Rdx);
+                if desc != 0 {
+                    write_u32(memory, desc, 2); // CBV_SRV_UAV
+                    write_u32(memory, desc + 4, 1);
+                    write_u32(memory, desc + 8, 0);
+                    write_u32(memory, desc + 12, 0);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3D12DescriptorHeapGetGpuHandleForHeapStart => {
+                let this = state.get(Register::Rcx);
+                let out = state.get(Register::Rdx);
+                if out != 0 {
+                    let cpu = self.d3d12_descriptor_heaps.get(&this).map(|h| h.cpu_handle_start).unwrap_or(0);
+                    write_u64(memory, out, cpu);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
             }
             HostThunk::D3D12FenceSignal => {
                 self.dispatch_d3d12_fence_signal(state)?;
@@ -69771,7 +69812,17 @@ impl PeHostRuntime {
         methods[0] = unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
+        // The true ID3D12DescriptorHeap order: the ID3D12Object methods +
+        // GetDesc, GetCPUDescriptorHandleForHeapStart,
+        // GetGPUDescriptorHandleForHeapStart.
+        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
+        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[6] = HostThunk::D3D12ObjectSetName;
+        methods[7] = HostThunk::D3D12DescriptorHeapGetDevice;
+        methods[8] = HostThunk::D3D12DescriptorHeapGetDesc;
         methods[9] = HostThunk::D3D12DescriptorHeapGetCpuHandleForHeapStart;
+        methods[10] = HostThunk::D3D12DescriptorHeapGetGpuHandleForHeapStart;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d12DescriptorHeap, vtable)?;
@@ -69922,6 +69973,14 @@ impl PeHostRuntime {
         methods[0] = unsupported_method(&self.telemetry, "ID3D12Fence::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
+        // The true ID3D12Fence order: the ID3D12Object methods + the
+        // fence value methods (GetDevice is at slot 7 via the object
+        // registry on the shared vtable helper).
+        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
+        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[6] = HostThunk::D3D12ObjectSetName;
+        methods[7] = HostThunk::D3D12FenceGetDevice;
         methods[8] = HostThunk::D3D12FenceGetCompletedValue;
         methods[9] = HostThunk::D3D12FenceSetEventOnCompletion;
         methods[10] = HostThunk::D3D12FenceSignal;
