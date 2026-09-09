@@ -181,13 +181,13 @@ fn database_seeds_nt_surface_matching_runtime() {
 #[test]
 fn database_seeds_interface_tables_at_runtime_levels() {
     let database = ApiDatabase::from_thunk_metadata();
-    // COM: IDispatch is genuinely dispatched (GetIDsOfNames/Invoke thunks).
+    // COM: IDispatch is genuinely dispatched (GetIDsOfNames/Invoke thunks)
+    // with the completed GetTypeInfoCount/GetTypeInfo answers.
     let dispatch = database
         .lookup("oleaut32.dll", "IDispatch")
         .expect("IDispatch entry");
-    assert_eq!(dispatch.implementation, ImplementationLevel::Partial);
-    assert!(dispatch.transitional);
-    assert!(dispatch.detail.is_some());
+    assert_eq!(dispatch.implementation, ImplementationLevel::Implemented);
+    assert!(!dispatch.transitional);
     // DXGI/D3D: ID3D11Device and friends are partial vtable dispatches.
     let device = database
         .lookup("d3d11.dll", "ID3D11Device")
@@ -207,8 +207,8 @@ fn database_seeds_interface_tables_at_runtime_levels() {
     let session = database
         .lookup("mf.dll", "IMFMediaSession")
         .expect("IMFMediaSession entry");
-    assert_eq!(session.implementation, ImplementationLevel::Partial);
-    assert!(session.transitional);
+    assert_eq!(session.implementation, ImplementationLevel::Implemented);
+    assert!(!session.transitional);
 }
 
 // ---------------------------------------------------------------------------

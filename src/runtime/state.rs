@@ -1760,6 +1760,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_async_results: HashMap<u64, ImfAsyncResultState>,
     /// Guest IMFMediaSource object -> source state.
     pub(crate) mf_media_sources: HashMap<u64, ImfMediaSourceState>,
+    /// Guest IMFMediaSession object -> its topology object.
+    pub(crate) mf_session_topologies: HashMap<u64, u64>,
     /// IMFTopologyNode object -> node state.
     pub(crate) mf_topology_nodes: HashMap<u64, TopologyNodeState>,
     /// IMFMediaEvent object -> event state.
@@ -2368,6 +2370,7 @@ impl PeHostRuntime {
             mf_sinks: HashMap::new(),
             mf_async_results: HashMap::new(),
             mf_media_sources: HashMap::new(),
+            mf_session_topologies: HashMap::new(),
             mf_topology_nodes: HashMap::new(),
             mf_locked_buffer_data: HashMap::new(),
             mf_source_resolvers: HashMap::new(),

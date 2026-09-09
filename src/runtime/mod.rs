@@ -5864,6 +5864,27 @@ pub enum HostThunk {
     MfSourceResolverCreateObjectFromUrl,
     MfPresentationDescriptorGetStreamDescriptorCount,
     MfEventGetType,
+    MfSessionSetTopology,
+    MfSessionGetSessionCapabilities,
+    MfSessionGetFullTopology,
+    MfSessionGetDescriptorFromTopology,
+    MfSinkWriterSetInputMediaType,
+    MfSinkWriterFlush,
+    MfSinkWriterGetStatistics,
+    MfSinkWriterSendStreamSample,
+    MfSinkWriterNotifyEndOfSegment,
+    MfSinkWriterGetServiceForStream,
+    IDispatchGetTypeInfoCount,
+    IDispatchGetTypeInfo,
+    MfMediaSourceGetCharacteristics,
+    MfMediaSourceCreatePresentationDescriptor,
+    MfMediaSourceControl,
+    MfMediaSourceShutdown,
+    MfMediaSourceEvents,
+    MfSourceResolverBegin,
+    MftStreamAttributes,
+    MftFixedStreams,
+    MftProcessEvent,
     MfAttrGetItem,
     MfAttrGetItemType,
     MfAttrCompareItem,
@@ -28740,7 +28761,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MftTransformUnsupported) => {
+            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceControl | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceEvents | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MftTransformUnsupported) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -129026,6 +129047,87 @@ mod tests {
                     &[sample as u32, buffer as u32]
                 ),
                 0
+            );
+
+            // The completed session surface: a session + a topology.
+            let create_session: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaSession);
+            let create_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopology);
+            let session_set_topology: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSessionSetTopology);
+            let session_caps: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSessionGetSessionCapabilities);
+            let session_full: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionGetFullTopology);
+            let session_out = 0x41_800_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_session,
+                    &[0, session_out as u32]
+                ),
+                0
+            );
+            let session = read_guest_pointer(&memory, session_out, GuestArch::X86).unwrap();
+            assert_ne!(session, 0);
+            let topo_out = 0x41_810_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_topology,
+                    &[topo_out as u32]
+                ),
+                0
+            );
+            let topology = read_guest_pointer(&memory, topo_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    session_set_topology,
+                    &[session as u32, 0, topology as u32]
+                ),
+                0
+            );
+            let caps_out = 0x41_820_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    session_caps,
+                    &[session as u32, caps_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, caps_out).unwrap() & 0x1,
+                0x1,
+                "MFSESSIONCAP_SEEK"
+            );
+            let full_out = 0x41_830_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    session_full,
+                    &[session as u32, 0, 0, full_out as u32]
+                ),
+                0
+            );
+            let full = read_guest_pointer(&memory, full_out, GuestArch::X86).unwrap();
+            assert_ne!(full, 0);
+
+            // The IDispatch typeinfo surface.
+            let id_count: u64 = runtime.alloc_host_thunk(HostThunk::IDispatchGetTypeInfoCount);
+            let count_out = 0x41_900_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, id_count, &[0, count_out as u32]),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, count_out).unwrap(),
+                0,
+                "no typeinfo"
             );
         })
     }

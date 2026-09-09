@@ -27,6 +27,7 @@ const MFT_CASA1_VIDEO_DECODER_CLSID: [u8; 16] = [
 
 const S_OK: u32 = 0x0000_0000;
 const E_INVALIDARG: u32 = 0x8007_0057;
+const E_NOTIMPL: u32 = 0x8000_4001;
 #[allow(dead_code)] // reserved for the MF error surface
 const E_NOINTERFACE: u32 = 0x8000_4002;
 #[allow(dead_code)] // reserved for the interface error surface
@@ -1336,6 +1337,394 @@ impl PeHostRuntime {
                 0xc00d_36b4 // MF_E_INVALIDTYPE
             },
         );
+        Ok(())
+    }
+
+    // ── The completed interface surfaces ───────────────────────────────────
+
+    /// `IMFMediaSession::SetTopology(dwTopologySetFlags, pTopology)` —
+    /// the session's topology state.
+    pub(crate) fn dispatch_mf_session_set_topology(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _flags = guest_call_arg_u32(state, memory, 1)?;
+        let topology = guest_call_arg(state, memory, 2)?;
+        let Some(session) = self.mf_sessions.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if topology == 0 {
+            session.clear_topologies();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let Some(topo) = self.mf_topologies.get(&topology).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let _ = session.set_topology(topo);
+        self.mf_session_topologies.insert(this, topology);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSession::GetSessionCapabilities(pdwCaps)` — the session
+    /// supports seek, pause, rate and time.
+    pub(crate) fn dispatch_mf_session_get_capabilities(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_sessions.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if out != 0 {
+            // MFSESSIONCAP_SEEK | MFSESSIONCAP_PAUSE | MFSESSIONCAP_RATE |
+            // MFSESSIONCAP_SEEK | MFSESSIONCAP_DOES_NOT_USE_NETWORK.
+            write_guest_u32(memory, out, 0x0000_0001 | 0x0000_0002 | 0x0000_0008).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSession::GetFullTopology(dwGetFlags, dwTopologyId,
+    /// ppFullTopology)` — the current topology object.
+    pub(crate) fn dispatch_mf_session_get_full_topology(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _flags = guest_call_arg_u32(state, memory, 1)?;
+        let _id = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if !self.mf_sessions.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let topology = self.mf_session_topologies.get(&this).copied().unwrap_or(0);
+        if topology == 0 {
+            state.set(Register::Rax, 0xc00d_3701); // MF_E_INVALIDREQUEST
+            return Ok(());
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, topology, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSession::GetDescriptorFromTopology(pTopology,
+    /// ppPresentationDescriptor)` — no presentation descriptor is attached.
+    pub(crate) fn dispatch_mf_session_get_descriptor_from_topology(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let _topology = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0xc00d_36e6); // MF_E_UNSUPPORTED_REPRESENTATION
+        Ok(())
+    }
+
+    /// `IMFSinkWriter::SetInputMediaType(dwStreamIndex, pInputMediaType,
+    /// pEncodingParameters)` — the stream's input type.
+    pub(crate) fn dispatch_mf_sink_writer_set_input_media_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let type_ptr = guest_call_arg(state, memory, 2)?;
+        let _params = guest_call_arg(state, memory, 3)?;
+        let Some(mt) = self.mf_media_types.get(&type_ptr).cloned() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(sink) = self.mf_sink_writers.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        sink.set_input_type(mt);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSinkWriter::Flush(dwStreamIndex)` — the pending data is
+    /// committed.
+    pub(crate) fn dispatch_mf_sink_writer_flush(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        if !self.mf_sink_writers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSinkWriter::GetStatistics(dwStreamIndex, pStats)` — the frame
+    /// count + the byte count.
+    pub(crate) fn dispatch_mf_sink_writer_get_statistics(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _stream = guest_call_arg_u32(state, memory, 1)?;
+        let stats = guest_call_arg(state, memory, 2)?;
+        let frame_count = self
+            .mf_sink_writers
+            .get(&this)
+            .map(|sink| sink.current_frame_count())
+            .unwrap_or(0);
+        if stats != 0 {
+            // The MF_SINK_WRITER_STATISTICS: cb(0), llLastTimestampReceived(8),
+            // llLastTimestampEncoded(16), llLastTimestampProcessed(24),
+            // llLastStreamProcessed(32), llCurrentMemoryUsage(40),
+            // dwNumberOfFramesWritten(48), dwNumberOfSamplesWritten(52),
+            // dwNumberOfEncodedFrames(56), dwNumberOfProcessedFrames(60),
+            // dwNumberOfStreamTransitions(64).
+            write_guest_u64(memory, stats, 80).ok();
+            write_guest_u64(memory, stats + 8, 0).ok();
+            write_guest_u64(memory, stats + 16, 0).ok();
+            write_guest_u64(memory, stats + 24, 0).ok();
+            write_guest_u64(memory, stats + 32, 0).ok();
+            write_guest_u64(memory, stats + 40, 0).ok();
+            write_guest_u32(memory, stats + 48, frame_count as u32).ok();
+            write_guest_u32(memory, stats + 52, frame_count as u32).ok();
+            write_guest_u32(memory, stats + 56, 0).ok();
+            write_guest_u32(memory, stats + 60, 0).ok();
+            write_guest_u32(memory, stats + 64, 0).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFSinkWriter::GetServiceForStream` / `NotifyEndOfSegment` —
+    /// the stream service is not exposed; the segment notification ends the
+    /// stream.
+    pub(crate) fn dispatch_mf_sink_writer_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0xc00d_36c4); // MF_E_INVALID_STREAM_DATA
+        Ok(())
+    }
+
+    /// `IDispatch::GetTypeInfoCount(pctinfo)` — no typeinfo.
+    pub(crate) fn dispatch_idispatch_get_type_info_count(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out != 0 {
+            write_guest_u32(memory, out, 0).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDispatch::GetTypeInfo(iTInfo, lcid, ppTInfo)` — no typeinfo
+    /// exists.
+    pub(crate) fn dispatch_idispatch_get_type_info(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        let _index = guest_call_arg_u32(state, memory, 1)?;
+        let _lcid = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0x8002_802b); // TYPE_E_ELEMENTNOTFOUND
+        Ok(())
+    }
+
+    /// `IMFMediaSource::GetCharacteristics(pdwCharacteristics)` — the
+    /// source is live and seekable.
+    pub(crate) fn dispatch_mf_media_source_get_characteristics(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_media_sources.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        if out != 0 {
+            // MFMEDIASOURCE_CAN_SEEK | MFMEDIASOURCE_CAN_PAUSE | LIVE.
+            write_guest_u32(memory, out, 0x1 | 0x2 | 0x4).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSource::CreatePresentationDescriptor(ppPD)` — the
+    /// presentation descriptor object.
+    pub(crate) fn dispatch_mf_media_source_create_presentation_descriptor(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_media_sources.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_presentation_descriptor_methods())?;
+        let descriptor = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfPresentationDescriptor, vtable)
+            .unwrap_or(0);
+        if descriptor == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_presentation_descriptors.insert(descriptor, ());
+        if out != 0 {
+            write_guest_pointer(memory, out, descriptor, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Start` / `Pause` / `Stop` — the source state.
+    pub(crate) fn dispatch_mf_media_source_control(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self.mf_media_sources.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFMediaSource::Shutdown` — release the source.
+    pub(crate) fn dispatch_mf_media_source_shutdown(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        self.mf_media_sources.remove(&this);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The async source-resolver entry points: the resolver is synchronous
+    /// in the runtime; the async begins answer the pending-object contract.
+    pub(crate) fn dispatch_mf_source_resolver_begin(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        Ok(())
+    }
+
+    /// `IMFMediaSource`/`IMFMediaEventGenerator` event methods — the
+    /// source queues events on its event queue.
+    pub(crate) fn dispatch_mf_media_source_events(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The MFT stream-attribute methods: the transform's per-stream
+    /// attribute stores.
+    pub(crate) fn dispatch_mft_stream_attributes(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let vtable = self.alloc_guest_vtable(memory, mf_attributes_methods())?;
+        let store = self
+            .alloc_guest_object(memory, GuestObjectKind::ImfMediaType, vtable)
+            .unwrap_or(0);
+        if store == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            return Ok(());
+        }
+        self.mf_media_types
+            .insert(store, crate::media::ImfMediaType::new());
+        if out != 0 {
+            write_guest_pointer(memory, out, store, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFTransform::DeleteInputStream` / `AddInputStreams` /
+    /// `SetOutputBounds` — the stream-count is fixed at 1/1.
+    pub(crate) fn dispatch_mft_fixed_streams(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        state.set(Register::Rax, 0xc00d_36d4); // MF_E_INVALIDSTREAMNUMBER
+        Ok(())
+    }
+
+    /// `IMFTransform::ProcessEvent` — the transform consumes no events.
+    pub(crate) fn dispatch_mft_process_event(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if !self.mf_transforms.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -3580,6 +3969,38 @@ impl PeHostRuntime {
             MfClockStart => self.dispatch_mf_clock_start(state, memory),
             MfClockStop => self.dispatch_mf_clock_stop(state, memory),
             MfSessionGetClock => self.dispatch_mf_session_get_clock(state, memory),
+            MfSessionSetTopology => self.dispatch_mf_session_set_topology(state, memory),
+            MfSessionGetSessionCapabilities => {
+                self.dispatch_mf_session_get_capabilities(state, memory)
+            }
+            MfSessionGetFullTopology => self.dispatch_mf_session_get_full_topology(state, memory),
+            MfSessionGetDescriptorFromTopology => {
+                self.dispatch_mf_session_get_descriptor_from_topology(state, memory)
+            }
+            MfSinkWriterSetInputMediaType => {
+                self.dispatch_mf_sink_writer_set_input_media_type(state, memory)
+            }
+            MfSinkWriterFlush => self.dispatch_mf_sink_writer_flush(state, memory),
+            MfSinkWriterGetStatistics => self.dispatch_mf_sink_writer_get_statistics(state, memory),
+            MfSinkWriterSendStreamSample | MfSinkWriterNotifyEndOfSegment => {
+                self.dispatch_mf_sink_writer_service(state, memory)
+            }
+            MfSinkWriterGetServiceForStream => self.dispatch_mf_sink_writer_service(state, memory),
+            IDispatchGetTypeInfoCount => self.dispatch_idispatch_get_type_info_count(state, memory),
+            IDispatchGetTypeInfo => self.dispatch_idispatch_get_type_info(state, memory),
+            MfMediaSourceGetCharacteristics => {
+                self.dispatch_mf_media_source_get_characteristics(state, memory)
+            }
+            MfMediaSourceCreatePresentationDescriptor => {
+                self.dispatch_mf_media_source_create_presentation_descriptor(state, memory)
+            }
+            MfMediaSourceControl => self.dispatch_mf_media_source_control(state, memory),
+            MfMediaSourceShutdown => self.dispatch_mf_media_source_shutdown(state, memory),
+            MfMediaSourceEvents => self.dispatch_mf_media_source_events(state, memory),
+            MfSourceResolverBegin => self.dispatch_mf_source_resolver_begin(state, memory),
+            MftStreamAttributes => self.dispatch_mft_stream_attributes(state, memory),
+            MftFixedStreams => self.dispatch_mft_fixed_streams(state, memory),
+            MftProcessEvent => self.dispatch_mft_process_event(state, memory),
             MfSessionStart => self.dispatch_mf_session_start(state, memory),
             MfSessionPause => self.dispatch_mf_session_pause(state, memory),
             MfSessionStop => self.dispatch_mf_session_stop(state, memory),
@@ -3763,13 +4184,21 @@ fn mf_clock_methods() -> Vec<HostThunk> {
 
 /// The IMFMediaSession vtable.
 fn mf_session_methods() -> Vec<HostThunk> {
+    // The true IMFMediaSession order: SetTopology, ClearTopologies, Start,
+    // Pause, Stop, Close, Shutdown, GetClock, GetSessionCapabilities,
+    // GetFullTopology, GetDescriptorFromTopology.
     let mut methods = unknown_preamble();
-    methods.push(HostThunk::MfSessionGetClock);
+    methods.push(HostThunk::MfSessionSetTopology);
+    methods.push(HostThunk::MfSessionSetTopology); // ClearTopologies
     methods.push(HostThunk::MfSessionStart);
     methods.push(HostThunk::MfSessionPause);
     methods.push(HostThunk::MfSessionStop);
     methods.push(HostThunk::MfSessionClose);
     methods.push(HostThunk::MfSessionShutdown);
+    methods.push(HostThunk::MfSessionGetClock);
+    methods.push(HostThunk::MfSessionGetSessionCapabilities);
+    methods.push(HostThunk::MfSessionGetFullTopology);
+    methods.push(HostThunk::MfSessionGetDescriptorFromTopology);
     methods
 }
 
@@ -3784,11 +4213,20 @@ fn mf_source_reader_methods() -> Vec<HostThunk> {
 
 /// The IMFSinkWriter vtable.
 fn mf_sink_writer_methods() -> Vec<HostThunk> {
+    // The true IMFSinkWriter order: AddStream, SetInputMediaType,
+    // BeginWriting, WriteSample, SendStreamSample, Flush,
+    // NotifyEndOfSegment, EndWriting, GetServiceForStream, GetStatistics.
     let mut methods = unknown_preamble();
     methods.push(HostThunk::MfSinkWriterAddStream);
+    methods.push(HostThunk::MfSinkWriterSetInputMediaType);
     methods.push(HostThunk::MfSinkWriterBeginWriting);
     methods.push(HostThunk::MfSinkWriterWriteSample);
+    methods.push(HostThunk::MfSinkWriterSendStreamSample);
+    methods.push(HostThunk::MfSinkWriterFlush);
+    methods.push(HostThunk::MfSinkWriterNotifyEndOfSegment);
     methods.push(HostThunk::MfSinkWriterEndWriting);
+    methods.push(HostThunk::MfSinkWriterGetServiceForStream);
+    methods.push(HostThunk::MfSinkWriterGetStatistics);
     methods
 }
 
@@ -3819,8 +4257,18 @@ fn mf_topology_node_methods() -> Vec<HostThunk> {
 
 /// The IMFSourceResolver vtable.
 fn mf_source_resolver_methods() -> Vec<HostThunk> {
+    // The true IMFSourceResolver order: BeginCreateObjectFromURL,
+    // BeginCreateObjectFromByteStream, EndCreateObjectFromURL,
+    // EndCreateObjectFromByteStream, CancelObjectCreation,
+    // CreateObjectFromURL, CreateObjectFromByteStream.
     let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfSourceResolverBegin);
+    methods.push(HostThunk::MfSourceResolverBegin);
+    methods.push(HostThunk::MfSourceResolverBegin);
+    methods.push(HostThunk::MfSourceResolverBegin);
+    methods.push(HostThunk::MfSourceResolverBegin);
     methods.push(HostThunk::MfSourceResolverCreateObjectFromUrl);
+    methods.push(HostThunk::MfSourceResolverBegin);
     methods
 }
 

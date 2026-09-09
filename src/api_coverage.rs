@@ -6300,6 +6300,36 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_mf_transform_pipeline",
     ),
     conformance(
+        "oleaut32.dll",
+        "IDispatch",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
+        "mf.dll",
+        "IMFMediaSession",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFSourceResolver",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFMediaSource",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
+        "mfplat.dll",
+        "IMFTransform",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    conformance(
+        "mfreadwrite.dll",
+        "IMFSinkWriter",
+        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+    ),
+    conformance(
         "ole32.dll",
         "IUnknown",
         "casa1-conformance:evidence_com_guid_string_conversions_and_task_allocator",

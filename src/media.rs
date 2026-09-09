@@ -2643,6 +2643,13 @@ impl MfMediaSession {
     /// Set a topology on the session.
     ///
     /// Corresponds to `IMFMediaSession::SetTopology`.
+    /// Remove the session's topology (the documented
+    /// IMFMediaSession::ClearTopologies contract).
+    pub fn clear_topologies(&mut self) {
+        self.topology = None;
+        self.has_topology = false;
+    }
+
     pub fn set_topology(&mut self, topology: Topology) -> AppResult<()> {
         if !self.state.is_active() {
             return Err(AppError::new(
@@ -3710,6 +3717,16 @@ impl SinkWriter {
     }
 
     /// Write a sample to the output.
+    /// The number of frames written so far.
+    pub fn current_frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Set the input media type for the writer.
+    pub fn set_input_type(&mut self, media_type: ImfMediaType) {
+        self.input_type = Some(media_type);
+    }
+
     pub fn write_sample(&mut self, _stream_index: u32, sample: &ImfSample) -> AppResult<()> {
         if let Some(file) = &mut self.output_handle {
             use std::io::Write;
