@@ -1583,6 +1583,12 @@ pub enum HostThunk {
     D3D12GraphicsCommandListClearRenderTargetView,
     D3D12GraphicsCommandListDrawInstanced,
     D3D12GraphicsCommandListClose,
+    D3D12CommandListGetDevice,
+    D3D12GraphicsCommandListClearState,
+    D3D12GraphicsCommandListDrawIndexedInstanced,
+    D3D12GraphicsCommandListCopyBufferRegion,
+    D3D12GraphicsCommandListCopyTiles,
+    D3D12GraphicsCommandListResolveSubresource,
     D3D12GraphicsCommandList1AtomicCopyBufferUINT,
     D3D12GraphicsCommandList1AtomicCopyBufferUINT64,
     D3D12GraphicsCommandList1OMSetDepthBounds,
@@ -13871,6 +13877,34 @@ impl PeHostRuntime {
             }
             HostThunk::D3D12GraphicsCommandListClearRenderTargetView => {
                 self.dispatch_d3d12_graphics_command_list_clear_render_target_view(memory, state)?;
+            }
+            HostThunk::D3D12CommandListGetDevice => {
+                let this = state.get(Register::Rcx);
+                let out = state.get(Register::Rdx);
+                let device = self.d3d12_command_lists.get(&this).map(|l| l.device_object).unwrap_or(0);
+                if out != 0 {
+                    write_guest_pointer(memory, out, device, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3D12GraphicsCommandListClearState
+            | HostThunk::D3D12GraphicsCommandListCopyBufferRegion
+            | HostThunk::D3D12GraphicsCommandListCopyTiles
+            | HostThunk::D3D12GraphicsCommandListResolveSubresource => {
+                let _this = state.get(Register::Rcx);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3D12GraphicsCommandListDrawIndexedInstanced => {
+                let _this = state.get(Register::Rcx);
+                let _count = state.get(Register::Rdx);
+                let _instance = state.get(Register::R8);
+                let _start = state.get(Register::R9);
+                let _base = state.get(Register::Rsp) + 0x28;
+                let _min = state.get(Register::Rsp) + 0x30;
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
             }
             HostThunk::D3D12GraphicsCommandListDrawInstanced => {
                 self.dispatch_d3d12_graphics_command_list_draw_instanced(memory, state)?;
@@ -69903,6 +69937,16 @@ impl PeHostRuntime {
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         // Slots 3-8: ID3D12Object / ID3D12DeviceChild — leave as unsupported
+        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
+        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[6] = HostThunk::D3D12ObjectSetName;
+        methods[7] = HostThunk::D3D12CommandListGetDevice;
+        methods[11] = HostThunk::D3D12GraphicsCommandListClearState;
+        methods[13] = HostThunk::D3D12GraphicsCommandListDrawIndexedInstanced;
+        methods[15] = HostThunk::D3D12GraphicsCommandListCopyBufferRegion;
+        methods[18] = HostThunk::D3D12GraphicsCommandListCopyTiles;
+        methods[19] = HostThunk::D3D12GraphicsCommandListResolveSubresource;
         methods[9] = HostThunk::D3D12GraphicsCommandListClose;
         methods[10] = HostThunk::D3D12GraphicsCommandListReset;
         // Slot 11: ClearState — leave as unsupported
