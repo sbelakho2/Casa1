@@ -2196,6 +2196,7 @@ pub enum HostThunk {
     D3D12DescriptorHeapGetGpuHandleForHeapStart,
     // -- D3D12 command queue gap-fill (Phase 3.2) --
     D3D12CommandQueueWait,
+    D3D12CommandQueueGetDevice,
     D3D12CommandQueueGetDesc,
     D3D12ObjectSetName,
     D3D12ObjectGetPrivateData,
@@ -14189,6 +14190,20 @@ impl PeHostRuntime {
                 self.dispatch_d3d12_fence_signal(state)?;
             }
             // ── D3D12 command queue gap-fill dispatchers (Phase 3.2) ────
+            HostThunk::D3D12CommandQueueGetDevice => {
+                let this = state.get(Register::Rcx);
+                let out = state.get(Register::Rdx);
+                let device = self
+                    .d3d12_command_queues
+                    .get(&this)
+                    .map(|queue| queue.device_object)
+                    .unwrap_or(0);
+                if out != 0 {
+                    write_guest_pointer(memory, out, device, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
             HostThunk::D3D12CommandQueueGetDesc => self.dispatch_d3d12_command_queue_get_desc(state, memory)?,
             HostThunk::D3D12ObjectSetName => self.dispatch_d3d12_object_set_name(state, memory)?,
             HostThunk::D3D12ObjectGetPrivateData => self.dispatch_d3d12_object_get_private_data(state, memory)?,
@@ -69846,7 +69861,7 @@ impl PeHostRuntime {
         methods[4] = HostThunk::D3D12ObjectSetPrivateData;
         methods[5] = HostThunk::D3D12ObjectSetPrivateData;
         methods[6] = HostThunk::D3D12ObjectSetName;
-        methods[7] = HostThunk::D3D12CommandQueueGetDesc;
+        methods[7] = HostThunk::D3D12CommandQueueGetDevice;
         methods[8] = HostThunk::D3D12CommandQueueGetDesc;
         methods[9] = HostThunk::D3D12CommandQueueGetTimestampFrequency;
         methods[10] = HostThunk::D3D12CommandQueueGetClockCalibration;
@@ -100365,6 +100380,7 @@ mod tests {
             let device_out_ptr = 0x31_008;
             let queue_out_ptr = 0x31_010;
             let fence_out_ptr = 0x31_018;
+            let queue_device_out_ptr = 0x31_020;
             let queue_desc_ptr = 0x32_000;
 
             memory.map_bytes(stack_base, &vec![0_u8; 0x100]);
@@ -100372,6 +100388,7 @@ mod tests {
             memory.map_bytes(device_out_ptr, &[0; 8]);
             memory.map_bytes(queue_out_ptr, &[0; 8]);
             memory.map_bytes(fence_out_ptr, &[0; 8]);
+            memory.map_bytes(queue_device_out_ptr, &[0; 8]);
             memory.map_bytes(queue_desc_ptr, &[0; 16]);
 
             let mut state = CpuState::new(GuestArch::X64);
@@ -100438,6 +100455,26 @@ mod tests {
                 GuestObjectKind::D3d12CommandQueue
             );
 
+            // Slot 7 is GetDevice (the ID3D12DeviceChild method of the true
+            // order): the queue resolves the owning device object through
+            // its queue state.
+            let queue_vtable = memory.read_u64(queue_object).expect("queue vtable");
+            let get_device_thunk = memory
+                .read_u64(queue_vtable + 7 * 8)
+                .expect("GetDevice thunk");
+            state.set(Register::Rsp, stack_base + 0x70);
+            state.set(Register::Rcx, queue_object);
+            state.set(Register::Rdx, queue_device_out_ptr);
+            memory.write_u64(stack_base + 0x70, 0xCC77_CC78);
+            runtime
+                .dispatch_import(get_device_thunk, &mut state, &mut memory)
+                .expect("dispatch GetDevice");
+            assert_eq!(state.get(Register::Rax), 0);
+            assert_eq!(
+                memory.read_u64(queue_device_out_ptr).expect("device out"),
+                device_object
+            );
+
             state.set(Register::Rsp, stack_base + 0x60);
             state.set(Register::Rcx, device_object);
             state.set(Register::Rdx, 0);
@@ -100457,8 +100494,12 @@ mod tests {
             );
 
             let queue_vtable = memory.read_u64(queue_object).expect("queue vtable");
+            // Signal is slot 12 of the true ID3D12CommandQueue order (the
+            // ID3D12Object private-data/name methods 3-6, GetDevice 7,
+            // GetDesc 8, GetTimestampFrequency 9, GetClockCalibration 10,
+            // ExecuteCommandLists 11, Signal 12, Wait 13).
             let signal_thunk = memory
-                .read_u64(queue_vtable + 14 * 8)
+                .read_u64(queue_vtable + 12 * 8)
                 .expect("Signal thunk");
             state.set(Register::Rsp, stack_base + 0x80);
             state.set(Register::Rcx, queue_object);
@@ -101225,8 +101266,13 @@ mod tests {
             assert_eq!(state.get(Register::Rax), 0);
 
             let queue_vtable = memory.read_u64(queue_object).expect("queue vtable");
+            // ExecuteCommandLists is slot 11 of the true ID3D12CommandQueue
+            // order (the ID3D12Object private-data/name methods 3-6,
+            // GetDevice 7, GetDesc 8, GetTimestampFrequency 9,
+            // GetClockCalibration 10, ExecuteCommandLists 11, Signal 12,
+            // Wait 13).
             let execute_thunk = memory
-                .read_u64(queue_vtable + 10 * 8)
+                .read_u64(queue_vtable + 11 * 8)
                 .expect("ExecuteCommandLists thunk");
             memory.write_u64(command_list_array_ptr, command_list_object);
             state.set(Register::Rsp, stack_base + 0x198);
