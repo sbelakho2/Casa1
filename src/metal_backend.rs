@@ -1660,6 +1660,66 @@ pub struct MetalGpuBackend {
     libraries: BTreeMap<u64, metal::Library>,
     render_pipelines: BTreeMap<u64, metal::RenderPipelineState>,
     compute_pipelines: BTreeMap<u64, metal::ComputePipelineState>,
+    /// Persistent shader-library cache: identical MSL source compiles once.
+    /// The map stores the registered library id; ids stay valid for the
+    /// lifetime of the backend (the registry holds the compiled library).
+    shader_library_cache: std::collections::HashMap<String, u64>,
+    /// Persistent render-pipeline cache: identical (library, functions,
+    /// formats) requests return the already-compiled pipeline state id
+    /// instead of asking the device to recompile.
+    render_pipeline_cache: std::collections::HashMap<RenderPipelineCacheKey, u64>,
+    /// Persistent compute-pipeline cache: identical (library, function)
+    /// requests reuse the compiled pipeline state.
+    compute_pipeline_cache: std::collections::HashMap<ComputePipelineCacheKey, u64>,
+    /// Number of render-pipeline creation requests satisfied from the cache.
+    pub pipeline_cache_hits: u64,
+    /// Number of shader-library requests satisfied from the cache.
+    pub shader_cache_hits: u64,
+}
+
+/// Cache key for a render pipeline state: the pipeline output configuration
+/// plus the (library, entry-point) identity it was compiled from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RenderPipelineCacheKey {
+    library_id: u64,
+    vertex_fn: String,
+    fragment_fn: String,
+    color_format: u64,
+    depth_format: Option<u64>,
+}
+
+/// Cache key for a compute pipeline state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ComputePipelineCacheKey {
+    library_id: u64,
+    compute_fn: String,
+}
+
+/// Format an `MTLPixelFormat` into a hashable raw value for cache keys.
+fn pixel_format_key(format: metal::MTLPixelFormat) -> u64 {
+    // `MTLPixelFormat` is a C-style enum in the metal crate; its raw value
+    // is stable for a given Metal SDK and is what the descriptor compares.
+    format as u64
+}
+
+/// Maximum number of entries kept in each persistent cache.
+///
+/// The caches are an accelerator, not an owner: evicting an entry never
+/// invalidates a registered resource id (the resource registries keep the
+/// GPU objects alive), it only means the next identical request recompiles.
+const MAX_CACHE_ENTRIES: usize = 256;
+
+/// Evict the entire cache when it exceeds [`MAX_CACHE_ENTRIES`].
+///
+/// Simple and bounded: real workloads have a bounded set of distinct
+/// pipeline configurations (formats x shader pairs), so clearing on overflow
+/// amortizes to one extra compile per distinct configuration ever created.
+fn cap_cache<K: Clone + PartialEq + Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, V>,
+) {
+    if map.len() >= MAX_CACHE_ENTRIES {
+        map.clear();
+    }
 }
 
 /// Maximum number of entries kept in each resource registry.
@@ -1701,6 +1761,11 @@ impl MetalGpuBackend {
             libraries: BTreeMap::new(),
             render_pipelines: BTreeMap::new(),
             compute_pipelines: BTreeMap::new(),
+            shader_library_cache: std::collections::HashMap::new(),
+            render_pipeline_cache: std::collections::HashMap::new(),
+            compute_pipeline_cache: std::collections::HashMap::new(),
+            pipeline_cache_hits: 0,
+            shader_cache_hits: 0,
         })
     }
 
@@ -1791,11 +1856,22 @@ impl MetalGpuBackend {
     }
 
     /// Compile and register a shader library.
+    ///
+    /// Identical MSL source compiles once: the persistent shader-library
+    /// cache returns the previously registered library id (a per-frame
+    /// re-link of the same shader costs a hash lookup, not a device
+    /// compile).
     pub fn compile_shader(&mut self, source: &str) -> AppResult<u64> {
+        if let Some(&cached) = self.shader_library_cache.get(source) {
+            self.shader_cache_hits += 1;
+            return Ok(cached);
+        }
         let library = self.device.compile_shader_library(source)?;
         let id = alloc_gpu_id();
         cap_registry(&mut self.libraries);
         self.libraries.insert(id, library);
+        cap_cache(&mut self.shader_library_cache);
+        self.shader_library_cache.insert(source.to_string(), id);
         Ok(id)
     }
 
@@ -1805,6 +1881,10 @@ impl MetalGpuBackend {
     }
 
     /// Create and register a render pipeline.
+    ///
+    /// The persistent render-pipeline cache serves identical (library,
+    /// vertex/fragment entry points, output formats) requests with the
+    /// already-compiled pipeline state instead of re-asking the device.
     pub fn create_render_pipeline(
         &mut self,
         vertex_fn_name: &str,
@@ -1813,6 +1893,18 @@ impl MetalGpuBackend {
         color_format: metal::MTLPixelFormat,
         depth_format: Option<metal::MTLPixelFormat>,
     ) -> AppResult<u64> {
+        let key = RenderPipelineCacheKey {
+            library_id,
+            vertex_fn: vertex_fn_name.to_string(),
+            fragment_fn: fragment_fn_name.to_string(),
+            color_format: pixel_format_key(color_format),
+            depth_format: depth_format.map(pixel_format_key),
+        };
+        if let Some(&cached) = self.render_pipeline_cache.get(&key) {
+            self.pipeline_cache_hits += 1;
+            return Ok(cached);
+        }
+
         let library = self.libraries.get(&library_id).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcCliInvalid,
@@ -1857,6 +1949,8 @@ impl MetalGpuBackend {
         let id = alloc_gpu_id();
         cap_registry(&mut self.render_pipelines);
         self.render_pipelines.insert(id, pipeline);
+        cap_cache(&mut self.render_pipeline_cache);
+        self.render_pipeline_cache.insert(key, id);
         Ok(id)
     }
 
@@ -1866,11 +1960,23 @@ impl MetalGpuBackend {
     }
 
     /// Create and register a compute pipeline.
+    ///
+    /// The persistent compute-pipeline cache serves identical (library,
+    /// compute function) requests with the already-compiled state.
     pub fn create_compute_pipeline(
         &mut self,
         compute_fn_name: &str,
         library_id: u64,
     ) -> AppResult<u64> {
+        let key = ComputePipelineCacheKey {
+            library_id,
+            compute_fn: compute_fn_name.to_string(),
+        };
+        if let Some(&cached) = self.compute_pipeline_cache.get(&key) {
+            self.pipeline_cache_hits += 1;
+            return Ok(cached);
+        }
+
         let library = self.libraries.get(&library_id).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcCliInvalid,
@@ -1889,6 +1995,8 @@ impl MetalGpuBackend {
         let id = alloc_gpu_id();
         cap_registry(&mut self.compute_pipelines);
         self.compute_pipelines.insert(id, pipeline);
+        cap_cache(&mut self.compute_pipeline_cache);
+        self.compute_pipeline_cache.insert(key, id);
         Ok(id)
     }
 
@@ -1910,12 +2018,25 @@ impl MetalGpuBackend {
     /// Destroy a shader library.
     pub fn destroy_library(&mut self, id: u64) {
         self.libraries.remove(&id);
+        // The pipeline caches must never resurrect a pipeline whose library
+        // was destroyed: drop every cached entry compiled from this library.
+        self.shader_library_cache
+            .retain(|_, &mut cached| cached != id);
+        self.render_pipeline_cache
+            .retain(|key, _| key.library_id != id);
+        self.compute_pipeline_cache
+            .retain(|key, _| key.library_id != id);
     }
 
     /// Destroy a pipeline.
     pub fn destroy_pipeline(&mut self, id: u64) {
         self.render_pipelines.remove(&id);
         self.compute_pipelines.remove(&id);
+        // A destroyed pipeline must never be handed out again from a cache.
+        self.render_pipeline_cache
+            .retain(|_, &mut cached| cached != id);
+        self.compute_pipeline_cache
+            .retain(|_, &mut cached| cached != id);
     }
 
     /// Get device info.
@@ -7119,6 +7240,125 @@ mod tests {
             .create_compute_pipeline("compute_main", lib_id)
             .unwrap();
         assert!(backend.get_compute_pipeline(pipeline_id).is_some());
+    }
+
+    #[test]
+    fn persistent_shader_and_pipeline_caches_serve_identical_requests() {
+        let mut backend = create_backend();
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 vertex_main(uint vid [[vertex_id]]) {
+                float2 positions[3] = { float2(-1, -1), float2(1, -1), float2(0, 1) };
+                return float4(positions[vid], 0.0, 1.0);
+            }
+            fragment float4 fragment_main() {
+                return float4(0.0, 1.0, 0.0, 1.0);
+            }
+        "#;
+
+        // Identical MSL source compiles once: the second request returns the
+        // same registered library without a device compile.
+        let first_lib = backend.compile_shader(source).unwrap();
+        assert_eq!(backend.shader_cache_hits, 0);
+        let second_lib = backend.compile_shader(source).unwrap();
+        assert_eq!(
+            second_lib, first_lib,
+            "identical source must reuse the library"
+        );
+        assert_eq!(backend.shader_cache_hits, 1);
+
+        // Identical pipeline requests return the same state id without
+        // recompiling; a distinct fragment entry point is a distinct key.
+        let first_pipeline = backend
+            .create_render_pipeline(
+                "vertex_main",
+                "fragment_main",
+                first_lib,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("render pipeline");
+        assert_eq!(backend.pipeline_cache_hits, 0);
+        let second_pipeline = backend
+            .create_render_pipeline(
+                "vertex_main",
+                "fragment_main",
+                first_lib,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("render pipeline");
+        assert_eq!(
+            second_pipeline, first_pipeline,
+            "identical pipeline requests must reuse the compiled state"
+        );
+        assert_eq!(backend.pipeline_cache_hits, 1);
+        let depth_pipeline = backend
+            .create_render_pipeline(
+                "vertex_main",
+                "fragment_main",
+                first_lib,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                Some(metal::MTLPixelFormat::Depth32Float),
+            )
+            .expect("render pipeline with depth");
+        assert_ne!(
+            depth_pipeline, first_pipeline,
+            "a different depth format is a different pipeline key"
+        );
+        let format_pipeline = backend
+            .create_render_pipeline(
+                "vertex_main",
+                "fragment_main",
+                first_lib,
+                metal::MTLPixelFormat::RGBA8Unorm,
+                None,
+            )
+            .expect("render pipeline with another format");
+        assert_ne!(
+            format_pipeline, first_pipeline,
+            "a different color format is a different pipeline key"
+        );
+
+        // Compute pipelines cache identically as well.
+        let compute_source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void compute_main(device float* output [[buffer(0)]],
+                                     uint gid [[thread_position_in_grid]]) {
+                output[gid] = float(gid);
+            }
+        "#;
+        let compute_lib = backend.compile_shader(compute_source).unwrap();
+        let first_compute = backend
+            .create_compute_pipeline("compute_main", compute_lib)
+            .unwrap();
+        let second_compute = backend
+            .create_compute_pipeline("compute_main", compute_lib)
+            .unwrap();
+        assert_eq!(
+            first_compute, second_compute,
+            "identical compute requests must reuse the compiled state"
+        );
+
+        // Destroying a pipeline invalidates its cache entries: a later
+        // identical request compiles fresh (a new id) instead of returning
+        // the destroyed state.
+        backend.destroy_pipeline(first_pipeline);
+        let rebuilt = backend
+            .create_render_pipeline(
+                "vertex_main",
+                "fragment_main",
+                first_lib,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("rebuilt render pipeline");
+        assert_ne!(
+            rebuilt, first_pipeline,
+            "a destroyed pipeline must never be resurrected from the cache"
+        );
     }
 
     #[test]
