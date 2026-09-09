@@ -1739,6 +1739,12 @@ pub(crate) struct PeHostRuntime {
     pub(crate) csp_keys: HashMap<u64, CspKeyState>,
     /// The security packages (QuerySecurityPackageInfoW).
     pub(crate) sec_packages: HashMap<u64, String>,
+    /// The COM global-memory blocks (OleDuplicateData).
+    pub(crate) com_globals: HashMap<u64, Vec<u8>>,
+    /// The next COM global handle.
+    pub(crate) com_globals_next: u64,
+    /// The OLE in-place menu descriptor (OleSetMenuDescriptor).
+    pub(crate) com_ole_menu_descriptor: Option<(u64, u64, u64)>,
     /// The WIM file handles.
     pub(crate) wim_handles: HashMap<u64, u32>,
     /// The WMI connection handles.
@@ -2352,6 +2358,9 @@ impl PeHostRuntime {
             csp_contexts: HashMap::new(),
             csp_keys: HashMap::new(),
             sec_packages: HashMap::new(),
+            com_globals: HashMap::new(),
+            com_globals_next: 0x5000_0000,
+            com_ole_menu_descriptor: None,
             wim_handles: HashMap::new(),
             wmi_handles: HashMap::new(),
             com_interface_iid_slots: [0],

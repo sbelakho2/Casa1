@@ -55,25 +55,16 @@ fn database_seeds_from_thunk_metadata_with_levels() {
     assert_eq!(create_file.implementation, ImplementationLevel::Implemented);
     assert!(!create_file.transitional);
 
-    // A Partial thunk is seeded transitional WITH a specific reason, never a
-    // generic one: the seed-time classification pass records what is missing.
+    // CompareStringW was completed in the partial-completion wave (the
+    // NORM_IGNORECASE flag semantics are honored) and is now Implemented.
     let compare_string = database
         .lookup("kernel32.dll", "CompareStringW")
         .expect("CompareStringW must be seeded");
-    assert_eq!(compare_string.implementation, ImplementationLevel::Partial);
-    assert!(
-        compare_string.transitional,
-        "Partial entries with a documented limitation must be flagged transitional"
+    assert_eq!(
+        compare_string.implementation,
+        ImplementationLevel::Implemented
     );
-    let reason = compare_string.detail.as_deref().expect("specific reason");
-    assert!(
-        !reason.contains("Partial per THUNK_METADATA"),
-        "the transitional reason must be specific, not the generic metadata note"
-    );
-    assert!(
-        reason.contains("locale"),
-        "the reason names the concrete limitation: {reason}"
-    );
+    assert!(!compare_string.transitional);
 
     // Stub entries are seeded with their metadata levels; the kernel32 core
     // surface (GetVersionExA and the interlocked/environment/INI/search
@@ -912,12 +903,12 @@ fn report_generator_emits_expected_json_shape() {
         "wsock32 WSAStartup is implemented (no shipping violation)"
     );
     assert!(
-        typed.gate.completeness_violations.iter().any(|v| {
+        !typed.gate.completeness_violations.iter().any(|v| {
             v.dll == "kernel32.dll"
                 && v.export == "CompareStringW"
                 && v.kind == ApiGateViolationKind::PartialNotCompletenessReady
         }),
-        "Partial entries are honest completeness violations"
+        "CompareStringW's completion closed its completeness violation"
     );
     assert_eq!(
         typed.gate.completeness_violation_count,

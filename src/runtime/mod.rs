@@ -25905,23 +25905,36 @@ impl PeHostRuntime {
                 let _hdc = guest_call_arg(state, memory, 0)?;
                 let metrics_ptr = guest_call_arg(state, memory, 1)?;
                 if metrics_ptr != 0 {
-                    // Return approximate font metrics (all zeros except tmHeight)
+                    // The default UI font metrics (the Segoe UI 12pt
+                    // geometry scaled by the selected text scale).
                     let scale = self.selected_text_scale(_hdc);
-                    let tm_height = (7 * scale) as i32;
-                    // TEXTMETRICW is 60 bytes (20 fields, i32 each on x86/x64)
-                    memory.map_bytes(metrics_ptr, &tm_height.to_le_bytes());       // tmHeight
-                    memory.map_bytes(metrics_ptr + 4, &(0i32).to_le_bytes());      // tmAscent
-                    memory.map_bytes(metrics_ptr + 8, &(0i32).to_le_bytes());      // tmDescent
-                    memory.map_bytes(metrics_ptr + 12, &(0i32).to_le_bytes());     // tmInternalLeading
-                    memory.map_bytes(metrics_ptr + 16, &(0i32).to_le_bytes());     // tmExternalLeading
-                    memory.map_bytes(metrics_ptr + 20, &(0i32).to_le_bytes());     // tmAveCharWidth
-                    memory.map_bytes(metrics_ptr + 24, &(0i32).to_le_bytes());     // tmMaxCharWidth
-                    memory.map_bytes(metrics_ptr + 28, &(0i32).to_le_bytes());     // tmWeight
-                    memory.map_bytes(metrics_ptr + 32, &(0i32).to_le_bytes());     // tmOverhang
-                    memory.map_bytes(metrics_ptr + 36, &(0i32).to_le_bytes());     // tmDigitizedAspectX
-                    memory.map_bytes(metrics_ptr + 40, &(0i32).to_le_bytes());     // tmDigitizedAspectY
-                    // tmFirstChar through tmItalic are u8/u8/u8/u8 (4 bytes) at offset 44
-                    // Total: 44 + 4 + 12 (face name) = 60
+                    let height = (12 * scale) as i32;
+                    let ascent = (9 * scale) as i32;
+                    let descent = (3 * scale) as i32;
+                    let ave_width = (6 * scale) as i32;
+                    let max_width = (12 * scale) as i32;
+                    for (offset, value) in [
+                        (0, height),        // tmHeight
+                        (4, ascent),        // tmAscent
+                        (8, descent),       // tmDescent
+                        (12, 0),            // tmInternalLeading
+                        (16, 0),            // tmExternalLeading
+                        (20, ave_width),    // tmAveCharWidth
+                        (24, max_width),    // tmMaxCharWidth
+                        (28, 400),          // tmWeight
+                        (32, 0),            // tmOverhang
+                        (36, 96),           // tmDigitizedAspectX
+                        (40, 96),           // tmDigitizedAspectY
+                    ] {
+                        memory.map_bytes(metrics_ptr + offset, &value.to_le_bytes());
+                    }
+                    // tmFirstChar (' ') .. tmItalic (0)
+                    memory.map_bytes(metrics_ptr + 44, &[0x20, 0x7f, 0x00, 0x00]);
+                    // tmPitchAndFamily + the face name "Segoe UI".
+                    memory.map_bytes(metrics_ptr + 48, &[0x00]);
+                    for (i, byte) in b"Segoe UI".iter().enumerate() {
+                        memory.map_bytes(metrics_ptr + 49 + i as u64, &[*byte]);
+                    }
                 }
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
@@ -29499,7 +29512,63 @@ impl PeHostRuntime {
                 if flags & SHGFI_ATTRIBUTES != 0 {
                     write_u32(memory, info_ptr + 648, attributes);
                 }
-                let result = if flags & (SHGFI_ICON | SHGFI_SYSICONINDEX | SHGFI_EXETYPE) != 0 {
+                if flags & SHGFI_EXETYPE != 0 {
+                    // SHGFI_EXETYPE: the executable type — MZ (DOS) or the
+                    // PE signature from the file's headers.
+                    let exe_type = if !path_text.is_empty() {
+                        if let Ok(bytes) = std::fs::read(&path_text) {
+                            if bytes.len() > 0x3c + 4 && &bytes[..2] == b"MZ" {
+                                let pe = u32::from_le_bytes([
+                                    bytes[0x3c],
+                                    bytes[0x3c + 1],
+                                    bytes[0x3c + 2],
+                                    bytes[0x3c + 3],
+                                ]) as usize;
+                                if bytes.len() > pe + 4
+                                    && u32::from_le_bytes([
+                                        bytes[pe],
+                                        bytes[pe + 1],
+                                        bytes[pe + 2],
+                                        bytes[pe + 3],
+                                    ]) == 0x4550
+                                {
+                                    0x4550
+                                } else {
+                                    0x5a4d
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    state.set(Register::Rax, u64::from(exe_type as u32));
+                    self.last_error = 0;
+                    self.push_trace(
+                        "shell32",
+                        "SHGetFileInfoW",
+                        BTreeMap::from([("exetype".to_string(), json!(exe_type))]),
+                        json!(exe_type),
+                    );
+                    return Ok(None);
+                }
+                let type_icon = if flags & SHGFI_ICON != 0 {
+                    // A stable file-type icon handle (the icon registry is
+                    // the shell's system image list; the runtime returns a
+                    // stable type handle for the file's extension).
+                    0x2000_0000 | (attributes & 0xffff)
+                } else {
+                    0
+                };
+                if flags & SHGFI_ICON != 0 && info_ptr != 0 {
+                    write_u32(memory, info_ptr + 4, type_icon as u32); // hIcon
+                }
+                let result = if flags & SHGFI_ICON != 0 {
+                    type_icon as u64
+                } else if flags & SHGFI_SYSICONINDEX != 0 {
                     0
                 } else {
                     1
@@ -38303,6 +38372,18 @@ impl PeHostRuntime {
                         if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
                             let _ = self.win32.set_event(event);
                         }
+                        // The APC completion routine (when provided) is
+                        // invoked with (0, cbTransferred, overlapped, 0).
+                        if completion_routine != 0 {
+                            let routine_state = CpuState::new(self.guest_arch);
+                            let _ = self.execute_guest_callback(
+                                &mut routine_state.clone(),
+                                memory,
+                                completion_routine,
+                                &[0, completed as u64, overlapped, 0],
+                                "wsa-completion-routine",
+                            );
+                        }
                     }
                     self.push_trace(
                         "network",
@@ -38401,6 +38482,15 @@ impl PeHostRuntime {
                         if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
                             let _ = self.win32.set_event(event);
                         }
+                        if completion_routine != 0 {
+                            let _ = self.execute_guest_callback(
+                                &mut CpuState::new(self.guest_arch),
+                                memory,
+                                completion_routine,
+                                &[0, completed as u64, overlapped, 0],
+                                "wsa-completion-routine",
+                            );
+                        }
                     }
                     self.push_trace(
                         "network",
@@ -38467,6 +38557,15 @@ impl PeHostRuntime {
                         )?;
                         if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
                             let _ = self.win32.set_event(event);
+                        }
+                        if completion_routine != 0 {
+                            let _ = self.execute_guest_callback(
+                                &mut CpuState::new(self.guest_arch),
+                                memory,
+                                completion_routine,
+                                &[0, u64::from(written), overlapped, 0],
+                                "wsa-completion-routine",
+                            );
                         }
                     }
                     self.push_trace(
@@ -38540,6 +38639,15 @@ impl PeHostRuntime {
                         )?;
                         if let Some(event) = self.overlapped_event_handle(memory, overlapped) {
                             let _ = self.win32.set_event(event);
+                        }
+                        if completion_routine != 0 {
+                            let _ = self.execute_guest_callback(
+                                &mut CpuState::new(self.guest_arch),
+                                memory,
+                                completion_routine,
+                                &[0, u64::from(written), overlapped, 0],
+                                "wsa-completion-routine",
+                            );
                         }
                     }
                     self.push_trace(
@@ -49850,10 +49958,22 @@ impl PeHostRuntime {
                 let str2_len = arg(5) as i32;
                 let s1 = if str1_len < 0 { read_utf16_string(memory, str1_ptr).unwrap_or_default() } else { String::from_utf16_lossy(&read_utf16_string(memory, str1_ptr).unwrap_or_default().encode_utf16().take(str1_len as usize).collect::<Vec<u16>>()) };
                 let s2 = if str2_len < 0 { read_utf16_string(memory, str2_ptr).unwrap_or_default() } else { String::from_utf16_lossy(&read_utf16_string(memory, str2_ptr).unwrap_or_default().encode_utf16().take(str2_len as usize).collect::<Vec<u16>>()) };
-                let result = match s1.to_lowercase().cmp(&s2.to_lowercase()) {
-                    std::cmp::Ordering::Less => 1,
-                    std::cmp::Ordering::Equal => 2,
-                    std::cmp::Ordering::Greater => 3,
+                const NORM_IGNORECASE: u32 = 0x0000_0001;
+                const NORM_IGNORECASE_NONSPACE: u32 = 0x0000_0002;
+                let flags = arg(1) as u32;
+                let case_insensitive = flags & (NORM_IGNORECASE | NORM_IGNORECASE_NONSPACE) != 0;
+                let result = if case_insensitive {
+                    match s1.to_lowercase().cmp(&s2.to_lowercase()) {
+                        std::cmp::Ordering::Less => 1,
+                        std::cmp::Ordering::Equal => 2,
+                        std::cmp::Ordering::Greater => 3,
+                    }
+                } else {
+                    match s1.cmp(&s2) {
+                        std::cmp::Ordering::Less => 1,
+                        std::cmp::Ordering::Equal => 2,
+                        std::cmp::Ordering::Greater => 3,
+                    }
                 };
                 state.set(Register::Rax, result as u64);
             }
@@ -50673,9 +50793,50 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::ReadConsoleA | HostThunk::ReadConsoleW => {
-                // Console input is not available in VM mode — return FALSE (no input read).
-                // In a headed environment, this would read from stdin.
-                state.set(Register::Rax, 0);
+                // Console input: read the available host stdin bytes into
+                // the guest buffer (the console input path); when stdin is
+                // closed, the documented failure.
+                let _console = arg(0);
+                let buffer = arg(1);
+                let count = arg(2) as usize;
+                let read_out = arg(3);
+                let mut bytes = Vec::new();
+                use std::io::Read;
+                let mut stdin = std::io::stdin().lock();
+                let mut chunk = vec![0_u8; count.min(4096)];
+                match stdin.read(&mut chunk) {
+                    Ok(0) | Err(_) => {
+                        // No input available (or closed): the documented
+                        // failure without consuming the stream.
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        let is_wide = matches!(thunk, HostThunk::ReadConsoleW);
+                        if is_wide {
+                            let units: Vec<u8> = bytes
+                                .iter()
+                                .flat_map(|b| (*b as u16).to_le_bytes())
+                                .collect();
+                            for (i, byte) in units.iter().enumerate() {
+                                memory.write_u8(buffer + i as u64, *byte);
+                            }
+                            if read_out != 0 {
+                                write_guest_u32(memory, read_out, bytes.len() as u32).ok();
+                            }
+                        } else {
+                            for (i, byte) in bytes.iter().enumerate() {
+                                memory.write_u8(buffer + i as u64, *byte);
+                            }
+                            if read_out != 0 {
+                                write_guest_u32(memory, read_out, bytes.len() as u32).ok();
+                            }
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                }
             }
             HostThunk::GetConsoleCP => {
                 // GetConsoleCP() — the console state's input code page (the
@@ -52304,8 +52465,44 @@ impl PeHostRuntime {
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                     }
+                    2 => {
+                        // UOI_TYPE: the window-station type string.
+                        let text = "WindowStation\0";
+                        let bytes = text.as_bytes();
+                        if info_len < bytes.len() as u32 {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                            return Ok(None);
+                        }
+                        for (i, byte) in bytes.iter().enumerate() {
+                            memory.write_u8(info + i as u64, *byte);
+                        }
+                        if ret_len != 0 {
+                            write_u32(memory, ret_len, bytes.len() as u32);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    3 => {
+                        // UOI_NAME: the window-station name.
+                        let name = self.win32.window_station_name(handle).unwrap_or_else(|_| "WinSta0".to_string());
+                        let text = format!("{name}\0");
+                        let bytes = text.as_bytes();
+                        if info_len < bytes.len() as u32 {
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                            return Ok(None);
+                        }
+                        for (i, byte) in bytes.iter().enumerate() {
+                            memory.write_u8(info + i as u64, *byte);
+                        }
+                        if ret_len != 0 {
+                            write_u32(memory, ret_len, bytes.len() as u32);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
                     _ => {
-                        // UOI_TYPE etc. are not modeled.
                         state.set(Register::Rax, 0);
                         self.last_error = ERROR_INVALID_PARAMETER;
                     }
@@ -52335,7 +52532,7 @@ impl PeHostRuntime {
                 let hwnd = arg(0) as u32;
                 let text_ptr = arg(1);
                 let caption_ptr = arg(2);
-                let _type = arg(3) as u32;
+                let mb_type = arg(3) as u32;
                 let text = if text_ptr != 0 {
                     read_c_string(memory, text_ptr).unwrap_or_default()
                 } else {
@@ -52350,7 +52547,29 @@ impl PeHostRuntime {
                     "[MessageBoxA hwnd={hwnd:#x}] {caption}: {text}"
                 ));
                 let _ = hwnd;
-                state.set(Register::Rax, 1); // IDOK
+                // The button style maps to the headless default answer:
+                // OK-only boxes answer IDOK; OK/Cancel the OK button;
+                // Yes/No the Yes button; Retry/Cancel the Retry button;
+                // Abort/Retry/Ignore the Abort button.
+                const MB_OKCANCEL: u32 = 0x1;
+                const MB_ABORTRETRYIGNORE: u32 = 0x2;
+                const MB_YESNOCANCEL: u32 = 0x3;
+                const MB_YESNO: u32 = 0x4;
+                const MB_RETRYCANCEL: u32 = 0x5;
+                const IDOK: u32 = 1;
+                const IDCANCEL: u32 = 2;
+                const IDABORT: u32 = 3;
+                const IDRETRY: u32 = 4;
+                const IDYES: u32 = 6;
+                let default_answer = match mb_type & 0x0f {
+                    MB_ABORTRETRYIGNORE => IDABORT,
+                    MB_YESNOCANCEL | MB_YESNO => IDYES,
+                    MB_RETRYCANCEL => IDRETRY,
+                    MB_OKCANCEL => IDOK,
+                    _ => IDOK,
+                };
+                let _ = IDCANCEL;
+                state.set(Register::Rax, u64::from(default_answer));
                 self.last_error = 0;
             }
             // --- I3: Scrollbars ---
@@ -52945,21 +53164,30 @@ impl PeHostRuntime {
             }
             HostThunk::SetPixelFormat => {
                 // SetPixelFormat(hdc, index, ppfd) — bind a pixel format to
-                // the DC.  The runtime models ONE fixed format (index 1:
-                // 32-bit, double-buffered, composited); any other index is
-                // ERROR_INVALID_PARAMETER like Windows.
+                // the DC.  The runtime models the standard 32-bit
+                // double-buffered formats (indexes 1..=4); the descriptor's
+                // color bits are validated against the supported formats.
                 let hdc = arg(0);
                 let index = arg(1) as i32;
-                let _ppfd = arg(2);
+                let ppfd = arg(2);
                 if !self.device_contexts.contains_key(&hdc) {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_HANDLE;
                     return Ok(None);
                 }
-                if index != 1 {
+                if !(1..=4).contains(&index) {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                     return Ok(None);
+                }
+                if ppfd != 0 {
+                    // The PIXELFORMATDESCRIPTOR: cColorBits at offset 9.
+                    let color_bits = memory.read_u8(ppfd + 9).unwrap_or(0);
+                    if color_bits != 0 && color_bits != 32 {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        return Ok(None);
+                    }
                 }
                 self.dc_pixel_formats.insert(hdc, index as u32);
                 state.set(Register::Rax, 1);
@@ -52999,7 +53227,16 @@ impl PeHostRuntime {
                     && color_bits >= 24
 ;
                 if compatible {
-                    state.set(Register::Rax, 1); // the single fixed format
+                    // The format selection: the best-matching index among
+                    // the supported 32/24/16-bit double-buffered formats.
+                    let index = if color_bits >= 32 {
+                        1
+                    } else if color_bits >= 24 {
+                        2
+                    } else {
+                        3
+                    };
+                    state.set(Register::Rax, index);
                     self.last_error = 0;
                 } else {
                     state.set(Register::Rax, 0);

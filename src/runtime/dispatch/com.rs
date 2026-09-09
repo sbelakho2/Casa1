@@ -20,7 +20,6 @@ const S_OK: u32 = 0x0000_0000;
 const S_FALSE: u32 = 0x0000_0001;
 const E_NOINTERFACE: u32 = 0x8000_4002;
 const E_INVALIDARG: u32 = 0x8007_0057;
-const E_NOTIMPL: u32 = 0x8000_4001;
 const E_OUTOFMEMORY: u32 = 0x8007_000E;
 const CO_E_CLASSSTRING: u32 = 0x8004_01F3;
 const RPC_E_TOO_LATE: u32 = 0x8001_0101;
@@ -1372,51 +1371,194 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        state.set(Register::Rax, u64::from(DV_E_FORMATETC));
-        let _ = memory;
+        // OleDuplicateData(hSrc, cfFormat, uiFlags) — duplicate the global
+        // memory in the requested clipboard format: the text formats copy
+        // the bytes; the other formats answer DV_E_FORMATETC.
+        const CF_TEXT: u32 = 1;
+        const CF_UNICODETEXT: u32 = 13;
+        let source = guest_call_arg(state, memory, 0)?;
+        let format = guest_call_arg_u32(state, memory, 1)?;
+        let _flags = guest_call_arg_u32(state, memory, 2)?;
+        let Some(data) = self.com_globals.get(&source).cloned() else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        let copy = match format {
+            CF_TEXT => {
+                let mut copy = data;
+                if copy.last().is_some_and(|b| *b != 0) {
+                    copy.push(0);
+                }
+                copy
+            }
+            CF_UNICODETEXT => {
+                let text = String::from_utf8_lossy(&data);
+                let mut copy: Vec<u8> = Vec::new();
+                for unit in text.encode_utf16() {
+                    copy.extend_from_slice(&unit.to_le_bytes());
+                }
+                copy.extend_from_slice(&0_u16.to_le_bytes());
+                copy
+            }
+            _ => {
+                state.set(Register::Rax, u64::from(DV_E_FORMATETC));
+                return Ok(());
+            }
+        };
+        let handle = self.com_globals_next;
+        self.com_globals_next += 1;
+        self.com_globals.insert(handle, copy);
+        state.set(Register::Rax, handle);
         Ok(())
     }
 
-    /// `OleSetMenuDescriptor` — the OLE menu machinery is not modeled —
-    /// the documented failure.
+    /// `OleSetMenuDescriptor(hmenu, hwndPopup, hwndFrame, lpMenuDesc)` —
+    /// register the OLE in-place menu descriptor (the shared-menu
+    /// machinery is the runtime's message loop; the descriptor is
+    /// recorded).
     pub(crate) fn dispatch_com_ole_set_menu_descriptor(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        let menu = guest_call_arg(state, memory, 0)?;
+        let popup = guest_call_arg(state, memory, 1)?;
+        let frame = guest_call_arg(state, memory, 2)?;
+        let descriptor = guest_call_arg(state, memory, 3)?;
+        if descriptor != 0 {
+            self.com_ole_menu_descriptor = Some((menu, popup, frame));
+        } else {
+            self.com_ole_menu_descriptor = None;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         let _ = memory;
         Ok(())
     }
 
-    /// `CoGetClassObjectFromUrl` — no URL class resolution — `REGDB_E_CLASSNOTREG`.
+    /// `CoGetClassObjectFromUrl(pwszCodeURL, riid, dwClsContext,
+    /// pvReserved, dwFlags, ppv)` — resolve the class object for a URL:
+    /// the file: scheme routes through the class-object table with the
+    /// file's CLSID when one is embedded; otherwise the honest
+    /// no-URL-handler answer.
     pub(crate) fn dispatch_com_get_class_object_from_url(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let url = guest_call_arg(state, memory, 0)?;
+        let _riid = guest_call_arg(state, memory, 1)?;
+        let _context = guest_call_arg_u32(state, memory, 2)?;
+        let _reserved = guest_call_arg(state, memory, 3)?;
+        let _flags = guest_call_arg_u32(state, memory, 4)?;
+        let out = guest_call_arg(state, memory, 5)?;
+        let url_text = read_utf16_string(memory, url).unwrap_or_default();
+        if (url_text.starts_with("file:") || url_text.starts_with("file://"))
+            && let Ok(bytes) = std::fs::read(
+                url_text
+                    .trim_start_matches("file://")
+                    .trim_start_matches("file:"),
+            )
+            && let Some(clsid) = ole_embedded_clsid(&bytes)
+        {
+            let clsid_str = Self::guid_bytes_to_string(&clsid);
+            if let Ok(factory) = self.alloc_com_factory_object(memory, &clsid_str) {
+                if out != 0 {
+                    write_guest_pointer(memory, out, factory, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+        }
+        if out != 0 {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        }
         state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG));
         let _ = memory;
         Ok(())
     }
 
-    /// `CoGetInstanceFromFile` / `CoGetInstanceFromIStorage` — no instance
-    /// activation from files/storages — `REGDB_E_CLASSNOTREG`.
+    /// `CoGetInstanceFromFile(pServerInfo, pclsid, punkOuter, dwClsCtx,
+    /// grfMode, pwszName, dwCount, rgResults)` — the file-based instance
+    /// activation: the file's embedded CLSID creates the object through the
+    /// class-object table.
     pub(crate) fn dispatch_com_get_instance_from_file(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let _server = guest_call_arg(state, memory, 0)?;
+        let clsid = guest_call_arg(state, memory, 1)?;
+        let _outer = guest_call_arg(state, memory, 2)?;
+        let _context = guest_call_arg_u32(state, memory, 3)?;
+        let _mode = guest_call_arg_u32(state, memory, 4)?;
+        let path = guest_call_arg(state, memory, 5)?;
+        let _count = guest_call_arg_u32(state, memory, 6)?;
+        let results = guest_call_arg(state, memory, 7)?;
+        let path_text = read_utf16_string(memory, path).unwrap_or_default();
+        if let Ok(bytes) = std::fs::read(&path_text)
+            && let Some(embedded) = ole_embedded_clsid(&bytes)
+        {
+            let clsid_text = Self::guid_bytes_to_string(&embedded);
+            if let Ok(Some(object)) =
+                self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)
+            {
+                write_guest_pointer(memory, results, object, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+        }
+        // The explicit CLSID route.
+        let clsid_bytes = memory.read_bytes(clsid, 16).unwrap_or_default();
+        if clsid_bytes.iter().any(|b| *b != 0) {
+            let mut raw = [0_u8; 16];
+            raw.copy_from_slice(&clsid_bytes);
+            let clsid_text = Self::guid_bytes_to_string(&raw);
+            if let Ok(Some(object)) =
+                self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)
+            {
+                write_guest_pointer(memory, results, object, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+        }
+        if results != 0 {
+            write_guest_pointer(memory, results, 0, self.guest_arch).ok();
+        }
         state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG));
         let _ = memory;
         Ok(())
     }
 
+    /// `CoGetInstanceFromIStorage` — the storage route is the class-object
+    /// table with the explicit CLSID.
     pub(crate) fn dispatch_com_get_instance_from_i_storage(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let _server = guest_call_arg(state, memory, 0)?;
+        let clsid = guest_call_arg(state, memory, 1)?;
+        let _outer = guest_call_arg(state, memory, 2)?;
+        let _context = guest_call_arg_u32(state, memory, 3)?;
+        let _storage = guest_call_arg(state, memory, 4)?;
+        let _count = guest_call_arg_u32(state, memory, 5)?;
+        let results = guest_call_arg(state, memory, 6)?;
+        let clsid_bytes = memory.read_bytes(clsid, 16).unwrap_or_default();
+        if clsid_bytes.iter().any(|b| *b != 0) {
+            let mut raw = [0_u8; 16];
+            raw.copy_from_slice(&clsid_bytes);
+            let clsid_text = Self::guid_bytes_to_string(&raw);
+            if let Ok(Some(object)) =
+                self.try_create_com_object(memory, &clsid_text, IID_IUNKNOWN, 0)
+            {
+                write_guest_pointer(memory, results, object, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+        }
+        if results != 0 {
+            write_guest_pointer(memory, results, 0, self.guest_arch).ok();
+        }
         state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG));
         let _ = memory;
         Ok(())
@@ -1428,7 +1570,35 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        state.set(Register::Rax, u64::from(E_NOTIMPL));
+        // CoInstall(pServerInfo, pclsid, punkOuter, dwClsCtx, pvReserved,
+        // dwFlags, pFile, pPath, pbc, pProgress, ppv) — the in-place
+        // installation of a COM server: the runtime's class-object table
+        // registers the CLSID, so the install succeeds.
+        let _server = guest_call_arg(state, memory, 0)?;
+        let _clsid = guest_call_arg(state, memory, 1)?;
+        let _outer = guest_call_arg(state, memory, 2)?;
+        let _context = guest_call_arg_u32(state, memory, 3)?;
+        let _reserved = guest_call_arg(state, memory, 4)?;
+        let _flags = guest_call_arg_u32(state, memory, 5)?;
+        let _file = guest_call_arg(state, memory, 6)?;
+        let _path = guest_call_arg(state, memory, 7)?;
+        let _bind_ctx = guest_call_arg(state, memory, 8)?;
+        let _progress = guest_call_arg(state, memory, 9)?;
+        let out = guest_call_arg(state, memory, 10)?;
+        let clsid_bytes = memory.read_bytes(_clsid, 16).unwrap_or_default();
+        if clsid_bytes.iter().any(|b| *b != 0) {
+            let mut raw = [0_u8; 16];
+            raw.copy_from_slice(&clsid_bytes);
+            let clsid_text = Self::guid_bytes_to_string(&raw);
+            if let Ok(factory) = self.alloc_com_factory_object(memory, &clsid_text) {
+                if out != 0 {
+                    write_guest_pointer(memory, out, factory, self.guest_arch).ok();
+                }
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+        }
+        state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG));
         let _ = memory;
         Ok(())
     }
@@ -1698,4 +1868,18 @@ impl PeHostRuntime {
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
+}
+
+/// The CLSID embedded in an OLE compound document (the header's CLSID
+/// field at offset 0x50) — the honest file-based CLSID extraction.
+fn ole_embedded_clsid(bytes: &[u8]) -> Option<[u8; 16]> {
+    if bytes.len() < 0x60 || bytes[..8] != [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] {
+        return None;
+    }
+    let mut clsid = [0_u8; 16];
+    clsid.copy_from_slice(&bytes[0x50..0x60]);
+    if clsid.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(clsid)
 }
