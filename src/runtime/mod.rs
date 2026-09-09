@@ -2565,6 +2565,7 @@ pub enum HostThunk {
     SHGetPathFromIDListW,
     SHGetSpecialFolderLocation,
     ShellLinkQueryInterface,
+    GraphicsObjectQueryInterface,
     ShellLinkAddRef,
     ShellLinkRelease,
     ShellLinkGetPathW,
@@ -29820,6 +29821,39 @@ impl PeHostRuntime {
                     state.set(Register::Rax, E_INVALIDARG);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 }
+            }
+
+            HostThunk::GraphicsObjectQueryInterface => {
+                let this = guest_call_arg(state, memory, 0)?;
+                let iid_ptr = guest_call_arg(state, memory, 1)?;
+                let out = guest_call_arg(state, memory, 2)?;
+                let bytes = memory.read_bytes(iid_ptr, 16).unwrap_or_default();
+                let kind = self.guest_object_kind(this)?;
+                let matches = match kind {
+                    GuestObjectKind::D3d11Device => bytes == [0xdd, 0x6f, 0xf6, 0xdb, 0x77, 0xac, 0x88, 0x4e, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40],
+                    GuestObjectKind::D3d11DeviceContext => bytes == [0xf0, 0xa0, 0xbf, 0xc1, 0x33, 0x51, 0xe0, 0x4a, 0xbb, 0xc4, 0xf1, 0x11, 0x43, 0x5b, 0x09, 0xaf],
+                    GuestObjectKind::DxgiFactory => bytes == [0xec, 0x71, 0x6b, 0x7b, 0xc7, 0x21, 0x44, 0xae, 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1e, 0xa3, 0x69],
+                    GuestObjectKind::DxgiSwapChain => bytes == [0xa0, 0x36, 0x0d, 0x31, 0xe7, 0xd2, 0x0a, 0x4c, 0xaa, 0x04, 0x6a, 0x9d, 0x23, 0xb8, 0x88, 0x6a],
+                    GuestObjectKind::D3d12Device => bytes == [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+                    GuestObjectKind::D3d12CommandQueue => bytes == [0xa6, 0x70, 0x08, 0x0e, 0x7e, 0x5d, 0x22, 0x4c, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+                    GuestObjectKind::D3d12Fence => bytes == [0xcf, 0xdc, 0x53, 0x0a, 0xd8, 0xc4, 0x91, 0x4b, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
+                    GuestObjectKind::D3d12DescriptorHeap => bytes == [0x1d, 0x47, 0xfb, 0x8e, 0x6c, 0x61, 0x49, 0x4f, 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                    GuestObjectKind::D3d12CommandList => bytes == [0x0f, 0x16, 0x0d, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x57],
+                    _ => false,
+                };
+                if matches {
+                    if out != 0 {
+                        write_guest_pointer(memory, out, this, self.guest_arch).ok();
+                    }
+                    self.add_ref_guest_object(this)?;
+                    state.set(Register::Rax, 0);
+                } else {
+                    if out != 0 {
+                        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+                    }
+                    state.set(Register::Rax, 0x8000_4002);
+                }
+                self.last_error = 0;
             }
             HostThunk::ShellLinkQueryInterface => {
                 let this = guest_call_arg(state, memory, 0)?;
@@ -65250,7 +65284,7 @@ impl PeHostRuntime {
             GuestObjectKind::D3d12DescriptorHeap => {
                 self.destroy_d3d12_descriptor_heap_object(address)?
             }
-            GuestObjectKind::D3d12GraphicsCommandList => {
+            GuestObjectKind::D3d12GraphicsCommandList | GuestObjectKind::D3d12CommandList => {
                 self.destroy_d3d12_command_list_object(address)?
             }
             GuestObjectKind::D3d12Fence => self.destroy_d3d12_fence_object(address)?,
@@ -66556,7 +66590,7 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let mut device_methods =
             vec![unsupported_method(&self.telemetry, "ID3D11Device::unsupported"); 43];
-        device_methods[0] = unsupported_method(&self.telemetry, "ID3D11Device::QueryInterface");
+        device_methods[0] = HostThunk::GraphicsObjectQueryInterface;
         device_methods[1] = HostThunk::GuestObjectAddRef;
         device_methods[2] = HostThunk::GuestObjectRelease;
         device_methods[3] = HostThunk::D3D11DeviceCreateBuffer;
@@ -66602,8 +66636,7 @@ impl PeHostRuntime {
 
         let mut context_methods =
             vec![unsupported_method(&self.telemetry, "ID3D11DeviceContext::unsupported"); 70];
-        context_methods[0] =
-            unsupported_method(&self.telemetry, "ID3D11DeviceContext::QueryInterface");
+        context_methods[0] = HostThunk::GraphicsObjectQueryInterface;
         context_methods[1] = HostThunk::GuestObjectAddRef;
         context_methods[2] = HostThunk::GuestObjectRelease;
         // ID3D11DeviceChild methods (slots 3-6)
@@ -66677,8 +66710,7 @@ impl PeHostRuntime {
 
         let mut swapchain_methods =
             vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 14];
-        swapchain_methods[0] =
-            unsupported_method(&self.telemetry, "IDXGISwapChain::QueryInterface");
+        swapchain_methods[0] = HostThunk::GraphicsObjectQueryInterface;
         swapchain_methods[1] = HostThunk::GuestObjectAddRef;
         swapchain_methods[2] = HostThunk::GuestObjectRelease;
         swapchain_methods[8] = HostThunk::DXGISwapChainPresent;
@@ -69279,7 +69311,7 @@ impl PeHostRuntime {
     fn alloc_dxgi_factory_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
         let mut methods =
             vec![unsupported_method(&self.telemetry, "IDXGIFactory::unsupported"); 26];
-        methods[0] = unsupported_method(&self.telemetry, "IDXGIFactory::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         // IDXGIObject methods (slots 3-6)
@@ -69745,7 +69777,7 @@ impl PeHostRuntime {
         // ID3D12Device vtable has 44 slots (0-43).
         let mut methods =
             vec![unsupported_method(&self.telemetry, "ID3D12Device::unsupported"); 44];
-        methods[0] = unsupported_method(&self.telemetry, "ID3D12Device::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         // Slot 3: SetStablePowerState — power optimization hint, just return S_OK
@@ -69807,7 +69839,7 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let mut methods =
             vec![unsupported_method(&self.telemetry, "ID3D12CommandQueue::unsupported"); 19];
-        methods[0] = unsupported_method(&self.telemetry, "ID3D12CommandQueue::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[3] = HostThunk::D3D12ObjectGetPrivateData;
@@ -69842,7 +69874,7 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let mut methods =
             vec![unsupported_method(&self.telemetry, "ID3D12CommandAllocator::unsupported"); 9];
-        methods[0] = unsupported_method(&self.telemetry, "ID3D12CommandAllocator::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
@@ -69869,7 +69901,7 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let mut methods =
             vec![unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::unsupported"); 11];
-        methods[0] = unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         // The true ID3D12DescriptorHeap order: the ID3D12Object methods +
@@ -70040,7 +70072,7 @@ impl PeHostRuntime {
         fence_id: D3d12FenceId,
     ) -> AppResult<u64> {
         let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12Fence::unsupported"); 11];
-        methods[0] = unsupported_method(&self.telemetry, "ID3D12Fence::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         // The true ID3D12Fence order: the ID3D12Object methods + the

@@ -67,6 +67,7 @@ pub(crate) enum GuestObjectKind {
     D3d12CommandQueue,
     D3d12CommandAllocator,
     D3d12DescriptorHeap,
+    D3d12CommandList,
     D3d12GraphicsCommandList,
     D3d12Fence,
     D3d12Resource,
