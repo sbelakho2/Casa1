@@ -3455,6 +3455,7 @@ pub enum HostThunk {
     GetDiskFreeSpaceA,
     /// `SetConsoleCtrlHandler` — adds or removes an application-defined HandlerRoutine function.
     SetConsoleCtrlHandler,
+    GenerateConsoleCtrlEvent,
     /// `ConvertThreadToFiber` — converts the current thread into a fiber.
     ConvertThreadToFiber,
     /// `ConvertFiberToThread` — converts the current fiber into a thread.
@@ -50695,14 +50696,62 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::RtlUnwind => {
-                // RtlUnwind(target_ip, target_frame, record, return_value)
-                // Performs a stack unwind. In the VM, we adjust RIP to simulate unwinding.
+                // RtlUnwind(target_ip, target_frame, record, return_value) —
+                // the x86 frame-based unwind: walk the guest's EBP chain
+                // (the standard-prolog frames store [saved EBP][saved EIP])
+                // until the target frame or the frame whose return address
+                // is the target IP, restoring EBP and EIP from the frame
+                // above; a full unwind (null targets) pops to the caller.
                 let target_ip = arg(0);
-                let _target_frame = arg(1);
-                let retval = arg(3); // read return value before mutating state
-                // If target_ip is non-zero, set RIP to continue at the target.
-                if target_ip != 0 && self.guest_arch == GuestArch::X86 {
-                    state.rip = target_ip as u32 as u64;
+                let target_frame = arg(1);
+                let _record = arg(2);
+                let retval = arg(3);
+                if self.guest_arch == GuestArch::X86 {
+                    let mut ebp = state.get(Register::Rbp);
+                    let mut eip = state.rip;
+                    for _ in 0..256 {
+                        if ebp == 0 {
+                            break;
+                        }
+                        let saved_ebp =
+                            u64::from(memory.read_u32(ebp).unwrap_or(0));
+                        let saved_eip =
+                            u64::from(memory.read_u32(ebp + 4).unwrap_or(0));
+                        if target_ip != 0 {
+                            // Unwind to the frame whose caller returns to
+                            // target_ip: when the saved EIP is the target,
+                            // the frame above is the continuation.
+                            if saved_eip == target_ip {
+                                eip = saved_eip;
+                                ebp = saved_ebp;
+                                break;
+                            }
+                            // The frame whose return address is the target
+                            // IP is the unwound frame.
+                            let _ = eip;
+                            eip = saved_eip;
+                            ebp = saved_ebp;
+                            if saved_eip == target_ip {
+                                break;
+                            }
+                        } else if target_frame != 0 {
+                            // Unwind to the target frame.
+                            if ebp == target_frame {
+                                eip = saved_eip;
+                                ebp = saved_ebp;
+                                break;
+                            }
+                            eip = saved_eip;
+                            ebp = saved_ebp;
+                        } else {
+                            // Full unwind: pop to the caller's frame.
+                            eip = saved_eip;
+                            ebp = saved_ebp;
+                            break;
+                        }
+                    }
+                    state.set(Register::Rbp, ebp);
+                    state.rip = eip;
                 }
                 state.set(Register::Rax, retval);
             }
@@ -51476,6 +51525,39 @@ impl PeHostRuntime {
                     self.console.control_handlers.retain(|h| *h != handler);
                 }
                 state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::GenerateConsoleCtrlEvent => {
+                // GenerateConsoleCtrlEvent(event, group) — deliver the
+                // control event to the registered handlers: each guest
+                // PHANDLER_ROUTINE is invoked with the event code; the
+                // first handler returning TRUE consumes the event.
+                let event = arg(0) as u32;
+                let _group = arg(1) as u32;
+                if self.console.ignore_ctrl_c && event == 0 {
+                    // CTRL_C_EVENT with the ignore flag set: succeed.
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let handlers = self.console.control_handlers.clone();
+                let mut delivered = false;
+                for handler in &handlers {
+                    let Ok(result) = self.execute_guest_callback(
+                        &mut CpuState::new(self.guest_arch),
+                        memory,
+                        *handler,
+                        &[u64::from(event)],
+                        "console-control-event",
+                    ) else {
+                        continue;
+                    };
+                    if result != 0 {
+                        delivered = true;
+                        break;
+                    }
+                }
+                state.set(Register::Rax, u64::from(delivered));
                 self.last_error = 0;
             }
             HostThunk::ConvertThreadToFiber => {
@@ -80376,6 +80458,11 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetDiskFreeSpaceA" => {
                 Self::GetDiskFreeSpaceA
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. })
+                if name == "GenerateConsoleCtrlEvent" =>
+            {
+                Self::GenerateConsoleCtrlEvent
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. })
                 if name == "SetConsoleCtrlHandler" =>
@@ -134739,6 +134826,11 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ordinal: 116,
             name: Some("CloseHandle".to_string()),
             target: ExportTarget::Rva(0x1100),
+        },
+        ExportSymbol {
+            ordinal: 900,
+            name: Some("GenerateConsoleCtrlEvent".to_string()),
+            target: ExportTarget::Rva(0x20a0),
         },
     ];
 

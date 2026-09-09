@@ -851,20 +851,7 @@ fn classify_partial_reason(dll: &str, export: &str) -> Option<&'static str> {
 /// implementation (pe_runtime.rs); a Partial entry may only be transitional
 /// with one of these (or an equivalent specific reason in the skeleton
 /// tables' `detail`).
-static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[
-    (
-        "kernel32.dll",
-        "RtlUnwind",
-        "simulates the unwind by adjusting RIP to the target; no full SEH frame-walk of \
-         the guest stack",
-    ),
-    (
-        "kernel32.dll",
-        "SetConsoleCtrlHandler",
-        "handler state is recorded but the headless console never delivers normal \
-         console control events",
-    ),
-];
+static PARTIAL_TRANSITION_REASONS: &[(&str, &str, &str)] = &[];
 
 // ---------------------------------------------------------------------------
 // Skeleton tables

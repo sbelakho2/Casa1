@@ -6301,6 +6301,17 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     conformance(
         "kernel32.dll",
+        "SetConsoleCtrlHandler",
+        "casa1-conformance:section11",
+    ),
+    conformance(
+        "kernel32.dll",
+        "GenerateConsoleCtrlEvent",
+        "casa1-conformance:section11",
+    ),
+    conformance("kernel32.dll", "RtlUnwind", "casa1-conformance:section11"),
+    conformance(
+        "kernel32.dll",
         "ReadConsoleA",
         "casa1-conformance:section11",
     ),
