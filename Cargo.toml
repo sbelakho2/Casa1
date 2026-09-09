@@ -78,7 +78,7 @@ exclude = ["windows_reference"]
 # Metal backend. `vulkan`/`opengl` are guest-translation-layer features: they
 # switch the guest-side translation path (vulkan-1.dll / opengl32.dll thunk
 # registration), not the host backend, which is always Metal.
-default = ["vulkan", "opengl"]
+default = ["vulkan", "opengl", "websocket"]
 vulkan = []
 opengl = []
 moltenvk = ["vulkan"]

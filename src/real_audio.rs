@@ -4073,16 +4073,25 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // Requires real audio hardware; hangs on headless/CI
     fn real_audio_backend_creates() {
-        let backend = RealAudioBackend::new();
-        assert!(backend.is_ok(), "expected audio backend to initialize");
-        let backend = backend.unwrap();
+        // Capability gate: audio services/hardware may be absent (headless
+        // CI, VMs without a CoreAudio/WASAPI device). The backend itself
+        // always constructs, so probe the device list instead.
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!(
+                    "skipping real_audio_backend_creates: no audio services available ({error})"
+                );
+                return;
+            }
+        };
         let devices = backend.enumerate_devices();
-        // On CI or headless systems, there may be no devices
-        if !devices.is_empty() {
-            assert!(devices.iter().any(|d| d.is_default || !d.name.is_empty()));
+        if devices.is_empty() {
+            eprintln!("skipping real_audio_backend_creates: no audio output devices present");
+            return;
         }
+        assert!(devices.iter().any(|d| d.is_default || !d.name.is_empty()));
     }
 
     #[test]
@@ -4251,29 +4260,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware (no mock device available in CI)
     fn default_device_detection() {
-        let backend = RealAudioBackend::new().unwrap();
-        let devices = backend.enumerate_devices();
-        if !devices.is_empty() {
-            let default_id = backend.default_device_id();
-            assert!(default_id.is_ok(), "expected Ok, got {default_id:?}");
+        // Capability gate: requires at least one real audio output device.
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping default_device_detection: no audio services ({error})");
+                return;
+            }
+        };
+        if backend.enumerate_devices().is_empty() {
+            eprintln!("skipping default_device_detection: no audio output devices present");
+            return;
         }
+        let default_id = backend.default_device_id();
+        assert!(default_id.is_ok(), "expected Ok, got {default_id:?}");
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware (cannot create stream without physical device)
     fn latency_log_records_entries() {
-        let backend = RealAudioBackend::new().unwrap();
+        // Capability gate: the backend must initialize (audio services).
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping latency_log_records_entries: no audio services ({error})");
+                return;
+            }
+        };
         let log = backend.latency_log();
         // The log starts empty; entries are added when streams open
         assert!(log.len() <= 10);
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware (needs hotpluggable physical device to test)
     fn device_hotplug_detect_changes() {
-        let mut backend = RealAudioBackend::new().unwrap();
+        // Capability gate: requires a live audio host to re-enumerate
+        // (works with zero devices too, but a host is needed).
+        let mut backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping device_hotplug_detect_changes: no audio services ({error})");
+                return;
+            }
+        };
         // Calling detect_device_changes should succeed even if no changes
         let result = backend.detect_device_changes();
         assert!(result.is_ok(), "expected Ok, got {result:?}");

@@ -1009,7 +1009,6 @@ pub struct DeferredContext {
 
 #[derive(Debug, Clone)]
 pub struct Direct3D9Shim {
-    enabled: bool,
     next_id: D3d9DeviceId,
     next_vertex_buffer_id: D3d9VertexBufferId,
     next_index_buffer_id: D3d9IndexBufferId,
@@ -3942,9 +3941,8 @@ fn remove_id_entry<T>(map: &mut BTreeMap<u64, T>, id: u64, kind: &str) -> AppRes
 }
 
 impl Direct3D9Shim {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new() -> Self {
         Direct3D9Shim {
-            enabled,
             next_id: 1,
             next_vertex_buffer_id: 1,
             next_index_buffer_id: 1,
@@ -3958,15 +3956,6 @@ impl Direct3D9Shim {
     }
 
     pub fn create_device(&mut self) -> AppResult<Direct3D9Device> {
-        if !self.enabled {
-            return Err(AppError::new(
-                ReasonCode::RcD3d9NotSupported,
-                "d3d9 is disabled for this GE",
-            )
-            .with_hint(
-                "enable the Direct3D9 compatibility shim for legacy fixed-function titles",
-            ));
-        }
         let id = self.next_id;
         self.next_id += 1;
         let mut device = Direct3D9Device {
@@ -4306,8 +4295,8 @@ pub fn d3d11_create_device_and_swapchain(
     create_device_internal(request, Some(swapchain_desc))
 }
 
-pub fn direct3d_create9(enabled: bool) -> Direct3D9Shim {
-    Direct3D9Shim::new(enabled)
+pub fn direct3d_create9() -> Direct3D9Shim {
+    Direct3D9Shim::new()
 }
 
 fn create_device_internal(

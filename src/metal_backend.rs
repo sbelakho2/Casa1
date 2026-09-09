@@ -88,10 +88,12 @@ impl_encoder_objc_ptr_ref!(metal::RenderCommandEncoderRef);
 impl_encoder_objc_ptr_ref!(metal::ComputeCommandEncoderRef);
 impl_encoder_objc_ptr_ref!(metal::BlitCommandEncoderRef);
 impl_encoder_objc_ptr_ref!(metal::AccelerationStructureCommandEncoderRef);
+impl_encoder_objc_ptr_ref!(metal::ParallelRenderCommandEncoderRef);
 impl_encoder_objc_ptr_owned!(metal::RenderCommandEncoder);
 impl_encoder_objc_ptr_owned!(metal::ComputeCommandEncoder);
 impl_encoder_objc_ptr_owned!(metal::BlitCommandEncoder);
 impl_encoder_objc_ptr_owned!(metal::AccelerationStructureCommandEncoder);
+impl_encoder_objc_ptr_owned!(metal::ParallelRenderCommandEncoder);
 
 macro_rules! impl_encoder_lifecycle {
     ($ty:ty) => {
@@ -114,6 +116,8 @@ impl_encoder_lifecycle!(metal::RenderCommandEncoder);
 impl_encoder_lifecycle!(metal::ComputeCommandEncoder);
 impl_encoder_lifecycle!(metal::BlitCommandEncoder);
 impl_encoder_lifecycle!(metal::AccelerationStructureCommandEncoder);
+impl_encoder_lifecycle!(metal::ParallelRenderCommandEncoderRef);
+impl_encoder_lifecycle!(metal::ParallelRenderCommandEncoder);
 
 /// RAII guard for raw Metal encoders not wrapped in the typed wrapper
 /// structs: ends encoding exactly once, on explicit `end()` or on drop, so
@@ -1660,6 +1664,14 @@ pub struct MetalGpuBackend {
     libraries: BTreeMap<u64, metal::Library>,
     render_pipelines: BTreeMap<u64, metal::RenderPipelineState>,
     compute_pipelines: BTreeMap<u64, metal::ComputePipelineState>,
+    /// Registered placement heaps (Feature 11). Heaps are never evicted
+    /// automatically: they own GPU memory whose placed resources live in the
+    /// buffer/texture registries, so release is always explicit via
+    /// `destroy_heap` (which drops the placed resources first).
+    heaps: BTreeMap<u64, MetalHeap>,
+    /// Registered residency sets (Feature 12). Bounded like the other
+    /// registries; a set holds no GPU memory itself.
+    residency_sets: BTreeMap<u64, MetalResidencySet>,
     /// Persistent shader-library cache: identical MSL source compiles once.
     /// The map stores the registered library id; ids stay valid for the
     /// lifetime of the backend (the registry holds the compiled library).
@@ -1761,6 +1773,8 @@ impl MetalGpuBackend {
             libraries: BTreeMap::new(),
             render_pipelines: BTreeMap::new(),
             compute_pipelines: BTreeMap::new(),
+            heaps: BTreeMap::new(),
+            residency_sets: BTreeMap::new(),
             shader_library_cache: std::collections::HashMap::new(),
             render_pipeline_cache: std::collections::HashMap::new(),
             compute_pipeline_cache: std::collections::HashMap::new(),
@@ -2006,13 +2020,43 @@ impl MetalGpuBackend {
     }
 
     /// Destroy a buffer.
+    ///
+    /// A heap sub-allocation has its byte range returned to the owning heap
+    /// allocator (see [`MetalHeap`] for the reuse-synchronization contract),
+    /// and the buffer is purged from every residency set before its Metal
+    /// object is released. Destroying an unknown id is a no-op.
     pub fn destroy_buffer(&mut self, id: u64) {
-        self.buffers.remove(&id);
+        if let Some(buffer) = self.buffers.remove(&id) {
+            let ptr =
+                metal::foreign_types::ForeignType::as_ptr(&buffer) as *mut objc::runtime::Object;
+            self.purge_allocation_from_residency_sets(ptr);
+            drop(buffer);
+            for (_, heap) in self.heaps.iter_mut() {
+                if heap.release_allocation(id) {
+                    break;
+                }
+            }
+        }
     }
 
     /// Destroy a texture.
+    ///
+    /// A heap sub-allocation has its byte range returned to the owning heap
+    /// allocator (see [`MetalHeap`] for the reuse-synchronization contract),
+    /// and the texture is purged from every residency set before its Metal
+    /// object is released. Destroying an unknown id is a no-op.
     pub fn destroy_texture(&mut self, id: u64) {
-        self.textures.remove(&id);
+        if let Some(texture) = self.textures.remove(&id) {
+            let ptr =
+                metal::foreign_types::ForeignType::as_ptr(&texture) as *mut objc::runtime::Object;
+            self.purge_allocation_from_residency_sets(ptr);
+            drop(texture);
+            for (_, heap) in self.heaps.iter_mut() {
+                if heap.release_allocation(id) {
+                    break;
+                }
+            }
+        }
     }
 
     /// Destroy a shader library.
@@ -5729,8 +5773,27 @@ pub fn compute_tessellation_factors(
 }
 
 // ===========================================================================
-// Feature 11: MTLHeap
+// Feature 11: MTLHeap — placement-heap GPU sub-allocation
 // ===========================================================================
+//
+// The heap API below is backed by a real MTLHeap created with
+// MTLHeapTypePlacement (macOS 10.15+). Placement heaps are Metal's
+// sub-allocation model: the caller chooses the byte offset of every buffer or
+// texture (`newBufferWithLength:options:offset:` /
+// `newTextureWithDescriptor:offset:`), and the device reports the exact
+// footprint and alignment of each resource through
+// `heapBufferSizeAndAlignWithLength:` / `heapTextureSizeAndAlignWithDescriptor:`.
+// Casa1 keeps a first-fit free list expressed in those device-reported
+// footprints, so the recorded offsets are the real GPU offsets (the tests
+// cross-check them against `MTLResource.heapOffset`) and destroying a
+// resource genuinely returns its bytes to the allocator.
+//
+// Synchronization contract (the same as D3D12 placed resources): the memory
+// of a destroyed resource must not be reallocated while GPU work that
+// referenced it is still executing. Metal command buffers retain every
+// resource they use, so the heap bytes stay alive until the last in-flight
+// reference is gone; callers recycle a destroyed resource's range by
+// synchronizing (wait_until_completed or a completion handler) first.
 
 /// Bit flags for heap resource types.
 pub type HeapTypeMask = u32;
@@ -5740,6 +5803,11 @@ pub const HEAP_TYPE_BUFFER: HeapTypeMask = 0x1;
 pub const HEAP_TYPE_TEXTURE: HeapTypeMask = 0x2;
 /// Acceleration structure resources can be allocated from the heap.
 pub const HEAP_TYPE_ACCELERATION_STRUCTURE: HeapTypeMask = 0x4;
+/// All known heap type bits.
+const HEAP_TYPE_MASK_ALL: HeapTypeMask =
+    HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE | HEAP_TYPE_ACCELERATION_STRUCTURE;
+/// The resource types this backend can actually place into a heap.
+const HEAP_TYPE_PLACEABLE: HeapTypeMask = HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE;
 
 /// Type of resource allocated from a heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5753,165 +5821,164 @@ pub enum HeapResourceType {
 }
 
 /// Tracks a single allocation within a heap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeapAllocation {
-    /// Byte offset within the heap.
+    /// Real byte offset of the placed resource inside the heap.
     pub offset: usize,
-    /// Size of the allocation in bytes.
+    /// Device-reported footprint of the resource in heap bytes.
     pub size: usize,
     /// Type of resource allocated.
     pub resource_type: HeapResourceType,
-    /// GPU resource handle.
+    /// GPU resource handle (the registered buffer/texture id).
     pub handle: u64,
 }
 
-/// A Metal heap for GPU memory allocation.
-///
-/// MTLHeap provides sub-allocation for GPU resources, reducing allocation
-/// overhead and enabling resource aliasing.
+/// A contiguous free byte range inside a placement heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeapFreeRange {
+    offset: usize,
+    size: usize,
+}
+
+/// Round `value` up to `alignment` (a power of two, or zero/one for none).
+fn heap_align_up(value: usize, alignment: usize) -> Option<usize> {
+    let a = alignment.max(1);
+    value.checked_add(a - 1).map(|v| v & !(a - 1))
+}
+
+/// A real Metal placement heap with a first-fit free-list allocator.
 pub struct MetalHeap {
     /// Unique GPU resource handle.
     pub handle: u64,
-    /// The underlying Metal heap.
+    /// The underlying Metal placement heap.
     pub heap: metal::Heap,
-    /// Total size of the heap in bytes.
-    pub size: usize,
-    /// Used bytes in the heap.
-    pub used: usize,
-    /// List of active allocations.
-    pub allocations: Vec<HeapAllocation>,
     /// Bit mask of allowed resource types.
     pub type_mask: HeapTypeMask,
+    /// Live allocations keyed by the registered buffer/texture handle.
+    pub allocations: BTreeMap<u64, HeapAllocation>,
+    /// Free byte ranges, sorted by offset and kept non-overlapping.
+    free_ranges: Vec<HeapFreeRange>,
 }
 
-/// Create a Metal heap with the specified size and resource type mask.
-pub fn create_heap(
-    device: &metal::DeviceRef,
-    size: usize,
-    type_mask: HeapTypeMask,
-) -> AppResult<MetalHeap> {
-    if size == 0 {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
-            "heap size must be non-zero",
-        ));
+impl MetalHeap {
+    /// The real on-device heap size in bytes (Metal rounds the request up).
+    pub fn size(&self) -> usize {
+        self.heap.size() as usize
     }
-    let descriptor = metal::HeapDescriptor::new();
-    descriptor.set_size(size as u64);
-    descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-    descriptor.set_cpu_cache_mode(metal::MTLCPUCacheMode::DefaultCache);
-    let heap = device.new_heap(&descriptor);
-    Ok(MetalHeap {
-        handle: alloc_gpu_id(),
-        heap,
-        size,
-        used: 0,
-        allocations: Vec::new(),
-        type_mask,
-    })
+
+    /// Live footprint: the sum of the device-reported allocation footprints.
+    pub fn used(&self) -> usize {
+        self.allocations.values().map(|a| a.size).sum()
+    }
+
+    /// Carve the first free range that can hold `size` bytes at `alignment`.
+    fn alloc_range(&mut self, size: usize, alignment: usize) -> Option<usize> {
+        let (index, start) = self
+            .free_ranges
+            .iter()
+            .enumerate()
+            .find_map(|(index, free)| {
+                let free_end = free.offset.checked_add(free.size)?;
+                let start = heap_align_up(free.offset, alignment)?;
+                start
+                    .checked_add(size)
+                    .filter(|&end| end <= free_end)
+                    .map(|_| (index, start))
+            })?;
+        let free = self.free_ranges[index];
+        let end = start + size;
+        let free_end = free.offset + free.size;
+        if end == free_end {
+            self.free_ranges.remove(index);
+        } else {
+            self.free_ranges[index] = HeapFreeRange {
+                offset: end,
+                size: free_end - end,
+            };
+        }
+        Some(start)
+    }
+
+    /// Return the byte range `[offset, offset + size)` to the free list,
+    /// coalescing it with adjacent free ranges.
+    fn free_range(&mut self, offset: usize, size: usize) {
+        let end = offset + size;
+        let left = self
+            .free_ranges
+            .iter()
+            .position(|r| r.offset + r.size == offset);
+        let right = self.free_ranges.iter().position(|r| r.offset == end);
+        match (left, right) {
+            (Some(l), Some(r)) => {
+                let lhs = self.free_ranges.remove(l);
+                let rhs = self.free_ranges.remove(r - 1);
+                self.free_ranges.insert(
+                    l,
+                    HeapFreeRange {
+                        offset: lhs.offset,
+                        size: lhs.size + size + rhs.size,
+                    },
+                );
+            }
+            (Some(l), None) => {
+                let lhs = self.free_ranges.remove(l);
+                self.free_ranges.insert(
+                    l,
+                    HeapFreeRange {
+                        offset: lhs.offset,
+                        size: lhs.size + size,
+                    },
+                );
+            }
+            (None, Some(r)) => {
+                let rhs = self.free_ranges.remove(r);
+                self.free_ranges.insert(
+                    r,
+                    HeapFreeRange {
+                        offset,
+                        size: size + rhs.size,
+                    },
+                );
+            }
+            (None, None) => {
+                let position = self
+                    .free_ranges
+                    .iter()
+                    .position(|r| r.offset > offset)
+                    .unwrap_or(self.free_ranges.len());
+                self.free_ranges
+                    .insert(position, HeapFreeRange { offset, size });
+            }
+        }
+    }
+
+    /// Release the allocation registered under `handle`, returning its bytes
+    /// to the free list. Returns `false` when the handle was never a live
+    /// allocation of this heap.
+    fn release_allocation(&mut self, handle: u64) -> bool {
+        let Some(allocation) = self.allocations.remove(&handle) else {
+            return false;
+        };
+        self.free_range(allocation.offset, allocation.size);
+        true
+    }
 }
 
-/// Allocate a buffer from a heap.
-pub fn allocate_buffer_from_heap(
-    heap: &mut MetalHeap,
-    size: usize,
-    alignment: usize,
-) -> AppResult<MetalBuffer> {
-    if heap.type_mask & HEAP_TYPE_BUFFER == 0 {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
-            "heap does not support buffer allocations",
-        ));
-    }
-    let aligned_size = align_up(size, alignment.max(16));
-    // `heap.used` must never exceed `heap.size`; if accounting ever
-    // overcommits, `checked_sub` fails instead of underflowing to a huge
-    // "available" value that would let the allocation slip through.
-    let available = heap.size.checked_sub(heap.used).ok_or_else(|| {
-        AppError::new(
-            ReasonCode::RcIo,
-            format!(
-                "heap accounting overcommitted: used {} exceeds size {}",
-                heap.used, heap.size
-            ),
-        )
-    })?;
-    if aligned_size > available {
-        return Err(AppError::new(
-            ReasonCode::RcIo,
-            format!("heap out of memory: requested {aligned_size}, {available} available"),
-        ));
-    }
-    let buffer = heap
-        .heap
-        .new_buffer(
-            aligned_size as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        )
-        .ok_or_else(|| AppError::new(ReasonCode::RcIo, "failed to allocate buffer from heap"))?;
-    let handle = alloc_gpu_id();
-    let offset = heap.used;
-    heap.allocations.push(HeapAllocation {
-        offset,
-        size: aligned_size,
-        resource_type: HeapResourceType::Buffer,
-        handle,
-    });
-    heap.used += aligned_size;
-    Ok(MetalBuffer {
-        handle,
-        buffer,
-        size: aligned_size as u64,
-    })
-}
+/// Options every placed buffer is created with (and the size/alignment query
+/// is made with): the storage mode must match the heap. The hazard tracking
+/// mode stays at its heap-context default, which for heap sub-allocations is
+/// untracked — the D3D12 placed-resource model, where the caller orders
+/// access explicitly.
+const PLACED_BUFFER_OPTIONS: metal::MTLResourceOptions =
+    metal::MTLResourceOptions::StorageModePrivate;
 
-/// Allocate a texture from a heap.
-///
-/// The texture's real byte cost is validated against the remaining heap
-/// space before allocation, mirroring the buffer path. The accounting uses a
-/// conservative estimate (pixels × bytes-per-pixel, 64-byte aligned) so
-/// `heap.used` can never exceed `heap.size` — which previously let later
-/// buffer allocations underflow and "succeed" against an overcommitted heap.
-pub fn allocate_texture_from_heap(
-    heap: &mut MetalHeap,
+/// Build the texture descriptor used for both the size/alignment query and
+/// the placement, so the booked footprint is exactly what Metal allocates.
+fn placed_texture_descriptor(
     width: u32,
     height: u32,
     format: PixelFormat,
-) -> AppResult<MetalTexture> {
-    if heap.type_mask & HEAP_TYPE_TEXTURE == 0 {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
-            "heap does not support texture allocations",
-        ));
-    }
-    let size = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|p| p.checked_mul(format.bytes_per_pixel() as usize))
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("heap texture size overflow for {width}x{height}"),
-            )
-        })?;
-    let aligned_size = align_up(size, 64);
-    let available = heap.size.checked_sub(heap.used).ok_or_else(|| {
-        AppError::new(
-            ReasonCode::RcIo,
-            format!(
-                "heap accounting overcommitted: used {} exceeds size {}",
-                heap.used, heap.size
-            ),
-        )
-    })?;
-    if aligned_size > available {
-        return Err(AppError::new(
-            ReasonCode::RcIo,
-            format!(
-                "heap out of memory: texture needs {aligned_size} bytes, {available} available"
-            ),
-        ));
-    }
-
+) -> metal::TextureDescriptor {
     let descriptor = metal::TextureDescriptor::new();
     descriptor.set_texture_type(metal::MTLTextureType::D2);
     descriptor.set_pixel_format(format.to_metal());
@@ -5924,48 +5991,863 @@ pub fn allocate_texture_from_heap(
             | metal::MTLTextureUsage::ShaderWrite,
     );
     descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-    let texture = heap
-        .heap
-        .new_texture(&descriptor)
-        .ok_or_else(|| AppError::new(ReasonCode::RcIo, "failed to allocate texture from heap"))?;
-    let handle = alloc_gpu_id();
-    let offset = heap.used;
-    heap.allocations.push(HeapAllocation {
-        offset,
-        size: aligned_size,
-        resource_type: HeapResourceType::Texture,
-        handle,
-    });
-    heap.used += aligned_size;
-    Ok(MetalTexture {
-        handle,
-        texture,
-        width,
-        height,
-        format,
-    })
+    descriptor
 }
 
-/// Deallocate a resource from a heap.
-pub fn deallocate_from_heap(heap: &mut MetalHeap, handle: u64) -> AppResult<()> {
-    let index = heap
-        .allocations
-        .iter()
-        .position(|a| a.handle == handle)
-        .ok_or_else(|| {
-            AppError::new(
+// ---------------------------------------------------------------------------
+// Heap API on MetalGpuBackend
+// ---------------------------------------------------------------------------
+
+impl MetalGpuBackend {
+    /// Create and register a placement heap of `size` bytes. Metal rounds the
+    /// backing allocation up; `heap_usage` reports the real size.
+    pub fn create_heap(&mut self, size: usize, type_mask: HeapTypeMask) -> AppResult<u64> {
+        if size == 0 {
+            return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
-                format!("allocation handle {handle} not found"),
+                "heap size must be non-zero",
+            ));
+        }
+        if type_mask & !HEAP_TYPE_MASK_ALL != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("heap type mask {type_mask:#x} has unknown resource-type bits"),
+            ));
+        }
+        if type_mask & HEAP_TYPE_PLACEABLE == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "a heap must allow buffer or texture allocations; acceleration \
+                 structures cannot be placed through this backend",
+            ));
+        }
+        let descriptor = metal::HeapDescriptor::new();
+        descriptor.set_size(size as u64);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_cpu_cache_mode(metal::MTLCPUCacheMode::DefaultCache);
+        descriptor.set_heap_type(metal::MTLHeapType::Placement);
+        let heap = self.device.metal_device().new_heap(&descriptor);
+        let real_size = heap.size() as usize;
+        if real_size == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "device refused the placement heap (zero bytes after rounding)",
+            ));
+        }
+        let handle = alloc_gpu_id();
+        self.heaps.insert(
+            handle,
+            MetalHeap {
+                handle,
+                heap,
+                type_mask,
+                allocations: BTreeMap::new(),
+                free_ranges: vec![HeapFreeRange {
+                    offset: 0,
+                    size: real_size,
+                }],
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Get a registered heap.
+    pub fn get_heap(&self, id: u64) -> Option<&MetalHeap> {
+        self.heaps.get(&id)
+    }
+
+    /// Allocate a buffer from a heap, returning the registered buffer id.
+    ///
+    /// `alignment` is an optional power-of-two minimum placement alignment
+    /// (0 or 1 = the device-reported alignment for this buffer). The buffer
+    /// is created at a real heap offset; `heap_allocation_offset` reports it.
+    pub fn heap_allocate_buffer(
+        &mut self,
+        heap_id: u64,
+        length: usize,
+        alignment: usize,
+    ) -> AppResult<u64> {
+        if length == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "heap buffer length must be non-zero",
+            ));
+        }
+        if alignment > 1 && !alignment.is_power_of_two() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("heap buffer alignment {alignment} is not a power of two"),
+            ));
+        }
+        let size_and_align = self
+            .device
+            .metal_device()
+            .heap_buffer_size_and_align(length as u64, PLACED_BUFFER_OPTIONS);
+        let footprint = size_and_align.size as usize;
+        if footprint == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("device reports a zero footprint for a {length}-byte heap buffer"),
+            ));
+        }
+        let required_alignment = size_and_align.align.max(alignment as u64) as usize;
+        let heap = self.heaps.get_mut(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
             )
         })?;
-    let allocation = heap.allocations.remove(index);
-    heap.used = heap.used.saturating_sub(allocation.size);
-    Ok(())
+        if heap.type_mask & HEAP_TYPE_BUFFER == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("heap {heap_id} does not support buffer allocations"),
+            ));
+        }
+        let offset = heap
+            .alloc_range(footprint, required_alignment)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "heap {heap_id} out of memory: a {length}-byte buffer needs \
+                         {footprint} bytes aligned to {required_alignment}"
+                    ),
+                )
+            })?;
+        let buffer = heap
+            .heap
+            .new_buffer_with_offset(length as u64, PLACED_BUFFER_OPTIONS, offset as u64)
+            .ok_or_else(|| {
+                heap.free_range(offset, footprint);
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "Metal refused the placed buffer (length {length}, offset {offset}) \
+                         in heap {heap_id}"
+                    ),
+                )
+            })?;
+        let handle = alloc_gpu_id();
+        cap_registry(&mut self.buffers);
+        self.buffers.insert(handle, buffer);
+        heap.allocations.insert(
+            handle,
+            HeapAllocation {
+                offset,
+                size: footprint,
+                resource_type: HeapResourceType::Buffer,
+                handle,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Allocate a texture from a heap, returning the registered texture id.
+    pub fn heap_allocate_texture(
+        &mut self,
+        heap_id: u64,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> AppResult<u64> {
+        if width == 0 || height == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("heap texture dimensions must be non-zero (got {width}x{height})"),
+            ));
+        }
+        let descriptor = placed_texture_descriptor(width, height, format);
+        let size_and_align = self
+            .device
+            .metal_device()
+            .heap_texture_size_and_align(&descriptor);
+        let footprint = size_and_align.size as usize;
+        if footprint == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("device reports a zero footprint for a {width}x{height} heap texture"),
+            ));
+        }
+        let required_alignment = size_and_align.align.max(1) as usize;
+        let heap = self.heaps.get_mut(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        if heap.type_mask & HEAP_TYPE_TEXTURE == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("heap {heap_id} does not support texture allocations"),
+            ));
+        }
+        let offset = heap
+            .alloc_range(footprint, required_alignment)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "heap {heap_id} out of memory: a {width}x{height} texture needs \
+                         {footprint} bytes aligned to {required_alignment}"
+                    ),
+                )
+            })?;
+        let texture = heap
+            .heap
+            .new_texture_with_offset(&descriptor, offset as u64)
+            .ok_or_else(|| {
+                heap.free_range(offset, footprint);
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("Metal refused the placed texture (offset {offset}) in heap {heap_id}"),
+                )
+            })?;
+        let handle = alloc_gpu_id();
+        cap_registry(&mut self.textures);
+        self.textures.insert(handle, texture);
+        heap.allocations.insert(
+            handle,
+            HeapAllocation {
+                offset,
+                size: footprint,
+                resource_type: HeapResourceType::Texture,
+                handle,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Return `(live footprint bytes, real heap size bytes)`.
+    pub fn heap_usage(&self, heap_id: u64) -> AppResult<(usize, usize)> {
+        let heap = self.heaps.get(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        Ok((heap.used(), heap.size()))
+    }
+
+    /// The real byte offset of a placed resource inside its heap.
+    pub fn heap_allocation_offset(&self, heap_id: u64, resource_id: u64) -> AppResult<usize> {
+        let heap = self.heaps.get(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        heap.allocations
+            .get(&resource_id)
+            .map(|allocation| allocation.offset)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcGeNotFound,
+                    format!("resource {resource_id} is not allocated in heap {heap_id}"),
+                )
+            })
+    }
+
+    /// Snapshot of the live allocations of a heap (sorted by offset).
+    pub fn heap_allocations(&self, heap_id: u64) -> AppResult<Vec<HeapAllocation>> {
+        let heap = self.heaps.get(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        let mut allocations: Vec<HeapAllocation> = heap.allocations.values().copied().collect();
+        allocations.sort_by_key(|allocation| allocation.offset);
+        Ok(allocations)
+    }
+
+    /// Destroy a heap and everything placed in it.
+    ///
+    /// Metal requires sub-allocated resources to die before their heap, so
+    /// every live placed buffer/texture is unregistered (and purged from any
+    /// residency set) before the heap itself is released.
+    pub fn destroy_heap(&mut self, heap_id: u64) -> AppResult<()> {
+        let heap = self.heaps.remove(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        let heap_ptr =
+            metal::foreign_types::ForeignType::as_ptr(&heap.heap) as *mut objc::runtime::Object;
+        self.purge_allocation_from_residency_sets(heap_ptr);
+        for (handle, allocation) in &heap.allocations {
+            match allocation.resource_type {
+                HeapResourceType::Buffer => {
+                    if let Some(buffer) = self.buffers.remove(handle) {
+                        let ptr = metal::foreign_types::ForeignType::as_ptr(&buffer)
+                            as *mut objc::runtime::Object;
+                        self.purge_allocation_from_residency_sets(ptr);
+                        drop(buffer);
+                    }
+                }
+                HeapResourceType::Texture => {
+                    if let Some(texture) = self.textures.remove(handle) {
+                        let ptr = metal::foreign_types::ForeignType::as_ptr(&texture)
+                            as *mut objc::runtime::Object;
+                        self.purge_allocation_from_residency_sets(ptr);
+                        drop(texture);
+                    }
+                }
+                HeapResourceType::AccelerationStructure => {}
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Return the (used, total) bytes for a heap.
-pub fn heap_usage(heap: &MetalHeap) -> (usize, usize) {
-    (heap.used, heap.size)
+// ===========================================================================
+// Feature 12: MTLResidencySet — explicit residency management
+// ===========================================================================
+//
+// metal 0.31 binds nothing of MTLResidencySet (no descriptor type, no set
+// type, no device method), so this module drives the real Objective-C API
+// through the objc runtime the metal crate already depends on — the same
+// technique the swapchain code uses for CAMetalLayer properties the crate
+// also misses. The device is probed with `respondsToSelector:` before any
+// message is sent, so hosts without the API fail cleanly instead of crashing
+// with an unrecognized selector.
+//
+// A residency set makes its allocations (buffers, textures, heaps) explicitly
+// resident: membership changes are staged and applied by commit();
+// request_residency() asks the device to make the set resident, and removing
+// an allocation and committing evicts it. The set does not retain its
+// allocations — the backend destroy paths purge destroyed resources from
+// every set first (see purge_allocation_from_residency_sets).
+
+/// Types that can be added to an MTLResidencySet: Metal buffers, textures,
+/// and heaps all conform to the MTLAllocation protocol.
+pub trait ResidencyAllocationPtr {
+    /// Raw Objective-C object pointer of the MTLAllocation.
+    fn residency_obj_ptr(&self) -> *mut objc::runtime::Object;
+}
+
+macro_rules! impl_residency_allocation_owned {
+    ($ty:ty) => {
+        impl ResidencyAllocationPtr for $ty {
+            fn residency_obj_ptr(&self) -> *mut objc::runtime::Object {
+                metal::foreign_types::ForeignType::as_ptr(self) as *mut objc::runtime::Object
+            }
+        }
+    };
+}
+
+macro_rules! impl_residency_allocation_ref {
+    ($ty:ty) => {
+        impl ResidencyAllocationPtr for $ty {
+            fn residency_obj_ptr(&self) -> *mut objc::runtime::Object {
+                metal::foreign_types::ForeignTypeRef::as_ptr(self) as *mut objc::runtime::Object
+            }
+        }
+    };
+}
+
+impl_residency_allocation_owned!(metal::Buffer);
+impl_residency_allocation_ref!(metal::BufferRef);
+impl_residency_allocation_owned!(metal::Texture);
+impl_residency_allocation_ref!(metal::TextureRef);
+impl_residency_allocation_owned!(metal::Heap);
+impl_residency_allocation_ref!(metal::HeapRef);
+
+/// Build an owned (+1) NSString from a Rust string. The caller must release
+/// the result (with `msg_send![..., release]`) once it is no longer needed.
+/// Returns `None` on allocation failure or interior NUL bytes.
+fn objc_nsstring_owned(value: &str) -> Option<*mut objc::runtime::Object> {
+    let class = objc::runtime::Class::get("NSString")?;
+    let c_string = std::ffi::CString::new(value).ok()?;
+    unsafe {
+        let allocated: *mut objc::runtime::Object = msg_send![class, alloc];
+        if allocated.is_null() {
+            return None;
+        }
+        let initialized: *mut objc::runtime::Object =
+            msg_send![allocated, initWithUTF8String: c_string.as_ptr()];
+        if initialized.is_null() {
+            let _: () = msg_send![allocated, release];
+            return None;
+        }
+        Some(initialized)
+    }
+}
+
+/// RAII handle to a real MTLResidencySet (owns the +1 Objective-C object
+/// returned by `newResidencySetWithDescriptor:error:`).
+pub struct MetalResidencySet {
+    object: *mut objc::runtime::Object,
+}
+
+// The owned MTLResidencySet object is thread-safe for messaging and release,
+// exactly like the metal crate's own wrappers (declared Sync + Send); callers
+// synchronize multi-thread use of the set itself.
+unsafe impl Send for MetalResidencySet {}
+unsafe impl Sync for MetalResidencySet {}
+
+impl Drop for MetalResidencySet {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+impl MetalResidencySet {
+    fn from_raw(object: *mut objc::runtime::Object) -> Self {
+        Self { object }
+    }
+
+    /// The label given at creation, if any.
+    pub fn label(&self) -> Option<String> {
+        unsafe {
+            let label: *mut objc::runtime::Object = msg_send![self.object, label];
+            if label.is_null() {
+                return None;
+            }
+            let utf8: *const std::os::raw::c_char = msg_send![label, UTF8String];
+            if utf8.is_null() {
+                return None;
+            }
+            Some(
+                std::ffi::CStr::from_ptr(utf8)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+
+    /// Number of unique allocations in the set (includes uncommitted
+    /// membership changes).
+    pub fn allocation_count(&self) -> u64 {
+        unsafe { msg_send![self.object, allocationCount] }
+    }
+
+    /// Memory footprint of the set in bytes at the last commit.
+    pub fn allocated_size(&self) -> u64 {
+        unsafe { msg_send![self.object, allocatedSize] }
+    }
+
+    /// Commit the staged membership changes (adds and removes).
+    pub fn commit(&self) {
+        unsafe {
+            let _: () = msg_send![self.object, commit];
+        }
+    }
+
+    /// Request that the set and its committed allocations be made resident.
+    pub fn request_residency(&self) {
+        unsafe {
+            let _: () = msg_send![self.object, requestResidency];
+        }
+    }
+
+    /// Request that the set and its committed allocations be made
+    /// non-resident.
+    pub fn end_residency(&self) {
+        unsafe {
+            let _: () = msg_send![self.object, endResidency];
+        }
+    }
+
+    /// Add one allocation (a buffer, texture, or heap) to the set.
+    pub fn add_allocation<A: ResidencyAllocationPtr + ?Sized>(&self, allocation: &A) {
+        self.add_allocation_ptr(allocation.residency_obj_ptr());
+    }
+
+    /// Mark one allocation for removal at the next commit.
+    pub fn remove_allocation<A: ResidencyAllocationPtr + ?Sized>(&self, allocation: &A) {
+        self.remove_allocation_ptr(allocation.residency_obj_ptr());
+    }
+
+    /// Mark every allocation for removal at the next commit.
+    pub fn remove_all_allocations(&self) {
+        unsafe {
+            let _: () = msg_send![self.object, removeAllAllocations];
+        }
+    }
+
+    /// Whether the allocation is a member of the set (includes uncommitted
+    /// membership changes).
+    pub fn contains_allocation<A: ResidencyAllocationPtr + ?Sized>(&self, allocation: &A) -> bool {
+        self.contains_allocation_ptr(allocation.residency_obj_ptr())
+    }
+
+    fn add_allocation_ptr(&self, allocation: *mut objc::runtime::Object) {
+        unsafe {
+            let _: () = msg_send![self.object, addAllocation: allocation];
+        }
+    }
+
+    fn remove_allocation_ptr(&self, allocation: *mut objc::runtime::Object) {
+        unsafe {
+            let _: () = msg_send![self.object, removeAllocation: allocation];
+        }
+    }
+
+    fn contains_allocation_ptr(&self, allocation: *mut objc::runtime::Object) -> bool {
+        unsafe { msg_send![self.object, containsAllocation: allocation] }
+    }
+}
+
+/// Create a residency set on a Metal device.
+///
+/// Errors with [`ReasonCode::RcUnsupportedPlatformApi`] when the device does
+/// not expose `newResidencySetWithDescriptor:error:` (MTLResidencySet).
+pub fn create_residency_set(
+    device: &metal::DeviceRef,
+    label: Option<&str>,
+    initial_capacity: usize,
+) -> AppResult<MetalResidencySet> {
+    let device_object = (device as *const metal::DeviceRef) as *mut objc::runtime::Object;
+    unsafe {
+        let has_api: bool = msg_send![
+            device_object,
+            respondsToSelector: sel!(newResidencySetWithDescriptor:error:)
+        ];
+        if !has_api {
+            return Err(AppError::new(
+                ReasonCode::RcUnsupportedPlatformApi,
+                "this Metal device does not expose newResidencySetWithDescriptor:error: \
+                 (MTLResidencySet); residency management is unavailable",
+            ));
+        }
+        let descriptor_class =
+            objc::runtime::Class::get("MTLResidencySetDescriptor").ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcUnsupportedPlatformApi,
+                    "MTLResidencySetDescriptor class not found; residency management is \
+                     unavailable",
+                )
+            })?;
+        let descriptor: *mut objc::runtime::Object = msg_send![descriptor_class, new];
+        if descriptor.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "failed to allocate MTLResidencySetDescriptor",
+            ));
+        }
+        let () = msg_send![descriptor, setInitialCapacity: initial_capacity as u64];
+        // A label needs one +1 NSString that is applied to the descriptor
+        // (a standard copy property) and, on runtimes where the created set
+        // does not inherit the descriptor label (observed on macOS 26), to
+        // the set object itself when it exposes the setLabel: accessor.
+        let staged_label: Option<*mut objc::runtime::Object> = if let Some(text) = label {
+            match objc_nsstring_owned(text) {
+                Some(ns_label) => {
+                    let _: () = msg_send![descriptor, setLabel: ns_label];
+                    Some(ns_label)
+                }
+                None => {
+                    let _: () = msg_send![descriptor, release];
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "residency set label is not a valid C string",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
+        let set: *mut objc::runtime::Object = msg_send![
+            device_object,
+            newResidencySetWithDescriptor: descriptor
+            error: &mut error
+        ];
+        let _: () = msg_send![descriptor, release];
+        if set.is_null() {
+            if let Some(ns_label) = staged_label {
+                let _: () = msg_send![ns_label, release];
+            }
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "failed to create MTLResidencySet (device returned nil)",
+            ));
+        }
+        if let Some(ns_label) = staged_label {
+            let accepts_label: bool = msg_send![set, respondsToSelector: sel!(setLabel:)];
+            if accepts_label {
+                let _: () = msg_send![set, setLabel: ns_label];
+            }
+            let _: () = msg_send![ns_label, release];
+        }
+        Ok(MetalResidencySet::from_raw(set))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Residency-set API on MetalGpuBackend
+// ---------------------------------------------------------------------------
+
+impl MetalGpuBackend {
+    fn residency_set(&self, set_id: u64) -> AppResult<&MetalResidencySet> {
+        self.residency_sets.get(&set_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("residency set {set_id} not found"),
+            )
+        })
+    }
+
+    /// Remove an allocation from every registered residency set.
+    ///
+    /// Called by the destroy paths so a destroyed resource can never dangle
+    /// inside a set (residency sets do not retain their allocations).
+    fn purge_allocation_from_residency_sets(&self, allocation: *mut objc::runtime::Object) {
+        for set in self.residency_sets.values() {
+            set.remove_allocation_ptr(allocation);
+        }
+    }
+
+    /// Create and register a residency set.
+    pub fn create_residency_set(
+        &mut self,
+        label: Option<&str>,
+        initial_capacity: usize,
+    ) -> AppResult<u64> {
+        let set = create_residency_set(self.device.metal_device(), label, initial_capacity)?;
+        let id = alloc_gpu_id();
+        cap_registry(&mut self.residency_sets);
+        self.residency_sets.insert(id, set);
+        Ok(id)
+    }
+
+    /// Get a registered residency set.
+    pub fn get_residency_set(&self, id: u64) -> Option<&MetalResidencySet> {
+        self.residency_sets.get(&id)
+    }
+
+    /// Destroy a residency set (releases the MTLResidencySet object).
+    pub fn destroy_residency_set(&mut self, id: u64) -> AppResult<()> {
+        if self.residency_sets.remove(&id).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("residency set {id} not found"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add a registered buffer to a residency set.
+    pub fn residency_set_add_buffer(&self, set_id: u64, buffer_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let buffer = self.buffers.get(&buffer_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("buffer {buffer_id} not found"),
+            )
+        })?;
+        set.add_allocation(buffer);
+        Ok(())
+    }
+
+    /// Remove a registered buffer from a residency set (applied at commit).
+    pub fn residency_set_remove_buffer(&self, set_id: u64, buffer_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let buffer = self.buffers.get(&buffer_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("buffer {buffer_id} not found"),
+            )
+        })?;
+        set.remove_allocation(buffer);
+        Ok(())
+    }
+
+    /// Whether a registered buffer is a member of a residency set. A buffer
+    /// that is not registered cannot be a member (destruction purges it).
+    pub fn residency_set_contains_buffer(&self, set_id: u64, buffer_id: u64) -> AppResult<bool> {
+        let set = self.residency_set(set_id)?;
+        let Some(buffer) = self.buffers.get(&buffer_id) else {
+            return Ok(false);
+        };
+        Ok(set.contains_allocation(buffer))
+    }
+
+    /// Add a registered texture to a residency set.
+    pub fn residency_set_add_texture(&self, set_id: u64, texture_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let texture = self.textures.get(&texture_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("texture {texture_id} not found"),
+            )
+        })?;
+        set.add_allocation(texture);
+        Ok(())
+    }
+
+    /// Remove a registered texture from a residency set (applied at commit).
+    pub fn residency_set_remove_texture(&self, set_id: u64, texture_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let texture = self.textures.get(&texture_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("texture {texture_id} not found"),
+            )
+        })?;
+        set.remove_allocation(texture);
+        Ok(())
+    }
+
+    /// Whether a registered texture is a member of a residency set.
+    pub fn residency_set_contains_texture(&self, set_id: u64, texture_id: u64) -> AppResult<bool> {
+        let set = self.residency_set(set_id)?;
+        let Some(texture) = self.textures.get(&texture_id) else {
+            return Ok(false);
+        };
+        Ok(set.contains_allocation(texture))
+    }
+
+    /// Add a registered heap to a residency set (heap residency covers its
+    /// placed resources).
+    pub fn residency_set_add_heap(&self, set_id: u64, heap_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let heap = self.heaps.get(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        set.add_allocation(&heap.heap);
+        Ok(())
+    }
+
+    /// Remove a registered heap from a residency set (applied at commit).
+    pub fn residency_set_remove_heap(&self, set_id: u64, heap_id: u64) -> AppResult<()> {
+        let set = self.residency_set(set_id)?;
+        let heap = self.heaps.get(&heap_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("heap {heap_id} not found"),
+            )
+        })?;
+        set.remove_allocation(&heap.heap);
+        Ok(())
+    }
+
+    /// Whether a registered heap is a member of a residency set.
+    pub fn residency_set_contains_heap(&self, set_id: u64, heap_id: u64) -> AppResult<bool> {
+        let set = self.residency_set(set_id)?;
+        let Some(heap) = self.heaps.get(&heap_id) else {
+            return Ok(false);
+        };
+        Ok(set.contains_allocation(&heap.heap))
+    }
+
+    /// Number of unique allocations in a residency set.
+    pub fn residency_set_allocation_count(&self, set_id: u64) -> AppResult<u64> {
+        Ok(self.residency_set(set_id)?.allocation_count())
+    }
+
+    /// Memory footprint of a residency set at its last commit.
+    pub fn residency_set_allocated_size(&self, set_id: u64) -> AppResult<u64> {
+        Ok(self.residency_set(set_id)?.allocated_size())
+    }
+
+    /// Commit the staged membership changes of a residency set.
+    pub fn residency_set_commit(&self, set_id: u64) -> AppResult<()> {
+        self.residency_set(set_id)?.commit();
+        Ok(())
+    }
+
+    /// Request that a residency set and its allocations be made resident.
+    pub fn residency_set_request_residency(&self, set_id: u64) -> AppResult<()> {
+        self.residency_set(set_id)?.request_residency();
+        Ok(())
+    }
+
+    /// Request that a residency set and its allocations be made non-resident.
+    pub fn residency_set_end_residency(&self, set_id: u64) -> AppResult<()> {
+        self.residency_set(set_id)?.end_residency();
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Feature 13: MTLParallelRenderCommandEncoder — parallel command recording
+// ===========================================================================
+//
+// A parallel render command encoder records one render pass from several
+// child render command encoders, letting the driver split the pass across
+// GPU cores. Metal allows exactly one live child at a time: a child must be
+// ended before the next child is created, and the parallel encoder itself
+// must be ended before its command buffer commits. Children are handed out
+// as the backend's own [`MetalRenderEncoder`], so every pipeline/viewport/
+// draw helper applies to parallel recording unchanged. The parallel encoder
+// joins the encoder-lifecycle macro family, so an abandoned wrapper still
+// ends its children and itself on drop (Metal would otherwise raise the
+// "encoder released without endEncoding" assertion at commit time).
+
+/// Records one render pass through a sequence of child render encoders.
+pub struct MetalParallelRenderEncoder {
+    /// The active child, dropped (and therefore ended) before `parallel`.
+    child: Option<MetalRenderEncoder>,
+    /// The underlying parallel encoder; ends itself on drop via
+    /// [`AutoEndEncoder`].
+    parallel: AutoEndEncoder<metal::ParallelRenderCommandEncoder>,
+}
+
+impl MetalParallelRenderEncoder {
+    /// Create a parallel render encoder for `descriptor` on `command_buffer`.
+    pub fn new(
+        command_buffer: &metal::CommandBufferRef,
+        descriptor: &metal::RenderPassDescriptorRef,
+    ) -> AppResult<Self> {
+        let parallel = command_buffer
+            .new_parallel_render_command_encoder(descriptor)
+            .to_owned();
+        if metal::foreign_types::ForeignType::as_ptr(&parallel).is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "failed to create MTLParallelRenderCommandEncoder (device returned nil)",
+            ));
+        }
+        Ok(Self {
+            child: None,
+            parallel: AutoEndEncoder::new(parallel),
+        })
+    }
+
+    /// Access the active child encoder, creating one on first use.
+    ///
+    /// Call [`Self::end_child`] before starting the next child: Metal only
+    /// permits one live child per parallel encoder.
+    pub fn child_encoder(&mut self) -> AppResult<&mut MetalRenderEncoder> {
+        if self.child.is_none() {
+            let raw = self
+                .parallel
+                .encoder_ref()
+                .render_command_encoder()
+                .to_owned();
+            if metal::foreign_types::ForeignType::as_ptr(&raw).is_null() {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    "failed to create a parallel child render encoder (device returned nil)",
+                ));
+            }
+            self.child = Some(MetalRenderEncoder::from_raw(raw));
+        }
+        Ok(self.child.as_mut().expect("child was just created"))
+    }
+
+    /// End the active child so the next child can start.
+    pub fn end_child(&mut self) {
+        if let Some(child) = self.child.take() {
+            child.end_encoding();
+        }
+    }
+
+    /// End the active child (if any) and the parallel encoder itself.
+    ///
+    /// Idempotent: finishing an already-finished encoder is a no-op, and the
+    /// wrapper's drop path ends everything when `finish` was never called.
+    pub fn finish(&mut self) {
+        self.end_child();
+        self.parallel.end();
+    }
 }
 
 // ===========================================================================
@@ -7835,46 +8717,628 @@ mod tests {
     }
 
     #[test]
-    fn metal_heap_allocation() {
-        let device = MetalDevice::system_default().unwrap();
-        let mut heap = create_heap(
-            device.device(),
-            1024 * 1024,
-            HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE,
-        )
-        .expect("heap");
+    fn metal_heap_placement_allocation_and_usage() {
+        let mut backend = create_backend();
+        let heap_id = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE)
+            .expect("heap");
+        let heap = backend.get_heap(heap_id).expect("registered heap");
         assert_ne!(heap.handle, 0);
-        assert_eq!(heap.size, 1024 * 1024);
-        assert_eq!(heap.allocations.len(), 0);
-        let (used, total) = heap_usage(&heap);
+        assert_eq!(heap.type_mask, HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE);
+        assert_eq!(heap.heap.heap_type(), metal::MTLHeapType::Placement);
+        let real_size = heap.size();
+        assert!(real_size >= 1024 * 1024);
+        let (used, total) = backend.heap_usage(heap_id).expect("heap usage");
         assert_eq!(used, 0);
-        assert_eq!(total, 1024 * 1024);
+        assert_eq!(total, real_size);
 
-        let buffer = allocate_buffer_from_heap(&mut heap, 4096, 256).expect("buffer from heap");
-        assert_ne!(buffer.handle, 0);
-        assert!(buffer.size >= 4096);
-        assert_eq!(heap.allocations.len(), 1);
-        assert_eq!(heap.allocations[0].resource_type, HeapResourceType::Buffer);
-        let (used_after_buf, _) = heap_usage(&heap);
-        assert!(used_after_buf > 0);
+        let buffer_id = backend
+            .heap_allocate_buffer(heap_id, 4096, 0)
+            .expect("buffer from heap");
+        let buffer_offset = backend
+            .heap_allocation_offset(heap_id, buffer_id)
+            .expect("buffer offset");
+        let placed_buffer = backend.get_buffer(buffer_id).expect("placed buffer");
+        assert_eq!(
+            buffer_offset,
+            placed_buffer.heap_offset() as usize,
+            "recorded offset must be the real MTLResource.heapOffset"
+        );
+        let (used_after_buffer, _) = backend.heap_usage(heap_id).expect("heap usage");
+        assert!(used_after_buffer >= 4096);
 
-        let texture = allocate_texture_from_heap(&mut heap, 64, 64, PixelFormat::Rgba8Unorm)
+        let texture_id = backend
+            .heap_allocate_texture(heap_id, 64, 64, PixelFormat::Rgba8Unorm)
             .expect("texture from heap");
-        assert_ne!(texture.handle, 0);
-        assert_eq!(texture.width, 64);
-        assert_eq!(heap.allocations.len(), 2);
-        let (used_after_tex, _) = heap_usage(&heap);
-        assert!(used_after_tex > used_after_buf);
+        let texture_offset = backend
+            .heap_allocation_offset(heap_id, texture_id)
+            .expect("texture offset");
+        let texture = backend.get_texture(texture_id).expect("placed texture");
+        assert_eq!(
+            texture_offset,
+            texture.heap_offset() as usize,
+            "recorded offset must be the real MTLResource.heapOffset"
+        );
+        assert_eq!(texture.width(), 64);
+        assert_eq!(texture.height(), 64);
+        assert_eq!(texture.pixel_format(), metal::MTLPixelFormat::RGBA8Unorm);
+        let (used_after_texture, _) = backend.heap_usage(heap_id).expect("heap usage");
+        assert!(used_after_texture > used_after_buffer);
 
-        deallocate_from_heap(&mut heap, buffer.handle).expect("deallocate");
-        assert_eq!(heap.allocations.len(), 1);
-        assert!(deallocate_from_heap(&mut heap, 99999).is_err());
-
-        let mut buffer_only_heap =
-            create_heap(device.device(), 4096, HEAP_TYPE_BUFFER).expect("buf heap");
+        let allocations = backend.heap_allocations(heap_id).expect("allocations");
+        assert_eq!(allocations.len(), 2);
+        for pair in allocations.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(
+                b.offset >= a.offset + a.size,
+                "heap allocations must never overlap"
+            );
+        }
         assert!(
-            allocate_texture_from_heap(&mut buffer_only_heap, 64, 64, PixelFormat::Rgba8Unorm)
+            backend.heap_allocation_offset(heap_id, 999_999).is_err(),
+            "unknown resource id must not report an offset"
+        );
+        assert!(backend.heap_usage(999_999).is_err());
+    }
+
+    #[test]
+    fn metal_heap_free_list_reuses_destroyed_ranges() {
+        let mut backend = create_backend();
+        let heap_id = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_BUFFER)
+            .expect("heap");
+        let first = backend
+            .heap_allocate_buffer(heap_id, 4096, 0)
+            .expect("first");
+        let second = backend
+            .heap_allocate_buffer(heap_id, 4096, 0)
+            .expect("second");
+        let first_offset = backend.heap_allocation_offset(heap_id, first).unwrap();
+        let second_offset = backend.heap_allocation_offset(heap_id, second).unwrap();
+        assert_ne!(first_offset, second_offset);
+        let (used, total) = backend.heap_usage(heap_id).unwrap();
+        assert!(used >= 8192 && used <= total);
+
+        backend.destroy_buffer(first);
+        let third = backend
+            .heap_allocate_buffer(heap_id, 4096, 0)
+            .expect("third reuses the hole");
+        let third_offset = backend.heap_allocation_offset(heap_id, third).unwrap();
+        assert_eq!(
+            first_offset, third_offset,
+            "first-fit must reuse the range freed by destroy_buffer"
+        );
+
+        backend.destroy_buffer(second);
+        backend.destroy_buffer(third);
+        let (used_after_all, _) = backend.heap_usage(heap_id).unwrap();
+        assert_eq!(used_after_all, 0, "all placed buffers destroyed");
+        backend.destroy_buffer(first);
+        backend.destroy_buffer(999_999);
+
+        assert!(
+            backend
+                .heap_allocate_texture(heap_id, 64, 64, PixelFormat::Rgba8Unorm)
+                .is_err(),
+            "buffer-only heap refuses texture allocations"
+        );
+        let texture_heap = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_TEXTURE)
+            .expect("texture heap");
+        assert!(
+            backend.heap_allocate_buffer(texture_heap, 64, 0).is_err(),
+            "texture-only heap refuses buffer allocations"
+        );
+    }
+
+    #[test]
+    fn metal_heap_validation_and_error_paths() {
+        let mut backend = create_backend();
+        assert!(backend.create_heap(0, HEAP_TYPE_BUFFER).is_err());
+        assert!(backend.create_heap(4096, 0).is_err());
+        assert!(
+            backend
+                .create_heap(4096, HEAP_TYPE_ACCELERATION_STRUCTURE)
                 .is_err()
+        );
+        assert!(backend.create_heap(4096, 0x10).is_err());
+
+        let heap_id = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_BUFFER)
+            .expect("heap");
+        assert!(backend.heap_allocate_buffer(heap_id, 0, 0).is_err());
+        assert!(backend.heap_allocate_buffer(heap_id, 256, 3).is_err());
+        assert!(backend.heap_allocate_buffer(99_999, 256, 0).is_err());
+        assert!(
+            backend
+                .heap_allocate_texture(heap_id, 0, 64, PixelFormat::Rgba8Unorm)
+                .is_err()
+        );
+        assert!(
+            backend
+                .heap_allocate_texture(99_999, 64, 64, PixelFormat::Rgba8Unorm)
+                .is_err()
+        );
+        assert!(backend.destroy_heap(99_999).is_err());
+
+        // Requested alignment is honored against the real placement offset.
+        let first = backend
+            .heap_allocate_buffer(heap_id, 4096, 0)
+            .expect("first");
+        let aligned = backend
+            .heap_allocate_buffer(heap_id, 4096, 65_536)
+            .expect("aligned buffer");
+        assert_eq!(
+            backend.heap_allocation_offset(heap_id, aligned).unwrap(),
+            65_536
+        );
+        assert_eq!(backend.heap_allocation_offset(heap_id, first).unwrap(), 0);
+
+        // Exhaust the heap: allocations must fail cleanly once the free list
+        // is empty, then succeed again after a destroy returns the bytes.
+        let mut ids = Vec::new();
+        while let Ok(id) = backend.heap_allocate_buffer(heap_id, 256, 0) {
+            ids.push(id);
+        }
+        assert!(
+            !ids.is_empty(),
+            "a 1 MiB heap must hold several 256-byte buffers"
+        );
+        let (used, total) = backend.heap_usage(heap_id).unwrap();
+        assert!(used <= total);
+        let victim = ids.remove(0);
+        let victim_offset = backend
+            .heap_allocation_offset(heap_id, victim)
+            .expect("victim offset");
+        backend.destroy_buffer(victim);
+        let again = backend
+            .heap_allocate_buffer(heap_id, 256, 0)
+            .expect("destroyed bytes are allocatable again");
+        assert_eq!(
+            backend.heap_allocation_offset(heap_id, again).unwrap(),
+            victim_offset,
+            "first-fit must reuse the exact range returned by destroy_buffer"
+        );
+
+        // destroy_heap drops the heap and every placed resource with it.
+        let other = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_BUFFER)
+            .expect("second heap");
+        let other_buffer = backend
+            .heap_allocate_buffer(other, 64, 0)
+            .expect("other buffer");
+        backend.destroy_heap(other).expect("destroy heap");
+        assert!(backend.get_heap(other).is_none());
+        assert!(backend.get_buffer(other_buffer).is_none());
+        assert!(backend.destroy_heap(other).is_err());
+    }
+
+    #[test]
+    fn metal_heap_placed_resources_survive_gpu_roundtrip() {
+        let mut backend = create_backend();
+        let queue = backend.device().create_command_queue();
+        let heap_id = backend
+            .create_heap(2 * 1024 * 1024, HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE)
+            .expect("heap");
+
+        // Buffer path: staging -> placed buffer -> readback. Each hop runs on
+        // its own command buffer with a wait in between, because placed
+        // (untracked) resources are ordered by explicit synchronization.
+        let payload: Vec<u8> = (0..256).map(|i| (i * 7) as u8).collect();
+        let staging_id =
+            backend.create_buffer(&payload, metal::MTLResourceOptions::StorageModeShared);
+        let placed_id = backend
+            .heap_allocate_buffer(heap_id, 256, 0)
+            .expect("placed buffer");
+        let readback_id =
+            backend.create_empty_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let upload = queue.new_command_buffer();
+        {
+            let blit = AutoEndEncoder::new(upload.new_blit_command_encoder().to_owned());
+            blit.encoder_ref().copy_from_buffer(
+                backend.get_buffer(staging_id).unwrap(),
+                0,
+                backend.get_buffer(placed_id).unwrap(),
+                0,
+                256,
+            );
+            blit.end();
+        }
+        upload.commit();
+        upload.wait_until_completed();
+
+        let download = queue.new_command_buffer();
+        {
+            let blit = AutoEndEncoder::new(download.new_blit_command_encoder().to_owned());
+            blit.encoder_ref().copy_from_buffer(
+                backend.get_buffer(placed_id).unwrap(),
+                0,
+                backend.get_buffer(readback_id).unwrap(),
+                0,
+                256,
+            );
+            blit.end();
+        }
+        download.commit();
+        download.wait_until_completed();
+
+        // SAFETY: the shared readback buffer is GPU-idle (wait_until_completed)
+        // and exposes 256 bytes of valid storage via contents().
+        let readback = backend.get_buffer(readback_id).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(readback.contents() as *const u8, 256) };
+        assert_eq!(bytes, payload.as_slice());
+
+        // Texture path: staging buffer -> placed texture -> readback buffer.
+        let (tex_width, tex_height) = (16u32, 16u32);
+        let tex_bytes = (tex_width * tex_height * 4) as usize;
+        let tex_payload: Vec<u8> = (0..tex_bytes).map(|i| (i % 251) as u8).collect();
+        let tex_upload_id =
+            backend.create_buffer(&tex_payload, metal::MTLResourceOptions::StorageModeShared);
+        let placed_texture_id = backend
+            .heap_allocate_texture(heap_id, tex_width, tex_height, PixelFormat::Rgba8Unorm)
+            .expect("placed texture");
+        let tex_readback_id = backend.create_empty_buffer(
+            tex_bytes as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let bytes_per_row = tex_width as u64 * 4;
+        let bytes_per_image = bytes_per_row * tex_height as u64;
+
+        let to_texture = queue.new_command_buffer();
+        {
+            let blit = AutoEndEncoder::new(to_texture.new_blit_command_encoder().to_owned());
+            blit.encoder_ref().copy_from_buffer_to_texture(
+                backend.get_buffer(tex_upload_id).unwrap(),
+                0,
+                bytes_per_row,
+                bytes_per_image,
+                metal::MTLSize::new(tex_width as u64, tex_height as u64, 1),
+                backend.get_texture(placed_texture_id).unwrap(),
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLBlitOption::None,
+            );
+            blit.end();
+        }
+        to_texture.commit();
+        to_texture.wait_until_completed();
+
+        let from_texture = queue.new_command_buffer();
+        {
+            let blit = AutoEndEncoder::new(from_texture.new_blit_command_encoder().to_owned());
+            blit.encoder_ref().copy_from_texture_to_buffer(
+                backend.get_texture(placed_texture_id).unwrap(),
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLSize::new(tex_width as u64, tex_height as u64, 1),
+                backend.get_buffer(tex_readback_id).unwrap(),
+                0,
+                bytes_per_row,
+                bytes_per_image,
+                metal::MTLBlitOption::None,
+            );
+            blit.end();
+        }
+        from_texture.commit();
+        from_texture.wait_until_completed();
+
+        // SAFETY: the shared readback buffer is GPU-idle (wait_until_completed)
+        // and exposes tex_bytes of valid storage via contents().
+        let tex_readback = backend.get_buffer(tex_readback_id).unwrap();
+        let tex_data =
+            unsafe { std::slice::from_raw_parts(tex_readback.contents() as *const u8, tex_bytes) };
+        assert_eq!(tex_data, tex_payload.as_slice());
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 12: MTLResidencySet tests (real device)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn residency_set_object_lifecycle() {
+        let device = MetalDevice::system_default().expect("metal device");
+        let set = create_residency_set(device.metal_device(), Some("casa1-object-test"), 8)
+            .expect("residency set");
+        assert_eq!(set.label().as_deref(), Some("casa1-object-test"));
+        assert_eq!(set.allocation_count(), 0);
+
+        let buffer = device.create_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        set.add_allocation(&buffer);
+        assert!(
+            set.contains_allocation(&buffer),
+            "containsAllocation includes staged additions"
+        );
+        set.commit();
+        assert_eq!(set.allocation_count(), 1);
+        set.request_residency();
+        set.end_residency();
+
+        let texture = device.create_texture(
+            64,
+            64,
+            metal::MTLPixelFormat::RGBA8Unorm,
+            metal::MTLTextureUsage::ShaderRead,
+            metal::MTLStorageMode::Private,
+        );
+        set.add_allocation(&texture);
+        set.commit();
+        assert_eq!(set.allocation_count(), 2);
+        let _set_footprint = set.allocated_size();
+
+        set.remove_allocation(&buffer);
+        set.remove_allocation(&texture);
+        set.commit();
+        assert_eq!(set.allocation_count(), 0);
+        assert!(!set.contains_allocation(&buffer));
+        set.remove_all_allocations();
+        set.commit();
+    }
+
+    #[test]
+    fn residency_set_backend_integration_and_destroy_purges() {
+        let mut backend = create_backend();
+        let set_id = backend
+            .create_residency_set(Some("casa1-backend-set"), 4)
+            .expect("residency set");
+        let heap_id = backend
+            .create_heap(1024 * 1024, HEAP_TYPE_BUFFER | HEAP_TYPE_TEXTURE)
+            .expect("heap");
+        let placed_id = backend
+            .heap_allocate_buffer(heap_id, 256, 0)
+            .expect("placed buffer");
+        let placed_texture_id = backend
+            .heap_allocate_texture(heap_id, 16, 16, PixelFormat::Rgba8Unorm)
+            .expect("placed texture");
+        let free_id = backend.create_buffer(
+            &[1u8, 2, 3, 4],
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        backend
+            .residency_set_add_buffer(set_id, placed_id)
+            .expect("add placed buffer");
+        backend
+            .residency_set_add_buffer(set_id, free_id)
+            .expect("add free buffer");
+        backend
+            .residency_set_add_texture(set_id, placed_texture_id)
+            .expect("add placed texture");
+        backend
+            .residency_set_add_heap(set_id, heap_id)
+            .expect("add heap");
+        backend.residency_set_commit(set_id).expect("commit");
+        assert_eq!(
+            backend
+                .residency_set_allocation_count(set_id)
+                .expect("count"),
+            4
+        );
+        assert!(
+            backend
+                .residency_set_contains_buffer(set_id, placed_id)
+                .expect("contains placed buffer")
+        );
+        assert!(
+            backend
+                .residency_set_contains_texture(set_id, placed_texture_id)
+                .expect("contains placed texture")
+        );
+        assert!(
+            backend
+                .residency_set_contains_heap(set_id, heap_id)
+                .expect("contains heap")
+        );
+        let _ = backend
+            .residency_set_allocated_size(set_id)
+            .expect("set footprint");
+
+        // Unknown ids and unknown sets are rejected without touching Metal.
+        assert!(
+            backend
+                .residency_set_add_buffer(set_id, 123_456_789)
+                .is_err()
+        );
+        assert!(
+            !backend
+                .residency_set_contains_buffer(set_id, 123_456_789)
+                .expect("unregistered buffer is not a member")
+        );
+        assert!(backend.residency_set_add_buffer(99_999, free_id).is_err());
+        assert!(backend.residency_set_commit(99_999).is_err());
+
+        // Destroy paths purge the residency set automatically.
+        backend.destroy_buffer(free_id);
+        backend
+            .residency_set_commit(set_id)
+            .expect("commit after destroy_buffer");
+        assert_eq!(
+            backend
+                .residency_set_allocation_count(set_id)
+                .expect("count"),
+            3
+        );
+
+        backend.destroy_heap(heap_id).expect("destroy heap");
+        backend
+            .residency_set_commit(set_id)
+            .expect("commit after destroy_heap");
+        assert_eq!(
+            backend
+                .residency_set_allocation_count(set_id)
+                .expect("count"),
+            0,
+            "destroy_heap purges the heap and every placed resource"
+        );
+        assert!(
+            !backend
+                .residency_set_contains_heap(set_id, heap_id)
+                .expect("destroyed heap is not a member")
+        );
+
+        backend.destroy_residency_set(set_id).expect("destroy set");
+        assert!(backend.destroy_residency_set(set_id).is_err());
+        assert!(backend.residency_set_commit(set_id).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 13: parallel command-recording tests (real device)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parallel_render_command_recording_two_child_encoders() {
+        let (_crate_device, queue, device) = metal_device_and_queue();
+        let library = device
+            .new_library_with_source(
+                r#"
+#include <metal_stdlib>
+using namespace metal;
+struct VOut {
+    float4 position [[position]];
+};
+vertex VOut fullscreen_triangle(uint vertex_id [[vertex_id]]) {
+    float2 uv = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));
+    VOut out;
+    out.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+fragment float4 red_fill() { return float4(1.0, 0.0, 0.0, 1.0); }
+fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
+"#,
+                &metal::CompileOptions::new(),
+            )
+            .expect("shader library compiles");
+        let vertex_fn = library
+            .get_function("fullscreen_triangle", None)
+            .expect("vertex function");
+        let red_fn = library
+            .get_function("red_fill", None)
+            .expect("red fragment function");
+        let green_fn = library
+            .get_function("green_fill", None)
+            .expect("green fragment function");
+        let make_pipeline = |fragment: &metal::Function| {
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_vertex_function(Some(&vertex_fn));
+            descriptor.set_fragment_function(Some(fragment));
+            descriptor
+                .color_attachments()
+                .object_at(0)
+                .unwrap()
+                .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            device
+                .new_render_pipeline_state(&descriptor)
+                .expect("render pipeline")
+        };
+        let red_pipeline = make_pipeline(&red_fn);
+        let green_pipeline = make_pipeline(&green_fn);
+
+        let texture_desc = metal::TextureDescriptor::new();
+        texture_desc.set_texture_type(metal::MTLTextureType::D2);
+        texture_desc.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_desc.set_width(64);
+        texture_desc.set_height(64);
+        texture_desc.set_usage(metal::MTLTextureUsage::RenderTarget);
+        texture_desc.set_storage_mode(metal::MTLStorageMode::Private);
+        let target = device.new_texture(&texture_desc);
+
+        let pass_desc = metal::RenderPassDescriptor::new();
+        let attachment = pass_desc.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(&target));
+        attachment.set_load_action(metal::MTLLoadAction::Clear);
+        attachment.set_store_action(metal::MTLStoreAction::Store);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.25, 0.25, 0.25, 1.0));
+
+        let cmd = queue.new_command_buffer();
+        let mut parallel = match MetalParallelRenderEncoder::new(cmd, &pass_desc) {
+            Ok(encoder) => encoder,
+            Err(_) => {
+                eprintln!("[skip] parallel render encoder unavailable in this environment");
+                return;
+            }
+        };
+
+        // Child 0 records the left half in red.
+        {
+            let child = parallel.child_encoder().expect("child 0");
+            child.encoder().set_render_pipeline_state(&red_pipeline);
+            child.encoder().set_viewport(metal::MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: 32.0,
+                height: 64.0,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            child
+                .encoder()
+                .draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        }
+        parallel.end_child();
+
+        // Child 1 records the right half in green — recorded only after the
+        // first child ended, as Metal requires one live child per encoder.
+        {
+            let child = parallel.child_encoder().expect("child 1");
+            child.encoder().set_render_pipeline_state(&green_pipeline);
+            child.encoder().set_viewport(metal::MTLViewport {
+                originX: 32.0,
+                originY: 0.0,
+                width: 32.0,
+                height: 64.0,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            child
+                .encoder()
+                .draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        }
+        parallel.end_child();
+        parallel.finish();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Read the render target back and verify both children really drew.
+        let readback = device.new_buffer(64 * 64 * 4, metal::MTLResourceOptions::StorageModeShared);
+        let readback_cmd = queue.new_command_buffer();
+        {
+            let blit = AutoEndEncoder::new(readback_cmd.new_blit_command_encoder().to_owned());
+            blit.encoder_ref().copy_from_texture_to_buffer(
+                &target,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLSize::new(64, 64, 1),
+                &readback,
+                0,
+                64 * 4,
+                64 * 64 * 4,
+                metal::MTLBlitOption::None,
+            );
+            blit.end();
+        }
+        readback_cmd.commit();
+        readback_cmd.wait_until_completed();
+
+        // SAFETY: the shared readback buffer is GPU-idle (wait_until_completed)
+        // and exposes 64*64*4 bytes of valid storage via contents().
+        let pixels =
+            unsafe { std::slice::from_raw_parts(readback.contents() as *const u8, 64 * 64 * 4) };
+        let sample = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 64 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        assert_eq!(
+            sample(16, 32),
+            [0, 0, 255, 255],
+            "left half must be red (BGRA)"
+        );
+        assert_eq!(
+            sample(48, 32),
+            [0, 255, 0, 255],
+            "right half must be green (BGRA)"
         );
     }
 

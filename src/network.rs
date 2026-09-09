@@ -608,8 +608,10 @@ struct WebSocketRecord {
     request_handle: HttpRequestId,
     /// Whether the WebSocket is still open.
     is_open: bool,
-    /// Buffer for received data.
+    /// Buffer for received data (peer → guest, synthetic ingress).
     receive_buffer: Vec<u8>,
+    /// Read cursor into `receive_buffer` (avoids O(n²) `drain` per receive).
+    receive_read_offset: usize,
     /// Buffer for sent data.
     send_buffer: Vec<u8>,
     /// Close status code.
@@ -628,6 +630,7 @@ impl WebSocketRecord {
             request_handle,
             is_open: true,
             receive_buffer: Vec::new(),
+            receive_read_offset: 0,
             send_buffer: Vec::new(),
             close_status: 1000, // Normal closure
             close_reason: None,
@@ -2111,6 +2114,10 @@ impl NetworkStack {
 
     /// Complete a WebSocket upgrade from an existing HTTP request.
     /// Returns a new WebSocket handle on success.
+    ///
+    /// The record starts open with a 1000 close status; data frames flow
+    /// through the buffered plumbing ([`Self::websocket_feed_received`] is
+    /// the peer-side ingress) until the connection is closed.
     pub fn websocket_complete_upgrade(&mut self, request_handle: HttpRequestId) -> AppResult<u64> {
         // Build the WebSocket URL from connection info
         let (host, port, secure, path) = {
@@ -2121,6 +2128,11 @@ impl NetworkStack {
 
         let is_text_mode = false; // Default to binary mode
         let scheme = if secure { "wss" } else { "ws" };
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
         let ws_url = Some(format!("{scheme}://{host}:{port}{path}"));
 
         let ws_handle = self.alloc_id();
@@ -2131,10 +2143,44 @@ impl NetworkStack {
         Ok(ws_handle)
     }
 
-    /// Send data over a WebSocket connection.
-    /// Buffers the data; real WebSocket I/O is delegated to WinHttpStack.
-    pub fn websocket_send(&mut self, ws_handle: u64, data: &[u8]) -> AppResult<()> {
+    /// Simulate the peer delivering `data` over this WebSocket: appends the
+    /// bytes to the receive buffer under the 16 MB spill cap. This is the
+    /// ingress side of the buffered plumbing — the same bound the live
+    /// WinHttpStack receive path enforces on unread message bytes.
+    pub fn websocket_feed_received(&mut self, ws_handle: u64, data: &[u8]) -> AppResult<()> {
         let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "websocket_feed_received: invalid handle",
+            )
+        })?;
+        if !ws.is_open {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "websocket_feed_received: WebSocket is closed",
+            ));
+        }
+        let new_len = ws.receive_buffer.len().saturating_add(data.len());
+        if new_len > MAX_WEBSOCKET_RECEIVE_SPILL {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                format!(
+                    "websocket_feed_received: receive buffer {new_len} exceeds limit \
+                     ({MAX_WEBSOCKET_RECEIVE_SPILL} bytes)"
+                ),
+            ));
+        }
+        ws.receive_buffer.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Send data over a WebSocket connection.
+    ///
+    /// Buffered plumbing: enforces the per-call 64 MB frame cap and the
+    /// 16 MB send-buffer cap, and validates UTF-8 for text-mode sockets so
+    /// the buffered record honors the same framing rules as the live stack.
+    pub fn websocket_send(&mut self, ws_handle: u64, data: &[u8]) -> AppResult<()> {
+        let ws = self.websockets.get(&ws_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "websocket_send: invalid handle",
@@ -2146,6 +2192,22 @@ impl NetworkStack {
                 "websocket_send: WebSocket is closed",
             ));
         }
+        if data.len() > MAX_WEBSOCKET_FRAME_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcWebSocketFrameTooLarge,
+                format!(
+                    "websocket_send: frame size {} exceeds limit ({MAX_WEBSOCKET_FRAME_SIZE})",
+                    data.len()
+                ),
+            ));
+        }
+        if ws.is_text_mode && std::str::from_utf8(data).is_err() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "websocket_send: invalid UTF-8 in text mode",
+            ));
+        }
+        let ws = self.websockets.get_mut(&ws_handle).unwrap();
         let new_len = ws.send_buffer.len().saturating_add(data.len());
         if new_len > MAX_WEBSOCKET_SEND_BUFFER {
             return Err(AppError::new(
@@ -2160,9 +2222,11 @@ impl NetworkStack {
     }
 
     /// Receive data from a WebSocket connection.
-    /// Reads from the internal buffer.
+    ///
+    /// Reads from the internal buffer with a read cursor (no O(n²) drain),
+    /// releasing the backing buffer once fully consumed.
     pub fn websocket_receive(&mut self, ws_handle: u64, data: &mut [u8]) -> AppResult<u32> {
-        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+        let ws = self.websockets.get(&ws_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "websocket_receive: invalid handle",
@@ -2174,28 +2238,64 @@ impl NetworkStack {
                 "websocket_receive: WebSocket is closed",
             ));
         }
-        let bytes_to_read = data.len().min(ws.receive_buffer.len());
-        data[..bytes_to_read].copy_from_slice(&ws.receive_buffer[..bytes_to_read]);
-        ws.receive_buffer.drain(..bytes_to_read);
+        let available = ws
+            .receive_buffer
+            .len()
+            .saturating_sub(ws.receive_read_offset);
+        let ws = self.websockets.get_mut(&ws_handle).unwrap();
+        let bytes_to_read = data.len().min(available);
+        let start = ws.receive_read_offset;
+        data[..bytes_to_read].copy_from_slice(&ws.receive_buffer[start..start + bytes_to_read]);
+        ws.receive_read_offset += bytes_to_read;
+        if ws.receive_read_offset == ws.receive_buffer.len() {
+            ws.receive_buffer.clear();
+            ws.receive_read_offset = 0;
+        }
         Ok(bytes_to_read as u32)
     }
 
     /// Close a WebSocket connection.
+    ///
+    /// Validates the close status (1005/1006/1015 describe local conditions
+    /// and must never be sent on the wire) and the RFC 123-byte reason
+    /// bound, then marks the record closed and frees its buffers. Idempotent
+    /// on already-closed sockets.
     pub fn websocket_close(
         &mut self,
         ws_handle: u64,
         status: u16,
         reason: Option<&str>,
     ) -> AppResult<()> {
-        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+        let ws = self.websockets.get(&ws_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "websocket_close: invalid handle",
             )
         })?;
+        if !ws.is_open {
+            return Ok(());
+        }
+        if matches!(status, 1005 | 1006 | 1015) {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("websocket_close: close status {status} cannot be sent to the peer"),
+            ));
+        }
+        if let Some(reason) = reason
+            && reason.len() > 123
+        {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "websocket_close: close reason exceeds the 123 byte limit",
+            ));
+        }
+        let ws = self.websockets.get_mut(&ws_handle).unwrap();
         ws.is_open = false;
         ws.close_status = status;
         ws.close_reason = reason.map(|s| s.to_string());
+        ws.receive_buffer.clear();
+        ws.receive_read_offset = 0;
+        ws.send_buffer.clear();
         Ok(())
     }
 
@@ -4509,6 +4609,159 @@ mod tests {
         network.close_handle(req);
         network.close_handle(conn);
         network.close_handle(session);
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket record plumbing (buffered, RFC 6455 semantics)
+    // -----------------------------------------------------------------------
+
+    /// Open a session/connection/request chain for WebSocket upgrades.
+    fn ws_open_request(network: &mut NetworkStack) -> super::HttpRequestId {
+        let session = network.win_http_open("ws-test");
+        let conn = network
+            .win_http_connect(session, "ws.example.com", 80, false)
+            .expect("connect");
+        network
+            .win_http_open_request(conn, "GET", "/chat")
+            .expect("open request")
+    }
+
+    #[test]
+    fn websocket_upgrade_creates_distinct_handles_and_close_handle_cleanup() {
+        let mut network = NetworkStack::new();
+        let req1 = ws_open_request(&mut network);
+        let req2 = ws_open_request(&mut network);
+        let ws1 = network.websocket_complete_upgrade(req1).expect("upgrade 1");
+        let ws2 = network.websocket_complete_upgrade(req2).expect("upgrade 2");
+        assert_ne!(ws1, ws2);
+        assert_eq!(
+            network.websockets.get(&ws1).unwrap().url.as_deref(),
+            Some("ws://ws.example.com:80/chat")
+        );
+
+        // Closing one WebSocket handle must not affect the other.
+        network.close_handle(ws1);
+        assert!(network.websocket_send(ws1, b"x").is_err());
+        network.websocket_send(ws2, b"ok").expect("ws2 unaffected");
+
+        // Closing the request handle also drops the upgraded WebSocket.
+        network.close_handle(req2);
+        assert!(network.websocket_send(ws2, b"x").is_err());
+    }
+
+    #[test]
+    fn websocket_send_receive_buffers_with_caps_and_offset() {
+        let mut network = NetworkStack::new();
+        let req = ws_open_request(&mut network);
+        let ws = network.websocket_complete_upgrade(req).expect("upgrade");
+
+        network.websocket_send(ws, b"hello").expect("send");
+        assert_eq!(network.websockets.get(&ws).unwrap().send_buffer, b"hello");
+
+        // Peer ingress, then chunked reads with a read cursor: bytes fed
+        // while earlier bytes are still unread stay in order.
+        network
+            .websocket_feed_received(ws, b"abcdefg")
+            .expect("feed 1");
+        let mut buf = [0u8; 4];
+        let got = network.websocket_receive(ws, &mut buf).expect("read 1");
+        assert_eq!(&buf[..got as usize], b"abcd");
+        network.websocket_feed_received(ws, b"hij").expect("feed 2");
+        let mut buf = [0u8; 16];
+        let got = network.websocket_receive(ws, &mut buf).expect("read 2");
+        assert_eq!(&buf[..got as usize], b"efghij");
+        // The backing buffer is released once fully consumed.
+        assert!(
+            network
+                .websockets
+                .get(&ws)
+                .unwrap()
+                .receive_buffer
+                .is_empty()
+        );
+
+        // A single frame over the 64 MB cap is rejected on send and feed.
+        let oversized = vec![0u8; super::MAX_WEBSOCKET_FRAME_SIZE + 1];
+        assert!(network.websocket_send(ws, &oversized).is_err());
+        assert!(network.websocket_feed_received(ws, &oversized).is_err());
+    }
+
+    #[test]
+    fn websocket_text_mode_validates_utf8_and_close_semantics() {
+        let mut network = NetworkStack::new();
+        let req = ws_open_request(&mut network);
+        let ws = network.websocket_complete_upgrade(req).expect("upgrade");
+        // Force text mode on the record (upgrades default to binary mode).
+        network.websockets.get_mut(&ws).unwrap().is_text_mode = true;
+        assert!(network.websocket_send(ws, b"\xFF\xFE").is_err());
+        network
+            .websocket_send(ws, "héllo".as_bytes())
+            .expect("valid text send");
+
+        // Close statuses that describe local conditions cannot be sent.
+        for bad in [1005u16, 1006, 1015] {
+            assert!(
+                network.websocket_close(ws, bad, None).is_err(),
+                "status {bad} must be rejected"
+            );
+        }
+        let long_reason = "x".repeat(124);
+        assert!(
+            network
+                .websocket_close(ws, 1000, Some(&long_reason))
+                .is_err()
+        );
+
+        network.websocket_feed_received(ws, b"data").expect("feed");
+        network
+            .websocket_close(ws, 1000, Some("done"))
+            .expect("close");
+        // Close frees the buffers and reports the code and reason.
+        assert_eq!(
+            network
+                .websocket_query_close_status(ws)
+                .expect("query close status"),
+            (1000, Some("done".to_string()))
+        );
+        assert!(network.websocket_receive(ws, &mut [0u8; 8]).is_err());
+        assert!(network.websocket_send(ws, b"x").is_err());
+        assert!(network.websocket_feed_received(ws, b"x").is_err());
+        assert!(
+            network
+                .websockets
+                .get(&ws)
+                .unwrap()
+                .receive_buffer
+                .is_empty()
+        );
+        network
+            .websocket_close(ws, 1000, None)
+            .expect("second close is idempotent");
+    }
+
+    #[test]
+    fn websocket_receive_spill_cap_is_16mb() {
+        let mut network = NetworkStack::new();
+        let req = ws_open_request(&mut network);
+        let ws = network.websocket_complete_upgrade(req).expect("upgrade");
+
+        let chunk = vec![7u8; 1024 * 1024];
+        // 16 x 1 MiB fits exactly under the 16 MB spill cap.
+        for _ in 0..16 {
+            network
+                .websocket_feed_received(ws, &chunk)
+                .expect("feed chunk");
+        }
+        assert!(network.websocket_feed_received(ws, &[0u8; 1]).is_err());
+
+        // The buffered data remains fully readable after the failed feed.
+        let mut drained = 0u32;
+        while drained < 16 * 1024 * 1024 {
+            let mut buf = [0u8; 65536];
+            let got = network.websocket_receive(ws, &mut buf).expect("drain");
+            drained += got;
+        }
+        assert_eq!(drained, 16 * 1024 * 1024);
     }
 
     #[test]

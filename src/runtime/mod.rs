@@ -16559,7 +16559,7 @@ impl PeHostRuntime {
                 // RCX = SDKVersion (ignored for now)
                 let out_ptr = state.get(Register::Rcx);
                 if self.d3d9_shim.is_none() {
-                    self.d3d9_shim = Some(direct3d_create9(true));
+                    self.d3d9_shim = Some(direct3d_create9());
                 }
                 if out_ptr != 0 {
                     // Allocate factory COM object — the returned pointer IS the factory
@@ -16589,7 +16589,7 @@ impl PeHostRuntime {
                 let _sdk_version = state.get(Register::Rcx);
                 let out_ptr = state.get(Register::Rdx);
                 if self.d3d9_shim.is_none() {
-                    self.d3d9_shim = Some(direct3d_create9(true));
+                    self.d3d9_shim = Some(direct3d_create9());
                 }
                 if out_ptr != 0 {
                     match self.alloc_d3d9_factory_object(memory) {
@@ -95102,7 +95102,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn redraw_window_queues_paint_like_invalidate_rect() {
         with_big_stack(|| {
             let temp_dir = TempDir::new().expect("temp dir");
@@ -101385,7 +101384,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn pe_runtime_live_input_enqueues_held_and_tapped_key_transitions() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -101508,7 +101506,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn pe_runtime_live_mouse_click_on_preview_button_enqueues_command() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -101606,7 +101603,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn draw_text_to_hdc_renders_into_window_surface() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -101642,7 +101638,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn built_in_progress_messages_update_rendered_surface() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -104671,7 +104666,7 @@ mod tests {
 
             // Set up the D3D9 shim + device exactly as D3d9FactoryCreateDevice
             // would leave them.
-            let mut shim = crate::d3d11::direct3d_create9(true);
+            let mut shim = crate::d3d11::direct3d_create9();
             let device = shim.create_device().expect("create d3d9 device");
             let (swapchain_width, swapchain_height) =
                 (device.swapchain_width, device.swapchain_height);

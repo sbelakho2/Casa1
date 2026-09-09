@@ -35,8 +35,50 @@ pub const WINHTTP_OPTION_QUERY_PROTOCOL: u32 = 160;
 pub const WINHTTP_PROTOCOL_FLAG_HTTP2: u32 = 0x0001;
 pub const WINHTTP_PROTOCOL_FLAG_HTTP3: u32 = 0x0002;
 
+/// WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET — mark a request as a WebSocket
+/// upgrade before WinHttpWebSocketCompleteUpgrade (set, zero-length buffer).
+pub const WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET: u32 = 114;
+/// WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT — close-handshake wait (ms).
+pub const WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT: u32 = 115;
+/// WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL — idle ping interval (ms).
+pub const WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL: u32 = 116;
+/// WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE — receive buffer size.
+pub const WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE: u32 = 122;
+/// WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE — send buffer size.
+pub const WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE: u32 = 123;
+
+/// Windows requires the WebSocket keepalive interval to be at least 15 s.
+pub const WINHTTP_MIN_WEB_SOCKET_KEEPALIVE_INTERVAL: u32 = 15_000;
+/// Default WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL (ms).
+pub const WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL: u32 = 30_000;
+/// Default WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT (ms).
+pub const WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT: u32 = 60_000;
+/// Default WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE / _SEND_BUFFER_SIZE.
+pub const WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE: u32 = 32_768;
+
+/// Default close-handshake drain bound for serde defaults.
+fn default_ws_close_timeout_ms() -> u32 {
+    WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT
+}
+/// Default idle keepalive interval for serde defaults.
+fn default_ws_keepalive_interval_ms() -> u32 {
+    WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL
+}
+/// Default WebSocket buffer size for serde defaults.
+fn default_ws_buffer_size() -> u32 {
+    WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE
+}
+
 #[cfg(feature = "websocket")]
-use tungstenite::{WebSocket, stream::MaybeTlsStream};
+use tungstenite::{
+    WebSocket,
+    client::IntoClientRequest,
+    http,
+    protocol::{
+        WebSocketConfig,
+        frame::{CloseFrame, Frame},
+    },
+};
 
 // ---------------------------------------------------------------------------
 // WinHTTP API surface — translates WinHTTP calls to native reqwest/TLS
@@ -126,6 +168,26 @@ pub struct WinHttpRequest {
     pub callback: Option<HINTERNET>, // stores callback context as handle
     pub callback_notify_flags: u32,
     pub certificate_errors: Vec<String>,
+    /// WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET — set before the request is
+    /// upgraded; gates real (live) WebSocket upgrades.
+    #[serde(default)]
+    pub upgrade_to_websocket: bool,
+    /// WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT value (ms); the upgraded
+    /// WebSocket inherits it.
+    #[serde(default = "default_ws_close_timeout_ms")]
+    pub ws_close_timeout_ms: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL value (ms); the
+    /// upgraded WebSocket inherits it.
+    #[serde(default = "default_ws_keepalive_interval_ms")]
+    pub ws_keepalive_interval_ms: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE value; the upgraded
+    /// WebSocket inherits it.
+    #[serde(default = "default_ws_buffer_size")]
+    pub ws_receive_buffer_size: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE value; the upgraded
+    /// WebSocket inherits it.
+    #[serde(default = "default_ws_buffer_size")]
+    pub ws_send_buffer_size: u32,
 }
 
 // -----------------------------------------------------------------------
@@ -158,6 +220,56 @@ impl WinHttpWebSocketBufferType {
                 format!("invalid WinHttpWebSocketBufferType discriminant {value}"),
             )),
         }
+    }
+
+    /// Whether this is one of the four sendable data buffer types
+    /// (message or fragment of binary/UTF-8 data). Close and ping-pong
+    /// buffers describe received frames and cannot be sent.
+    pub fn is_data(self) -> bool {
+        matches!(
+            self,
+            Self::BinaryMessageBuffer
+                | Self::BinaryFragmentBuffer
+                | Self::Utf8MessageBuffer
+                | Self::Utf8FragmentBuffer
+        )
+    }
+
+    /// Whether this buffer type is a fragment (part of a message).
+    pub fn is_fragment(self) -> bool {
+        matches!(self, Self::BinaryFragmentBuffer | Self::Utf8FragmentBuffer)
+    }
+
+    /// Whether this buffer type carries UTF-8 text rather than binary data.
+    pub fn is_text(self) -> bool {
+        matches!(self, Self::Utf8MessageBuffer | Self::Utf8FragmentBuffer)
+    }
+
+    /// The data class of a sendable buffer type, or `None` for close and
+    /// ping-pong buffers (which are receive-side only).
+    pub fn data_class(self) -> Option<WinHttpWebSocketDataClass> {
+        if self.is_text() {
+            Some(WinHttpWebSocketDataClass::Utf8)
+        } else if self.is_data() {
+            Some(WinHttpWebSocketDataClass::Binary)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether a WebSocket data stream carries binary or UTF-8 text frames.
+/// Governs the frame opcode and the per-message fragment state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WinHttpWebSocketDataClass {
+    Binary,
+    Utf8,
+}
+
+impl WinHttpWebSocketDataClass {
+    /// Whether this class is UTF-8 text.
+    pub fn is_text(self) -> bool {
+        matches!(self, Self::Utf8)
     }
 }
 
@@ -245,11 +357,171 @@ pub struct WinHttpWebSocketState {
     pub url: Option<String>,
     /// Whether this is a text-mode WebSocket (vs binary).
     pub is_text_mode: bool,
+    /// Whether a live tungstenite connection is attached. When false the
+    /// socket is a buffered state machine (offline/synthetic mode).
+    #[serde(default)]
+    pub is_live: bool,
+    /// Data class of the fragmented message currently being sent, if any.
+    /// `*FragmentBuffer` sends continue this message, `*MessageBuffer`
+    /// sends finish it.
+    #[serde(default)]
+    pub fragmented_send: Option<WinHttpWebSocketDataClass>,
+    /// Carry-over bytes of an incomplete UTF-8 sequence that straddles two
+    /// UTF-8 fragment sends.
+    #[serde(default)]
+    pub utf8_send_pending: Vec<u8>,
+    /// WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT value (ms).
+    #[serde(default = "default_ws_close_timeout_ms")]
+    pub close_timeout_ms: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL value (ms).
+    #[serde(default = "default_ws_keepalive_interval_ms")]
+    pub keepalive_interval_ms: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE value.
+    #[serde(default = "default_ws_buffer_size")]
+    pub receive_buffer_size: u32,
+    /// WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE value.
+    #[serde(default = "default_ws_buffer_size")]
+    pub send_buffer_size: u32,
+}
+
+impl WinHttpWebSocketState {
+    /// Initial state of a freshly upgraded WebSocket, before any frame is
+    /// exchanged. `options` carries the request-handle WebSocket option
+    /// values that Windows applies to the upgraded socket.
+    pub fn new(
+        request_handle: HINTERNET,
+        url: Option<String>,
+        close_timeout_ms: u32,
+        keepalive_interval_ms: u32,
+        receive_buffer_size: u32,
+        send_buffer_size: u32,
+    ) -> Self {
+        Self {
+            request_handle,
+            is_open: true,
+            buffer_type: WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            receive_buffer: Vec::new(),
+            receive_read_offset: 0,
+            send_buffer: Vec::new(),
+            close_status: WinHttpWebSocketCloseStatus::Success,
+            close_reason: None,
+            url,
+            is_text_mode: false,
+            is_live: false,
+            fragmented_send: None,
+            utf8_send_pending: Vec::new(),
+            close_timeout_ms,
+            keepalive_interval_ms,
+            receive_buffer_size,
+            send_buffer_size,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tungstenite-backed real WebSocket connection (feature-gated)
 // ---------------------------------------------------------------------------
+
+/// Transport of a live WebSocket: plain TCP for `ws://`, or a native-tls
+/// stream for `wss://` (tungstenite is compiled here without a TLS feature).
+#[cfg(feature = "websocket")]
+#[derive(Debug)]
+enum WsTransport {
+    Plain(TcpStream),
+    Tls(native_tls::TlsStream<TcpStream>),
+}
+
+#[cfg(feature = "websocket")]
+impl WsTransport {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            WsTransport::Plain(s) => s.set_read_timeout(dur),
+            WsTransport::Tls(s) => s.get_ref().set_read_timeout(dur),
+        }
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            WsTransport::Plain(s) => s.set_write_timeout(dur),
+            WsTransport::Tls(s) => s.get_ref().set_write_timeout(dur),
+        }
+    }
+
+    fn set_nodelay(&self, enabled: bool) -> std::io::Result<()> {
+        match self {
+            WsTransport::Plain(s) => s.set_nodelay(enabled),
+            WsTransport::Tls(s) => s.get_ref().set_nodelay(enabled),
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl Read for WsTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            WsTransport::Plain(s) => s.read(buf),
+            WsTransport::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl Write for WsTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WsTransport::Plain(s) => s.write(buf),
+            WsTransport::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WsTransport::Plain(s) => s.flush(),
+            WsTransport::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// How a live read failed; each arm maps to the WinHTTP close status that
+/// WinHttpWebSocketQueryCloseStatus must report afterwards.
+#[cfg(feature = "websocket")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketReadFailure {
+    /// The underlying connection dropped without a close frame (status 1006).
+    ConnectionLost(String),
+    /// The peer violated the WebSocket protocol (status 1002).
+    ProtocolViolation(String),
+    /// A frame or reassembled message exceeded the 64 MB cap (status 1009).
+    MessageTooBig(String),
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketReadFailure {
+    /// WinHTTP close status recorded on the socket state for this failure.
+    fn close_status(&self) -> WinHttpWebSocketCloseStatus {
+        match self {
+            Self::ConnectionLost(_) => WinHttpWebSocketCloseStatus::AbnormalClosure,
+            Self::ProtocolViolation(_) => WinHttpWebSocketCloseStatus::ProtocolError,
+            Self::MessageTooBig(_) => WinHttpWebSocketCloseStatus::MessageTooBig,
+        }
+    }
+
+    /// Optional close-frame code sent to the peer before the socket drops.
+    fn wire_close_code(&self) -> Option<u16> {
+        match self {
+            Self::ConnectionLost(_) => None,
+            Self::ProtocolViolation(_) => Some(1002),
+            Self::MessageTooBig(_) => Some(1009),
+        }
+    }
+
+    /// Guest-visible error text for this failure.
+    fn detail(&self) -> &str {
+        match self {
+            Self::ConnectionLost(d) | Self::ProtocolViolation(d) | Self::MessageTooBig(d) => d,
+        }
+    }
+}
 
 /// Wraps a real `tungstenite` WebSocket connection for actual network I/O.
 /// Only available when the `websocket` feature is enabled.
@@ -257,97 +529,354 @@ pub struct WinHttpWebSocketState {
 #[derive(Debug)]
 pub struct TungsteniteWebSocket {
     /// The underlying tungstenite WebSocket.
-    inner: WebSocket<MaybeTlsStream<TcpStream>>,
+    inner: WebSocket<WsTransport>,
     /// URL this socket is connected to.
     url: String,
 }
 
+/// Outcome of connecting to a WebSocket server.
+#[cfg(feature = "websocket")]
+enum WsConnectOutcome {
+    Connected(WebSocket<WsTransport>, http::Response<Option<Vec<u8>>>),
+    /// HTTP redirect response with a Location header to follow.
+    Redirect(http::Response<Option<Vec<u8>>>),
+    Failed(AppError),
+}
+
 #[cfg(feature = "websocket")]
 impl TungsteniteWebSocket {
-    /// Connect to a WebSocket server at the given URL.
+    /// Tungstenite configuration enforcing the casa frame and reassembled
+    /// message caps (64 MB) on the receive path.
+    fn ws_config() -> WebSocketConfig {
+        WebSocketConfig::default()
+            .max_frame_size(Some(MAX_WEBSOCKET_FRAME_SIZE))
+            .max_message_size(Some(MAX_WEBSOCKET_FRAME_SIZE))
+    }
+
+    /// Connect to a WebSocket server at `url` (`ws://` or `wss://`).
+    ///
+    /// HTTP redirects are followed up to 3 times, mirroring tungstenite's
+    /// own `connect` behavior. The close-handshake drain bound is taken from
+    /// the socket's WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT at close time.
     pub fn connect(url: &str) -> AppResult<Self> {
-        let (socket, _response) = tungstenite::connect(url).map_err(|e| {
+        const MAX_REDIRECTS: u8 = 3;
+        fn create_request(parts: &http::request::Parts, uri: &http::Uri) -> http::Request<()> {
+            let mut builder = http::Request::builder()
+                .uri(uri.clone())
+                .method(parts.method.clone())
+                .version(parts.version);
+            *builder
+                .headers_mut()
+                .expect("request builder accepts headers") = parts.headers.clone();
+            builder
+                .body(())
+                .expect("request builder accepts an empty body")
+        }
+
+        let request = url.into_client_request().map_err(|e| {
             AppError::new(
-                ReasonCode::RcNetworkUnreachable,
+                ReasonCode::RcCliInvalid,
                 format!("WebSocket connect failed: {e}"),
             )
         })?;
-        Ok(Self {
-            inner: socket,
-            url: url.to_string(),
-        })
-    }
+        let (parts, _) = request.into_parts();
+        let mut uri = parts.uri.clone();
 
-    /// Send a text message.
-    pub fn send_text(&mut self, text: &str) -> AppResult<()> {
-        self.inner
-            .write(tungstenite::Message::Text(text.into()))
-            .map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcNetworkUnreachable,
-                    format!("WebSocket send failed: {e}"),
-                )
-            })
-    }
-
-    /// Send a binary message.
-    pub fn send_binary(&mut self, data: &[u8]) -> AppResult<()> {
-        self.inner
-            .write(tungstenite::Message::Binary(data.to_vec().into()))
-            .map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcNetworkUnreachable,
-                    format!("WebSocket send failed: {e}"),
-                )
-            })
-    }
-
-    /// Receive the next message. Returns `(is_text, data)`.
-    /// On close frame, returns the close code and reason.
-    pub fn receive(&mut self) -> AppResult<WebSocketMessage> {
-        let msg = self.inner.read().map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetworkUnreachable,
-                format!("WebSocket receive failed: {e}"),
-            )
-        })?;
-        match msg {
-            tungstenite::Message::Text(text) => Ok(WebSocketMessage::Text(text.to_string())),
-            tungstenite::Message::Binary(data) => Ok(WebSocketMessage::Binary(data.to_vec())),
-            tungstenite::Message::Close(Some(frame)) => Ok(WebSocketMessage::Close(
-                frame.code.into(),
-                frame.reason.to_string(),
-            )),
-            tungstenite::Message::Close(None) => Ok(WebSocketMessage::Close(1000, String::new())),
-            tungstenite::Message::Ping(data) => {
-                self.inner
-                    .write(tungstenite::Message::Pong(data))
-                    .map_err(|e| {
-                        AppError::new(
+        for attempt in 0..=MAX_REDIRECTS {
+            let request = create_request(&parts, &uri);
+            match Self::try_client_handshake(request) {
+                WsConnectOutcome::Failed(error) => return Err(error),
+                WsConnectOutcome::Redirect(response) if attempt < MAX_REDIRECTS => {
+                    let Some(location) = response.headers().get(http::header::LOCATION) else {
+                        return Err(AppError::new(
                             ReasonCode::RcNetworkUnreachable,
-                            format!("WebSocket pong failed: {e}"),
-                        )
-                    })?;
-                Ok(WebSocketMessage::Ping)
+                            format!(
+                                "WebSocket connect failed: redirect without a Location header from {uri}"
+                            ),
+                        ));
+                    };
+                    match location
+                        .to_str()
+                        .ok()
+                        .and_then(|l| l.parse::<http::Uri>().ok())
+                    {
+                        Some(next_uri) => uri = next_uri,
+                        None => {
+                            return Err(AppError::new(
+                                ReasonCode::RcNetworkUnreachable,
+                                format!(
+                                    "WebSocket connect failed: unparsable redirect Location from {uri}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                WsConnectOutcome::Redirect(response) => {
+                    return Err(AppError::new(
+                        ReasonCode::RcNetworkUnreachable,
+                        format!(
+                            "WebSocket connect failed: too many redirects (last status {}) from {url}",
+                            response.status()
+                        ),
+                    ));
+                }
+                WsConnectOutcome::Connected(socket, _response) => {
+                    return Ok(Self {
+                        inner: socket,
+                        url: uri.to_string(),
+                    });
+                }
             }
-            tungstenite::Message::Pong(_) => Ok(WebSocketMessage::Pong),
-            tungstenite::Message::Frame(_) => Ok(WebSocketMessage::Binary(Vec::new())),
+        }
+        Err(AppError::new(
+            ReasonCode::RcNetworkUnreachable,
+            format!("WebSocket connect failed: too many redirects from {url}"),
+        ))
+    }
+
+    /// One TCP/TLS connection plus a single client handshake.
+    fn try_client_handshake(request: http::Request<()>) -> WsConnectOutcome {
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+        let uri = request.uri();
+        let use_tls = match uri.scheme_str() {
+            Some("ws") => false,
+            Some("wss") => true,
+            other => {
+                return WsConnectOutcome::Failed(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("WebSocket connect failed: unsupported URL scheme {other:?}"),
+                ));
+            }
+        };
+        let host = match uri.host() {
+            Some(host) => host,
+            None => {
+                return WsConnectOutcome::Failed(AppError::new(
+                    ReasonCode::RcNetDnsResolutionFailed,
+                    format!("WebSocket connect failed: URL {uri} has no host"),
+                ));
+            }
+        };
+        let host_no_brackets = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
+
+        let addrs = match (host_no_brackets, port).to_socket_addrs() {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(e) => {
+                return WsConnectOutcome::Failed(AppError::new(
+                    ReasonCode::RcNetDnsResolutionFailed,
+                    format!("WebSocket DNS resolution failed for {host}: {e}"),
+                ));
+            }
+        };
+        let mut stream = None;
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, HANDSHAKE_TIMEOUT) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Some(stream) = stream else {
+            return WsConnectOutcome::Failed(AppError::new(
+                ReasonCode::RcNetworkUnreachable,
+                format!("WebSocket connect failed: no address of {host} reachable"),
+            ));
+        };
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+        let transport = if use_tls {
+            let connector = match native_tls::TlsConnector::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    return WsConnectOutcome::Failed(AppError::new(
+                        ReasonCode::RcNetworkUnreachable,
+                        format!("WebSocket TLS connector creation failed: {e}"),
+                    ));
+                }
+            };
+            match connector.connect(host_no_brackets, stream) {
+                Ok(tls) => WsTransport::Tls(tls),
+                Err(e) => {
+                    return WsConnectOutcome::Failed(AppError::new(
+                        ReasonCode::RcNetworkUnreachable,
+                        format!("WebSocket TLS handshake with {host} failed: {e}"),
+                    ));
+                }
+            }
+        } else {
+            WsTransport::Plain(stream)
+        };
+
+        match tungstenite::client::client_with_config(request, transport, Some(Self::ws_config())) {
+            Ok((socket, response)) => {
+                // Normal operation is fully blocking; the handshake bound is
+                // no longer wanted on reads or writes.
+                let _ = socket.get_ref().set_read_timeout(None);
+                let _ = socket.get_ref().set_write_timeout(None);
+                let _ = socket.get_ref().set_nodelay(true);
+                WsConnectOutcome::Connected(socket, response)
+            }
+            Err(tungstenite::handshake::HandshakeError::Failure(f)) => match f {
+                tungstenite::Error::Http(response) if response.status().is_redirection() => {
+                    WsConnectOutcome::Redirect(response)
+                }
+                other => WsConnectOutcome::Failed(AppError::new(
+                    ReasonCode::RcNetworkUnreachable,
+                    format!("WebSocket connect failed: {other}"),
+                )),
+            },
+            Err(tungstenite::handshake::HandshakeError::Interrupted(_)) => {
+                WsConnectOutcome::Failed(AppError::new(
+                    ReasonCode::RcNetworkUnreachable,
+                    "WebSocket connect failed: blocking handshake was interrupted",
+                ))
+            }
         }
     }
 
-    /// Close the WebSocket with the given status code and reason.
-    pub fn close(&mut self, code: u16, reason: &str) -> AppResult<()> {
+    /// Write one data frame (payload is masked by tungstenite as this is a
+    /// client socket) and flush it to the wire.
+    fn send_frame(
+        &mut self,
+        payload: &[u8],
+        opcode: tungstenite::protocol::frame::coding::OpCode,
+        fin: bool,
+    ) -> AppResult<()> {
+        let frame = Frame::message(tungstenite::Bytes::copy_from_slice(payload), opcode, fin);
         self.inner
-            .close(Some(tungstenite::protocol::CloseFrame {
-                code: code.into(),
-                reason: reason.into(),
-            }))
+            .write(tungstenite::Message::Frame(frame))
             .map_err(|e| {
                 AppError::new(
                     ReasonCode::RcNetworkUnreachable,
-                    format!("WebSocket close failed: {e}"),
+                    format!("WebSocket send failed: {e}"),
                 )
-            })
+            })?;
+        self.inner.flush().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetworkUnreachable,
+                format!("WebSocket send failed: {e}"),
+            )
+        })
+    }
+
+    /// Flush any pending automatic frames (pong/close replies).
+    pub fn flush(&mut self) -> AppResult<()> {
+        self.inner.flush().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetworkUnreachable,
+                format!("WebSocket flush failed: {e}"),
+            )
+        })
+    }
+
+    /// Receive the next frame-level message. Close frames carry their code
+    /// (1005 for an empty close frame); ping/pong frames are surfaced so
+    /// the caller can decide how to consume them — the tungstenite reader
+    /// already auto-queues the pong reply for incoming pings.
+    pub fn receive(&mut self) -> Result<WebSocketMessage, WebSocketReadFailure> {
+        match self.inner.read() {
+            Ok(tungstenite::Message::Text(text)) => Ok(WebSocketMessage::Text(text.to_string())),
+            Ok(tungstenite::Message::Binary(data)) => Ok(WebSocketMessage::Binary(data.to_vec())),
+            Ok(tungstenite::Message::Close(Some(frame))) => Ok(WebSocketMessage::Close(
+                frame.code.into(),
+                frame.reason.to_string(),
+            )),
+            Ok(tungstenite::Message::Close(None)) => {
+                Ok(WebSocketMessage::Close(1005, String::new()))
+            }
+            Ok(tungstenite::Message::Ping(_)) => Ok(WebSocketMessage::Ping),
+            Ok(tungstenite::Message::Pong(_)) => Ok(WebSocketMessage::Pong),
+            // read() never yields raw frames (they are reassembled); a raw
+            // frame here would be an empty binary message by construction.
+            Ok(tungstenite::Message::Frame(_)) => Ok(WebSocketMessage::Binary(Vec::new())),
+            Err(tungstenite::Error::ConnectionClosed) => Err(WebSocketReadFailure::ConnectionLost(
+                "connection closed by the peer without a close frame".to_string(),
+            )),
+            Err(tungstenite::Error::AlreadyClosed) => Err(WebSocketReadFailure::ConnectionLost(
+                "connection already closed".to_string(),
+            )),
+            Err(tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            )) => Err(WebSocketReadFailure::ConnectionLost(
+                "connection closed by the peer without a close frame".to_string(),
+            )),
+            Err(tungstenite::Error::Protocol(e)) => Err(WebSocketReadFailure::ProtocolViolation(
+                format!("WebSocket protocol violation: {e}"),
+            )),
+            Err(tungstenite::Error::Utf8) => Err(WebSocketReadFailure::ProtocolViolation(
+                "WebSocket protocol violation: invalid UTF-8 in a text message".to_string(),
+            )),
+            Err(tungstenite::Error::Capacity(e)) => Err(WebSocketReadFailure::MessageTooBig(
+                format!("WebSocket frame/message exceeds the 64 MB cap: {e}"),
+            )),
+            Err(tungstenite::Error::Io(e)) => Err(WebSocketReadFailure::ConnectionLost(format!(
+                "WebSocket connection lost: {e}"
+            ))),
+            Err(other) => Err(WebSocketReadFailure::ConnectionLost(format!(
+                "WebSocket connection lost: {other}"
+            ))),
+        }
+    }
+
+    /// Best-effort close-frame send after a receive-side failure, mirroring
+    /// the RFC 6455 close codes for protocol violations (1002) and messages
+    /// beyond the size limit (1009). Failures are ignored: the connection
+    /// is dropped right afterwards anyway.
+    fn best_effort_close(&mut self, code: u16) {
+        let frame = CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::from(code),
+            reason: "".into(),
+        };
+        let _ = self.inner.close(Some(frame));
+    }
+
+    /// WinHttpWebSocketShutdown semantics: send the close frame, flush it,
+    /// then drive the close handshake until the peer's close reply
+    /// (ConnectionClosed) or `drain_bound` (the socket's
+    /// WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT) elapses. Returns an error
+    /// only if the close frame itself could not be written.
+    pub fn shutdown(&mut self, code: u16, reason: &str, drain_bound: Duration) -> AppResult<()> {
+        let frame = CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::from(code),
+            reason: reason.into(),
+        };
+        self.inner.close(Some(frame)).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetworkUnreachable,
+                format!("WebSocket close failed: {e}"),
+            )
+        })?;
+
+        let deadline = std::time::Instant::now() + drain_bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = self.inner.get_ref().set_read_timeout(Some(remaining));
+            match self.inner.read() {
+                Ok(_) => continue,
+                Err(tungstenite::Error::ConnectionClosed)
+                | Err(tungstenite::Error::AlreadyClosed) => break,
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = self.inner.get_ref().set_read_timeout(None);
+        Ok(())
     }
 
     /// Get the URL this socket is connected to.
@@ -364,6 +893,29 @@ pub enum WebSocketMessage {
     Close(u16, String),
     Ping,
     Pong,
+}
+
+/// Validate an incremental UTF-8 fragment stream. `carry` holds up to 3
+/// unvalidated bytes left over from the previous fragment; the combined
+/// stream is validated up to the last complete code point and the trailing
+/// incomplete bytes are returned for the next fragment.
+fn utf8_fragment_carry(carry: &[u8], chunk: &[u8]) -> AppResult<Vec<u8>> {
+    let mut joined = Vec::with_capacity(carry.len() + chunk.len());
+    joined.extend_from_slice(carry);
+    joined.extend_from_slice(chunk);
+    match std::str::from_utf8(&joined) {
+        Ok(_) => Ok(Vec::new()),
+        Err(e) => {
+            if e.error_len().is_some() {
+                Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "WinHttpWebSocketSend: invalid UTF-8 in text frame",
+                ))
+            } else {
+                Ok(joined[e.valid_up_to()..].to_vec())
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1152,6 +1704,11 @@ impl WinHttpStack {
             callback: None,
             callback_notify_flags: 0,
             certificate_errors: Vec::new(),
+            upgrade_to_websocket: false,
+            ws_close_timeout_ms: WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT,
+            ws_keepalive_interval_ms: WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL,
+            ws_receive_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+            ws_send_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
         };
         let handle = self.next_handle();
         self.requests.insert(handle, req);
@@ -1611,6 +2168,44 @@ impl WinHttpStack {
         option: u32,
         value: &[u8],
     ) -> AppResult<()> {
+        // WebSocket-handle options (the WebSocket surface introduced
+        // WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET and the WebSocket timing /
+        // buffer options; they may be set on the request handle before the
+        // upgrade and on the WebSocket handle afterwards).
+        if let Some(ws) = self.websockets.get_mut(&handle) {
+            match option {
+                WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET => {}
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT
+                | WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE
+                | WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE
+                    if value.len() >= 4 =>
+                {
+                    let value = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    match option {
+                        WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT => {
+                            ws.close_timeout_ms = value;
+                        }
+                        WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE => {
+                            ws.receive_buffer_size = value;
+                        }
+                        _ => ws.send_buffer_size = value,
+                    }
+                }
+                WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL if value.len() >= 4 => {
+                    let interval = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    // Windows rejects keepalive intervals below 15 s.
+                    if interval < WINHTTP_MIN_WEB_SOCKET_KEEPALIVE_INTERVAL {
+                        return Err(AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            "WinHttpSetOption: keepalive interval must be at least 15000 ms",
+                        ));
+                    }
+                    ws.keepalive_interval_ms = interval;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         // Try session, connection, request in order
         if let Some(session) = self.sessions.get_mut(&handle) {
             match option {
@@ -1714,6 +2309,38 @@ impl WinHttpStack {
                     // WINHTTP_OPTION_RECEIVE_TIMEOUT
                     req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
+                WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET => {
+                    // Marks the request for WinHttpWebSocketCompleteUpgrade.
+                    req.upgrade_to_websocket = true;
+                }
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT
+                | WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL
+                | WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE
+                | WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE
+                    if value.len() >= 4 =>
+                {
+                    let option_value = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    if option == WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL
+                        && option_value < WINHTTP_MIN_WEB_SOCKET_KEEPALIVE_INTERVAL
+                    {
+                        return Err(AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            "WinHttpSetOption: keepalive interval must be at least 15000 ms",
+                        ));
+                    }
+                    match option {
+                        WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT => {
+                            req.ws_close_timeout_ms = option_value;
+                        }
+                        WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL => {
+                            req.ws_keepalive_interval_ms = option_value;
+                        }
+                        WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE => {
+                            req.ws_receive_buffer_size = option_value;
+                        }
+                        _ => req.ws_send_buffer_size = option_value,
+                    }
+                }
                 _ => {}
             }
             return Ok(());
@@ -1733,6 +2360,47 @@ impl WinHttpStack {
         option: u32,
         buffer: &mut [u8],
     ) -> AppResult<u32> {
+        // WebSocket option surface: the WebSocket timing/buffer options
+        // apply to WebSocket handles and to the request handles that carry
+        // the values a future upgrade would inherit.
+        if matches!(
+            option,
+            WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT
+                | WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL
+                | WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE
+                | WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE
+        ) {
+            let value: u32 = if let Some(ws) = self.websockets.get(&handle) {
+                match option {
+                    WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT => ws.close_timeout_ms,
+                    WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL => ws.keepalive_interval_ms,
+                    WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE => ws.receive_buffer_size,
+                    _ => ws.send_buffer_size,
+                }
+            } else if let Some(req) = self.requests.get(&handle) {
+                match option {
+                    WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT => req.ws_close_timeout_ms,
+                    WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL => req.ws_keepalive_interval_ms,
+                    WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE => req.ws_receive_buffer_size,
+                    _ => req.ws_send_buffer_size,
+                }
+            } else {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!(
+                        "WinHttpQueryOption: handle {handle:#x} does not carry WebSocket options"
+                    ),
+                ));
+            };
+            if buffer.len() < 4 {
+                return Err(AppError::new(
+                    ReasonCode::RcNetProtocolError,
+                    "WinHttpQueryOption: buffer too small for WebSocket option",
+                ));
+            }
+            buffer[..4].copy_from_slice(&value.to_ne_bytes());
+            return Ok(4);
+        }
         match option {
             WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => {
                 if let Some(session) = self.sessions.get(&handle) {
@@ -2107,9 +2775,12 @@ impl WinHttpStack {
     /// WinHttpWebSocketCompleteUpgrade — upgrade an HTTP request to a WebSocket.
     /// Returns a new WebSocket handle.
     ///
-    /// When the `websocket` feature is enabled and the request URL is available,
-    /// attempts a real `tungstenite` connection. Otherwise falls back to buffer-based
-    /// state tracking.
+    /// Windows requires the request to be marked with
+    /// `WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET` before it is sent; that flag
+    /// is what arms the real tungstenite connection here. Without it (and
+    /// when no live connection can be established in feature-less builds)
+    /// the socket falls back to buffered state tracking so offline guests
+    /// still observe a working state machine.
     pub fn websocket_complete_upgrade(
         &mut self,
         request_handle: HINTERNET,
@@ -2129,50 +2800,81 @@ impl WinHttpStack {
             ));
         }
 
-        // Build the WebSocket URL from the connection + request info
+        // Build the WebSocket URL from the connection + request info, and
+        // inherit the request-handle WebSocket options (Windows applies
+        // options set on the request to the upgraded socket).
+        #[cfg_attr(not(feature = "websocket"), allow(unused_variables))]
+        let (
+            wants_live,
+            close_timeout_ms,
+            keepalive_interval_ms,
+            receive_buffer_size,
+            send_buffer_size,
+        ) = (
+            request.upgrade_to_websocket,
+            request.ws_close_timeout_ms,
+            request.ws_keepalive_interval_ms,
+            request.ws_receive_buffer_size,
+            request.ws_send_buffer_size,
+        );
         let conn = self.connections.get(&request.connection_handle);
         let ws_url = conn.map(|c| {
             let scheme = if c.is_secure { "wss" } else { "ws" };
+            // IPv6 literals must be bracketed in a URL.
+            let server_name = if c.server_name.contains(':') && !c.server_name.starts_with('[') {
+                format!("[{}]", c.server_name)
+            } else {
+                c.server_name.clone()
+            };
             format!(
                 "{}://{}:{}{}",
-                scheme, c.server_name, c.server_port, request.object_name
+                scheme, server_name, c.server_port, request.object_name
             )
         });
 
-        let ws_handle = self.next_handle;
-
-        // Frame encoding is governed by the per-call buffer types passed to
-        // WinHttpWebSocketSend/Receive, not by the negotiated subprotocol
-        // (Sec-WebSocket-Protocol is unrelated to text vs binary framing).
-        let is_text_mode = false;
+        let ws_handle = self.next_handle();
 
         self.websockets.insert(
             ws_handle,
-            WinHttpWebSocketState {
+            // Frame encoding is governed by the per-call buffer types passed
+            // to WinHttpWebSocketSend/Receive, not by the negotiated
+            // subprotocol (Sec-WebSocket-Protocol is unrelated to text vs
+            // binary framing).
+            WinHttpWebSocketState::new(
                 request_handle,
-                is_open: true,
-                buffer_type: if is_text_mode {
-                    WinHttpWebSocketBufferType::Utf8MessageBuffer
-                } else {
-                    WinHttpWebSocketBufferType::BinaryMessageBuffer
-                },
-                receive_buffer: Vec::new(),
-                receive_read_offset: 0,
-                send_buffer: Vec::new(),
-                close_status: WinHttpWebSocketCloseStatus::Success,
-                close_reason: None,
-                url: ws_url.clone(),
-                is_text_mode,
-            },
+                ws_url.clone(),
+                close_timeout_ms,
+                keepalive_interval_ms,
+                receive_buffer_size,
+                send_buffer_size,
+            ),
         );
 
-        // Attempt real tungstenite connection if feature is enabled and URL is available
+        // Attempt real tungstenite connection when the guest requested a
+        // WebSocket upgrade. A failure is surfaced like Windows does
+        // (ERROR_WINHTTP_CANNOT_CONNECT via the runtime) instead of being
+        // masked, because the guest explicitly asked for the wire.
         #[cfg(feature = "websocket")]
-        if let Some(ref url) = ws_url {
-            if let Ok(live_ws) = TungsteniteWebSocket::connect(url) {
-                self.live_websockets.insert(ws_handle, live_ws);
+        if wants_live {
+            let Some(ref url) = ws_url else {
+                self.websockets.remove(&ws_handle);
+                return Err(AppError::new(
+                    ReasonCode::RcNetworkUnreachable,
+                    "WinHttpWebSocketCompleteUpgrade: request has no connection for upgrade",
+                ));
+            };
+            match TungsteniteWebSocket::connect(url) {
+                Ok(live_ws) => {
+                    self.live_websockets.insert(ws_handle, live_ws);
+                    if let Some(ws) = self.websockets.get_mut(&ws_handle) {
+                        ws.is_live = true;
+                    }
+                }
+                Err(e) => {
+                    self.websockets.remove(&ws_handle);
+                    return Err(e);
+                }
             }
-            // If connection fails, we still have the buffer-based fallback
         }
 
         Ok(ws_handle)
@@ -2180,9 +2882,11 @@ impl WinHttpStack {
 
     /// WinHttpWebSocketSend — send data over a WebSocket connection.
     ///
-    /// When the `websocket` feature is enabled and a live tungstenite connection
-    /// exists, sends directly over the wire. Otherwise buffers the data.
-    #[allow(unused_variables)]
+    /// `*MessageBuffer` sends are complete frames (or, when a fragmented
+    /// message is in progress, its final continuation frame);
+    /// `*FragmentBuffer` sends open or continue a fragmented message on the
+    /// wire. Close and ping-pong buffer types are send-parameter errors, and
+    /// close frames travel through [`Self::websocket_close`] only.
     pub fn websocket_send(
         &mut self,
         ws_handle: HINTERNET,
@@ -2214,25 +2918,77 @@ impl WinHttpStack {
             ));
         }
 
-        // Try live tungstenite connection first
-        #[cfg(feature = "websocket")]
-        if let Some(live_ws) = self.live_websockets.get_mut(&ws_handle) {
-            let is_text = matches!(
-                buffer_type,
-                WinHttpWebSocketBufferType::Utf8MessageBuffer
-                    | WinHttpWebSocketBufferType::Utf8FragmentBuffer
-            );
-            if is_text {
-                let text = std::str::from_utf8(data).map_err(|_| {
+        // Close/ping-pong buffers describe received frames and cannot be sent.
+        let class = match buffer_type.data_class() {
+            Some(class) => class,
+            None => {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "WinHttpWebSocketSend: close and ping-pong buffers cannot be sent; \
+                     use WinHttpWebSocketClose",
+                ));
+            }
+        };
+        let is_fragment = buffer_type.is_fragment();
+        let finishing = !is_fragment;
+        let continuing = ws.fragmented_send.is_some();
+        if let Some(active) = ws.fragmented_send
+            && active != class
+        {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "WinHttpWebSocketSend: buffer type does not match the fragmented \
+                 message currently being sent",
+            ));
+        }
+
+        // UTF-8 validation. Whole-message sends validate their payload;
+        // fragments validate incrementally so multi-byte characters may
+        // straddle fragment boundaries (the last fragment of a text message
+        // must end on a complete character).
+        let mut new_utf8_pending: Vec<u8> = Vec::new();
+        if class.is_text() {
+            if continuing || is_fragment {
+                let carry = utf8_fragment_carry(&ws.utf8_send_pending, data)?;
+                if finishing && !carry.is_empty() {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "WinHttpWebSocketSend: UTF-8 text message ends inside a \
+                         multi-byte character",
+                    ));
+                }
+                new_utf8_pending = carry;
+            } else {
+                std::str::from_utf8(data).map_err(|_| {
                     AppError::new(
                         ReasonCode::RcCliInvalid,
                         "WinHttpWebSocketSend: invalid UTF-8 in text frame",
                     )
                 })?;
-                live_ws.send_text(text)?;
-            } else {
-                live_ws.send_binary(data)?;
             }
+        }
+
+        // Try live tungstenite connection first
+        #[cfg(feature = "websocket")]
+        if self.live_websockets.contains_key(&ws_handle) {
+            use tungstenite::protocol::frame::coding::{Data as WsOpData, OpCode};
+            let opcode = match (continuing, class.is_text()) {
+                (false, true) => OpCode::Data(WsOpData::Text),
+                (false, false) => OpCode::Data(WsOpData::Binary),
+                (true, _) => OpCode::Data(WsOpData::Continue),
+            };
+            let live_ws = self.live_websockets.get_mut(&ws_handle).unwrap();
+            live_ws.send_frame(data, opcode, finishing)?;
+            // Frame successfully written (and flushed): commit the new
+            // fragmented-send state. On a write failure the connection is
+            // dying and the previous state is kept.
+            let ws = self.websockets.get_mut(&ws_handle).unwrap();
+            ws.fragmented_send = if finishing { None } else { Some(class) };
+            ws.utf8_send_pending = if class.is_text() {
+                new_utf8_pending
+            } else {
+                Vec::new()
+            };
             return Ok(());
         }
 
@@ -2253,14 +3009,24 @@ impl WinHttpStack {
             ));
         }
         ws.send_buffer.extend_from_slice(data);
+        ws.fragmented_send = if finishing { None } else { Some(class) };
+        ws.utf8_send_pending = if class.is_text() {
+            new_utf8_pending
+        } else {
+            Vec::new()
+        };
 
         Ok(())
     }
 
     /// WinHttpWebSocketReceive — receive data from a WebSocket connection.
     ///
-    /// When the `websocket` feature is enabled and a live tungstenite connection
-    /// exists, reads from the wire. Otherwise reads from the internal buffer.
+    /// Ping/pong control frames are consumed transparently (tungstenite
+    /// answers pings automatically). A close frame records the peer's close
+    /// status and reason for WinHttpWebSocketQueryCloseStatus and returns
+    /// zero bytes; later receives fail because the channel is closed.
+    /// Messages larger than the guest buffer spill into the per-socket
+    /// receive buffer, which is served before the wire is read again.
     pub fn websocket_receive(
         &mut self,
         ws_handle: HINTERNET,
@@ -2281,78 +3047,93 @@ impl WinHttpStack {
             ));
         }
 
+        // Serve previously spilled message bytes before touching the wire.
+        let available = ws
+            .receive_buffer
+            .len()
+            .saturating_sub(ws.receive_read_offset);
+        if available > 0 {
+            let ws = self.websockets.get_mut(&ws_handle).unwrap();
+            let to_copy = data.len().min(available);
+            let start = ws.receive_read_offset;
+            data[..to_copy].copy_from_slice(&ws.receive_buffer[start..start + to_copy]);
+            ws.receive_read_offset += to_copy;
+            if ws.receive_read_offset == ws.receive_buffer.len() {
+                ws.receive_buffer.clear();
+                ws.receive_read_offset = 0;
+            }
+            return Ok(to_copy as u32);
+        }
+
         // Try live tungstenite connection first
         #[cfg(feature = "websocket")]
-        if let Some(live_ws) = self.live_websockets.get_mut(&ws_handle) {
-            let msg = live_ws.receive()?;
-            match msg {
-                WebSocketMessage::Text(text) => {
-                    let bytes = text.as_bytes();
-                    let to_copy = data.len().min(bytes.len());
-                    data[..to_copy].copy_from_slice(&bytes[..to_copy]);
-                    // Store any remaining data in the receive buffer
-                    if bytes.len() > to_copy {
-                        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
-                            AppError::new(
-                                ReasonCode::RcWin32InvalidHandle,
-                                "WinHttpWebSocketReceive: WebSocket handle vanished",
-                            )
-                        })?;
-                        let new_recv_len = ws
-                            .receive_buffer
-                            .len()
-                            .saturating_add(bytes.len() - to_copy);
-                        if new_recv_len > MAX_WEBSOCKET_RECEIVE_SPILL {
-                            return Err(AppError::new(
-                                ReasonCode::RcBufferLimitExceeded,
-                                format!(
-                                    "WinHttpWebSocketReceive: receive spill buffer {new_recv_len} exceeds limit ({MAX_WEBSOCKET_RECEIVE_SPILL})"
-                                ),
-                            ));
+        if self.live_websockets.contains_key(&ws_handle) {
+            let outcome = {
+                let live_ws = self.live_websockets.get_mut(&ws_handle).unwrap();
+                loop {
+                    match live_ws.receive() {
+                        // Control frames are handled transparently by the
+                        // stack (pings are auto-ponged), mirroring WinHTTP.
+                        Ok(WebSocketMessage::Ping) | Ok(WebSocketMessage::Pong) => continue,
+                        Ok(WebSocketMessage::Text(text)) => break Ok(WebSocketMessage::Text(text)),
+                        Ok(WebSocketMessage::Binary(bin)) => {
+                            break Ok(WebSocketMessage::Binary(bin));
                         }
-                        ws.receive_buffer.extend_from_slice(&bytes[to_copy..]);
-                    }
-                    return Ok(to_copy as u32);
-                }
-                WebSocketMessage::Binary(bin) => {
-                    let to_copy = data.len().min(bin.len());
-                    data[..to_copy].copy_from_slice(&bin[..to_copy]);
-                    if bin.len() > to_copy {
-                        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
-                            AppError::new(
-                                ReasonCode::RcWin32InvalidHandle,
-                                "WinHttpWebSocketReceive: WebSocket handle vanished",
-                            )
-                        })?;
-                        let new_recv_len =
-                            ws.receive_buffer.len().saturating_add(bin.len() - to_copy);
-                        if new_recv_len > MAX_WEBSOCKET_RECEIVE_SPILL {
-                            return Err(AppError::new(
-                                ReasonCode::RcBufferLimitExceeded,
-                                format!(
-                                    "WinHttpWebSocketReceive: receive spill buffer {new_recv_len} exceeds limit ({MAX_WEBSOCKET_RECEIVE_SPILL})"
-                                ),
-                            ));
+                        Ok(WebSocketMessage::Close(code, reason)) => {
+                            // tungstenite auto-queued the close reply; make
+                            // sure it reaches the wire before the socket is
+                            // dropped below.
+                            let _ = live_ws.flush();
+                            break Ok(WebSocketMessage::Close(code, reason));
                         }
-                        ws.receive_buffer.extend_from_slice(&bin[to_copy..]);
+                        Err(failure) => {
+                            // Send the RFC close code for the failure kind
+                            // (1002/1009) before the socket is dropped.
+                            if let Some(code) = failure.wire_close_code() {
+                                live_ws.best_effort_close(code);
+                            }
+                            break Err(failure);
+                        }
                     }
-                    return Ok(to_copy as u32);
                 }
-                WebSocketMessage::Close(code, reason) => {
-                    let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            "WinHttpWebSocketReceive: WebSocket handle vanished",
-                        )
-                    })?;
+            };
+            match outcome {
+                Ok(WebSocketMessage::Text(text)) => {
+                    return self.websocket_deliver_bytes(ws_handle, text.as_bytes(), data);
+                }
+                Ok(WebSocketMessage::Binary(bin)) => {
+                    return self.websocket_deliver_bytes(ws_handle, &bin, data);
+                }
+                Ok(WebSocketMessage::Close(code, reason)) => {
+                    self.live_websockets.remove(&ws_handle);
+                    let ws = self.websockets.get_mut(&ws_handle).unwrap();
                     ws.is_open = false;
                     ws.close_status = WinHttpWebSocketCloseStatus::from_code(code);
                     ws.close_reason = Some(reason);
+                    ws.receive_buffer.clear();
+                    ws.receive_read_offset = 0;
+                    ws.fragmented_send = None;
+                    ws.utf8_send_pending.clear();
                     return Ok(0);
                 }
-                WebSocketMessage::Ping | WebSocketMessage::Pong => {
-                    return Ok(0);
+                Err(failure) => {
+                    self.live_websockets.remove(&ws_handle);
+                    let ws = self.websockets.get_mut(&ws_handle).unwrap();
+                    ws.is_open = false;
+                    // Locally-computed statuses (1002/1006/1009) carry no
+                    // wire reason: Windows reports an empty close reason.
+                    ws.close_status = failure.close_status();
+                    ws.close_reason = None;
+                    ws.receive_buffer.clear();
+                    ws.receive_read_offset = 0;
+                    ws.fragmented_send = None;
+                    ws.utf8_send_pending.clear();
+                    return Err(AppError::new(
+                        ReasonCode::RcNetworkUnreachable,
+                        format!("WinHttpWebSocketReceive: {}", failure.detail()),
+                    ));
                 }
+                Ok(WebSocketMessage::Ping) | Ok(WebSocketMessage::Pong) => unreachable!(),
             }
         }
 
@@ -2375,37 +3156,123 @@ impl WinHttpStack {
         Ok(bytes_to_read as u32)
     }
 
+    /// Copy as much of `bytes` (a whole tungstenite message) into `data` as
+    /// fits and spill the remainder for the next receive. A remainder that
+    /// would breach the 16 MB spill cap is fatal: the message can no longer
+    /// be delivered in order, so the socket is closed with an internal error.
+    #[cfg(feature = "websocket")]
+    fn websocket_deliver_bytes(
+        &mut self,
+        ws_handle: HINTERNET,
+        bytes: &[u8],
+        data: &mut [u8],
+    ) -> AppResult<u32> {
+        let to_copy = data.len().min(bytes.len());
+        data[..to_copy].copy_from_slice(&bytes[..to_copy]);
+        if bytes.len() > to_copy {
+            let ws = self.websockets.get_mut(&ws_handle).unwrap();
+            let new_recv_len = ws
+                .receive_buffer
+                .len()
+                .saturating_add(bytes.len() - to_copy);
+            if new_recv_len > MAX_WEBSOCKET_RECEIVE_SPILL {
+                self.live_websockets.remove(&ws_handle);
+                let ws = self.websockets.get_mut(&ws_handle).unwrap();
+                ws.is_open = false;
+                ws.close_status = WinHttpWebSocketCloseStatus::InternalError;
+                ws.close_reason = Some(format!(
+                    "receive message exceeds the {MAX_WEBSOCKET_RECEIVE_SPILL} byte spill limit"
+                ));
+                ws.receive_buffer.clear();
+                ws.receive_read_offset = 0;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    format!(
+                        "WinHttpWebSocketReceive: receive spill buffer {new_recv_len} exceeds limit ({MAX_WEBSOCKET_RECEIVE_SPILL})"
+                    ),
+                ));
+            }
+            ws.receive_buffer.extend_from_slice(&bytes[to_copy..]);
+        }
+        Ok(to_copy as u32)
+    }
+
     /// WinHttpWebSocketClose — close a WebSocket connection.
     ///
-    /// When the `websocket` feature is enabled and a live tungstenite connection
-    /// exists, sends a proper close frame over the wire.
+    /// Validates the close status (1005/1006/1015 must never be sent on the
+    /// wire) and the 123-byte reason bound, then performs the close
+    /// handshake on a live connection within the configured close timeout.
+    /// Idempotent on already-closed sockets, and never clobbers a close
+    /// status that the peer already reported.
     pub fn websocket_close(
         &mut self,
         ws_handle: HINTERNET,
         status: WinHttpWebSocketCloseStatus,
         reason: Option<&str>,
     ) -> AppResult<()> {
-        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+        let ws = self.websockets.get(&ws_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "WinHttpWebSocketClose: invalid WebSocket handle",
             )
         })?;
 
+        // 1005/1006/1015 describe local conditions and must not be sent in a
+        // close frame (RFC 6455 §7.4.1).
+        if matches!(
+            status,
+            WinHttpWebSocketCloseStatus::Empty
+                | WinHttpWebSocketCloseStatus::AbnormalClosure
+                | WinHttpWebSocketCloseStatus::TlsHandshakeFailure
+        ) {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "WinHttpWebSocketClose: close status {status:?} cannot be sent to the peer"
+                ),
+            ));
+        }
+        if let Some(reason) = reason
+            && reason.len() > 123
+        {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "WinHttpWebSocketClose: close reason exceeds the 123 byte limit",
+            ));
+        }
+
+        let close_reason = reason.map(|s| s.to_string());
+
+        // The peer already closed the channel (status recorded by receive):
+        // just release the live transport, keeping the peer's close code.
+        if !ws.is_open {
+            #[cfg(feature = "websocket")]
+            if let Some(mut live_ws) = self.live_websockets.remove(&ws_handle) {
+                let _ = live_ws.flush();
+            }
+            return Ok(());
+        }
+
+        let ws = self.websockets.get_mut(&ws_handle).unwrap();
         ws.is_open = false;
         ws.close_status = status;
-        ws.close_reason = reason.map(|s| s.to_string());
+        ws.close_reason = close_reason;
+        ws.receive_buffer.clear();
+        ws.receive_read_offset = 0;
+        ws.fragmented_send = None;
+        ws.utf8_send_pending.clear();
 
         // Close live tungstenite connection
         #[cfg(feature = "websocket")]
-        {
+        if let Some(mut live_ws) = self.live_websockets.remove(&ws_handle) {
             let code = status as u16;
             let reason_str = reason.unwrap_or("").to_string();
-            if let Some(mut live_ws) = self.live_websockets.remove(&ws_handle) {
-                if let Err(e) = live_ws.close(code, &reason_str) {
-                    eprintln!("WinHttpWebSocketClose: failed to close WebSocket: {e}");
-                }
-            }
+            // The state above is committed regardless: a failed wire close
+            // leaves the guest-visible channel closed with the status set.
+            // The drain bound honors the socket's current close-timeout
+            // option (a zero value makes the post-close drain trivial).
+            let drain_bound = Duration::from_millis(u64::from(ws.close_timeout_ms.max(1)));
+            live_ws.shutdown(code, &reason_str, drain_bound)?;
         }
 
         Ok(())
@@ -3493,6 +4360,942 @@ mod tests {
         // After clearing all pins, the host should pass again.
         stack.clear_certificate_pins();
         assert!(stack.verify_certificate_pin("example.com", &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket semantics
+    // -----------------------------------------------------------------------
+
+    /// A WinHttpStack with one request chain (session/connection/request)
+    /// whose request is already in the Complete state and is NOT marked as a
+    /// WebSocket upgrade, so upgrades stay buffered (no network).
+    fn stack_with_completed_request() -> (WinHttpStack, HINTERNET) {
+        let mut stack = WinHttpStack::new();
+        let session = stack.next_handle();
+        stack.sessions.insert(
+            session,
+            WinHttpSession {
+                user_agent: String::new(),
+                access_type: 0,
+                proxy: None,
+                proxy_bypass: None,
+                state: WinHttpSessionState::Open,
+                enabled_protocols: 0,
+                security_flags: 0,
+            },
+        );
+        let conn = stack.next_handle();
+        stack.connections.insert(
+            conn,
+            WinHttpConnection {
+                session_handle: session,
+                server_name: "127.0.0.1".to_string(),
+                server_port: 80,
+                is_secure: false,
+                state: WinHttpSessionState::Complete,
+            },
+        );
+        let req = stack.next_handle();
+        stack.requests.insert(
+            req,
+            WinHttpRequest {
+                connection_handle: conn,
+                verb: "GET".to_string(),
+                object_name: "/ws".to_string(),
+                headers: BTreeMap::new(),
+                raw_headers: Vec::new(),
+                body: Vec::new(),
+                response_body: Vec::new(),
+                response_read_offset: 0,
+                response_headers: BTreeMap::new(),
+                status_code: 200,
+                status_text: "OK".to_string(),
+                state: WinHttpSessionState::Complete,
+                timeout_ms: 30000,
+                callback: None,
+                callback_notify_flags: 0,
+                certificate_errors: Vec::new(),
+                upgrade_to_websocket: false,
+                ws_close_timeout_ms: WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT,
+                ws_keepalive_interval_ms: WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL,
+                ws_receive_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+                ws_send_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+            },
+        );
+        (stack, req)
+    }
+
+    /// Insert a buffered (non-live) WebSocket state and return its handle.
+    fn stack_with_buffered_ws() -> (WinHttpStack, HINTERNET) {
+        let (mut stack, _req) = stack_with_completed_request();
+        let ws = stack.next_handle();
+        stack.websockets.insert(
+            ws,
+            WinHttpWebSocketState::new(
+                _req,
+                None,
+                WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT,
+                WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL,
+                WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+                WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+            ),
+        );
+        (stack, ws)
+    }
+
+    #[test]
+    fn websocket_buffer_type_classification() {
+        assert_eq!(
+            WinHttpWebSocketBufferType::BinaryMessageBuffer.data_class(),
+            Some(WinHttpWebSocketDataClass::Binary)
+        );
+        assert_eq!(
+            WinHttpWebSocketBufferType::BinaryFragmentBuffer.data_class(),
+            Some(WinHttpWebSocketDataClass::Binary)
+        );
+        assert_eq!(
+            WinHttpWebSocketBufferType::Utf8MessageBuffer.data_class(),
+            Some(WinHttpWebSocketDataClass::Utf8)
+        );
+        assert_eq!(
+            WinHttpWebSocketBufferType::Utf8FragmentBuffer.data_class(),
+            Some(WinHttpWebSocketDataClass::Utf8)
+        );
+        // Close and ping-pong buffers are receive-side only: they carry no
+        // data class and cannot be sent.
+        assert_eq!(WinHttpWebSocketBufferType::CloseBuffer.data_class(), None);
+        assert_eq!(
+            WinHttpWebSocketBufferType::PingPongBuffer.data_class(),
+            None
+        );
+        assert!(!WinHttpWebSocketBufferType::CloseBuffer.is_data());
+        assert!(!WinHttpWebSocketBufferType::PingPongBuffer.is_data());
+        assert!(WinHttpWebSocketBufferType::BinaryFragmentBuffer.is_fragment());
+        assert!(WinHttpWebSocketBufferType::Utf8FragmentBuffer.is_fragment());
+        assert!(!WinHttpWebSocketBufferType::Utf8MessageBuffer.is_fragment());
+        assert!(WinHttpWebSocketBufferType::Utf8MessageBuffer.is_text());
+        assert!(!WinHttpWebSocketBufferType::BinaryMessageBuffer.is_text());
+    }
+
+    #[test]
+    fn websocket_utf8_fragment_carry_validates_across_fragments() {
+        // A multi-byte character split across fragments is legal.
+        let carry = utf8_fragment_carry(&[], "frag-".as_bytes()).expect("ascii fragment");
+        assert!(carry.is_empty());
+        let carry = utf8_fragment_carry(&[], b"\xC3\xA9".as_slice()).expect("complete é");
+        assert!(carry.is_empty());
+        // The first byte of é alone is an incomplete sequence: carried over.
+        let carry = utf8_fragment_carry(&[], b"\xC3").expect("incomplete lead byte");
+        assert_eq!(carry, b"\xC3");
+        let carry = utf8_fragment_carry(&carry, b"\xA9").expect("completed é");
+        assert!(carry.is_empty());
+        // Completing a lead byte with a non-continuation byte is invalid.
+        assert!(utf8_fragment_carry(&[], b"\xC3").is_ok());
+        let lead = utf8_fragment_carry(&[], b"\xC3").expect("carried lead");
+        assert!(utf8_fragment_carry(&lead, b"x").is_err());
+        assert!(utf8_fragment_carry(&[], b"\xFF").is_err());
+    }
+
+    #[test]
+    fn websocket_buffered_send_rejects_invalid_buffer_types_and_caps() {
+        let (mut stack, ws) = stack_with_buffered_ws();
+        // Close and ping-pong buffers cannot be sent (send-parameter error).
+        assert!(
+            stack
+                .websocket_send(ws, WinHttpWebSocketBufferType::CloseBuffer, b"x")
+                .is_err()
+        );
+        assert!(
+            stack
+                .websocket_send(ws, WinHttpWebSocketBufferType::PingPongBuffer, b"x")
+                .is_err()
+        );
+        // A single frame over the 64 MB cap is rejected before any I/O.
+        let oversized = vec![0u8; MAX_WEBSOCKET_FRAME_SIZE + 1];
+        assert!(
+            stack
+                .websocket_send(
+                    ws,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer,
+                    &oversized
+                )
+                .is_err()
+        );
+        // Invalid UTF-8 in a whole text message is rejected.
+        assert!(
+            stack
+                .websocket_send(
+                    ws,
+                    WinHttpWebSocketBufferType::Utf8MessageBuffer,
+                    b"\xFF\xFE"
+                )
+                .is_err()
+        );
+        // Valid sends succeed and are buffered.
+        stack
+            .websocket_send(
+                ws,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+                b"hello",
+            )
+            .expect("binary send");
+        stack
+            .websocket_send(
+                ws,
+                WinHttpWebSocketBufferType::Utf8MessageBuffer,
+                "héllo".as_bytes(),
+            )
+            .expect("text send");
+    }
+
+    #[test]
+    fn websocket_buffered_fragment_sequencing_and_utf8_state() {
+        let (mut stack, ws) = stack_with_buffered_ws();
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"ab")
+            .expect("first fragment");
+        assert_eq!(
+            stack.websockets.get(&ws).unwrap().fragmented_send,
+            Some(WinHttpWebSocketDataClass::Utf8)
+        );
+        // Switching classes mid-message is a protocol misuse.
+        assert!(
+            stack
+                .websocket_send(ws, WinHttpWebSocketBufferType::BinaryFragmentBuffer, b"xx")
+                .is_err()
+        );
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"\xC3")
+            .expect("mid fragment with incomplete utf8 tail");
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"\xA9")
+            .expect("final fragment completes the é");
+        assert_eq!(stack.websockets.get(&ws).unwrap().fragmented_send, None);
+        assert!(
+            stack
+                .websockets
+                .get(&ws)
+                .unwrap()
+                .utf8_send_pending
+                .is_empty()
+        );
+
+        // A text message that ends inside a multi-byte character is invalid.
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"\xC3")
+            .expect("lead byte fragment");
+        assert!(
+            stack
+                .websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"z")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn websocket_buffered_close_semantics() {
+        let (mut stack, ws) = stack_with_buffered_ws();
+        // Close statuses that describe local conditions cannot be sent.
+        assert!(
+            stack
+                .websocket_close(ws, WinHttpWebSocketCloseStatus::Empty, None)
+                .is_err()
+        );
+        assert!(
+            stack
+                .websocket_close(ws, WinHttpWebSocketCloseStatus::AbnormalClosure, None)
+                .is_err()
+        );
+        assert!(
+            stack
+                .websocket_close(ws, WinHttpWebSocketCloseStatus::TlsHandshakeFailure, None)
+                .is_err()
+        );
+        // Close reasons are capped at 123 bytes on the wire.
+        let long_reason = "x".repeat(124);
+        assert!(
+            stack
+                .websocket_close(ws, WinHttpWebSocketCloseStatus::Success, Some(&long_reason))
+                .is_err()
+        );
+        let max_reason = "x".repeat(123);
+        stack
+            .websocket_close(ws, WinHttpWebSocketCloseStatus::Success, Some(&max_reason))
+            .expect("valid close");
+        assert_eq!(
+            stack.websocket_query_close_status(ws).expect("query"),
+            (WinHttpWebSocketCloseStatus::Success, Some(max_reason))
+        );
+        // The channel is closed: sends and receives fail, and close is
+        // idempotent (Windows cleanup path after a close or peer close).
+        assert!(
+            stack
+                .websocket_send(ws, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"x")
+                .is_err()
+        );
+        let mut buf = [0u8; 16];
+        assert!(
+            stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer
+                )
+                .is_err()
+        );
+        stack
+            .websocket_close(ws, WinHttpWebSocketCloseStatus::Success, None)
+            .expect("second close is idempotent");
+    }
+
+    #[test]
+    fn websocket_upgrades_allocate_distinct_handles_and_close_cleanup() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.next_handle();
+        stack.sessions.insert(
+            session,
+            WinHttpSession {
+                user_agent: String::new(),
+                access_type: 0,
+                proxy: None,
+                proxy_bypass: None,
+                state: WinHttpSessionState::Open,
+                enabled_protocols: 0,
+                security_flags: 0,
+            },
+        );
+        let mk_req = |stack: &mut WinHttpStack, port: u16| -> HINTERNET {
+            let conn = stack.next_handle();
+            stack.connections.insert(
+                conn,
+                WinHttpConnection {
+                    session_handle: session,
+                    server_name: "127.0.0.1".to_string(),
+                    server_port: port,
+                    is_secure: false,
+                    state: WinHttpSessionState::Complete,
+                },
+            );
+            let req = stack.next_handle();
+            stack.requests.insert(
+                req,
+                WinHttpRequest {
+                    connection_handle: conn,
+                    verb: "GET".to_string(),
+                    object_name: "/ws".to_string(),
+                    headers: BTreeMap::new(),
+                    raw_headers: Vec::new(),
+                    body: Vec::new(),
+                    response_body: Vec::new(),
+                    response_read_offset: 0,
+                    response_headers: BTreeMap::new(),
+                    status_code: 200,
+                    status_text: "OK".to_string(),
+                    state: WinHttpSessionState::Complete,
+                    timeout_ms: 30000,
+                    callback: None,
+                    callback_notify_flags: 0,
+                    certificate_errors: Vec::new(),
+                    upgrade_to_websocket: false,
+                    ws_close_timeout_ms: WINHTTP_DEFAULT_WEB_SOCKET_CLOSE_TIMEOUT,
+                    ws_keepalive_interval_ms: WINHTTP_DEFAULT_WEB_SOCKET_KEEPALIVE_INTERVAL,
+                    ws_receive_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+                    ws_send_buffer_size: WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE,
+                },
+            );
+            req
+        };
+        let req1 = mk_req(&mut stack, 81);
+        let req2 = mk_req(&mut stack, 82);
+        let ws1 = stack.websocket_complete_upgrade(req1).expect("upgrade 1");
+        let ws2 = stack.websocket_complete_upgrade(req2).expect("upgrade 2");
+        assert_ne!(ws1, ws2);
+
+        // Closing one WebSocket handle must not affect the other.
+        stack.win_http_close_handle(ws1).expect("close ws1");
+        assert!(
+            stack
+                .websocket_send(ws1, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"x")
+                .is_err()
+        );
+        stack
+            .websocket_send(ws2, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"ok")
+            .expect("ws2 unaffected");
+    }
+
+    #[test]
+    fn websocket_request_options_inherit_and_query_round_trip() {
+        let (mut stack, req) = stack_with_completed_request();
+        // Keepalive below the Windows minimum of 15 s is rejected.
+        assert!(
+            stack
+                .win_http_set_option(
+                    req,
+                    WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL,
+                    &20000u32.to_ne_bytes()
+                )
+                .is_ok()
+        );
+        assert!(
+            stack
+                .win_http_set_option(
+                    req,
+                    WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL,
+                    &14000u32.to_ne_bytes()
+                )
+                .is_err()
+        );
+        stack
+            .win_http_set_option(
+                req,
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+                &5000u32.to_ne_bytes(),
+            )
+            .expect("close timeout");
+        stack
+            .win_http_set_option(
+                req,
+                WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE,
+                &65536u32.to_ne_bytes(),
+            )
+            .expect("receive buffer");
+        let mut buf = [0u8; 8];
+        let n = stack
+            .win_http_query_option(req, WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, &mut buf)
+            .expect("query request option");
+        assert_eq!(n, 4);
+        assert_eq!(u32::from_ne_bytes(buf[..4].try_into().unwrap()), 5000);
+
+        // The upgraded (buffered) socket inherits the request option values.
+        let ws = stack.websocket_complete_upgrade(req).expect("upgrade");
+        let n = stack
+            .win_http_query_option(ws, WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, &mut buf)
+            .expect("query ws option");
+        assert_eq!(
+            u32::from_ne_bytes(buf[..n as usize].try_into().unwrap()),
+            5000
+        );
+        let n = stack
+            .win_http_query_option(ws, WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL, &mut buf)
+            .expect("query keepalive");
+        assert_eq!(
+            u32::from_ne_bytes(buf[..n as usize].try_into().unwrap()),
+            20000
+        );
+
+        // Options may also be changed on the WebSocket handle itself.
+        stack
+            .win_http_set_option(
+                ws,
+                WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+                &9000u32.to_ne_bytes(),
+            )
+            .expect("set ws close timeout");
+        let n = stack
+            .win_http_query_option(ws, WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, &mut buf)
+            .expect("requery");
+        assert_eq!(
+            u32::from_ne_bytes(buf[..n as usize].try_into().unwrap()),
+            9000
+        );
+    }
+
+    #[test]
+    fn websocket_buffered_receive_serves_synthetic_data() {
+        let (mut stack, ws) = stack_with_buffered_ws();
+        // Synthetic peer data (buffered mode ingress).
+        stack
+            .websockets
+            .get_mut(&ws)
+            .unwrap()
+            .receive_buffer
+            .extend_from_slice(b"abcdef");
+        let mut buf = [0u8; 4];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("first read");
+        assert_eq!(got, 4);
+        assert_eq!(&buf, b"abcd");
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("second read");
+        assert_eq!(got, 2);
+        assert_eq!(&buf[..2], b"ef");
+        // The backing buffer is released once fully consumed.
+        assert!(stack.websockets.get(&ws).unwrap().receive_buffer.is_empty());
+    }
+
+    #[cfg(feature = "websocket")]
+    /// Echo loop used by the live round-trip tests: answers every message
+    /// and completes the close handshake when the client closes.
+    fn ws_echo_handler(ws: &mut tungstenite::WebSocket<TcpStream>) {
+        loop {
+            match ws.read() {
+                Ok(m) if m.is_close() => {
+                    let _ = ws.flush();
+                    break;
+                }
+                Ok(m) => {
+                    if ws.send(m).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    /// Bind a loopback server that first answers the HTTP request leg of
+    /// the upgrade flow (plain 200) and then serves one WebSocket
+    /// connection to `handler`.
+    fn spawn_ws_test_server<H>(mut handler: H) -> (u16, std::thread::JoinHandle<()>)
+    where
+        H: FnMut(&mut tungstenite::WebSocket<TcpStream>) + Send + 'static,
+    {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ws test server");
+        let port = listener.local_addr().expect("local addr").port();
+        let thread = std::thread::spawn(move || {
+            let Ok((mut http, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") && buf.len() < (1 << 16) {
+                if http.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            let _ = http
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            drop(http);
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(mut ws) = tungstenite::accept(stream) else {
+                return;
+            };
+            handler(&mut ws);
+        });
+        (port, thread)
+    }
+
+    #[cfg(feature = "websocket")]
+    /// Drive a full upgrade against `port` with the request marked as a
+    /// WebSocket upgrade (option 114), returning a LIVE socket.
+    fn ws_upgrade_to(port: u16) -> (WinHttpStack, HINTERNET) {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("ws test"), 0, None, None);
+        let conn = stack
+            .win_http_connect(session, "127.0.0.1", port, false)
+            .expect("connect");
+        let req = stack
+            .win_http_open_request(conn, "GET", "/ws", None)
+            .expect("open request");
+        stack
+            .win_http_set_option(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, &[])
+            .expect("mark upgrade");
+        stack.win_http_send_request(req, None, None).expect("send");
+        stack.win_http_receive_response(req).expect("receive");
+        let ws = stack.websocket_complete_upgrade(req).expect("upgrade");
+        assert!(stack.websockets.get(&ws).expect("ws state").is_live);
+        (stack, ws)
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_binary_echo_round_trip() {
+        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
+        let (mut stack, ws) = ws_upgrade_to(port);
+        stack
+            .websocket_send(
+                ws,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+                b"ping-msg",
+            )
+            .expect("send");
+        let mut buf = [0u8; 64];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("receive");
+        assert_eq!(got, 8);
+        assert_eq!(&buf[..got as usize], b"ping-msg");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_text_echo_round_trip() {
+        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
+        let (mut stack, ws) = ws_upgrade_to(port);
+        stack
+            .websocket_send(
+                ws,
+                WinHttpWebSocketBufferType::Utf8MessageBuffer,
+                "héllo wörld".as_bytes(),
+            )
+            .expect("send text");
+        let mut buf = [0u8; 64];
+        let got = stack
+            .websocket_receive(ws, &mut buf, WinHttpWebSocketBufferType::Utf8MessageBuffer)
+            .expect("receive");
+        assert_eq!(&buf[..got as usize], "héllo wörld".as_bytes());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_fragmented_send_reassembled_as_one_message() {
+        let (port, _server) = spawn_ws_test_server(ws_echo_handler);
+        let (mut stack, ws) = ws_upgrade_to(port);
+        // Fragment sends open/continue one message; only the final
+        // message-type send carries the FIN bit, so the peer reassembles a
+        // single message (an echo would otherwise return three messages).
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"frag-")
+            .expect("fragment 1");
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8FragmentBuffer, b"-ment")
+            .expect("fragment 2");
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"-ed!")
+            .expect("final fragment");
+        let mut buf = [0u8; 64];
+        let got = stack
+            .websocket_receive(ws, &mut buf, WinHttpWebSocketBufferType::Utf8MessageBuffer)
+            .expect("receive");
+        assert_eq!(&buf[..got as usize], b"frag--ment-ed!");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_fragmented_receive_reassembles_one_message() {
+        use tungstenite::protocol::frame::coding::{Data as WsData, OpCode};
+        use tungstenite::{Bytes, Message};
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            let frames = [
+                Frame::message(
+                    Bytes::copy_from_slice(b"Hel"),
+                    OpCode::Data(WsData::Text),
+                    false,
+                ),
+                Frame::message(
+                    Bytes::copy_from_slice(b"lo "),
+                    OpCode::Data(WsData::Continue),
+                    false,
+                ),
+                Frame::message(
+                    Bytes::copy_from_slice(b"World"),
+                    OpCode::Data(WsData::Continue),
+                    true,
+                ),
+            ];
+            for frame in frames {
+                if ws.write(Message::Frame(frame)).is_err() {
+                    return;
+                }
+            }
+            let _ = ws.flush();
+            let _ = ws.read();
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 64];
+        let got = stack
+            .websocket_receive(ws, &mut buf, WinHttpWebSocketBufferType::Utf8MessageBuffer)
+            .expect("receive");
+        assert_eq!(&buf[..got as usize], b"Hello World");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_server_close_code_and_reason_are_reported() {
+        use tungstenite::Message;
+        use tungstenite::protocol::frame::{CloseFrame, coding::CloseCode};
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            let _ = ws.write(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "going away".into(),
+            })));
+            let _ = ws.flush();
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 64];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("close surfaces as zero bytes");
+        assert_eq!(got, 0);
+        assert_eq!(
+            stack.websocket_query_close_status(ws).expect("query"),
+            (
+                WinHttpWebSocketCloseStatus::EndpointUnavailable,
+                Some("going away".to_string())
+            )
+        );
+        // The receive channel is closed after the peer's close.
+        assert!(
+            stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_empty_close_frame_maps_to_1005() {
+        use tungstenite::Message;
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            let _ = ws.write(Message::Close(None));
+            let _ = ws.flush();
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 16];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("close surfaces");
+        assert_eq!(got, 0);
+        assert_eq!(
+            stack.websocket_query_close_status(ws).expect("query"),
+            (WinHttpWebSocketCloseStatus::Empty, Some(String::new()))
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_guest_close_reaches_peer_with_code_and_reason() {
+        use std::sync::mpsc;
+        use tungstenite::Message;
+        let (tx, rx): (mpsc::Sender<(u16, String)>, mpsc::Receiver<(u16, String)>) =
+            mpsc::channel();
+        let (port, server) = spawn_ws_test_server(move |ws| {
+            loop {
+                match ws.read() {
+                    Ok(m) if m.is_close() => {
+                        if let Message::Close(Some(frame)) = m {
+                            let _ = tx.send((frame.code.into(), frame.reason.to_string()));
+                        }
+                        let _ = ws.flush();
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        stack
+            .websocket_close(ws, WinHttpWebSocketCloseStatus::Success, Some("done"))
+            .expect("close");
+        let (code, reason) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server saw close");
+        assert_eq!(code, 1000);
+        assert_eq!(reason, "done");
+        assert_eq!(
+            stack.websocket_query_close_status(ws).expect("query"),
+            (
+                WinHttpWebSocketCloseStatus::Success,
+                Some("done".to_string())
+            )
+        );
+        server.join().expect("server thread");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_ping_is_transparent_and_answered() {
+        use std::sync::mpsc;
+        use tungstenite::{Bytes, Message};
+        let (tx, rx) = mpsc::channel();
+        let (port, _server) = spawn_ws_test_server(move |ws| {
+            if ws.write(Message::Ping(Bytes::from_static(b"hb"))).is_err() {
+                return;
+            }
+            if ws
+                .write(Message::Binary(Bytes::from_static(b"after")))
+                .is_err()
+            {
+                return;
+            }
+            if ws.flush().is_err() {
+                return;
+            }
+            loop {
+                match ws.read() {
+                    Ok(Message::Pong(data)) => {
+                        let _ = tx.send(data.to_vec());
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        // The ping is consumed internally (auto-pong); the data frame that
+        // follows it is what the guest receives.
+        let mut buf = [0u8; 16];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("receive after ping");
+        assert_eq!(&buf[..got as usize], b"after");
+        // The peer received the automatic pong for its ping.
+        let pong = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server saw pong");
+        assert_eq!(pong, b"hb");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_receive_spill_streams_large_messages() {
+        use tungstenite::{Bytes, Message};
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            let big: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+            if ws
+                .write(Message::Binary(Bytes::copy_from_slice(&big)))
+                .is_err()
+            {
+                return;
+            }
+            let _ = ws.write(Message::Binary(Bytes::from_static(b"two")));
+            let _ = ws.flush();
+            loop {
+                match ws.read() {
+                    Ok(m) if m.is_close() => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let expected: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let mut collected = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0u8; 1000];
+            let got = stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer,
+                )
+                .expect("chunked receive");
+            collected.extend_from_slice(&buf[..got as usize]);
+        }
+        assert_eq!(collected, expected);
+        // After the spill drains, the next wire message is served.
+        let mut buf = [0u8; 16];
+        let got = stack
+            .websocket_receive(
+                ws,
+                &mut buf,
+                WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            )
+            .expect("second message");
+        assert_eq!(&buf[..got as usize], b"two");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_connection_drop_records_abnormal_closure() {
+        let (port, _server) = spawn_ws_test_server(|_ws| {
+            // Drop the connection without a close frame.
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 16];
+        assert!(
+            stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer
+                )
+                .is_err()
+        );
+        let (status, reason) = stack.websocket_query_close_status(ws).expect("query");
+        assert_eq!(status, WinHttpWebSocketCloseStatus::AbnormalClosure);
+        assert!(reason.is_none());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_protocol_error_records_1002() {
+        use tungstenite::{Bytes, Message};
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            // Control frames are limited to 125 bytes of payload; sending a
+            // 200-byte ping is a wire-level protocol violation.
+            let _ = ws.write(Message::Ping(Bytes::from(vec![0u8; 200])));
+            let _ = ws.flush();
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 16];
+        assert!(
+            stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer
+                )
+                .is_err()
+        );
+        let (status, reason) = stack.websocket_query_close_status(ws).expect("query");
+        assert_eq!(status, WinHttpWebSocketCloseStatus::ProtocolError);
+        assert!(reason.is_none());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_live_oversized_frame_records_1009() {
+        let (port, _server) = spawn_ws_test_server(|ws| {
+            // A binary frame header (FIN + opcode 2, 8-byte length) whose
+            // payload length is one byte over the 64 MB cap. The client
+            // rejects it from the header alone, before any payload arrives.
+            let mut header = vec![0x82u8, 0x7F];
+            header.extend_from_slice(&((MAX_WEBSOCKET_FRAME_SIZE as u64 + 1).to_be_bytes()));
+            use std::io::Write as _;
+            let _ = ws.get_mut().write_all(&header);
+            let _ = ws.get_mut().flush();
+        });
+        let (mut stack, ws) = ws_upgrade_to(port);
+        let mut buf = [0u8; 16];
+        assert!(
+            stack
+                .websocket_receive(
+                    ws,
+                    &mut buf,
+                    WinHttpWebSocketBufferType::BinaryMessageBuffer
+                )
+                .is_err()
+        );
+        let (status, reason) = stack.websocket_query_close_status(ws).expect("query");
+        assert_eq!(status, WinHttpWebSocketCloseStatus::MessageTooBig);
+        assert!(reason.is_none());
     }
 }
 

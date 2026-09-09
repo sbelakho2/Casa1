@@ -732,7 +732,7 @@ fn t9_3_state_leak_tests_random_state_churn_output_matches_oracle() {
 
 #[test]
 fn t9_4_d3d9_legacy_suite_covers_golden_frames_and_exact_not_supported_errors() {
-    let mut d3d9 = direct3d_create9(true);
+    let mut d3d9 = direct3d_create9();
     let device = d3d9.create_device().expect("create D3D9 device");
     let scene = FixedFunctionScene {
         texture_factor: 0x1122_3344,
@@ -749,15 +749,16 @@ fn t9_4_d3d9_legacy_suite_covers_golden_frames_and_exact_not_supported_errors() 
     assert_eq!(frame.signature, expected_signature);
     assert_eq!(frame.hash, sha(expected_signature.as_bytes()));
 
-    let mut disabled = direct3d_create9(false);
-    let error = disabled
+    // The D3D9 shim is always on: construction takes no feature flag, so a
+    // fresh shim creates devices just like the first.
+    let mut always_on = direct3d_create9();
+    let device = always_on
         .create_device()
-        .expect_err("disabled D3D9 shim must fail with exact reason code");
+        .expect("always-on D3D9 shim must create a device");
+    // The shim's only remaining exact RcD3d9NotSupported is an unknown
+    // device id at present.
+    let error = always_on
+        .present(device.id + 1)
+        .expect_err("an unknown d3d9 device id must fail with exact reason code");
     assert_eq!(error.code, ReasonCode::RcD3d9NotSupported);
-    assert!(
-        error
-            .reproduction_hints
-            .iter()
-            .any(|hint| hint.contains("Direct3D9 compatibility shim"))
-    );
 }

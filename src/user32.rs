@@ -1883,7 +1883,15 @@ impl User32Subsystem {
         const WS_OVERLAPPED: u32 = 0x0000_0000;
         let is_child = style & WS_CHILD != 0;
         let is_overlapped_or_popup = !is_child;
-        let ns_window = if is_overlapped_or_popup {
+        // Materialize a real NSWindow only when this process can actually own
+        // one: an app bundle or forced window creation (see mac_window).
+        // Headless processes — CLI tools and `cargo test` binaries — never
+        // pump mac_window's main queue, so init_nsapplication() and
+        // create_nswindow() called from a worker thread would block forever
+        // waiting for a pump that never comes. Skip the round trip: the Win32
+        // window stays a logical headless window with a null NSWindow, exactly
+        // what the AppKit path itself produces for non-bundled processes.
+        let ns_window = if is_overlapped_or_popup && !mac_window::is_headless() {
             // Lazy initialization of NSApplication if not already done
             if !mac_window::init_nsapplication() {
                 std::ptr::null_mut()
@@ -6500,7 +6508,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn show_window_queues_paint_message() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6527,7 +6534,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn invalidate_window_queues_paint_once() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6561,7 +6567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn draw_animated_rects_updates_window_rect_and_queues_messages() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6605,7 +6610,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn draw_menu_bar_queues_paint_for_valid_window_menu() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6626,7 +6630,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn animate_window_updates_visibility_and_messages() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6650,7 +6653,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn track_popup_menu_validates_menu_and_refreshes_window() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6689,7 +6691,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn monitor_from_window_returns_window_monitor_or_primary_fallback() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -6957,7 +6958,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn enable_non_client_dpi_scaling_refreshes_window_dpi() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -7034,7 +7034,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn test_get_key_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
@@ -7116,7 +7115,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn test_keyboard_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
@@ -7209,7 +7207,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn test_get_async_key_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
@@ -7401,7 +7398,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn test_message_queue_has_key_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -7879,7 +7875,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn test_update_window_existing() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -7931,7 +7926,6 @@ mod tests {
     // ── Message queue ordering tests ───────────────────────────────────
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn message_queue_preserves_fifo_order() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("msg-order");
@@ -7959,7 +7953,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn timer_fires_and_is_reported_by_poll_timers() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("timer-msg");
@@ -7984,7 +7977,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn keyboard_input_generates_key_down() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("kbd-test");
@@ -8023,7 +8015,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn mouse_input_generates_button_down() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("mouse-test");
@@ -8068,7 +8059,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires AppKit on main thread"]
     fn set_focus_generates_focus_messages() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("focus-test1");
