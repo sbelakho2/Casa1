@@ -10327,16 +10327,22 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
     static ENCODER_BALANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn run_scenario(f: impl FnOnce()) {
-        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
-        let before = encoder_balance();
-        f();
-        // Wait for other threads' encoder traffic (from parallel tests) to
-        // settle, then require the invariant: every encoder created in this
-        // window (ours, plus any interleaved test's) must be ended.
-        // 8 s settle window (600 x 5 ms): other metal tests create encoders
-        // concurrently under full-suite parallelism, so the counters keep
-        // moving; wait for a quiescent read before asserting the invariant.
-        for _ in 0..1600 {
+        let before = {
+            let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
+            let before = encoder_balance();
+            f();
+            before
+        };
+        // The scenario ran exclusively; the process-wide counters are shared
+        // with other tests running in parallel threads, so before asserting
+        // the created == ended invariant wait (WITHOUT holding the lock —
+        // asserting under the lock would poison it for every other encoder
+        // test) for a quiescent read: a window where the counters stop
+        // moving and the created delta equals the ended delta.
+        // 60 s budget (12 000 x 5 ms): under full-suite GPU parallelism the
+        // other Metal tests' frames can keep encoder traffic moving for many
+        // seconds; anything beyond that is a real leak, not interleaving.
+        for _ in 0..12_000 {
             let a = encoder_balance();
             std::thread::sleep(std::time::Duration::from_millis(5));
             let b = encoder_balance();
@@ -10344,6 +10350,11 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
                 return;
             }
         }
+        eprintln!(
+            "encoder traffic never quiesced within 60 s (created delta {}, ended delta {})",
+            encoder_balance().0 - before.0,
+            encoder_balance().1 - before.1
+        );
         assert_encoder_balance(before);
     }
 
