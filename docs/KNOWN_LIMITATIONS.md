@@ -101,26 +101,6 @@ hardware-accelerated rendering and may have lower quality than native D3D
 captures. This is only relevant during the initial bootstrapper phase before
 D3D rendering begins.
 
-### D3D9 Requires an Explicit Feature Flag
-
-**Limitation**: Direct3D 9 support is provided via a compatibility shim
-([`Direct3D9Shim`](../src/d3d11.rs:862)) that is disabled by default and
-gated behind the `RcD3d9NotSupported` error. When enabled, the shim provides
-basic fixed-function rendering via Metal translation — including device
-creation, vertex/index buffers, textures, state block tracking, and present.
-
-**Reason**: Casa1 focuses on D3D10+ translation via Metal. The D3D9 shim
-covers the most common fixed-function patterns but may not handle every
-legacy D3D9 API call. Games with complex pixel/vertex shader emulation
-or obscure D3D9 extensions may still fail.
-
-**Enabling**: Set the appropriate GE configuration to enable the D3D9 shim:
-```json
-{ "d3d9": true }
-```
-
-
-
 ### Vulkan Requires MoltenVK on macOS
 
 **Limitation**: Vulkan support on macOS is implemented via MoltenVK, which
@@ -207,15 +187,6 @@ and honest — activation answers `COR_E_CLRNOTAVAILABLE`, directory queries fai
 as they would on a Windows machine with no CLR installed — but the ledger
 records the CLR capability as **absent** (fidelity `synthetic-environment`).
 Six callable exports must never be read as ".NET support".
-
-
-## Networking
-
-### WebSocket Requires Feature Flag
-
-**Limitation**: WebSocket support is not included by default. Guest applications
-that use WinHTTP WebSocket extensions will fail without the `websocket` feature.
-
 
 
 ## Security
