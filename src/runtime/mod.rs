@@ -1700,6 +1700,13 @@ pub enum HostThunk {
     DXGISwapChainGetBuffer,
     DXGISwapChainPresent,
     DXGISwapChainResizeBuffers,
+    DXGISwapChainSetFullscreenState,
+    DXGISwapChainGetFullscreenState,
+    DXGISwapChainGetDesc,
+    DXGISwapChainResizeTarget,
+    DXGISwapChainGetContainingOutput,
+    DXGISwapChainGetFrameStatistics,
+    DXGISwapChainGetLastPresentCount,
     // -- DXGI Factory methods (Phase 5.5 #2) --
     DXGIFactoryMakeWindowAssociation,
     DXGIFactoryGetWindowAssociation,
@@ -16455,6 +16462,25 @@ impl PeHostRuntime {
                 }
                 state.set(Register::Rax, 0); // S_OK
                 self.last_error = 0;
+            }
+            HostThunk::DXGISwapChainSetFullscreenState => {
+                self.dispatch_dxgi_swapchain_set_fullscreen_state(memory, state)?
+            }
+            HostThunk::DXGISwapChainGetFullscreenState => {
+                self.dispatch_dxgi_swapchain_get_fullscreen_state(memory, state)?
+            }
+            HostThunk::DXGISwapChainGetDesc => self.dispatch_dxgi_swapchain_get_desc(memory, state)?,
+            HostThunk::DXGISwapChainResizeTarget => {
+                self.dispatch_dxgi_swapchain_resize_target(memory, state)?
+            }
+            HostThunk::DXGISwapChainGetContainingOutput => {
+                self.dispatch_dxgi_swapchain_get_containing_output(memory, state)?
+            }
+            HostThunk::DXGISwapChainGetFrameStatistics => {
+                self.dispatch_dxgi_swapchain_get_frame_statistics(memory, state)?
+            }
+            HostThunk::DXGISwapChainGetLastPresentCount => {
+                self.dispatch_dxgi_swapchain_get_last_present_count(memory, state)?
             }
             HostThunk::DXGISwapChainGetBuffer => {
                 self.dispatch_dxgi_swapchain_get_buffer(memory, state)?;
@@ -70011,6 +70037,17 @@ impl PeHostRuntime {
         methods[8] = HostThunk::DXGISwapChainPresent;
         methods[9] = HostThunk::DXGISwapChainGetBuffer;
         methods[13] = HostThunk::DXGISwapChainResizeBuffers;
+        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
+        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[6] = HostThunk::D3D12ObjectSetName;
+        methods[10] = HostThunk::DXGISwapChainSetFullscreenState;
+        methods[11] = HostThunk::DXGISwapChainGetFullscreenState;
+        methods[12] = HostThunk::DXGISwapChainGetDesc;
+        methods[14] = HostThunk::DXGISwapChainResizeTarget;
+        methods[15] = HostThunk::DXGISwapChainGetContainingOutput;
+        methods[16] = HostThunk::DXGISwapChainGetFrameStatistics;
+        methods[17] = HostThunk::DXGISwapChainGetLastPresentCount;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiSwapChain, vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -70654,6 +70691,121 @@ impl PeHostRuntime {
                 format!("Present on unknown DXGI swapchain {swapchain_object:#x}"),
             ))
         }
+    }
+
+    fn dispatch_dxgi_swapchain_set_fullscreen_state(
+        &mut self,
+        _memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let this = state.get(Register::Rcx);
+        let fullscreen = state.get(Register::Rdx) != 0;
+        self.d3d12_fullscreen.insert(this, fullscreen);
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_get_fullscreen_state(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let this = state.get(Register::Rcx);
+        let out = state.get(Register::Rdx);
+        let fullscreen = self.d3d12_fullscreen.get(&this).copied().unwrap_or(false);
+        if out != 0 {
+            write_u32(memory, out, u32::from(fullscreen));
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_get_desc(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let _this = state.get(Register::Rcx);
+        let desc = state.get(Register::Rdx);
+        if desc != 0 {
+            // DXGI_SWAP_CHAIN_DESC: BufferDesc(0..40: width 0, height 4,
+            // format 8, refresh 12..19, scanline 20, scaling 21, flags 24),
+            // SampleDesc(40), BufferUsage(48), BufferCount(52),
+            // OutputWindow(56), Windowed(64), SwapEffect(68), Flags(72).
+            write_u32(memory, desc, 640);
+            write_u32(memory, desc + 4, 480);
+            write_u32(memory, desc + 8, 28); // R8G8B8A8_UNORM
+            write_u32(memory, desc + 40, 1); // 1 sample
+            write_u32(memory, desc + 44, 0);
+            write_u32(memory, desc + 48, 8); // RENDER_TARGET_OUTPUT
+            write_u32(memory, desc + 52, 2); // double buffered
+            write_u32(memory, desc + 64, 1); // windowed
+            write_u32(memory, desc + 68, 2); // FLIP_DISCARD
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_resize_target(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let _this = state.get(Register::Rcx);
+        let desc = state.get(Register::Rdx);
+        if desc != 0 {
+            let width = read_u32(memory, desc).unwrap_or(640).max(1);
+            let height = read_u32(memory, desc + 4).unwrap_or(480).max(1);
+            let _ = (width, height);
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_get_containing_output(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let out = state.get(Register::Rdx);
+        // The runtime's single adapter output.
+        if out != 0 {
+            write_guest_pointer(memory, out, 1, self.guest_arch).ok();
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_get_frame_statistics(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let stats = state.get(Register::Rdx);
+        if stats != 0 {
+            // DXGI_FRAME_STATISTICS: PresentCount(0), PresentRefreshCount(4),
+            // SyncRefreshCount(8), SyncQPCTime(16), SyncGPUTime(24).
+            write_u32(memory, stats, 1);
+            write_u32(memory, stats + 4, 0);
+            write_u32(memory, stats + 8, 0);
+            write_u64(memory, stats + 16, 0);
+            write_u64(memory, stats + 24, 0);
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_dxgi_swapchain_get_last_present_count(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let out = state.get(Register::Rdx);
+        if out != 0 {
+            write_u32(memory, out, 1);
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
     }
 
     fn dispatch_dxgi_swapchain_resize_buffers(

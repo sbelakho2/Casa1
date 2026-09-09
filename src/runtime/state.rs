@@ -1008,6 +1008,8 @@ pub(crate) struct PeHostRuntime {
     pub(crate) d3d12_devices: BTreeMap<u64, GuestD3d12Device>,
     /// Guest D3D12 object -> its debug name (SetName).
     pub(crate) d3d12_object_names: HashMap<u64, String>,
+    /// Guest swapchain -> its fullscreen state.
+    pub(crate) d3d12_fullscreen: HashMap<u64, bool>,
     /// Guest D3D12 object -> its private data (SetPrivateData).
     pub(crate) d3d12_private_data: HashMap<u64, Vec<u8>>,
     pub(crate) d3d12_command_queues: BTreeMap<u64, GuestD3d12CommandQueue>,
@@ -2060,6 +2062,7 @@ impl PeHostRuntime {
             dxgi_adapters: BTreeMap::new(),
             d3d12_devices: BTreeMap::new(),
             d3d12_object_names: HashMap::new(),
+            d3d12_fullscreen: HashMap::new(),
             d3d12_private_data: HashMap::new(),
             d3d12_command_queues: BTreeMap::new(),
             d3d12_command_allocators: BTreeMap::new(),
