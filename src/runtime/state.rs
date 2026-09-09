@@ -1006,6 +1006,10 @@ pub(crate) struct PeHostRuntime {
     pub(crate) dxgi_factories: BTreeMap<u64, GuestDxgiFactory>,
     pub(crate) dxgi_adapters: BTreeMap<u64, GuestDxgiAdapter>,
     pub(crate) d3d12_devices: BTreeMap<u64, GuestD3d12Device>,
+    /// Guest D3D12 object -> its debug name (SetName).
+    pub(crate) d3d12_object_names: HashMap<u64, String>,
+    /// Guest D3D12 object -> its private data (SetPrivateData).
+    pub(crate) d3d12_private_data: HashMap<u64, Vec<u8>>,
     pub(crate) d3d12_command_queues: BTreeMap<u64, GuestD3d12CommandQueue>,
     pub(crate) d3d12_command_allocators: BTreeMap<u64, GuestD3d12CommandAllocator>,
     pub(crate) d3d12_descriptor_heaps: BTreeMap<u64, GuestD3d12DescriptorHeap>,
@@ -2055,6 +2059,8 @@ impl PeHostRuntime {
             dxgi_factories: BTreeMap::new(),
             dxgi_adapters: BTreeMap::new(),
             d3d12_devices: BTreeMap::new(),
+            d3d12_object_names: HashMap::new(),
+            d3d12_private_data: HashMap::new(),
             d3d12_command_queues: BTreeMap::new(),
             d3d12_command_allocators: BTreeMap::new(),
             d3d12_descriptor_heaps: BTreeMap::new(),

@@ -2179,6 +2179,10 @@ pub enum HostThunk {
     D3D12FenceSignal,
     // -- D3D12 command queue gap-fill (Phase 3.2) --
     D3D12CommandQueueWait,
+    D3D12CommandQueueGetDesc,
+    D3D12ObjectSetName,
+    D3D12ObjectGetPrivateData,
+    D3D12ObjectSetPrivateData,
     D3D12CommandQueueGetTimestampFrequency,
     D3D12CommandQueueGetClockCalibration,
     // -- D3D9 Device gap-fill methods (Phase 3.3) --
@@ -14102,6 +14106,12 @@ impl PeHostRuntime {
                 self.dispatch_d3d12_fence_signal(state)?;
             }
             // ── D3D12 command queue gap-fill dispatchers (Phase 3.2) ────
+            HostThunk::D3D12CommandQueueGetDesc => self.dispatch_d3d12_command_queue_get_desc(state, memory)?,
+            HostThunk::D3D12ObjectSetName => self.dispatch_d3d12_object_set_name(state, memory)?,
+            HostThunk::D3D12ObjectGetPrivateData => self.dispatch_d3d12_object_get_private_data(state, memory)?,
+            HostThunk::D3D12ObjectSetPrivateData => {
+                self.dispatch_d3d12_object_set_private_data(state, memory)?
+            }
             HostThunk::D3D12CommandQueueWait => {
                 self.dispatch_d3d12_command_queue_wait(state)?;
             }
@@ -69699,11 +69709,17 @@ impl PeHostRuntime {
         methods[0] = unsupported_method(&self.telemetry, "ID3D12CommandQueue::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
-        methods[8] = HostThunk::D3D12CommandQueueWait;
-        methods[10] = HostThunk::D3D12CommandQueueExecuteCommandLists;
-        methods[14] = HostThunk::D3D12CommandQueueSignal;
-        methods[15] = HostThunk::D3D12CommandQueueGetTimestampFrequency;
-        methods[16] = HostThunk::D3D12CommandQueueGetClockCalibration;
+        methods[3] = HostThunk::D3D12ObjectGetPrivateData;
+        methods[4] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[5] = HostThunk::D3D12ObjectSetPrivateData;
+        methods[6] = HostThunk::D3D12ObjectSetName;
+        methods[7] = HostThunk::D3D12CommandQueueGetDesc;
+        methods[8] = HostThunk::D3D12CommandQueueGetDesc;
+        methods[9] = HostThunk::D3D12CommandQueueGetTimestampFrequency;
+        methods[10] = HostThunk::D3D12CommandQueueGetClockCalibration;
+        methods[11] = HostThunk::D3D12CommandQueueExecuteCommandLists;
+        methods[12] = HostThunk::D3D12CommandQueueSignal;
+        methods[13] = HostThunk::D3D12CommandQueueWait;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12CommandQueue, vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -71858,6 +71874,85 @@ impl PeHostRuntime {
     }
 
     // ── D3D12 command queue gap-fill dispatch handlers (Phase 3.2) ──
+
+    fn dispatch_d3d12_command_queue_get_desc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let queue = state.get(Register::Rcx);
+        let desc_out = state.get(Register::Rdx);
+        let Some(state_obj) = self.d3d12_command_queues.get(&queue) else {
+            return Ok(());
+        };
+        if desc_out != 0 {
+            write_u32(memory, desc_out, 3); // DIRECT
+            write_u32(memory, desc_out + 4, 0);
+            write_u32(memory, desc_out + 8, 0);
+            write_u32(memory, desc_out + 12, 0);
+        }
+        let _ = state_obj;
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_d3d12_object_set_name(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = state.get(Register::Rcx);
+        let name = state.get(Register::Rdx);
+        let text = read_utf16_string(memory, name).unwrap_or_default();
+        self.d3d12_object_names.insert(this, text);
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_d3d12_object_get_private_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = state.get(Register::Rcx);
+        let _guid = state.get(Register::Rdx);
+        let data = state.get(Register::R8);
+        let size = state.get(Register::R9);
+        let actual = state.get(Register::Rsp) + 0x28;
+        let Some(bytes) = self.d3d12_private_data.get(&this).cloned() else {
+            if data != 0 && size != 0 {
+                write_u32(memory, actual, 0);
+            }
+            state.set(Register::Rax, 0x8007_004e); // DXGI_ERROR_NOT_FOUND
+            return Ok(());
+        };
+        if data != 0 {
+            let copy = (size as usize).min(bytes.len());
+            for (i, byte) in bytes[..copy].iter().enumerate() {
+                memory.write_u8(data + i as u64, *byte);
+            }
+        }
+        if size != 0 {
+            write_u32(memory, actual, bytes.len() as u32);
+        }
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
+
+    fn dispatch_d3d12_object_set_private_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = state.get(Register::Rcx);
+        let _guid = state.get(Register::Rdx);
+        let size = state.get(Register::R8);
+        let data = state.get(Register::R9);
+        let bytes = memory.read_bytes(data, size as usize).unwrap_or_default();
+        self.d3d12_private_data.insert(this, bytes);
+        state.set(Register::Rax, 0);
+        Ok(())
+    }
 
     fn dispatch_d3d12_command_queue_wait(&mut self, state: &mut CpuState) -> AppResult<()> {
         let queue_object = state.get(Register::Rcx);
