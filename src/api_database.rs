@@ -20,8 +20,8 @@
 //!   The audit's "meaning of Implemented" problem: an export may be callable
 //!   without being exact (`mscoree` answers `COR_E_CLRNOTAVAILABLE` for a
 //!   machine with no CLR — dispatch callable, capability absent), and a
-//!   no-op must never claim real semantics (`X3DAudioCalculate` is demoted to
-//!   a documented `Partial`).  Seed-time overrides
+//!   no-op must never claim real semantics (the canned `X3DAudioCalculate`
+//!   is now real spatial math; remaining no-ops are documented stubs).  Seed-time overrides
 //!   ([`SEMANTIC_OVERRIDES`]) record the audited truth on both axes, and the
 //!   report and the generated `KNOWN_LIMITATIONS.compat.md` ledger surface
 //!   them.
@@ -934,8 +934,8 @@ impl ApiDatabase {
     /// operation is exact, restricted, an approximation, an honest model of an
     /// absent/limited environment, or a canned response — and whether the
     /// backing Windows subsystem is available.  A row may also be demoted
-    /// here (e.g. `X3DAudioCalculate`, whose "sound-cone math" is a canned
-    /// zeroed response, is demoted to a documented `Stub`).  A `"*"` DLL
+    /// here (e.g. the canned no-ops are documented `Stub`s, registered
+    /// deliberately unsupported with their consequence).  A `"*"` DLL
     /// matches every DLL (export-wide rules such as the shared module-class
     /// registration contract).
     pub fn apply_semantic_overrides(&mut self) {
@@ -1220,16 +1220,19 @@ const fn semantic_override(
 /// math" but writes a zeroed DSP response — is demoted to a documented
 /// `Partial` here.
 static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
-    // ── X3DAudio: the claimed spatial math is not performed ────────────────
+    // ── X3DAudio: the spatial math is now real ─────────────────────────────
     semantic_override(
         "x3daudio1_7.dll",
         "X3DAudioCalculate",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No listener/emitter sound-cone math is performed: the DSP settings are \
-         zeroed and S_OK is returned.  The guest sees a silent no-op instead of \
-         the spatial calculation the API documents.",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Performs real X3DAudio spatial math (distance curves, cone inside/outside \
+         attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel \
+         delay/coefficient matrices) with documented approximations: speaker-circle \
+         azimuths, unit speaker radius and the inner-radius blend curve are complete \
+         deterministic approximations because no Windows oracle exists; the matrix \
+         layout follows the SDK header (dst-major).  Zeroed-response no-op is gone.",
     ),
     semantic_override(
         "x3daudio1_7.dll",
@@ -1237,9 +1240,9 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Validates the output pointer and hands back an instance token derived from \
-         the channel mask, but the X3DAudio engine surface behind the handle is \
-         absent (calculate is a canned zeroed response).",
+        "Writes a real opaque instance handle (magic + speaker mask + speed of \
+         sound) that Calculate validates; the engine surface is the software spatial \
+         math above.",
     ),
     // ── XACT3: no engine — the honest no-class environment model ───────────
     semantic_override(
@@ -1392,14 +1395,16 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
          operation answers FALSE without performing the documented dialog \
          contract.",
     ),
+    // ── certificate digest helper: real digests now ────────────────────────
     semantic_override(
         "cryptdlg.dll",
         "CertDigestDigest",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "The digest helper is not implemented: the operation answers \
-         ERROR_NOT_FOUND without computing a digest.",
+        None,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        "Computes real MD5/SHA-1/SHA-256 digests over the guest buffer via the \
+         crypto layer, with size-probe mode, ERROR_INSUFFICIENT_BUFFER \
+         partial-write semantics and ERROR_NOT_SUPPORTED for unknown algorithms.",
     ),
     // ── audio-session activation: the runtime audio is session-local ───────
     semantic_override(
@@ -1497,17 +1502,20 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "Creates a real GDI+ graphics object, but the object carries an empty vtable \
          (no drawing methods) — the handle is real, the drawing surface is not.",
     ),
-    // ── NT native process creation: not creatable in this surface ──────────
+    // ── NT native process creation: a real native child now ────────────────
     semantic_override(
         "ntdll.dll",
         "NtCreateProcess",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
+        None,
+        SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "No child processes are creatable through the native surface: the call \
-         answers STATUS_INVALID_HANDLE without creating a process.  Process APIs \
-         exist through the Win32 layer; the native creation path is a canned \
-         failure the guest sees.",
+        "Creates a real child guest process through the same machinery CreateProcessW \
+         uses (real pid, image, environment/cwd, kernel handle, exit sync) with real \
+         NTSTATUS failure paths.  The native contract's primary-thread creation is \
+         NtCreateThread's job (no native-thread surface exists) and no host \
+         subprocess runner is spawned (the contract carries no command line), so the \
+         process object is a record-only guest process with full query/terminate \
+         semantics.",
     ),
     // ── shell UI helpers: canned failure without any shell-UI operation ────
     semantic_override(
@@ -1546,36 +1554,37 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "No favorites navigation happens: the operation answers E_FAIL without \
          performing the work.",
     ),
-    // ── rich-edit class registration: canned TRUE, class never registered ──
+    // ── rich-edit class registration: real registered classes now ──────────
     semantic_override(
         "msftedit.dll",
         "MsftEditRegisterClass",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "The rich-edit window class is not registered: the operation returns TRUE \
-         without performing the registration, so later class creation cannot \
-         succeed.",
+        None,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Registers the real RICHEDIT50W class through the user32 class registry and \
+         returns its real atom (idempotent re-registration, stable atom); window \
+         creation routes through the built-in rich-edit control path.",
     ),
     semantic_override(
         "riched32.dll",
         "RichEditANSIWndClass",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "The ANSI rich-edit window class is not registered: the operation returns \
-         TRUE without performing the registration.",
+        None,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Registers the real RICHEDIT class through the user32 class registry and \
+         returns its real atom; window creation routes through the built-in \
+         rich-edit control path.",
     ),
-    // ── CNG audit: canned success, nothing audited ─────────────────────────
+    // ── CNG audit: real audit records now ──────────────────────────────────
     semantic_override(
         "cngaudit.dll",
         "CngAuditLog",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No audit record is written: the operation answers ERROR_SUCCESS without \
-         performing any audit-logging work (a silent no-op the guest sees as \
-         success).",
+        None,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Appends a real audit record (timestamp, provider, action, result) to the \
+         runtime's bounded audit trail on every call; the trail is the runtime's own \
+         store rather than the Windows security-event log.",
     ),
     // ── the shared module-class registration contract ──────────────────────
     // Every module-class-object DLL routes DllRegisterServer/DllUnregisterServer

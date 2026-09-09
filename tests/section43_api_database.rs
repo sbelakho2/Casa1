@@ -221,49 +221,47 @@ fn database_seeds_interface_tables_at_runtime_levels() {
 fn semantic_axes_keep_callable_separate_from_exact() {
     // The audit's "meaning of Implemented" regression: an export can be
     // callable without being exact, and the registry must never claim real
-    // semantics its dispatch does not perform.  X3DAudioCalculate claims
-    // "real sound-cone math" but writes a zeroed DSP response — it is
-    // demoted to a documented Stub (canned/no-op belongs under Stub per
-    // Casa1's own taxonomy), registered deliberately unsupported with the
-    // guest-visible consequence the axes record.
+    // semantics its dispatch does not perform.  X3DAudioCalculate once
+    // claimed "real sound-cone math" while writing a zeroed DSP response;
+    // the real spatial-math implementation landed, so the row is
+    // Implemented with Restricted fidelity (documented approximations — no
+    // Windows oracle for speaker-circle azimuths etc.), not a stub.
     let database = ApiDatabase::from_thunk_metadata();
     let x3daudio_calculate = database
         .lookup("x3daudio1_7.dll", "X3DAudioCalculate")
         .expect("X3DAudioCalculate entry");
     assert_eq!(
         x3daudio_calculate.implementation,
-        ImplementationLevel::Stub,
-        "a canned zeroed-DSP dispatch must not be Implemented (or Partial — \
-         no real operation exists to be partial about)"
+        ImplementationLevel::Implemented,
+        "the real spatial-math dispatch is Implemented"
     );
     assert!(
         !x3daudio_calculate.transitional,
-        "stubs carry a deliberate consequence, not a transitional partial reason"
+        "no transitional partial reason applies to an implemented row"
     );
     assert_eq!(
         x3daudio_calculate.semantic_fidelity,
-        SemanticFidelity::CannedFailure,
-        "the fidelity axis records the canned response"
+        SemanticFidelity::Restricted,
+        "real math with documented approximations is Restricted, never Exact \
+         without an oracle"
     );
     assert_eq!(
         x3daudio_calculate.subsystem_capability,
-        SubsystemCapability::Absent,
-        "no X3DAudio engine exists behind the handle"
+        SubsystemCapability::Partial,
+        "the software X3DAudio engine exists with documented approximations"
     );
-    let consequence = database
-        .deliberately_unsupported_error("x3daudio1_7.dll", "X3DAudioCalculate")
-        .expect("the stub is registered deliberately unsupported");
     assert!(
-        consequence.contains("silent no-op"),
-        "the deliberate registration documents the guest-visible consequence: {consequence}"
+        database
+            .deliberately_unsupported_error("x3daudio1_7.dll", "X3DAudioCalculate")
+            .is_none(),
+        "an implemented export is no longer deliberately unsupported"
     );
     assert!(
         x3daudio_calculate
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("no sound-cone math")
-                || detail.to_ascii_lowercase().contains("sound-cone")),
-        "the specific documented limitation is recorded"
+            .is_some_and(|detail| detail.to_ascii_lowercase().contains("spatial math")),
+        "the implemented row documents what the math covers"
     );
 
     // The environment-model rows stay callable while the capability axis
@@ -328,7 +326,8 @@ fn every_documented_stub_is_deliberate_and_ships_clean() {
     // The re-audit's invariant: no Stub may exist without its deliberate
     // registration (the guest-visible consequence), and no Implemented row
     // may remain a no-op.  The seeded database's stubs are exactly the
-    // audited canned no-ops, each carrying CannedFailure fidelity and a
+    // remaining audited canned no-ops (the certificate-selection dialog and
+    // the four shell-UI helpers), each carrying CannedFailure fidelity and a
     // deliberate consequence, so the shipping gate is clean.
     let database = ApiDatabase::from_thunk_metadata();
     let stubs: Vec<&ApiEntry> = database
@@ -338,8 +337,8 @@ fn every_documented_stub_is_deliberate_and_ships_clean() {
         .collect();
     assert_eq!(
         stubs.len(),
-        11,
-        "the documented stub set is exactly the re-audited canned no-ops"
+        5,
+        "the documented stub set is exactly the remaining canned no-ops"
     );
     for entry in &stubs {
         let consequence = database
@@ -1039,26 +1038,19 @@ fn report_generator_emits_expected_json_shape() {
             .len() as u64
     );
     // The completeness-gate violation count is the total-compatibility
-    // progress number.  The re-audit (the audit's "meaning of Implemented"
-    // P0) demoted every verified no-op dispatch — X3DAudioCalculate's
-    // claimed "sound-cone math" that writes a zeroed DSP response, the
-    // canned shell/rich-edit/certificate-digest/audit answers, the native
-    // process-creation failure — to documented Stubs registered deliberately
-    // unsupported.  Deliberate stubs pass shipping but honestly block
-    // completeness: the report carries exactly those eleven violations, and
-    // an exact registry never claims what the dispatch does not do.
+    // progress number.  The real-implementation wave completed six of the
+    // eleven documented no-ops (X3DAudioCalculate spatial math, CertDigestDigest
+    // digests, CngAuditLog audit records, MsftEditRegisterClass/RichEditANSIWndClass
+    // registration, NtCreateProcess native child creation); the five remaining
+    // canned no-ops — the certificate-selection dialog and the four shell-UI
+    // helpers — are still documented Stubs that pass shipping but honestly
+    // block completeness.
     const DOCUMENTED_STUBS: &[(&str, &str)] = &[
-        ("x3daudio1_7.dll", "X3DAudioCalculate"),
         ("cryptdlg.dll", "CertSelectCertificate"),
-        ("cryptdlg.dll", "CertDigestDigest"),
         ("browseui.dll", "SHCreateExplorerTaskband"),
         ("browseui.dll", "SHOpenFolderWindow"),
         ("shdocvw.dll", "SHCreateLinks"),
         ("shdocvw.dll", "SHNavigateToFavorite"),
-        ("msftedit.dll", "MsftEditRegisterClass"),
-        ("riched32.dll", "RichEditANSIWndClass"),
-        ("cngaudit.dll", "CngAuditLog"),
-        ("ntdll.dll", "NtCreateProcess"),
     ];
     assert_eq!(
         completeness_count,

@@ -1714,12 +1714,12 @@ impl User32Subsystem {
     }
 
     pub fn register_class_info(&mut self, class_name: &str, info: WindowClassInfo) -> Atom {
-        if let Some(existing) = self.classes.get(class_name) {
+        let key = class_registry_key(class_name);
+        if let Some(existing) = self.classes.get(&key) {
             return existing.atom;
         }
         let atom = self.alloc_atom();
-        self.classes
-            .insert(class_name.to_string(), WindowClass { atom, info });
+        self.classes.insert(key, WindowClass { atom, info });
         atom
     }
 
@@ -1808,11 +1808,23 @@ impl User32Subsystem {
     }
 
     pub fn class_info(&self, class_name: &str) -> Option<WindowClassInfo> {
-        self.classes.get(class_name).map(|class| class.info)
+        self.classes
+            .get(&class_registry_key(class_name))
+            .map(|class| class.info)
+    }
+
+    /// The atom of a registered class entry, resolved case-insensitively
+    /// (Windows class names are case-insensitive).  `None` when no class of
+    /// that name is registered and it is not a built-in class.
+    pub fn class_atom(&self, class_name: &str) -> Option<Atom> {
+        self.classes
+            .get(&class_registry_key(class_name))
+            .map(|class| class.atom)
     }
 
     pub fn ensure_class_available(&mut self, class_name: &str) -> Option<Atom> {
-        if let Some(existing) = self.classes.get(class_name) {
+        let key = class_registry_key(class_name);
+        if let Some(existing) = self.classes.get(&key) {
             return Some(existing.atom);
         }
         if is_builtin_window_class(class_name) {
@@ -1869,7 +1881,10 @@ impl User32Subsystem {
                 format!("unregistered class {class_name}"),
             )
         })?;
-        let class_info = self.classes.get(class_name).map(|class| class.info);
+        let class_info = self
+            .classes
+            .get(&class_registry_key(class_name))
+            .map(|class| class.info);
         // atom is verified via ensure_class_available above; only needed for its side effect
         let _atom = atom;
         let hwnd = self.alloc_hwnd();
@@ -2463,7 +2478,9 @@ impl User32Subsystem {
 
     /// UnregisterClassW — unregister a window class.
     pub fn unregister_class_w(&mut self, class_name: &str) -> bool {
-        self.classes.remove(class_name).is_some()
+        self.classes
+            .remove(&class_registry_key(class_name))
+            .is_some()
     }
 
     /// Set a timer (called from the dispatch side for SetTimer).
@@ -6487,6 +6504,13 @@ fn is_builtin_window_class(class_name: &str) -> bool {
     )
 }
 
+/// The canonical class-registry key: Windows window-class names are
+/// case-insensitive, so the registry stores every class under its
+/// lower-cased name and every lookup resolves through this key.
+fn class_registry_key(class_name: &str) -> String {
+    class_name.to_ascii_lowercase()
+}
+
 fn stable_device_id(prefix: &str, source: &str) -> String {
     let hash = util::sha256_bytes(source.as_bytes());
     format!("{prefix}-{}", &hash[..16])
@@ -6506,6 +6530,64 @@ fn normalize_axis(raw: i32, calibration: AxisCalibration) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_classes_resolve_case_insensitively() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let atom = user32.register_class_ex_w("RICHEDIT50W");
+        assert_ne!(atom, 0, "a real class atom must be handed out");
+        // Windows class names are case-insensitive: every registry query
+        // must resolve the entry regardless of the caller's spelling.
+        assert_eq!(
+            user32.class_atom("richedit50w"),
+            Some(atom),
+            "lower-case lookup must resolve the upper-case registration"
+        );
+        assert_eq!(user32.class_atom("RichEdit50w"), Some(atom));
+        assert!(user32.class_info("RICHEDIT50W").is_some());
+        // Re-registration of the same class (any case) is idempotent and
+        // returns the SAME atom — one class entry, one atom.
+        assert_eq!(user32.register_class_ex_w("richedit50w"), atom);
+        // And a different class gets a distinct atom.
+        assert_ne!(user32.register_class_ex_w("RICHEDIT"), atom);
+    }
+
+    #[test]
+    fn registered_class_creation_round_trips_the_atom() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let atom = user32.register_class_ex_w("RICHEDIT");
+        assert_eq!(
+            user32.ensure_class_available("richedit"),
+            Some(atom),
+            "creation lookup must round-trip the registration atom"
+        );
+        let hwnd = user32
+            .create_window_ex_w("richedit", "rich text", 320, 200, false, false, None, 1)
+            .expect("window of the registered class must be creatable");
+        assert!(user32.has_window(hwnd));
+        // The control text path (WM_SETTEXT/WM_GETTEXT style behaviour)
+        // must behave exactly like the built-in rich-edit classes.
+        assert!(user32.set_window_text_w(hwnd, "hello rich edit"));
+        assert_eq!(
+            user32.get_window_text_w(hwnd).as_deref(),
+            Some("hello rich edit")
+        );
+    }
+
+    #[test]
+    fn builtin_rich_edit_classes_create_with_mixed_case() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        // A guest commonly spells the built-in class names in mixed case;
+        // the built-in registry must auto-register and resolve them
+        // case-insensitively against the canonical builtin list.
+        let atom = user32.ensure_class_available("RIChed20W");
+        assert_ne!(atom, None, "built-in class must auto-register");
+        let hwnd = user32
+            .create_window_ex_w("RIChed20W", "title", 100, 100, false, false, None, 1)
+            .expect("built-in class creation succeeds");
+        assert!(user32.set_window_text_w(hwnd, "text"));
+        assert_eq!(user32.get_window_text_w(hwnd).as_deref(), Some("text"));
+    }
 
     #[test]
     fn show_window_queues_paint_message() {

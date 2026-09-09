@@ -464,6 +464,18 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
+/// SHA-256 digest (32 bytes) — the `sha2` crate the BCrypt layer already
+/// uses (the digest surface of `CALG_SHA_256`).
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +644,19 @@ mod tests {
         );
         assert_eq!(md5(b"").len(), 16);
         assert_eq!(sha1(b"").len(), 20);
+    }
+
+    #[test]
+    fn sha256_known_digest() {
+        // FIPS 180-2: SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            sha256(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
+            ]
+        );
+        assert_eq!(sha256(b"").len(), 32);
     }
 }

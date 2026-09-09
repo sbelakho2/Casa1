@@ -28988,8 +28988,26 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
                 self.dispatch_long_tail(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::ShCreateExplorerTaskband | HostThunk::ShOpenFolderWindow | HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::CertDigestDigest | HostThunk::CertSelectCertificate | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::ShCreateLinks | HostThunk::ShNavigateToFavorite | HostThunk::X3dAudioCalculate | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::NtCreateProcess | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::CngAuditLog | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::MsftEditRegisterClass | HostThunk::RichEditAnsiWndClass | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
+            ref thunk @ (HostThunk::ShCreateExplorerTaskband | HostThunk::ShOpenFolderWindow | HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::CertSelectCertificate | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::ShCreateLinks | HostThunk::ShNavigateToFavorite | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
+            }
+            // ── the real dispatches that left the final-scraps group: each
+            //    one performs its genuine operation (see
+            //    `dispatch::final_scraps` for the implementations) ──
+            HostThunk::X3dAudioCalculate => {
+                self.dispatch_x3daudio_calculate(state, memory)?;
+            }
+            HostThunk::NtCreateProcess => {
+                self.dispatch_nt_create_process(state, memory)?;
+            }
+            HostThunk::CertDigestDigest => {
+                self.dispatch_cert_digest_digest(state, memory)?;
+            }
+            HostThunk::CngAuditLog => {
+                self.dispatch_cng_audit_log(state, memory)?;
+            }
+            ref thunk @ (HostThunk::MsftEditRegisterClass | HostThunk::RichEditAnsiWndClass) => {
+                self.dispatch_richedit_register_class(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::LdapBindS | HostThunk::LdapCountEntries | HostThunk::LdapFirstEntry | HostThunk::LdapGetDn | HostThunk::LdapGetValues | HostThunk::LdapInit | HostThunk::LdapMemfree | HostThunk::LdapMsgfree | HostThunk::LdapNextEntry | HostThunk::LdapResult | HostThunk::LdapSearch | HostThunk::LdapSearchS | HostThunk::LdapUnbind | HostThunk::LdapValueFreeLen) => {
                 self.dispatch_ldap(thunk, state, memory)?;
@@ -128899,18 +128917,33 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     x3da_init,
-                    &[0x3, 343.0f32.to_bits(), handle_out as u32]
+                    &[0x3, 343.5f32.to_bits(), handle_out as u32]
                 ),
                 0
             );
+            // The initialize call writes a real opaque instance handle: our
+            // magic prefix + the instance's speaker mask + speed of sound.
+            assert_eq!(
+                read_u32(&memory, handle_out).unwrap(),
+                0x3144_3358,
+                "the X3DAudio instance handle carries the runtime magic"
+            );
+            assert_eq!(read_u32(&memory, handle_out + 4).unwrap(), 0x3);
+            assert_eq!(
+                f32::from_bits(read_u32(&memory, handle_out + 8).unwrap()),
+                343.5
+            );
+            // A calculate with no listener/emitter/DSP settings is an
+            // invalid call (deterministic error, not a silent zero).
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
                     &mut memory,
                     x3da_calc,
-                    &[0, 0, 0, 0, 0, 0x41_010]
+                    &[handle_out as u32, 0, 0, 0x7f, 0x41_010]
                 ),
-                0
+                1,
+                "null listener/emitter must not be a silent success"
             );
 
             let persist: u64 = runtime.alloc_host_thunk(HostThunk::IPersistFile);
@@ -128976,6 +129009,463 @@ mod tests {
                 read_guest_pointer(&memory, section_out, GuestArch::X86).unwrap(),
                 0
             );
+        })
+    }
+
+    // ── X3DAudio guest-dispatch fixtures (packed x86 layouts) ────────────
+
+    fn x3da_write_vec(memory: &mut MemoryImage, address: u64, x: f32, y: f32, z: f32) {
+        write_guest_f32(memory, address, x).unwrap();
+        write_guest_f32(memory, address + 4, y).unwrap();
+        write_guest_f32(memory, address + 8, z).unwrap();
+    }
+
+    /// Build a stereo X3DAudio scene in guest memory: a listener at the
+    /// origin facing +z, and a single-channel emitter 6 units to its LEFT
+    /// moving toward it at 3 units/s (distance 6, CurveDistanceScaler 3).
+    /// Returns (handle, listener, emitter, dsp, matrix, delays).
+    #[allow(clippy::type_complexity)]
+    fn x3daudio_guest_scene(memory: &mut MemoryImage) -> (u64, u64, u64, u64, u64, u64) {
+        let handle = 0x60_000_u64;
+        let listener = 0x60_100_u64;
+        let emitter = 0x60_200_u64;
+        let dsp = 0x60_300_u64;
+        let matrix = 0x60_400_u64;
+        let delays = 0x60_500_u64;
+        // X3DAudioInitialize(SPEAKER_STEREO, 343.5, handle).
+        write_u32(&mut *memory, handle, 0x3144_3358); // magic "X3D1"
+        write_u32(&mut *memory, handle + 4, 0x3); // SPEAKER_STEREO
+        write_u32(&mut *memory, handle + 8, 343.5f32.to_bits());
+        write_u32(&mut *memory, handle + 12, 0);
+        write_u32(&mut *memory, handle + 16, 0);
+        // Listener at the origin: front +z, top +y, stationary.
+        x3da_write_vec(&mut *memory, listener, 0.0, 0.0, 1.0); // OrientFront
+        x3da_write_vec(&mut *memory, listener + 12, 0.0, 1.0, 0.0); // OrientTop
+        x3da_write_vec(&mut *memory, listener + 24, 0.0, 0.0, 0.0); // Position
+        x3da_write_vec(&mut *memory, listener + 36, 0.0, 0.0, 0.0); // Velocity
+        write_u32(&mut *memory, listener + 48, 0); // pCone
+        // Single-channel emitter 6 units left, approaching at 3 units/s.
+        write_u32(&mut *memory, emitter, 0); // pCone
+        x3da_write_vec(&mut *memory, emitter + 4, 0.0, 0.0, 1.0); // OrientFront
+        x3da_write_vec(&mut *memory, emitter + 16, 0.0, 1.0, 0.0); // OrientTop
+        x3da_write_vec(&mut *memory, emitter + 28, -6.0, 0.0, 0.0); // Position
+        x3da_write_vec(&mut *memory, emitter + 40, 3.0, 0.0, 0.0); // Velocity
+        write_u32(&mut *memory, emitter + 52, 0.0f32.to_bits()); // InnerRadius
+        write_u32(&mut *memory, emitter + 56, 0.0f32.to_bits()); // InnerRadiusAngle
+        write_u32(&mut *memory, emitter + 60, 1); // ChannelCount
+        write_u32(&mut *memory, emitter + 64, 0.0f32.to_bits()); // ChannelRadius
+        write_u32(&mut *memory, emitter + 68, 0); // pChannelAzimuths
+        write_u32(&mut *memory, emitter + 72, 0); // pVolumeCurve
+        write_u32(&mut *memory, emitter + 76, 0); // pLFECurve
+        write_u32(&mut *memory, emitter + 80, 0); // pLPFDirectCurve
+        write_u32(&mut *memory, emitter + 84, 0); // pLPFReverbCurve
+        write_u32(&mut *memory, emitter + 88, 0); // pReverbCurve
+        write_u32(&mut *memory, emitter + 92, 3.0f32.to_bits()); // CurveDistanceScaler
+        write_u32(&mut *memory, emitter + 96, 1.0f32.to_bits()); // DopplerScaler
+        // DSP settings: 1 source channel → 2 destination channels.
+        write_u32(&mut *memory, dsp, matrix as u32); // pMatrixCoefficients
+        write_u32(&mut *memory, dsp + 4, delays as u32); // pDelayTimes
+        write_u32(&mut *memory, dsp + 8, 1); // SrcChannelCount
+        write_u32(&mut *memory, dsp + 12, 2); // DstChannelCount
+        (handle, listener, emitter, dsp, matrix, delays)
+    }
+
+    fn read_guest_f32_or_panic(memory: &MemoryImage, address: u64) -> f32 {
+        read_guest_f32(memory, address).expect("read guest f32")
+    }
+
+    #[test]
+    fn x3daudio_calculate_dispatch_writes_real_dsp_values() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("x3daudio-dispatch");
+            let mut memory = MemoryImage::default();
+            let calc = runtime.alloc_host_thunk(HostThunk::X3dAudioCalculate);
+            let (handle, listener, emitter, dsp, matrix, delays) =
+                x3daudio_guest_scene(&mut memory);
+
+            // All DSP outputs: MATRIX|DELAY|LPF_DIRECT|LPF_REVERB|REVERB|
+            // DOPPLER|EMITTER_ANGLE = 0x7f.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                calc,
+                &[
+                    handle as u32,
+                    listener as u32,
+                    emitter as u32,
+                    0x7f,
+                    dsp as u32,
+                ],
+            );
+            assert_eq!(status, 0, "the calculation succeeds");
+
+            // Emitter→listener distance: 6 units, always written.
+            let distance = read_guest_f32_or_panic(&memory, dsp + 36);
+            assert!((distance - 6.0).abs() < 1.0e-5);
+            // Emitter-to-listener angle: the emitter faces +z, the listener
+            // sits along +x → π/2.
+            let angle = read_guest_f32_or_panic(&memory, dsp + 32);
+            assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 1.0e-5);
+            // Matrix (dst-major, 1×2): hard-left source at distance 6 with
+            // CurveDistanceScaler 3 → volume 0.5 entirely in FL.
+            let m_left = read_guest_f32_or_panic(&memory, matrix);
+            let m_right = read_guest_f32_or_panic(&memory, matrix + 4);
+            assert!(
+                (m_left - 0.5).abs() < 1.0e-5,
+                "FL receives the -6 dB rolloff"
+            );
+            assert!(m_right.abs() < 1.0e-6, "FR silent for a hard-left source");
+            // Delay times (stereo field): FL speaker is 5 units from the
+            // emitter, FR 7 → FL delayed by 2/343.5 s ≈ 5.82 ms.
+            let delay_left = read_guest_f32_or_panic(&memory, delays);
+            let delay_right = read_guest_f32_or_panic(&memory, delays + 4);
+            assert!(
+                (delay_left - 5.8224).abs() < 0.01,
+                "left delay {delay_left}"
+            );
+            assert!(delay_right.abs() < 1.0e-5, "farthest speaker has no delay");
+            // LPF direct/reverb at scaled distance 2: 0.75 / 0.75.
+            assert!((read_guest_f32_or_panic(&memory, dsp + 16) - 0.75).abs() < 1.0e-6);
+            assert!((read_guest_f32_or_panic(&memory, dsp + 20) - 0.75).abs() < 1.0e-6);
+            // Reverb level at scaled distance 2: 0 (linear curve reaches 0
+            // at one scaler unit).
+            assert!(read_guest_f32_or_panic(&memory, dsp + 24).abs() < 1.0e-6);
+            // Doppler: approaching at 3 units/s → 1 + 3/343.5.
+            let doppler = read_guest_f32_or_panic(&memory, dsp + 28);
+            assert!((doppler - (1.0 + 3.0 / 343.5)).abs() < 1.0e-4);
+            // Velocity components along the emitter→listener axis.
+            assert!((read_guest_f32_or_panic(&memory, dsp + 40) - 3.0).abs() < 1.0e-5);
+            assert!(read_guest_f32_or_panic(&memory, dsp + 44).abs() < 1.0e-6);
+
+            // Deterministic: a second call reproduces the same DSP memory.
+            let snapshot = memory.read_bytes(dsp, 48).expect("dsp bytes");
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                calc,
+                &[
+                    handle as u32,
+                    listener as u32,
+                    emitter as u32,
+                    0x7f,
+                    dsp as u32,
+                ],
+            );
+            assert_eq!(status, 0);
+            assert_eq!(
+                memory.read_bytes(dsp, 48).expect("dsp bytes"),
+                snapshot,
+                "the DSP output must be deterministic"
+            );
+
+            // Flag-gated outputs: with only MATRIX|EMITTER_ANGLE the scalar
+            // coefficients the guest did not request stay untouched (they
+            // keep their pre-call sentinel values).
+            write_guest_f32(&mut memory, dsp + 16, 1.0).unwrap(); // sentinel
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                calc,
+                &[
+                    handle as u32,
+                    listener as u32,
+                    emitter as u32,
+                    0x41,
+                    dsp as u32,
+                ],
+            );
+            assert_eq!(status, 0);
+            assert_eq!(
+                read_guest_f32_or_panic(&memory, dsp + 16),
+                1.0,
+                "LPF direct not requested must not be written"
+            );
+        })
+    }
+
+    #[test]
+    fn nt_create_process_creates_real_native_child() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("nt-create-process");
+            runtime.main_module_path = "C:\\Games\\NativeDemo\\native.exe".to_string();
+            let mut memory = MemoryImage::default();
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let handle_out = 0x41_000_u64;
+
+            // NtCreateProcess(&handle, PROCESS_ALL_ACCESS, NULL, NULL
+            // parent, FALSE, NULL section, NULL, NULL).
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(status, 0, "STATUS_SUCCESS");
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            assert_ne!(child, 0, "a real process handle must be returned");
+            let state = runtime
+                .win32
+                .process_state(child)
+                .expect("child process record exists");
+            assert_eq!(
+                state.executable, "C:\\Games\\NativeDemo\\native.exe",
+                "the child is born from the parent's image"
+            );
+            assert_ne!(state.process_id, runtime.win32.current_process_id());
+            assert_eq!(state.exit_code, None, "the child is running");
+
+            // Termination works through the runtime's standard process path.
+            runtime
+                .win32
+                .terminate_process(child, 5)
+                .expect("terminate child");
+            assert_eq!(
+                runtime
+                    .win32
+                    .get_exit_code_process(child)
+                    .expect("exit code"),
+                Some(5),
+                "termination must set the child's exit code"
+            );
+
+            // ── failure paths return real NTSTATUSes ──
+            // Null process-handle pointer → STATUS_INVALID_PARAMETER.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[0, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(status, 0xC000_000D);
+            // Invalid parent handle → STATUS_INVALID_CID.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0xDEAD, 0, 0, 0, 0],
+            );
+            assert_eq!(status, 0xC000_000B);
+            assert_eq!(runtime.last_error, 0xC000_000B);
+            // Garbage section handle → STATUS_INVALID_HANDLE.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0xDEAD, 0, 0],
+            );
+            assert_eq!(status, 0xC000_0008);
+            // A live-but-data section → STATUS_INVALID_IMAGE_FORMAT (the
+            // section is not an executable image).
+            let section = runtime
+                .win32
+                .create_section(
+                    0x1000,
+                    crate::win32::MemoryProtection {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                    false,
+                )
+                .expect("create section");
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, section, 0, 0],
+            );
+            assert_eq!(status, 0xC000_007B);
+            // A debug port is not modelable → STATUS_INVALID_PARAMETER.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0x1234, 0],
+            );
+            assert_eq!(status, 0xC000_000D);
+        })
+    }
+
+    #[test]
+    fn cert_digest_digest_dispatch_writes_known_digests() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("cert-digest");
+            let mut memory = MemoryImage::default();
+            let digest = runtime.alloc_host_thunk(HostThunk::CertDigestDigest);
+            let request = 0x41_000_u64;
+            let data = 0x41_100_u64;
+            let out = 0x41_200_u64;
+            let cap = 0x41_300_u64;
+            memory.map_bytes(data, b"abc");
+            write_u32(&mut memory, request, data as u32); // pbData
+            write_u32(&mut memory, request + 4, 3); // cbData
+            write_u32(&mut memory, request + 8, 0x8003); // CALG_MD5
+            write_u32(&mut memory, request + 12, out as u32); // pbDigest
+            write_u32(&mut memory, request + 16, cap as u32); // pcbDigest
+            write_u32(&mut memory, cap, 16); // capacity
+
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, digest, &[request as u32]);
+            assert_eq!(ret, 1, "the digest helper returns TRUE");
+            assert_eq!(runtime.last_error, 0);
+            // RFC 1321: MD5("abc") = 900150983cd24fb0d6963f7d28e17f72.
+            assert_eq!(
+                memory.read_bytes(out, 16).expect("digest bytes"),
+                vec![
+                    0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28,
+                    0xe1, 0x7f, 0x72
+                ]
+            );
+            assert_eq!(read_u32(&memory, cap).expect("capacity"), 16);
+
+            // FIPS 180-2: SHA-256("abc") =
+            // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad.
+            write_u32(&mut memory, request + 8, 0x800c); // CALG_SHA_256
+            write_u32(&mut memory, cap, 32); // grow the output capacity
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, digest, &[request as u32]);
+            assert_eq!(ret, 1);
+            assert_eq!(
+                memory.read_bytes(out, 32).expect("digest bytes"),
+                vec![
+                    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
+                    0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
+                    0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+                ]
+            );
+            assert_eq!(read_u32(&memory, cap).expect("capacity"), 32);
+
+            // An unknown algorithm fails honestly: FALSE +
+            // ERROR_NOT_SUPPORTED, nothing written.
+            write_u32(&mut memory, request + 8, 0x9999);
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, digest, &[request as u32]);
+            assert_eq!(ret, 0);
+            assert_eq!(runtime.last_error, ERROR_NOT_SUPPORTED);
+        })
+    }
+
+    #[test]
+    fn cng_audit_log_appends_real_records() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("cng-audit");
+            let mut memory = MemoryImage::default();
+            let audit = runtime.alloc_host_thunk(HostThunk::CngAuditLog);
+            let record = 0x41_000_u64;
+            assert!(runtime.cng_audit_records().is_empty());
+
+            // A genuine append: provider/action/result + host timestamp.
+            write_u32(&mut memory, record, 0x0001_2345); // provider
+            write_u32(&mut memory, record + 4, 0x1); // action
+            write_u32(&mut memory, record + 8, 0); // result (success)
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, audit, &[record as u32]);
+            assert_eq!(ret, u64::from(ERROR_SUCCESS));
+            assert_eq!(runtime.last_error, 0);
+            let records = runtime.cng_audit_records();
+            assert_eq!(records.len(), 1, "one genuine record appended");
+            assert_eq!(records[0].provider, 0x0001_2345);
+            assert_eq!(records[0].action, 0x1);
+            assert_eq!(records[0].result, 0);
+            assert!(records[0].timestamp_ms > 0);
+
+            // A second call appends a second record (the op count grows).
+            write_u32(&mut memory, record, 0x0000_beef);
+            write_u32(&mut memory, record + 4, 0x2);
+            write_u32(&mut memory, record + 8, 0xC000_000D); // audited failure status
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, audit, &[record as u32]);
+            assert_eq!(ret, u64::from(ERROR_SUCCESS));
+            let records = runtime.cng_audit_records();
+            assert_eq!(records.len(), 2, "the op count increases per call");
+            assert_eq!(records[1].provider, 0x0000_beef);
+            assert_eq!(records[1].action, 0x2);
+            assert_eq!(records[1].result, 0xC000_000D);
+            assert!(records[1].timestamp_ms >= records[0].timestamp_ms);
+
+            // A NULL record is a parameter failure and appends nothing.
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, audit, &[0]);
+            assert_eq!(ret, u64::from(ERROR_INVALID_PARAMETER));
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(runtime.cng_audit_records().len(), 2);
+        })
+    }
+
+    #[test]
+    fn rich_edit_register_entries_create_real_windows() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("rte-register");
+            let mut memory = MemoryImage::default();
+            let msft = runtime.alloc_host_thunk(HostThunk::MsftEditRegisterClass);
+            let riched = runtime.alloc_host_thunk(HostThunk::RichEditAnsiWndClass);
+
+            // Both entries register real classes (zero-argument exports).
+            let msft_atom = dispatch_x86_thunk(&mut runtime, &mut memory, msft, &[]);
+            assert_ne!(msft_atom, 0, "MsftEditRegisterClass returns a real atom");
+            let riched_atom = dispatch_x86_thunk(&mut runtime, &mut memory, riched, &[]);
+            assert_ne!(riched_atom, 0, "RichEditANSIWndClass returns a real atom");
+            assert_ne!(msft_atom, riched_atom, "two distinct class entries");
+
+            // The atoms round-trip through the user32 class registry.
+            assert_eq!(
+                runtime.user32.class_atom("RICHEDIT50W"),
+                Some(msft_atom as u16),
+                "MSFTEDIT_CLASS registered under its Windows name"
+            );
+            assert_eq!(
+                runtime.user32.class_atom("richedit"),
+                Some(riched_atom as u16),
+                "the ANSI class registers as RICHEDIT"
+            );
+            // Re-registration is idempotent (same class → same atom).
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, msft, &[]),
+                msft_atom
+            );
+
+            // A guest can now create windows of both classes through the
+            // real CreateWindowExW dispatch path (WS_CHILD keeps the test
+            // headless), and the control text path works on them exactly
+            // like on the built-in rich-edit class.
+            let create_window = runtime.alloc_host_thunk(HostThunk::CreateWindowExW);
+            for (class, atom) in [
+                ("RICHEDIT50W", msft_atom),
+                ("RICHEDIT", riched_atom),
+                ("richedit", riched_atom),
+            ] {
+                let class_ptr = runtime
+                    .alloc_utf16_string(&mut memory, class)
+                    .expect("class name");
+                let title_ptr = runtime
+                    .alloc_utf16_string(&mut memory, "rich text")
+                    .expect("title");
+                let hwnd = dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_window,
+                    &[
+                        0,
+                        class_ptr as u32,
+                        title_ptr as u32,
+                        0x4000_0000, // WS_CHILD
+                        0,
+                        0,
+                        320,
+                        200,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                assert_ne!(hwnd, 0, "windows of the {class} class must be creatable");
+                assert!(
+                    runtime
+                        .user32
+                        .set_window_text_w(hwnd as u32, "control text")
+                );
+                assert_eq!(
+                    runtime.user32.get_window_text_w(hwnd as u32).as_deref(),
+                    Some("control text"),
+                    "the {class} control answers WM_SETTEXT/WM_GETTEXT-style text"
+                );
+                let _ = atom;
+            }
         })
     }
 
