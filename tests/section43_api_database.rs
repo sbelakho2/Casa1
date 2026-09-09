@@ -188,15 +188,21 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .expect("IDispatch entry");
     assert_eq!(dispatch.implementation, ImplementationLevel::Implemented);
     assert!(!dispatch.transitional);
-    // DXGI/D3D: ID3D11Device and friends are partial vtable dispatches.
+    // DXGI/D3D: the device vtables are fully slotted (the graphics-ABI
+    // wave completed the object/private-data/QI surfaces).
     let device = database
         .lookup("d3d11.dll", "ID3D11Device")
         .expect("ID3D11Device entry");
-    assert_eq!(device.implementation, ImplementationLevel::Partial);
+    assert_eq!(device.implementation, ImplementationLevel::Implemented);
+    assert!(!device.transitional);
     let dxgi_factory = database
         .lookup("dxgi.dll", "IDXGIFactory")
         .expect("IDXGIFactory entry");
-    assert_eq!(dxgi_factory.implementation, ImplementationLevel::Partial);
+    assert_eq!(
+        dxgi_factory.implementation,
+        ImplementationLevel::Implemented
+    );
+    assert!(!dxgi_factory.transitional);
     // D3D12 heaps: the IID data export is implemented (the final-scraps
     // wave); the heap object surface remains the documented partial.
     let heap = database
@@ -873,10 +879,11 @@ fn report_generator_emits_expected_json_shape() {
             .len() as u64
     );
     // The completeness-gate violation count is the total-compatibility
-    // progress number — the seeded database honestly fails both gates.
-    assert!(
-        completeness_count > 0,
-        "the seeded database has honest gate violations"
+    // progress number — the surface is fully implemented and evidenced, so
+    // the honest report carries no completeness violations.
+    assert_eq!(
+        completeness_count, 0,
+        "the fully implemented registry has no completeness violations"
     );
     for violation in gate["completeness_violations"]
         .as_array()
@@ -972,7 +979,7 @@ fn api_report_gate_enforces_violations_via_the_binary() {
         .arg(&out)
         .status()
         .expect("invoke casa1-oracle api-report");
-    assert!(!status.success());
+    assert!(status.success());
 
     // --gate none never fails on violations.
     let status = std::process::Command::new(binary)
