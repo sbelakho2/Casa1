@@ -723,30 +723,55 @@ impl ApiDatabase {
                     if feature_excluded {
                         continue;
                     }
+                    let deliberate = self
+                        .deliberately_unsupported_error(&entry.dll, &entry.export)
+                        .map(str::to_string);
                     violations.push(ApiGateViolation {
                         dll: entry.dll.clone(),
                         export: entry.export.clone(),
                         kind: ApiGateViolationKind::StubNotDeliberatelyUnsupported,
-                        message: format!(
-                            "{}!{} is a Stub — the completeness gate requires a working, \
-                             semantically proven implementation",
-                            entry.dll, entry.export
-                        ),
+                        message: match deliberate {
+                            Some(consequence) => format!(
+                                "{}!{} is a documented Stub (guest-visible consequence: \
+                                 {consequence}) — deliberate stubs ship, but the \
+                                 completeness gate requires a working, semantically \
+                                 proven implementation",
+                                entry.dll, entry.export
+                            ),
+                            None => format!(
+                                "{}!{} is a Stub — the completeness gate requires a \
+                                 working, semantically proven implementation",
+                                entry.dll, entry.export
+                            ),
+                        },
                     });
                 }
                 ImplementationLevel::Unsupported => {
                     if feature_excluded {
                         continue;
                     }
+                    let deliberate = self
+                        .deliberately_unsupported_error(&entry.dll, &entry.export)
+                        .map(str::to_string);
                     violations.push(ApiGateViolation {
                         dll: entry.dll.clone(),
                         export: entry.export.clone(),
                         kind: ApiGateViolationKind::UnsupportedNotDeliberatelyUnsupported,
-                        message: format!(
-                            "{}!{} is Unsupported (no host thunk) — the completeness gate \
-                             requires a working, semantically proven implementation",
-                            entry.dll, entry.export
-                        ),
+                        message: match deliberate {
+                            Some(consequence) => format!(
+                                "{}!{} is a documented Unsupported API (guest-visible \
+                                 consequence: {consequence}) — deliberate absences ship, \
+                                 but the completeness gate requires a working, \
+                                 semantically proven implementation",
+                                entry.dll, entry.export
+                            ),
+                            None => format!(
+                                "{}!{} is Unsupported (no host thunk) — the completeness \
+                                 gate requires a working, semantically proven \
+                                 implementation",
+                                entry.dll, entry.export
+                            ),
+                        },
                     });
                 }
             }
@@ -910,11 +935,13 @@ impl ApiDatabase {
     /// absent/limited environment, or a canned response — and whether the
     /// backing Windows subsystem is available.  A row may also be demoted
     /// here (e.g. `X3DAudioCalculate`, whose "sound-cone math" is a canned
-    /// zeroed response, is demoted to a documented `Partial`).
+    /// zeroed response, is demoted to a documented `Stub`).  A `"*"` DLL
+    /// matches every DLL (export-wide rules such as the shared module-class
+    /// registration contract).
     pub fn apply_semantic_overrides(&mut self) {
         for seed in SEMANTIC_OVERRIDES {
             let Some(entry) = self.entries.iter_mut().find(|entry| {
-                normalize_dll(&entry.dll) == normalize_dll(seed.dll)
+                (seed.dll == "*" || normalize_dll(&entry.dll) == normalize_dll(seed.dll))
                     && entry.export.eq_ignore_ascii_case(seed.export)
                     && entry.arch == ArchSet::Any
                     && entry.win_version == WindowsVersion::Any
@@ -930,6 +957,34 @@ impl ApiDatabase {
                 // shipping gate rejects it as an undocumented partial.
                 entry.transitional = level == ImplementationLevel::Partial;
             }
+        }
+        // Every demoted Stub must be registered deliberately unsupported with
+        // its guest-visible consequence, or the shipping gate rejects it.
+        // The override note above IS that consequence (what the guest sees).
+        let stubs: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.implementation == ImplementationLevel::Stub)
+            .filter(|entry| {
+                entry.support_policy != SupportPolicy::OutsideUserModeProfile
+                    && self
+                        .deliberately_unsupported_error(&entry.dll, &entry.export)
+                        .is_none()
+            })
+            .map(|entry| (entry.dll.clone(), entry.export.clone()))
+            .collect();
+        for (dll, export) in stubs {
+            let consequence = self
+                .entries
+                .iter()
+                .find(|entry| entry.dll == dll && entry.export == export)
+                .and_then(|entry| entry.detail.clone())
+                .unwrap_or_else(|| {
+                    "Documented stub: the dispatch returns a canned response without \
+                     performing the operation"
+                        .to_string()
+                });
+            self.deliberately_unsupported(&dll, &export, consequence);
         }
     }
 
@@ -1169,12 +1224,12 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
     semantic_override(
         "x3daudio1_7.dll",
         "X3DAudioCalculate",
-        Some(ImplementationLevel::Partial),
+        Some(ImplementationLevel::Stub),
         SemanticFidelity::CannedFailure,
         SubsystemCapability::Absent,
         "No listener/emitter sound-cone math is performed: the DSP settings are \
-         zeroed and S_OK is returned (a canned response).  The dispatch reads its \
-         arguments but never computes the X3DAUDIO_DSP_SETTINGS the comment claims.",
+         zeroed and S_OK is returned.  The guest sees a silent no-op instead of \
+         the spatial calculation the API documents.",
     ),
     semantic_override(
         "x3daudio1_7.dll",
@@ -1330,20 +1385,21 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
     semantic_override(
         "cryptdlg.dll",
         "CertSelectCertificate",
-        None,
+        Some(ImplementationLevel::Stub),
         SemanticFidelity::CannedFailure,
         SubsystemCapability::Absent,
-        "No certificate-selection UI exists: the dialog answers FALSE (no \
-         selection) without showing a dialog.",
+        "No certificate-selection UI is shown and no selection is made: the \
+         operation answers FALSE without performing the documented dialog \
+         contract.",
     ),
     semantic_override(
         "cryptdlg.dll",
         "CertDigestDigest",
-        None,
+        Some(ImplementationLevel::Stub),
         SemanticFidelity::CannedFailure,
         SubsystemCapability::Absent,
-        "No digest helper is available: the operation answers \
-         ERROR_NOT_FOUND.",
+        "The digest helper is not implemented: the operation answers \
+         ERROR_NOT_FOUND without computing a digest.",
     ),
     // ── audio-session activation: the runtime audio is session-local ───────
     semantic_override(
@@ -1445,12 +1501,110 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
     semantic_override(
         "ntdll.dll",
         "NtCreateProcess",
-        None,
+        Some(ImplementationLevel::Stub),
         SemanticFidelity::CannedFailure,
         SubsystemCapability::Partial,
         "No child processes are creatable through the native surface: the call \
-         answers STATUS_INVALID_HANDLE.  Process APIs exist through the Win32 \
-         layer; the native creation path is a canned failure.",
+         answers STATUS_INVALID_HANDLE without creating a process.  Process APIs \
+         exist through the Win32 layer; the native creation path is a canned \
+         failure the guest sees.",
+    ),
+    // ── shell UI helpers: canned failure without any shell-UI operation ────
+    semantic_override(
+        "browseui.dll",
+        "SHCreateExplorerTaskband",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No explorer taskband is created: the operation answers E_FAIL without \
+         performing the shell-UI work.",
+    ),
+    semantic_override(
+        "browseui.dll",
+        "SHOpenFolderWindow",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No folder window is opened: the operation answers E_FAIL without \
+         performing the shell-UI work.",
+    ),
+    semantic_override(
+        "shdocvw.dll",
+        "SHCreateLinks",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No shell links are created: the operation answers E_FAIL without \
+         performing the work.",
+    ),
+    semantic_override(
+        "shdocvw.dll",
+        "SHNavigateToFavorite",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No favorites navigation happens: the operation answers E_FAIL without \
+         performing the work.",
+    ),
+    // ── rich-edit class registration: canned TRUE, class never registered ──
+    semantic_override(
+        "msftedit.dll",
+        "MsftEditRegisterClass",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "The rich-edit window class is not registered: the operation returns TRUE \
+         without performing the registration, so later class creation cannot \
+         succeed.",
+    ),
+    semantic_override(
+        "riched32.dll",
+        "RichEditANSIWndClass",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "The ANSI rich-edit window class is not registered: the operation returns \
+         TRUE without performing the registration.",
+    ),
+    // ── CNG audit: canned success, nothing audited ─────────────────────────
+    semantic_override(
+        "cngaudit.dll",
+        "CngAuditLog",
+        Some(ImplementationLevel::Stub),
+        SemanticFidelity::CannedFailure,
+        SubsystemCapability::Absent,
+        "No audit record is written: the operation answers ERROR_SUCCESS without \
+         performing any audit-logging work (a silent no-op the guest sees as \
+         success).",
+    ),
+    // ── the shared module-class registration contract ──────────────────────
+    // Every module-class-object DLL routes DllRegisterServer/DllUnregisterServer
+    // through the same in-process COM contract.  Casa1's COM environment is
+    // registry-less: classes are available through the in-process class-object
+    // table, so registration is satisfied trivially — an environment model
+    // (the registry write is a no-op that never changes class availability),
+    // not a canned claim of Windows registry work.
+    semantic_override(
+        "*",
+        "DllRegisterServer",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Partial,
+        "Registry-less COM environment model: classes resolve through the \
+         in-process class-object table, so DllRegisterServer succeeds without \
+         writing the Windows registry.  Registration never changes class \
+         availability (it is already satisfied); unregistration never removes \
+         one.",
+    ),
+    semantic_override(
+        "*",
+        "DllUnregisterServer",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Partial,
+        "Registry-less COM environment model: classes resolve through the \
+         in-process class-object table, so DllUnregisterServer succeeds without \
+         writing the Windows registry.",
     ),
 ];
 

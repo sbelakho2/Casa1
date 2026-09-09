@@ -223,19 +223,22 @@ fn semantic_axes_keep_callable_separate_from_exact() {
     // callable without being exact, and the registry must never claim real
     // semantics its dispatch does not perform.  X3DAudioCalculate claims
     // "real sound-cone math" but writes a zeroed DSP response — it is
-    // demoted to a documented Partial with the axes recording why.
+    // demoted to a documented Stub (canned/no-op belongs under Stub per
+    // Casa1's own taxonomy), registered deliberately unsupported with the
+    // guest-visible consequence the axes record.
     let database = ApiDatabase::from_thunk_metadata();
     let x3daudio_calculate = database
         .lookup("x3daudio1_7.dll", "X3DAudioCalculate")
         .expect("X3DAudioCalculate entry");
     assert_eq!(
         x3daudio_calculate.implementation,
-        ImplementationLevel::Partial,
-        "a canned zeroed-DSP dispatch must not be Implemented"
+        ImplementationLevel::Stub,
+        "a canned zeroed-DSP dispatch must not be Implemented (or Partial — \
+         no real operation exists to be partial about)"
     );
     assert!(
-        x3daudio_calculate.transitional,
-        "the demotion carries its reason"
+        !x3daudio_calculate.transitional,
+        "stubs carry a deliberate consequence, not a transitional partial reason"
     );
     assert_eq!(
         x3daudio_calculate.semantic_fidelity,
@@ -246,6 +249,13 @@ fn semantic_axes_keep_callable_separate_from_exact() {
         x3daudio_calculate.subsystem_capability,
         SubsystemCapability::Absent,
         "no X3DAudio engine exists behind the handle"
+    );
+    let consequence = database
+        .deliberately_unsupported_error("x3daudio1_7.dll", "X3DAudioCalculate")
+        .expect("the stub is registered deliberately unsupported");
+    assert!(
+        consequence.contains("silent no-op"),
+        "the deliberate registration documents the guest-visible consequence: {consequence}"
     );
     assert!(
         x3daudio_calculate
@@ -311,6 +321,60 @@ fn semantic_axes_keep_callable_separate_from_exact() {
         .expect("CreateFileW entry");
     assert_eq!(create_file.semantic_fidelity, SemanticFidelity::Exact);
     assert_eq!(create_file.subsystem_capability, SubsystemCapability::Full);
+}
+
+#[test]
+fn every_documented_stub_is_deliberate_and_ships_clean() {
+    // The re-audit's invariant: no Stub may exist without its deliberate
+    // registration (the guest-visible consequence), and no Implemented row
+    // may remain a no-op.  The seeded database's stubs are exactly the
+    // audited canned no-ops, each carrying CannedFailure fidelity and a
+    // deliberate consequence, so the shipping gate is clean.
+    let database = ApiDatabase::from_thunk_metadata();
+    let stubs: Vec<&ApiEntry> = database
+        .entries()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationLevel::Stub)
+        .collect();
+    assert_eq!(
+        stubs.len(),
+        11,
+        "the documented stub set is exactly the re-audited canned no-ops"
+    );
+    for entry in &stubs {
+        let consequence = database
+            .deliberately_unsupported_error(&entry.dll, &entry.export)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}!{} must be deliberately unsupported with a consequence",
+                    entry.dll, entry.export
+                )
+            });
+        assert!(
+            !consequence.trim().is_empty(),
+            "{}!{} carries a non-empty consequence",
+            entry.dll,
+            entry.export
+        );
+        assert_eq!(
+            entry.semantic_fidelity,
+            SemanticFidelity::CannedFailure,
+            "{}!{} records canned fidelity",
+            entry.dll,
+            entry.export
+        );
+        assert!(
+            entry.subsystem_capability != SubsystemCapability::Full,
+            "{}!{} must not claim a fully available subsystem (got {:?})",
+            entry.dll,
+            entry.export,
+            entry.subsystem_capability
+        );
+    }
+    assert!(
+        database.shipping_gate().is_empty(),
+        "documented deliberate stubs ship clean"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -975,34 +1039,55 @@ fn report_generator_emits_expected_json_shape() {
             .len() as u64
     );
     // The completeness-gate violation count is the total-compatibility
-    // progress number.  The semantic-truth model (the audit's "meaning of
-    // Implemented" split) demoted X3DAudioCalculate — the dispatch that
-    // claimed "real sound-cone math" but writes a zeroed DSP response — to a
-    // documented Partial, so the honest report carries exactly that one
-    // completeness violation: an exact registry must never claim what the
-    // dispatch does not do.
+    // progress number.  The re-audit (the audit's "meaning of Implemented"
+    // P0) demoted every verified no-op dispatch — X3DAudioCalculate's
+    // claimed "sound-cone math" that writes a zeroed DSP response, the
+    // canned shell/rich-edit/certificate-digest/audit answers, the native
+    // process-creation failure — to documented Stubs registered deliberately
+    // unsupported.  Deliberate stubs pass shipping but honestly block
+    // completeness: the report carries exactly those eleven violations, and
+    // an exact registry never claims what the dispatch does not do.
+    const DOCUMENTED_STUBS: &[(&str, &str)] = &[
+        ("x3daudio1_7.dll", "X3DAudioCalculate"),
+        ("cryptdlg.dll", "CertSelectCertificate"),
+        ("cryptdlg.dll", "CertDigestDigest"),
+        ("browseui.dll", "SHCreateExplorerTaskband"),
+        ("browseui.dll", "SHOpenFolderWindow"),
+        ("shdocvw.dll", "SHCreateLinks"),
+        ("shdocvw.dll", "SHNavigateToFavorite"),
+        ("msftedit.dll", "MsftEditRegisterClass"),
+        ("riched32.dll", "RichEditANSIWndClass"),
+        ("cngaudit.dll", "CngAuditLog"),
+        ("ntdll.dll", "NtCreateProcess"),
+    ];
     assert_eq!(
-        completeness_count, 1,
-        "the honest registry carries exactly one completeness violation: \
-         X3DAudioCalculate (no sound-cone math, zeroed DSP response)"
+        completeness_count,
+        DOCUMENTED_STUBS.len() as u64,
+        "the honest registry carries exactly the documented stub completeness violations"
     );
-    assert!(
-        gate["completeness_violations"]
-            .as_array()
-            .expect("completeness_violations")
-            .iter()
-            .any(|violation| {
-                violation["dll"] == "x3daudio1_7.dll"
-                    && violation["export"] == "X3DAudioCalculate"
-                    && violation["kind"]
-                        == serde_json::json!(ApiGateViolationKind::PartialNotCompletenessReady)
-            }),
-        "the single completeness violation must be the documented X3DAudioCalculate partial"
-    );
-    for violation in gate["completeness_violations"]
+    let violations = gate["completeness_violations"]
         .as_array()
-        .expect("completeness_violations")
-    {
+        .expect("completeness_violations");
+    assert_eq!(
+        violations.len(),
+        DOCUMENTED_STUBS.len(),
+        "violation array matches the documented count"
+    );
+    for (dll, export) in DOCUMENTED_STUBS {
+        assert!(
+            violations.iter().any(|violation| {
+                violation["dll"] == *dll
+                    && violation["export"] == *export
+                    && violation["kind"]
+                        == serde_json::json!(ApiGateViolationKind::StubNotDeliberatelyUnsupported)
+                    && violation["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("documented Stub"))
+            }),
+            "completeness must report {dll}!{export} as a documented Stub with its consequence"
+        );
+    }
+    for violation in violations {
         let entry = violation.as_object().expect("violation object");
         for key in ["dll", "export", "kind", "message"] {
             assert!(entry.contains_key(key), "missing violation field {key}");
@@ -1095,10 +1180,10 @@ fn api_report_gate_enforces_violations_via_the_binary() {
     );
 
     // The completeness gate fails on the seeded database exactly as the
-    // semantic-truth model requires: Partial never passes it, and
-    // X3DAudioCalculate (the canned "sound-cone math" dispatch) is the one
-    // honest Partial — the gate must exit non-zero until the real operation
-    // exists.
+    // re-audited truth requires: the eleven documented Stubs (the canned
+    // no-ops — X3DAudioCalculate's "sound-cone math" included) pass shipping
+    // with their deliberate consequences but honestly block completeness, so
+    // the gate must exit non-zero until the real operations exist.
     let status = std::process::Command::new(binary)
         .args(["api-report", "--gate", "completeness", "--out"])
         .arg(&out)
@@ -1107,7 +1192,7 @@ fn api_report_gate_enforces_violations_via_the_binary() {
     assert!(
         !status.success(),
         "api-report --gate completeness must exit non-zero while the documented \
-         X3DAudioCalculate partial is unresolved"
+         stubs are unresolved"
     );
 
     // --gate none never fails on violations.

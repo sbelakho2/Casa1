@@ -6,12 +6,26 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 30 entries deviate from exact/full — fidelity Restricted 3, Approximate 1, SyntheticEnvironment 22, CannedFailure 4, capability Partial 6, Absent 24.
+**Counts**: 39 entries deviate from exact/full — fidelity Restricted 3, Approximate 1, SyntheticEnvironment 24, CannedFailure 11, capability Partial 8, Absent 31.
 
+
+### actxprxy.dll
+
+- `DllRegisterServer` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Registry-less COM environment model: classes resolve through the in-process class-object table, so DllRegisterServer succeeds without writing the Windows registry.  Registration never changes class availability (it is already satisfied); unregistration never removes one.
+- `DllUnregisterServer` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Registry-less COM environment model: classes resolve through the in-process class-object table, so DllUnregisterServer succeeds without writing the Windows registry.
 
 ### browser.dll
 
 - `BrowserServerEnum` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No domain servers exist to enumerate: the enumeration answers NERR_DCNotFound.
+
+### browseui.dll
+
+- `SHCreateExplorerTaskband` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No explorer taskband is created: the operation answers E_FAIL without performing the shell-UI work.
+- `SHOpenFolderWindow` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No folder window is opened: the operation answers E_FAIL without performing the shell-UI work.
+
+### cngaudit.dll
+
+- `CngAuditLog` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No audit record is written: the operation answers ERROR_SUCCESS without performing any audit-logging work (a silent no-op the guest sees as success).
 
 ### credssp.dll
 
@@ -20,8 +34,8 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### cryptdlg.dll
 
-- `CertDigestDigest` — level `Implemented`, fidelity `CannedFailure`, capability `Absent` — No digest helper is available: the operation answers ERROR_NOT_FOUND.
-- `CertSelectCertificate` — level `Implemented`, fidelity `CannedFailure`, capability `Absent` — No certificate-selection UI exists: the dialog answers FALSE (no selection) without showing a dialog.
+- `CertDigestDigest` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The digest helper is not implemented: the operation answers ERROR_NOT_FOUND without computing a digest.
+- `CertSelectCertificate` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No certificate-selection UI is shown and no selection is made: the operation answers FALSE without performing the documented dialog contract.
 
 ### dpaddr.dll
 
@@ -69,6 +83,10 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 - `CorBindToRuntime` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No CLR workhorse runtime exists in the modeled environment: activation answers COR_E_CLRNOTAVAILABLE.
 - `CorBindToRuntimeEx` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No CLR workhorse runtime exists in the modeled environment: activation answers COR_E_CLRNOTAVAILABLE.
 
+### msftedit.dll
+
+- `MsftEditRegisterClass` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The rich-edit window class is not registered: the operation returns TRUE without performing the registration, so later class creation cannot succeed.
+
 ### netutils.dll
 
 - `NetGetAnyDCName` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a workstation not joined to a domain: the domain-controller query answers NERR_DCNotFound.
@@ -76,7 +94,16 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### ntdll.dll
 
-- `NtCreateProcess` — level `Implemented`, fidelity `CannedFailure`, capability `Partial` — No child processes are creatable through the native surface: the call answers STATUS_INVALID_HANDLE.  Process APIs exist through the Win32 layer; the native creation path is a canned failure.
+- `NtCreateProcess` — level `Stub`, fidelity `CannedFailure`, capability `Partial` — No child processes are creatable through the native surface: the call answers STATUS_INVALID_HANDLE without creating a process.  Process APIs exist through the Win32 layer; the native creation path is a canned failure the guest sees.
+
+### riched32.dll
+
+- `RichEditANSIWndClass` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The ANSI rich-edit window class is not registered: the operation returns TRUE without performing the registration.
+
+### shdocvw.dll
+
+- `SHCreateLinks` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No shell links are created: the operation answers E_FAIL without performing the work.
+- `SHNavigateToFavorite` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No favorites navigation happens: the operation answers E_FAIL without performing the work.
 
 ### srvsvc.dll
 
@@ -88,7 +115,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### x3daudio1_7.dll
 
-- `X3DAudioCalculate` — level `Partial`, fidelity `CannedFailure`, capability `Absent` — No listener/emitter sound-cone math is performed: the DSP settings are zeroed and S_OK is returned (a canned response).  The dispatch reads its arguments but never computes the X3DAUDIO_DSP_SETTINGS the comment claims.
+- `X3DAudioCalculate` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No listener/emitter sound-cone math is performed: the DSP settings are zeroed and S_OK is returned.  The guest sees a silent no-op instead of the spatial calculation the API documents.
 - `X3DAudioInitialize` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Validates the output pointer and hands back an instance token derived from the channel mask, but the X3DAudio engine surface behind the handle is absent (calculate is a canned zeroed response).
 
 ### xactengine3_7.dll

@@ -7557,21 +7557,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
-        "browseui.dll",
-        "SHCreateExplorerTaskband",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "browseui.dll",
-        "SHOpenFolderWindow",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "cngaudit.dll",
-        "CngAuditLog",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
         "credssp.dll",
         "CredSSPGetClientCredential",
         "casa1-conformance:evidence_final_scraps_surfaces",
@@ -7579,16 +7564,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "credssp.dll",
         "CredSSPGetServerCredential",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "cryptdlg.dll",
-        "CertDigestDigest",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "cryptdlg.dll",
-        "CertSelectCertificate",
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
@@ -7657,11 +7632,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
-        "msftedit.dll",
-        "MsftEditRegisterClass",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
         "msimtf.dll",
         "DllRegisterServer",
         "casa1-conformance:evidence_final_scraps_surfaces",
@@ -7722,11 +7692,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
-        "riched32.dll",
-        "RichEditANSIWndClass",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
         "sens.dll",
         "DllRegisterServer",
         "casa1-conformance:evidence_final_scraps_surfaces",
@@ -7734,16 +7699,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "sens.dll",
         "DllUnregisterServer",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "shdocvw.dll",
-        "SHCreateLinks",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "shdocvw.dll",
-        "SHNavigateToFavorite",
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
@@ -7828,11 +7783,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     ),
     conformance(
         "x3daudio1_7.dll",
-        "X3DAudioCalculate",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "x3daudio1_7.dll",
         "X3DAudioInitialize",
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
@@ -7854,11 +7804,6 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "ntdll.dll",
         "NtCreateFileMapping",
-        "casa1-conformance:evidence_final_scraps_surfaces",
-    ),
-    conformance(
-        "ntdll.dll",
-        "NtCreateProcess",
         "casa1-conformance:evidence_final_scraps_surfaces",
     ),
     conformance(
