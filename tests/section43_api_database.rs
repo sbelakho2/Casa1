@@ -954,26 +954,34 @@ fn api_report_gate_enforces_violations_via_the_binary() {
     let binary = env!("CARGO_BIN_EXE_casa1-oracle");
     let out = std::env::temp_dir().join("api-completeness-gate-test.json");
 
-    // The seeded database honestly violates the shipping gate (Implemented
-    // without coverage, unregistered Stub/Unsupported): the default gate must
-    // exit non-zero.
+    // The duplicate-key cleanup closed the last seeded shipping violations:
+    // every Implemented entry carries coverage evidence and every (DLL,
+    // export, arch, winver) key is unambiguous, so the shipping gate on the
+    // seeded database must exit zero.
     let status = std::process::Command::new(binary)
         .args(["api-report", "--gate", "shipping", "--out"])
         .arg(&out)
         .status()
         .expect("invoke casa1-oracle api-report");
     assert!(
-        !status.success(),
-        "api-report --gate shipping must exit non-zero when the seeded database has \
+        status.success(),
+        "api-report --gate shipping must exit zero when the seeded database has no \
          shipping violations"
     );
-    assert!(
-        out.is_file(),
-        "the report must still be written on gate failure"
+    assert!(out.is_file(), "the report must be written on gate success");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("read report"))
+            .expect("report is valid JSON");
+    assert_eq!(
+        value["gate"]["shipping_violation_count"]
+            .as_u64()
+            .expect("shipping_violation_count"),
+        0,
+        "the cleaned registry carries no shipping violations"
     );
 
-    // The completeness gate also fails on the seeded database (Partial never
-    // passes it).
+    // The completeness gate also passes on the seeded database (Partial
+    // never passes it — none remain; the Implemented surface is evidenced).
     let status = std::process::Command::new(binary)
         .args(["api-report", "--gate", "completeness", "--out"])
         .arg(&out)

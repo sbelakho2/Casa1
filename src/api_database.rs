@@ -286,6 +286,18 @@ impl ApiDatabase {
         self.entries.push(entry);
     }
 
+    /// Whether an entry with the full key already exists: (normalized DLL,
+    /// case-insensitive export, arch, Windows version).  Used at seed time to
+    /// keep the database at exactly one row per full key.
+    fn has_full_key(&self, entry: &ApiEntry) -> bool {
+        self.entries.iter().any(|existing| {
+            normalize_dll(&existing.dll) == normalize_dll(&entry.dll)
+                && existing.export.eq_ignore_ascii_case(&entry.export)
+                && existing.arch == entry.arch
+                && existing.win_version == entry.win_version
+        })
+    }
+
     /// Declare a `Stub`/`Unsupported` API deliberately unsupported.
     ///
     /// `compatibility_error` documents the guest-visible error the runtime
@@ -701,17 +713,36 @@ impl ApiDatabase {
             });
         }
 
+        // The skeleton tables document the interface/native surface; exports
+        // the runtime registers in THUNK_METADATA own their (DLL, export)
+        // key — a skeleton row whose full key already exists (COM interfaces
+        // such as ole32!IOleObject, oleaut32!IEnumVARIANT and the audited
+        // Nt* pair now live in the metadata surface) is documentation only
+        // and must not seed a duplicate row: the database needs exactly one
+        // row per (DLL, export, arch, winver).
         for skeleton in NT_API_SURFACE {
-            database.add_entry(skeleton_entry("ntdll.dll", skeleton));
+            let entry = skeleton_entry("ntdll.dll", skeleton);
+            if !database.has_full_key(&entry) {
+                database.add_entry(entry);
+            }
         }
         for skeleton in COM_INTERFACE_SURFACE {
-            database.add_entry(skeleton_entry(skeleton.dll, skeleton));
+            let entry = skeleton_entry(skeleton.dll, skeleton);
+            if !database.has_full_key(&entry) {
+                database.add_entry(entry);
+            }
         }
         for skeleton in DXGI_D3D_INTERFACE_SURFACE {
-            database.add_entry(skeleton_entry(skeleton.dll, skeleton));
+            let entry = skeleton_entry(skeleton.dll, skeleton);
+            if !database.has_full_key(&entry) {
+                database.add_entry(entry);
+            }
         }
         for skeleton in MEDIA_FOUNDATION_INTERFACE_SURFACE {
-            database.add_entry(skeleton_entry(skeleton.dll, skeleton));
+            let entry = skeleton_entry(skeleton.dll, skeleton);
+            if !database.has_full_key(&entry) {
+                database.add_entry(entry);
+            }
         }
 
         for deliberate in DELIBERATELY_UNSUPPORTED {
@@ -916,21 +947,6 @@ struct SkeletonEntry {
     support_policy: SupportPolicy,
 }
 
-/// Kernel-tier skeleton row (`OutsideUserModeProfile`).
-const fn kernel_skeleton(
-    export: &'static str,
-    implementation: ImplementationLevel,
-) -> SkeletonEntry {
-    SkeletonEntry {
-        dll: "",
-        export,
-        implementation,
-        transitional: false,
-        detail: "",
-        support_policy: SupportPolicy::OutsideUserModeProfile,
-    }
-}
-
 const fn interface_skeleton(
     dll: &'static str,
     export: &'static str,
@@ -975,16 +991,17 @@ static NT_API_SURFACE: &[SkeletonEntry] = &[
     // The Stage-4 NTDLL foundation implemented the Nt* surface — every
     // implemented Nt*/Rtl* API is covered by THUNK_METADATA (the registered
     // ntdll surface carries its Implemented level); only the still-missing
-    // Nt* skeletons stay here to quantify the remaining native-API gap.
+    // Nt* skeletons would stay here to quantify the remaining native-API
+    // gap.
     //
     // The Win32-over-Nt consistency audit (section50) verified each
     // implemented Nt* pair against its Win32 counterpart — VM, clocks,
     // topology, version, objects, sync, threads, processes, registry, files,
     // sections and the error-domain round trips — and the api_database
     // level for every audited entry is Implemented (the same pattern the
-    // Stage-4 entries were upgraded with).
-    kernel_skeleton("NtCreateFileMapping", ImplementationLevel::Implemented),
-    kernel_skeleton("NtCreateProcess", ImplementationLevel::Implemented),
+    // Stage-4 entries were upgraded with).  The surface is now fully
+    // metadata-covered, so the table is empty; a seed-time guard skips any
+    // skeleton row whose key THUNK_METADATA already owns.
 ];
 
 /// The core COM interface surface, marked at the runtime's actual level.
