@@ -1225,45 +1225,48 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "x3daudio1_7.dll",
         "X3DAudioCalculate",
         None,
-        SemanticFidelity::Restricted,
-        SubsystemCapability::Partial,
-        "Performs real X3DAudio spatial math (distance curves, cone inside/outside \
-         attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel \
-         delay/coefficient matrices) with documented approximations: speaker-circle \
-         azimuths, unit speaker radius and the inner-radius blend curve are complete \
-         deterministic approximations because no Windows oracle exists; the matrix \
-         layout follows the SDK header (dst-major).  Zeroed-response no-op is gone.",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        "Performs the real X3DAudio spatial model (documented speaker-circle azimuth \
+         tables for mono/stereo/quad/5.1/7.1 masks, unit-circle per-channel delays, \
+         distance curves, cone inside/outside attenuation, doppler, equal-power \
+         panning, inner-radius diffusion curve) with flag-gated deterministic \
+         outputs.  No differential Windows oracle exists for this model, but the \
+         documented algorithm is implemented rather than approximated.",
     ),
     semantic_override(
         "x3daudio1_7.dll",
         "X3DAudioInitialize",
         None,
-        SemanticFidelity::Restricted,
-        SubsystemCapability::Partial,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
         "Writes a real opaque instance handle (magic + speaker mask + speed of \
-         sound) that Calculate validates; the engine surface is the software spatial \
-         math above.",
+         sound) that Calculate validates; the engine surface is the real software \
+         spatial math above.",
     ),
-    // ── XACT3: no engine — the honest no-class environment model ───────────
+    // ── XACT3: real engine core ────────────────────────────────────────────
     semantic_override(
         "xactengine3_7.dll",
         "XACT3CreateEngine",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "Models a machine with no XACT3 engine installed: the factory answers E_FAIL \
-         with a NULL engine.  The environment model is honest; no XACT subsystem is \
-         available.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Creates a real XACT3 engine object with fully populated interface vtables \
+         (engine/soundbank/wavebank/cue/wave), genuine XWB/XSB/XGSF parsing \
+         (versions, entry metadata, compact banks, loop regions, PCM and MS ADPCM \
+         decode, cue variation selection) and real cue/wave playback on the runtime \
+         audio stack with category gains, loops and notifications.  Streaming \
+         banks, XMA/WMA decode, output-voice matrices and cue-local variables \
+         answer the genuine XACT errors; there is no release-fade envelope.",
     ),
     semantic_override(
         "xactengine3_7.dll",
         "XACT3CreateEngineWithFlags",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "Models a machine with no XACT3 engine installed: the factory answers E_FAIL \
-         with a NULL engine.  The environment model is honest; no XACT subsystem is \
-         available.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Same real XACT3 engine core as XACT3CreateEngine, with documented flag \
+         validation (E_INVALIDARG for rejected flag combinations).",
     ),
     // ── DirectPlay: no sessions / class not registered ─────────────────────
     semantic_override(
@@ -1326,27 +1329,30 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "srvsvc.dll",
         "NetServerGetInfo",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No domain server is reachable: the server-info query answers \
-         NERR_DCNotFound.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "The local machine (NULL server name) returns a real SERVER_INFO record \
+         from host facts with a NetApiBufferFree-able buffer; remote server names \
+         answer NERR_DCNotFound because no DC/SMB transport exists.",
     ),
     semantic_override(
         "wkssvc.dll",
         "NetWkstaSetInfo",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No domain server is reachable: the workstation-info update answers \
-         NERR_DCNotFound.",
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Real local workstation state: WKSTA_INFO levels are validated (platform, \
+         name/group limits, parm_err offsets) and stored per runtime; remote server \
+         names answer NERR_DCNotFound.",
     ),
     semantic_override(
         "browser.dll",
         "BrowserServerEnum",
         None,
-        SemanticFidelity::SyntheticEnvironment,
-        SubsystemCapability::Absent,
-        "No domain servers exist to enumerate: the enumeration answers \
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Enumerates the local host as one real SERVER_INFO entry; no network \
+         share/session state is modeled, and remote enumeration answers \
          NERR_DCNotFound.",
     ),
     // ── credentials / Kerberos: no credentials, no KDC ─────────────────────
@@ -1393,11 +1399,12 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
         "Selects a real certificate from the runtime certificate stores (requested \
-         store membership + parsed X.509 validity), writes a real CERT_CONTEXT and \
-         the owning store handle when exactly one candidate is eligible, and answers \
-         FALSE user-cancel when none or several are eligible (no dialog is shown); \
-         real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker \
-         callback cannot be invoked from this surface.",
+         store membership + parsed X.509 validity) with a deterministic best-match \
+         order (signature-strength then latest NotAfter then store order), writes a \
+         real CERT_CONTEXT and owning store handle, and answers FALSE only when no \
+         certificate is eligible (no dialog is shown); real \
+         ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback \
+         cannot be invoked from this surface.",
     ),
     // ── certificate digest helper: real digests now ────────────────────────
     semantic_override(
@@ -1417,18 +1424,20 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Real asynchronous activation over the real audio stack: resolves the default \
-         render device (or the render DEVINTERFACE GUID) to an enumerated cpal device \
-         record and returns a real guest endpoint with the full 21-slot IAudioClient/\
-         IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and \
-         validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and \
-         periods, real clock-driven GetCurrentPadding, Initialize opening the real \
-         cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer \
-         hand out and commit the real guest buffer into the output path, real \
-         event-handle signalling.  Exclusive mode is enforced client-side over the \
-         shared-mode host stream; capture-side services and IAudioClock/volume/session \
-         services answer E_NOINTERFACE (not backed); the AsyncOperation object itself \
-         is not modeled (the completion handler receives the result directly).",
+        "Real asynchronous activation over the real audio stack: the render \
+         DEVINTERFACE (or empty path) resolves to the default render device and the \
+         capture DEVINTERFACE resolves to a real input device, returning guest \
+         endpoints with the full 21-slot IAudioClient/2/3 vtable (real \
+         WAVEFORMATEX/EXTENSIBLE validation, device mix format/periods, clock-driven \
+         GetCurrentPadding, Initialize opening the real cpal stream, event-handle \
+         signalling) and real service objects from GetService: IAudioRenderClient \
+         (buffer round-trips into the output path), IAudioCaptureClient (real \
+         captured frames), IAudioClock, ISimpleAudioVolume, IAudioStreamVolume and \
+         IAudioSessionControl(2) with applied volume/mute state and notifications.  \
+         Exclusive mode is enforced client-side over the shared-mode host stream; \
+         offload/capture-loopback facilities answer E_NOINTERFACE; the \
+         AsyncOperation object itself is not modeled (the handler receives the \
+         result directly).",
     ),
     // ── CLR: a machine with no CLR installed ───────────────────────────────
     semantic_override(

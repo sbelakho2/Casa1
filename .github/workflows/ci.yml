@@ -86,10 +86,23 @@ jobs:
       # the report with --gate none and enforces the regression gate
       # instead: no new Stub, no new Unsupported, no Implemented -> Partial
       # downgrade, no loss of semantic coverage, no new API ambiguity.
-      - name: Emit api-completeness.json (gate none)
-        run: cargo run --bin casa1-oracle -- api-report --gate none --out api-completeness.json
+      - name: Emit api-completeness.json (gate none) with commit-bound provenance
+        run: |
+          set -euo pipefail
+          cargo run --bin casa1-oracle -- api-report --gate none --out api-completeness.json
+          bash ci/api_report_provenance.sh api-completeness.json
       - name: Run API regression gate
-        run: bash ci/check_api_regression.sh api-completeness.json ci/api-baseline.json
+        run: bash ci/check_api_regression.sh api-completeness.json --baseline ci/api-baseline.json
+      - name: Upload commit-bound API completeness evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-completeness-${{ github.sha }}
+          path: |
+            api-completeness.json
+            api-completeness.json.provenance.json
+          if-no-files-found: error
+          retention-days: 30
 
   integration-tests:
     name: Integration Tests

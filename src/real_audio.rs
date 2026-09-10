@@ -104,10 +104,54 @@ pub enum AudioActivationDeviceFailure {
 /// the device-interface id that names the **default render** device.
 pub const DEVINTERFACE_AUDIO_RENDER: &str = "{e6327cad-dcec-4949-ae8a-991e976a79d2}";
 /// `DEVINTERFACE_AUDIO_CAPTURE` (`{2eef81be-33fa-4800-9670-1cd474972c3f}`) —
-/// the device-interface id that names the default capture device. The real
-/// capture stack is not part of this activation surface, so the id never
-/// resolves here.
+/// the device-interface id that names the default capture device. Capture
+/// activations resolve this id (or a capture endpoint instance path) to the
+/// real default input device enumerated from the host.
 pub const DEVINTERFACE_AUDIO_CAPTURE: &str = "{2eef81be-33fa-4800-9670-1cd474972c3f}";
+
+/// Whether an `ActivateAudioInterfaceAsync` device-interface path asks for a
+/// **capture** endpoint.
+///
+/// Windows names capture endpoints with the
+/// `DEVINTERFACE_AUDIO_CAPTURE` interface id or a capture endpoint instance
+/// path. Capture endpoint instance paths carry the `{0.0.1.00000000}.{...}`
+/// endpoint id (render endpoints use the `{0.0.0....}` form) and usually
+/// embed the capture interface id as well.
+pub fn audio_activation_path_is_capture(device_interface_path: Option<&str>) -> bool {
+    let Some(path) = device_interface_path else {
+        return false;
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let capture_guid = DEVINTERFACE_AUDIO_CAPTURE
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+    lower.contains(capture_guid) || lower.contains("{0.0.1.") || lower.contains("#0.0.1.")
+}
+
+/// Resolve a capture-side `ActivateAudioInterfaceAsync` device-interface path
+/// against the real input-device snapshot (pure, deterministic — tests
+/// exercise it with synthetic lists).
+///
+/// The `DEVINTERFACE_AUDIO_CAPTURE` interface id and capture endpoint instance
+/// paths resolve to the default real input device. A non-capture path is
+/// `UnknownDevicePath`; an empty list (or a list without a default input
+/// device) is `NoDevices`.
+pub fn resolve_audio_capture_activation_device(
+    input_devices: &[RealAudioDevice],
+    device_interface_path: Option<&str>,
+) -> Result<RealAudioDevice, AudioActivationDeviceFailure> {
+    if !audio_activation_path_is_capture(device_interface_path) {
+        return Err(AudioActivationDeviceFailure::UnknownDevicePath);
+    }
+    let Some(default) = input_devices.iter().find(|device| device.is_default) else {
+        return Err(AudioActivationDeviceFailure::NoDevices);
+    };
+    Ok(default.clone())
+}
 
 /// Resolve an `ActivateAudioInterfaceAsync` device-interface path against a
 /// real-device snapshot (pure, deterministic — tests exercise it with
@@ -294,13 +338,61 @@ impl RealAudioBackend {
     /// Resolve the `ActivateAudioInterfaceAsync` device-interface path
     /// against the real device list of this backend.
     ///
-    /// See [`resolve_audio_activation_device`] for the resolution rules.
+    /// Capture paths (the `DEVINTERFACE_AUDIO_CAPTURE` interface id and
+    /// capture endpoint instance paths) resolve against the real host input
+    /// devices; render paths use [`resolve_audio_activation_device`].
     pub fn resolve_activation_device(
         &self,
         device_interface_path: Option<&str>,
     ) -> Result<RealAudioDevice, AudioActivationDeviceFailure> {
+        if audio_activation_path_is_capture(device_interface_path) {
+            let inputs = self.capture_device_snapshot();
+            return resolve_audio_capture_activation_device(&inputs, device_interface_path);
+        }
         let devices = self.activation_device_snapshot();
         resolve_audio_activation_device(&devices, device_interface_path)
+    }
+
+    /// Snapshot the real host input devices (default input device included)
+    /// for capture-side activation.
+    ///
+    /// Each entry carries the real device name, channel count and sample rate
+    /// from the host's default input configuration. The default input device
+    /// is the one capture activations bind to; ids continue the output-device
+    /// id space so a capture record can never collide with a render record.
+    pub fn capture_device_snapshot(&self) -> Vec<RealAudioDevice> {
+        let default_input_name = self
+            .host
+            .default_input_device()
+            .and_then(|device| device.name().ok());
+        let mut inputs = Vec::new();
+        let Ok(devices) = self.host.input_devices() else {
+            return inputs;
+        };
+        for (index, device) in devices.enumerate() {
+            let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+            let Ok(config) = device.default_input_config() else {
+                eprintln!(
+                    "[RealAudio] capture_device_snapshot: no input config for '{name}'; skipping"
+                );
+                continue;
+            };
+            let channels = config.channels();
+            let sample_rate = config.sample_rate().0;
+            let is_default = default_input_name
+                .as_ref()
+                .map(|default_name| default_name == &name)
+                .unwrap_or(false);
+            inputs.push(RealAudioDevice {
+                id: self.next_device_id + index as DeviceId,
+                key: format!("{name}|{channels}|{sample_rate}|capture"),
+                name,
+                channels,
+                sample_rate,
+                is_default,
+            });
+        }
+        inputs
     }
 
     // -----------------------------------------------------------------------
@@ -1248,7 +1340,7 @@ fn max_output_queue_samples(rate: u32, channels: u16) -> usize {
 }
 
 /// Maximum number of captured samples (~4 seconds of audio).
-fn max_capture_samples(rate: u32, channels: u16) -> usize {
+pub fn max_capture_samples(rate: u32, channels: u16) -> usize {
     max_output_queue_samples(rate, channels)
 }
 

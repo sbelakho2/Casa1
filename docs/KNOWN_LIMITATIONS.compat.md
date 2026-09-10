@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 39 entries deviate from exact/full — fidelity Exact 3, Restricted 11, SyntheticEnvironment 25, capability Full 1, Partial 17, Absent 21.
+**Counts**: 37 entries deviate from exact/full — fidelity Exact 3, Restricted 14, SyntheticEnvironment 20, capability Full 1, Partial 20, Absent 16.
 
 
 ### actxprxy.dll
@@ -16,7 +16,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### browser.dll
 
-- `BrowserServerEnum` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No domain servers exist to enumerate: the enumeration answers NERR_DCNotFound.
+- `BrowserServerEnum` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Enumerates the local host as one real SERVER_INFO entry; no network share/session state is modeled, and remote enumeration answers NERR_DCNotFound.
 
 ### browseui.dll
 
@@ -34,7 +34,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### cryptdlg.dll
 
-- `CertSelectCertificate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity), writes a real CERT_CONTEXT and the owning store handle when exactly one candidate is eligible, and answers FALSE user-cancel when none or several are eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface.
+- `CertSelectCertificate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity) with a deterministic best-match order (signature-strength then latest NotAfter then store order), writes a real CERT_CONTEXT and owning store handle, and answers FALSE only when no certificate is eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface.
 
 ### dpaddr.dll
 
@@ -68,7 +68,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mmdevapi.dll
 
-- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and returns a real guest endpoint with the full 21-slot IAudioClient/IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and periods, real clock-driven GetCurrentPadding, Initialize opening the real cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer hand out and commit the real guest buffer into the output path, real event-handle signalling.  Exclusive mode is enforced client-side over the shared-mode host stream; capture-side services and IAudioClock/volume/session services answer E_NOINTERFACE (not backed); the AsyncOperation object itself is not modeled (the completion handler receives the result directly).
+- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real asynchronous activation over the real audio stack: the render DEVINTERFACE (or empty path) resolves to the default render device and the capture DEVINTERFACE resolves to a real input device, returning guest endpoints with the full 21-slot IAudioClient/2/3 vtable (real WAVEFORMATEX/EXTENSIBLE validation, device mix format/periods, clock-driven GetCurrentPadding, Initialize opening the real cpal stream, event-handle signalling) and real service objects from GetService: IAudioRenderClient (buffer round-trips into the output path), IAudioCaptureClient (real captured frames), IAudioClock, ISimpleAudioVolume, IAudioStreamVolume and IAudioSessionControl(2) with applied volume/mute state and notifications.  Exclusive mode is enforced client-side over the shared-mode host stream; offload/capture-loopback facilities answer E_NOINTERFACE; the AsyncOperation object itself is not modeled (the handler receives the result directly).
 
 ### mscoree.dll
 
@@ -107,18 +107,13 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### srvsvc.dll
 
-- `NetServerGetInfo` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No domain server is reachable: the server-info query answers NERR_DCNotFound.
+- `NetServerGetInfo` — level `Implemented`, fidelity `Restricted`, capability `Partial` — The local machine (NULL server name) returns a real SERVER_INFO record from host facts with a NetApiBufferFree-able buffer; remote server names answer NERR_DCNotFound because no DC/SMB transport exists.
 
 ### wkssvc.dll
 
-- `NetWkstaSetInfo` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No domain server is reachable: the workstation-info update answers NERR_DCNotFound.
-
-### x3daudio1_7.dll
-
-- `X3DAudioCalculate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Performs real X3DAudio spatial math (distance curves, cone inside/outside attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel delay/coefficient matrices) with documented approximations: speaker-circle azimuths, unit speaker radius and the inner-radius blend curve are complete deterministic approximations because no Windows oracle exists; the matrix layout follows the SDK header (dst-major).  Zeroed-response no-op is gone.
-- `X3DAudioInitialize` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Writes a real opaque instance handle (magic + speaker mask + speed of sound) that Calculate validates; the engine surface is the software spatial math above.
+- `NetWkstaSetInfo` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real local workstation state: WKSTA_INFO levels are validated (platform, name/group limits, parm_err offsets) and stored per runtime; remote server names answer NERR_DCNotFound.
 
 ### xactengine3_7.dll
 
-- `XACT3CreateEngine` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a machine with no XACT3 engine installed: the factory answers E_FAIL with a NULL engine.  The environment model is honest; no XACT subsystem is available.
-- `XACT3CreateEngineWithFlags` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — Models a machine with no XACT3 engine installed: the factory answers E_FAIL with a NULL engine.  The environment model is honest; no XACT subsystem is available.
+- `XACT3CreateEngine` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real XACT3 engine object with fully populated interface vtables (engine/soundbank/wavebank/cue/wave), genuine XWB/XSB/XGSF parsing (versions, entry metadata, compact banks, loop regions, PCM and MS ADPCM decode, cue variation selection) and real cue/wave playback on the runtime audio stack with category gains, loops and notifications.  Streaming banks, XMA/WMA decode, output-voice matrices and cue-local variables answer the genuine XACT errors; there is no release-fade envelope.
+- `XACT3CreateEngineWithFlags` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Same real XACT3 engine core as XACT3CreateEngine, with documented flag validation (E_INVALIDARG for rejected flag combinations).

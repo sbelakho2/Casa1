@@ -105,6 +105,29 @@ pub const AUDCLNT_E_INVALID_DEVICE_PERIOD: u32 = 0x8889_0020;
 /// `AUDCLNT_E_INVALID_STREAM_FLAG` `AUDCLNT_ERR(0x021)`.
 pub const AUDCLNT_E_INVALID_STREAM_FLAG: u32 = 0x8889_0021;
 
+/// `AUDCLNT_S_BUFFER_EMPTY` `AUDCLNT_SUCCESS(0x001)` — no captured packet is
+/// available to read.
+pub const AUDCLNT_S_BUFFER_EMPTY: u32 = 0x0889_0001;
+/// `AUDCLNT_S_THREAD_ALREADY_REGISTERED` `AUDCLNT_SUCCESS(0x002)` — the
+/// session notification object is already registered.
+pub const AUDCLNT_S_THREAD_ALREADY_REGISTERED: u32 = 0x0889_0002;
+
+/// `AUDCLNT_STREAMSTATE_STRMFLGS_STOPPED` — `IAudioClock::GetState`.
+pub const AUDCLNT_STREAMSTATE_STOPPED: u32 = 0x1;
+/// `AUDCLNT_STREAMSTATE_STRMFLGS_RUNNING` — `IAudioClock::GetState`.
+pub const AUDCLNT_STREAMSTATE_RUNNING: u32 = 0x2;
+/// `AUDCLNT_STREAMSTATE_STRMFLGS_PAUSED` — `IAudioClock::GetState`.
+pub const AUDCLNT_STREAMSTATE_PAUSED: u32 = 0x4;
+/// `AUDCLNT_STREAMSTATE_STRMFLGS_ERROR` — `IAudioClock::GetState`.
+pub const AUDCLNT_STREAMSTATE_ERROR: u32 = 0x8;
+
+/// `AudioSessionStateInactive`.
+pub const AUDIO_SESSION_STATE_INACTIVE: u32 = 0;
+/// `AudioSessionStateActive`.
+pub const AUDIO_SESSION_STATE_ACTIVE: u32 = 1;
+/// `AudioSessionStateExpired`.
+pub const AUDIO_SESSION_STATE_EXPIRED: u32 = 2;
+
 /// `AUDCLNT_SHAREMODE_SHARED`.
 pub const AUDCLNT_SHAREMODE_SHARED: u32 = 0;
 /// `AUDCLNT_SHAREMODE_EXCLUSIVE`.
@@ -154,6 +177,31 @@ pub const IID_IAUDIO_RENDER_CLIENT: [u8; 16] = [
     0xfc, 0xac, 0x94, 0xf2, 0x46, 0x31, 0x83, 0x44, 0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2,
 ];
 
+/// `IID_IAudioCaptureClient` `{c8adbd64-e71e-48a0-a4de-185c395cd317}`.
+pub const IID_IAUDIO_CAPTURE_CLIENT: [u8; 16] = [
+    0x64, 0xbd, 0xad, 0xc8, 0x1e, 0xe7, 0xa0, 0x48, 0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17,
+];
+/// `IID_IAudioClock` `{cd63314f-3fba-4a1b-812c-ef96358728e7}`.
+pub const IID_IAUDIO_CLOCK: [u8; 16] = [
+    0x4f, 0x31, 0x63, 0xcd, 0xba, 0x3f, 0x1b, 0x4a, 0x81, 0x2c, 0xef, 0x96, 0x35, 0x87, 0x28, 0xe7,
+];
+/// `IID_ISimpleAudioVolume` `{87ce5498-68d6-44e5-9215-6da47ef883d8}`.
+pub const IID_ISIMPLE_AUDIO_VOLUME: [u8; 16] = [
+    0x98, 0x54, 0xce, 0x87, 0xd6, 0x68, 0xe5, 0x44, 0x92, 0x15, 0x6d, 0xa4, 0x7e, 0xf8, 0x83, 0xd8,
+];
+/// `IID_IAudioStreamVolume` `{93014887-242d-4068-8a15-cf5e93b90fe3}`.
+pub const IID_IAUDIO_STREAM_VOLUME: [u8; 16] = [
+    0x87, 0x48, 0x01, 0x93, 0x2d, 0x24, 0x68, 0x40, 0x8a, 0x15, 0xcf, 0x5e, 0x93, 0xb9, 0x0f, 0xe3,
+];
+/// `IID_IAudioSessionControl` `{f4b1a599-7266-4319-a8ca-e70acb11e8cd}`.
+pub const IID_IAUDIO_SESSION_CONTROL: [u8; 16] = [
+    0x99, 0xa5, 0xb1, 0xf4, 0x66, 0x72, 0x19, 0x43, 0xa8, 0xca, 0xe7, 0x0a, 0xcb, 0x11, 0xe8, 0xcd,
+];
+/// `IID_IAudioSessionControl2` `{bfb7ff88-7239-4fc9-8fa2-07c950be9c6d}`.
+pub const IID_IAUDIO_SESSION_CONTROL_2: [u8; 16] = [
+    0x88, 0xff, 0xb7, 0xbf, 0x39, 0x72, 0xc9, 0x4f, 0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d,
+];
+
 // ---------------------------------------------------------------------------
 // Requested-interface (riid) table
 // ---------------------------------------------------------------------------
@@ -199,6 +247,20 @@ pub fn activation_riid_name(riid: &[u8; 16]) -> String {
         "IAudioClient3".to_string()
     } else if *riid == IID_IUNKNOWN {
         "IUnknown".to_string()
+    } else if *riid == IID_IAUDIO_RENDER_CLIENT {
+        "IAudioRenderClient".to_string()
+    } else if *riid == IID_IAUDIO_CAPTURE_CLIENT {
+        "IAudioCaptureClient".to_string()
+    } else if *riid == IID_IAUDIO_CLOCK {
+        "IAudioClock".to_string()
+    } else if *riid == IID_ISIMPLE_AUDIO_VOLUME {
+        "ISimpleAudioVolume".to_string()
+    } else if *riid == IID_IAUDIO_STREAM_VOLUME {
+        "IAudioStreamVolume".to_string()
+    } else if *riid == IID_IAUDIO_SESSION_CONTROL {
+        "IAudioSessionControl".to_string()
+    } else if *riid == IID_IAUDIO_SESSION_CONTROL_2 {
+        "IAudioSessionControl2".to_string()
     } else {
         let bytes: Vec<String> = riid.iter().map(|byte| format!("{byte:02x}")).collect();
         bytes.join("")
@@ -616,6 +678,196 @@ pub(crate) fn audio_render_client_methods() -> Vec<HostThunk> {
     ]
 }
 
+/// The stream direction of a bound audio client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AudioDirection {
+    /// A render (playback) client: released frames flow into the real output.
+    Render,
+    /// A capture (recording) client: `GetBuffer` hands out real captured
+    /// frames.
+    Capture,
+}
+
+/// Which real service object a bound guest service object is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AudioServiceKind {
+    /// `IAudioRenderClient` (render endpoints only).
+    RenderClient,
+    /// `IAudioClock`.
+    Clock,
+    /// `ISimpleAudioVolume`.
+    SimpleVolume,
+    /// `IAudioStreamVolume`.
+    StreamVolume,
+    /// `IAudioSessionControl` / `IAudioSessionControl2`.
+    SessionControl,
+    /// `IAudioCaptureClient` (capture endpoints only).
+    CaptureClient,
+}
+
+impl AudioServiceKind {
+    /// Whether this service kind is valid for the endpoint direction.
+    pub fn supports_direction(self, direction: AudioDirection) -> bool {
+        match self {
+            AudioServiceKind::RenderClient => direction == AudioDirection::Render,
+            AudioServiceKind::CaptureClient => direction == AudioDirection::Capture,
+            _ => true,
+        }
+    }
+}
+
+/// The IAudioClock vtable method sequence: IUnknown preamble,
+/// `GetFrequency`, `GetPosition`, `GetState`.
+pub(crate) fn audio_clock_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::AudioServiceQueryInterface, // [0]
+        HostThunk::GuestObjectAddRef,          // [1]
+        HostThunk::GuestObjectRelease,         // [2]
+        HostThunk::AudioClockGetFrequency,     // [3]
+        HostThunk::AudioClockGetPosition,      // [4]
+        HostThunk::AudioClockGetState,         // [5]
+    ]
+}
+
+/// The ISimpleAudioVolume vtable method sequence: IUnknown preamble,
+/// `SetMasterVolume`, `GetMasterVolume`, `SetMute`, `GetMute`.
+pub(crate) fn simple_audio_volume_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::AudioServiceQueryInterface,       // [0]
+        HostThunk::GuestObjectAddRef,                // [1]
+        HostThunk::GuestObjectRelease,               // [2]
+        HostThunk::AudioSimpleVolumeSetMasterVolume, // [3]
+        HostThunk::AudioSimpleVolumeGetMasterVolume, // [4]
+        HostThunk::AudioSimpleVolumeSetMute,         // [5]
+        HostThunk::AudioSimpleVolumeGetMute,         // [6]
+    ]
+}
+
+/// The IAudioStreamVolume vtable method sequence: IUnknown preamble,
+/// `GetChannelCount`, `SetChannelVolume`, `GetChannelVolume`,
+/// `SetAllVolumes`, `GetAllVolumes`.
+pub(crate) fn audio_stream_volume_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::AudioServiceQueryInterface,        // [0]
+        HostThunk::GuestObjectAddRef,                 // [1]
+        HostThunk::GuestObjectRelease,                // [2]
+        HostThunk::AudioStreamVolumeGetChannelCount,  // [3]
+        HostThunk::AudioStreamVolumeSetChannelVolume, // [4]
+        HostThunk::AudioStreamVolumeGetChannelVolume, // [5]
+        HostThunk::AudioStreamVolumeSetAllVolumes,    // [6]
+        HostThunk::AudioStreamVolumeGetAllVolumes,    // [7]
+    ]
+}
+
+/// The IAudioSessionControl2 vtable method sequence: the IAudioSessionControl
+/// surface plus the IAudioSessionControl2 extension methods.  Activating
+/// `IAudioSessionControl` returns this same object; its first eleven slots are
+/// layout-compatible with `IAudioSessionControl`.
+pub(crate) fn audio_session_control_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::AudioServiceQueryInterface,                // [0]
+        HostThunk::GuestObjectAddRef,                         // [1]
+        HostThunk::GuestObjectRelease,                        // [2]
+        HostThunk::AudioSessionControlGetState,               // [3]
+        HostThunk::AudioSessionControlSetDisplayName,         // [4]
+        HostThunk::AudioSessionControlGetDisplayName,         // [5]
+        HostThunk::AudioSessionControlSetIconPath,            // [6]
+        HostThunk::AudioSessionControlGetIconPath,            // [7]
+        HostThunk::AudioSessionControlSetGroupingParam,       // [8]
+        HostThunk::AudioSessionControlGetGroupingParam,       // [9]
+        HostThunk::AudioSessionControlRegisterNotification,   // [10]
+        HostThunk::AudioSessionControlUnregisterNotification, // [11]
+        HostThunk::AudioSessionControl2GetSessionIdentifier,  // [12]
+        HostThunk::AudioSessionControl2GetSessionInstanceIdentifier, // [13]
+        HostThunk::AudioSessionControl2GetProcessId,          // [14]
+        HostThunk::AudioSessionControl2IsSystemSoundsSession, // [15]
+        HostThunk::AudioSessionControl2SetDuckingPreference,  // [16]
+    ]
+}
+
+/// The IAudioCaptureClient vtable method sequence: IUnknown preamble,
+/// `GetBuffer`, `ReleaseBuffer`, `GetNextPacketSize`.
+pub(crate) fn audio_capture_client_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::AudioServiceQueryInterface,          // [0]
+        HostThunk::GuestObjectAddRef,                   // [1]
+        HostThunk::GuestObjectRelease,                  // [2]
+        HostThunk::AudioCaptureClientGetBuffer,         // [3]
+        HostThunk::AudioCaptureClientReleaseBuffer,     // [4]
+        HostThunk::AudioCaptureClientGetNextPacketSize, // [5]
+    ]
+}
+
+/// The vtable method sequence of one service kind.
+pub(crate) fn audio_service_methods(kind: AudioServiceKind) -> Vec<HostThunk> {
+    match kind {
+        AudioServiceKind::RenderClient => audio_render_client_methods(),
+        AudioServiceKind::Clock => audio_clock_methods(),
+        AudioServiceKind::SimpleVolume => simple_audio_volume_methods(),
+        AudioServiceKind::StreamVolume => audio_stream_volume_methods(),
+        AudioServiceKind::SessionControl => audio_session_control_methods(),
+        AudioServiceKind::CaptureClient => audio_capture_client_methods(),
+    }
+}
+
+/// The IID of a service kind's primary interface (used by `GetService` and
+/// `QueryInterface`).
+pub(crate) fn audio_service_iid(kind: AudioServiceKind) -> [u8; 16] {
+    match kind {
+        AudioServiceKind::RenderClient => IID_IAUDIO_RENDER_CLIENT,
+        AudioServiceKind::Clock => IID_IAUDIO_CLOCK,
+        AudioServiceKind::SimpleVolume => IID_ISIMPLE_AUDIO_VOLUME,
+        AudioServiceKind::StreamVolume => IID_IAUDIO_STREAM_VOLUME,
+        AudioServiceKind::SessionControl => IID_IAUDIO_SESSION_CONTROL,
+        AudioServiceKind::CaptureClient => IID_IAUDIO_CAPTURE_CLIENT,
+    }
+}
+
+/// Resolve a requested service IID to its real service kind (`GetService`).
+pub(crate) fn audio_service_kind_for_riid(riid: &[u8; 16]) -> Option<AudioServiceKind> {
+    if *riid == IID_IAUDIO_RENDER_CLIENT {
+        Some(AudioServiceKind::RenderClient)
+    } else if *riid == IID_IAUDIO_CLOCK {
+        Some(AudioServiceKind::Clock)
+    } else if *riid == IID_ISIMPLE_AUDIO_VOLUME {
+        Some(AudioServiceKind::SimpleVolume)
+    } else if *riid == IID_IAUDIO_STREAM_VOLUME {
+        Some(AudioServiceKind::StreamVolume)
+    } else if *riid == IID_IAUDIO_SESSION_CONTROL || *riid == IID_IAUDIO_SESSION_CONTROL_2 {
+        Some(AudioServiceKind::SessionControl)
+    } else if *riid == IID_IAUDIO_CAPTURE_CLIENT {
+        Some(AudioServiceKind::CaptureClient)
+    } else {
+        None
+    }
+}
+
+/// Whether a service object of `kind` supports `riid` in its
+/// `QueryInterface`.
+pub(crate) fn audio_service_supports_riid(kind: AudioServiceKind, riid: &[u8; 16]) -> bool {
+    if *riid == IID_IUNKNOWN {
+        return true;
+    }
+    match kind {
+        AudioServiceKind::SessionControl => {
+            *riid == IID_IAUDIO_SESSION_CONTROL || *riid == IID_IAUDIO_SESSION_CONTROL_2
+        }
+        other => *riid == audio_service_iid(other),
+    }
+}
+
+/// Human-readable service name for traces.
+pub(crate) fn audio_service_name(kind: AudioServiceKind) -> &'static str {
+    match kind {
+        AudioServiceKind::RenderClient => "IAudioRenderClient",
+        AudioServiceKind::Clock => "IAudioClock",
+        AudioServiceKind::SimpleVolume => "ISimpleAudioVolume",
+        AudioServiceKind::StreamVolume => "IAudioStreamVolume",
+        AudioServiceKind::SessionControl => "IAudioSessionControl",
+        AudioServiceKind::CaptureClient => "IAudioCaptureClient",
+    }
+}
+
 /// Default device period when the real backend cannot be queried: 10 ms in
 /// `REFERENCE_TIME` units (100 ns).
 pub const DEFAULT_DEVICE_PERIOD_HNS: u64 = 100_000;
@@ -636,13 +888,20 @@ fn hns_to_frames(hns: u64, rate: u32) -> u64 {
 }
 
 /// One bound audio client: the real device, the parsed initialized format,
-/// the real guest render buffer and the real playback clock.
+/// the real guest buffer and the real stream clock.  Render clients drain
+/// committed frames through the playback clock; capture clients produce
+/// frames through the capture clock (real input callback when the host input
+/// opened, the paced capture queue otherwise).
 #[derive(Debug, Clone)]
 pub struct AudioClientState {
     /// The real device snapshot the endpoint was activated on.
     pub device: RealAudioDevice,
+    /// The direction the endpoint was activated for.
+    pub direction: AudioDirection,
     /// The riid the guest requested at activation.
     pub requested_riid: [u8; 16],
+    /// Per-session serial backing the session identifiers.
+    pub session_serial: u64,
     /// Whether `Initialize` has succeeded.
     pub initialized: bool,
     /// `AUDCLNT_SHAREMODE_SHARED` / `EXCLUSIVE`.
@@ -655,9 +914,9 @@ pub struct AudioClientState {
     pub format: Option<AudioClientFormat>,
     /// The real client buffer size in frames.
     pub buffer_frames: u32,
-    /// Guest address of the real render buffer.
+    /// Guest address of the real render/capture buffer.
     pub buffer_address: u64,
-    /// Byte length of the real render buffer.
+    /// Byte length of the real guest buffer.
     pub buffer_bytes: u64,
     /// Frames handed out by `GetBuffer` and not yet released (0 when none).
     pub buffer_outstanding_frames: u32,
@@ -682,12 +941,62 @@ pub struct AudioClientState {
     pub stream_latency_hns: u64,
     /// The real cpal device id the output stream was opened on.
     pub real_device_id: Option<crate::audio::DeviceId>,
+    /// The real exclusive-mode audio client id the exclusive stream opened
+    /// with (None when exclusive mode fell back to the client-side contract
+    /// or the stream is shared).
+    pub exclusive_client_id: Option<crate::audio::AudioClientId>,
     /// The cached IAudioRenderClient guest object (0 when none yet).
     pub render_service_object: u64,
+    /// The cached IAudioClock guest object (0 when none yet).
+    pub clock_service_object: u64,
+    /// The cached ISimpleAudioVolume guest object (0 when none yet).
+    pub simple_volume_service_object: u64,
+    /// The cached IAudioStreamVolume guest object (0 when none yet).
+    pub stream_volume_service_object: u64,
+    /// The cached IAudioSessionControl/IAudioSessionControl2 guest object
+    /// (0 when none yet).
+    pub session_service_object: u64,
+    /// The cached IAudioCaptureClient guest object (0 when none yet).
+    pub capture_service_object: u64,
     /// The `IAudioClient2::SetClientProperties` stream category.
     pub client_category: u32,
     /// The `IAudioClient2::SetClientProperties` offload request.
     pub client_offload_requested: bool,
+    // ── Session (ISimpleAudioVolume / IAudioStreamVolume / session) state ──
+    /// Session master volume (0.0..=1.0), applied to pushed output samples.
+    pub session_volume: f32,
+    /// Session mute; when set the endpoint's output gain is zero.
+    pub session_muted: bool,
+    /// Per-channel stream volumes (empty = every channel at 1.0).
+    pub channel_volumes: Vec<f32>,
+    /// Session display name (`SetDisplayName`); None is the device default.
+    pub session_display_name: Option<String>,
+    /// Session icon path (`SetIconPath`); None means no icon path set.
+    pub session_icon_path: Option<String>,
+    /// Session grouping parameter (`SetGroupingParam`).
+    pub session_grouping_param: [u8; 16],
+    /// The registered `IAudioSessionEvents` notification object (0 = none).
+    pub session_notification_object: u64,
+    /// `IAudioSessionControl2::SetDuckingPreference` opt-out flag.
+    pub session_ducking_opt_out: bool,
+    // ── Capture state ──────────────────────────────────────────────────────
+    /// Frames produced by the capture clock before the current run span.
+    pub capture_frames_carry: u64,
+    /// Frames released to the guest through `ReleaseBuffer`.
+    pub capture_consumed_frames: u64,
+    /// Frames of the outstanding capture packet (0 when none is handed out).
+    pub capture_outstanding_frames: u32,
+    /// Capture packet device position at `GetBuffer` time.
+    pub capture_packet_position: u64,
+    /// Capture packet QPC position (100 ns since the client epoch).
+    pub capture_packet_qpc: u64,
+    /// Real captured samples delivered by the input callback (f32,
+    /// interleaved) waiting to be handed out.
+    pub capture_queue: VecDeque<f32>,
+    /// Whether the real cpal input stream opened for this client.
+    pub capture_input_active: bool,
+    /// Client epoch used for `IAudioClock::GetPosition`'s QPC value.
+    pub clock_epoch: Instant,
 }
 
 impl AudioClientState {
@@ -712,6 +1021,107 @@ impl AudioClientState {
     fn padding_frames(&self, now: Instant) -> u32 {
         self.submitted_frames
             .saturating_sub(self.drained_frames(now)) as u32
+    }
+
+    /// Frames the real capture clock has produced at `now`.
+    fn capture_arrived_frames(&self, now: Instant) -> u64 {
+        let mut arrived = self.capture_frames_carry;
+        if let Some(started) = self.run_started {
+            let rate = self
+                .format
+                .as_ref()
+                .map(|format| format.sample_rate)
+                .unwrap_or(self.device.sample_rate)
+                .max(1);
+            let elapsed = now.saturating_duration_since(started);
+            let frames = (elapsed.as_nanos() * rate as u128 / 1_000_000_000) as u64;
+            arrived = arrived.saturating_add(frames);
+        }
+        arrived
+    }
+
+    /// The frames of the next capture packet: not-yet-released captured
+    /// frames, capped at the client buffer size (the engine's packet size).
+    fn capture_next_packet_frames(&self, now: Instant) -> u32 {
+        let available = self
+            .capture_arrived_frames(now)
+            .saturating_sub(self.capture_consumed_frames);
+        available.min(self.buffer_frames.max(1) as u64) as u32
+    }
+
+    /// The stream frequency (`IAudioClock::GetFrequency`).
+    fn clock_frequency(&self) -> u32 {
+        self.format
+            .as_ref()
+            .map(|format| format.sample_rate)
+            .unwrap_or(self.device.sample_rate)
+            .max(1)
+    }
+
+    /// The played/captured frame position and the QPC position at `now`.
+    fn clock_position(&self, now: Instant) -> (u64, u64) {
+        let position = match self.direction {
+            AudioDirection::Render => self.drained_frames(now),
+            AudioDirection::Capture => self.capture_arrived_frames(now),
+        };
+        let qpc = now
+            .saturating_duration_since(self.clock_epoch)
+            .as_nanos()
+            .checked_div(100)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64;
+        (position, qpc)
+    }
+
+    /// The session state (`AudioSessionStateActive` while the stream runs).
+    fn session_state(&self) -> u32 {
+        if self.running {
+            AUDIO_SESSION_STATE_ACTIVE
+        } else {
+            AUDIO_SESSION_STATE_INACTIVE
+        }
+    }
+
+    /// The per-channel output gains of the session volume/mute state and the
+    /// per-channel stream volumes (one gain per client channel).
+    pub fn output_gains(&self) -> Vec<f32> {
+        let channels = self
+            .format
+            .as_ref()
+            .map(|format| format.channels)
+            .unwrap_or(self.device.channels)
+            .max(1) as usize;
+        let master = if self.session_muted {
+            0.0
+        } else {
+            self.session_volume.clamp(0.0, 1.0)
+        };
+        (0..channels)
+            .map(|channel| master * self.channel_volumes.get(channel).copied().unwrap_or(1.0))
+            .collect()
+    }
+
+    /// Apply the session gains to interleaved `samples` in place.
+    pub fn apply_output_gain(&self, samples: &mut [f32]) {
+        let gains = self.output_gains();
+        if gains.is_empty() {
+            return;
+        }
+        for (index, sample) in samples.iter_mut().enumerate() {
+            *sample *= gains[index % gains.len()];
+        }
+    }
+}
+
+/// Apply per-channel output gains to interleaved samples (the real
+/// `ISimpleAudioVolume` + `IAudioStreamVolume` gain, applied where released
+/// frames enter the host output).
+pub fn apply_output_gains(samples: &mut [f32], gains: &[f32]) {
+    if gains.is_empty() {
+        return;
+    }
+    for (index, sample) in samples.iter_mut().enumerate() {
+        *sample *= gains[index % gains.len()];
     }
 }
 
@@ -738,8 +1148,14 @@ pub struct AudioInitializePlan {
 #[derive(Default)]
 struct AudioClientRegistry {
     clients: HashMap<u32, BTreeMap<u64, AudioClientState>>,
-    render_clients: HashMap<u32, BTreeMap<u64, u64>>,
+    /// Every real service object handed out by `GetService`: object →
+    /// (endpoint, service kind).
+    services: HashMap<u32, BTreeMap<u64, (u64, AudioServiceKind)>>,
 }
+
+/// Per-session serial counter (the non-zero identity component of the
+/// session identifier strings).
+static NEXT_SESSION_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 static AUDIO_CLIENTS: LazyLock<Mutex<AudioClientRegistry>> =
     LazyLock::new(|| Mutex::new(AudioClientRegistry::default()));
@@ -774,7 +1190,8 @@ fn ensure_audio_client_backend(
     guard.as_mut()
 }
 
-/// Attach a real audio-client state to a freshly activated endpoint object.
+/// Attach a real render audio-client state to a freshly activated endpoint
+/// object.
 ///
 /// Idempotent: a pre-existing state for the object is left untouched.
 pub(crate) fn register_audio_client(
@@ -782,6 +1199,19 @@ pub(crate) fn register_audio_client(
     object: u64,
     device: RealAudioDevice,
     requested_riid: [u8; 16],
+) {
+    register_audio_client_direction(pid, object, device, requested_riid, AudioDirection::Render);
+}
+
+/// Attach a real audio-client state for `direction` to an endpoint object.
+///
+/// Idempotent: a pre-existing state for the object is left untouched.
+pub(crate) fn register_audio_client_direction(
+    pid: u32,
+    object: u64,
+    device: RealAudioDevice,
+    requested_riid: [u8; 16],
+    direction: AudioDirection,
 ) {
     let (default_period_hns, minimum_period_hns) = {
         let mut backend = audio_client_backend();
@@ -800,7 +1230,9 @@ pub(crate) fn register_audio_client(
         .entry(object)
         .or_insert_with(|| AudioClientState {
             device,
+            direction,
             requested_riid,
+            session_serial: NEXT_SESSION_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             initialized: false,
             share_mode: AUDCLNT_SHAREMODE_SHARED,
             stream_flags: 0,
@@ -820,29 +1252,51 @@ pub(crate) fn register_audio_client(
             minimum_period_hns,
             stream_latency_hns: default_period_hns,
             real_device_id: None,
+            exclusive_client_id: None,
             render_service_object: 0,
+            clock_service_object: 0,
+            simple_volume_service_object: 0,
+            stream_volume_service_object: 0,
+            session_service_object: 0,
+            capture_service_object: 0,
             client_category: 0,
             client_offload_requested: false,
+            session_volume: 1.0,
+            session_muted: false,
+            channel_volumes: Vec::new(),
+            session_display_name: None,
+            session_icon_path: None,
+            session_grouping_param: [0_u8; 16],
+            session_notification_object: 0,
+            session_ducking_opt_out: false,
+            capture_frames_carry: 0,
+            capture_consumed_frames: 0,
+            capture_outstanding_frames: 0,
+            capture_packet_position: 0,
+            capture_packet_qpc: 0,
+            capture_queue: VecDeque::new(),
+            capture_input_active: false,
+            clock_epoch: Instant::now(),
         });
 }
 
-/// Drop every audio-client/render-client state bound to `object` (called when
-/// the runtime releases the guest object).  When the released endpoint was
-/// the last audio client using a real stream, the backend stream is closed.
+/// Drop every audio-client/service state bound to `object` (called when the
+/// runtime releases the guest object).  When the released endpoint was the
+/// last audio client using a real stream, the backend stream is closed.
 pub(crate) fn release_audio_object(pid: u32, object: u64) {
-    let (removed, close_device) = {
+    let (removed, close_device, stop_capture) = {
         let mut registry = audio_clients();
         let removed = registry
             .clients
             .get_mut(&pid)
             .and_then(|clients| clients.remove(&object));
         if removed.is_some() {
-            // Cached render-client service objects lose their binding too.
-            if let Some(render_clients) = registry.render_clients.get_mut(&pid) {
-                render_clients.retain(|_, endpoint| *endpoint != object);
+            // Cached service objects of the endpoint lose their binding too.
+            if let Some(services) = registry.services.get_mut(&pid) {
+                services.retain(|_, (endpoint, _)| *endpoint != object);
             }
-        } else if let Some(render_clients) = registry.render_clients.get_mut(&pid) {
-            render_clients.remove(&object);
+        } else if let Some(services) = registry.services.get_mut(&pid) {
+            services.remove(&object);
         }
         let close_device = removed
             .as_ref()
@@ -854,12 +1308,20 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
                     .flat_map(|clients| clients.values())
                     .any(|state| state.real_device_id == Some(*device_id))
             });
+        let stop_capture = removed
+            .as_ref()
+            .is_some_and(|state| state.capture_input_active)
+            && !registry
+                .clients
+                .values()
+                .flat_map(|clients| clients.values())
+                .any(|state| state.capture_input_active);
         if registry
-            .render_clients
+            .services
             .get(&pid)
-            .is_some_and(|render_clients| render_clients.is_empty())
+            .is_some_and(|services| services.is_empty())
         {
-            registry.render_clients.remove(&pid);
+            registry.services.remove(&pid);
         }
         if registry
             .clients
@@ -868,13 +1330,19 @@ pub(crate) fn release_audio_object(pid: u32, object: u64) {
         {
             registry.clients.remove(&pid);
         }
-        (removed, close_device)
+        (removed, close_device, stop_capture)
     };
     let _ = removed;
     if let Some(device_id) = close_device {
         let mut guard = audio_client_backend();
         if let Some(backend) = guard.as_mut() {
             backend.close_stream(device_id);
+        }
+    }
+    if stop_capture {
+        let mut guard = audio_client_backend();
+        if let Some(backend) = guard.as_mut() {
+            backend.stop_input_stream();
         }
     }
 }
@@ -898,16 +1366,29 @@ pub(crate) fn device_of(pid: u32, object: u64) -> Option<RealAudioDevice> {
 
 /// Observable snapshot of one bound audio client (tests).
 #[cfg(test)]
-#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub(crate) struct AudioClientTestSnapshot {
     pub initialized: bool,
     pub running: bool,
+    pub direction: AudioDirection,
+    pub share_mode: u32,
     pub buffer_frames: u32,
     pub buffer_address: u64,
     pub submitted_frames: u64,
     pub drained_frames_carry: u64,
     pub event_handle: u64,
     pub real_device_id: Option<crate::audio::DeviceId>,
+    pub exclusive_client_id: Option<crate::audio::AudioClientId>,
+    pub session_volume: f32,
+    pub session_muted: bool,
+    pub channel_volumes: Vec<f32>,
+    pub session_display_name: Option<String>,
+    pub session_notification_object: u64,
+    pub capture_consumed_frames: u64,
+    pub capture_frames_carry: u64,
+    pub capture_outstanding_frames: u32,
+    pub capture_input_active: bool,
 }
 
 #[cfg(test)]
@@ -919,12 +1400,24 @@ pub(crate) fn test_client_snapshot(pid: u32, object: u64) -> Option<AudioClientT
         .map(|state| AudioClientTestSnapshot {
             initialized: state.initialized,
             running: state.running,
+            direction: state.direction,
+            share_mode: state.share_mode,
             buffer_frames: state.buffer_frames,
             buffer_address: state.buffer_address,
             submitted_frames: state.submitted_frames,
             drained_frames_carry: state.drained_frames_carry,
             event_handle: state.event_handle,
             real_device_id: state.real_device_id,
+            exclusive_client_id: state.exclusive_client_id,
+            session_volume: state.session_volume,
+            session_muted: state.session_muted,
+            channel_volumes: state.channel_volumes.clone(),
+            session_display_name: state.session_display_name.clone(),
+            session_notification_object: state.session_notification_object,
+            capture_consumed_frames: state.capture_consumed_frames,
+            capture_frames_carry: state.capture_frames_carry,
+            capture_outstanding_frames: state.capture_outstanding_frames,
+            capture_input_active: state.capture_input_active,
         })
 }
 
@@ -947,7 +1440,8 @@ pub(crate) fn plan_initialize(
         return Err(AUDCLNT_E_INVALIDARG);
     }
     if stream_flags & AUDCLNT_STREAMFLAGS_LOOPBACK != 0 {
-        // Loopback is a capture mode; this endpoint is a render client.
+        // Loopback is a capture mode on a RENDER endpoint; the real capture
+        // path activates a true capture endpoint, which also rejects it.
         return Err(AUDCLNT_E_INVALID_STREAM_FLAG);
     }
     let mut registry = audio_clients();
@@ -966,6 +1460,11 @@ pub(crate) fn plan_initialize(
     if share_mode == AUDCLNT_SHAREMODE_EXCLUSIVE {
         if duration_hns == 0 {
             return Err(AUDCLNT_E_INVALIDARG);
+        }
+        if periodicity_hns != 0 && periodicity_hns > duration_hns {
+            // An exclusive periodicity larger than the buffer itself can
+            // never be scheduled.
+            return Err(AUDCLNT_E_INVALID_DEVICE_PERIOD);
         }
     } else if periodicity_hns != 0 {
         // Shared mode does not take a periodicity.
@@ -995,8 +1494,13 @@ pub(crate) fn plan_initialize(
     })
 }
 
-/// Store a successful `Initialize` and open the real output stream for the
-/// bound device (best effort: headless hosts keep the real paced queue).
+/// Store a successful `Initialize` and open the real host stream for the
+/// bound device and direction (best effort: headless hosts keep the real
+/// paced queue).
+///
+/// Render clients open the real shared or exclusive output stream the share
+/// mode selects; capture clients start the real host input stream (the paced
+/// capture queue backs hosts where the input cannot open).
 pub(crate) fn commit_initialize(
     pid: u32,
     object: u64,
@@ -1018,26 +1522,81 @@ pub(crate) fn commit_initialize(
     state.stream_flags = plan.stream_flags;
     state.event_driven = plan.event_driven;
     state.format = Some(format.clone());
+    state.channel_volumes = vec![1.0; format.channels.max(1) as usize];
     state.buffer_frames = plan.buffer_frames;
     state.buffer_address = buffer_address;
     state.buffer_bytes = buffer_bytes;
     state.buffer_outstanding_frames = 0;
     state.submitted_frames = 0;
     state.drained_frames_carry = 0;
+    state.capture_frames_carry = 0;
+    state.capture_consumed_frames = 0;
+    state.capture_outstanding_frames = 0;
+    state.capture_packet_position = 0;
+    state.capture_packet_qpc = 0;
+    state.capture_queue.clear();
     state.run_started = None;
     state.running = false;
     state.event_ready_signaled = false;
+    state.exclusive_client_id = None;
+    state.clock_epoch = Instant::now();
     let device_rate = state.device.sample_rate.max(1);
     state.stream_latency_hns = frames_to_hns(plan.buffer_frames as u64, device_rate).max(1);
-    if let Some((device_id, latency_ms)) =
-        open_real_render_stream(&state.device, format, plan.buffer_frames, plan.event_driven)
-    {
-        state.real_device_id = Some(device_id);
-        if let Some(latency_ms) = latency_ms {
-            state.stream_latency_hns = (latency_ms as u64).saturating_mul(10_000).max(1);
+    match state.direction {
+        AudioDirection::Render => {
+            if plan.share_mode == AUDCLNT_SHAREMODE_EXCLUSIVE {
+                if let Some((device_id, client_id, latency_ms)) =
+                    open_real_exclusive_render_stream(&state.device, format)
+                {
+                    state.real_device_id = Some(device_id);
+                    state.exclusive_client_id = Some(client_id);
+                    if let Some(latency_ms) = latency_ms {
+                        state.stream_latency_hns =
+                            (latency_ms as u64).saturating_mul(10_000).max(1);
+                    }
+                }
+            } else if let Some((device_id, latency_ms)) = open_real_render_stream(
+                &state.device,
+                format,
+                plan.buffer_frames,
+                plan.event_driven,
+            ) {
+                state.real_device_id = Some(device_id);
+                if let Some(latency_ms) = latency_ms {
+                    state.stream_latency_hns = (latency_ms as u64).saturating_mul(10_000).max(1);
+                }
+            }
+        }
+        AudioDirection::Capture => {
+            state.capture_input_active = open_real_capture_stream(format);
         }
     }
     AUDCLNT_S_OK
+}
+
+/// The real `WaveFormat` of an initialized client format.
+fn client_wave_format(format: &AudioClientFormat) -> WaveFormat {
+    WaveFormat {
+        channels: format.channels,
+        sample_rate: format.sample_rate,
+        sample_format: if format.is_float() {
+            SampleFormat::Float32
+        } else {
+            SampleFormat::Pcm16
+        },
+    }
+}
+
+/// The real backend device id matching a bound device snapshot.
+fn real_backend_device_id(
+    backend: &RealAudioBackend,
+    device: &RealAudioDevice,
+) -> Option<crate::audio::DeviceId> {
+    backend
+        .activation_device_snapshot()
+        .into_iter()
+        .find(|candidate| candidate.key == device.key)
+        .map(|candidate| candidate.id)
 }
 
 /// Open the real cpal output stream for the bound device (shared-mode path).
@@ -1047,22 +1606,10 @@ fn open_real_render_stream(
     buffer_frames: u32,
     event_driven: bool,
 ) -> Option<(crate::audio::DeviceId, Option<u32>)> {
-    let wave_format = WaveFormat {
-        channels: format.channels,
-        sample_rate: format.sample_rate,
-        sample_format: if format.is_float() {
-            SampleFormat::Float32
-        } else {
-            SampleFormat::Pcm16
-        },
-    };
+    let wave_format = client_wave_format(format);
     let mut guard = audio_client_backend();
     let backend = ensure_audio_client_backend(&mut guard)?;
-    let device_id = backend
-        .activation_device_snapshot()
-        .into_iter()
-        .find(|candidate| candidate.key == device.key)?
-        .id;
+    let device_id = real_backend_device_id(backend, device)?;
     backend
         .open_wasapi_client(&wave_format, buffer_frames as usize, event_driven)
         .ok()?;
@@ -1070,8 +1617,45 @@ fn open_real_render_stream(
     Some((device_id, latency_ms))
 }
 
-/// Push decoded render frames into the real cpal output stream of
-/// `device_id` (a no-op when the stream was never opened).
+/// Open the real exclusive-mode cpal output stream for the bound device
+/// (the real `open_wasapi_client_exclusive` path: exact client format, no
+/// resampling, smallest hardware buffer).
+fn open_real_exclusive_render_stream(
+    device: &RealAudioDevice,
+    format: &AudioClientFormat,
+) -> Option<(
+    crate::audio::DeviceId,
+    crate::audio::AudioClientId,
+    Option<u32>,
+)> {
+    let wave_format = client_wave_format(format);
+    let mut guard = audio_client_backend();
+    let backend = ensure_audio_client_backend(&mut guard)?;
+    let device_id = real_backend_device_id(backend, device)?;
+    let client_id = backend
+        .open_wasapi_client_exclusive(device_id, wave_format)
+        .ok()?;
+    let latency_ms = backend.last_latency_ms(device_id);
+    Some((device_id, client_id, latency_ms))
+}
+
+/// Start the real host input stream for a capture client (best effort).
+fn open_real_capture_stream(format: &AudioClientFormat) -> bool {
+    let mut guard = audio_client_backend();
+    let Some(backend) = ensure_audio_client_backend(&mut guard) else {
+        return false;
+    };
+    match backend.start_input_stream(format.sample_rate, format.channels) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("[RealAudio] capture input stream unavailable: {error}");
+            false
+        }
+    }
+}
+
+/// Push render frames into the real cpal output stream of `device_id` (a
+/// no-op when the stream was never opened).
 pub(crate) fn push_real_render_samples(
     device_id: crate::audio::DeviceId,
     samples: &[f32],
@@ -1237,18 +1821,23 @@ pub(crate) fn plan_initialize_shared_audio_stream(
     )
 }
 
-/// `GetCurrentPadding` — the real client-side padding (frames committed but
-/// not yet drained by the playback clock).
+/// `GetCurrentPadding` — the real client-side padding: frames committed but
+/// not yet drained by the playback clock on render streams; frames available
+/// to read on capture streams.
 pub(crate) fn get_current_padding(pid: u32, object: u64) -> Result<u32, u32> {
     with_client_state(pid, object, "GetCurrentPadding", |state| {
         if !state.initialized {
             return Err(AUDCLNT_E_NOT_INITIALIZED);
         }
-        Ok(state.padding_frames(Instant::now()))
+        let now = Instant::now();
+        Ok(match state.direction {
+            AudioDirection::Render => state.padding_frames(now),
+            AudioDirection::Capture => state.capture_next_packet_frames(now),
+        })
     })
 }
 
-/// `Start` — start the real playback clock.
+/// `Start` — start the real stream clock.
 pub(crate) fn start(pid: u32, object: u64) -> u32 {
     let result = with_client_state(pid, object, "Start", |state| {
         if !state.initialized {
@@ -1264,6 +1853,7 @@ pub(crate) fn start(pid: u32, object: u64) -> u32 {
         state.running = true;
         state.run_started = Some(Instant::now());
         state.event_ready_signaled = false;
+        notify_session_state(pid, state);
         Ok(AUDCLNT_S_OK)
     });
     match result {
@@ -1272,7 +1862,8 @@ pub(crate) fn start(pid: u32, object: u64) -> u32 {
     }
 }
 
-/// `Stop` — freeze the playback clock (remaining padding stays buffered).
+/// `Stop` — freeze the stream clock (remaining padding stays buffered;
+/// captured frames already produced stay readable).
 pub(crate) fn stop(pid: u32, object: u64) -> u32 {
     let result = with_client_state(pid, object, "Stop", |state| {
         if !state.initialized {
@@ -1283,9 +1874,11 @@ pub(crate) fn stop(pid: u32, object: u64) -> u32 {
         }
         let now = Instant::now();
         state.drained_frames_carry = state.drained_frames(now);
+        state.capture_frames_carry = state.capture_arrived_frames(now);
         state.run_started = None;
         state.running = false;
         state.event_ready_signaled = false;
+        notify_session_state(pid, state);
         Ok(AUDCLNT_S_OK)
     });
     match result {
@@ -1305,6 +1898,12 @@ pub(crate) fn reset(pid: u32, object: u64) -> u32 {
         }
         state.submitted_frames = 0;
         state.drained_frames_carry = 0;
+        state.capture_frames_carry = 0;
+        state.capture_consumed_frames = 0;
+        state.capture_outstanding_frames = 0;
+        state.capture_packet_position = 0;
+        state.capture_packet_qpc = 0;
+        state.capture_queue.clear();
         state.run_started = None;
         state.buffer_outstanding_frames = 0;
         state.event_ready_signaled = false;
@@ -1339,17 +1938,24 @@ pub(crate) fn set_event_handle(pid: u32, object: u64, handle: u64) -> u32 {
     }
 }
 
-/// The event handle to signal right now, if the buffer is ready and the ready
+/// The event handle to signal right now, if the stream is ready and the ready
 /// signal has not already been raised.  Transition-based so auto-reset events
 /// are not consumed before the guest observes them.
+///
+/// Render streams are ready when the buffer has free space; capture streams
+/// are ready when a packet is available to read.
 pub(crate) fn take_ready_event(pid: u32, endpoint: u64) -> Option<u64> {
     let mut registry = audio_clients();
     let state = registry.clients.get_mut(&pid)?.get_mut(&endpoint)?;
     if !state.running || state.event_handle == 0 {
         return None;
     }
-    let padding = state.padding_frames(Instant::now());
-    if padding < state.buffer_frames {
+    let now = Instant::now();
+    let ready = match state.direction {
+        AudioDirection::Render => state.padding_frames(now) < state.buffer_frames,
+        AudioDirection::Capture => state.capture_next_packet_frames(now) > 0,
+    };
+    if ready {
         if state.event_ready_signaled {
             return None;
         }
@@ -1361,7 +1967,7 @@ pub(crate) fn take_ready_event(pid: u32, endpoint: u64) -> Option<u64> {
 }
 
 /// Every ready event of `pid` that should be raised now (the servicing-point
-/// tick: a running client whose buffer has free space raises its event so a
+/// tick: a running client whose buffer is ready raises its event so a
 /// blocked event-driven guest wakes).
 pub(crate) fn take_ready_events(pid: u32) -> Vec<u64> {
     let mut registry = audio_clients();
@@ -1374,7 +1980,11 @@ pub(crate) fn take_ready_events(pid: u32) -> Vec<u64> {
         if !state.running || state.event_handle == 0 {
             continue;
         }
-        if state.padding_frames(now) < state.buffer_frames {
+        let ready = match state.direction {
+            AudioDirection::Render => state.padding_frames(now) < state.buffer_frames,
+            AudioDirection::Capture => state.capture_next_packet_frames(now) > 0,
+        };
+        if ready {
             if !state.event_ready_signaled {
                 state.event_ready_signaled = true;
                 handles.push(state.event_handle);
@@ -1386,41 +1996,798 @@ pub(crate) fn take_ready_events(pid: u32) -> Vec<u64> {
     handles
 }
 
-/// Bind an `IAudioRenderClient` service object to its endpoint.
-pub(crate) fn bind_render_service(pid: u32, endpoint: u64, service_object: u64) {
+/// Bind a real service object to its endpoint and service kind.
+pub(crate) fn bind_service(pid: u32, endpoint: u64, service_object: u64, kind: AudioServiceKind) {
     let mut registry = audio_clients();
     if let Some(state) = registry
         .clients
         .get_mut(&pid)
         .and_then(|clients| clients.get_mut(&endpoint))
     {
-        state.render_service_object = service_object;
+        match kind {
+            AudioServiceKind::RenderClient => state.render_service_object = service_object,
+            AudioServiceKind::Clock => state.clock_service_object = service_object,
+            AudioServiceKind::SimpleVolume => state.simple_volume_service_object = service_object,
+            AudioServiceKind::StreamVolume => state.stream_volume_service_object = service_object,
+            AudioServiceKind::SessionControl => state.session_service_object = service_object,
+            AudioServiceKind::CaptureClient => state.capture_service_object = service_object,
+        }
     }
     registry
-        .render_clients
+        .services
         .entry(pid)
         .or_default()
-        .insert(service_object, endpoint);
+        .insert(service_object, (endpoint, kind));
 }
 
-/// The cached `IAudioRenderClient` object of an endpoint, if any.
-pub(crate) fn render_service_for(pid: u32, endpoint: u64) -> Option<u64> {
+/// Bind an `IAudioRenderClient` service object to its endpoint (test helper;
+/// production code binds through [`bind_service`]).
+#[cfg(test)]
+pub(crate) fn bind_render_service(pid: u32, endpoint: u64, service_object: u64) {
+    bind_service(
+        pid,
+        endpoint,
+        service_object,
+        AudioServiceKind::RenderClient,
+    );
+}
+
+/// The cached service object of an endpoint for `kind`, if any.
+pub(crate) fn service_for(pid: u32, endpoint: u64, kind: AudioServiceKind) -> Option<u64> {
     audio_clients()
         .clients
         .get(&pid)
         .and_then(|clients| clients.get(&endpoint))
-        .map(|state| state.render_service_object)
+        .map(|state| match kind {
+            AudioServiceKind::RenderClient => state.render_service_object,
+            AudioServiceKind::Clock => state.clock_service_object,
+            AudioServiceKind::SimpleVolume => state.simple_volume_service_object,
+            AudioServiceKind::StreamVolume => state.stream_volume_service_object,
+            AudioServiceKind::SessionControl => state.session_service_object,
+            AudioServiceKind::CaptureClient => state.capture_service_object,
+        })
         .filter(|object| *object != 0)
 }
 
-/// The endpoint a render-client service object belongs to.
-fn render_client_endpoint(registry: &AudioClientRegistry, pid: u32, service: u64) -> Option<u64> {
-    registry
-        .render_clients
+/// The service kind of a bound service object (for generic `QueryInterface`).
+pub(crate) fn service_kind(pid: u32, service: u64) -> Option<AudioServiceKind> {
+    audio_clients()
+        .services
         .get(&pid)
-        .and_then(|clients| clients.get(&service))
-        .copied()
+        .and_then(|services| services.get(&service))
+        .map(|(_, kind)| *kind)
 }
+
+/// The endpoint a service object of `kind` belongs to.
+fn service_endpoint(
+    registry: &AudioClientRegistry,
+    pid: u32,
+    service: u64,
+    kind: AudioServiceKind,
+) -> Option<u64> {
+    registry
+        .services
+        .get(&pid)
+        .and_then(|services| services.get(&service))
+        .filter(|(_, bound_kind)| *bound_kind == kind)
+        .map(|(endpoint, _)| *endpoint)
+}
+
+/// Run `body` against the audio-client state behind a bound service object.
+fn with_service_state<T>(
+    pid: u32,
+    service: u64,
+    kind: AudioServiceKind,
+    message: &str,
+    body: impl FnOnce(&mut AudioClientState) -> Result<T, u32>,
+) -> Result<T, u32> {
+    let mut registry = audio_clients();
+    let endpoint =
+        service_endpoint(&registry, pid, service, kind).ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
+    let Some(state) = registry
+        .clients
+        .get_mut(&pid)
+        .and_then(|clients| clients.get_mut(&endpoint))
+    else {
+        eprintln!("[RealAudio] {message}: service {service:#x} has no endpoint state");
+        return Err(AUDCLNT_E_DEVICE_INVALIDATED);
+    };
+    body(state)
+}
+
+// ---------------------------------------------------------------------------
+// Session notifications — the real IAudioSessionEvents callbacks
+// ---------------------------------------------------------------------------
+
+/// One `IAudioSessionEvents` callback raised by a real session-state change.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioSessionNotificationKind {
+    /// `OnStateChanged` — the session became active/inactive.
+    StateChanged { state: u32 },
+    /// `OnDisplayNameChanged` (the new display name is a real guest string).
+    DisplayNameChanged { name: String, event_context: u64 },
+    /// `OnIconPathChanged`.
+    IconPathChanged { path: String, event_context: u64 },
+    /// `OnSimpleVolumeChanged`.
+    SimpleVolumeChanged {
+        volume: f32,
+        muted: bool,
+        event_context: u64,
+    },
+    /// `OnChannelVolumeChanged`.
+    ChannelVolumeChanged {
+        volumes: Vec<f32>,
+        changed_channel: u32,
+        event_context: u64,
+    },
+    /// `OnGroupingParamChanged`.
+    GroupingParamChanged { param: [u8; 16], event_context: u64 },
+}
+
+/// One queued session notification: the registered notification object plus
+/// the callback data (the vtable slot is derived from the kind).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSessionNotification {
+    /// The registered `IAudioSessionEvents` object.
+    pub object: u64,
+    /// The callback data.
+    pub kind: AudioSessionNotificationKind,
+}
+
+/// A fully resolved session callback: object, method entry point and
+/// arguments, ready to invoke from the runtime servicing point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingAudioNotification {
+    /// The notification object.
+    pub object: u64,
+    /// The resolved method entry point.
+    pub method: u64,
+    /// The invocation arguments (the object `this` is passed separately).
+    pub args: Vec<u64>,
+}
+
+static SESSION_NOTIFICATION_OUTBOX: LazyLock<
+    Mutex<HashMap<u32, VecDeque<AudioSessionNotification>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PENDING_AUDIO_NOTIFICATIONS: LazyLock<
+    Mutex<HashMap<u32, VecDeque<PendingAudioNotification>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn session_notification_locks()
+-> MutexGuard<'static, HashMap<u32, VecDeque<AudioSessionNotification>>> {
+    SESSION_NOTIFICATION_OUTBOX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn pending_notification_locks()
+-> MutexGuard<'static, HashMap<u32, VecDeque<PendingAudioNotification>>> {
+    PENDING_AUDIO_NOTIFICATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn queue_session_notification(pid: u32, notification: AudioSessionNotification) {
+    session_notification_locks()
+        .entry(pid)
+        .or_default()
+        .push_back(notification);
+}
+
+/// Notify the registered session object of a simple-volume change.
+fn notify_simple_volume(pid: u32, state: &AudioClientState, event_context: u64) {
+    if state.session_notification_object == 0 {
+        return;
+    }
+    queue_session_notification(
+        pid,
+        AudioSessionNotification {
+            object: state.session_notification_object,
+            kind: AudioSessionNotificationKind::SimpleVolumeChanged {
+                volume: state.session_volume,
+                muted: state.session_muted,
+                event_context,
+            },
+        },
+    );
+}
+
+/// Notify the registered session object of a channel-volume change.
+fn notify_channel_volume(
+    pid: u32,
+    state: &AudioClientState,
+    changed_channel: u32,
+    event_context: u64,
+) {
+    if state.session_notification_object == 0 {
+        return;
+    }
+    queue_session_notification(
+        pid,
+        AudioSessionNotification {
+            object: state.session_notification_object,
+            kind: AudioSessionNotificationKind::ChannelVolumeChanged {
+                volumes: state.channel_volumes.clone(),
+                changed_channel,
+                event_context,
+            },
+        },
+    );
+}
+
+/// Notify the registered session object of a state change.
+fn notify_session_state(pid: u32, state: &AudioClientState) {
+    if state.session_notification_object == 0 {
+        return;
+    }
+    queue_session_notification(
+        pid,
+        AudioSessionNotification {
+            object: state.session_notification_object,
+            kind: AudioSessionNotificationKind::StateChanged {
+                state: state.session_state(),
+            },
+        },
+    );
+}
+
+/// Drain the pending session-notification descriptors of `pid` (the runtime
+/// resolves the vtable method and queues the invocation).
+pub(crate) fn take_session_notifications(pid: u32) -> Vec<AudioSessionNotification> {
+    let mut outbox = session_notification_locks();
+    let Some(queue) = outbox.get_mut(&pid) else {
+        return Vec::new();
+    };
+    let notifications = queue.drain(..).collect();
+    outbox.remove(&pid);
+    notifications
+}
+
+/// Queue a fully resolved session callback for the runtime servicing point.
+pub(crate) fn push_audio_notification(pid: u32, notification: PendingAudioNotification) {
+    pending_notification_locks()
+        .entry(pid)
+        .or_default()
+        .push_back(notification);
+}
+
+/// Pop the oldest resolved session callback of `pid`.
+pub(crate) fn pop_audio_notification(pid: u32) -> Option<PendingAudioNotification> {
+    let mut pending = pending_notification_locks();
+    let queue = pending.get_mut(&pid)?;
+    let notification = queue.pop_front();
+    if queue.is_empty() {
+        pending.remove(&pid);
+    }
+    notification
+}
+
+// ---------------------------------------------------------------------------
+// IAudioClock — real stream clock
+// ---------------------------------------------------------------------------
+
+/// `IAudioClock::GetFrequency` — the initialized stream frequency.
+pub(crate) fn clock_frequency(pid: u32, service: u64) -> Result<u32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::Clock,
+        "GetFrequency",
+        |state| {
+            if !state.initialized {
+                return Err(AUDCLNT_E_NOT_INITIALIZED);
+            }
+            Ok(state.clock_frequency())
+        },
+    )
+}
+
+/// `IAudioClock::GetPosition` — `(frame_position, qpc_position)` in the
+/// clock's own units (frames and 100 ns), driven by the same clock that backs
+/// `GetCurrentPadding`.
+pub(crate) fn clock_position(pid: u32, service: u64) -> Result<(u64, u64), u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::Clock,
+        "GetPosition",
+        |state| {
+            if !state.initialized {
+                return Err(AUDCLNT_E_NOT_INITIALIZED);
+            }
+            Ok(state.clock_position(Instant::now()))
+        },
+    )
+}
+
+/// `IAudioClock::GetState` — the real stream state.
+pub(crate) fn clock_state(pid: u32, service: u64) -> Result<u32, u32> {
+    with_service_state(pid, service, AudioServiceKind::Clock, "GetState", |state| {
+        if !state.initialized {
+            return Err(AUDCLNT_E_NOT_INITIALIZED);
+        }
+        Ok(if state.running {
+            AUDCLNT_STREAMSTATE_RUNNING
+        } else {
+            AUDCLNT_STREAMSTATE_STOPPED
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ISimpleAudioVolume — real session master volume and mute
+// ---------------------------------------------------------------------------
+
+/// `ISimpleAudioVolume::SetMasterVolume(level, eventContext)`.
+pub(crate) fn set_master_volume(pid: u32, service: u64, level: f32, event_context: u64) -> u32 {
+    if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+        return AUDCLNT_E_INVALIDARG;
+    }
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SimpleVolume,
+        "SetMasterVolume",
+        |state| {
+            state.session_volume = level;
+            notify_simple_volume(pid, state, event_context);
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `ISimpleAudioVolume::GetMasterVolume(pfLevel)`.
+pub(crate) fn get_master_volume(pid: u32, service: u64) -> Result<f32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SimpleVolume,
+        "GetMasterVolume",
+        |state| Ok(state.session_volume),
+    )
+}
+
+/// `ISimpleAudioVolume::SetMute(bMute, eventContext)`.
+pub(crate) fn set_mute(pid: u32, service: u64, muted: bool, event_context: u64) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SimpleVolume,
+        "SetMute",
+        |state| {
+            state.session_muted = muted;
+            notify_simple_volume(pid, state, event_context);
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `ISimpleAudioVolume::GetMute(pbMute)`.
+pub(crate) fn get_mute(pid: u32, service: u64) -> Result<bool, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SimpleVolume,
+        "GetMute",
+        |state| Ok(state.session_muted),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// IAudioStreamVolume — real per-channel stream volumes
+// ---------------------------------------------------------------------------
+
+/// The initialized channel count of the endpoint behind a service object.
+fn service_channel_count(state: &AudioClientState) -> Result<u32, u32> {
+    if !state.initialized {
+        return Err(AUDCLNT_E_NOT_INITIALIZED);
+    }
+    Ok(state
+        .format
+        .as_ref()
+        .map(|format| format.channels)
+        .unwrap_or(state.device.channels)
+        .max(1) as u32)
+}
+
+/// `IAudioStreamVolume::GetChannelCount(pu32Count)`.
+pub(crate) fn stream_volume_channel_count(pid: u32, service: u64) -> Result<u32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::StreamVolume,
+        "GetChannelCount",
+        |state| service_channel_count(state),
+    )
+}
+
+/// `IAudioStreamVolume::SetChannelVolume(dwIndex, fLevel, EventContext)`.
+pub(crate) fn set_channel_volume(
+    pid: u32,
+    service: u64,
+    index: u32,
+    level: f32,
+    event_context: u64,
+) -> u32 {
+    if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+        return AUDCLNT_E_INVALIDARG;
+    }
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::StreamVolume,
+        "SetChannelVolume",
+        |state| {
+            let channels = service_channel_count(state)?;
+            if index >= channels {
+                return Err(AUDCLNT_E_INVALIDARG);
+            }
+            if state.channel_volumes.len() < channels as usize {
+                state.channel_volumes.resize(channels as usize, 1.0);
+            }
+            state.channel_volumes[index as usize] = level;
+            notify_channel_volume(pid, state, index, event_context);
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioStreamVolume::GetChannelVolume(dwIndex, pfLevel)`.
+pub(crate) fn get_channel_volume(pid: u32, service: u64, index: u32) -> Result<f32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::StreamVolume,
+        "GetChannelVolume",
+        |state| {
+            let channels = service_channel_count(state)?;
+            if index >= channels {
+                return Err(AUDCLNT_E_INVALIDARG);
+            }
+            Ok(state
+                .channel_volumes
+                .get(index as usize)
+                .copied()
+                .unwrap_or(1.0))
+        },
+    )
+}
+
+/// `IAudioStreamVolume::SetAllVolumes(dwCount, pfVolumes, EventContext)`.
+pub(crate) fn set_all_volumes(
+    pid: u32,
+    service: u64,
+    volumes: Vec<f32>,
+    event_context: u64,
+) -> u32 {
+    if volumes
+        .iter()
+        .any(|level| !level.is_finite() || !(0.0..=1.0).contains(level))
+    {
+        return AUDCLNT_E_INVALIDARG;
+    }
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::StreamVolume,
+        "SetAllVolumes",
+        |state| {
+            let channels = service_channel_count(state)? as usize;
+            if volumes.len() != channels {
+                return Err(AUDCLNT_E_INVALIDARG);
+            }
+            state.channel_volumes = volumes;
+            notify_channel_volume(pid, state, u32::MAX, event_context);
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioStreamVolume::GetAllVolumes(dwCount, pfVolumes)`.
+pub(crate) fn get_all_volumes(pid: u32, service: u64) -> Result<Vec<f32>, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::StreamVolume,
+        "GetAllVolumes",
+        |state| {
+            let channels = service_channel_count(state)? as usize;
+            let mut volumes = state.channel_volumes.clone();
+            volumes.resize(channels, 1.0);
+            Ok(volumes)
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// IAudioSessionControl / IAudioSessionControl2 — real session state
+// ---------------------------------------------------------------------------
+
+/// `IAudioSessionControl::GetState(pRetVal)`.
+pub(crate) fn session_state(pid: u32, service: u64) -> Result<u32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetState",
+        |state| Ok(state.session_state()),
+    )
+}
+
+/// `IAudioSessionControl::SetDisplayName(Value, EventContext)`.
+pub(crate) fn set_display_name(
+    pid: u32,
+    service: u64,
+    name: Option<String>,
+    event_context: u64,
+) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "SetDisplayName",
+        |state| {
+            state.session_display_name = name.clone();
+            if state.session_notification_object != 0 {
+                let effective = name.clone().unwrap_or_else(|| state.device.name.clone());
+                let notification = AudioSessionNotification {
+                    object: state.session_notification_object,
+                    kind: AudioSessionNotificationKind::DisplayNameChanged {
+                        name: effective,
+                        event_context,
+                    },
+                };
+                queue_session_notification(pid, notification);
+            }
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioSessionControl::GetDisplayName(pRetVal)` — the stored name, or the
+/// device's real name when the guest left the default.
+pub(crate) fn get_display_name(pid: u32, service: u64) -> Result<String, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetDisplayName",
+        |state| {
+            Ok(state
+                .session_display_name
+                .clone()
+                .unwrap_or_else(|| state.device.name.clone()))
+        },
+    )
+}
+
+/// `IAudioSessionControl::SetIconPath(Value, EventContext)`.
+pub(crate) fn set_icon_path(
+    pid: u32,
+    service: u64,
+    path: Option<String>,
+    event_context: u64,
+) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "SetIconPath",
+        |state| {
+            state.session_icon_path = path.clone();
+            if let Some(path) = path
+                && state.session_notification_object != 0
+            {
+                queue_session_notification(
+                    pid,
+                    AudioSessionNotification {
+                        object: state.session_notification_object,
+                        kind: AudioSessionNotificationKind::IconPathChanged {
+                            path,
+                            event_context,
+                        },
+                    },
+                );
+            }
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioSessionControl::GetIconPath(pRetVal)`.
+pub(crate) fn get_icon_path(pid: u32, service: u64) -> Result<Option<String>, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetIconPath",
+        |state| Ok(state.session_icon_path.clone()),
+    )
+}
+
+/// `IAudioSessionControl::SetGroupingParam(Override, EventContext)`.
+pub(crate) fn set_grouping_param(
+    pid: u32,
+    service: u64,
+    param: Option<[u8; 16]>,
+    event_context: u64,
+) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "SetGroupingParam",
+        |state| {
+            state.session_grouping_param = param.unwrap_or([0_u8; 16]);
+            if state.session_notification_object != 0 {
+                queue_session_notification(
+                    pid,
+                    AudioSessionNotification {
+                        object: state.session_notification_object,
+                        kind: AudioSessionNotificationKind::GroupingParamChanged {
+                            param: state.session_grouping_param,
+                            event_context,
+                        },
+                    },
+                );
+            }
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioSessionControl::GetGroupingParam(pRetVal)`.
+pub(crate) fn get_grouping_param(pid: u32, service: u64) -> Result<[u8; 16], u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetGroupingParam",
+        |state| Ok(state.session_grouping_param),
+    )
+}
+
+/// `IAudioSessionControl::RegisterAudioSessionNotification(NewNotifications)`.
+pub(crate) fn register_session_notification(pid: u32, service: u64, object: u64) -> u32 {
+    if object == 0 {
+        return AUDCLNT_E_INVALIDARG;
+    }
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "RegisterAudioSessionNotification",
+        |state| {
+            if state.session_notification_object == object {
+                return Ok(AUDCLNT_S_THREAD_ALREADY_REGISTERED);
+            }
+            state.session_notification_object = object;
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioSessionControl::UnregisterAudioSessionNotification(PrevNotifications)`.
+pub(crate) fn unregister_session_notification(pid: u32, service: u64, object: u64) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "UnregisterAudioSessionNotification",
+        |state| {
+            if object == 0 || state.session_notification_object == object {
+                state.session_notification_object = 0;
+            }
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+/// `IAudioSessionControl2::GetSessionIdentifier(pRetVal)`.
+pub(crate) fn session_identifier(pid: u32, service: u64) -> Result<String, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetSessionIdentifier",
+        |state| Ok(format!("{}.{}", state.device.key, state.session_serial)),
+    )
+}
+
+/// `IAudioSessionControl2::GetSessionInstanceIdentifier(pRetVal)`.
+pub(crate) fn session_instance_identifier(pid: u32, service: u64) -> Result<String, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetSessionInstanceIdentifier",
+        |state| {
+            Ok(format!(
+                "{}.{}.instance",
+                state.device.key, state.session_serial
+            ))
+        },
+    )
+}
+
+/// `IAudioSessionControl2::GetProcessId(pRetVal)` — the guest process that
+/// owns the runtime.
+pub(crate) fn session_process_id(pid: u32, service: u64) -> Result<u32, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "GetProcessId",
+        |state| {
+            let _ = state;
+            Ok(pid)
+        },
+    )
+}
+
+/// `IAudioSessionControl2::IsSystemSoundsSession()` — app sessions are not
+/// the system-sounds session.
+pub(crate) fn is_system_sounds_session(pid: u32, service: u64) -> Result<bool, u32> {
+    with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "IsSystemSoundsSession",
+        |state| {
+            let _ = state;
+            Ok(false)
+        },
+    )
+}
+
+/// `IAudioSessionControl2::SetDuckingPreference(optOut)`.
+pub(crate) fn set_ducking_preference(pid: u32, service: u64, opt_out: bool) -> u32 {
+    match with_service_state(
+        pid,
+        service,
+        AudioServiceKind::SessionControl,
+        "SetDuckingPreference",
+        |state| {
+            state.session_ducking_opt_out = opt_out;
+            Ok(AUDCLNT_S_OK)
+        },
+    ) {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IAudioRenderClient / IAudioCaptureClient — real buffer hand-out
+// ---------------------------------------------------------------------------
 
 /// `IAudioRenderClient::GetBuffer` — hand out the real guest render buffer.
 pub(crate) fn render_get_buffer(
@@ -1429,8 +2796,13 @@ pub(crate) fn render_get_buffer(
     frames_requested: u32,
 ) -> Result<(u64, u32), u32> {
     let mut registry = audio_clients();
-    let endpoint = render_client_endpoint(&registry, pid, service_object)
-        .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
+    let endpoint = service_endpoint(
+        &registry,
+        pid,
+        service_object,
+        AudioServiceKind::RenderClient,
+    )
+    .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
     let Some(state) = registry
         .clients
         .get_mut(&pid)
@@ -1438,6 +2810,9 @@ pub(crate) fn render_get_buffer(
     else {
         return Err(AUDCLNT_E_DEVICE_INVALIDATED);
     };
+    if state.direction != AudioDirection::Render {
+        return Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    }
     if !state.initialized {
         return Err(AUDCLNT_E_NOT_INITIALIZED);
     }
@@ -1483,10 +2858,16 @@ pub struct RenderRelease {
     pub silent: bool,
     /// The real cpal device id (when a real stream was opened).
     pub real_device_id: Option<crate::audio::DeviceId>,
+    /// The real exclusive-mode client id (when an exclusive stream opened).
+    pub exclusive_client_id: Option<crate::audio::AudioClientId>,
+    /// The per-channel session/stream gains applied where released frames
+    /// enter the host output.
+    pub channel_gains: Vec<f32>,
 }
 
-/// `IAudioRenderClient::ReleaseBuffer` — reclaim the buffer and commit the
-/// written frames into the real playback clock.
+/// `IAudioRenderClient::ReleaseBuffer` — reclaim the buffer, commit the
+/// written frames into the real playback clock and report the real session
+/// gains to apply before the frames reach the host output.
 pub(crate) fn render_release_buffer(
     pid: u32,
     service_object: u64,
@@ -1494,8 +2875,13 @@ pub(crate) fn render_release_buffer(
     flags: u32,
 ) -> Result<RenderRelease, u32> {
     let mut registry = audio_clients();
-    let endpoint = render_client_endpoint(&registry, pid, service_object)
-        .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
+    let endpoint = service_endpoint(
+        &registry,
+        pid,
+        service_object,
+        AudioServiceKind::RenderClient,
+    )
+    .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
     let Some(state) = registry
         .clients
         .get_mut(&pid)
@@ -1503,6 +2889,9 @@ pub(crate) fn render_release_buffer(
     else {
         return Err(AUDCLNT_E_DEVICE_INVALIDATED);
     };
+    if state.direction != AudioDirection::Render {
+        return Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    }
     if !state.initialized {
         return Err(AUDCLNT_E_NOT_INITIALIZED);
     }
@@ -1533,7 +2922,217 @@ pub(crate) fn render_release_buffer(
         sample_rate: format.sample_rate,
         silent: flags & AUDCLNT_BUFFERFLAGS_SILENT != 0,
         real_device_id: state.real_device_id,
+        exclusive_client_id: state.exclusive_client_id,
+        channel_gains: state.output_gains(),
     })
+}
+
+/// One real capture packet handed to the guest through
+/// `IAudioCaptureClient::GetBuffer`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturePacket {
+    /// The endpoint the packet belongs to.
+    pub endpoint: u64,
+    /// Guest address of the packet data.
+    pub buffer_address: u64,
+    /// Frames in the packet.
+    pub frames: u32,
+    /// Client channel count.
+    pub channels: u16,
+    /// Effective sample format tag.
+    pub wave_format_tag: u16,
+    /// Container bit depth.
+    pub bits_per_sample: u16,
+    /// Block alignment in bytes.
+    pub block_align: u16,
+    /// `AUDCLNT_BUFFERFLAGS_*` for the packet.
+    pub flags: u32,
+    /// Device position of the packet's first frame.
+    pub device_position: u64,
+    /// QPC position of the packet (100 ns units).
+    pub qpc_position: u64,
+    /// The interleaved f32 samples of the packet (real captured frames when
+    /// the input delivered them, silence otherwise).
+    pub samples: Vec<f32>,
+}
+
+/// `IAudioCaptureClient::GetBuffer` — fill and hand out the next real
+/// captured packet.
+pub(crate) fn capture_get_buffer(pid: u32, service_object: u64) -> Result<CapturePacket, u32> {
+    let mut registry = audio_clients();
+    let endpoint = service_endpoint(
+        &registry,
+        pid,
+        service_object,
+        AudioServiceKind::CaptureClient,
+    )
+    .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
+    let Some(state) = registry
+        .clients
+        .get_mut(&pid)
+        .and_then(|clients| clients.get_mut(&endpoint))
+    else {
+        return Err(AUDCLNT_E_DEVICE_INVALIDATED);
+    };
+    if state.direction != AudioDirection::Capture {
+        return Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    }
+    if !state.initialized {
+        return Err(AUDCLNT_E_NOT_INITIALIZED);
+    }
+    if !state.running {
+        return Err(AUDCLNT_E_NOT_STARTED);
+    }
+    if state.capture_outstanding_frames != 0 {
+        return Err(AUDCLNT_E_OUT_OF_ORDER);
+    }
+    // Pull whatever the real input callback delivered since the last packet.
+    if state.capture_input_active {
+        let mut backend_guard = audio_client_backend();
+        if let Some(backend) = backend_guard.as_mut() {
+            let captured = backend.read_capture_data();
+            if !captured.is_empty() {
+                state.capture_queue.extend(captured);
+                let cap = crate::real_audio::max_capture_samples(
+                    state.clock_frequency(),
+                    state
+                        .format
+                        .as_ref()
+                        .map(|format| format.channels)
+                        .unwrap_or(state.device.channels),
+                );
+                while state.capture_queue.len() > cap {
+                    state.capture_queue.pop_front();
+                }
+            }
+        }
+    }
+    let now = Instant::now();
+    let frames = state.capture_next_packet_frames(now);
+    if frames == 0 {
+        return Err(AUDCLNT_S_BUFFER_EMPTY);
+    }
+    let format = state
+        .format
+        .as_ref()
+        .cloned()
+        .ok_or(AUDCLNT_E_NOT_INITIALIZED)?;
+    let channels = format.channels.max(1) as usize;
+    let sample_count = frames as usize * channels;
+    let mut samples = Vec::with_capacity(sample_count);
+    let mut real_frames = 0_usize;
+    while samples.len() < sample_count {
+        match state.capture_queue.pop_front() {
+            Some(sample) => {
+                if samples.len() % channels == 0 {
+                    real_frames += 1;
+                }
+                samples.push(sample);
+            }
+            None => samples.push(0.0),
+        }
+    }
+    let silent = real_frames == 0;
+    state.capture_outstanding_frames = frames;
+    state.capture_packet_position = state.capture_consumed_frames;
+    let (_, qpc_position) = state.clock_position(now);
+    state.capture_packet_qpc = qpc_position;
+    Ok(CapturePacket {
+        endpoint,
+        buffer_address: state.buffer_address,
+        frames,
+        channels: format.channels,
+        wave_format_tag: format.wave_format_tag,
+        bits_per_sample: format.bits_per_sample,
+        block_align: format.block_align,
+        flags: if silent {
+            AUDCLNT_BUFFERFLAGS_SILENT
+        } else {
+            0
+        },
+        device_position: state.capture_packet_position,
+        qpc_position,
+        samples,
+    })
+}
+
+/// The real capture route information `ReleaseBuffer` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureRelease {
+    /// The endpoint the release belongs to.
+    pub endpoint: u64,
+    /// Frames released to the guest.
+    pub frames: u32,
+}
+
+/// `IAudioCaptureClient::ReleaseBuffer` — consume the outstanding packet.
+pub(crate) fn capture_release_buffer(
+    pid: u32,
+    service_object: u64,
+    frames_released: u32,
+    _flags: u32,
+) -> Result<CaptureRelease, u32> {
+    let mut registry = audio_clients();
+    let endpoint = service_endpoint(
+        &registry,
+        pid,
+        service_object,
+        AudioServiceKind::CaptureClient,
+    )
+    .ok_or(AUDCLNT_E_DEVICE_INVALIDATED)?;
+    let Some(state) = registry
+        .clients
+        .get_mut(&pid)
+        .and_then(|clients| clients.get_mut(&endpoint))
+    else {
+        return Err(AUDCLNT_E_DEVICE_INVALIDATED);
+    };
+    if state.direction != AudioDirection::Capture {
+        return Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    }
+    if !state.initialized {
+        return Err(AUDCLNT_E_NOT_INITIALIZED);
+    }
+    if !state.running {
+        return Err(AUDCLNT_E_NOT_STARTED);
+    }
+    if state.capture_outstanding_frames == 0 {
+        return Err(AUDCLNT_E_OUT_OF_ORDER);
+    }
+    if frames_released == 0 || frames_released > state.capture_outstanding_frames {
+        return Err(AUDCLNT_E_INVALIDARG);
+    }
+    state.capture_outstanding_frames = 0;
+    state.capture_consumed_frames = state
+        .capture_consumed_frames
+        .saturating_add(frames_released as u64);
+    Ok(CaptureRelease {
+        endpoint,
+        frames: frames_released,
+    })
+}
+
+/// `IAudioCaptureClient::GetNextPacketSize` — frames in the next packet (0
+/// when none is available).
+pub(crate) fn capture_next_packet_size(pid: u32, service_object: u64) -> Result<u32, u32> {
+    with_service_state(
+        pid,
+        service_object,
+        AudioServiceKind::CaptureClient,
+        "GetNextPacketSize",
+        |state| {
+            if state.direction != AudioDirection::Capture {
+                return Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+            }
+            if !state.initialized {
+                return Err(AUDCLNT_E_NOT_INITIALIZED);
+            }
+            if state.capture_outstanding_frames != 0 {
+                return Err(AUDCLNT_E_OUT_OF_ORDER);
+            }
+            Ok(state.capture_next_packet_frames(Instant::now()))
+        },
+    )
 }
 
 #[cfg(test)]

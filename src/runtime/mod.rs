@@ -5610,6 +5610,17 @@ pub enum HostThunk {
     X3dAudioInitialize,
     Xact3CreateEngine,
     Xact3CreateEngineWithFlags,
+    /// One vtable slot of a real XACT3 guest object (`IXACT3Engine`,
+    /// `IXACT3SoundBank`, `IXACT3WaveBank`, `IXACT3Cue`, `IXACT3Wave`).
+    /// `interface` is a `crate::xact::IFACE_*` id, `method` the vtable index
+    /// (including the three `IUnknown` slots), and `x86_arg_bytes` the
+    /// stdcall argument byte count the 32-bit dispatcher pops on return.
+    /// See `crate::xact` and `dispatch::final_scraps`.
+    Xact3Method {
+        interface: u8,
+        method: u16,
+        x86_arg_bytes: u8,
+    },
     NtCreateFileMapping,
     NtCreateProcess,
     ImfAsyncResult,
@@ -5642,6 +5653,38 @@ pub enum HostThunk {
     AudioClientGetSharedModeEnginePeriod,
     AudioClientGetCurrentSharedModeEnginePeriod,
     AudioClientInitializeSharedAudioStream,
+    // ── service objects returned by IAudioClient::GetService (real host
+    //    thunks; see `crate::audio_activation`) ──
+    AudioServiceQueryInterface,
+    AudioClockGetFrequency,
+    AudioClockGetPosition,
+    AudioClockGetState,
+    AudioSimpleVolumeSetMasterVolume,
+    AudioSimpleVolumeGetMasterVolume,
+    AudioSimpleVolumeSetMute,
+    AudioSimpleVolumeGetMute,
+    AudioStreamVolumeGetChannelCount,
+    AudioStreamVolumeSetChannelVolume,
+    AudioStreamVolumeGetChannelVolume,
+    AudioStreamVolumeSetAllVolumes,
+    AudioStreamVolumeGetAllVolumes,
+    AudioSessionControlGetState,
+    AudioSessionControlSetDisplayName,
+    AudioSessionControlGetDisplayName,
+    AudioSessionControlSetIconPath,
+    AudioSessionControlGetIconPath,
+    AudioSessionControlSetGroupingParam,
+    AudioSessionControlGetGroupingParam,
+    AudioSessionControlRegisterNotification,
+    AudioSessionControlUnregisterNotification,
+    AudioSessionControl2GetSessionIdentifier,
+    AudioSessionControl2GetSessionInstanceIdentifier,
+    AudioSessionControl2GetProcessId,
+    AudioSessionControl2IsSystemSoundsSession,
+    AudioSessionControl2SetDuckingPreference,
+    AudioCaptureClientGetBuffer,
+    AudioCaptureClientReleaseBuffer,
+    AudioCaptureClientGetNextPacketSize,
     MsftEditRegisterClass,
     RichEditAnsiWndClass,
     NetServerGetInfo,
@@ -18939,6 +18982,43 @@ impl PeHostRuntime {
             HostThunk::AudioClientInitializeSharedAudioStream => {
                 self.dispatch_audio_client_initialize_shared_audio_stream(state, memory)?;
             }
+            // The service interfaces returned by `IAudioClient::GetService`
+            // and activation: IAudioClock, ISimpleAudioVolume,
+            // IAudioStreamVolume, IAudioSessionControl(2) and
+            // IAudioCaptureClient.  The state behind them lives in
+            // `crate::audio_activation`.
+            ref thunk @ (HostThunk::AudioServiceQueryInterface
+            | HostThunk::AudioClockGetFrequency
+            | HostThunk::AudioClockGetPosition
+            | HostThunk::AudioClockGetState
+            | HostThunk::AudioSimpleVolumeSetMasterVolume
+            | HostThunk::AudioSimpleVolumeGetMasterVolume
+            | HostThunk::AudioSimpleVolumeSetMute
+            | HostThunk::AudioSimpleVolumeGetMute
+            | HostThunk::AudioStreamVolumeGetChannelCount
+            | HostThunk::AudioStreamVolumeSetChannelVolume
+            | HostThunk::AudioStreamVolumeGetChannelVolume
+            | HostThunk::AudioStreamVolumeSetAllVolumes
+            | HostThunk::AudioStreamVolumeGetAllVolumes
+            | HostThunk::AudioSessionControlGetState
+            | HostThunk::AudioSessionControlSetDisplayName
+            | HostThunk::AudioSessionControlGetDisplayName
+            | HostThunk::AudioSessionControlSetIconPath
+            | HostThunk::AudioSessionControlGetIconPath
+            | HostThunk::AudioSessionControlSetGroupingParam
+            | HostThunk::AudioSessionControlGetGroupingParam
+            | HostThunk::AudioSessionControlRegisterNotification
+            | HostThunk::AudioSessionControlUnregisterNotification
+            | HostThunk::AudioSessionControl2GetProcessId
+            | HostThunk::AudioSessionControl2GetSessionIdentifier
+            | HostThunk::AudioSessionControl2GetSessionInstanceIdentifier
+            | HostThunk::AudioSessionControl2IsSystemSoundsSession
+            | HostThunk::AudioSessionControl2SetDuckingPreference
+            | HostThunk::AudioCaptureClientGetBuffer
+            | HostThunk::AudioCaptureClientReleaseBuffer
+            | HostThunk::AudioCaptureClientGetNextPacketSize) => {
+                self.dispatch_audio_service_method(thunk, state, memory)?;
+            }
             // -- DirectInput8 (Phase 4.3) --
             HostThunk::DirectInput8Create => {
                 let instance = state.get(Register::Rcx);
@@ -29087,6 +29167,12 @@ impl PeHostRuntime {
                 self.dispatch_long_tail(thunk, state, memory)?;
             }
             ref thunk @ (HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
+                self.dispatch_final_scraps(thunk, state, memory)?;
+            }
+            // ── the real XACT3 guest-object vtables: every slot is a
+            //    distinct host thunk carrying its interface/method identity
+            //    (see `crate::xact` and `dispatch::final_scraps`) ──
+            ref thunk @ HostThunk::Xact3Method { .. } => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
             }
             // ── the real dispatches that left the final-scraps group: each
@@ -63869,6 +63955,7 @@ impl PeHostRuntime {
         // are delivered here — asynchronously, from the runtime servicing
         // point, never inline inside the activating call.
         let _ = self.drain_pending_audio_activations(state, memory)?;
+        let _ = self.drain_pending_audio_notifications(state, memory)?;
         // Event-driven WASAPI clients are driven from the same servicing
         // point: a running client whose buffer has free space raises its
         // ready event so a guest blocked in WaitForSingleObject wakes.
@@ -63947,6 +64034,7 @@ impl PeHostRuntime {
         // (ActivateAudioInterfaceAsync) during message-loop idle — the
         // same servicing point the timer/wait callbacks use.
         let _ = self.drain_pending_audio_activations(state, memory)?;
+        let _ = self.drain_pending_audio_notifications(state, memory)?;
         self.tick_audio_client_events();
         self.win32.sleep_ex(16, false, None)?;
         // Always yield the CPU between GetMessageW polls to prevent
@@ -78208,8 +78296,7 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         use crate::audio_activation::{
-            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_RENDER_CLIENT,
-            IID_IUNKNOWN, audio_render_client_methods, bind_render_service, render_service_for,
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IUNKNOWN,
         };
         let object = guest_call_arg(state, memory, 0)?;
         let riid_ptr = guest_call_arg(state, memory, 1)?;
@@ -78231,8 +78318,8 @@ impl PeHostRuntime {
             self.add_ref_guest_object(object)?;
             write_guest_pointer(memory, out, object, self.guest_arch)?;
             ACTIVATION_S_OK
-        } else if riid == IID_IAUDIO_RENDER_CLIENT {
-            let cached = render_service_for(self.guest_pid, object)
+        } else if let Some(kind) = crate::audio_activation::audio_service_kind_for_riid(&riid) {
+            let cached = crate::audio_activation::service_for(self.guest_pid, object, kind)
                 .filter(|service| self.guest_objects.contains_key(service));
             let service = match cached {
                 Some(service) => {
@@ -78240,10 +78327,13 @@ impl PeHostRuntime {
                     service
                 }
                 None => {
-                    let vtable = self.alloc_guest_vtable(memory, audio_render_client_methods())?;
+                    let vtable = self.alloc_guest_vtable(
+                        memory,
+                        crate::audio_activation::audio_service_methods(kind),
+                    )?;
                     let service =
                         self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
-                    bind_render_service(self.guest_pid, object, service);
+                    crate::audio_activation::bind_service(self.guest_pid, object, service, kind);
                     service
                 }
             };
@@ -78255,13 +78345,18 @@ impl PeHostRuntime {
         };
         state.set(Register::Rax, u64::from(hr));
         self.last_error = 0;
+        let service_name = crate::audio_activation::audio_service_kind_for_riid(&riid)
+            .map(crate::audio_activation::audio_service_name);
         self.push_trace(
             "audio",
             "IAudioClient::GetService",
-            BTreeMap::from([(
-                "riid".to_string(),
-                json!(crate::audio_activation::activation_riid_name(&riid)),
-            )]),
+            BTreeMap::from([
+                (
+                    "riid".to_string(),
+                    json!(crate::audio_activation::activation_riid_name(&riid)),
+                ),
+                ("service".to_string(), json!(service_name)),
+            ]),
             json!(hr),
         );
         Ok(())
@@ -78388,10 +78483,444 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    // ── IAudioClient2 / IAudioClient3 extension methods ────────────────────
-    //
-    // A guest that activated `IID_IAudioClient2` / `IID_IAudioClient3` gets
-    // these real extension slots on the same endpoint object.
+    /// Dispatch the service interfaces returned by
+    /// `IAudioClient::GetService` / activation — IAudioClock,
+    /// ISimpleAudioVolume, IAudioStreamVolume, IAudioSessionControl(2) and
+    /// IAudioCaptureClient.  All state is real and lives in
+    /// `crate::audio_activation`; this layer only reads guest arguments,
+    /// calls the state operation and writes real results back.
+    fn dispatch_audio_service_method(
+        &mut self,
+        thunk: &HostThunk,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_INVALIDARG, AUDCLNT_E_POINTER,
+            AUDCLNT_S_FALSE, AUDCLNT_S_OK, audio_service_supports_riid, capture_get_buffer,
+            capture_next_packet_size, capture_release_buffer, clock_frequency, clock_position,
+            clock_state, get_all_volumes, get_channel_volume, get_display_name, get_grouping_param,
+            get_icon_path, get_master_volume, get_mute, is_system_sounds_session,
+            register_session_notification, service_kind, session_identifier,
+            session_instance_identifier, session_process_id, session_state, set_all_volumes,
+            set_channel_volume, set_display_name, set_ducking_preference, set_grouping_param,
+            set_icon_path, set_master_volume, set_mute, stream_volume_channel_count,
+            unregister_session_notification,
+        };
+        let pid = self.guest_pid;
+        let this = guest_call_arg(state, memory, 0)?;
+        let hr: u32 = match thunk {
+            HostThunk::AudioServiceQueryInterface => {
+                let riid_ptr = guest_call_arg(state, memory, 1)?;
+                let out = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    let riid: Option<[u8; 16]> = memory
+                        .read_bytes(riid_ptr, 16)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok());
+                    match (riid, service_kind(pid, this)) {
+                        (Some(riid), Some(kind)) if audio_service_supports_riid(kind, &riid) => {
+                            let _ = write_guest_pointer(memory, out, this, self.guest_arch);
+                            AUDCLNT_S_OK
+                        }
+                        _ => {
+                            let _ = write_guest_pointer(memory, out, 0, self.guest_arch);
+                            ACTIVATION_E_NOINTERFACE
+                        }
+                    }
+                }
+            }
+            HostThunk::AudioClockGetFrequency => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match clock_frequency(pid, this) {
+                        Ok(frequency) => {
+                            write_u64(memory, out, frequency as u64);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioClockGetPosition => {
+                let position_out = guest_call_arg(state, memory, 1)?;
+                let qpc_out = guest_call_arg(state, memory, 2)?;
+                if position_out == 0 || qpc_out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match clock_position(pid, this) {
+                        Ok((position, qpc)) => {
+                            write_u64(memory, position_out, position);
+                            write_u64(memory, qpc_out, qpc);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioClockGetState => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match clock_state(pid, this) {
+                        Ok(value) => {
+                            write_u32(memory, out, value);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSimpleVolumeSetMasterVolume => {
+                let level = f32::from_bits(guest_call_arg_u32(state, memory, 1)?);
+                let event_context = guest_call_arg(state, memory, 2)?;
+                set_master_volume(pid, this, level, event_context)
+            }
+            HostThunk::AudioSimpleVolumeGetMasterVolume => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_master_volume(pid, this) {
+                        Ok(level) => {
+                            write_u32(memory, out, level.to_bits());
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSimpleVolumeSetMute => {
+                let muted = guest_call_arg_u32(state, memory, 1)? != 0;
+                let event_context = guest_call_arg(state, memory, 2)?;
+                set_mute(pid, this, muted, event_context)
+            }
+            HostThunk::AudioSimpleVolumeGetMute => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_mute(pid, this) {
+                        Ok(muted) => {
+                            write_u32(memory, out, u32::from(muted));
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioStreamVolumeGetChannelCount => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match stream_volume_channel_count(pid, this) {
+                        Ok(count) => {
+                            write_u32(memory, out, count);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioStreamVolumeSetChannelVolume => {
+                let index = guest_call_arg_u32(state, memory, 1)?;
+                let level = f32::from_bits(guest_call_arg_u32(state, memory, 2)?);
+                let event_context = guest_call_arg(state, memory, 3)?;
+                set_channel_volume(pid, this, index, level, event_context)
+            }
+            HostThunk::AudioStreamVolumeGetChannelVolume => {
+                let index = guest_call_arg_u32(state, memory, 1)?;
+                let out = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_channel_volume(pid, this, index) {
+                        Ok(level) => {
+                            write_u32(memory, out, level.to_bits());
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioStreamVolumeSetAllVolumes => {
+                let count = guest_call_arg_u32(state, memory, 1)?;
+                let volumes_ptr = guest_call_arg(state, memory, 2)?;
+                let event_context = guest_call_arg(state, memory, 3)?;
+                if volumes_ptr == 0 || count == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    let mut volumes = Vec::with_capacity(count as usize);
+                    let mut ok = true;
+                    for index in 0..count as u64 {
+                        match read_u32(memory, volumes_ptr + index * 4) {
+                            Ok(bits) => volumes.push(f32::from_bits(bits)),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        set_all_volumes(pid, this, volumes, event_context)
+                    } else {
+                        AUDCLNT_E_POINTER
+                    }
+                }
+            }
+            HostThunk::AudioStreamVolumeGetAllVolumes => {
+                let count = guest_call_arg_u32(state, memory, 1)?;
+                let out = guest_call_arg(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_all_volumes(pid, this) {
+                        Ok(volumes) => {
+                            if count < volumes.len() as u32 {
+                                AUDCLNT_E_INVALIDARG
+                            } else {
+                                for (index, level) in volumes.iter().enumerate() {
+                                    write_u32(memory, out + index as u64 * 4, level.to_bits());
+                                }
+                                ACTIVATION_S_OK
+                            }
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControlGetState => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match session_state(pid, this) {
+                        Ok(value) => {
+                            write_u32(memory, out, value);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControlSetDisplayName => {
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let event_context = guest_call_arg(state, memory, 2)?;
+                let name = if name_ptr == 0 {
+                    None
+                } else {
+                    Some(read_utf16z(memory, name_ptr, 1024)?)
+                };
+                set_display_name(pid, this, name, event_context)
+            }
+            HostThunk::AudioSessionControlGetDisplayName => {
+                let out = guest_call_arg(state, memory, 1)?;
+                let capacity = guest_call_arg_u32(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_display_name(pid, this) {
+                        Ok(name) => {
+                            if write_utf16_buffer(memory, out, capacity as usize, &name) {
+                                ACTIVATION_S_OK
+                            } else {
+                                AUDCLNT_E_INVALIDARG
+                            }
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControlSetIconPath => {
+                let path_ptr = guest_call_arg(state, memory, 1)?;
+                let event_context = guest_call_arg(state, memory, 2)?;
+                let path = if path_ptr == 0 {
+                    None
+                } else {
+                    Some(read_utf16z(memory, path_ptr, 1024)?)
+                };
+                set_icon_path(pid, this, path, event_context)
+            }
+            HostThunk::AudioSessionControlGetIconPath => {
+                let out = guest_call_arg(state, memory, 1)?;
+                let capacity = guest_call_arg_u32(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_icon_path(pid, this) {
+                        Ok(path) => {
+                            let path = path.unwrap_or_default();
+                            if write_utf16_buffer(memory, out, capacity as usize, &path) {
+                                ACTIVATION_S_OK
+                            } else {
+                                AUDCLNT_E_INVALIDARG
+                            }
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControlSetGroupingParam => {
+                let override_ptr = guest_call_arg(state, memory, 1)?;
+                let event_context = guest_call_arg(state, memory, 2)?;
+                let param = if override_ptr == 0 {
+                    None
+                } else {
+                    memory
+                        .read_bytes(override_ptr, 16)
+                        .ok()
+                        .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+                };
+                set_grouping_param(pid, this, param, event_context)
+            }
+            HostThunk::AudioSessionControlGetGroupingParam => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match get_grouping_param(pid, this) {
+                        Ok(param) => {
+                            for (index, byte) in param.iter().enumerate() {
+                                write_u8(memory, out + index as u64, *byte);
+                            }
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControlRegisterNotification => {
+                let object = guest_call_arg(state, memory, 1)?;
+                register_session_notification(pid, this, object)
+            }
+            HostThunk::AudioSessionControlUnregisterNotification => {
+                let object = guest_call_arg(state, memory, 1)?;
+                unregister_session_notification(pid, this, object)
+            }
+            HostThunk::AudioSessionControl2GetProcessId => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match session_process_id(pid, this) {
+                        Ok(process_id) => {
+                            write_u32(memory, out, process_id);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControl2GetSessionIdentifier => {
+                let out = guest_call_arg(state, memory, 1)?;
+                let capacity = guest_call_arg_u32(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match session_identifier(pid, this) {
+                        Ok(identifier) => {
+                            if write_utf16_buffer(memory, out, capacity as usize, &identifier) {
+                                ACTIVATION_S_OK
+                            } else {
+                                AUDCLNT_E_INVALIDARG
+                            }
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControl2GetSessionInstanceIdentifier => {
+                let out = guest_call_arg(state, memory, 1)?;
+                let capacity = guest_call_arg_u32(state, memory, 2)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match session_instance_identifier(pid, this) {
+                        Ok(identifier) => {
+                            if write_utf16_buffer(memory, out, capacity as usize, &identifier) {
+                                ACTIVATION_S_OK
+                            } else {
+                                AUDCLNT_E_INVALIDARG
+                            }
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioSessionControl2IsSystemSoundsSession => {
+                match is_system_sounds_session(pid, this) {
+                    Ok(true) => AUDCLNT_S_OK,
+                    Ok(false) => AUDCLNT_S_FALSE,
+                    Err(hr) => hr,
+                }
+            }
+            HostThunk::AudioSessionControl2SetDuckingPreference => {
+                let opt_out = guest_call_arg_u32(state, memory, 1)? != 0;
+                set_ducking_preference(pid, this, opt_out)
+            }
+            HostThunk::AudioCaptureClientGetBuffer => {
+                let data_out = guest_call_arg(state, memory, 1)?;
+                let frames_out = guest_call_arg(state, memory, 2)?;
+                let flags_out = guest_call_arg(state, memory, 3)?;
+                let device_position_out = guest_call_arg(state, memory, 4)?;
+                let qpc_out = guest_call_arg(state, memory, 5)?;
+                if data_out == 0 || frames_out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match capture_get_buffer(pid, this) {
+                        Ok(packet) => {
+                            let buffer = packet.buffer_address;
+                            let _ = write_guest_pointer(memory, data_out, buffer, self.guest_arch);
+                            write_u32(memory, frames_out, packet.frames);
+                            if flags_out != 0 {
+                                write_u32(memory, flags_out, packet.flags);
+                            }
+                            if device_position_out != 0 {
+                                write_u64(memory, device_position_out, packet.device_position);
+                            }
+                            if qpc_out != 0 {
+                                write_u64(memory, qpc_out, packet.qpc_position);
+                            }
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            HostThunk::AudioCaptureClientReleaseBuffer => {
+                let frames = guest_call_arg_u32(state, memory, 1)?;
+                let flags = guest_call_arg_u32(state, memory, 2).unwrap_or(0);
+                match capture_release_buffer(pid, this, frames, flags) {
+                    Ok(_) => ACTIVATION_S_OK,
+                    Err(hr) => hr,
+                }
+            }
+            HostThunk::AudioCaptureClientGetNextPacketSize => {
+                let out = guest_call_arg(state, memory, 1)?;
+                if out == 0 {
+                    AUDCLNT_E_POINTER
+                } else {
+                    match capture_next_packet_size(pid, this) {
+                        Ok(frames) => {
+                            write_u32(memory, out, frames);
+                            ACTIVATION_S_OK
+                        }
+                        Err(hr) => hr,
+                    }
+                }
+            }
+            _ => AUDCLNT_E_INVALIDARG,
+        };
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        Ok(())
+    }
 
     /// `IAudioClient2::IsOffloadCapable(category, pbOffloadCapable)`.
     fn dispatch_audio_client_is_offload_capable(
@@ -90289,6 +90818,42 @@ impl HostThunk {
             Self::AudioClientStart | Self::AudioClientStop | Self::AudioClientReset => 4,
             Self::AudioClientGetSharedModeEnginePeriod => 24,
             Self::AudioClientInitializeSharedAudioStream => 20,
+            // Audio service objects (IAudioClock/volume/session/capture).
+            Self::AudioServiceQueryInterface
+            | Self::AudioClockGetPosition
+            | Self::AudioSimpleVolumeSetMasterVolume
+            | Self::AudioSimpleVolumeSetMute
+            | Self::AudioStreamVolumeGetChannelVolume
+            | Self::AudioStreamVolumeGetAllVolumes
+            | Self::AudioSessionControlSetDisplayName
+            | Self::AudioSessionControlSetIconPath
+            | Self::AudioSessionControlSetGroupingParam
+            | Self::AudioCaptureClientReleaseBuffer => 12,
+            Self::AudioClockGetFrequency
+            | Self::AudioClockGetState
+            | Self::AudioSimpleVolumeGetMasterVolume
+            | Self::AudioSimpleVolumeGetMute
+            | Self::AudioStreamVolumeGetChannelCount
+            | Self::AudioSessionControlGetState
+            | Self::AudioSessionControlGetDisplayName
+            | Self::AudioSessionControlGetIconPath
+            | Self::AudioSessionControlGetGroupingParam
+            | Self::AudioSessionControlRegisterNotification
+            | Self::AudioSessionControlUnregisterNotification
+            | Self::AudioSessionControl2GetSessionIdentifier
+            | Self::AudioSessionControl2GetSessionInstanceIdentifier
+            | Self::AudioSessionControl2GetProcessId
+            | Self::AudioSessionControl2SetDuckingPreference
+            | Self::AudioCaptureClientGetNextPacketSize => 8,
+            Self::AudioStreamVolumeSetChannelVolume => 20,
+            Self::AudioStreamVolumeSetAllVolumes => 16,
+            Self::AudioSessionControl2IsSystemSoundsSession => 4,
+            Self::AudioCaptureClientGetBuffer => 24,
+            // XACT3: the factory takes (flags, out-engine); the guest-object
+            // vtable methods carry their stdcall argument byte count on the
+            // thunk itself (see `crate::xact`).
+            Self::Xact3CreateEngine | Self::Xact3CreateEngineWithFlags => 8,
+            Self::Xact3Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),
             _ => 0,
         }
     }
@@ -92857,6 +93422,29 @@ fn read_utf16z(memory: &MemoryImage, ptr: u64, max_chars: usize) -> AppResult<St
         count += 1;
     }
     Ok(String::from_utf16_lossy(&code_units))
+}
+
+/// Write a NUL-terminated UTF-16 string into a guest buffer with `capacity_chars`
+/// units.  Returns false (writing nothing) when the buffer cannot hold the
+/// string and its terminator, or when the pointer is null.
+fn write_utf16_buffer(
+    memory: &mut MemoryImage,
+    address: u64,
+    capacity_chars: usize,
+    value: &str,
+) -> bool {
+    if address == 0 || capacity_chars == 0 {
+        return false;
+    }
+    let units: Vec<u16> = value.encode_utf16().collect();
+    if units.len() + 1 > capacity_chars {
+        return false;
+    }
+    for (index, unit) in units.iter().enumerate() {
+        write_u16(memory, address + index as u64 * 2, *unit);
+    }
+    write_u16(memory, address + units.len() as u64 * 2, 0);
+    true
 }
 
 /// Read a null-terminated ANSI string from guest memory.
@@ -135593,7 +136181,7 @@ mod tests {
             let (mut runtime, _tmp) = test_runtime("evidence-mf-attrs");
             let mut memory = MemoryImage::default();
             let create_type: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaType);
-            let set_guid: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetGuid);
+            let _set_guid: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetGuid);
             let set_string: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetString);
             let get_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItem);
             let get_item_type: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItemType);
@@ -136124,8 +136712,9 @@ mod tests {
             assert_eq!(ret, 0);
             assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
 
-            // Two simultaneously eligible certificates: no single best
-            // candidate exists, so nothing is auto-selected.
+            // Two simultaneously eligible certificates: the best-match
+            // ordering (algorithm strength, then notAfter, then store order)
+            // claims a selection instead of cancelling.
             let first = build_test_cert_der(3, "First Eligible", -60, 86400 * 3650);
             let second = build_test_cert_der(4, "Second Eligible", -60, 86400 * 3650);
             let store_handle = runtime.cert_store_manager.open_store("SELECT_TEST_B");
@@ -136144,9 +136733,18 @@ mod tests {
                 select,
                 &[request as u32, selected_out as u32],
             );
-            assert_eq!(ret, 0, "an ambiguous pick must not claim a selection");
+            assert_eq!(ret, 1, "the best-match selection claims a certificate");
             assert_eq!(runtime.last_error, 0);
-            assert_eq!(read_u32(&memory, selected_out).unwrap(), 0);
+            let context = read_u32(&memory, selected_out).unwrap() as u64;
+            assert_ne!(context, 0);
+            let selected = runtime
+                .cert_contexts
+                .get(&context)
+                .expect("selected context");
+            assert!(
+                selected == &first || selected == &second,
+                "the selection is one of the eligible certificates"
+            );
 
             // Only expired certificates: none is selectable (cancel).
             let only_expired = build_test_cert_der(5, "Only Expired", -86400 * 400, -86400 * 10);

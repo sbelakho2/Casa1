@@ -600,6 +600,113 @@ pub struct Flags {
     pub of: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Lazy x86 flag materialisation
+// ---------------------------------------------------------------------------
+//
+// The interpreter used to compute the full x86 flag set eagerly after every
+// arithmetic instruction, even when the next instructions overwrote the flags
+// before ever reading them.  Instead, an ALU result is *parked* in
+// `CpuState::pending_flags`; the six flags are computed on the first read
+// (conditional branch, pushf, adc/sbb, ...) or when the block ends.  Parking
+// costs a few stores; evaluating costs a parity fold plus a handful of
+// comparisons, so chains of flag-dead ALU ops (the common case in compiled
+// guest code) get materially cheaper.
+
+/// Arithmetic operation whose flag set is parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlagOp {
+    Add,
+    Sub,
+    Logic,
+}
+
+/// A flag computation that has been deferred: the operands, width-masked
+/// result, and the operation that produced it.  `CpuState::flags` is stale
+/// while this is `Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingFlags {
+    lhs: u64,
+    rhs: u64,
+    result: u64,
+    op: FlagOp,
+    width_bits: u8,
+}
+
+impl PendingFlags {
+    #[inline]
+    fn evaluate(self) -> Flags {
+        match self.op {
+            FlagOp::Add => add_flags(self.lhs, self.rhs, self.result, self.width_bits as usize),
+            FlagOp::Sub => sub_flags(self.lhs, self.rhs, self.result, self.width_bits as usize),
+            FlagOp::Logic => logic_flags(self.result, self.width_bits as usize),
+        }
+    }
+}
+
+/// Per-execution lazy-flag counters, flushed to the global telemetry
+/// atomics once at the end of `execute_ir_with_hashing`.  Keeping the
+/// counters in plain locals keeps the hot path free of atomic operations.
+/// `deferred` is derived as `materialised + skipped` (every parked flag set
+/// is either computed later or discarded when overwritten), so parking a
+/// flag costs no counter update in the common case.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LazyFlagStats {
+    pub materialised: u64,
+    pub skipped: u64,
+}
+
+/// Number of ALU results whose flags were parked instead of computed eagerly.
+pub static LAZY_FLAGS_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of parked flag sets computed on demand (first flag read / block end).
+pub static LAZY_FLAGS_MATERIALISED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Number of parked flag sets discarded without computation because a later
+/// flag producer overwrote them first — the eager work that was skipped.
+pub static LAZY_FLAGS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the lazy-flag counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LazyFlagTelemetry {
+    pub deferred: u64,
+    pub materialised: u64,
+    pub skipped: u64,
+}
+
+/// Read the current lazy-flag materialisation counters.
+pub fn lazy_flag_telemetry() -> LazyFlagTelemetry {
+    use std::sync::atomic::Ordering;
+    LazyFlagTelemetry {
+        deferred: LAZY_FLAGS_DEFERRED.load(Ordering::Relaxed),
+        materialised: LAZY_FLAGS_MATERIALISED.load(Ordering::Relaxed),
+        skipped: LAZY_FLAGS_SKIPPED.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the lazy-flag materialisation counters (test/diagnostic helper).
+pub fn reset_lazy_flag_telemetry() {
+    use std::sync::atomic::Ordering;
+    LAZY_FLAGS_DEFERRED.store(0, Ordering::Relaxed);
+    LAZY_FLAGS_MATERIALISED.store(0, Ordering::Relaxed);
+    LAZY_FLAGS_SKIPPED.store(0, Ordering::Relaxed);
+}
+
+fn flush_lazy_flag_stats(stats: LazyFlagStats) {
+    use std::sync::atomic::Ordering;
+    // Every parked flag set is later materialised or discarded; the total is
+    // therefore derivable without touching a counter on the hot path.
+    let deferred = stats.materialised + stats.skipped;
+    if deferred != 0 {
+        LAZY_FLAGS_DEFERRED.fetch_add(deferred, Ordering::Relaxed);
+    }
+    if stats.materialised != 0 {
+        LAZY_FLAGS_MATERIALISED.fetch_add(stats.materialised, Ordering::Relaxed);
+    }
+    if stats.skipped != 0 {
+        LAZY_FLAGS_SKIPPED.fetch_add(stats.skipped, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct XmmValue {
     pub low: u64,
@@ -689,6 +796,12 @@ pub struct CpuState {
     /// `jit_pending_fault` is `Some`.
     #[serde(default)]
     pub jit_pending_fault_write: bool,
+    /// Deferred arithmetic flags (interpreter lazy-flag fast path).  While
+    /// `Some`, the arithmetic bits in `flags` are stale and are recomputed
+    /// from these operands on the first read.  Always `None` at API
+    /// boundaries — `execute_ir_with_hashing` materialises before returning.
+    #[serde(skip)]
+    pub(crate) pending_flags: Option<PendingFlags>,
 }
 
 impl CpuState {
@@ -718,6 +831,7 @@ impl CpuState {
             ssp: 0,
             jit_pending_fault: None,
             jit_pending_fault_write: false,
+            pending_flags: None,
         }
     }
 
@@ -821,6 +935,86 @@ impl CpuState {
     pub fn set_bnd(&mut self, index: u8, value: (u64, u64)) {
         self.bnd[index as usize & 0x3] = value;
     }
+
+    // ── Lazy flag materialisation ───────────────────────────────────────
+
+    /// Compute and install any parked arithmetic flags.  Cheap no-op when no
+    /// computation is pending (the common case for non-ALU instructions).
+    #[inline]
+    pub(crate) fn materialize_flags(&mut self, stats: &mut LazyFlagStats) {
+        if let Some(pending) = self.pending_flags.take() {
+            self.flags = pending.evaluate();
+            stats.materialised += 1;
+        }
+    }
+
+    /// Park the flags of an ADD result.  Overwriting an already-parked set
+    /// means its eager computation was skipped.
+    #[inline]
+    pub(crate) fn defer_add_flags(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        result: u64,
+        width_bits: usize,
+        stats: &mut LazyFlagStats,
+    ) {
+        stats.skipped += u64::from(self.pending_flags.is_some());
+        self.pending_flags = Some(PendingFlags {
+            lhs,
+            rhs,
+            result,
+            op: FlagOp::Add,
+            width_bits: width_bits as u8,
+        });
+    }
+
+    /// Park the flags of a SUB/CMP result.
+    #[inline]
+    pub(crate) fn defer_sub_flags(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        result: u64,
+        width_bits: usize,
+        stats: &mut LazyFlagStats,
+    ) {
+        stats.skipped += u64::from(self.pending_flags.is_some());
+        self.pending_flags = Some(PendingFlags {
+            lhs,
+            rhs,
+            result,
+            op: FlagOp::Sub,
+            width_bits: width_bits as u8,
+        });
+    }
+
+    /// Park the flags of a logic (AND/OR/XOR/TEST) result.
+    #[inline]
+    pub(crate) fn defer_logic_flags(
+        &mut self,
+        result: u64,
+        width_bits: usize,
+        stats: &mut LazyFlagStats,
+    ) {
+        stats.skipped += u64::from(self.pending_flags.is_some());
+        self.pending_flags = Some(PendingFlags {
+            lhs: 0,
+            rhs: 0,
+            result,
+            op: FlagOp::Logic,
+            width_bits: width_bits as u8,
+        });
+    }
+
+    /// Drop a parked flag computation because an instruction wrote
+    /// `state.flags` directly.  Counts as a skipped materialisation.
+    #[inline]
+    pub(crate) fn discard_pending_flags(&mut self, stats: &mut LazyFlagStats) {
+        if self.pending_flags.take().is_some() {
+            stats.skipped += 1;
+        }
+    }
 }
 
 const EFLAGS_CF: u64 = 1 << 0;
@@ -858,6 +1052,8 @@ fn pack_eflags(state: &CpuState) -> u64 {
 }
 
 fn unpack_eflags(state: &mut CpuState, value: u64) {
+    // The popped flags supersede any parked arithmetic computation.
+    state.pending_flags = None;
     state.flags.cf = value & EFLAGS_CF != 0;
     state.flags.pf = value & EFLAGS_PF != 0;
     state.flags.af = value & EFLAGS_AF != 0;
@@ -1494,6 +1690,35 @@ impl MemoryImage {
             return false;
         }
         target.copy_from_slice(&page.bytes[..]);
+        true
+    }
+
+    /// Signal-safe direct page copy: copies a fully-mapped 4 KiB guest page
+    /// straight into `dst` with no intermediate buffer, no allocation and no
+    /// error formatting, and returns `true`. Returns `false` (leaving `dst`
+    /// untouched) when the page is absent or not fully mapped.
+    ///
+    /// Designed for the SIGBUS page-sync handler, which must be
+    /// async-signal-safe and wants to avoid the double copy of
+    /// `read_page_signal_safe` + `sync_from_memory_image`: the lookup is a
+    /// page-table read and the copy is one `copy_nonoverlapping`.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for [`MEMORY_PAGE_SIZE`] bytes of writes.
+    pub unsafe fn copy_page_to_raw(&self, page_base: u64, dst: *mut u8) -> bool {
+        let Some(index) = self.page_index(page_base) else {
+            return false;
+        };
+        let page = &self.pages[index].1;
+        if !page.is_fully_mapped() {
+            return false;
+        }
+        // SAFETY: the caller guarantees `dst` is valid for MEMORY_PAGE_SIZE
+        // bytes; `page.bytes` is exactly that size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(page.bytes.as_ptr(), dst, MEMORY_PAGE_SIZE);
+        }
         true
     }
 
@@ -4976,7 +5201,162 @@ impl ExceptionDispatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hot-block decode cache
+// ---------------------------------------------------------------------------
+//
+// Guest blocks are decoded repeatedly (the guest executes the same basic
+// blocks thousands of times).  `decode_block` is a pure function of
+// `(bytes, start_address, arch)`, so its result is memoised for hot blocks.
+// The raw bytes are stored alongside the decoded sequence and compared
+// exactly, so a collision or a self-modifying-code update can never return a
+// stale decode: different bytes are a miss and replace the entry.
+
+/// Decoded-block cache hits (repeated decode of the same bytes/address/arch).
+pub static DECODE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decoded-block cache misses (first decode, or bytes changed).
+pub static DECODE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decoded-block cache entries evicted to stay within the capacity bound.
+pub static DECODE_CACHE_EVICTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the hot-block decode-cache counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeCacheTelemetry {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// Read the current hot-block decode-cache counters.
+pub fn decode_cache_telemetry() -> DecodeCacheTelemetry {
+    use std::sync::atomic::Ordering;
+    DecodeCacheTelemetry {
+        hits: DECODE_CACHE_HITS.load(Ordering::Relaxed),
+        misses: DECODE_CACHE_MISSES.load(Ordering::Relaxed),
+        evictions: DECODE_CACHE_EVICTIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the hot-block decode-cache counters (test/diagnostic helper).
+pub fn reset_decode_cache_telemetry() {
+    use std::sync::atomic::Ordering;
+    DECODE_CACHE_HITS.store(0, Ordering::Relaxed);
+    DECODE_CACHE_MISSES.store(0, Ordering::Relaxed);
+    DECODE_CACHE_EVICTIONS.store(0, Ordering::Relaxed);
+}
+
+/// Maximum number of decoded blocks retained.  Sized to hold the working set
+/// of a hot guest loop plus its callers without unbounded growth.
+const DECODE_CACHE_CAPACITY: usize = 1024;
+
+fn guest_arch_tag(arch: GuestArch) -> u8 {
+    match arch {
+        GuestArch::X64 => 0,
+        GuestArch::X86 => 1,
+    }
+}
+
+struct DecodeCacheEntry {
+    /// Exact source bytes; a mismatch invalidates the entry.
+    bytes: Box<[u8]>,
+    decoded: Arc<Vec<DecodedInstruction>>,
+    /// Monotonic last-use stamp for approximate-LRU eviction.
+    last_use: u64,
+}
+
+struct DecodeCache {
+    entries: HashMap<(u64, usize, u8), DecodeCacheEntry>,
+    clock: u64,
+}
+
+impl DecodeCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        address: u64,
+        len: usize,
+        arch_tag: u8,
+        bytes: &[u8],
+    ) -> Option<Arc<Vec<DecodedInstruction>>> {
+        let entry = self.entries.get_mut(&(address, len, arch_tag))?;
+        if entry.bytes.as_ref() != bytes {
+            return None;
+        }
+        self.clock += 1;
+        entry.last_use = self.clock;
+        Some(Arc::clone(&entry.decoded))
+    }
+
+    fn insert(
+        &mut self,
+        address: u64,
+        len: usize,
+        arch_tag: u8,
+        bytes: &[u8],
+        decoded: Arc<Vec<DecodedInstruction>>,
+    ) {
+        if self.entries.len() >= DECODE_CACHE_CAPACITY
+            && let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest_key);
+            DECODE_CACHE_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.clock += 1;
+        self.entries.insert(
+            (address, len, arch_tag),
+            DecodeCacheEntry {
+                bytes: bytes.to_vec().into_boxed_slice(),
+                decoded,
+                last_use: self.clock,
+            },
+        );
+    }
+}
+
+static DECODE_CACHE: std::sync::LazyLock<Mutex<DecodeCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(DecodeCache::new()));
+
 pub fn decode_block(
+    bytes: &[u8],
+    start_address: u64,
+    arch: GuestArch,
+) -> AppResult<Vec<DecodedInstruction>> {
+    use std::sync::atomic::Ordering;
+
+    // Hot path: exact-bytes memoised decode.
+    if let Ok(mut cache) = DECODE_CACHE.lock() {
+        if let Some(decoded) = cache.get(start_address, bytes.len(), guest_arch_tag(arch), bytes) {
+            DECODE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok((*decoded).clone());
+        }
+    }
+    DECODE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+    let decoded = decode_block_uncached(bytes, start_address, arch)?;
+    if let Ok(mut cache) = DECODE_CACHE.lock() {
+        cache.insert(
+            start_address,
+            bytes.len(),
+            guest_arch_tag(arch),
+            bytes,
+            Arc::new(decoded.clone()),
+        );
+    }
+    Ok(decoded)
+}
+
+fn decode_block_uncached(
     bytes: &[u8],
     start_address: u64,
     arch: GuestArch,
@@ -18566,10 +18946,32 @@ pub fn execute_ir_with_hashing(
     _capture_memory_hash: bool,
     port_bus: Option<&Mutex<dyn IoPortBus + Send + Sync>>,
 ) -> AppResult<ExecutionSummary> {
+    let mut lazy_stats = LazyFlagStats::default();
+    let result = execute_ir_inner(state, memory, ir, virtualization, port_bus, &mut lazy_stats);
+    // Parked arithmetic flags must be visible to the caller (summary,
+    // snapshots, the JIT dispatcher) even when execution failed mid-block.
+    state.materialize_flags(&mut lazy_stats);
+    flush_lazy_flag_stats(lazy_stats);
+    result.map(|()| ExecutionSummary {
+        flags: state.flags,
+        memory_hash: String::new(),
+        ordering_log: Vec::new(),
+    })
+}
+
+fn execute_ir_inner(
+    state: &mut CpuState,
+    memory: &mut MemoryImage,
+    ir: &[IrInstruction],
+    virtualization: Option<&CpuVirtualization>,
+    port_bus: Option<&Mutex<dyn IoPortBus + Send + Sync>>,
+    lazy_stats: &mut LazyFlagStats,
+) -> AppResult<()> {
     // HOT PATH executor: handles only the ~30 most common IR variants inline.
     // Rare instructions fall through to execute_cold_path.  This split lets
     // rustc compile the hot match as a small, efficient jump table instead of
-    // a 5000-line binary search.
+    // a 5000-line binary search.  Arithmetic flags are parked (lazy) and
+    // materialised on first read — see `PendingFlags`.
     for instruction in ir {
         match instruction {
             IrInstruction::Nop => {}
@@ -18597,7 +18999,7 @@ pub fn execute_ir_with_hashing(
                 let rhs = *value & mask;
                 let result = lhs.wrapping_add(rhs) & mask;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = add_flags(lhs, rhs, result, *width * 8);
+                state.defer_add_flags(lhs, rhs, result, *width * 8, lazy_stats);
             }
             IrInstruction::SubImm { dst, value, width } => {
                 let mask = width_mask(*width);
@@ -18605,28 +19007,28 @@ pub fn execute_ir_with_hashing(
                 let rhs = *value & mask;
                 let result = lhs.wrapping_sub(rhs) & mask;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = sub_flags(lhs, rhs, result, *width * 8);
+                state.defer_sub_flags(lhs, rhs, result, *width * 8, lazy_stats);
             }
             IrInstruction::AndImm { dst, value, width } => {
                 let mask = width_mask(*width);
                 let lhs = state.get(*dst) & mask;
                 let result = lhs & (*value & mask);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::OrImm { dst, value, width } => {
                 let mask = width_mask(*width);
                 let lhs = state.get(*dst) & mask;
                 let result = lhs | (*value & mask);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::XorImm { dst, value, width } => {
                 let mask = width_mask(*width);
                 let lhs = state.get(*dst) & mask;
                 let result = lhs ^ (*value & mask);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::XorReg { dst, src, width } => {
                 let mask = width_mask(*width);
@@ -18645,27 +19047,28 @@ pub fn execute_ir_with_hashing(
                     }
                 };
                 state.set(*dst, next);
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::AndReg { dst, src, width } => {
                 let lhs = state.get(*dst) & width_mask(*width);
                 let rhs = read_compare_operand(state, memory, src, *width)? & width_mask(*width);
                 let result = (lhs & rhs) & width_mask(*width);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::OrReg { dst, src, width } => {
                 let lhs = state.get(*dst) & width_mask(*width);
                 let rhs = read_compare_operand(state, memory, src, *width)? & width_mask(*width);
                 let result = (lhs | rhs) & width_mask(*width);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
-                state.flags = logic_flags(result, *width * 8);
+                state.defer_logic_flags(result, *width * 8, lazy_stats);
             }
             IrInstruction::Compare {
                 lhs: _,
                 rhs: _,
                 width: _,
             } => {
+                state.materialize_flags(lazy_stats);
                 execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
             IrInstruction::Test {
@@ -18673,6 +19076,7 @@ pub fn execute_ir_with_hashing(
                 rhs: _,
                 width: _,
             } => {
+                state.materialize_flags(lazy_stats);
                 execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
             IrInstruction::ShlImm { dst, count, width } => {
@@ -18684,6 +19088,9 @@ pub fn execute_ir_with_hashing(
                     let result = (lhs << shift) & mask;
                     let sign_bit = 1_u64 << (bits - 1);
                     state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                    // The shift defines its own flag set; any parked
+                    // arithmetic flags are overwritten (skipped).
+                    state.discard_pending_flags(lazy_stats);
                     state.flags = Flags {
                         cf: ((lhs >> (bits - shift)) & 1) != 0,
                         pf: parity(result as u8),
@@ -18703,6 +19110,7 @@ pub fn execute_ir_with_hashing(
                     let result = lhs >> shift;
                     let sign_bit = 1_u64 << (bits - 1);
                     state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                    state.discard_pending_flags(lazy_stats);
                     state.flags = Flags {
                         cf: ((lhs >> (shift - 1)) & 1) != 0,
                         pf: parity(result as u8),
@@ -18772,11 +19180,14 @@ pub fn execute_ir_with_hashing(
             IrInstruction::PushFlags { width } => {
                 let sp = state.get(Register::Rsp).wrapping_sub(*width as u64);
                 state.set(Register::Rsp, sp);
+                state.materialize_flags(lazy_stats);
                 write_memory_value(memory, sp, pack_eflags(state), *width)?;
             }
             IrInstruction::PopFlags { width } => {
                 let sp = state.get(Register::Rsp);
                 let value = read_memory_value(memory, sp, *width)?;
+                // The popped value replaces every arithmetic flag.
+                state.discard_pending_flags(lazy_stats);
                 unpack_eflags(state, value);
                 state.set(Register::Rsp, sp.wrapping_add(*width as u64));
             }
@@ -18805,6 +19216,9 @@ pub fn execute_ir_with_hashing(
                 target,
                 fallthrough,
             } => {
+                // The condition is the first flag consumer; compute any
+                // parked arithmetic flags now.
+                state.materialize_flags(lazy_stats);
                 let taken = evaluate_condition(*condition, &state.flags);
                 state.rip = if taken { *target } else { *fallthrough };
             }
@@ -18830,15 +19244,14 @@ pub fn execute_ir_with_hashing(
             }
             // Everything else goes to the cold path
             _ => {
+                // The cold path reads/writes `state.flags` directly; make any
+                // parked arithmetic flags visible before it runs.
+                state.materialize_flags(lazy_stats);
                 execute_cold_path(state, memory, instruction, virtualization, port_bus)?;
             }
         }
     }
-    Ok(ExecutionSummary {
-        flags: state.flags,
-        memory_hash: String::new(),
-        ordering_log: Vec::new(),
-    })
+    Ok(())
 }
 
 #[inline(never)]
@@ -39445,5 +39858,313 @@ mod tests {
         state.flags.cf = true;
         execute_ir(&mut state, &mut memory, &ir).expect("execute SBB eax, 5");
         assert_eq!(state.get(Register::Rax), 94);
+    }
+
+    // ── Hot-block decode cache ──────────────────────────────────────────
+
+    /// A repeated decode of identical bytes at the same address must be
+    /// served from the hot-block cache; changed bytes at the same address
+    /// must miss and re-decode (no stale result can ever be returned).
+    #[test]
+    fn decode_cache_repeated_block_decode_hits_and_changed_bytes_miss() {
+        let arch = GuestArch::X64;
+        // Address reserved for this test so other tests cannot alias it.
+        let address = 0xDEAD_0000u64;
+        // MOV EAX, imm32 + MOV EBX, imm32 + ADD EAX, EBX, repeated.
+        let mut code = Vec::new();
+        for i in 0..32u32 {
+            code.push(0xB8);
+            code.extend_from_slice(&i.to_le_bytes());
+            code.push(0xBB);
+            code.extend_from_slice(&(i + 1).to_le_bytes());
+            code.extend_from_slice(&[0x01, 0xD8]);
+        }
+
+        let before = decode_cache_telemetry();
+        let first = decode_block(&code, address, arch).expect("first decode");
+        let after_first = decode_cache_telemetry();
+        assert!(
+            after_first.misses > before.misses,
+            "the first decode of these bytes must be a miss"
+        );
+
+        let second = decode_block(&code, address, arch).expect("second decode");
+        let after_second = decode_cache_telemetry();
+        assert_eq!(first, second, "cached decode must be byte-identical");
+        assert!(
+            after_second.hits > after_first.hits,
+            "the repeated decode must be a cache hit"
+        );
+
+        // Self-modifying code: same address, different bytes must not reuse
+        // the old decode.
+        let mut changed = code.clone();
+        changed[0] = 0x90;
+        changed[1] = 0x90;
+        let redecoded = decode_block(&changed, address, arch).expect("decode changed bytes");
+        assert_eq!(
+            redecoded[0].size, 1,
+            "changed bytes must be re-decoded (0x90 is a one-byte NOP)"
+        );
+    }
+
+    /// Direct cache-behaviour test: exact-bytes lookup, byte-mismatch miss,
+    /// and capacity eviction.
+    #[test]
+    fn decode_cache_direct_hit_miss_and_capacity_eviction() {
+        let bytes = [0x90u8; 8];
+        let decoded =
+            Arc::new(decode_block_uncached(&bytes, 0x1000, GuestArch::X64).expect("decode"));
+
+        let mut cache = DecodeCache::new();
+        cache.insert(0x1000, bytes.len(), 0, &bytes, Arc::clone(&decoded));
+        assert!(
+            cache.get(0x1000, bytes.len(), 0, &bytes).is_some(),
+            "identical bytes must hit"
+        );
+        assert!(
+            cache.get(0x1000, bytes.len(), 0, &[0xCC; 8]).is_none(),
+            "different bytes at the same address must miss"
+        );
+        assert!(
+            cache.get(0x2000, bytes.len(), 0, &bytes).is_none(),
+            "different address must miss"
+        );
+
+        let evictions_before = decode_cache_telemetry().evictions;
+        for index in 0..(DECODE_CACHE_CAPACITY as u64 + 4) {
+            cache.insert(0x20_0000 + index, 1, 0, &[0x90], Arc::clone(&decoded));
+        }
+        assert!(
+            decode_cache_telemetry().evictions > evictions_before,
+            "exceeding capacity must evict entries"
+        );
+    }
+
+    // ── Lazy x86 flag materialisation ───────────────────────────────────
+
+    /// Parked arithmetic flags must evaluate to exactly the eager helper
+    /// result for every hot ALU op and width.
+    #[test]
+    fn lazy_flags_match_eager_helpers_for_hot_alu() {
+        let cases: &[(u64, u64)] = &[
+            (0, 0),
+            (1, 0),
+            (0x7f, 1),
+            (0x80, 0x80),
+            (0x8000_0000, 0x8000_0000),
+            (0xffff_ffff_ffff_ffff, 1),
+            (0xdead_beef_cafe_f00d, 0x0123_4567_89ab_cdef),
+        ];
+        for width in [1usize, 2, 4, 8] {
+            let mask = width_mask(width);
+            for &(lhs, rhs) in cases {
+                let (a, b) = (lhs & mask, rhs & mask);
+
+                // Add
+                let mut state = CpuState::new(GuestArch::X64);
+                let mut memory = MemoryImage::default();
+                state.set(Register::Rax, a);
+                execute_ir(
+                    &mut state,
+                    &mut memory,
+                    &[IrInstruction::AddImm {
+                        dst: Register::Rax,
+                        value: b,
+                        width,
+                    }],
+                )
+                .expect("execute add");
+                assert_eq!(
+                    state.flags,
+                    add_flags(a, b, a.wrapping_add(b) & mask, width * 8),
+                    "lazy ADD flags w={width} {a:#x}+{b:#x}"
+                );
+                assert!(
+                    state.pending_flags.is_none(),
+                    "block boundary must materialise parked flags"
+                );
+
+                // Sub
+                let mut state = CpuState::new(GuestArch::X64);
+                let mut memory = MemoryImage::default();
+                state.set(Register::Rax, a);
+                execute_ir(
+                    &mut state,
+                    &mut memory,
+                    &[IrInstruction::SubImm {
+                        dst: Register::Rax,
+                        value: b,
+                        width,
+                    }],
+                )
+                .expect("execute sub");
+                assert_eq!(
+                    state.flags,
+                    sub_flags(a, b, a.wrapping_sub(b) & mask, width * 8),
+                    "lazy SUB flags w={width} {a:#x}-{b:#x}"
+                );
+
+                // Logic (AND)
+                let mut state = CpuState::new(GuestArch::X64);
+                let mut memory = MemoryImage::default();
+                state.set(Register::Rax, a);
+                execute_ir(
+                    &mut state,
+                    &mut memory,
+                    &[IrInstruction::AndImm {
+                        dst: Register::Rax,
+                        value: b,
+                        width,
+                    }],
+                )
+                .expect("execute and");
+                assert_eq!(
+                    state.flags,
+                    logic_flags(a & b, width * 8),
+                    "lazy AND flags w={width} {a:#x}&{b:#x}"
+                );
+
+                // Logic (XOR)
+                let mut state = CpuState::new(GuestArch::X64);
+                let mut memory = MemoryImage::default();
+                state.set(Register::Rax, a);
+                execute_ir(
+                    &mut state,
+                    &mut memory,
+                    &[IrInstruction::XorImm {
+                        dst: Register::Rax,
+                        value: b,
+                        width,
+                    }],
+                )
+                .expect("execute xor");
+                assert_eq!(
+                    state.flags,
+                    logic_flags((a ^ b) & mask, width * 8),
+                    "lazy XOR flags w={width} {a:#x}^{b:#x}"
+                );
+            }
+        }
+    }
+
+    /// A chain of ALU ops with no intervening flag reader must park every
+    /// flag set and materialise only the last one — the eager computations
+    /// for the earlier ops are counted as skipped.
+    #[test]
+    fn lazy_flags_skip_dead_materialisation() {
+        let before = lazy_flag_telemetry();
+
+        let ir: Vec<IrInstruction> = (0..16u64)
+            .map(|i| IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: i + 1,
+                width: 8,
+            })
+            .collect();
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        execute_ir(&mut state, &mut memory, &ir).expect("execute add chain");
+
+        let after = lazy_flag_telemetry();
+        let deferred = after.deferred.saturating_sub(before.deferred);
+        let skipped = after.skipped.saturating_sub(before.skipped);
+        let materialised = after.materialised.saturating_sub(before.materialised);
+        assert!(deferred >= 16, "every ADD must park its flags");
+        assert!(
+            skipped >= 15,
+            "all but the last ADD's eager flag computation must be skipped (got {skipped})"
+        );
+        assert!(materialised >= 1, "the final flag set must materialise");
+        assert_eq!(state.get(Register::Rax), (1..=16u64).sum::<u64>());
+    }
+
+    /// A conditional branch is a flag consumer: it must materialise the
+    /// parked flags before evaluating the condition.
+    #[test]
+    fn lazy_flags_materialise_before_conditional_branch() {
+        // 0 + 1 = 1 → ZF=0 → NotEqual is taken.
+        let ir = vec![
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: 0x2000,
+                fallthrough: 0x3000,
+            },
+        ];
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        execute_ir(&mut state, &mut memory, &ir).expect("execute");
+        assert_eq!(state.rip, 0x2000, "ZF=0 must take NotEqual");
+
+        // u64::MAX + 1 wraps to 0 → ZF=1 → NotEqual is not taken.
+        let ir = vec![
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::JumpIf {
+                condition: ConditionCode::NotEqual,
+                target: 0x2000,
+                fallthrough: 0x3000,
+            },
+        ];
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rax, u64::MAX);
+        let mut memory = MemoryImage::default();
+        execute_ir(&mut state, &mut memory, &ir).expect("execute");
+        assert_eq!(state.rip, 0x3000, "ZF=1 must fall through NotEqual");
+    }
+
+    /// PUSHF is a flag consumer: the pushed EFLAGS image must contain the
+    /// parked CF/ZF from the preceding ALU op.
+    #[test]
+    fn lazy_flags_materialise_before_pushf() {
+        let ir = vec![
+            IrInstruction::AddImm {
+                dst: Register::Rax,
+                value: 1,
+                width: 8,
+            },
+            IrInstruction::PushFlags { width: 8 },
+        ];
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x6000, &[0u8; 0x1000]);
+        state.set(Register::Rsp, 0x6800);
+        state.set(Register::Rax, u64::MAX);
+        execute_ir(&mut state, &mut memory, &ir).expect("execute");
+        let pushed = memory.read_u64(0x67f8).expect("read pushed eflags");
+        assert_ne!(pushed & EFLAGS_CF, 0, "wrapped ADD must set carry");
+        assert_ne!(pushed & EFLAGS_ZF, 0, "zero result must set zero flag");
+    }
+
+    /// The SIGBUS page-sync handler copies pages straight from the
+    /// `MemoryImage` into the flat mirror with this primitive: a fully-mapped
+    /// page must copy byte-for-byte, and absent / partially-mapped pages must
+    /// be rejected (so the caller can prefault-only instead of copying junk).
+    #[test]
+    fn copy_page_to_raw_copies_fully_mapped_page_and_rejects_partial() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x4000, &[0xCD; 4096]);
+
+        let mut dst = [0u8; 4096];
+        assert!(unsafe { memory.copy_page_to_raw(0x4000, dst.as_mut_ptr()) });
+        assert_eq!(dst[0], 0xCD);
+        assert_eq!(dst[2048], 0xCD);
+        assert_eq!(dst[4095], 0xCD);
+
+        // A partially-mapped page must be rejected.
+        let mut partial = MemoryImage::default();
+        partial.map_bytes(0x5000, &[0x11; 16]);
+        assert!(!unsafe { partial.copy_page_to_raw(0x5000, dst.as_mut_ptr()) });
+
+        // An absent page must be rejected.
+        assert!(!unsafe { memory.copy_page_to_raw(0x9000, dst.as_mut_ptr()) });
     }
 }

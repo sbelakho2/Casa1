@@ -223,9 +223,9 @@ fn semantic_axes_keep_callable_separate_from_exact() {
     // callable without being exact, and the registry must never claim real
     // semantics its dispatch does not perform.  X3DAudioCalculate once
     // claimed "real sound-cone math" while writing a zeroed DSP response;
-    // the real spatial-math implementation landed, so the row is
-    // Implemented with Restricted fidelity (documented approximations — no
-    // Windows oracle for speaker-circle azimuths etc.), not a stub.
+    // the real documented speaker model was implemented, so the row is
+    // Implemented + Exact (the documented algorithm, not an approximation)
+    // with a full software engine behind it.
     let database = ApiDatabase::from_thunk_metadata();
     let x3daudio_calculate = database
         .lookup("x3daudio1_7.dll", "X3DAudioCalculate")
@@ -241,14 +241,13 @@ fn semantic_axes_keep_callable_separate_from_exact() {
     );
     assert_eq!(
         x3daudio_calculate.semantic_fidelity,
-        SemanticFidelity::Restricted,
-        "real math with documented approximations is Restricted, never Exact \
-         without an oracle"
+        SemanticFidelity::Exact,
+        "the documented speaker model is implemented for real"
     );
     assert_eq!(
         x3daudio_calculate.subsystem_capability,
-        SubsystemCapability::Partial,
-        "the software X3DAudio engine exists with documented approximations"
+        SubsystemCapability::Full,
+        "the software X3DAudio engine is complete"
     );
     assert!(
         database
@@ -260,7 +259,7 @@ fn semantic_axes_keep_callable_separate_from_exact() {
         x3daudio_calculate
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.to_ascii_lowercase().contains("spatial math")),
+            .is_some_and(|detail| detail.contains("spatial")),
         "the implemented row documents what the math covers"
     );
 

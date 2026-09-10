@@ -59,6 +59,20 @@ const WIC_TRANSFORM_ROTATE_270: u32 = 3;
 const WIC_TRANSFORM_FLIP_HORIZONTAL: u32 = 4;
 const WIC_TRANSFORM_FLIP_VERTICAL: u32 = 8;
 
+// The WICBitmapPaletteType values the predefined-palette initializer
+// supports (the fixed grayscale and black/white tables).
+const WIC_PALETTE_TYPE_CUSTOM: u32 = 0;
+const WIC_PALETTE_TYPE_OPTIMAL: u32 = 1;
+const WIC_PALETTE_TYPE_FIXED_BW: u32 = 2;
+const WIC_PALETTE_TYPE_FIXED_GRAY4: u32 = 11;
+const WIC_PALETTE_TYPE_FIXED_GRAY16: u32 = 12;
+const WIC_PALETTE_TYPE_FIXED_GRAY256: u32 = 13;
+/// The maximum WIC palette size in colors.
+const WIC_PALETTE_MAX_COLORS: u32 = 256;
+
+/// The default bitmap resolution the runtime reports when none was set.
+const WIC_DEFAULT_DPI: f64 = 96.0;
+
 const WIC_GUID_FORMAT_EXIF: [u8; 16] = [
     0x7e, 0xd9, 0x4a, 0x1c, 0x73, 0x2b, 0x3a, 0x4b, 0x92, 0x38, 0x02, 0x65, 0xd4, 0x43, 0xa6, 0x5c,
 ];
@@ -83,7 +97,7 @@ enum PixelLayout {
 }
 
 fn pixel_layout(guid: &[u8; 16]) -> Option<PixelLayout> {
-    if guid == &GUID_PIXEL_FORMAT_32BPP_BGRA || guid == &GUID_PIXEL_FORMAT_DONT_CARE {
+    if guid == &GUID_PIXEL_FORMAT_32BPP_BGRA {
         Some(PixelLayout::Bgra)
     } else if guid == &GUID_PIXEL_FORMAT_32BPP_PBGRA {
         Some(PixelLayout::Pbgra)
@@ -286,9 +300,9 @@ impl PeHostRuntime {
             HostThunk::WicPaletteGetType => self.wic_palette_get_type(state, memory),
             HostThunk::WicPaletteGetColorCount => self.wic_palette_get_color_count(state, memory),
             HostThunk::WicPaletteGetColors => self.wic_palette_get_colors(state, memory),
-            HostThunk::WicPaletteIsBlackWhite
-            | HostThunk::WicPaletteIsGrayscale
-            | HostThunk::WicPaletteHasAlpha => self.wic_palette_flag_zero(state, memory),
+            HostThunk::WicPaletteIsBlackWhite => self.wic_palette_flag(state, memory, 0),
+            HostThunk::WicPaletteIsGrayscale => self.wic_palette_flag(state, memory, 1),
+            HostThunk::WicPaletteHasAlpha => self.wic_palette_flag(state, memory, 2),
             HostThunk::WicStreamInitializeFromIStream => {
                 self.wic_stream_initialize_from_i_stream(state, memory)
             }
@@ -1055,14 +1069,20 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
         let dpi_x = guest_call_arg(state, memory, 1)?;
         let dpi_y = guest_call_arg(state, memory, 2)?;
+        let (x, y) = self
+            .wic
+            .objects
+            .get(&this)
+            .map(|object| wic_source_resolution(&self.wic.objects, object))
+            .unwrap_or((WIC_DEFAULT_DPI, WIC_DEFAULT_DPI));
         if dpi_x != 0 {
-            write_guest_f64(memory, dpi_x, 96.0).ok();
+            write_guest_f64(memory, dpi_x, x).ok();
         }
         if dpi_y != 0 {
-            write_guest_f64(memory, dpi_y, 96.0).ok();
+            write_guest_f64(memory, dpi_y, y).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1073,20 +1093,27 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
         let palette = guest_call_arg(state, memory, 1)?;
-        let Some(target) = self.wic.objects.get(&palette).cloned() else {
+        let Some(source) = self.wic.objects.get(&this).cloned() else {
+            state.set(Register::Rax, 0x8007_0057);
+            return Ok(());
+        };
+        let Some(target) = self.wic.objects.get(&palette) else {
             state.set(Register::Rax, 0x8007_0057);
             return Ok(());
         };
         if target.kind != WicObjectKind::Palette {
-            state.set(Register::Rax, u64::from(WIC_E_NOTSUPPORTED));
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        // Sources without indexed formats copy an empty palette.
+        // The source's palette (empty for the non-indexed software bitmaps;
+        // set for the objects that carry one).
+        let colors = source.palette.clone();
+        let premultiplied = source.palette_premultiplied;
         if let Some(slot) = self.wic.objects.get_mut(&palette) {
-            slot.palette = Vec::new();
-            slot.palette_premultiplied = false;
+            slot.palette = colors;
+            slot.palette_premultiplied = premultiplied;
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1131,9 +1158,25 @@ impl PeHostRuntime {
             ),
             None => (0, 0, source_width, source_height),
         };
+        // The requested rectangle must be inside the source: WIC rejects an
+        // out-of-bounds or empty rectangle rather than clipping it.
+        if w == 0 || h == 0 || x >= source_width || y >= source_height {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if x.saturating_add(w) > source_width || y.saturating_add(h) > source_height {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
         let source_pixels = wic_copy_source_pixels(&self.wic.objects, &source, x, y, w, h);
         let layout = pixel_layout(&source.pixel_format);
         let bytes = layout.map(layout_bytes).unwrap_or(0);
+        if bytes == 0
+            || source_pixels.len() < (w as usize).saturating_mul(h as usize * bytes as usize)
+        {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        }
         if stride < w * bytes {
             state.set(Register::Rax, 0x8007_0057);
             return Ok(());
@@ -1174,9 +1217,28 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        let _palette = guest_call_arg(state, memory, 1)?;
-        state.set(Register::Rax, u64::from(S_OK));
+        let this = guest_call_arg(state, memory, 0)?;
+        let palette = guest_call_arg(state, memory, 1)?;
+        let Some(bitmap) = self.wic.objects.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if bitmap.kind != WicObjectKind::Bitmap {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        }
+        let Some(target) = self.wic.objects.get(&palette) else {
+            state.set(Register::Rax, 0x8007_0057);
+            return Ok(());
+        };
+        if target.kind != WicObjectKind::Palette {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        // A palette can only be set on an indexed bitmap; every pixel format
+        // the runtime creates is non-indexed, so the documented answer is the
+        // unsupported-pixel-format error rather than a silent accept.
+        state.set(Register::Rax, u64::from(WIC_E_UNSUPPORTEDPIXELFORMAT));
         Ok(())
     }
 
@@ -1185,9 +1247,22 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        let _dpi_x = guest_call_arg_f64(state, memory, 1)?;
-        let _dpi_y = guest_call_arg_f64(state, memory, 2)?;
+        let this = guest_call_arg(state, memory, 0)?;
+        let dpi_x = guest_call_arg_f64(state, memory, 1)?;
+        let dpi_y = guest_call_arg_f64(state, memory, 2)?;
+        if !dpi_x.is_finite() || !dpi_y.is_finite() || dpi_x <= 0.0 || dpi_y <= 0.0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(bitmap) = self.wic.objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if bitmap.kind != WicObjectKind::Bitmap {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        }
+        bitmap.profile = wic_encode_dpi(dpi_x, dpi_y);
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1424,16 +1499,29 @@ impl PeHostRuntime {
         let this = guest_call_arg(state, memory, 0)?;
         let colors = guest_call_arg(state, memory, 1)?;
         let count = guest_call_arg_u32(state, memory, 2)?;
+        if colors == 0 || count == 0 || count > WIC_PALETTE_MAX_COLORS {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
         let mut palette = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            if let Ok(color) = read_guest_u32(memory, colors + (i as u64 * 4)) {
-                palette.push(color);
-            }
+            let Ok(color) = read_guest_u32(memory, colors + (i as u64 * 4)) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            palette.push(color);
         }
-        if let Some(target) = self.wic.objects.get_mut(&this) {
-            target.palette = palette;
-            target.palette_premultiplied = false;
+        let Some(target) = self.wic.objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if target.kind != WicObjectKind::Palette {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
         }
+        target.palette = palette;
+        target.palette_premultiplied = false;
+        target.exif_color_space = WIC_PALETTE_TYPE_CUSTOM;
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1445,17 +1533,30 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let source = guest_call_arg(state, memory, 1)?;
-        let _count = guest_call_arg_u32(state, memory, 2)?;
+        let count = guest_call_arg_u32(state, memory, 2)?;
         let _alpha = guest_call_arg_u32(state, memory, 3)?;
         let Some(source_state) = self.wic.objects.get(&source).cloned() else {
             state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
             return Ok(());
         };
         let colors = wic_collect_palette(&source_state);
-        if let Some(target) = self.wic.objects.get_mut(&this) {
-            target.palette = colors;
-            target.palette_premultiplied = false;
+        let Some(target) = self.wic.objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if target.kind != WicObjectKind::Palette {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
         }
+        target.palette = colors;
+        target.palette_premultiplied = false;
+        // A zero color count asks for an optimal palette; otherwise the
+        // generated table is a custom one.
+        target.exif_color_space = if count == 0 {
+            WIC_PALETTE_TYPE_OPTIMAL
+        } else {
+            WIC_PALETTE_TYPE_CUSTOM
+        };
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1583,10 +1684,48 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        let _type = guest_call_arg_u32(state, memory, 1)?;
-        let _alpha = guest_call_arg_u32(state, memory, 2)?;
-        state.set(Register::Rax, u64::from(WIC_E_NOTSUPPORTED));
+        let this = guest_call_arg(state, memory, 0)?;
+        let palette_type = guest_call_arg_u32(state, memory, 1)?;
+        let add_transparent = guest_call_arg_u32(state, memory, 2)?;
+        let colors = match palette_type {
+            WIC_PALETTE_TYPE_FIXED_BW => vec![0xff00_0000, 0xffff_ffff],
+            WIC_PALETTE_TYPE_FIXED_GRAY4 => (0..4_u32)
+                .map(|step| {
+                    let value = step * 85;
+                    0xff00_0000 | (value << 16) | (value << 8) | value
+                })
+                .collect(),
+            WIC_PALETTE_TYPE_FIXED_GRAY16 => (0..16_u32)
+                .map(|step| {
+                    let value = step * 17;
+                    0xff00_0000 | (value << 16) | (value << 8) | value
+                })
+                .collect(),
+            WIC_PALETTE_TYPE_FIXED_GRAY256 => (0..256_u32)
+                .map(|value| 0xff00_0000 | (value << 16) | (value << 8) | value)
+                .collect(),
+            _ => {
+                // The halftone/median-cut predefined tables are not provided.
+                state.set(Register::Rax, u64::from(WIC_E_NOTSUPPORTED));
+                return Ok(());
+            }
+        };
+        let Some(target) = self.wic.objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if target.kind != WicObjectKind::Palette {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        }
+        target.palette = colors;
+        target.palette_premultiplied = false;
+        if add_transparent != 0 {
+            // The documented transparent entry (alpha 0).
+            target.palette.push(0x0000_0000);
+        }
+        target.exif_color_space = palette_type;
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -1601,10 +1740,17 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         };
-        if let Some(target) = self.wic.objects.get_mut(&this) {
-            target.palette = other.palette.clone();
-            target.palette_premultiplied = other.palette_premultiplied;
+        let Some(target) = self.wic.objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
+        };
+        if target.kind != WicObjectKind::Palette {
+            state.set(Register::Rax, u64::from(WIC_E_INVALIDSTATE));
+            return Ok(());
         }
+        target.palette = other.palette.clone();
+        target.palette_premultiplied = other.palette_premultiplied;
+        target.exif_color_space = other.exif_color_space;
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1614,24 +1760,55 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
+        let palette_type = self
+            .wic
+            .objects
+            .get(&this)
+            .map(|object| object.exif_color_space)
+            .unwrap_or(WIC_PALETTE_TYPE_CUSTOM);
         if out != 0 {
-            write_guest_u32(memory, out, 0).ok();
+            write_guest_u32(memory, out, palette_type).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
-    fn wic_palette_flag_zero(
+    /// `IWICPalette::IsBlackWhite` / `IsGrayscale` / `HasAlpha` — computed
+    /// from the palette's ARGB entries.
+    fn wic_palette_flag(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
+        which: u32,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
+        let this = guest_call_arg(state, memory, 0)?;
         let out = guest_call_arg(state, memory, 1)?;
+        let colors = self
+            .wic
+            .objects
+            .get(&this)
+            .map(|object| object.palette.as_slice())
+            .unwrap_or(&[]);
+        let flag = if colors.is_empty() {
+            false
+        } else {
+            match which {
+                0 => colors.iter().all(|c| {
+                    let r = (c >> 16) as u8;
+                    let g = (c >> 8) as u8;
+                    let b = *c as u8;
+                    (r == 0 || r == 255) && r == g && g == b
+                }),
+                1 => colors.iter().all(|c| {
+                    ((c >> 16) as u8) == ((c >> 8) as u8) && ((c >> 8) as u8) == (*c as u8)
+                }),
+                _ => colors.iter().any(|c| (c >> 24) as u8 != 0xff),
+            }
+        };
         if out != 0 {
-            write_guest_u32(memory, out, 0).ok();
+            write_guest_u32(memory, out, if flag { 1 } else { 0 }).ok();
         }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1995,7 +2172,7 @@ fn wic_copy_source_pixels(
     let bytes = layout_bytes(layout);
     let mut out = Vec::with_capacity((w * h * bytes) as usize);
     match source.kind {
-        WicObjectKind::Bitmap | WicObjectKind::FormatConverter => {
+        WicObjectKind::Bitmap => {
             for row in 0..h as usize {
                 let src_y = y as usize + row;
                 if src_y >= source.height as usize {
@@ -2007,6 +2184,38 @@ fn wic_copy_source_pixels(
                         + col)
                         .min(source.pixels.len().saturating_sub(1));
                     out.push(source.pixels[src]);
+                }
+            }
+        }
+        WicObjectKind::FormatConverter => {
+            // The converter wraps its source and translates each pixel into
+            // the destination format (the converter's own pixel format).
+            let Some(wrapped) = objects.get(&source.source) else {
+                return out;
+            };
+            let (sw, sh) = wic_source_dimensions(wrapped);
+            let full = wic_copy_source_pixels(objects, wrapped, 0, 0, sw, sh);
+            let Some(src_layout) = pixel_layout(&wrapped.pixel_format) else {
+                return out;
+            };
+            let src_bytes = layout_bytes(src_layout);
+            for row in 0..h as usize {
+                let sy = y as usize + row;
+                if sy >= sh as usize {
+                    break;
+                }
+                for col in 0..w as usize {
+                    let sx = x as usize + col;
+                    if sx >= sw as usize {
+                        break;
+                    }
+                    let base = sy * sw as usize * src_bytes as usize + sx * src_bytes as usize;
+                    let mut pixel = [0_u8; 4];
+                    for (i, slot) in pixel.iter_mut().enumerate().take(src_bytes as usize) {
+                        *slot = full.get(base + i).copied().unwrap_or(0);
+                    }
+                    let converted = convert_pixel(src_layout, layout, &pixel);
+                    out.extend_from_slice(&converted[..bytes as usize]);
                 }
             }
         }
@@ -2130,6 +2339,102 @@ fn wic_collect_palette(source: &WicObjectState) -> Vec<u32> {
         }
     }
     colors
+}
+
+/// Translate one pixel between the supported WIC layouts.  The pixel is
+/// normalized to non-premultiplied RGBA and then written in the destination
+/// layout (premultiplying for PBGRA, dropping alpha for BGR, and using the
+/// Rec. 601 luminance for 8bppGray).
+fn convert_pixel(src: PixelLayout, dst: PixelLayout, pixel: &[u8; 4]) -> [u8; 4] {
+    let (r, g, b, a) = match src {
+        PixelLayout::Bgra | PixelLayout::Rgba => (pixel[2], pixel[1], pixel[0], pixel[3]),
+        PixelLayout::Pbgra => {
+            let alpha = pixel[3];
+            let unpremultiply = |channel: u8| {
+                if alpha == 0 {
+                    0
+                } else {
+                    ((u32::from(channel) * 255) / u32::from(alpha)).min(255) as u8
+                }
+            };
+            (
+                unpremultiply(pixel[2]),
+                unpremultiply(pixel[1]),
+                unpremultiply(pixel[0]),
+                alpha,
+            )
+        }
+        PixelLayout::Bgr => (pixel[2], pixel[1], pixel[0], 255),
+        PixelLayout::Gray => (pixel[0], pixel[0], pixel[0], 255),
+    };
+    match dst {
+        PixelLayout::Bgra => [b, g, r, a],
+        PixelLayout::Rgba => [r, g, b, a],
+        PixelLayout::Pbgra => {
+            let premultiply = |channel: u8| ((u32::from(channel) * u32::from(a)) / 255) as u8;
+            [premultiply(b), premultiply(g), premultiply(r), a]
+        }
+        PixelLayout::Bgr => [b, g, r, 0],
+        PixelLayout::Gray => {
+            let luma = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+            [luma as u8, 0, 0, 0]
+        }
+    }
+}
+
+/// The bitmap's stored resolution encoded in the object's `profile` slot
+/// (bitmaps do not carry a color profile; the slot is a per-kind union).
+fn wic_encode_dpi(dpi_x: f64, dpi_y: f64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&(dpi_x as f32).to_le_bytes());
+    bytes.extend_from_slice(&(dpi_y as f32).to_le_bytes());
+    bytes
+}
+
+fn wic_decode_dpi(object: &WicObjectState) -> Option<(f64, f64)> {
+    if object.profile.len() != 8 {
+        return None;
+    }
+    let x = f32::from_le_bytes([
+        object.profile[0],
+        object.profile[1],
+        object.profile[2],
+        object.profile[3],
+    ]) as f64;
+    let y = f32::from_le_bytes([
+        object.profile[4],
+        object.profile[5],
+        object.profile[6],
+        object.profile[7],
+    ]) as f64;
+    if x > 0.0 && y > 0.0 && x.is_finite() && y.is_finite() {
+        Some((x, y))
+    } else {
+        None
+    }
+}
+
+/// The effective resolution of a source object: bitmaps report their stored
+/// DPI, the transform chain reports the wrapped source's DPI (the WIC
+/// transform contract), everything else the 96 DPI default.
+fn wic_source_resolution(
+    objects: &std::collections::HashMap<u64, WicObjectState>,
+    object: &WicObjectState,
+) -> (f64, f64) {
+    let mut current = object;
+    for _ in 0..32 {
+        if current.kind == WicObjectKind::Bitmap {
+            return wic_decode_dpi(current).unwrap_or((WIC_DEFAULT_DPI, WIC_DEFAULT_DPI));
+        }
+        if current.source == 0 {
+            break;
+        }
+        let Some(wrapped) = objects.get(&current.source) else {
+            break;
+        };
+        current = wrapped;
+    }
+    (WIC_DEFAULT_DPI, WIC_DEFAULT_DPI)
 }
 
 // ── The vtable builders ────────────────────────────────────────────────────
@@ -2277,4 +2582,646 @@ fn wic_component_info_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::WicComponentInfoGetSpecVersion);
     methods.push(HostThunk::WicComponentInfoGetFriendlyName);
     methods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{
+        Fixture, dispatch_x86, dispatch_x86_stack, with_big_stack, x86_fixture,
+    };
+    use super::*;
+
+    const FACTORY_OUT: u64 = 0x41_000;
+    const FORMAT: u64 = 0x41_100;
+    const TEXELS: u64 = 0x41_200;
+    const BITMAP_OUT: u64 = 0x41_300;
+    const CONVERTER_OUT: u64 = 0x41_400;
+    const PIXELS_OUT: u64 = 0x41_500;
+    const PALETTE_OUT: u64 = 0x41_600;
+    const COLORS_IN: u64 = 0x41_700;
+    const COLORS_OUT: u64 = 0x41_800;
+    const RESOLUTION_OUT: u64 = 0x41_900;
+    const RECT: u64 = 0x41_a00;
+    const APPLICATION_OUT: u64 = 0x41_b00;
+
+    fn read_ptr(fixture: &Fixture, address: u64) -> u64 {
+        read_guest_pointer(&fixture.memory, address, GuestArch::X86).unwrap()
+    }
+
+    /// Create the imaging factory and return its guest pointer.
+    fn create_factory(fixture: &mut Fixture) -> u64 {
+        fixture.memory.map_bytes(FACTORY_OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicCreateImagingFactory,
+                &[0, FACTORY_OUT as u32]
+            ),
+            0
+        );
+        let factory = read_ptr(fixture, FACTORY_OUT);
+        assert_ne!(factory, 0);
+        factory
+    }
+
+    /// Create a 2x2 BGRA bitmap with the four distinct test texels.
+    fn create_test_bitmap(fixture: &mut Fixture, factory: u64) -> u64 {
+        fixture
+            .memory
+            .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_32BPP_BGRA);
+        fixture.memory.map_bytes(
+            TEXELS,
+            &[
+                0, 0, 255, 255, // opaque red (BGRA)
+                0, 255, 0, 128, // half-alpha green
+                255, 0, 0, 255, // opaque blue
+                40, 20, 10, 200, // arbitrary
+            ],
+        );
+        fixture.memory.map_bytes(BITMAP_OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::WicFactoryCreateBitmapFromMemory,
+                &[
+                    factory as u32,
+                    2,
+                    2,
+                    FORMAT as u32,
+                    8,
+                    16,
+                    TEXELS as u32,
+                    0,
+                    BITMAP_OUT as u32,
+                ],
+            ),
+            0
+        );
+        read_ptr(fixture, BITMAP_OUT)
+    }
+
+    #[test]
+    fn format_converter_translates_between_pixel_layouts() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-convert");
+            let factory = create_factory(&mut fixture);
+            let bitmap = create_test_bitmap(&mut fixture, factory);
+
+            fixture.memory.map_bytes(CONVERTER_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreateFormatConverter,
+                    &[factory as u32, CONVERTER_OUT as u32]
+                ),
+                0
+            );
+            let converter = read_ptr(&fixture, CONVERTER_OUT);
+            assert_ne!(converter, 0);
+
+            // BGRA -> RGBA swaps the red and blue channels.
+            fixture
+                .memory
+                .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_32BPP_RGBA);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFormatConverterInitialize,
+                    &[converter as u32, bitmap as u32, FORMAT as u32, 0, 0, 0]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(PIXELS_OUT, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPixels,
+                    &[converter as u32, 0, 8, 16, PIXELS_OUT as u32]
+                ),
+                0
+            );
+            let rgba = fixture.memory.read_bytes(PIXELS_OUT, 16).unwrap();
+            assert_eq!(&rgba[..4], &[255, 0, 0, 255], "BGRA red -> RGBA red");
+            assert_eq!(&rgba[4..8], &[0, 255, 0, 128], "green preserved");
+
+            // Swapping the converter's format to 24bpp BGR drops alpha.
+            fixture
+                .memory
+                .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_24BPP_BGR);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFormatConverterSetPixelFormat,
+                    &[converter as u32, FORMAT as u32]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(PIXELS_OUT, &[0_u8; 12]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPixels,
+                    &[converter as u32, 0, 6, 12, PIXELS_OUT as u32]
+                ),
+                0
+            );
+            let bgr = fixture.memory.read_bytes(PIXELS_OUT, 12).unwrap();
+            assert_eq!(&bgr[..3], &[0, 0, 255], "first pixel is BGR red");
+            assert_eq!(&bgr[3..6], &[0, 255, 0], "second pixel is BGR green");
+        })
+    }
+
+    #[test]
+    fn copy_pixels_rejects_out_of_bounds_and_empty_rectangles() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-rect");
+            let factory = create_factory(&mut fixture);
+            let bitmap = create_test_bitmap(&mut fixture, factory);
+
+            fixture.memory.map_bytes(PIXELS_OUT, &[0_u8; 64]);
+            let mut rect = Vec::new();
+            for value in [0_i32, 0, 4, 4] {
+                rect.extend_from_slice(&value.to_le_bytes());
+            }
+            fixture.memory.map_bytes(RECT, &rect);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPixels,
+                    &[bitmap as u32, RECT as u32, 32, 64, PIXELS_OUT as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "a rectangle beyond the source is rejected"
+            );
+
+            let mut empty = Vec::new();
+            for value in [0_i32, 0, 0, 2] {
+                empty.extend_from_slice(&value.to_le_bytes());
+            }
+            fixture.memory.map_bytes(RECT, &empty);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPixels,
+                    &[bitmap as u32, RECT as u32, 8, 16, PIXELS_OUT as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "an empty rectangle is rejected"
+            );
+
+            // A valid sub-rectangle succeeds and copies exactly its rows.
+            let mut sub = Vec::new();
+            for value in [1_i32, 0, 1, 2] {
+                sub.extend_from_slice(&value.to_le_bytes());
+            }
+            fixture.memory.map_bytes(RECT, &sub);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPixels,
+                    &[bitmap as u32, RECT as u32, 4, 8, PIXELS_OUT as u32]
+                ),
+                0
+            );
+            let column = fixture.memory.read_bytes(PIXELS_OUT, 8).unwrap();
+            assert_eq!(&column[..4], &[0, 255, 0, 128], "second column pixel");
+        })
+    }
+
+    #[test]
+    fn predefined_palettes_carry_real_color_tables_and_flags() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-palette-predefined");
+            let factory = create_factory(&mut fixture);
+            fixture.memory.map_bytes(PALETTE_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreatePalette,
+                    &[factory as u32, PALETTE_OUT as u32]
+                ),
+                0
+            );
+            let palette = read_ptr(&fixture, PALETTE_OUT);
+
+            // Fixed black-and-white.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializePredefined,
+                    &[palette as u32, WIC_PALETTE_TYPE_FIXED_BW, 0]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(APPLICATION_OUT, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteGetColorCount,
+                    &[palette as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(), 2);
+            fixture.memory.map_bytes(COLORS_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteGetColors,
+                    &[palette as u32, 2, COLORS_OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, COLORS_OUT).unwrap(),
+                0xff00_0000
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, COLORS_OUT + 4).unwrap(),
+                0xffff_ffff
+            );
+            for (thunk, expected) in [
+                (HostThunk::WicPaletteIsBlackWhite, 1),
+                (HostThunk::WicPaletteIsGrayscale, 1),
+                (HostThunk::WicPaletteHasAlpha, 0),
+            ] {
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        thunk,
+                        &[palette as u32, APPLICATION_OUT as u32]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteGetType,
+                    &[palette as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(),
+                WIC_PALETTE_TYPE_FIXED_BW
+            );
+
+            // The fixed grayscale tables have their documented sizes.
+            for (palette_type, expected) in [
+                (WIC_PALETTE_TYPE_FIXED_GRAY4, 4),
+                (WIC_PALETTE_TYPE_FIXED_GRAY16, 16),
+                (WIC_PALETTE_TYPE_FIXED_GRAY256, 256),
+            ] {
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::WicPaletteInitializePredefined,
+                        &[palette as u32, palette_type, 0]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::WicPaletteGetColorCount,
+                        &[palette as u32, APPLICATION_OUT as u32]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(),
+                    expected
+                );
+            }
+
+            // An unsupported predefined table is the honest not-supported.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializePredefined,
+                    &[palette as u32, 7, 0]
+                ),
+                u64::from(WIC_E_NOTSUPPORTED)
+            );
+
+            // A custom palette with alpha reports the real flags.
+            fixture
+                .memory
+                .map_bytes(COLORS_IN, &0x0011_2233_u32.to_le_bytes());
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializeCustom,
+                    &[palette as u32, COLORS_IN as u32, 1]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteHasAlpha,
+                    &[palette as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteIsBlackWhite,
+                    &[palette as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(), 0);
+            // Zero colors and a null table are invalid.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializeCustom,
+                    &[palette as u32, COLORS_IN as u32, 0]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+        })
+    }
+
+    #[test]
+    fn palette_copy_chain_preserves_colors_and_type() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-palette-copy");
+            let factory = create_factory(&mut fixture);
+            fixture.memory.map_bytes(PALETTE_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreatePalette,
+                    &[factory as u32, PALETTE_OUT as u32]
+                ),
+                0
+            );
+            let source = read_ptr(&fixture, PALETTE_OUT);
+            let mut colors = Vec::new();
+            colors.extend_from_slice(&0x1122_3344_u32.to_le_bytes());
+            colors.extend_from_slice(&0x5566_7788_u32.to_le_bytes());
+            fixture.memory.map_bytes(COLORS_IN, &colors);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializeCustom,
+                    &[source as u32, COLORS_IN as u32, 2]
+                ),
+                0
+            );
+
+            fixture.memory.map_bytes(APPLICATION_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreatePalette,
+                    &[factory as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            let target = read_ptr(&fixture, APPLICATION_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteInitializeFromPalette,
+                    &[target as u32, source as u32]
+                ),
+                0
+            );
+            fixture.memory.map_bytes(COLORS_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteGetColors,
+                    &[target as u32, 2, COLORS_OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, COLORS_OUT).unwrap(),
+                0x1122_3344
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, COLORS_OUT + 4).unwrap(),
+                0x5566_7788
+            );
+
+            // A bitmap without an indexed palette answers CopyPalette with an
+            // empty palette, and a non-palette target is rejected.
+            let bitmap = create_test_bitmap(&mut fixture, factory);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPalette,
+                    &[bitmap as u32, target as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicPaletteGetColorCount,
+                    &[target as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&fixture.memory, APPLICATION_OUT).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceCopyPalette,
+                    &[bitmap as u32, bitmap as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+        })
+    }
+
+    #[test]
+    fn bitmap_resolution_round_trips_and_propagates() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-resolution");
+            let factory = create_factory(&mut fixture);
+            let bitmap = create_test_bitmap(&mut fixture, factory);
+
+            let mut stack = Vec::new();
+            stack.extend_from_slice(&(bitmap as u32).to_le_bytes());
+            // 8-byte aligned doubles on the x86 stack (4 bytes of padding
+            // after the 32-bit method receiver).
+            stack.extend_from_slice(&[0_u8; 4]);
+            stack.extend_from_slice(&150.0_f64.to_le_bytes());
+            stack.extend_from_slice(&300.0_f64.to_le_bytes());
+            assert_eq!(
+                dispatch_x86_stack(&mut fixture, HostThunk::WicBitmapSetResolution, &stack),
+                0
+            );
+
+            fixture.memory.map_bytes(RESOLUTION_OUT, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetResolution,
+                    &[
+                        bitmap as u32,
+                        RESOLUTION_OUT as u32,
+                        (RESOLUTION_OUT + 8) as u32
+                    ]
+                ),
+                0
+            );
+            let dpi_x = read_guest_f64(&fixture.memory, RESOLUTION_OUT).unwrap();
+            let dpi_y = read_guest_f64(&fixture.memory, RESOLUTION_OUT + 8).unwrap();
+            assert_eq!((dpi_x, dpi_y), (150.0, 300.0));
+
+            // A non-positive resolution is invalid and leaves the stored one.
+            let mut invalid = Vec::new();
+            invalid.extend_from_slice(&(bitmap as u32).to_le_bytes());
+            invalid.extend_from_slice(&[0_u8; 4]);
+            invalid.extend_from_slice(&0.0_f64.to_le_bytes());
+            invalid.extend_from_slice(&96.0_f64.to_le_bytes());
+            assert_eq!(
+                dispatch_x86_stack(&mut fixture, HostThunk::WicBitmapSetResolution, &invalid),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetResolution,
+                    &[bitmap as u32, RESOLUTION_OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_f64(&fixture.memory, RESOLUTION_OUT).unwrap(),
+                150.0
+            );
+
+            // The transform chain reports the wrapped source's resolution.
+            fixture.memory.map_bytes(APPLICATION_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreateBitmapScaler,
+                    &[factory as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            let scaler = read_ptr(&fixture, APPLICATION_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicScalerInitialize,
+                    &[scaler as u32, bitmap as u32, 1, 1, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetResolution,
+                    &[scaler as u32, RESOLUTION_OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_f64(&fixture.memory, RESOLUTION_OUT).unwrap(),
+                150.0
+            );
+
+            // An object that never had a resolution reports the 96 DPI default.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreatePalette,
+                    &[factory as u32, APPLICATION_OUT as u32]
+                ),
+                0
+            );
+            let palette = read_ptr(&fixture, APPLICATION_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicSourceGetResolution,
+                    &[palette as u32, RESOLUTION_OUT as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_f64(&fixture.memory, RESOLUTION_OUT).unwrap(),
+                WIC_DEFAULT_DPI
+            );
+        })
+    }
+
+    #[test]
+    fn dont_care_is_not_a_concrete_pixel_format() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-dontcare");
+            let factory = create_factory(&mut fixture);
+            fixture
+                .memory
+                .map_bytes(FORMAT, &GUID_PIXEL_FORMAT_DONT_CARE);
+            fixture.memory.map_bytes(BITMAP_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreateBitmap,
+                    &[factory as u32, 2, 2, FORMAT as u32, 0, BITMAP_OUT as u32]
+                ),
+                u64::from(WIC_E_UNSUPPORTEDPIXELFORMAT)
+            );
+        })
+    }
+
+    #[test]
+    fn bitmap_set_palette_rejects_non_indexed_bitmaps() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("wic-setpalette");
+            let factory = create_factory(&mut fixture);
+            let bitmap = create_test_bitmap(&mut fixture, factory);
+            fixture.memory.map_bytes(PALETTE_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicFactoryCreatePalette,
+                    &[factory as u32, PALETTE_OUT as u32]
+                ),
+                0
+            );
+            let palette = read_ptr(&fixture, PALETTE_OUT);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicBitmapSetPalette,
+                    &[bitmap as u32, palette as u32]
+                ),
+                u64::from(WIC_E_UNSUPPORTEDPIXELFORMAT)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicBitmapSetPalette,
+                    &[bitmap as u32, bitmap as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::WicBitmapSetPalette,
+                    &[APPLICATION_OUT as u32, palette as u32]
+                ),
+                u64::from(WIC_E_INVALIDSTATE)
+            );
+        })
+    }
 }

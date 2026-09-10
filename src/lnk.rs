@@ -125,6 +125,7 @@ pub(crate) struct ShellLinkData {
 /// tests.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub(crate) struct ParsedShellLink {
     /// The LinkFlags from the header.
     pub link_flags: u32,
@@ -715,10 +716,9 @@ mod tests {
         data.working_directory = "C:\\x".to_string();
         let bytes = encode(&data);
         let mut padded = Vec::new();
-        let mut cursor = 76usize;
+        let cursor = 76usize;
         let info_size = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         padded.extend_from_slice(&bytes[..cursor + info_size]);
-        cursor += info_size;
         for chunk in [&data.description[..], &data.working_directory[..]] {
             let units = chunk.encode_utf16().count();
             padded.extend_from_slice(&(units as u16).to_le_bytes());

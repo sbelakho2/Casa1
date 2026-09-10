@@ -479,25 +479,96 @@ impl PeHostRuntime {
     }
 
     /// `IDirectDrawSurface7::Blt(dstRect, srcSurface, srcRect, flags, bltFx)`
-    /// — a pixel copy between the runtime's surfaces.
+    /// — a rectangle-aware pixel copy between the runtime's surfaces (or a
+    /// DDBLT_COLORFILL of the destination rectangle).
     pub(crate) fn dispatch_direct_draw_surface_blt(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        const DDBLT_COLORFILL: u32 = 0x0000_0400;
+        /// DDERR_INVALIDPARAMS.
+        const DDERR_INVALIDPARAMS: u32 = 0x8007_0057;
+        // DDBLTFX.dwFillColor (after dwSize..dwReserved).
+        const DDBLTFX_FILL_COLOR: u64 = 56;
         let this = guest_call_arg(state, memory, 0)?;
-        let _dst_rect = guest_call_arg(state, memory, 1)?;
-        let source = guest_call_arg(state, memory, 2)?;
-        let _src_rect = guest_call_arg(state, memory, 3)?;
-        let _flags = guest_call_arg_u32(state, memory, 4)?;
-        let _blt_fx = guest_call_arg(state, memory, 5)?;
-        let Some(source) = self.ddraw_surfaces.get(&source).cloned() else {
+        let dst_rect = guest_call_arg(state, memory, 1)?;
+        let source_handle = guest_call_arg(state, memory, 2)?;
+        let src_rect = guest_call_arg(state, memory, 3)?;
+        let flags = guest_call_arg_u32(state, memory, 4)?;
+        let blt_fx = guest_call_arg(state, memory, 5)?;
+        let Some(target) = self.ddraw_surfaces.get(&this).cloned() else {
             state.set(Register::Rax, u64::from(E_FAIL));
             return Ok(());
         };
-        if let Some(target) = self.ddraw_surfaces.get_mut(&this) {
-            let copy = source.pixels.len().min(target.pixels.len());
-            target.pixels[..copy].copy_from_slice(&source.pixels[..copy]);
+        let (dst_left, dst_top, dst_right, dst_bottom) =
+            dd_rect(memory, dst_rect, target.width as i32, target.height as i32);
+        if flags & DDBLT_COLORFILL != 0 {
+            let color = if blt_fx != 0 {
+                read_guest_u32(memory, blt_fx + DDBLTFX_FILL_COLOR).unwrap_or(0)
+            } else {
+                0
+            };
+            if let Some(slot) = self.ddraw_surfaces.get_mut(&this) {
+                dd_fill_rect(slot, dst_left, dst_top, dst_right, dst_bottom, color);
+            }
+            state.set(Register::Rax, u64::from(DD_OK));
+            return Ok(());
+        }
+        let Some(source) = self.ddraw_surfaces.get(&source_handle).cloned() else {
+            state.set(
+                Register::Rax,
+                u64::from(if source_handle == 0 {
+                    DDERR_INVALIDPARAMS
+                } else {
+                    E_FAIL
+                }),
+            );
+            return Ok(());
+        };
+        let (mut src_left, mut src_top, src_right, src_bottom) =
+            dd_rect(memory, src_rect, source.width as i32, source.height as i32);
+        let (mut dst_left, mut dst_top, dst_right, dst_bottom) =
+            (dst_left, dst_top, dst_right, dst_bottom);
+        // Joint clipping: shift both rectangles by the same amount so the
+        // copy stays aligned when either side runs off the surface.
+        let shift_x = (-src_left).max(-dst_left).max(0);
+        let shift_y = (-src_top).max(-dst_top).max(0);
+        src_left += shift_x;
+        dst_left += shift_x;
+        src_top += shift_y;
+        dst_top += shift_y;
+        let width = (src_right - src_left)
+            .min(dst_right - dst_left)
+            .min(source.width as i32 - src_left)
+            .min(target.width as i32 - dst_left);
+        let height = (src_bottom - src_top)
+            .min(dst_bottom - dst_top)
+            .min(source.height as i32 - src_top)
+            .min(target.height as i32 - dst_top);
+        if width <= 0 || height <= 0 {
+            state.set(Register::Rax, u64::from(DD_OK));
+            return Ok(());
+        }
+        let source_pitch = source.pitch as usize;
+        let target_pitch = target.pitch as usize;
+        if let Some(slot) = self.ddraw_surfaces.get_mut(&this) {
+            for row in 0..height as usize {
+                let source_y = src_top as usize + row;
+                let target_y = dst_top as usize + row;
+                for column in 0..width as usize {
+                    let source_x = src_left as usize + column;
+                    let target_x = dst_left as usize + column;
+                    let source_start = source_y * source_pitch + source_x * 4;
+                    let target_start = target_y * target_pitch + target_x * 4;
+                    if source_start + 4 <= source.pixels.len()
+                        && target_start + 4 <= slot.pixels.len()
+                    {
+                        slot.pixels[target_start..target_start + 4]
+                            .copy_from_slice(&source.pixels[source_start..source_start + 4]);
+                    }
+                }
+            }
         }
         state.set(Register::Rax, u64::from(DD_OK));
         Ok(())
@@ -740,5 +811,168 @@ impl PeHostRuntime {
         methods[24] = HostThunk::DirectDrawSurfaceUnlock;
         methods[26] = HostThunk::DirectDrawSurfaceGetSurfaceDesc;
         methods
+    }
+}
+
+/// The DirectDraw rectangle: a null pointer selects the whole surface.
+fn dd_rect(memory: &MemoryImage, pointer: u64, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    if pointer == 0 {
+        return (0, 0, width, height);
+    }
+    let left = read_guest_u32(memory, pointer).unwrap_or(0) as i32;
+    let top = read_guest_u32(memory, pointer + 4).unwrap_or(0) as i32;
+    let right = read_guest_u32(memory, pointer + 8).unwrap_or(width as u32) as i32;
+    let bottom = read_guest_u32(memory, pointer + 12).unwrap_or(height as u32) as i32;
+    (left, top, right, bottom)
+}
+
+/// Fill the clamped rectangle with the 32-bit color (DDBLT_COLORFILL).
+fn dd_fill_rect(
+    surface: &mut crate::runtime::state::DirectDrawSurfaceState,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: u32,
+) {
+    let left = left.max(0).min(surface.width as i32);
+    let top = top.max(0).min(surface.height as i32);
+    let right = right.max(left).min(surface.width as i32);
+    let bottom = bottom.max(top).min(surface.height as i32);
+    let bytes = color.to_le_bytes();
+    let pitch = surface.pitch as usize;
+    for y in top as usize..bottom as usize {
+        for x in left as usize..right as usize {
+            let start = y * pitch + x * 4;
+            if start + 4 <= surface.pixels.len() {
+                surface.pixels[start..start + 4].copy_from_slice(&bytes);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{Fixture, dispatch_x86, with_big_stack, x86_fixture};
+    use super::*;
+
+    const DD_OUT: u64 = 0x41_000;
+    const DESC: u64 = 0x41_100;
+    const SURFACE_OUT: u64 = 0x41_200;
+    const RECT: u64 = 0x41_400;
+    const BLT_FX: u64 = 0x41_500;
+    const DD_OFF: u64 = 0x41_600;
+
+    fn create_surface(fixture: &mut Fixture, dd: u64, width: u32, height: u32) -> u64 {
+        fixture.memory.map_bytes(DESC, &[0_u8; 124]);
+        write_guest_u32(&mut fixture.memory, DESC + 20, height).unwrap();
+        write_guest_u32(&mut fixture.memory, DESC + 24, width).unwrap();
+        write_guest_u32(&mut fixture.memory, DESC + 4, 0x1000).unwrap();
+        fixture.memory.map_bytes(SURFACE_OUT, &[0_u8; 8]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::DirectDrawCreateSurface,
+                &[dd as u32, DESC as u32, SURFACE_OUT as u32, 0]
+            ),
+            0
+        );
+        read_guest_pointer(&fixture.memory, SURFACE_OUT, GuestArch::X86).unwrap()
+    }
+
+    fn write_rect(fixture: &mut Fixture, left: i32, top: i32, right: i32, bottom: i32) {
+        let mut bytes = Vec::new();
+        for value in [left, top, right, bottom] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fixture.memory.map_bytes(RECT, &bytes);
+    }
+
+    fn pixel(fixture: &Fixture, surface: u64, x: u32, y: u32) -> u32 {
+        let state = fixture.runtime.ddraw_surfaces.get(&surface).unwrap();
+        let start = (y * state.width + x) as usize * 4;
+        u32::from_le_bytes([
+            state.pixels[start],
+            state.pixels[start + 1],
+            state.pixels[start + 2],
+            state.pixels[start + 3],
+        ])
+    }
+
+    #[test]
+    fn blt_copies_the_clipped_rectangles() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("ddraw-blt");
+            fixture.memory.map_bytes(DD_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectDrawCreateEx,
+                    &[0, DD_OUT as u32, 0, 0]
+                ),
+                0
+            );
+            let dd = read_guest_pointer(&fixture.memory, DD_OUT, GuestArch::X86).unwrap();
+            let source = create_surface(&mut fixture, dd, 4, 4);
+            let target = create_surface(&mut fixture, dd, 4, 4);
+            {
+                let state = fixture.runtime.ddraw_surfaces.get_mut(&source).unwrap();
+                for (index, pixel) in state.pixels.chunks_exact_mut(4).enumerate() {
+                    pixel.copy_from_slice(&(index as u32 + 1).to_le_bytes());
+                }
+            }
+
+            // Copy the source's 2x2 sub-rectangle (1,1)-(3,3) to (0,0).
+            write_rect(&mut fixture, 1, 1, 3, 3);
+            fixture.memory.map_bytes(DD_OFF, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectDrawSurfaceBlt,
+                    &[
+                        target as u32,
+                        DD_OFF as u32,
+                        source as u32,
+                        RECT as u32,
+                        0,
+                        0
+                    ]
+                ),
+                0
+            );
+            // Source pixel (1,1) is value 6 (row 1 * 4 + 1 + 1).
+            assert_eq!(pixel(&fixture, target, 0, 0), 6);
+            assert_eq!(pixel(&fixture, target, 1, 0), 7);
+            assert_eq!(pixel(&fixture, target, 0, 1), 10);
+            assert_eq!(pixel(&fixture, target, 1, 1), 11);
+            assert_eq!(pixel(&fixture, target, 2, 0), 0, "untouched pixel");
+
+            // Color fill ignores the source and writes the DDBLTFX color.
+            let mut fx = vec![0_u8; 88];
+            fx[56..60].copy_from_slice(&0x00AB_CDEF_u32.to_le_bytes());
+            fixture.memory.map_bytes(BLT_FX, &fx);
+            write_rect(&mut fixture, 1, 1, 3, 3);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectDrawSurfaceBlt,
+                    &[target as u32, RECT as u32, 0, 0, 0x400, BLT_FX as u32]
+                ),
+                0
+            );
+            assert_eq!(pixel(&fixture, target, 0, 0), 6, "outside the fill rect");
+            assert_eq!(pixel(&fixture, target, 1, 1), 0x00AB_CDEF);
+            assert_eq!(pixel(&fixture, target, 2, 2), 0x00AB_CDEF);
+
+            // A null source without DDBLT_COLORFILL is invalid parameters.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DirectDrawSurfaceBlt,
+                    &[target as u32, 0, 0, 0, 0, 0]
+                ),
+                0x8007_0057
+            );
+        })
     }
 }

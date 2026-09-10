@@ -17,10 +17,55 @@
 # and commit it together with the intentional change.
 #
 # Usage: ci/check_api_regression.sh <new-report.json> [baseline.json]
+#        ci/check_api_regression.sh <new-report.json> --baseline <baseline.json>
 set -euo pipefail
 
-NEW_REPORT="${1:?usage: check_api_regression.sh <new-report.json> [baseline.json]}"
-BASELINE="${2:-ci/api-baseline.json}"
+usage() {
+  cat >&2 <<'EOF'
+usage: ci/check_api_regression.sh <new-report.json> [baseline.json]
+       ci/check_api_regression.sh <new-report.json> --baseline <baseline.json>
+
+Compares a freshly generated api-completeness report against a baseline and
+fails on any compatibility regression.
+
+  --baseline <path>  baseline to compare against (default: ci/api-baseline.json)
+EOF
+}
+
+fail_usage() { echo "::error::$*" >&2; usage; exit 2; }
+
+NEW_REPORT=""
+BASELINE=""
+POSITIONAL_BASELINE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --baseline)
+      [[ $# -ge 2 ]] || fail_usage "--baseline requires a path"
+      BASELINE="$2"; shift 2 ;;
+    --baseline=*) BASELINE="${1#--baseline=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) fail_usage "unknown option: $1" ;;
+    *)
+      if [[ -z "$NEW_REPORT" ]]; then
+        NEW_REPORT="$1"
+      elif [[ -z "$POSITIONAL_BASELINE" ]]; then
+        POSITIONAL_BASELINE="$1"
+      else
+        fail_usage "unexpected argument: $1"
+      fi
+      shift ;;
+  esac
+done
+if [[ -z "$NEW_REPORT" && $# -gt 0 ]]; then NEW_REPORT="$1"; shift; fi
+if [[ -z "$POSITIONAL_BASELINE" && $# -gt 0 ]]; then POSITIONAL_BASELINE="$1"; shift; fi
+[[ $# -eq 0 ]] || fail_usage "unexpected argument: $1"
+
+if [[ -n "$BASELINE" && -n "$POSITIONAL_BASELINE" && "$BASELINE" != "$POSITIONAL_BASELINE" ]]; then
+  fail_usage "baseline specified twice with different paths: $BASELINE vs $POSITIONAL_BASELINE"
+fi
+BASELINE="${BASELINE:-${POSITIONAL_BASELINE:-ci/api-baseline.json}}"
+[[ -n "$NEW_REPORT" ]] || fail_usage "missing <new-report.json>"
 
 python3 - "$NEW_REPORT" "$BASELINE" <<'PYEOF'
 import json

@@ -248,6 +248,8 @@ pub mod workloads {
     pub mod steam;
 }
 pub mod wsl;
+pub mod x3daudio;
+pub mod xact;
 
 pub const PRODUCT_NAME: &str = "Casa1";
 pub const CLI_NAME: &str = "macwin";

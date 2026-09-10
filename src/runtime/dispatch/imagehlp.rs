@@ -228,18 +228,19 @@ impl PeHostRuntime {
     }
 
     /// `ImageGetDigestStream(file, flags, digestFunction, digestContext)` —
-    /// hash the mapped image through the callback (FALSE: no callback
-    /// provided).
+    /// walk the mapped image (headers plus every section's raw data, with
+    /// the requested data directories added for the selective levels) and
+    /// invoke the guest digest callback for each byte range.
     pub(crate) fn dispatch_image_get_digest_stream(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let file = guest_call_arg(state, memory, 0)?;
-        let _flags = guest_call_arg_u32(state, memory, 1)?;
+        let flags = guest_call_arg_u32(state, memory, 1)?;
         let digest_function = guest_call_arg(state, memory, 2)?;
-        let _context = guest_call_arg(state, memory, 3)?;
-        let Some(image) = self.image_loads.get(&file) else {
+        let context = guest_call_arg(state, memory, 3)?;
+        let Some(image) = self.image_loads.get(&file).cloned() else {
             state.set(Register::Rax, 0);
             return Ok(());
         };
@@ -247,11 +248,31 @@ impl PeHostRuntime {
             state.set(Register::Rax, 0);
             return Ok(());
         }
-        // A single callback with the raw image (the section-walking digest
-        // is a refinement; the callback contract is honored).
-        let size = image.bytes as usize;
-        state.set(Register::Rax, 1);
-        let _ = size;
+        let bytes = memory
+            .read_bytes(image.mapped, image.bytes as usize)
+            .unwrap_or_default();
+        let Some(ranges) = pe_digest_ranges(&bytes, flags) else {
+            state.set(Register::Rax, 0);
+            return Ok(());
+        };
+        let mut ok = true;
+        for (start, length) in ranges {
+            if length == 0 {
+                continue;
+            }
+            let result = self.execute_guest_callback(
+                state,
+                memory,
+                digest_function,
+                &[context, image.mapped + start as u64, length as u64],
+                "ImageGetDigestStream::DigestFunction",
+            );
+            if result.unwrap_or(0) == 0 {
+                ok = false;
+                break;
+            }
+        }
+        state.set(Register::Rax, u64::from(ok));
         Ok(())
     }
 
@@ -364,6 +385,153 @@ impl PeHostRuntime {
     }
 }
 
+/// The `CERT_PE_IMAGE_DIGEST_*` levels.
+const CERT_PE_IMAGE_DIGEST_DEBUG_INFO: u32 = 1;
+const CERT_PE_IMAGE_DIGEST_RESOURCES: u32 = 2;
+const CERT_PE_IMAGE_DIGEST_ALL_IMPORT_INFO: u32 = 4;
+const CERT_PE_IMAGE_DIGEST_NON_PE_INFO: u32 = 8;
+
+/// The byte ranges the image digest covers: the headers, every section's
+/// raw data, the data directories the selective levels ask for, and the
+/// non-PE overlay for CERT_PE_IMAGE_DIGEST_NON_PE_INFO.
+fn pe_digest_ranges(bytes: &[u8], flags: u32) -> Option<Vec<(usize, usize)>> {
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return None;
+    }
+    let pe_offset =
+        u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    if pe_offset + 24 > bytes.len()
+        || u32::from_le_bytes([
+            bytes[pe_offset],
+            bytes[pe_offset + 1],
+            bytes[pe_offset + 2],
+            bytes[pe_offset + 3],
+        ]) != IMAGE_NT_SIGNATURE
+    {
+        return None;
+    }
+    let number_of_sections =
+        u16::from_le_bytes([bytes[pe_offset + 6], bytes[pe_offset + 7]]) as usize;
+    let optional_size = u16::from_le_bytes([bytes[pe_offset + 20], bytes[pe_offset + 21]]) as usize;
+    let optional = pe_offset + 24;
+    if optional + 2 > bytes.len() {
+        return None;
+    }
+    let size_of_headers = u32::from_le_bytes([
+        bytes[optional + 0x3c],
+        bytes[optional + 0x3d],
+        bytes[optional + 0x3e],
+        bytes[optional + 0x3f],
+    ]) as usize;
+    let mut ranges = Vec::new();
+    ranges.push((0, size_of_headers.min(bytes.len())));
+    // The section table: (VirtualAddress, VirtualSize, PointerToRawData,
+    // SizeOfRawData) per entry.
+    let section_table = optional + optional_size;
+    let mut sections: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut max_raw_end = size_of_headers.min(bytes.len());
+    for index in 0..number_of_sections {
+        let entry = section_table + index * 40;
+        if entry + 40 > bytes.len() {
+            break;
+        }
+        let virtual_size = u32::from_le_bytes([
+            bytes[entry + 8],
+            bytes[entry + 9],
+            bytes[entry + 10],
+            bytes[entry + 11],
+        ]) as usize;
+        let virtual_address = u32::from_le_bytes([
+            bytes[entry + 12],
+            bytes[entry + 13],
+            bytes[entry + 14],
+            bytes[entry + 15],
+        ]) as usize;
+        let raw_size = u32::from_le_bytes([
+            bytes[entry + 16],
+            bytes[entry + 17],
+            bytes[entry + 18],
+            bytes[entry + 19],
+        ]) as usize;
+        let raw_pointer = u32::from_le_bytes([
+            bytes[entry + 20],
+            bytes[entry + 21],
+            bytes[entry + 22],
+            bytes[entry + 23],
+        ]) as usize;
+        sections.push((
+            virtual_address,
+            virtual_size.max(raw_size),
+            raw_pointer,
+            raw_size,
+        ));
+        if raw_size != 0 && raw_pointer < bytes.len() {
+            let end = raw_pointer.saturating_add(raw_size).min(bytes.len());
+            ranges.push((raw_pointer, end - raw_pointer));
+            max_raw_end = max_raw_end.max(end);
+        }
+    }
+    let rva_to_offset = |rva: usize| -> Option<usize> {
+        if rva < size_of_headers {
+            return Some(rva);
+        }
+        for (virtual_address, virtual_size, raw_pointer, _) in &sections {
+            if rva >= *virtual_address && rva < virtual_address + virtual_size.max(&1) {
+                return Some(raw_pointer + (rva - virtual_address));
+            }
+        }
+        None
+    };
+    let magic = u16::from_le_bytes([bytes[optional], bytes[optional + 1]]);
+    let directory_offset = if magic == 0x20b {
+        optional + 112
+    } else {
+        optional + 96
+    };
+    let mark_directory = |index: usize, ranges: &mut Vec<(usize, usize)>| {
+        let entry = directory_offset + index * 8;
+        if entry + 8 > bytes.len() {
+            return;
+        }
+        let rva = u32::from_le_bytes([
+            bytes[entry],
+            bytes[entry + 1],
+            bytes[entry + 2],
+            bytes[entry + 3],
+        ]) as usize;
+        let size = u32::from_le_bytes([
+            bytes[entry + 4],
+            bytes[entry + 5],
+            bytes[entry + 6],
+            bytes[entry + 7],
+        ]) as usize;
+        if rva == 0 || size == 0 {
+            return;
+        }
+        if let Some(offset) = rva_to_offset(rva) {
+            let end = offset.saturating_add(size).min(bytes.len());
+            if end > offset {
+                ranges.push((offset, end - offset));
+            }
+        }
+    };
+    if flags & CERT_PE_IMAGE_DIGEST_DEBUG_INFO != 0 {
+        mark_directory(6, &mut ranges);
+    }
+    if flags & CERT_PE_IMAGE_DIGEST_RESOURCES != 0 {
+        mark_directory(2, &mut ranges);
+    }
+    if flags & CERT_PE_IMAGE_DIGEST_ALL_IMPORT_INFO != 0 {
+        for index in [1, 11, 12, 13] {
+            mark_directory(index, &mut ranges);
+        }
+    }
+    if flags & CERT_PE_IMAGE_DIGEST_NON_PE_INFO != 0 && max_raw_end < bytes.len() {
+        ranges.push((max_raw_end, bytes.len() - max_raw_end));
+    }
+    Some(ranges)
+}
+
 /// The PE checksum algorithm (sum of 16-bit words with the checksum field
 /// zeroed, folded back into the low 16 bits).
 fn pe_checksum(bytes: &[u8]) -> u32 {
@@ -386,4 +554,133 @@ fn pe_checksum(bytes: &[u8]) -> u32 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     sum + bytes.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{dispatch_x86, with_big_stack, x86_fixture};
+    use super::*;
+
+    const NAME: u64 = 0x42_000;
+    const LOADED: u64 = 0x43_000;
+    const STUB: u64 = 0x44_000;
+    const COUNTERS: u64 = 0x45_000;
+
+    /// A minimal, structurally valid PE32 with one 4-byte .text section.
+    fn build_pe() -> Vec<u8> {
+        let mut pe = vec![0_u8; 0x204];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+        let pe_offset = 0x40;
+        pe[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        pe[pe_offset + 4..pe_offset + 6].copy_from_slice(&0x14c_u16.to_le_bytes());
+        pe[pe_offset + 6..pe_offset + 8].copy_from_slice(&1_u16.to_le_bytes());
+        pe[pe_offset + 20..pe_offset + 22].copy_from_slice(&0xe0_u16.to_le_bytes());
+        let optional = pe_offset + 24;
+        pe[optional..optional + 2].copy_from_slice(&0x10b_u16.to_le_bytes());
+        pe[optional + 0x38..optional + 0x3c].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[optional + 0x3c..optional + 0x40].copy_from_slice(&0x200_u32.to_le_bytes());
+        let section = optional + 0xe0;
+        pe[section..section + 5].copy_from_slice(b".text");
+        pe[section + 8..section + 12].copy_from_slice(&4_u32.to_le_bytes());
+        pe[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[section + 16..section + 20].copy_from_slice(&4_u32.to_le_bytes());
+        pe[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[0x200..0x204].copy_from_slice(b"DATA");
+        pe
+    }
+
+    /// The digest callback stub: accumulate dwLength and increment the call
+    /// counter, then return TRUE.
+    fn digest_stub() -> Vec<u8> {
+        vec![
+            0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]
+            0x01, 0x05, 0x00, 0x50, 0x04, 0x00, // add [0x45000], eax
+            0x83, 0x05, 0x04, 0x50, 0x04, 0x00, 0x01, // add dword [0x45004], 1
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xC3, // ret
+        ]
+    }
+
+    fn map_fixture_pe(fixture: &mut super::super::test_support::Fixture) -> u64 {
+        let path = fixture._temp.path().join("digest.dll");
+        std::fs::write(&path, build_pe()).unwrap();
+        let mut name_bytes = Vec::new();
+        for unit in path.to_string_lossy().encode_utf16().chain([0]) {
+            name_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fixture.memory.map_bytes(NAME, &name_bytes);
+        fixture.memory.map_bytes(LOADED, &[0_u8; 64]);
+        assert_eq!(
+            dispatch_x86(
+                fixture,
+                HostThunk::MapAndLoad,
+                &[NAME as u32, 0, LOADED as u32, 0, 0]
+            ),
+            1
+        );
+        let mapped = read_guest_pointer(&fixture.memory, LOADED + 16, GuestArch::X86).unwrap();
+        assert_ne!(mapped, 0);
+        mapped
+    }
+
+    #[test]
+    fn digest_stream_walks_headers_and_sections_through_the_callback() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("imagehlp-digest");
+            fixture.memory.map_bytes(COUNTERS, &[0_u8; 8]);
+            fixture.memory.map_bytes(STUB, &digest_stub());
+            let mapped = map_fixture_pe(&mut fixture);
+
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ImageGetDigestStream,
+                    &[mapped as u32, 0, STUB as u32, 0x1234]
+                ),
+                1
+            );
+            let total = read_guest_u32(&fixture.memory, COUNTERS).unwrap();
+            let count = read_guest_u32(&fixture.memory, COUNTERS + 4).unwrap();
+            assert_eq!(total, 0x200 + 4, "headers plus the .text raw data");
+            assert_eq!(count, 2, "one callback per digest range");
+
+            // A callback that returns FALSE fails the digest.
+            fixture.memory.map_bytes(COUNTERS, &[0_u8; 8]);
+            let mut failing = digest_stub();
+            failing[17..22].copy_from_slice(&[0x31, 0xC0, 0x90, 0x90, 0x90]);
+            fixture.memory.map_bytes(STUB, &failing);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ImageGetDigestStream,
+                    &[mapped as u32, 0, STUB as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&fixture.memory, COUNTERS + 4).unwrap(),
+                1,
+                "the walk stops at the failing callback"
+            );
+
+            // A null callback and an unmapped image are both rejected.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ImageGetDigestStream,
+                    &[mapped as u32, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ImageGetDigestStream,
+                    &[0x1234, 0, STUB as u32, 0]
+                ),
+                0
+            );
+        })
+    }
 }

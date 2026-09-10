@@ -21,12 +21,20 @@ name: Release Checklist
 #                                         verify the EXISTING signatures
 #   check-release-gate (macos-latest)     needs steam-e2e: download the
 #                                         evidence bundle (which embeds the
-#                                         signed candidate + hash) and run
+#                                         signed candidate + hash), fetch the
+#                                         commit-bound api-completeness-<sha>
+#                                         artifact from the CI run for this
+#                                         same SHA (run id pinned via the
+#                                         GitHub API, fail closed if absent),
+#                                         fold its provenance into
+#                                         release-evidence.json and run
 #                                         ci/check_release_gate.sh
 #   release-gate                          aggregates every job's result
 #
 # The gate consumes the evidence produced in THIS run — it never depends on
-# a separately scheduled steam-e2e workflow's artifact.
+# a separately scheduled steam-e2e workflow's artifact. The one cross-run
+# input is the api-completeness-<sha> artifact produced by ci.yml for the exact
+# same commit: its run is resolved via the API and its absence fails the gate.
 
 on:
   workflow_dispatch:
@@ -402,6 +410,9 @@ jobs:
   check-release-gate:
     name: Release Evidence Gate
     runs-on: macos-latest
+    permissions:
+      contents: read
+      actions: read
     needs:
       - steam-e2e
       - release-smoke-tests
@@ -423,6 +434,38 @@ jobs:
         with:
           name: steam-e2e-${{ github.sha }}
           path: e2e-evidence
+      # Commit-bound api-report evidence: ci.yml uploads
+      # api-completeness-<sha> (report + provenance sidecar) for the same
+      # commit. GitHub serves another run's artifact only when the run id is
+      # pinned, so resolve it via the API first; a missing run or artifact
+      # fails this job (fail closed), never a silent skip.
+      - name: Resolve the CI run owning api-completeness-${{ github.sha }}
+        id: api-report-ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$(bash ci/resolve_ci_artifact_run.sh "api-completeness-${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+      - name: Download commit-bound api-completeness evidence from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: api-completeness-${{ github.sha }}
+          run-id: ${{ steps.api-report-ci.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: e2e-evidence
+      # Bind the downloaded report+provenance into release-evidence.json (both
+      # the outer file and its embedded peer copy, which the gate requires
+      # byte-identical) before the release gate runs.
+      - name: Fold api-report provenance into the release evidence
+        run: |
+          set -euo pipefail
+          python3 ci/fold_api_report_provenance.py \
+            --evidence e2e-evidence/release-evidence.json \
+            --peer e2e-evidence/steam-e2e-evidence/release-evidence.json \
+            --report e2e-evidence/api-completeness.json \
+            --provenance e2e-evidence/api-completeness.json.provenance.json \
+            --ci-run-id "${{ steps.api-report-ci.outputs.run_id }}" \
+            --ci-run-url "${{ steps.api-report-ci.outputs.run_url }}"
       # The release-smoke job's JIT self-test verdict must reach the
       # evidence: the smoke job uploads its report, and this job folds it
       # into release-evidence.json before the gate runs.
@@ -463,7 +506,9 @@ jobs:
           fi
       # Evidence model: the gate verifies release-evidence.json (commit ==
       # HEAD, all required fields "pass", Steam E2E artifact digest ties to
-      # this commit, signed candidate hash matches the artifact tested).
+      # this commit, signed candidate hash matches the artifact tested, and
+      # the folded api-report provenance ties the CI report to this
+      # commit/tree with matching raw + canonical report hashes).
       - name: Verify release evidence
         run: |
           RELEASE_EVIDENCE_FILE="$GITHUB_WORKSPACE/e2e-evidence/release-evidence.json" \

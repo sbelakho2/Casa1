@@ -19,7 +19,78 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Counters for the CoreVideo/IOSurface zero-copy pipeline.
+///
+/// * `iosurface_frames` — frames whose pixel storage is backed by a real
+///   `IOSurface` (VideoToolbox decode output or CoreVideo pixel buffers
+///   allocated by the software path).
+/// * `cpu_copies_avoided` — full-frame CPU pixel copies that the
+///   IOSurface/Metal path made unnecessary (hardware frames delivered as
+///   textures without touching CPU memory, and decoded frames presented by
+///   binding the IOSurface texture instead of uploading pixels).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZeroCopyStats {
+    pub iosurface_frames: u64,
+    pub cpu_copies_avoided: u64,
+}
+
+static IOSURFACE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static CPU_COPIES_AVOIDED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the process-wide zero-copy counters.
+pub fn zero_copy_stats() -> ZeroCopyStats {
+    ZeroCopyStats {
+        iosurface_frames: IOSURFACE_FRAMES.load(Ordering::Relaxed),
+        cpu_copies_avoided: CPU_COPIES_AVOIDED.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the process-wide zero-copy counters to zero.
+pub fn reset_zero_copy_stats() {
+    IOSURFACE_FRAMES.store(0, Ordering::Relaxed);
+    CPU_COPIES_AVOIDED.store(0, Ordering::Relaxed);
+}
+
+/// Record one IOSurface-backed decoded/created frame.
+pub(crate) fn record_iosurface_frame() {
+    IOSURFACE_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one full-frame CPU copy avoided on the way to the GPU.
+pub(crate) fn record_cpu_copy_avoided() {
+    CPU_COPIES_AVOIDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Availability of the CoreVideo → Metal zero-copy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroCopyStatus {
+    /// A Metal device and a CoreVideo texture cache are available.
+    Available,
+    /// No Metal device was found (the CPU decode path is still usable).
+    MetalUnavailable,
+    /// A Metal device exists but the CoreVideo texture cache could not be
+    /// created (the CPU decode path is still usable).
+    CoreVideoUnavailable,
+}
+
+impl ZeroCopyStatus {
+    /// Whether decoded frames can be exposed as IOSurface-backed textures.
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// Human-readable reason for a non-available status.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Available => "CoreVideo/Metal zero-copy path available",
+            Self::MetalUnavailable => "No Metal device available",
+            Self::CoreVideoUnavailable => "CVMetalTextureCache creation failed",
+        }
+    }
+}
 
 /// Maximum size (in bytes) of media data buffered from HTTP sources.
 ///
@@ -111,8 +182,10 @@ impl ColorSpace {
 
 /// Full-range YUV -> RGB conversion coefficients for the given color space,
 /// returned as `(cr, cg_u, cg_v, cb)` multipliers.
-#[cfg(target_os = "macos")]
-fn yuv_to_rgb_coeffs(color_space: ColorSpace) -> (f32, f32, f32, f32) {
+///
+/// Public within the crate so the Metal present path can pass the same
+/// coefficients to its NV12 conversion shader as the CPU path uses.
+pub(crate) fn yuv_to_rgb_coeffs(color_space: ColorSpace) -> (f32, f32, f32, f32) {
     match color_space {
         ColorSpace::Rec601 => (1.402, 0.344, 0.714, 1.772),
         ColorSpace::Rec709 => (1.5748, 0.1873, 0.4681, 1.8556),
@@ -166,13 +239,188 @@ pub struct VideoFrame {
     pub color_space: ColorSpace,
 }
 
+// ===========================================================================
+// CoreVideo surface registry
+// ===========================================================================
+//
+// `VideoFrame`'s public field set is frozen (integration tests construct it
+// directly), so the extra zero-copy state — the retained CVPixelBuffer and,
+// for NV12, the +1 retained UV-plane texture — is kept in a registry keyed by
+// the (unique while retained) luma/BGRA texture pointer. Entries are removed
+// by `VideoFrame::drop`, which then releases both resources.
+
+/// Extra CoreVideo state associated with a zero-copy frame's Metal texture.
+#[cfg(target_os = "macos")]
+struct FrameSurfaces {
+    /// +1 retained `CVPixelBufferRef` whose IOSurface backs the texture(s).
+    pixel_buffer: vt_ffi::CVPixelBufferRef,
+    /// +1 retained `id<MTLTexture>` for the NV12 chroma plane (null when
+    /// the frame is single-plane).
+    uv_texture: *mut std::ffi::c_void,
+    /// Whether CoreVideo actually backed the pixel buffer with an IOSurface.
+    iosurface: bool,
+}
+
+// SAFETY: the raw pointers reference CoreFoundation/Objective-C objects with
+// atomic retain/release semantics, and every access is serialized by the
+// `FRAME_SURFACES` mutex.
+#[cfg(target_os = "macos")]
+unsafe impl Send for FrameSurfaces {}
+
+#[cfg(target_os = "macos")]
+static FRAME_SURFACES: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, FrameSurfaces>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Associate CoreVideo state with a frame texture pointer.
+#[cfg(target_os = "macos")]
+fn register_frame_surfaces(
+    texture_ptr: *mut std::ffi::c_void,
+    pixel_buffer: vt_ffi::CVPixelBufferRef,
+    uv_texture: *mut std::ffi::c_void,
+    iosurface: bool,
+) {
+    if texture_ptr.is_null() {
+        return;
+    }
+    lock_poisoned(&FRAME_SURFACES).insert(
+        texture_ptr as usize,
+        FrameSurfaces {
+            pixel_buffer,
+            uv_texture,
+            iosurface,
+        },
+    );
+}
+
+/// Run `f` with the registry entry for `texture_ptr`, if any.
+#[cfg(target_os = "macos")]
+fn with_frame_surfaces<R>(
+    texture_ptr: *mut std::ffi::c_void,
+    f: impl FnOnce(&FrameSurfaces) -> R,
+) -> Option<R> {
+    if texture_ptr.is_null() {
+        return None;
+    }
+    lock_poisoned(&FRAME_SURFACES)
+        .get(&(texture_ptr as usize))
+        .map(f)
+}
+
+/// Remove and return the registry entry for `texture_ptr`.
+#[cfg(target_os = "macos")]
+fn take_frame_surfaces(texture_ptr: *mut std::ffi::c_void) -> Option<FrameSurfaces> {
+    if texture_ptr.is_null() {
+        return None;
+    }
+    lock_poisoned(&FRAME_SURFACES).remove(&(texture_ptr as usize))
+}
+
+impl VideoFrame {
+    /// The `IOSurfaceRef` backing this frame's pixel buffer, if any.
+    ///
+    /// The returned pointer is borrowed (`+0`): it is valid only while the
+    /// frame is alive and must not be released by the caller.
+    #[cfg(target_os = "macos")]
+    pub fn io_surface_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        let texture = self.metal_texture?;
+        with_frame_surfaces(texture, |surfaces| {
+            if !surfaces.iosurface || surfaces.pixel_buffer.is_null() {
+                return None;
+            }
+            // SAFETY: `pixel_buffer` is a +1 retained CVPixelBufferRef kept
+            // alive by the frame's registry entry.
+            let surface = unsafe { vt_ffi::CVPixelBufferGetIOSurface(surfaces.pixel_buffer) };
+            if surface.is_null() {
+                None
+            } else {
+                Some(surface)
+            }
+        })
+        .flatten()
+    }
+
+    /// The `IOSurfaceRef` backing this frame, if any (always `None` off macOS).
+    #[cfg(not(target_os = "macos"))]
+    pub fn io_surface_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// The retained `CVPixelBufferRef` backing this frame, if any.
+    ///
+    /// The returned pointer is borrowed (`+0`) and stays valid while the frame
+    /// is alive; CPU consumers can `CVPixelBufferLockBaseAddress` it for real
+    /// pixel access. Always `None` off macOS and for CPU-only frames.
+    #[cfg(target_os = "macos")]
+    pub fn pixel_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        let texture = self.metal_texture?;
+        with_frame_surfaces(texture, |surfaces| {
+            if surfaces.pixel_buffer.is_null() {
+                None
+            } else {
+                Some(surfaces.pixel_buffer)
+            }
+        })
+        .flatten()
+    }
+
+    /// The retained pixel buffer backing this frame (always `None` off macOS).
+    #[cfg(not(target_os = "macos"))]
+    pub fn pixel_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// Whether this frame's pixel storage is a real IOSurface.
+    pub fn is_iosurface_backed(&self) -> bool {
+        self.io_surface_ptr().is_some()
+    }
+
+    /// The +1 retained NV12 chroma-plane Metal texture, if this is a
+    /// two-plane frame. The pointer is borrowed (`+0`) and lives as long as
+    /// the frame.
+    #[cfg(target_os = "macos")]
+    pub fn uv_texture_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        let texture = self.metal_texture?;
+        with_frame_surfaces(texture, |surfaces| {
+            if surfaces.uv_texture.is_null() {
+                None
+            } else {
+                Some(surfaces.uv_texture)
+            }
+        })
+        .flatten()
+    }
+
+    /// The NV12 chroma-plane texture (always `None` off macOS).
+    #[cfg(not(target_os = "macos"))]
+    pub fn uv_texture_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    /// Whether the frame has a separate NV12 chroma-plane texture.
+    pub fn has_uv_plane(&self) -> bool {
+        self.uv_texture_ptr().is_some()
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Drop for VideoFrame {
     fn drop(&mut self) {
+        use self::vt_ffi::CVPixelBufferRelease;
         // SAFETY: `metal_texture` is a +1 retained id<MTLTexture> owned by
         // this frame (see `MetalVideoTextureCache::create_texture_from_pixel_buffer`).
-        if let Some(ptr) = self.metal_texture {
-            unsafe {
+        // Any NV12 chroma texture and the retained CVPixelBufferRef live in
+        // the registry and are released here as well.
+        unsafe {
+            if let Some(ptr) = self.metal_texture {
+                if let Some(surfaces) = take_frame_surfaces(ptr) {
+                    if !surfaces.uv_texture.is_null() {
+                        let uv = surfaces.uv_texture as *mut objc::runtime::Object;
+                        let _: () = msg_send![uv, release];
+                    }
+                    if !surfaces.pixel_buffer.is_null() {
+                        CVPixelBufferRelease(surfaces.pixel_buffer);
+                    }
+                }
                 let obj = ptr as *mut objc::runtime::Object;
                 let _: () = msg_send![obj, release];
             }
@@ -281,16 +529,36 @@ pub(crate) mod vt_ffi {
     pub const kCVPixelFormatType_32BGRA: u32 = 0x42475241;
     /// NV12 bi-planar video-range pixel format '420v'.
     pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = 0x34323076;
+    /// NV12 bi-planar full-range pixel format '420f'.
+    pub const kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: u32 = 0x34323066;
 
     /// Block buffer flag: ensure memory is backed by real pages.
     pub const kCMBlockBuffer_AssureMemoryNowFlag: u32 = 0;
 
     /// kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder key.
+    ///
+    /// Stored without a trailing NUL: `CString::new` appends the terminator.
     pub const kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: &[u8] =
-        b"RequireHardwareAcceleratedVideoDecoder\0";
+        b"RequireHardwareAcceleratedVideoDecoder";
 
     /// kCVPixelBufferPixelFormatTypeKey
-    pub const kCVPixelBufferPixelFormatTypeKey: &[u8] = b"PixelFormatType\0";
+    pub const kCVPixelBufferPixelFormatTypeKey: &[u8] = b"PixelFormatType";
+
+    /// kCVPixelBufferIOSurfacePropertiesKey — requests an IOSurface-backed
+    /// pixel buffer (value must be a CFDictionary, usually empty).
+    pub const kCVPixelBufferIOSurfacePropertiesKey: &[u8] = b"IOSurfaceProperties";
+
+    /// kCVPixelBufferMetalCompatibilityKey — marks the buffer usable by Metal.
+    pub const kCVPixelBufferMetalCompatibilityKey: &[u8] = b"MetalCompatibility";
+
+    // ---- VideoToolbox compression (used to produce real H.264 test streams) ----
+
+    /// kVTCompressionPropertyKey_RealTime
+    pub const kVTCompressionPropertyKey_RealTime: &[u8] = b"RealTime";
+    /// kVTCompressionPropertyKey_AllowFrameReordering
+    pub const kVTCompressionPropertyKey_AllowFrameReordering: &[u8] = b"AllowFrameReordering";
+    /// kVTCompressionPropertyKey_MaxKeyFrameInterval
+    pub const kVTCompressionPropertyKey_MaxKeyFrameInterval: &[u8] = b"MaxKeyFrameInterval";
 
     // ---- CMTime structure ----
 
@@ -348,6 +616,24 @@ pub(crate) mod vt_ffi {
         pub decompressionOutputRefCon: *mut c_void,
     }
 
+    // ---- VideoToolbox compression types ----
+
+    /// VideoToolbox compression session.
+    pub type VTCompressionSessionRef = *mut c_void;
+    /// VideoToolbox session (base type used by VTSessionSetProperty).
+    pub type VTSessionRef = *mut c_void;
+    /// VTEncodeInfoFlags.
+    pub type VTEncodeInfoFlags = u32;
+
+    /// C callback invoked by VideoToolbox when an encoded sample is ready.
+    pub type VTCompressionOutputCallback = unsafe extern "C" fn(
+        outputCallbackRefCon: *mut c_void,
+        sourceFrameRefCon: *mut c_void,
+        status: i32,
+        infoFlags: VTEncodeInfoFlags,
+        sampleBuffer: CMSampleBufferRef,
+    );
+
     // ---- FFI function declarations ----
     //
     // Multiple framework link attributes on one extern block trip
@@ -404,15 +690,34 @@ pub(crate) mod vt_ffi {
 
         /// Create a CMVideoFormatDescription from H.264 parameter sets (SPS, PPS).
         ///
-        /// Matches the real API:
-        /// `CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator,
-        /// parameterSetCount, parameterSetSizes, parameterSetPointers,
-        /// nalUnitHeaderLength, out)`.
+        /// NOTE: this legacy declaration keeps the historical (incorrect)
+        /// `sizes, pointers` argument order for in-crate callers that already
+        /// bind it. New code must use
+        /// [`cm_video_format_description_create_from_h264_parameter_sets`],
+        /// which matches the real API order (`pointers, sizes`).
         pub fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
             allocator: CFAllocatorRef,
             parameterSetCount: usize,
             parameterSetSizes: *const usize,
             parameterSetPointers: *const *const u8,
+            nalUnitHeaderLength: i32,
+            formatDescriptionOut: *mut CMVideoFormatDescriptionRef,
+        ) -> i32;
+
+        /// Correct-order binding of `CMVideoFormatDescriptionCreateFromH264ParameterSets`.
+        ///
+        /// The real CoreMedia signature is
+        /// `(allocator, parameterSetCount, parameterSetPointers,
+        /// parameterSetSizes, nalUnitHeaderLength, out)`; the legacy
+        /// declaration above has `sizes` and `pointers` swapped, so this
+        /// separate binding calls the same symbol with the right ABI.
+        #[link_name = "CMVideoFormatDescriptionCreateFromH264ParameterSets"]
+        #[allow(clashing_extern_declarations)]
+        pub fn cm_video_format_description_create_from_h264_parameter_sets(
+            allocator: CFAllocatorRef,
+            parameterSetCount: usize,
+            parameterSetPointers: *const *const u8,
+            parameterSetSizes: *const usize,
             nalUnitHeaderLength: i32,
             formatDescriptionOut: *mut CMVideoFormatDescriptionRef,
         ) -> i32;
@@ -452,6 +757,16 @@ pub(crate) mod vt_ffi {
         pub fn CVPixelBufferGetWidth(pixelBuffer: CVPixelBufferRef) -> usize;
         /// Get the height of a pixel buffer.
         pub fn CVPixelBufferGetHeight(pixelBuffer: CVPixelBufferRef) -> usize;
+        /// Get the width of a pixel buffer plane.
+        pub fn CVPixelBufferGetWidthOfPlane(
+            pixelBuffer: CVPixelBufferRef,
+            planeIndex: usize,
+        ) -> usize;
+        /// Get the height of a pixel buffer plane.
+        pub fn CVPixelBufferGetHeightOfPlane(
+            pixelBuffer: CVPixelBufferRef,
+            planeIndex: usize,
+        ) -> usize;
         /// Get the pixel format type of a pixel buffer.
         pub fn CVPixelBufferGetPixelFormatType(pixelBuffer: CVPixelBufferRef) -> u32;
         /// Get the base address of a pixel buffer (for packed formats).
@@ -555,6 +870,101 @@ pub(crate) mod vt_ffi {
         ///
         /// Pass `options = 0` for a standard flush.
         pub fn CVMetalTextureCacheFlush(cache: CVMetalTextureCacheRef, options: u64);
+
+        // ========== CoreVideo pixel buffer creation ==========
+
+        /// Create a CVPixelBuffer with the given pixel format and attributes.
+        pub fn CVPixelBufferCreate(
+            allocator: CFAllocatorRef,
+            width: usize,
+            height: usize,
+            pixelFormatType: u32,
+            pixelBufferAttributes: CFDictionaryRef,
+            pixelBufferOut: *mut CVPixelBufferRef,
+        ) -> CVReturn;
+
+        /// Create a CVPixelBuffer that uses the storage of an existing IOSurface.
+        pub fn CVPixelBufferCreateWithIOSurface(
+            allocator: CFAllocatorRef,
+            surface: *mut c_void,
+            pixelBufferAttributes: CFDictionaryRef,
+            pixelBufferOut: *mut CVPixelBufferRef,
+        ) -> CVReturn;
+
+        /// Return the IOSurface backing a pixel buffer (borrowed reference).
+        pub fn CVPixelBufferGetIOSurface(pixelBuffer: CVPixelBufferRef) -> *mut c_void;
+
+        // ========== VideoToolbox compression ==========
+
+        /// Create a VideoToolbox compression (encoder) session.
+        pub fn VTCompressionSessionCreate(
+            allocator: CFAllocatorRef,
+            width: i32,
+            height: i32,
+            codecType: u32,
+            encoderSpecification: CFDictionaryRef,
+            sourceImageBufferAttributes: CFDictionaryRef,
+            compressedDataAllocator: CFAllocatorRef,
+            outputCallback: Option<VTCompressionOutputCallback>,
+            outputCallbackRefCon: *mut c_void,
+            compressionSessionOut: *mut VTCompressionSessionRef,
+        ) -> i32;
+
+        /// Set a property on a VideoToolbox session.
+        pub fn VTSessionSetProperty(
+            session: VTSessionRef,
+            propertyKey: CFStringRef,
+            propertyValue: CFTypeRef,
+        ) -> i32;
+
+        /// Encode one frame.
+        pub fn VTCompressionSessionEncodeFrame(
+            session: VTCompressionSessionRef,
+            imageBuffer: CVPixelBufferRef,
+            presentationTimeStamp: CMTime,
+            duration: CMTime,
+            frameProperties: CFDictionaryRef,
+            sourceFrameRefCon: *mut c_void,
+            infoFlagsOut: *mut VTEncodeInfoFlags,
+        ) -> i32;
+
+        /// Block until all pending frames have been emitted.
+        pub fn VTCompressionSessionCompleteFrames(
+            session: VTCompressionSessionRef,
+            completeUntilPresentationTimeStamp: CMTime,
+        ) -> i32;
+
+        /// Invalidate a compression session.
+        pub fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
+
+        // ========== CMSampleBuffer inspection ==========
+
+        /// Get the block buffer containing a sample buffer's data.
+        pub fn CMSampleBufferGetDataBuffer(sampleBuffer: CMSampleBufferRef) -> CMBlockBufferRef;
+
+        /// Get the format description of a sample buffer.
+        pub fn CMSampleBufferGetFormatDescription(
+            sampleBuffer: CMSampleBufferRef,
+        ) -> CMVideoFormatDescriptionRef;
+
+        /// Get a pointer to a block buffer's contiguous data.
+        pub fn CMBlockBufferGetDataPointer(
+            buffer: CMBlockBufferRef,
+            offset: usize,
+            lengthAtOffsetOut: *mut usize,
+            totalLengthOut: *mut usize,
+            dataPointerOut: *mut *mut std::ffi::c_char,
+        ) -> i32;
+
+        /// Get the Nth H.264 parameter set (SPS/PPS) from a format description.
+        pub fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            videoDesc: CMVideoFormatDescriptionRef,
+            parameterSetIndex: usize,
+            parameterSetPointerOut: *mut *const u8,
+            parameterSetSizeOut: *mut usize,
+            parameterSetCountOut: *mut usize,
+            nalUnitHeaderLengthOut: *mut i32,
+        ) -> i32;
     }
 
     // CFNumber types
@@ -576,6 +986,12 @@ pub const MTLPixelFormatRGBA8Unorm: u32 = 70;
 /// MTLPixelFormatNV12 — bi-planar Y/CbCr (420v).
 #[cfg(target_os = "macos")]
 pub const MTLPixelFormatNV12: u32 = 150;
+/// MTLPixelFormatR8Unorm — single 8-bit component (NV12 luma plane).
+#[cfg(target_os = "macos")]
+pub const MTLPixelFormatR8Unorm: u32 = 10;
+/// MTLPixelFormatRG8Unorm — two 8-bit components (NV12 chroma plane).
+#[cfg(target_os = "macos")]
+pub const MTLPixelFormatRG8Unorm: u32 = 30;
 
 // ===========================================================================
 // CVMetalTextureCache — zero-copy CVPixelBuffer → MTLTexture bridge
@@ -829,6 +1245,7 @@ mod ffmpeg_decoder {
                 pts,
                 duration,
                 texture_id: None,
+                metal_texture: None,
                 color_space: ColorSpace::Rec709,
             }))
         }
@@ -921,6 +1338,9 @@ pub struct VideoDecoder {
     /// is available; `None` otherwise.
     #[cfg(target_os = "macos")]
     metal_cache: Option<MetalVideoTextureCache>,
+    /// Probed availability of the CoreVideo → Metal zero-copy path.
+    #[cfg(target_os = "macos")]
+    zero_copy_status: ZeroCopyStatus,
 
     #[cfg(feature = "ffmpeg")]
     ffmpeg_ctx: Option<ffmpeg_decoder::FfmpegCodecContext>,
@@ -948,9 +1368,16 @@ impl VideoDecoder {
             }
         };
 
+        // Probe the CoreVideo → Metal capability once. When it is not
+        // available the decoder keeps working through the existing CPU path.
         #[cfg(target_os = "macos")]
-        let metal_cache =
-            metal::Device::system_default().and_then(|dev| MetalVideoTextureCache::new(&dev));
+        let (metal_cache, zero_copy_status) = match metal::Device::system_default() {
+            Some(dev) => match MetalVideoTextureCache::new(&dev) {
+                Some(cache) => (Some(cache), ZeroCopyStatus::Available),
+                None => (None, ZeroCopyStatus::CoreVideoUnavailable),
+            },
+            None => (None, ZeroCopyStatus::MetalUnavailable),
+        };
 
         Self {
             #[cfg(target_os = "macos")]
@@ -963,6 +1390,8 @@ impl VideoDecoder {
             callback_refcon: None,
             #[cfg(target_os = "macos")]
             metal_cache,
+            #[cfg(target_os = "macos")]
+            zero_copy_status,
             #[cfg(feature = "ffmpeg")]
             ffmpeg_ctx,
             config,
@@ -973,6 +1402,23 @@ impl VideoDecoder {
             frame_queue: VecDeque::new(),
             frame_number: 0,
         }
+    }
+
+    /// Probed availability of the CoreVideo → Metal zero-copy path.
+    ///
+    /// When this is not `Available`, decoded frames are delivered through the
+    /// existing CPU RGBA path (`VideoFrame::data`) with
+    /// [`ZeroCopyStatus::reason`] explaining why.
+    #[cfg(target_os = "macos")]
+    pub fn zero_copy_status(&self) -> ZeroCopyStatus {
+        self.zero_copy_status
+    }
+
+    /// Availability of the CoreVideo → Metal zero-copy path (always
+    /// [`ZeroCopyStatus::MetalUnavailable`] off macOS).
+    #[cfg(not(target_os = "macos"))]
+    pub fn zero_copy_status(&self) -> ZeroCopyStatus {
+        ZeroCopyStatus::MetalUnavailable
     }
 
     /// Decode a single packet of compressed video data.
@@ -1135,11 +1581,11 @@ impl VideoDecoder {
         // 1. Create CMVideoFormatDescription from SPS + PPS
         let mut format_desc: CMVideoFormatDescriptionRef = ptr::null_mut();
         let status = unsafe {
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            cm_video_format_description_create_from_h264_parameter_sets(
                 ptr::null_mut(), // kCFAllocatorDefault
                 2,               // SPS + PPS
-                param_set_sizes.as_ptr(),
                 param_set_pointers.as_ptr(),
+                param_set_sizes.as_ptr(),
                 4, // nalUnitHeaderLength: AVCC 4-byte length prefixes
                 &mut format_desc,
             )
@@ -1195,8 +1641,11 @@ impl VideoDecoder {
             }
         };
 
-        // 4. Create destination pixel buffer attributes (request BGRA output)
-        let dest_attrs = match create_bgra_pixel_buffer_attributes() {
+        // 4. Create destination pixel buffer attributes. Request native
+        //    NV12 (hardware decoder output) with IOSurface backing so the
+        //    decoded CVPixelBuffer can be wrapped as a Metal texture without
+        //    any CPU copy. `software_copy` handles NV12/BGRA for CPU callers.
+        let dest_attrs = match create_zero_copy_pixel_buffer_attributes() {
             Ok(attrs) => attrs,
             Err(e) => {
                 cleanup_on_error(self, format_desc);
@@ -1216,9 +1665,12 @@ impl VideoDecoder {
             }
         };
 
-        // 6. Create the decompression session
+        // 6. Create the decompression session. If VideoToolbox rejects the
+        //    NV12/IOSurface attributes (some decoders only accept packed
+        //    output), retry once with the legacy BGRA attributes so decoding
+        //    keeps working through the CPU path.
         let mut session: VTDecompressionSessionRef = ptr::null_mut();
-        let status = unsafe {
+        let mut status = unsafe {
             VTDecompressionSessionCreate(
                 ptr::null_mut(), // kCFAllocatorDefault
                 format_desc,
@@ -1228,12 +1680,39 @@ impl VideoDecoder {
                 &mut session,
             )
         };
+        if status != 0 || session.is_null() {
+            if !dest_attrs.is_null() {
+                unsafe { CFRelease(dest_attrs as CFTypeRef) };
+            }
+            // Retry with packed BGRA (still requesting IOSurface backing so
+            // the zero-copy path remains possible for BGRA-capable decoders).
+            let bgra_attrs = create_pixel_buffer_attributes(kCVPixelFormatType_32BGRA, false)
+                .unwrap_or(ptr::null());
+            eprintln!(
+                "[VideoDecoder] NV12 zero-copy attributes rejected (status={status}); \
+                 retrying with BGRA destination buffers"
+            );
+            status = unsafe {
+                VTDecompressionSessionCreate(
+                    ptr::null_mut(),
+                    format_desc,
+                    decoder_spec,
+                    bgra_attrs,
+                    &callback_record,
+                    &mut session,
+                )
+            };
+            if !bgra_attrs.is_null() {
+                unsafe { CFRelease(bgra_attrs as CFTypeRef) };
+            }
+        }
 
-        // Release CoreFoundation objects we created
+        // Release CoreFoundation objects we created. `dest_attrs` was already
+        // released on the retry path above.
         if !decoder_spec.is_null() {
             unsafe { CFRelease(decoder_spec as CFTypeRef) };
         }
-        if !dest_attrs.is_null() {
+        if status == 0 && !session.is_null() && !dest_attrs.is_null() {
             unsafe { CFRelease(dest_attrs as CFTypeRef) };
         }
 
@@ -1861,44 +2340,11 @@ unsafe extern "C" fn decompression_output_callback(
         let result = if width == 0 || height == 0 {
             None
         } else {
-            // ---- ZERO-COPY PATH (CVMetalTextureCache) ----
-            // Only 32BGRA pixel buffers are eligible: CoreVideo supports
-            // direct BGRA texture wrapping, and requesting anything else
-            // (e.g. "converting" NV12 to BGRA) yields undefined contents.
-            // NV12 buffers fall through to the software path below.
-            if let Some(ref metal_cache) = ctx.metal_cache {
-                let pixel_format = CVPixelBufferGetPixelFormatType(imageBuffer);
-                if pixel_format == kCVPixelFormatType_32BGRA {
-                    let mtl_texture = metal_cache.create_texture_from_pixel_buffer(
-                        imageBuffer,
-                        width,
-                        height,
-                        MTLPixelFormatBGRA8Unorm,
-                        0, // planeIndex: 0 for single-plane BGRA
-                    );
-                    if let Some(texture_ptr) = mtl_texture {
-                        // Zero-copy succeeded — no need to lock / copy pixels.
-                        let frame = VideoFrame {
-                            width: ctx.output_width.max(width),
-                            height: ctx.output_height.max(height),
-                            data: Vec::new(), // zero-copy — no CPU data
-                            pts,
-                            duration,
-                            texture_id: None,
-                            metal_texture: Some(texture_ptr),
-                            color_space: ctx.color_space,
-                        };
-                        Some(frame)
-                    } else {
-                        // Zero-copy failed — fall through to software path below.
-                        software_copy(&ctx, imageBuffer, width, height, pts, duration)
-                    }
-                } else {
-                    software_copy(&ctx, imageBuffer, width, height, pts, duration)
-                }
-            } else {
-                software_copy(&ctx, imageBuffer, width, height, pts, duration)
-            }
+            // Prefer the zero-copy IOSurface → Metal texture path; fall back
+            // to the existing CPU RGBA copy when CoreVideo/Metal or the
+            // pixel-buffer layout cannot support it.
+            try_zero_copy_frame(&ctx, imageBuffer, width, height, pts, duration)
+                .or_else(|| software_copy(&ctx, imageBuffer, width, height, pts, duration))
         };
 
         if let Some(frame) = result {
@@ -1908,6 +2354,124 @@ unsafe extern "C" fn decompression_output_callback(
 
         drop(ctx);
     }
+}
+
+/// Try to wrap the decoded `CVPixelBuffer` as an IOSurface-backed Metal
+/// texture (zero-copy), retaining the pixel buffer for the frame's lifetime.
+///
+/// Handles both packed BGRA (`'BGRA'`) and bi-planar NV12 (`'420v'`/`'420f'`)
+/// output; for NV12 the luma plane becomes `metal_texture` (R8Unorm) and the
+/// interleaved chroma plane becomes the frame's UV texture (RG8Unorm, see `VideoFrame::uv_texture_ptr`).
+///
+/// Returns `None` when the buffer is not IOSurface-backed, the texture cache
+/// is unavailable, or the format is unsupported — in which case the caller
+/// falls back to the CPU path.
+#[cfg(target_os = "macos")]
+fn try_zero_copy_frame(
+    ctx: &Arc<DecoderContext>,
+    image_buffer: vt_ffi::CVPixelBufferRef,
+    width: u32,
+    height: u32,
+    pts: u64,
+    duration: u64,
+) -> Option<VideoFrame> {
+    use self::vt_ffi::*;
+
+    let metal_cache = ctx.metal_cache.as_ref()?;
+
+    // The zero-copy path requires an IOSurface: only then does the Metal
+    // texture alias the decoder's storage instead of a private copy.
+    // SAFETY: `image_buffer` is live for the duration of the callback.
+    let surface = unsafe { CVPixelBufferGetIOSurface(image_buffer) };
+    if surface.is_null() {
+        return None;
+    }
+
+    // SAFETY: `image_buffer` is live for the duration of the callback.
+    let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(image_buffer) };
+    let (texture, texture_uv) = match pixel_format {
+        kCVPixelFormatType_32BGRA => {
+            // SAFETY: `image_buffer` is a valid CVPixelBufferRef delivered by
+            // VideoToolbox while this callback runs.
+            let texture = unsafe {
+                metal_cache.create_texture_from_pixel_buffer(
+                    image_buffer,
+                    width,
+                    height,
+                    MTLPixelFormatBGRA8Unorm,
+                    0,
+                )
+            }?;
+            (texture, None)
+        }
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        | kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
+            // SAFETY: as above; plane 0 is luma, plane 1 interleaved chroma.
+            let y_texture = unsafe {
+                metal_cache.create_texture_from_pixel_buffer(
+                    image_buffer,
+                    width,
+                    height,
+                    MTLPixelFormatR8Unorm,
+                    0,
+                )
+            };
+            // Use CoreVideo's real plane dimensions (they are the authoritative
+            // chroma size; `div_ceil` is only a fallback for odd buffers).
+            let mut uv_width = unsafe { CVPixelBufferGetWidthOfPlane(image_buffer, 1) } as u32;
+            let mut uv_height = unsafe { CVPixelBufferGetHeightOfPlane(image_buffer, 1) } as u32;
+            if uv_width == 0 || uv_height == 0 {
+                uv_width = width.div_ceil(2);
+                uv_height = height.div_ceil(2);
+            }
+            let uv_texture = unsafe {
+                metal_cache.create_texture_from_pixel_buffer(
+                    image_buffer,
+                    uv_width,
+                    uv_height,
+                    MTLPixelFormatRG8Unorm,
+                    1,
+                )
+            };
+            match (y_texture, uv_texture) {
+                (Some(y), Some(uv)) => (y, Some(uv)),
+                (y, uv) => {
+                    // Release any half-created texture so nothing leaks.
+                    unsafe {
+                        if let Some(ptr) = y {
+                            CFRelease(ptr as CFTypeRef);
+                        }
+                        if let Some(ptr) = uv {
+                            CFRelease(ptr as CFTypeRef);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        // Unknown/unsupported format: the CPU path knows how to read it.
+        _ => return None,
+    };
+
+    // Retain the pixel buffer: it owns the IOSurface that backs the texture
+    // and must outlive this callback. Released by `VideoFrame::drop`.
+    // SAFETY: `image_buffer` is a live CVPixelBufferRef.
+    unsafe { CVPixelBufferRetain(image_buffer) };
+    let uv_ptr = texture_uv.unwrap_or(std::ptr::null_mut());
+    register_frame_surfaces(texture, image_buffer, uv_ptr, true);
+    record_iosurface_frame();
+    record_cpu_copy_avoided();
+
+    Some(VideoFrame {
+        width: ctx.output_width.max(width),
+        height: ctx.output_height.max(height),
+        data: Vec::new(), // zero-copy — no CPU pixel copy
+        pts,
+        duration,
+        texture_id: None,
+        metal_texture: Some(texture),
+        color_space: ctx.color_space,
+    })
 }
 
 /// Convert a `CMTime` to microseconds; a zero/invalid timescale yields 0.
@@ -1988,7 +2552,8 @@ fn software_copy(
                     }
                 }
             }
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            | kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
                 // NV12 bi-planar: Y plane + interleaved UV plane
                 let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
                 let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
@@ -2081,116 +2646,592 @@ fn software_copy(
 }
 
 // ===========================================================================
+// CoreVideo-backed zero-copy frame creation (software path)
+// ===========================================================================
+
+/// Probe the CoreVideo → Metal zero-copy path on this machine.
+///
+/// A real `CVMetalTextureCache` is created and immediately dropped, so the
+/// result reflects actual framework availability rather than configuration.
+#[cfg(target_os = "macos")]
+pub fn probe_zero_copy_status() -> ZeroCopyStatus {
+    match metal::Device::system_default() {
+        Some(device) => match MetalVideoTextureCache::new(&device) {
+            Some(_) => ZeroCopyStatus::Available,
+            None => ZeroCopyStatus::CoreVideoUnavailable,
+        },
+        None => ZeroCopyStatus::MetalUnavailable,
+    }
+}
+
+/// Probe the CoreVideo → Metal zero-copy path (always unavailable off macOS).
+#[cfg(not(target_os = "macos"))]
+pub fn probe_zero_copy_status() -> ZeroCopyStatus {
+    ZeroCopyStatus::MetalUnavailable
+}
+
+/// Wrap an IOSurface into a `CVPixelBuffer` via CoreVideo.
+///
+/// Takes a `+0` borrowed reference to `surface` (the surface must stay alive
+/// for the duration of the call); on success returns a `+1` retained
+/// `CVPixelBufferRef` that the caller owns.
+///
+/// # Safety
+/// `surface` must be a live `IOSurfaceRef` with a pixel format/layout matching
+/// the intended use. Passing anything else is undefined behaviour.
+#[cfg(target_os = "macos")]
+pub unsafe fn wrap_io_surface_in_pixel_buffer(
+    surface: *mut c_void,
+) -> AppResult<vt_ffi::CVPixelBufferRef> {
+    use self::vt_ffi::*;
+    use std::ptr;
+
+    if surface.is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "wrap_io_surface_in_pixel_buffer: null IOSurface",
+        ));
+    }
+
+    let mut pixel_buffer: CVPixelBufferRef = ptr::null_mut();
+    // SAFETY: per the contract, `surface` is a live IOSurfaceRef. Passing a
+    // NULL attribute dictionary uses CoreVideo's defaults.
+    let status = unsafe {
+        CVPixelBufferCreateWithIOSurface(ptr::null_mut(), surface, ptr::null(), &mut pixel_buffer)
+    };
+    if status != 0 || pixel_buffer.is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!("CVPixelBufferCreateWithIOSurface failed with status {status}"),
+        ));
+    }
+    Ok(pixel_buffer)
+}
+
+/// Copy tightly packed RGBA rows into a locked BGRA pixel buffer, honoring the
+/// buffer's real `BytesPerRow`.
+#[cfg(target_os = "macos")]
+fn write_rgba_into_bgra_pixel_buffer(
+    pixel_buffer: vt_ffi::CVPixelBufferRef,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> AppResult<()> {
+    use self::vt_ffi::*;
+
+    let src_stride = width
+        .checked_mul(4)
+        .ok_or_else(|| AppError::new(ReasonCode::RcMediaInvalid, "RGBA stride overflow"))?;
+    if rgba.len() < src_stride * height {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!(
+                "RGBA source too small: {} bytes for {width}x{height}",
+                rgba.len()
+            ),
+        ));
+    }
+
+    // SAFETY: `pixel_buffer` is a live CVPixelBufferRef owned by the caller.
+    unsafe {
+        let lock_status = CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+        if lock_status != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("CVPixelBufferLockBaseAddress failed with status {lock_status}"),
+            ));
+        }
+
+        let base = CVPixelBufferGetBaseAddress(pixel_buffer) as *mut u8;
+        let dst_stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
+        if base.is_null() || dst_stride < src_stride {
+            CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "Pixel buffer has no base address or a stride smaller than the frame",
+            ));
+        }
+
+        // BGRA byte order expected by Metal/CoreVideo; swap R and B.
+        for y in 0..height {
+            let src_row = &rgba[y * src_stride..y * src_stride + src_stride];
+            let dst_row = base.add(y * dst_stride);
+            for x in 0..width {
+                let si = x * 4;
+                *dst_row.add(si) = src_row[si + 2]; // B
+                *dst_row.add(si + 1) = src_row[si + 1]; // G
+                *dst_row.add(si + 2) = src_row[si]; // R
+                *dst_row.add(si + 3) = src_row[si + 3]; // A
+            }
+        }
+
+        let unlock_status = CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        if unlock_status != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("CVPixelBufferUnlockBaseAddress failed with status {unlock_status}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap an IOSurface as a `+1` retained `id<MTLTexture>` via
+/// `metal_backend::create_texture_from_io_surface`.
+///
+/// Used as the fallback when `CVMetalTextureCache` is unavailable. The
+/// returned pointer is owned by the caller (release via `msg_send![obj, release]`
+/// or by adopting it with `metal::Texture::from_ptr`).
+#[cfg(target_os = "macos")]
+fn wrap_io_surface_texture(
+    surface: *mut c_void,
+    format: metal::MTLPixelFormat,
+    width: u32,
+    height: u32,
+) -> Option<*mut c_void> {
+    use metal::foreign_types::ForeignType;
+
+    let device = metal::Device::system_default()?;
+    let texture = crate::metal_backend::create_texture_from_io_surface(
+        &device,
+        surface,
+        format,
+        width as u64,
+        height as u64,
+    )?;
+    let ptr = texture.as_ptr() as *mut c_void;
+    // Transfer the +1 reference into the raw pointer (no release on drop).
+    std::mem::forget(texture);
+    Some(ptr)
+}
+
+/// Create a decoded frame whose pixels live in an IOSurface-backed
+/// `CVPixelBuffer`, exposed directly as a BGRA8 Metal texture.
+///
+/// This is the software-path equivalent of the hardware zero-copy pipeline:
+/// the pixel buffer is created through CoreVideo (`CVPixelBufferCreate`), the
+/// RGBA pixels are written through a real lock/unlock, and the resulting
+/// IOSurface is wrapped as a Metal texture with no separate upload copy.
+///
+/// The returned frame has empty `data` (the texture owns the pixels); CPU
+/// consumers can lock `frame.pixel_buffer_ptr()`.
+#[cfg(target_os = "macos")]
+pub fn create_corevideo_frame_from_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    pts: u64,
+    duration: u64,
+    color_space: ColorSpace,
+) -> AppResult<VideoFrame> {
+    use self::vt_ffi::*;
+    use std::ptr;
+
+    if width == 0 || height == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "Cannot create a zero-sized CoreVideo frame",
+        ));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| AppError::new(ReasonCode::RcMediaInvalid, "Frame dimensions overflow"))?;
+    if rgba.len() < expected {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!(
+                "RGBA source has {} bytes, need {expected} for {width}x{height}",
+                rgba.len()
+            ),
+        ));
+    }
+
+    // Create the CoreVideo pixel buffer with IOSurface backing. If the Metal
+    // compatibility key is rejected, retry without it — IOSurface backing
+    // alone is sufficient for CVMetalTextureCache wrapping.
+    let mut pixel_buffer: CVPixelBufferRef = ptr::null_mut();
+    let mut status = 0;
+    for metal_compat in [true, false] {
+        let attrs = create_pixel_buffer_attributes(kCVPixelFormatType_32BGRA, metal_compat)?;
+        status = unsafe {
+            CVPixelBufferCreate(
+                ptr::null_mut(),
+                width as usize,
+                height as usize,
+                kCVPixelFormatType_32BGRA,
+                attrs,
+                &mut pixel_buffer,
+            )
+        };
+        unsafe { CFRelease(attrs as CFTypeRef) };
+        if status == 0 && !pixel_buffer.is_null() {
+            break;
+        }
+        if metal_compat {
+            eprintln!(
+                "[VideoDecoder] CVPixelBufferCreate with MetalCompatibility failed \
+                 (status={status}); retrying without it"
+            );
+        }
+    }
+    if status != 0 || pixel_buffer.is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!("CVPixelBufferCreate failed with status {status}"),
+        ));
+    }
+
+    if let Err(error) =
+        write_rgba_into_bgra_pixel_buffer(pixel_buffer, width as usize, height as usize, rgba)
+    {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(error);
+    }
+
+    // SAFETY: `pixel_buffer` is a live, retained CVPixelBufferRef.
+    let surface = unsafe { CVPixelBufferGetIOSurface(pixel_buffer) };
+    if surface.is_null() {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "CoreVideo did not back the pixel buffer with an IOSurface",
+        ));
+    }
+
+    let texture = match metal::Device::system_default() {
+        Some(device) => match MetalVideoTextureCache::new(&device) {
+            Some(cache) => unsafe {
+                cache.create_texture_from_pixel_buffer(
+                    pixel_buffer,
+                    width,
+                    height,
+                    MTLPixelFormatBGRA8Unorm,
+                    0,
+                )
+            },
+            None => None,
+        },
+        None => None,
+    }
+    .or_else(|| wrap_io_surface_texture(surface, metal::MTLPixelFormat::BGRA8Unorm, width, height));
+    let Some(texture) = texture else {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "Failed to wrap the IOSurface-backed pixel buffer as a Metal texture",
+        ));
+    };
+
+    record_iosurface_frame();
+    register_frame_surfaces(texture, pixel_buffer, std::ptr::null_mut(), true);
+    Ok(VideoFrame {
+        width,
+        height,
+        data: Vec::new(),
+        pts,
+        duration,
+        texture_id: None,
+        metal_texture: Some(texture),
+        color_space,
+    })
+}
+
+/// Create a decoded NV12 frame in an IOSurface-backed `CVPixelBuffer` and
+/// expose both planes as Metal textures (Y = R8Unorm, UV = RG8Unorm).
+///
+/// `y_plane` must hold `width * height` bytes and `uv_plane` must hold
+/// interleaved CbCr samples for a `(width / 2) x (height / 2)` plane. This is
+/// the same layout VideoToolbox produces for `'420v'` hardware decode, so the
+/// present path is identical for hardware and software frames.
+#[cfg(target_os = "macos")]
+pub fn create_corevideo_nv12_frame(
+    width: u32,
+    height: u32,
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    pts: u64,
+    duration: u64,
+    color_space: ColorSpace,
+) -> AppResult<VideoFrame> {
+    use self::vt_ffi::*;
+    use std::ptr;
+
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("NV12 frames require non-zero even dimensions, got {width}x{height}"),
+        ));
+    }
+    let y_len = (width as usize) * (height as usize);
+    let chroma_w = (width / 2) as usize;
+    let chroma_h = (height / 2) as usize;
+    let uv_len = chroma_w * chroma_h * 2;
+    if y_plane.len() < y_len || uv_plane.len() < uv_len {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!(
+                "NV12 planes too small: y={} (need {y_len}), uv={} (need {uv_len})",
+                y_plane.len(),
+                uv_plane.len()
+            ),
+        ));
+    }
+
+    let mut pixel_buffer: CVPixelBufferRef = ptr::null_mut();
+    let attrs =
+        create_pixel_buffer_attributes(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, false)?;
+    let status = unsafe {
+        CVPixelBufferCreate(
+            ptr::null_mut(),
+            width as usize,
+            height as usize,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            attrs,
+            &mut pixel_buffer,
+        )
+    };
+    unsafe { CFRelease(attrs as CFTypeRef) };
+    if status != 0 || pixel_buffer.is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!("CVPixelBufferCreate (NV12) failed with status {status}"),
+        ));
+    }
+
+    // SAFETY: `pixel_buffer` is live and retained; plane writes are bounded by
+    // the real plane strides/sizes reported by CoreVideo.
+    let write_ok = unsafe {
+        let lock_status = CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+        if lock_status != 0 {
+            false
+        } else {
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0) as *mut u8;
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1) as *mut u8;
+            let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+            let ok = !y_base.is_null()
+                && !uv_base.is_null()
+                && y_stride >= width as usize
+                && uv_stride >= chroma_w * 2;
+            if ok {
+                for row in 0..height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        y_plane[row * width as usize..].as_ptr(),
+                        y_base.add(row * y_stride),
+                        width as usize,
+                    );
+                }
+                for row in 0..chroma_h {
+                    std::ptr::copy_nonoverlapping(
+                        uv_plane[row * chroma_w * 2..].as_ptr(),
+                        uv_base.add(row * uv_stride),
+                        chroma_w * 2,
+                    );
+                }
+            }
+            let _ = CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+            ok
+        }
+    };
+    if !write_ok {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "Failed to write the NV12 planes through the CoreVideo lock",
+        ));
+    }
+
+    // SAFETY: `pixel_buffer` is a live, retained CVPixelBufferRef.
+    let surface = unsafe { CVPixelBufferGetIOSurface(pixel_buffer) };
+    if surface.is_null() {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "CoreVideo did not back the NV12 pixel buffer with an IOSurface",
+        ));
+    }
+
+    let Some(device) = metal::Device::system_default() else {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "No Metal device for the NV12 zero-copy path",
+        ));
+    };
+    let Some(cache) = MetalVideoTextureCache::new(&device) else {
+        unsafe { CVPixelBufferRelease(pixel_buffer) };
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "CVMetalTextureCache unavailable for the NV12 zero-copy path",
+        ));
+    };
+
+    // SAFETY: both planes belong to the retained pixel buffer.
+    let y_texture = unsafe {
+        cache.create_texture_from_pixel_buffer(
+            pixel_buffer,
+            width,
+            height,
+            MTLPixelFormatR8Unorm,
+            0,
+        )
+    };
+    let uv_texture = unsafe {
+        cache.create_texture_from_pixel_buffer(
+            pixel_buffer,
+            width / 2,
+            height / 2,
+            MTLPixelFormatRG8Unorm,
+            1,
+        )
+    };
+    let (Some(y_texture), Some(uv_texture)) = (y_texture, uv_texture) else {
+        unsafe {
+            if let Some(ptr) = y_texture {
+                CFRelease(ptr as *const c_void);
+            }
+            if let Some(ptr) = uv_texture {
+                CFRelease(ptr as *const c_void);
+            }
+            CVPixelBufferRelease(pixel_buffer);
+        }
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "Failed to create the NV12 plane textures from the pixel buffer",
+        ));
+    };
+
+    record_iosurface_frame();
+    register_frame_surfaces(y_texture, pixel_buffer, uv_texture, true);
+    Ok(VideoFrame {
+        width,
+        height,
+        data: Vec::new(),
+        pts,
+        duration,
+        texture_id: None,
+        metal_texture: Some(y_texture),
+        color_space,
+    })
+}
+
+// ===========================================================================
 // CoreFoundation dictionary helpers
 // ===========================================================================
 
 /// Create a CFDictionary to request BGRA pixel buffers from VideoToolbox.
+///
+/// Delegates to [`create_pixel_buffer_attributes`], so the buffers are
+/// IOSurface-backed (a prerequisite for the Metal zero-copy wrap).
 #[cfg(target_os = "macos")]
 pub(crate) fn create_bgra_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
+    create_pixel_buffer_attributes(vt_ffi::kCVPixelFormatType_32BGRA, false)
+}
+
+/// Create a CFString from a NUL-terminated byte string.
+///
+/// Returns null on failure (allocation error or invalid encoding).
+#[cfg(all(test, target_os = "macos"))]
+fn cfstring_from_bytes(bytes: &[u8]) -> vt_ffi::CFStringRef {
     use self::vt_ffi::*;
-    use std::ffi::CString;
     use std::ptr;
+    let Ok(cstr) = std::ffi::CString::new(bytes) else {
+        return ptr::null();
+    };
+    unsafe { CFStringCreateWithCString(ptr::null(), cstr.as_ptr(), kCFStringEncodingUTF8) }
+}
 
+/// Create a `CFNumber` holding a 32-bit signed integer.
+#[cfg(all(test, target_os = "macos"))]
+fn cfnumber_i32(value: i32) -> vt_ffi::CFNumberRef {
+    use self::vt_ffi::*;
+    use std::ptr;
     unsafe {
-        // Key: kCVPixelBufferPixelFormatTypeKey
-        let key_cstr = CString::new(kCVPixelBufferPixelFormatTypeKey).map_err(|_| {
-            AppError::new(
-                ReasonCode::RcMediaInvalid,
-                "Invalid CString for pixel format key",
-            )
-        })?;
-        let key_str =
-            CFStringCreateWithCString(ptr::null(), key_cstr.as_ptr(), kCFStringEncodingUTF8);
-        if key_str.is_null() {
-            return Ok(ptr::null());
-        }
-
-        // Value: kCVPixelFormatType_32BGRA as CFNumber
-        let fmt = kCVPixelFormatType_32BGRA as i32;
-        let val_num = CFNumberCreate(
+        CFNumberCreate(
             ptr::null_mut(),
             kCFNumberSInt32Type,
-            &fmt as *const i32 as *const c_void,
-        );
-        if val_num.is_null() {
-            CFRelease(key_str as CFTypeRef);
-            return Ok(ptr::null());
-        }
-
-        let keys: [*const c_void; 1] = [key_str];
-        let values: [*const c_void; 1] = [val_num];
-
-        let dict = CFDictionaryCreate(
-            ptr::null_mut(),
-            keys.as_ptr(),
-            values.as_ptr(),
-            1,
-            ptr::null(),
-            ptr::null(),
-        );
-
-        // Release intermediate objects (dictionary retains its elements)
-        CFRelease(key_str as CFTypeRef);
-        CFRelease(val_num as CFTypeRef);
-
-        Ok(dict)
+            &value as *const i32 as *const c_void,
+        )
     }
 }
 
+/// Build a CoreVideo pixel-buffer attribute dictionary.
+///
+/// Always includes `kCVPixelBufferPixelFormatTypeKey` and an (empty)
+/// `kCVPixelBufferIOSurfacePropertiesKey` so CoreVideo allocates an
+/// IOSurface-backed buffer. `metal_compatibility` additionally sets
+/// `kCVPixelBufferMetalCompatibilityKey`, which some Metal integrations
+/// require for `CVPixelBufferCreate`.
+///
+/// The dictionary is built with real `CFType` callbacks (so it retains its
+/// keys/values), and returned with `+1` ownership for the caller to
+/// `CFRelease`.
+#[cfg(target_os = "macos")]
+pub(crate) fn create_pixel_buffer_attributes(
+    pixel_format: u32,
+    metal_compatibility: bool,
+) -> AppResult<vt_ffi::CFDictionaryRef> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    let mut pairs: Vec<(CFType, CFType)> = vec![
+        (
+            CFString::from_static_string("PixelFormatType").as_CFType(),
+            CFNumber::from(pixel_format as i32).as_CFType(),
+        ),
+        (
+            CFString::from_static_string("IOSurfaceProperties").as_CFType(),
+            CFDictionary::from_CFType_pairs(&[] as &[(CFType, CFType)]).as_CFType(),
+        ),
+    ];
+    if metal_compatibility {
+        pairs.push((
+            CFString::from_static_string("MetalCompatibility").as_CFType(),
+            CFNumber::from(1i32).as_CFType(),
+        ));
+    }
+
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let raw = dict.as_concrete_TypeRef() as vt_ffi::CFDictionaryRef;
+    // Transfer the +1 ownership of `dict` to the raw pointer; callers release
+    // it with CFRelease.
+    std::mem::forget(dict);
+    Ok(raw)
+}
+
+/// Create the VideoToolbox destination attributes for the zero-copy path:
+/// native NV12 output with IOSurface backing.
+#[cfg(target_os = "macos")]
+pub(crate) fn create_zero_copy_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
+    create_pixel_buffer_attributes(
+        vt_ffi::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        false,
+    )
+}
+
 /// Create a CFDictionary to request hardware-accelerated decoding.
+///
+/// Uses a real `CFBoolean` value: VideoToolbox treats the specification
+/// value as a boolean, not a number.
 #[cfg(target_os = "macos")]
 pub(crate) fn create_hardware_decoder_specification() -> AppResult<vt_ffi::CFDictionaryRef> {
-    use self::vt_ffi::*;
-    use std::ffi::CString;
-    use std::ptr;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
 
-    unsafe {
-        // Key: kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder
-        let key_cstr =
-            CString::new(kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder)
-                .map_err(|_| {
-                    AppError::new(
-                        ReasonCode::RcMediaInvalid,
-                        "Invalid CString for decoder spec key",
-                    )
-                })?;
-        let key_str =
-            CFStringCreateWithCString(ptr::null(), key_cstr.as_ptr(), kCFStringEncodingUTF8);
-        if key_str.is_null() {
-            return Ok(ptr::null());
-        }
-
-        // Value: kCFBooleanTrue — we use a CFNumber(1) as a simple boolean.
-        // CFNumberCreate with kCFNumberSInt32Type reads a 4-byte value, so
-        // the backing variable must be an i32.
-        let val: i32 = 1;
-        let val_num = CFNumberCreate(
-            ptr::null_mut(),
-            kCFNumberSInt32Type,
-            &val as *const i32 as *const c_void,
-        );
-        if val_num.is_null() {
-            CFRelease(key_str as CFTypeRef);
-            return Ok(ptr::null());
-        }
-
-        let keys: [*const c_void; 1] = [key_str];
-        let values: [*const c_void; 1] = [val_num];
-
-        let dict = CFDictionaryCreate(
-            ptr::null_mut(),
-            keys.as_ptr(),
-            values.as_ptr(),
-            1,
-            ptr::null(),
-            ptr::null(),
-        );
-
-        CFRelease(key_str as CFTypeRef);
-        CFRelease(val_num as CFTypeRef);
-
-        Ok(dict)
-    }
+    let pairs: Vec<(CFType, CFType)> = vec![(
+        CFString::from_static_string("RequireHardwareAcceleratedVideoDecoder").as_CFType(),
+        CFBoolean::true_value().as_CFType(),
+    )];
+    let dict = CFDictionary::from_CFType_pairs(&pairs);
+    let raw = dict.as_concrete_TypeRef() as vt_ffi::CFDictionaryRef;
+    // Transfer the +1 ownership of `dict` to the raw pointer.
+    std::mem::forget(dict);
+    Ok(raw)
 }
 
 // ===========================================================================
@@ -3462,5 +4503,534 @@ mod tests {
         let data = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88];
         let result = decoder.decode_packet(&data, 0);
         let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // CoreVideo/IOSurface zero-copy path
+    // -----------------------------------------------------------------------
+
+    /// Generate a deterministic RGBA test pattern.
+    #[cfg(target_os = "macos")]
+    fn test_pattern_rgba(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.push((x.wrapping_mul(3).wrapping_add(seed)) as u8);
+                rgba.push((y.wrapping_mul(5).wrapping_add(seed)) as u8);
+                rgba.push(seed.wrapping_add(17) as u8);
+                rgba.push(255);
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn test_probe_zero_copy_status_reports_metal() {
+        let decoder = VideoDecoder::new(VideoDecoderConfig::default());
+        let probe = probe_zero_copy_status();
+        assert_eq!(
+            decoder.zero_copy_status(),
+            probe,
+            "decoder must report the probed capability"
+        );
+        // This machine has a real Metal device; the CoreVideo cache must be
+        // creatable. If that changes, the CPU fallback remains correct, so
+        // only log rather than fail when the probe is negative.
+        if probe.is_available() {
+            let status = decoder.zero_copy_status();
+            assert!(status.is_available());
+        } else {
+            eprintln!("zero-copy unavailable: {}", probe.reason());
+        }
+    }
+
+    #[test]
+    fn test_software_sequence_produces_iosurface_frames() {
+        #[cfg(target_os = "macos")]
+        {
+            if !probe_zero_copy_status().is_available() {
+                eprintln!(
+                    "skipping IOSurface sequence test: {}",
+                    probe_zero_copy_status().reason()
+                );
+                return;
+            }
+
+            let (width, height) = (16u32, 8u32);
+            let before = zero_copy_stats();
+            let mut frames = Vec::new();
+            for i in 0..3u8 {
+                let rgba = test_pattern_rgba(width, height, u32::from(i) * 31);
+                let frame = create_corevideo_frame_from_rgba(
+                    width,
+                    height,
+                    &rgba,
+                    u64::from(i) * 33_333,
+                    33_333,
+                    ColorSpace::Rec709,
+                )
+                .expect("CoreVideo frame creation must succeed with a Metal device");
+                assert_eq!(frame.width, width);
+                assert_eq!(frame.height, height);
+                assert!(
+                    frame.is_iosurface_backed(),
+                    "frame {i} must be IOSurface-backed"
+                );
+                assert!(
+                    frame.metal_texture.is_some(),
+                    "frame {i} must expose a Metal texture"
+                );
+                assert!(!frame.has_uv_plane());
+                assert!(frame.pixel_buffer_ptr().is_some());
+                assert!(
+                    frame.data.is_empty(),
+                    "zero-copy frame {i} must not carry a CPU copy"
+                );
+                frames.push(frame);
+            }
+            let after = zero_copy_stats();
+            assert!(
+                after.iosurface_frames >= before.iosurface_frames + 3,
+                "3 IOSurface-backed frames expected: before={before:?} after={after:?}"
+            );
+
+            // Real CoreVideo lock/read-back: the pixels are accessible to CPU
+            // consumers through the retained pixel buffer.
+            unsafe {
+                use self::vt_ffi::*;
+                let frame = &frames[0];
+                let pixel_buffer = frame.pixel_buffer_ptr().expect("retained pixel buffer");
+                assert_eq!(CVPixelBufferLockBaseAddress(pixel_buffer, 0), 0);
+                let base = CVPixelBufferGetBaseAddress(pixel_buffer) as *const u8;
+                let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
+                assert!(!base.is_null());
+                assert!(bytes_per_row >= (width as usize) * 4);
+                // First pixel of pattern seed 0: RGBA(0,0,17,255) -> BGRA(17,0,0,255)
+                assert_eq!(*base, 17, "BGRA blue channel");
+                assert_eq!(*base.add(1), 0, "BGRA green channel");
+                assert_eq!(*base.add(2), 0, "BGRA red channel");
+                assert_eq!(*base.add(3), 255, "BGRA alpha channel");
+                assert_eq!(CVPixelBufferUnlockBaseAddress(pixel_buffer, 0), 0);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping IOSurface sequence test off macOS");
+        }
+    }
+
+    #[test]
+    fn test_software_nv12_frame_exposes_two_plane_textures() {
+        #[cfg(target_os = "macos")]
+        {
+            if !probe_zero_copy_status().is_available() {
+                eprintln!("skipping NV12 test: {}", probe_zero_copy_status().reason());
+                return;
+            }
+
+            let (width, height) = (16u32, 8u32);
+            let y_plane = vec![128u8; (width * height) as usize];
+            let uv_plane = vec![64u8; ((width / 2) * (height / 2) * 2) as usize];
+            let before = zero_copy_stats();
+            let frame = create_corevideo_nv12_frame(
+                width,
+                height,
+                &y_plane,
+                &uv_plane,
+                0,
+                33_333,
+                ColorSpace::Rec709,
+            )
+            .expect("NV12 CoreVideo frame creation must succeed");
+
+            assert!(frame.is_iosurface_backed());
+            assert!(frame.metal_texture.is_some(), "Y plane texture");
+            assert!(frame.has_uv_plane(), "UV plane texture");
+            assert!(frame.data.is_empty());
+
+            // The NV12 planes must be readable through CoreVideo's locks.
+            unsafe {
+                use self::vt_ffi::*;
+                let pixel_buffer = frame.pixel_buffer_ptr().expect("retained pixel buffer");
+                assert_eq!(CVPixelBufferLockBaseAddress(pixel_buffer, 0), 0);
+                let y_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0) as *const u8;
+                let uv_base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1) as *const u8;
+                let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+                let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+                assert!(!y_base.is_null() && !uv_base.is_null());
+                assert!(y_stride >= width as usize);
+                assert!(uv_stride >= (width as usize));
+                assert_eq!(*y_base, 128);
+                assert_eq!(*uv_base, 64);
+                assert_eq!(*uv_base.add(1), 64);
+                assert_eq!(CVPixelBufferUnlockBaseAddress(pixel_buffer, 0), 0);
+            }
+
+            let after = zero_copy_stats();
+            assert!(after.iosurface_frames >= before.iosurface_frames + 1);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping NV12 test off macOS");
+        }
+    }
+
+    #[test]
+    fn test_wrap_io_surface_in_pixel_buffer_roundtrip() {
+        #[cfg(target_os = "macos")]
+        {
+            use self::vt_ffi::*;
+            let surface = crate::metal_backend::create_io_surface(8, 8)
+                .expect("IOSurfaceCreate must succeed");
+            let pixel_buffer =
+                unsafe { wrap_io_surface_in_pixel_buffer(surface).expect("pixel buffer wrapping") };
+            unsafe {
+                assert_eq!(CVPixelBufferGetWidth(pixel_buffer), 8);
+                assert_eq!(CVPixelBufferGetHeight(pixel_buffer), 8);
+                assert_eq!(
+                    CVPixelBufferGetPixelFormatType(pixel_buffer),
+                    kCVPixelFormatType_32BGRA
+                );
+                assert!(!CVPixelBufferGetIOSurface(pixel_buffer).is_null());
+                CVPixelBufferRelease(pixel_buffer);
+                core_foundation::base::CFRelease(surface as core_foundation::base::CFTypeRef);
+            }
+        }
+    }
+
+    // ---- Hardware VideoToolbox decode (capability-gated) ----
+
+    #[cfg(target_os = "macos")]
+    struct EncoderSink {
+        samples: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn set_vt_property_number(
+        session: vt_ffi::VTCompressionSessionRef,
+        key: &[u8],
+        value: i32,
+    ) {
+        use self::vt_ffi::*;
+        let key_ref = cfstring_from_bytes(key);
+        let value_ref = cfnumber_i32(value);
+        if !key_ref.is_null() && !value_ref.is_null() {
+            unsafe {
+                VTSessionSetProperty(session, key_ref, value_ref as CFTypeRef);
+                CFRelease(key_ref as CFTypeRef);
+                CFRelease(value_ref as CFTypeRef);
+            }
+        } else {
+            unsafe {
+                if !key_ref.is_null() {
+                    CFRelease(key_ref as CFTypeRef);
+                }
+                if !value_ref.is_null() {
+                    CFRelease(value_ref as CFTypeRef);
+                }
+            }
+        }
+    }
+
+    /// VideoToolbox compression callback: convert each encoded AVCC sample to
+    /// Annex B (SPS/PPS + slice NALs) and append it to the sink.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn compression_output_callback(
+        refcon: *mut c_void,
+        _source_frame: *mut c_void,
+        status: i32,
+        _info_flags: vt_ffi::VTEncodeInfoFlags,
+        sample_buffer: vt_ffi::CMSampleBufferRef,
+    ) {
+        use self::vt_ffi::*;
+        use std::ptr;
+
+        unsafe {
+            if status != 0 || sample_buffer.is_null() || refcon.is_null() {
+                return;
+            }
+            let sink = &*(refcon as *const EncoderSink);
+            let mut annexb: Vec<u8> = Vec::new();
+
+            // Parameter sets (SPS/PPS) from the sample's format description.
+            let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
+            if !format_desc.is_null() {
+                let mut count: usize = 0;
+                let mut first_ptr: *const u8 = ptr::null();
+                let mut first_size: usize = 0;
+                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    format_desc,
+                    0,
+                    &mut first_ptr,
+                    &mut first_size,
+                    &mut count,
+                    ptr::null_mut(),
+                ) == 0
+                    && !first_ptr.is_null()
+                    && first_size > 0
+                {
+                    annexb.extend_from_slice(&[0, 0, 0, 1]);
+                    annexb.extend_from_slice(std::slice::from_raw_parts(first_ptr, first_size));
+                    for index in 1..count {
+                        let mut param_ptr: *const u8 = ptr::null();
+                        let mut param_size: usize = 0;
+                        if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            format_desc,
+                            index,
+                            &mut param_ptr,
+                            &mut param_size,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        ) == 0
+                            && !param_ptr.is_null()
+                            && param_size > 0
+                        {
+                            annexb.extend_from_slice(&[0, 0, 0, 1]);
+                            annexb.extend_from_slice(std::slice::from_raw_parts(
+                                param_ptr, param_size,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // AVCC sample data: 4-byte big-endian NAL lengths.
+            let block_buffer = CMSampleBufferGetDataBuffer(sample_buffer);
+            if !block_buffer.is_null() {
+                let mut total: usize = 0;
+                let mut data_ptr: *mut std::ffi::c_char = ptr::null_mut();
+                if CMBlockBufferGetDataPointer(
+                    block_buffer,
+                    0,
+                    ptr::null_mut(),
+                    &mut total,
+                    &mut data_ptr,
+                ) == 0
+                    && !data_ptr.is_null()
+                    && total > 0
+                {
+                    let bytes = std::slice::from_raw_parts(data_ptr as *const u8, total);
+                    let mut offset = 0usize;
+                    while offset + 4 <= bytes.len() {
+                        let length = u32::from_be_bytes([
+                            bytes[offset],
+                            bytes[offset + 1],
+                            bytes[offset + 2],
+                            bytes[offset + 3],
+                        ]) as usize;
+                        offset += 4;
+                        if length == 0 || offset + length > bytes.len() {
+                            break;
+                        }
+                        annexb.extend_from_slice(&[0, 0, 0, 1]);
+                        annexb.extend_from_slice(&bytes[offset..offset + length]);
+                        offset += length;
+                    }
+                }
+            }
+
+            if !annexb.is_empty() {
+                lock_poisoned(&sink.samples).push(annexb);
+            }
+        }
+    }
+
+    /// Encode `frame_count` synthetic frames as a real H.264 Annex B stream
+    /// using VideoToolbox. Returns `None` when no encoder is available.
+    #[cfg(target_os = "macos")]
+    fn encode_test_h264(width: u32, height: u32, frame_count: usize) -> Option<Vec<Vec<u8>>> {
+        use self::vt_ffi::*;
+        use std::ptr;
+        use std::sync::Arc;
+
+        let sink = Arc::new(EncoderSink {
+            samples: Mutex::new(Vec::new()),
+        });
+        let refcon = Arc::into_raw(sink.clone()) as *mut c_void;
+
+        let mut session: VTCompressionSessionRef = ptr::null_mut();
+        let status = unsafe {
+            VTCompressionSessionCreate(
+                ptr::null_mut(),
+                width as i32,
+                height as i32,
+                kCMVideoCodecType_H264,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                Some(compression_output_callback),
+                refcon,
+                &mut session,
+            )
+        };
+        if status != 0 || session.is_null() {
+            unsafe {
+                drop(Arc::from_raw(refcon as *const EncoderSink));
+            }
+            eprintln!("[test] VTCompressionSessionCreate failed (status={status})");
+            return None;
+        }
+
+        // Real-time, no frame reordering, keyframe every frame: the decoder
+        // can then decode each sample independently.
+        unsafe {
+            set_vt_property_number(session, kVTCompressionPropertyKey_RealTime, 1);
+            set_vt_property_number(session, kVTCompressionPropertyKey_AllowFrameReordering, 0);
+            set_vt_property_number(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, 1);
+        }
+
+        let mut encode_failed = false;
+        for index in 0..frame_count {
+            let mut source: CVPixelBufferRef = ptr::null_mut();
+            let create_status = unsafe {
+                CVPixelBufferCreate(
+                    ptr::null_mut(),
+                    width as usize,
+                    height as usize,
+                    kCVPixelFormatType_32BGRA,
+                    ptr::null(),
+                    &mut source,
+                )
+            };
+            if create_status != 0 || source.is_null() {
+                encode_failed = true;
+                break;
+            }
+
+            // Fill a moving gradient through the CoreVideo lock.
+            unsafe {
+                if CVPixelBufferLockBaseAddress(source, 0) == 0 {
+                    let base = CVPixelBufferGetBaseAddress(source) as *mut u8;
+                    let stride = CVPixelBufferGetBytesPerRow(source);
+                    if !base.is_null() {
+                        for y in 0..height as usize {
+                            for x in 0..width as usize {
+                                let pixel = base.add(y * stride + x * 4);
+                                *pixel = (x * 4) as u8;
+                                *pixel.add(1) = (y * 4) as u8;
+                                *pixel.add(2) = (index * 40) as u8;
+                                *pixel.add(3) = 255;
+                            }
+                        }
+                    }
+                    let _ = CVPixelBufferUnlockBaseAddress(source, 0);
+                }
+            }
+
+            let mut info_flags: VTEncodeInfoFlags = 0;
+            let encode_status = unsafe {
+                VTCompressionSessionEncodeFrame(
+                    session,
+                    source,
+                    CMTime::make(index as i64, 30),
+                    CMTime::make(1, 30),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut info_flags,
+                )
+            };
+            unsafe { CVPixelBufferRelease(source) };
+            if encode_status != 0 {
+                encode_failed = true;
+                break;
+            }
+        }
+
+        // kCMTimeInvalid waits for all pending frames.
+        unsafe {
+            let _ = VTCompressionSessionCompleteFrames(session, CMTime::make(0, 0));
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session as CFTypeRef);
+            drop(Arc::from_raw(refcon as *const EncoderSink));
+        }
+
+        if encode_failed {
+            return None;
+        }
+        let samples = lock_poisoned(&sink.samples).clone();
+        if samples.is_empty() {
+            None
+        } else {
+            Some(samples)
+        }
+    }
+
+    #[test]
+    fn test_hardware_vt_decode_is_iosurface_backed() {
+        #[cfg(target_os = "macos")]
+        {
+            if !probe_zero_copy_status().is_available() {
+                eprintln!(
+                    "skipping hardware decode test: {}",
+                    probe_zero_copy_status().reason()
+                );
+                return;
+            }
+
+            let (width, height) = (64u32, 64u32);
+            let Some(samples) = encode_test_h264(width, height, 3) else {
+                eprintln!("skipping hardware decode test: VT encoder unavailable");
+                return;
+            };
+
+            let mut decoder = VideoDecoder::new(VideoDecoderConfig {
+                codec: VideoCodec::H264,
+                width,
+                height,
+                fps: 30.0,
+                bitrate: 1_000_000,
+            });
+            assert!(decoder.zero_copy_status().is_available());
+
+            let before = zero_copy_stats();
+            for (index, sample) in samples.iter().enumerate() {
+                let _ = decoder.decode_packet(sample, index as u64 * 33_333);
+            }
+            let frames = decoder.flush();
+            if frames.is_empty() {
+                // Hardware decode is capability-gated: this machine exposes a
+                // Metal device but may not have a hardware H.264 decoder for
+                // the encoded profile. The CPU path remains correct.
+                eprintln!(
+                    "skipping hardware decode assertions: VideoToolbox produced no frames \
+                     (hardware H.264 decode unavailable)"
+                );
+                return;
+            }
+
+            let after = zero_copy_stats();
+            for (index, frame) in frames.iter().enumerate() {
+                assert!(
+                    frame.is_iosurface_backed(),
+                    "hardware frame {index} must be IOSurface-backed"
+                );
+                assert!(
+                    frame.metal_texture.is_some(),
+                    "hardware frame {index} must expose a Metal texture"
+                );
+                assert!(
+                    frame.data.is_empty(),
+                    "hardware frame {index} must be zero-copy (no CPU pixels)"
+                );
+            }
+            assert!(
+                after.iosurface_frames >= before.iosurface_frames + frames.len() as u64,
+                "every hardware frame must count as IOSurface-backed: before={before:?} \
+                 after={after:?} frames={}",
+                frames.len()
+            );
+            assert!(
+                after.cpu_copies_avoided >= before.cpu_copies_avoided + frames.len() as u64,
+                "every hardware frame must count as an avoided CPU copy"
+            );
+            eprintln!(
+                "hardware video decode produced {} IOSurface-backed frames",
+                frames.len()
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping hardware decode test off macOS");
+        }
     }
 }

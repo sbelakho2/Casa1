@@ -14,13 +14,13 @@ use crate::vm::{VmProtection, VmRegionKind, VmState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type Handle = u32;
 
@@ -764,13 +764,22 @@ pub struct Win32Subsystem {
     next_tls_slot: u32,
     threads: BTreeMap<u32, ThreadState>,
     overlapped: BTreeMap<u64, OverlappedRequest>,
-    /// File handles associated with an I/O completion port (the association
-    /// records only existence; the port itself lives in the handle table).
-    io_completion_associations: BTreeSet<Handle>,
+    /// File handles associated with an I/O completion port, with the
+    /// completion key every packet for that handle carries.
+    io_completion_associations: BTreeMap<Handle, IoCompletionAssociation>,
+    /// Real shared completion-port state keyed by object id (survives handle
+    /// duplication; dropped with the last handle).
+    io_completion_ports: BTreeMap<ObjectId, Arc<CompletionPortWaitState>>,
     heaps: BTreeMap<Handle, HeapState>,
     time: TimeState,
     locale: LocaleState,
-    thread_apcs: BTreeMap<u32, VecDeque<String>>,
+    /// Per-thread APC queues, FIFO.  Entries are freed by delivery
+    /// (`take_pending_apcs`) at alertable boundaries only.
+    thread_apcs: BTreeMap<u32, VecDeque<ApcRequest>>,
+    /// APC instrumentation (queued / delivered / alertable boundaries).
+    apc_counters: ApcCounters,
+    /// Monotonic APC enqueue sequence (FIFO diagnostics).
+    next_apc_sequence: u64,
     com_apartments: BTreeMap<u32, ApartmentModel>,
     com_registrations: BTreeMap<String, ComRegistration>,
     /// Monotonic serial for `get_temp_file_name_w` uniqueness.
@@ -799,6 +808,502 @@ pub enum WaitSatisfaction {
     NotSignaled,
     Signaled,
     Abandoned,
+}
+
+// ── I/O completion ports ────────────────────────────────────────────────────
+//
+// The completion port's real state is a host-side queue guarded by a mutex
+// and a condition variable ([`CompletionPortWaitState`]).  `GetQueuedCompletion
+// Status` blocks on that condition variable until a packet is posted or the
+// timeout expires — there is deliberately NO polling loop anywhere in the
+// wait path.  The state is `Send + Sync` and shared through an `Arc`, so real
+// host threads (the runtime's future worker pool, and the in-module tests)
+// can block on the same port the subsystem posts to.
+
+/// Documented wait result when a thread blocked in `GetQueuedCompletionStatus`
+/// has its completion port closed underneath it (`ERROR_ABANDONED_WAIT_0`).
+pub const ERROR_ABANDONED_WAIT_0: u32 = 0x0000_02FE;
+
+/// Per-port instrumentation counters (real, incremented on the operations
+/// themselves — never estimated).  `poll_iterations` counts lock acquisitions
+/// that re-examined the queue; a blocked wait that times out with no wakeup
+/// must add exactly one, which is what proves the wait path is event-driven
+/// rather than a poll loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoCompletionCounters {
+    /// `PostQueuedCompletionStatus` packets enqueued.
+    pub packets_posted: u64,
+    /// Packets handed to a dequeue/wait caller.
+    pub packets_dequeued: u64,
+    /// Waiter notifications issued by posts / concurrency re-evaluation /
+    /// close (one per condition-variable notify event).
+    pub waiter_wakeups: u64,
+    /// Waits that expired at their deadline with no packet.
+    pub timeout_expirations: u64,
+    /// Active-slot releases (a dequeuing thread that went back to waiting, or
+    /// an explicit [`CompletionPortWaitState::release_active`]).
+    pub threads_released: u64,
+    /// Queue re-examinations (condition-variable wakeups + entry checks).
+    pub poll_iterations: u64,
+    /// Port closures observed by the shared state.
+    pub closes: u64,
+}
+
+/// Why a completion-port dequeue/wait returned without a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionPortWaitError {
+    /// The timeout expired before a packet arrived.
+    TimedOut,
+    /// The port was closed while the caller was waiting or dequeuing; queued
+    /// packets are invalidated at close time.
+    Closed,
+}
+
+impl CompletionPortWaitError {
+    /// The Win32 last-error the operation reports (`WAIT_TIMEOUT` for an
+    /// expired wait, `ERROR_ABANDONED_WAIT_0` for a closed port).
+    pub const fn last_error(self) -> u32 {
+        match self {
+            Self::TimedOut => WAIT_TIMEOUT,
+            Self::Closed => ERROR_ABANDONED_WAIT_0,
+        }
+    }
+}
+
+/// Result of a blocking `GetQueuedCompletionStatus` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionPortWaitOutcome {
+    /// One or more packets were removed (a single packet for the singular
+    /// API; up to `entry_count` for the batch API).
+    Packets(Vec<IoCompletionPacket>),
+    /// The timeout expired with no packet available.
+    TimedOut,
+    /// The port was closed while waiting; queued packets were invalidated.
+    Closed,
+}
+
+impl CompletionPortWaitOutcome {
+    pub const fn last_error(&self) -> u32 {
+        match self {
+            Self::Packets(_) => 0,
+            Self::TimedOut => WAIT_TIMEOUT,
+            Self::Closed => ERROR_ABANDONED_WAIT_0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletionPortInner {
+    /// The completion queue (FIFO packet lifecycle).
+    queue: VecDeque<IoCompletionPacket>,
+    /// `NumberOfConcurrentThreads` configured at creation / re-evaluated by
+    /// `SetCompletionPortConcurrency`; 0 = the system default (one slot per
+    /// processor).
+    configured_concurrency: u32,
+    /// Associated threads that currently hold an active slot: they removed a
+    /// packet and have not blocked (or returned it) since.
+    active_threads: std::collections::HashSet<CompletionPortThreadKey>,
+    /// Threads blocked on the condition variable right now.
+    waiters: usize,
+    closed: bool,
+    counters: IoCompletionCounters,
+}
+
+/// Identity of the thread associated with a completion port for concurrency
+/// accounting.  The subsystem keys by GUEST thread id (its cooperative guest
+/// threads share one host thread, so host ids cannot distinguish them); real
+/// host workers and the in-module tests key by host thread id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompletionPortThreadKey {
+    Guest(u32),
+    Host(std::thread::ThreadId),
+}
+
+impl CompletionPortThreadKey {
+    fn current_host() -> Self {
+        Self::Host(std::thread::current().id())
+    }
+}
+
+/// Real, thread-safe completion-port state: FIFO queue, per-packet key /
+/// overlapped / bytes, an associated-thread concurrency model and a condition
+/// variable for blocking waits.  See the module-level IOCP contract above.
+#[derive(Debug)]
+pub struct CompletionPortWaitState {
+    inner: Mutex<CompletionPortInner>,
+    wake: Condvar,
+    /// System default concurrency captured at creation (processors).
+    default_concurrency: usize,
+}
+
+impl CompletionPortWaitState {
+    fn new(concurrent_threads: u32) -> Self {
+        let default_concurrency = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .max(1);
+        Self {
+            inner: Mutex::new(CompletionPortInner {
+                queue: VecDeque::new(),
+                configured_concurrency: concurrent_threads,
+                active_threads: std::collections::HashSet::new(),
+                waiters: 0,
+                closed: false,
+                counters: IoCompletionCounters::default(),
+            }),
+            wake: Condvar::new(),
+            default_concurrency,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CompletionPortInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn effective_limit(&self, inner: &CompletionPortInner) -> usize {
+        if inner.configured_concurrency == 0 {
+            self.default_concurrency
+        } else {
+            inner.configured_concurrency as usize
+        }
+    }
+
+    /// Wake exactly one blocked waiter when a queued packet can be handed to
+    /// it under the current concurrency limit.  With no packets, no waiters,
+    /// or every active slot taken, no notification is issued and the packet
+    /// stays queued until a slot frees.
+    fn wake_eligible_waiter(&self, inner: &mut CompletionPortInner) {
+        if inner.waiters == 0 || inner.queue.is_empty() || inner.closed {
+            return;
+        }
+        if inner.active_threads.len() < self.effective_limit(inner) {
+            inner.counters.waiter_wakeups += 1;
+            self.wake.notify_one();
+        }
+    }
+
+    /// Remove up to `max_packets` packets when the calling thread may run
+    /// concurrently, updating the active-slot set and the dequeue counter.
+    fn take_locked(
+        &self,
+        inner: &mut CompletionPortInner,
+        thread: CompletionPortThreadKey,
+        max_packets: usize,
+    ) -> Vec<IoCompletionPacket> {
+        let limit = self.effective_limit(inner);
+        let already_active = inner.active_threads.contains(&thread);
+        if !already_active && inner.active_threads.len() >= limit {
+            return Vec::new();
+        }
+        let mut packets = Vec::new();
+        while packets.len() < max_packets.max(1) {
+            match inner.queue.pop_front() {
+                Some(packet) => packets.push(packet),
+                None => break,
+            }
+        }
+        if !packets.is_empty() {
+            inner.active_threads.insert(thread);
+            inner.counters.packets_dequeued += packets.len() as u64;
+        }
+        packets
+    }
+
+    /// Non-blocking dequeue.  `Err(TimedOut)` means no packet was available
+    /// (or the concurrency limit excluded the caller) and `Err(Closed)` means
+    /// the port was closed (queued packets are invalidated).
+    pub fn try_dequeue(
+        &self,
+        max_packets: usize,
+    ) -> Result<Vec<IoCompletionPacket>, CompletionPortWaitError> {
+        self.try_dequeue_as(CompletionPortThreadKey::current_host(), max_packets)
+    }
+
+    /// Non-blocking dequeue for an explicit associated thread (the subsystem
+    /// passes the GUEST thread id).
+    pub fn try_dequeue_as(
+        &self,
+        thread: CompletionPortThreadKey,
+        max_packets: usize,
+    ) -> Result<Vec<IoCompletionPacket>, CompletionPortWaitError> {
+        let mut inner = self.lock();
+        inner.counters.poll_iterations += 1;
+        if inner.closed {
+            return Err(CompletionPortWaitError::Closed);
+        }
+        let packets = self.take_locked(&mut inner, thread, max_packets);
+        if !packets.is_empty() {
+            return Ok(packets);
+        }
+        // A non-blocking failed dequeue gives up any active slot: the thread
+        // is not going to process the port right now.
+        if inner.active_threads.remove(&thread) {
+            inner.counters.threads_released += 1;
+            self.wake_eligible_waiter(&mut inner);
+        }
+        Err(CompletionPortWaitError::TimedOut)
+    }
+
+    /// Blocking dequeue: wait on the condition variable until a packet is
+    /// posted, the timeout expires, or the port is closed.  No polling: the
+    /// loop body only runs on an actual condition-variable wakeup, the initial
+    /// entry check, and the post-deadline re-check.
+    pub fn wait_dequeue(
+        &self,
+        timeout: Option<Duration>,
+        max_packets: usize,
+    ) -> Result<Vec<IoCompletionPacket>, CompletionPortWaitError> {
+        self.wait_dequeue_as(
+            CompletionPortThreadKey::current_host(),
+            timeout,
+            max_packets,
+        )
+    }
+
+    /// Blocking dequeue for an explicit associated thread (see
+    /// [`Self::try_dequeue_as`]).
+    pub fn wait_dequeue_as(
+        &self,
+        thread: CompletionPortThreadKey,
+        timeout: Option<Duration>,
+        max_packets: usize,
+    ) -> Result<Vec<IoCompletionPacket>, CompletionPortWaitError> {
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+        let mut inner = self.lock();
+        loop {
+            inner.counters.poll_iterations += 1;
+            if inner.closed {
+                inner.active_threads.remove(&thread);
+                return Err(CompletionPortWaitError::Closed);
+            }
+            let packets = self.take_locked(&mut inner, thread, max_packets);
+            if !packets.is_empty() {
+                return Ok(packets);
+            }
+            // Going to block: an active thread that finds no work stops
+            // holding its slot, so another waiter can be released.
+            if inner.active_threads.remove(&thread) {
+                inner.counters.threads_released += 1;
+                self.wake_eligible_waiter(&mut inner);
+            }
+            if timeout == Some(Duration::ZERO) {
+                inner.counters.timeout_expirations += 1;
+                return Err(CompletionPortWaitError::TimedOut);
+            }
+            let wait_for = match deadline {
+                None => None,
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        inner.counters.timeout_expirations += 1;
+                        return Err(CompletionPortWaitError::TimedOut);
+                    }
+                    Some(deadline - now)
+                }
+            };
+            inner.waiters += 1;
+            let timed_out = match wait_for {
+                Some(wait_for) => {
+                    let (guard, result) = self
+                        .wake
+                        .wait_timeout(inner, wait_for)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    inner = guard;
+                    result.timed_out()
+                }
+                None => {
+                    inner = self
+                        .wake
+                        .wait(inner)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    false
+                }
+            };
+            inner.waiters -= 1;
+            if timed_out {
+                // One final queue check catches a packet posted exactly at the
+                // deadline; the next loop iteration reports the timeout when
+                // the queue is still empty.
+                if inner.queue.is_empty() {
+                    inner.counters.timeout_expirations += 1;
+                    return Err(CompletionPortWaitError::TimedOut);
+                }
+            }
+        }
+    }
+
+    /// Enqueue a packet and wake one eligible waiter.  Fails only when the
+    /// port is closed.
+    pub fn post(&self, packet: IoCompletionPacket) -> Result<(), CompletionPortWaitError> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(CompletionPortWaitError::Closed);
+        }
+        inner.queue.push_back(packet);
+        inner.counters.packets_posted += 1;
+        self.wake_eligible_waiter(&mut inner);
+        Ok(())
+    }
+
+    /// Re-evaluate the concurrency limit (`SetCompletionPortConcurrency`).
+    /// Raising the limit immediately re-examines blocked waiters so queued
+    /// packets are handed out without waiting for the next post.
+    pub fn set_concurrency(&self, concurrent_threads: u32) {
+        let mut inner = self.lock();
+        let previous = inner.configured_concurrency;
+        inner.configured_concurrency = concurrent_threads;
+        if previous == concurrent_threads {
+            return;
+        }
+        if !inner.queue.is_empty() && inner.waiters > 0 {
+            let limit = self.effective_limit(&inner);
+            if inner.active_threads.len() < limit {
+                inner.counters.waiter_wakeups += 1;
+                self.wake.notify_all();
+            }
+        }
+    }
+
+    /// Give up this thread's active slot explicitly (the thread finished
+    /// processing a packet), releasing one concurrency unit and waking a
+    /// waiter when work is queued.
+    pub fn release_active(&self) {
+        self.release_active_as(CompletionPortThreadKey::current_host());
+    }
+
+    /// Explicit active-slot release for an associated thread.
+    pub fn release_active_as(&self, thread: CompletionPortThreadKey) {
+        let mut inner = self.lock();
+        if inner.active_threads.remove(&thread) {
+            inner.counters.threads_released += 1;
+            self.wake_eligible_waiter(&mut inner);
+        }
+    }
+
+    /// Release the active slot held by a guest thread (thread-exit cleanup).
+    pub fn release_guest_thread(&self, guest_thread_id: u32) {
+        self.release_active_as(CompletionPortThreadKey::Guest(guest_thread_id));
+    }
+
+    /// Close the port: queued packets are invalidated and every blocked
+    /// waiter wakes with [`CompletionPortWaitError::Closed`]
+    /// (`ERROR_ABANDONED_WAIT_0`).
+    pub fn close(&self) {
+        let mut inner = self.lock();
+        if inner.closed {
+            return;
+        }
+        inner.closed = true;
+        inner.queue.clear();
+        inner.active_threads.clear();
+        inner.counters.closes += 1;
+        if inner.waiters > 0 {
+            inner.counters.waiter_wakeups += inner.waiters as u64;
+        }
+        self.wake.notify_all();
+    }
+
+    /// Non-consuming readiness probe for a cooperative scheduler: `true` when
+    /// `thread` could dequeue a packet right now (queue non-empty and the
+    /// thread either already holds an active slot or capacity remains).
+    /// Doesn't touch the instrumentation counters.
+    pub fn readable_for(&self, thread: CompletionPortThreadKey) -> bool {
+        let inner = self.lock();
+        if inner.closed || inner.queue.is_empty() {
+            return false;
+        }
+        let limit = self.effective_limit(&inner);
+        inner.active_threads.contains(&thread) || inner.active_threads.len() < limit
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    pub fn queued_packet_count(&self) -> usize {
+        self.lock().queue.len()
+    }
+
+    pub fn waiter_count(&self) -> usize {
+        self.lock().waiters
+    }
+
+    pub fn active_thread_count(&self) -> usize {
+        self.lock().active_threads.len()
+    }
+
+    pub fn concurrency_limit(&self) -> u32 {
+        let inner = self.lock();
+        if inner.configured_concurrency == 0 {
+            self.default_concurrency as u32
+        } else {
+            inner.configured_concurrency
+        }
+    }
+
+    pub fn counters(&self) -> IoCompletionCounters {
+        self.lock().counters
+    }
+}
+
+/// A file handle associated with a completion port: the port plus the
+/// completion key delivered with every packet generated for that handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoCompletionAssociation {
+    pub port: Handle,
+    pub completion_key: u64,
+}
+
+// ── Asynchronous procedure calls ────────────────────────────────────────────
+//
+// APCs are queued per guest thread and delivered ONLY at alertable wait
+// boundaries, in FIFO enqueue order.  `take_pending_apcs` is the delivery
+// primitive: it removes the entries from the queue (freeing the APC objects)
+// and hands them to the caller, which executes the guest callbacks.  This
+// module's own alertable waits (`sleep_ex`, `wait_for_single_object`,
+// `wait_for_multiple_objects`) and `test_alert` use it directly; the runtime
+// wait paths call it through `take_pending_apcs_for_handle` (see the
+// hook report in the module task notes).
+
+/// `STATUS_USER_APC` — the NTSTATUS an alertable wait returns after
+/// delivering at least one APC (numerically identical to
+/// `WAIT_IO_COMPLETION`).
+pub const STATUS_USER_APC: u32 = 0x0000_00C0;
+
+/// Whether an APC is a user-mode or kernel-mode request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApcKind {
+    User,
+    Kernel,
+}
+
+/// One queued APC.  Entries are created by `QueueUserAPC`
+/// (`ApcKind::User`) / kernel completions (`ApcKind::Kernel`), stored FIFO
+/// per thread, and freed after delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApcRequest {
+    /// Guest callback address (0 for diagnostic token-only entries).
+    pub callback: u64,
+    /// Callback context parameter.
+    pub context: u64,
+    pub kind: ApcKind,
+    /// Diagnostic token carried by the legacy [`Win32Subsystem::queue_apc`]
+    /// API; `None` for real callback APCs.
+    pub token: Option<String>,
+    /// Monotonic enqueue sequence (FIFO evidence for diagnostics/tests).
+    pub sequence: u64,
+}
+
+/// APC instrumentation: queued / delivered counts and alertable boundaries
+/// observed by this subsystem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApcCounters {
+    pub queued: u64,
+    pub delivered: u64,
+    /// Alertable wait entries that found and delivered at least one APC.
+    pub alertable_waits: u64,
 }
 
 /// Generic named-pipe service facade: pre-created server-side listeners for
@@ -877,7 +1382,8 @@ impl Win32Subsystem {
             next_tls_slot: 0,
             threads: BTreeMap::new(),
             overlapped: BTreeMap::new(),
-            io_completion_associations: BTreeSet::new(),
+            io_completion_associations: BTreeMap::new(),
+            io_completion_ports: BTreeMap::new(),
             heaps: BTreeMap::new(),
             time: TimeState {
                 dtm,
@@ -892,6 +1398,8 @@ impl Win32Subsystem {
                 oemcp: 437,
             },
             thread_apcs: BTreeMap::new(),
+            apc_counters: ApcCounters::default(),
+            next_apc_sequence: 1,
             com_apartments: BTreeMap::new(),
             com_registrations: BTreeMap::new(),
             next_temp_file_serial: 0,
@@ -1223,7 +1731,7 @@ impl Win32Subsystem {
         &mut self,
         file_handle: Option<Handle>,
         existing_completion_port: Option<Handle>,
-        _completion_key: u64,
+        completion_key: u64,
         concurrent_threads: u32,
     ) -> AppResult<Handle> {
         if file_handle.is_none() && existing_completion_port.is_some() {
@@ -1234,12 +1742,14 @@ impl Win32Subsystem {
         }
 
         let port_handle = if let Some(port_handle) = existing_completion_port {
+            // Associating a file with an existing port: Windows ignores the
+            // concurrency parameter on this path.
             match self.handle_object(port_handle)? {
                 KernelObject::IoCompletionPort(_) => port_handle,
                 _ => return invalid_handle("handle is not an I/O completion port"),
             }
         } else {
-            self.insert_object(
+            let handle = self.insert_object(
                 ObjectType::IoCompletionPort,
                 0x1F0003,
                 false,
@@ -1247,23 +1757,96 @@ impl Win32Subsystem {
                     concurrent_threads,
                     queue: VecDeque::new(),
                 }),
-            )
+            );
+            let object_id = self.process.handle_table.entry(handle)?.object_id;
+            self.io_completion_ports.insert(
+                object_id,
+                Arc::new(CompletionPortWaitState::new(concurrent_threads)),
+            );
+            handle
         };
 
         if let Some(file_handle) = file_handle {
             self.handle_entry(file_handle)?;
-            if self.io_completion_associations.contains(&file_handle) {
+            if let Some(association) = self.io_completion_associations.get(&file_handle) {
                 return Err(AppError::new(
                     ReasonCode::RcCliInvalid,
                     format!(
-                        "handle {file_handle} is already associated with an I/O completion port"
+                        "handle {file_handle} is already associated with I/O completion port {}",
+                        association.port
                     ),
                 ));
             }
-            self.io_completion_associations.insert(file_handle);
+            self.io_completion_associations.insert(
+                file_handle,
+                IoCompletionAssociation {
+                    port: port_handle,
+                    completion_key,
+                },
+            );
         }
 
         Ok(port_handle)
+    }
+
+    /// The real shared wait state behind a completion-port handle (the runtime
+    /// worker hooks and the in-module real-thread tests block on this).
+    pub fn io_completion_port_state(
+        &self,
+        completion_port: Handle,
+    ) -> AppResult<Arc<CompletionPortWaitState>> {
+        let object_id = self.process.handle_table.entry(completion_port)?.object_id;
+        match self.objects.object(object_id) {
+            KernelObject::IoCompletionPort(_) => self
+                .io_completion_ports
+                .get(&object_id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("I/O completion port {completion_port} has no wait state"),
+                    )
+                }),
+            _ => invalid_handle("handle is not an I/O completion port"),
+        }
+    }
+
+    /// The port + completion key captured when `file_handle` was associated.
+    pub fn io_completion_association(
+        &self,
+        file_handle: Handle,
+    ) -> Option<&IoCompletionAssociation> {
+        self.io_completion_associations.get(&file_handle)
+    }
+
+    /// Post a completion for an associated file handle using the completion
+    /// key captured at association time.  Returns `false` when the handle is
+    /// not associated with any port.
+    pub fn post_completion_status_for_file(
+        &mut self,
+        file_handle: Handle,
+        bytes_transferred: u32,
+        overlapped: u64,
+        internal: u64,
+    ) -> AppResult<bool> {
+        let Some(association) = self.io_completion_associations.get(&file_handle).cloned() else {
+            return Ok(false);
+        };
+        let state = self.io_completion_port_state(association.port)?;
+        state
+            .post(IoCompletionPacket {
+                bytes_transferred,
+                completion_key: association.completion_key,
+                overlapped,
+                internal,
+            })
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("I/O completion port {} is closed", association.port),
+                )
+            })?;
+        Ok(true)
     }
 
     pub fn post_queued_completion_status(
@@ -1273,20 +1856,24 @@ impl Win32Subsystem {
         completion_key: u64,
         overlapped: u64,
     ) -> AppResult<()> {
-        match self.handle_object_mut(completion_port)? {
-            KernelObject::IoCompletionPort(port) => {
-                port.queue.push_back(IoCompletionPacket {
-                    bytes_transferred,
-                    completion_key,
-                    overlapped,
-                    internal: 0,
-                });
-                Ok(())
-            }
-            _ => invalid_handle("handle is not an I/O completion port"),
-        }
+        let state = self.io_completion_port_state(completion_port)?;
+        state
+            .post(IoCompletionPacket {
+                bytes_transferred,
+                completion_key,
+                overlapped,
+                internal: 0,
+            })
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("I/O completion port {completion_port} is closed"),
+                )
+            })
     }
 
+    /// Non-blocking dequeue (the historical entry point; blocking callers use
+    /// [`Self::get_queued_completion_status`]).
     pub fn dequeue_io_completion_packets(
         &mut self,
         completion_port: Handle,
@@ -1298,33 +1885,100 @@ impl Win32Subsystem {
                 "GetQueuedCompletionStatusEx requires a non-zero entry count",
             ));
         }
-        match self.handle_object_mut(completion_port)? {
-            KernelObject::IoCompletionPort(port) => {
-                // A non-zero `concurrent_threads` throttles how many
-                // completion packets may be handed out at once.
-                let cap = if port.concurrent_threads == 0 {
-                    max_packets
-                } else {
-                    max_packets.min(port.concurrent_threads as usize)
-                };
-                let mut packets = Vec::new();
-                while packets.len() < cap {
-                    let Some(packet) = port.queue.pop_front() else {
-                        break;
-                    };
-                    packets.push(packet);
-                }
-                if packets.is_empty() {
-                    Err(AppError::new(
-                        ReasonCode::RcWin32Timeout,
-                        format!("I/O completion port {completion_port} has no queued packets"),
-                    ))
-                } else {
-                    Ok(packets)
-                }
-            }
+        let state = self.io_completion_port_state(completion_port)?;
+        let guest_thread = CompletionPortThreadKey::Guest(self.current_thread_id);
+        match state.try_dequeue_as(guest_thread, max_packets) {
+            Ok(packets) => Ok(packets),
+            Err(CompletionPortWaitError::TimedOut) => Err(AppError::new(
+                ReasonCode::RcWin32Timeout,
+                format!("I/O completion port {completion_port} has no queued packets"),
+            )),
+            Err(CompletionPortWaitError::Closed) => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!(
+                    "I/O completion port {completion_port} was closed ({ERROR_ABANDONED_WAIT_0:#x})"
+                ),
+            )),
+        }
+    }
+
+    /// Blocking `GetQueuedCompletionStatus`: waits on the port's condition
+    /// variable until a packet is posted, `timeout_ms` (`u32::MAX` =
+    /// INFINITE) expires, or the port is closed.  No polling loop.
+    pub fn get_queued_completion_status(
+        &mut self,
+        completion_port: Handle,
+        timeout_ms: u32,
+    ) -> AppResult<CompletionPortWaitOutcome> {
+        self.get_queued_completion_status_ex(completion_port, 1, timeout_ms)
+    }
+
+    /// Batch form (`GetQueuedCompletionStatusEx`) with the same blocking
+    /// semantics.
+    pub fn get_queued_completion_status_ex(
+        &mut self,
+        completion_port: Handle,
+        max_packets: usize,
+        timeout_ms: u32,
+    ) -> AppResult<CompletionPortWaitOutcome> {
+        if max_packets == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "GetQueuedCompletionStatusEx requires a non-zero entry count",
+            ));
+        }
+        let state = self.io_completion_port_state(completion_port)?;
+        let guest_thread = CompletionPortThreadKey::Guest(self.current_thread_id);
+        let timeout = (timeout_ms != u32::MAX).then(|| Duration::from_millis(timeout_ms as u64));
+        match state.wait_dequeue_as(guest_thread, timeout, max_packets) {
+            Ok(packets) => Ok(CompletionPortWaitOutcome::Packets(packets)),
+            Err(CompletionPortWaitError::TimedOut) => Ok(CompletionPortWaitOutcome::TimedOut),
+            Err(CompletionPortWaitError::Closed) => Ok(CompletionPortWaitOutcome::Closed),
+        }
+    }
+
+    /// `SetCompletionPortConcurrency`: re-evaluate the limit immediately,
+    /// waking blocked waiters when queued packets become eligible.
+    pub fn set_completion_port_concurrency(
+        &mut self,
+        completion_port: Handle,
+        concurrent_threads: u32,
+    ) -> AppResult<()> {
+        let state = self.io_completion_port_state(completion_port)?;
+        state.set_concurrency(concurrent_threads);
+        if let KernelObject::IoCompletionPort(port) = self.handle_object_mut(completion_port)? {
+            port.concurrent_threads = concurrent_threads;
+        }
+        Ok(())
+    }
+
+    /// Per-port instrumentation counters.
+    pub fn io_completion_counters(
+        &self,
+        completion_port: Handle,
+    ) -> AppResult<IoCompletionCounters> {
+        Ok(self.io_completion_port_state(completion_port)?.counters())
+    }
+
+    /// Legacy inline-queue depth of the object payload.  The canonical packet
+    /// queue lives in the shared wait state, so this must stay 0 (a non-zero
+    /// depth would mean two divergent queues).
+    pub fn io_completion_inline_queue_depth(&self, completion_port: Handle) -> AppResult<usize> {
+        match self.handle_object(completion_port)? {
+            KernelObject::IoCompletionPort(port) => Ok(port.queue.len()),
             _ => invalid_handle("handle is not an I/O completion port"),
         }
+    }
+
+    /// Scheduler readiness probe for a guest thread's parked
+    /// `GetQueuedCompletionStatus` wait (non-consuming, counter-neutral).
+    pub fn completion_port_readable(
+        &self,
+        completion_port: Handle,
+        guest_thread_id: u32,
+    ) -> AppResult<bool> {
+        let state = self.io_completion_port_state(completion_port)?;
+        Ok(state.readable_for(CompletionPortThreadKey::Guest(guest_thread_id)))
     }
 
     pub fn set_event(&mut self, handle: Handle) -> AppResult<()> {
@@ -1505,15 +2159,11 @@ impl Win32Subsystem {
     ) -> AppResult<WaitStatus> {
         let current_thread_id = self.current_thread_id;
         if alertable {
-            let thread_id = match thread_handle {
-                Some(thread_handle) => Some(self.thread_id(thread_handle)?),
-                None => None,
-            };
-            if let Some(thread_id) = thread_id
-                && let Some(queue) = self.thread_apcs.get_mut(&thread_id)
-                && !queue.is_empty()
-            {
-                queue.pop_front();
+            // Alertable boundary: deliver every pending APC (FIFO) before the
+            // wait evaluates its object, then report WAIT_IO_COMPLETION.
+            let (_, apcs) = self.take_pending_apcs_for_handle(thread_handle)?;
+            if !apcs.is_empty() {
+                self.apc_counters.alertable_waits += 1;
                 return Ok(WaitStatus::IoCompletion);
             }
         }
@@ -1880,15 +2530,14 @@ impl Win32Subsystem {
             Some(self.time.ticks_ms.saturating_add(timeout_ms as u64))
         };
 
-        if alertable
-            && let Some(thread_handle) = thread_handle
-            && let Ok(thread_id) = self.thread_id(thread_handle)
-            && self
-                .thread_apcs
-                .get(&thread_id)
-                .is_some_and(|queue| !queue.is_empty())
-        {
-            return Ok((WaitStatus::IoCompletion, 0));
+        if alertable {
+            // Alertable boundary: deliver every pending APC (FIFO) and return
+            // WAIT_IO_COMPLETION with index 0.
+            let (_, apcs) = self.take_pending_apcs_for_handle(thread_handle)?;
+            if !apcs.is_empty() {
+                self.apc_counters.alertable_waits += 1;
+                return Ok((WaitStatus::IoCompletion, 0));
+            }
         }
 
         loop {
@@ -2084,13 +2733,119 @@ impl Win32Subsystem {
             .find_map(|(handle, entry)| (entry.object_id == object_id).then_some(handle))
     }
 
-    pub fn queue_apc(&mut self, thread_handle: Handle, token: impl Into<String>) -> AppResult<()> {
-        let thread_id = self.thread_id(thread_handle)?;
+    /// Push an APC onto a thread's real FIFO queue (queue-user-APC and
+    /// kernel-APC entry points share this path).
+    fn push_apc(
+        &mut self,
+        thread_id: u32,
+        callback: u64,
+        context: u64,
+        kind: ApcKind,
+        token: Option<String>,
+    ) {
+        let sequence = self.next_apc_sequence;
+        self.next_apc_sequence = self.next_apc_sequence.saturating_add(1);
+        self.apc_counters.queued += 1;
         self.thread_apcs
             .entry(thread_id)
             .or_default()
-            .push_back(token.into());
+            .push_back(ApcRequest {
+                callback,
+                context,
+                kind,
+                token,
+                sequence,
+            });
+    }
+
+    /// Legacy diagnostic APC: queues a token-only entry for the target thread.
+    pub fn queue_apc(&mut self, thread_handle: Handle, token: impl Into<String>) -> AppResult<()> {
+        let thread_id = self.thread_id(thread_handle)?;
+        self.push_apc(thread_id, 0, 0, ApcKind::User, Some(token.into()));
         Ok(())
+    }
+
+    /// `QueueUserAPC`: queue a real user-mode APC (callback + context) for the
+    /// target thread.  Delivered only at an alertable wait boundary.
+    pub fn queue_user_apc(
+        &mut self,
+        thread_handle: Handle,
+        callback: u64,
+        context: u64,
+    ) -> AppResult<()> {
+        let thread_id = self.thread_id(thread_handle)?;
+        self.push_apc(thread_id, callback, context, ApcKind::User, None);
+        Ok(())
+    }
+
+    /// Kernel-mode APC (issued by the I/O manager for an associated handle).
+    pub fn queue_kernel_apc(
+        &mut self,
+        thread_handle: Handle,
+        callback: u64,
+        context: u64,
+    ) -> AppResult<()> {
+        let thread_id = self.thread_id(thread_handle)?;
+        self.push_apc(thread_id, callback, context, ApcKind::Kernel, None);
+        Ok(())
+    }
+
+    /// Number of APCs pending delivery for a thread.
+    pub fn pending_apc_count(&self, thread_id: u32) -> usize {
+        self.thread_apcs.get(&thread_id).map_or(0, VecDeque::len)
+    }
+
+    /// Whether any APC is pending for a thread (the alertable-readiness probe
+    /// the scheduler can use without consuming the queue).
+    pub fn has_pending_apcs(&self, thread_id: u32) -> bool {
+        self.pending_apc_count(thread_id) > 0
+    }
+
+    /// The delivery primitive: remove EVERY pending APC for the thread in
+    /// FIFO order.  The queue entries are freed (moved out) here; the caller
+    /// executes the guest callbacks (or drops token-only entries).
+    pub fn take_pending_apcs(&mut self, thread_id: u32) -> Vec<ApcRequest> {
+        let Some(queue) = self.thread_apcs.get_mut(&thread_id) else {
+            return Vec::new();
+        };
+        let delivered = queue.drain(..).collect::<Vec<_>>();
+        if !delivered.is_empty() {
+            self.apc_counters.delivered += delivered.len() as u64;
+        }
+        delivered
+    }
+
+    /// Resolve `thread_handle` (or the current thread when `None`) and drain
+    /// its APCs.  Used by the alertable wait paths and the runtime hook.
+    pub fn take_pending_apcs_for_handle(
+        &mut self,
+        thread_handle: Option<Handle>,
+    ) -> AppResult<(u32, Vec<ApcRequest>)> {
+        let thread_id = match thread_handle {
+            Some(thread_handle) => self.thread_id(thread_handle)?,
+            None => self.current_thread_id,
+        };
+        let apcs = self.take_pending_apcs(thread_id);
+        Ok((thread_id, apcs))
+    }
+
+    /// `NtTestAlert`: deliver the calling thread's pending APCs immediately
+    /// and report the NTSTATUS (`STATUS_USER_APC` when at least one was
+    /// delivered, 0 = STATUS_SUCCESS otherwise) with the freed entries for
+    /// guest execution.
+    pub fn test_alert(&mut self) -> (u32, Vec<ApcRequest>) {
+        let apcs = self.take_pending_apcs(self.current_thread_id);
+        if apcs.is_empty() {
+            (0, apcs)
+        } else {
+            self.apc_counters.alertable_waits += 1;
+            (STATUS_USER_APC, apcs)
+        }
+    }
+
+    /// APC instrumentation snapshot.
+    pub fn apc_counters(&self) -> ApcCounters {
+        self.apc_counters
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2449,6 +3204,17 @@ impl Win32Subsystem {
         // type, removes the entry, bumps the value's generation and recycles
         // the value for future reuse (Windows reuses handle values).
         let removed = self.process.handle_table.close(handle, object_type)?;
+        if let KernelObject::IoCompletionPort(_) = &object
+            && last_handle
+            && let Some(state) = self.io_completion_ports.remove(&removed.object_id)
+        {
+            // Closing the last handle invalidates every queued packet and
+            // wakes blocked waiters with ERROR_ABANDONED_WAIT_0.
+            state.close();
+        }
+        // A closed handle can no longer generate completions, so its
+        // association (and completion key) dies with it.
+        self.io_completion_associations.remove(&handle);
         // Windows forgets named objects once the last handle closes; the
         // object manager drops the object and its name at refcount 0.
         self.objects.handle_removed(removed.object_id);
@@ -6060,15 +6826,11 @@ impl Win32Subsystem {
         thread_handle: Option<Handle>,
     ) -> AppResult<WaitStatus> {
         if alertable {
-            let thread_id = match thread_handle {
-                Some(thread_handle) => Some(self.thread_id(thread_handle)?),
-                None => None,
-            };
-            if let Some(thread_id) = thread_id
-                && let Some(queue) = self.thread_apcs.get_mut(&thread_id)
-                && !queue.is_empty()
-            {
-                queue.pop_front();
+            // Alertable sleep: deliver every pending APC (FIFO) and return
+            // immediately with WAIT_IO_COMPLETION instead of sleeping.
+            let (_, apcs) = self.take_pending_apcs_for_handle(thread_handle)?;
+            if !apcs.is_empty() {
+                self.apc_counters.alertable_waits += 1;
                 return Ok(WaitStatus::IoCompletion);
             }
         }
@@ -6706,6 +7468,16 @@ impl Win32Subsystem {
             // do not accumulate unbounded entries.
             self.thread_apcs.remove(&thread_id);
             self.com_apartments.remove(&thread_id);
+            // A guest thread stops holding completion-port concurrency slots
+            // when it exits, releasing any waiter waiting on that capacity.
+            let ports = self
+                .io_completion_ports
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for port in ports {
+                port.release_guest_thread(thread_id);
+            }
         }
     }
 
@@ -7324,15 +8096,19 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, KernelObject,
+        ApcKind, CP_WIN1252, CompletionPortWaitError, CompletionPortWaitOutcome,
+        CreationDisposition, ERROR_ABANDONED_WAIT_0, FileAccess, IoCompletionPacket, KernelObject,
         MemoryProtection, MutexObject, ObjectType, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE,
-        SeekOrigin, SemaphoreObject, ShareMode, ThreadPlan, WaitStatus, Win32Subsystem, iconv_ffi,
-        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches,
+        STATUS_USER_APC, SeekOrigin, SemaphoreObject, ShareMode, ThreadPlan, WAIT_IO_COMPLETION,
+        WAIT_TIMEOUT, WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms,
+        split_find_search_pattern, windows_pattern_matches,
     };
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use crate::reason::ReasonCode;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn paced_sleep_duration_non_live_caps_host_sleep_at_1ms() {
@@ -7404,6 +8180,528 @@ mod tests {
                 internal: 0,
             }]
         );
+    }
+
+    /// Test-side predicate poll (never used inside the wait path under test).
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "test predicate never held");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn iocp_test_subsystem(name: &str) -> (tempfile::TempDir, Win32Subsystem) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        (temp_dir, Win32Subsystem::new(ge, false))
+    }
+
+    #[test]
+    fn iocp_waiter_blocks_and_post_wakes_it_within_latency_bound() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-wake");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+
+        let waiter_state = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = waiter_state.wait_dequeue(Some(Duration::from_secs(5)), 1);
+            (started.elapsed(), result)
+        });
+        // Wait until the thread is parked on the condition variable, then
+        // give it a moment to enter the actual wait (a notify issued before
+        // the wait call could otherwise be lost).
+        wait_until(|| state.waiter_count() == 1);
+        assert_eq!(state.counters().poll_iterations, 1);
+        std::thread::sleep(Duration::from_millis(20));
+
+        win32
+            .post_queued_completion_status(port, 11, 0xAA, 0xBB)
+            .expect("post completion status");
+        let (elapsed, result) = waiter.join().expect("waiter thread");
+        let packets = result.expect("waiter must receive the posted packet");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].bytes_transferred, 11);
+        assert_eq!(packets[0].completion_key, 0xAA);
+        assert_eq!(packets[0].overlapped, 0xBB);
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "waiter woke after {elapsed:?}; expected a condition-variable wake"
+        );
+        let counters = state.counters();
+        assert_eq!(counters.packets_posted, 1);
+        assert_eq!(counters.packets_dequeued, 1);
+        assert_eq!(counters.waiter_wakeups, 1);
+        assert!(
+            counters.poll_iterations <= 2,
+            "event-driven wait must not poll: {counters:?}"
+        );
+    }
+
+    #[test]
+    fn iocp_wait_times_out_at_deadline_without_busy_waiting() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-timeout");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+
+        let started = Instant::now();
+        let result = state.wait_dequeue(Some(Duration::from_millis(120)), 1);
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(CompletionPortWaitError::TimedOut)));
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "timeout fired early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "timeout fired late: {elapsed:?}"
+        );
+        let counters = state.counters();
+        assert_eq!(counters.timeout_expirations, 1);
+        assert_eq!(counters.packets_dequeued, 0);
+        assert!(
+            counters.poll_iterations <= 3,
+            "120 ms of waiting must not poll: {counters:?}"
+        );
+        assert_eq!(CompletionPortWaitError::TimedOut.last_error(), WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn iocp_get_queued_completion_status_blocks_until_posted() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-gqcs");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+
+        let poster_state = Arc::clone(&state);
+        let poster = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            poster_state
+                .post(IoCompletionPacket {
+                    bytes_transferred: 5,
+                    completion_key: 0xC0DE,
+                    overlapped: 0xBEEF,
+                    internal: 0,
+                })
+                .expect("post");
+        });
+
+        let started = Instant::now();
+        let outcome = win32
+            .get_queued_completion_status(port, 2_000)
+            .expect("get queued completion status");
+        let elapsed = started.elapsed();
+        poster.join().expect("poster thread");
+        match outcome {
+            CompletionPortWaitOutcome::Packets(packets) => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0].completion_key, 0xC0DE);
+                assert_eq!(packets[0].bytes_transferred, 5);
+                assert_eq!(packets[0].overlapped, 0xBEEF);
+            }
+            other => panic!("expected a packet, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "blocked call did not wake promptly: {elapsed:?}"
+        );
+
+        // Timeout arm: no packet queued, finite timeout.
+        let outcome = win32
+            .get_queued_completion_status(port, 60)
+            .expect("timeout wait");
+        assert_eq!(outcome, CompletionPortWaitOutcome::TimedOut);
+        assert_eq!(outcome.last_error(), WAIT_TIMEOUT);
+
+        // Batch arm: the Ex form removes up to the requested count, FIFO.
+        for key in [1u64, 2, 3] {
+            win32
+                .post_queued_completion_status(port, key as u32, key, 0)
+                .expect("post batch packet");
+        }
+        match win32
+            .get_queued_completion_status_ex(port, 2, 500)
+            .expect("batch wait")
+        {
+            CompletionPortWaitOutcome::Packets(packets) => {
+                assert_eq!(packets.len(), 2);
+                assert_eq!(packets[0].completion_key, 1);
+                assert_eq!(packets[1].completion_key, 2);
+            }
+            other => panic!("expected a batch, got {other:?}"),
+        }
+        match win32
+            .get_queued_completion_status_ex(port, 2, 500)
+            .expect("batch wait")
+        {
+            CompletionPortWaitOutcome::Packets(packets) => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0].completion_key, 3);
+            }
+            other => panic!("expected a batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iocp_concurrency_limit_and_set_concurrency_reevaluate_waiters() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-limit");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+        assert_eq!(state.concurrency_limit(), 1);
+
+        let (packet_tx, packet_rx) = mpsc::channel::<(usize, u64)>();
+        let mut release_senders = Vec::new();
+        let mut waiters = Vec::new();
+        for id in 0..3usize {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            release_senders.push(release_tx);
+            let waiter_state = Arc::clone(&state);
+            let packet_tx = packet_tx.clone();
+            waiters.push(std::thread::spawn(move || {
+                let packets = waiter_state
+                    .wait_dequeue(Some(Duration::from_secs(5)), 1)
+                    .expect("waiter packet");
+                packet_tx
+                    .send((id, packets[0].completion_key))
+                    .expect("send packet");
+                // Hold the active slot until the test releases it.
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release signal");
+                waiter_state.release_active();
+            }));
+        }
+        drop(packet_tx);
+        wait_until(|| state.waiter_count() == 3);
+        std::thread::sleep(Duration::from_millis(20));
+
+        // One post wakes exactly one eligible waiter at limit 1.
+        win32
+            .post_queued_completion_status(port, 1, 0x1001, 0)
+            .expect("post first");
+        let (_holder, key) = packet_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first waiter must wake");
+        assert_eq!(key, 0x1001);
+        wait_until(|| state.active_thread_count() == 1);
+        assert_eq!(
+            state.waiter_count(),
+            2,
+            "only one waiter may run at limit 1"
+        );
+        assert_eq!(state.counters().waiter_wakeups, 1);
+
+        // Packets posted while the slot is taken stay queued and wake nobody.
+        win32
+            .post_queued_completion_status(port, 2, 0x1002, 0)
+            .expect("post second");
+        win32
+            .post_queued_completion_status(port, 3, 0x1003, 0)
+            .expect("post third");
+        assert!(
+            packet_rx.recv_timeout(Duration::from_millis(120)).is_err(),
+            "waiters must stay blocked at the concurrency limit"
+        );
+        assert_eq!(state.queued_packet_count(), 2);
+        assert_eq!(state.counters().waiter_wakeups, 1);
+
+        // Raising the limit re-evaluates the blocked waiters immediately.
+        win32
+            .set_completion_port_concurrency(port, 3)
+            .expect("set concurrency");
+        assert_eq!(state.concurrency_limit(), 3);
+        let mut received = vec![key];
+        for _ in 0..2 {
+            let (_, key) = packet_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("waiter must wake after concurrency is raised");
+            received.push(key);
+        }
+        received.sort_unstable();
+        assert_eq!(received, vec![0x1001, 0x1002, 0x1003]);
+        assert_eq!(state.active_thread_count(), 3);
+
+        for sender in release_senders {
+            let _ = sender.send(());
+        }
+        for waiter in waiters {
+            waiter.join().expect("waiter thread");
+        }
+        assert_eq!(state.active_thread_count(), 0);
+    }
+
+    #[test]
+    fn iocp_guest_thread_keys_track_concurrency_per_guest_thread() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-guest-keys");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 1)
+            .expect("create completion port");
+        win32
+            .post_queued_completion_status(port, 1, 0x2001, 0)
+            .expect("post first");
+        win32
+            .post_queued_completion_status(port, 2, 0x2002, 0)
+            .expect("post second");
+        assert!(win32.completion_port_readable(port, 1).expect("readable"));
+        assert!(win32.completion_port_readable(port, 2).expect("readable"));
+
+        // Guest thread 1 takes the first packet and holds the single slot.
+        win32.set_current_thread_id(1);
+        let first = win32
+            .dequeue_io_completion_packets(port, 1)
+            .expect("first guest thread packet");
+        assert_eq!(first[0].completion_key, 0x2001);
+        assert!(win32.completion_port_readable(port, 1).expect("readable"));
+        assert!(!win32.completion_port_readable(port, 2).expect("readable"));
+
+        // Guest thread 2 is a different associated thread: excluded at
+        // limit 1 even though the same host thread makes the call.
+        win32.set_current_thread_id(2);
+        let error = win32
+            .dequeue_io_completion_packets(port, 1)
+            .expect_err("second guest thread must be excluded at limit 1");
+        assert_eq!(error.code, ReasonCode::RcWin32Timeout);
+        assert_eq!(
+            win32
+                .io_completion_counters(port)
+                .expect("counters")
+                .packets_dequeued,
+            1
+        );
+
+        // Guest thread 1 already holds the slot, so it may keep draining.
+        win32.set_current_thread_id(1);
+        let second = win32
+            .dequeue_io_completion_packets(port, 1)
+            .expect("same guest thread keeps its slot");
+        assert_eq!(second[0].completion_key, 0x2002);
+        let counters = win32.io_completion_counters(port).expect("counters");
+        assert_eq!(counters.packets_posted, 2);
+        assert_eq!(counters.packets_dequeued, 2);
+    }
+
+    #[test]
+    fn iocp_close_invalidates_queued_packets() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-close-queue");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+        win32
+            .post_queued_completion_status(port, 1, 1, 1)
+            .expect("post first");
+        win32
+            .post_queued_completion_status(port, 2, 2, 2)
+            .expect("post second");
+        assert_eq!(state.queued_packet_count(), 2);
+        // Single source of truth: the object payload's legacy inline queue
+        // stays empty while the shared queue holds the packets.
+        assert_eq!(
+            win32.io_completion_inline_queue_depth(port).expect("depth"),
+            0
+        );
+
+        win32.close_handle(port).expect("close port");
+        assert!(state.is_closed());
+        assert_eq!(
+            state.queued_packet_count(),
+            0,
+            "queued packets are invalidated at close"
+        );
+        assert!(matches!(
+            state.try_dequeue(1),
+            Err(CompletionPortWaitError::Closed)
+        ));
+        assert!(win32.io_completion_port_state(port).is_err());
+        assert_eq!(state.counters().closes, 1);
+        assert_eq!(
+            CompletionPortWaitError::Closed.last_error(),
+            ERROR_ABANDONED_WAIT_0
+        );
+    }
+
+    #[test]
+    fn iocp_close_wakes_blocked_waiters_with_abandoned_error() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-close-wait");
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        let state = win32.io_completion_port_state(port).expect("wait state");
+        let waiter_state = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = waiter_state.wait_dequeue(Some(Duration::from_secs(5)), 1);
+            (started.elapsed(), result)
+        });
+        wait_until(|| state.waiter_count() == 1);
+        std::thread::sleep(Duration::from_millis(20));
+
+        win32.close_handle(port).expect("close port");
+        let (elapsed, result) = waiter.join().expect("waiter thread");
+        assert!(matches!(result, Err(CompletionPortWaitError::Closed)));
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "close must wake the waiter: {elapsed:?}"
+        );
+        assert_eq!(state.counters().closes, 1);
+        assert!(state.counters().waiter_wakeups >= 1);
+        assert_eq!(state.waiter_count(), 0);
+    }
+
+    #[test]
+    fn iocp_file_association_stores_completion_key_and_routes_packets() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("iocp-assoc");
+        let host_path = win32
+            .ge()
+            .host_path_for_windows_path("C:\\iocp\\data.bin")
+            .expect("host path");
+        fs::create_dir_all(host_path.parent().expect("parent")).expect("create dir");
+        fs::write(&host_path, b"payload").expect("write file");
+        let file = win32
+            .create_file_w(
+                "C:\\iocp\\data.bin",
+                FileAccess::read_only(),
+                ShareMode::all(),
+                CreationDisposition::OpenExisting,
+                false,
+                false,
+                false,
+            )
+            .expect("open file");
+
+        let port = win32
+            .create_io_completion_port(Some(file), None, 0x5151, 0)
+            .expect("associate file");
+        let association = win32
+            .io_completion_association(file)
+            .expect("association stored");
+        assert_eq!(association.port, port);
+        assert_eq!(association.completion_key, 0x5151);
+
+        // A handle can be associated with one completion port only.
+        let error = win32
+            .create_io_completion_port(Some(file), Some(port), 0x9999, 0)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+
+        // Completion packets for the file carry the stored key.
+        assert!(
+            win32
+                .post_completion_status_for_file(file, 9, 0x1234, 0x0103)
+                .expect("post for file")
+        );
+        let outcome = win32
+            .get_queued_completion_status(port, 0)
+            .expect("dequeue");
+        match outcome {
+            CompletionPortWaitOutcome::Packets(packets) => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0].completion_key, 0x5151);
+                assert_eq!(packets[0].bytes_transferred, 9);
+                assert_eq!(packets[0].overlapped, 0x1234);
+                assert_eq!(packets[0].internal, 0x0103);
+            }
+            other => panic!("expected a packet, got {other:?}"),
+        }
+        assert!(
+            !win32
+                .post_completion_status_for_file(port, 1, 2, 3)
+                .unwrap()
+        );
+
+        // The association dies with the file handle.
+        win32.close_handle(file).expect("close file");
+        assert!(win32.io_completion_association(file).is_none());
+    }
+
+    #[test]
+    fn apcs_deliver_fifo_only_at_alertable_waits() {
+        let (_temp_dir, mut win32) = iocp_test_subsystem("apc-alert");
+        let thread = win32.create_thread(
+            ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let thread_id = win32.thread_id_for_handle(thread).expect("thread id");
+        let (event, _) = win32.create_event(false, false, false, None);
+
+        win32.queue_user_apc(thread, 0xA001, 1).expect("apc 1");
+        win32.queue_user_apc(thread, 0xA002, 2).expect("apc 2");
+        win32.queue_kernel_apc(thread, 0xA003, 3).expect("apc 3");
+        assert_eq!(win32.pending_apc_count(thread_id), 3);
+        assert_eq!(win32.apc_counters().queued, 3);
+
+        // Non-alertable waits never deliver (and never consume) APCs.
+        let status = win32
+            .wait_for_single_object(event, 0, false, Some(thread))
+            .expect("non-alertable wait");
+        assert_eq!(status, WaitStatus::Timeout);
+        assert_eq!(win32.pending_apc_count(thread_id), 3);
+        assert_eq!(win32.apc_counters().delivered, 0);
+        let status = win32
+            .sleep_ex(0, false, Some(thread))
+            .expect("non-alertable sleep");
+        assert_eq!(status, WaitStatus::Object0);
+        assert_eq!(win32.pending_apc_count(thread_id), 3);
+        assert_eq!(win32.apc_counters().delivered, 0);
+
+        // The alertable boundary delivers every pending APC, FIFO, and frees
+        // the queue entries.
+        let status = win32
+            .wait_for_single_object(event, 0, true, Some(thread))
+            .expect("alertable wait");
+        assert_eq!(status, WaitStatus::IoCompletion);
+        assert_eq!(status.code(), WAIT_IO_COMPLETION);
+        assert_eq!(win32.pending_apc_count(thread_id), 0);
+        assert_eq!(win32.apc_counters().delivered, 3);
+        assert_eq!(win32.apc_counters().alertable_waits, 1);
+
+        // FIFO order is observable through the delivery primitive, and the
+        // delivered entries are freed from the queue.
+        win32.queue_apc(thread, "one").expect("token 1");
+        win32.queue_apc(thread, "two").expect("token 2");
+        win32.queue_apc(thread, "three").expect("token 3");
+        let delivered = win32.take_pending_apcs(thread_id);
+        let tokens = delivered
+            .iter()
+            .map(|apc| apc.token.clone().expect("token"))
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, vec!["one", "two", "three"]);
+        assert!(
+            delivered
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        assert_eq!(win32.pending_apc_count(thread_id), 0);
+
+        // NtTestAlert: STATUS_SUCCESS with an empty queue, STATUS_USER_APC
+        // (and only then) when APCs were actually delivered.
+        win32.set_current_thread_id(thread_id);
+        let (status, delivered) = win32.test_alert();
+        assert_eq!(status, 0);
+        assert!(delivered.is_empty());
+        win32
+            .queue_user_apc(thread, 0xBEEF, 7)
+            .expect("apc for test_alert");
+        let (status, delivered) = win32.test_alert();
+        assert_eq!(status, STATUS_USER_APC);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].callback, 0xBEEF);
+        assert_eq!(delivered[0].context, 7);
+        assert_eq!(delivered[0].kind, ApcKind::User);
+        assert_eq!(win32.pending_apc_count(thread_id), 0);
     }
 
     #[test]

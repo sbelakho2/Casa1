@@ -1615,6 +1615,150 @@ fn bench_cpu_decode_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Re-sync a large *sparse* guest memory image into the flat JIT mirror.
+///
+/// The guest image commits only 16 pages spread across a 2 GiB address range;
+/// every other guest page is untouched.  Before the on-demand materialisation
+/// work this call synchronises (and eagerly pre-faults) the whole 4 GiB flat
+/// region on every block execution — over a million page touches per call.
+/// After it, only the 16 committed pages are materialised, so the benchmark
+/// measures exactly the eager work that was eliminated.
+fn bench_cpu_memory_sync_sparse(c: &mut Criterion) {
+    use casa1::cpu::MemoryImage;
+    use casa1::jit::JitRuntime;
+
+    let arch = casa1::cpu::GuestArch::X64;
+    let mut memory = MemoryImage::default();
+    let mut committed_pages = 0u64;
+    for i in 0..16u64 {
+        let addr = i * 0x0800_0000;
+        memory.map_bytes(addr, &[0xABu8; 0x1000]);
+        committed_pages += 1;
+    }
+    assert_eq!(memory.committed_page_addresses().len(), 16);
+    let mut runtime = JitRuntime::new(arch);
+    // Warm one sync so the first call's mmap/page-population cost is not
+    // attributed to the measured steady state.
+    runtime.sync_all_pages_to_flat(&memory);
+
+    // On-demand proof: one more sync must materialise exactly the 16
+    // committed pages, not the whole 1,048,576-page flat region.
+    let before = casa1::jit::guest_memory_telemetry();
+    runtime.sync_all_pages_to_flat(&memory);
+    let after = casa1::jit::guest_memory_telemetry();
+    assert_eq!(
+        after.pages_materialised - before.pages_materialised,
+        16,
+        "a sparse 16-page guest image must materialise only 16 pages"
+    );
+    assert_eq!(
+        after.bytes_copied - before.bytes_copied,
+        16 * 4096,
+        "only the committed bytes may be copied"
+    );
+
+    let mut group = c.benchmark_group("cpu/memory");
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    group.bench_function("sync_sparse_guest", |b| {
+        b.iter(|| {
+            runtime.sync_all_pages_to_flat(bb(&memory));
+            bb(runtime.synced_page_count())
+        })
+    });
+    let _ = committed_pages;
+    group.finish();
+}
+
+/// Repeated resolution of a guest thunk address to its host trampoline.
+/// A resolved-target cache should make repeat lookups O(1) and bypass the
+/// linear entry scan + global-map lock.
+fn bench_jit_thunk_resolve(c: &mut Criterion) {
+    use casa1::jit::FastThunkTable;
+
+    extern "C" fn bench_thunk_target() -> u64 {
+        0x42
+    }
+
+    let mut table = FastThunkTable::new();
+    let mut guest_addrs = Vec::new();
+    let host_fn = bench_thunk_target as *const () as usize;
+    for i in 0..256u64 {
+        let guest = 0x100_0000 + i * 0x10;
+        table
+            .register_with_guest_addr(host_fn, guest)
+            .expect("register thunk");
+        guest_addrs.push(guest);
+    }
+
+    let mut group = c.benchmark_group("jit/thunk_resolve");
+    group.bench_function("256_repeat_lookups", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for guest in &guest_addrs {
+                acc = acc.wrapping_add(table.find_thunk_by_guest(bb(*guest)).unwrap_or(0));
+            }
+            bb(acc)
+        })
+    });
+    group.finish();
+}
+
+/// Lazy x86 flag materialisation: a chain of 200 ADD instructions whose flags
+/// are never read until the block ends.  The eager implementation computed a
+/// full flag set after every ADD; the lazy path parks each result and
+/// materialises only the last one.
+fn bench_cpu_lazy_flags_alu_chain(c: &mut Criterion) {
+    use casa1::cpu::{
+        CpuEngineConfig, CpuExecutionEngine, CpuState, CpuVirtualization, GuestArch, IrInstruction,
+        MemoryImage, Register,
+    };
+
+    let arch = GuestArch::X64;
+    let engine = CpuExecutionEngine::new(CpuEngineConfig {
+        arch,
+        os_build: "bench".into(),
+        macwin_version: "0.0.0".into(),
+        virtualization: CpuVirtualization::from_profile(arch, None).unwrap(),
+    });
+    let ir: Vec<IrInstruction> = (0..200u64)
+        .map(|i| IrInstruction::AddImm {
+            dst: Register::Rax,
+            value: i + 1,
+            width: 8,
+        })
+        .collect();
+
+    // Prove the laziness engages before measuring: at most the final flag set
+    // can be computed eagerly; the other 199 must be skipped.  (Other tests
+    // run concurrently, so assert the guaranteed lower bound.)
+    let mut probe_state = CpuState::new(arch);
+    let mut probe_memory = MemoryImage::default();
+    let before = casa1::cpu::lazy_flag_telemetry();
+    engine
+        .execute_ir(&mut probe_state, &mut probe_memory, &ir)
+        .expect("probe execution");
+    let after = casa1::cpu::lazy_flag_telemetry();
+    assert!(
+        after.skipped - before.skipped >= 199,
+        "lazy flags did not skip dead materialisations: {before:?} -> {after:?}"
+    );
+
+    let mut group = c.benchmark_group("cpu/lazy_flags");
+    group.bench_function("200_dead_add_flags", |b| {
+        b.iter_with_setup(
+            || (CpuState::new(arch), MemoryImage::default()),
+            |(mut state, mut memory)| {
+                let result = engine
+                    .execute_ir(bb(&mut state), bb(&mut memory), bb(&ir))
+                    .expect("execute");
+                bb(result)
+            },
+        )
+    });
+    group.finish();
+}
+
 // ===========================================================================
 // 12. MEMORY USAGE TRACKING UTILITY  (Item 293)
 // ===========================================================================
@@ -1896,6 +2040,11 @@ criterion_group!(
     bench_fast_thunk_guest_pointer_checks,
     // 11. Decode Throughput
     bench_cpu_decode_throughput,
+    // Interpreter memory model (on-demand page materialisation)
+    bench_cpu_memory_sync_sparse,
+    bench_jit_thunk_resolve,
+    // Interpreter lazy flag materialisation
+    bench_cpu_lazy_flags_alu_chain,
     // 12. Memory Usage Tracking
     bench_memory_usage_tracking,
     // 13. Stress / Leak Tests

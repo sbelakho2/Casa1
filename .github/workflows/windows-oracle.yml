@@ -60,6 +60,33 @@ jobs:
           name: windows-oracle-vectors
       - name: Build the Windows reference executable
         run: cargo build --manifest-path windows_reference/Cargo.toml --release
+      - name: Verify the reference binary embeds the application manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "windows_reference\target\release\casa1-windows-reference.exe"
+          if (-not (Test-Path $exe)) { throw "reference executable not found: $exe" }
+          $mt = $null
+          foreach ($root in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "$env:ProgramFiles\Windows Kits\10\bin")) {
+            if ($mt) { break }
+            if (-not (Test-Path $root)) { continue }
+            $candidate = Get-ChildItem -Path (Join-Path $root "*\x64\mt.exe") -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($candidate) { $mt = $candidate }
+          }
+          if (-not $mt) { throw "mt.exe not found in the Windows 10 SDK — cannot verify the embedded manifest" }
+          $manifest = Join-Path $env:RUNNER_TEMP "casa1-reference-manifest.xml"
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw "mt.exe could not extract an embedded manifest from $exe (exit $LASTEXITCODE)" }
+          $xml = Get-Content -Raw -Path $manifest
+          if ($xml -notmatch "urn:schemas-microsoft-com:asm.v1") {
+            throw "the extracted resource is not an assembly manifest"
+          }
+          if ($xml -notmatch "8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a") {
+            throw "the embedded manifest lacks the Windows 10 supportedOS GUID — GetVersionExW would be shimmed to 6.2.9200"
+          }
+          Write-Host "OK: $exe embeds the application manifest with the Windows 10 supportedOS GUID"
       - name: Run the reference executable on the corpus
         run: .\windows_reference\target\release\casa1-windows-reference.exe windows_oracle_vectors.json windows_oracle_reference_results.json
       - uses: actions/upload-artifact@v4

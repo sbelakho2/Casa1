@@ -194,6 +194,9 @@ pub unsafe extern "C" fn jit_helper_set_flags(
         return;
     }
     let s = unsafe { &mut *state };
+    // The helper writes `flags` directly; a parked lazy computation from a
+    // prior interpreted instruction must not survive it.
+    s.pending_flags = None;
     let bits = (width * 8) as u32;
     let mask = if bits >= 64 {
         u64::MAX
@@ -1355,6 +1358,68 @@ pub static SIGBUS_FIRST_FAULT_ADDR: std::sync::atomic::AtomicU64 =
 static SIGBUS_HANDLER_DEPTH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ── Guest-page materialisation instrumentation ──────────────────────────────
+//
+// The flat guest mirror is populated strictly on demand: only guest pages
+// that are actually committed (or faulted on) are copied into it.  These
+// monotonic counters make that work observable so tests can assert that the
+// former whole-4-GiB prefault is gone.
+
+/// Number of 4 KiB guest pages copied into (materialised in) the flat mirror.
+pub static GUEST_PAGES_MATERIALISED: AtomicU64 = AtomicU64::new(0);
+/// Number of batched sync operations performed (one per contiguous run of
+/// materialised pages, plus one per page in the signal-handler fast path).
+pub static GUEST_SYNC_OPERATIONS: AtomicU64 = AtomicU64::new(0);
+/// Total bytes copied from `MemoryImage` into the flat mirror.
+pub static GUEST_SYNC_BYTES_COPIED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the guest-page materialisation counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuestMemoryTelemetry {
+    pub pages_materialised: u64,
+    pub sync_operations: u64,
+    pub bytes_copied: u64,
+}
+
+/// Read the current guest-page materialisation counters.
+pub fn guest_memory_telemetry() -> GuestMemoryTelemetry {
+    GuestMemoryTelemetry {
+        pages_materialised: GUEST_PAGES_MATERIALISED.load(Ordering::Relaxed),
+        sync_operations: GUEST_SYNC_OPERATIONS.load(Ordering::Relaxed),
+        bytes_copied: GUEST_SYNC_BYTES_COPIED.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the guest-page materialisation counters (test/diagnostic helper).
+pub fn reset_guest_memory_telemetry() {
+    GUEST_PAGES_MATERIALISED.store(0, Ordering::Relaxed);
+    GUEST_SYNC_OPERATIONS.store(0, Ordering::Relaxed);
+    GUEST_SYNC_BYTES_COPIED.store(0, Ordering::Relaxed);
+}
+
+// ── Resolved host-thunk target instrumentation ─────────────────────────────
+
+/// Number of guest→host thunk resolutions served from the resolved-target
+/// index (the fast path that bypasses the entry scan and global-map lock).
+pub static THUNK_RESOLVE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Number of guest→host thunk resolutions that missed the fast index and
+/// fell back to the global map (or returned "not registered").
+pub static THUNK_RESOLVE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the thunk-resolution counters (test/diagnostic helper).
+pub fn reset_thunk_resolve_telemetry() {
+    THUNK_RESOLVE_HITS.store(0, Ordering::Relaxed);
+    THUNK_RESOLVE_MISSES.store(0, Ordering::Relaxed);
+}
+
+/// `(hits, misses)` since the last reset.
+pub fn thunk_resolve_telemetry() -> (u64, u64) {
+    (
+        THUNK_RESOLVE_HITS.load(Ordering::Relaxed),
+        THUNK_RESOLVE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
 /// Helper: write JIT diagnostic info to a temp file for post-crash analysis.
 /// The runner process captures stderr via pipes that are lost if the runner
 /// crashes, so we write to a file as a fallback.  Not called from signal
@@ -1568,71 +1633,74 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
         std::process::abort();
     }
 
-    // ── Batch sync: sync the faulting page + surrounding pages ────────
-    let batch_start = page.saturating_sub(SIGBUS_BATCH_SYNC_RADIUS * 4096);
-    let batch_end = page.saturating_add(SIGBUS_BATCH_SYNC_RADIUS * 4096);
-    let mut batch_page_data = [0u8; 4096];
+    // ── Batch sync: materialise the faulting page + surrounding pages ──
+    //
+    // The previous handler copied every page through a stack buffer that was
+    // then zeroed (three 4 KiB memory touches per page) and additionally wrote
+    // a zero byte to the LAST byte of every page *after* copying it —
+    // corrupting the last byte of every guest page that held data.  The
+    // handler now copies each MemoryImage page directly into the flat mirror
+    // (one 4 KiB copy, no intermediate buffer, no buffer zeroing) and groups
+    // contiguous mapped pages into one sync operation for accounting.  Pages
+    // absent from the MemoryImage are only physically backed (they hold no
+    // guest data yet, so the zero write is lossless).
+    let batch_start = page.saturating_sub(SIGBUS_BATCH_SYNC_RADIUS * 4096) & !0xfff;
+    let batch_end = page
+        .saturating_add(SIGBUS_BATCH_SYNC_RADIUS * 4096)
+        .saturating_add(4096)
+        .min(flat_size);
+    let flat_base_ptr = runtime.flat_memory.base() as *mut u8;
 
     let mut cursor = batch_start;
-    while cursor <= batch_end {
-        if memory.read_page_signal_safe(cursor, &mut batch_page_data) {
+    let mut copied_pages = 0u64;
+    let mut sync_operations = 0u64;
+    let mut copied_bytes = 0u64;
+    let mut in_run = false;
+    while cursor < batch_end {
+        // SAFETY: cursor < batch_end <= flat_size, so writing one 4 KiB page
+        // at the mirror offset stays inside the mmap'd region.
+        // `copy_page_to_raw` is async-signal-safe: it performs a page-table
+        // lookup and one `copy_nonoverlapping` with no allocation.
+        let copied = unsafe { memory.copy_page_to_raw(cursor, flat_base_ptr.add(cursor as usize)) };
+        if copied {
             runtime
                 .flat_memory
-                .sync_from_memory_image(cursor, &batch_page_data);
+                .mark_page_materialised_signal_safe(cursor);
             SIGBUS_PAGE_FOUND.fetch_add(1, Ordering::Relaxed);
+            copied_pages += 1;
+            copied_bytes += 4096;
+            if !in_run {
+                sync_operations += 1;
+                in_run = true;
+            }
         } else {
             SIGBUS_PAGE_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
-        }
-        // ── ALWAYS pre-fault every page in the batch ─────────────────────
-        // On macOS with MAP_NORESERVE, even pages that are NOT in the memory
-        // image's committed_page_addresses() still need to be physically
-        // backed.  The flat memory is a 4GB mmap with MAP_NORESERVE — every
-        // page exists in the virtual address space but has no physical page
-        // allocated until the first write.  A READ access is served by the
-        // kernel's zero-fill pool WITHOUT allocating backing store, so a
-        // subsequent JIT write-access will SIGBUS.
-        //
-        // We ALWAYS do write_volatile to the last byte of the page to force
-        // the kernel to commit a physical page.  Writing 0 to a zero-initialized
-        // page is harmless but guarantees the physical page exists, eliminating
-        // the second SIGBUS on write access.
-        //
-        // This is critical for pages that the JIT code accesses but which were
-        // never explicitly committed in the MemoryImage (e.g., guest stack
-        // growth pages, runtime heap allocations, pages that exist only in the
-        // flat memory mirror but not in committed_page_addresses).
-        //
-        // SAFETY: Pre-fault write to force physical page allocation.
-        // `offset` is validated with checked arithmetic: `offset.checked_add(4095)`
-        // ensures no usize overflow, and the result is bounds-checked against
-        // `flat_memory.size()` to guarantee the write stays within the 4GB
-        // mmap'd region. `write_volatile` prevents the compiler from optimizing
-        // away the write. Writing 0 to a zero-initialized page is harmless.
-        let offset = cursor as usize;
-        let flat_size_val = runtime.flat_memory.size();
-        // Use checked arithmetic: offset + 4095 must not overflow usize,
-        // and the resulting pointer must fall within the flat memory region.
-        if let Some(end_offset) = offset.checked_add(4095)
-            && end_offset < flat_size_val
-        {
-            // SAFETY: end_offset < flat_size_val guarantees the pointer
-            // base + end_offset is within the mmap'd region.
-            unsafe {
-                std::ptr::write_volatile(
-                    (runtime.flat_memory.base() as *mut u8).add(end_offset),
-                    0u8,
-                );
+            in_run = false;
+            // ── ALWAYS pre-fault pages with no MemoryImage data ───────────
+            // On macOS with MAP_NORESERVE, a page of the flat mmap exists in
+            // the virtual address space but has no physical backing until the
+            // first write; a subsequent JIT write would SIGBUS.  A single
+            // write to the last byte forces the kernel to back the page.  The
+            // page has no guest data yet, so writing zero is lossless.
+            let offset = cursor as usize;
+            if let Some(end_offset) = offset.checked_add(4095)
+                && end_offset < flat_size as usize
+            {
+                // SAFETY: end_offset < flat_size guarantees the pointer is
+                // within the mmap'd region.
+                unsafe {
+                    std::ptr::write_volatile(flat_base_ptr.add(end_offset), 0u8);
+                }
+                runtime
+                    .flat_memory
+                    .mark_page_materialised_signal_safe(cursor);
             }
-        }
-        // Signal-safe zeroing: ptr::write_bytes compiles to an inline memset
-        // which is async-signal-safe (memset is in the POSIX safe list).
-        // SAFETY: batch_page_data is a stack-local [u8; 4096] array,
-        // always valid and 4096 bytes in size.
-        unsafe {
-            std::ptr::write_bytes(batch_page_data.as_mut_ptr(), 0, 4096);
         }
         cursor += 4096;
     }
+    GUEST_PAGES_MATERIALISED.fetch_add(copied_pages, Ordering::Relaxed);
+    GUEST_SYNC_OPERATIONS.fetch_add(sync_operations, Ordering::Relaxed);
+    GUEST_SYNC_BYTES_COPIED.fetch_add(copied_bytes, Ordering::Relaxed);
     SIGBUS_HANDLER_DEPTH.fetch_sub(1, Ordering::Relaxed);
     // Clear re-entrancy guard with Release ordering to ensure all writes
     // made during the handler are visible before another invocation proceeds.
@@ -2389,11 +2457,26 @@ impl Drop for JitMemoryManager {
 
 /// A flat mmap'd region mirroring the guest address space.
 /// JIT-compiled code uses this for direct load/store access.
+///
+/// The mirror is populated **on demand**: a guest page is copied in only when
+/// it is committed in the `MemoryImage` (or when the SIGBUS handler services a
+/// fault on it).  `materialised` is a one-bit-per-4-KiB-page record of exactly
+/// which pages have ever been copied, so instrumentation and tests can prove
+/// that untouched guest pages are never materialised.
 pub struct FlatGuestMemory {
     base: *mut u8,
     size: usize,
     valid: bool,
+    /// One bit per 4 KiB page of `size`: set once the page has been copied
+    /// from `MemoryImage` (or otherwise physically backed).  Atomics keep the
+    /// SIGBUS fast path async-signal-safe.
+    materialised: Box<[AtomicU64]>,
 }
+
+/// Maximum bytes read into the scratch buffer for a single batched sync
+/// operation.  A contiguous run longer than this is split into bounded
+/// chunks so one sync can never allocate a multi-gigabyte scratch buffer.
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 // SAFETY: FlatGuestMemory contains a raw mmap'd pointer. It is safe to
 // send across threads because mmap'd memory is thread-safe (kernel manages
@@ -2436,10 +2519,17 @@ impl FlatGuestMemory {
                 unsafe { *libc::__error() },
             );
         }
+        // 4 GiB / 4 KiB = 1,048,576 pages → 16,384 u64 words (128 KiB).
+        let bitmap_words = size.div_ceil(4096 * 64);
+        let materialised = (0..bitmap_words)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             base: base_ptr,
             size,
             valid,
+            materialised,
         }
     }
 
@@ -2448,6 +2538,52 @@ impl FlatGuestMemory {
     }
     pub fn is_valid(&self) -> bool {
         self.valid
+    }
+
+    /// Number of 4 KiB pages in the flat mirror (the whole guest range).
+    pub fn total_page_count(&self) -> u64 {
+        (self.size / 4096) as u64
+    }
+
+    /// Bitmap index/bit for a page base address, or `None` when the page is
+    /// outside the flat region.
+    fn materialised_bit(&self, page_addr: u64) -> Option<(usize, u64)> {
+        if !self.valid {
+            return None;
+        }
+        let offset = page_addr as usize;
+        if offset % 4096 != 0 || offset >= self.size {
+            return None;
+        }
+        let page = offset / 4096;
+        let word = page / 64;
+        let bit = 1u64 << (page % 64);
+        Some((word, bit))
+    }
+
+    /// Record that `page_addr` has been materialised.  Async-signal-safe:
+    /// a single lock-free atomic OR with no allocation.
+    #[inline]
+    pub fn mark_page_materialised_signal_safe(&self, page_addr: u64) {
+        if let Some((word, bit)) = self.materialised_bit(page_addr) {
+            self.materialised[word].fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns `true` when `page_addr` has ever been copied into the mirror.
+    pub fn is_page_materialised(&self, page_addr: u64) -> bool {
+        match self.materialised_bit(page_addr) {
+            Some((word, bit)) => self.materialised[word].load(Ordering::Relaxed) & bit != 0,
+            None => false,
+        }
+    }
+
+    /// Number of guest pages materialised in the mirror so far.
+    pub fn materialised_page_count(&self) -> u64 {
+        self.materialised
+            .iter()
+            .map(|word| word.load(Ordering::Relaxed).count_ones() as u64)
+            .sum()
     }
 
     /// Sync data from MemoryImage into the flat region at a guest address.
@@ -2484,98 +2620,95 @@ impl FlatGuestMemory {
         }
     }
 
-    /// Pre-fault (physically back) a contiguous range of guest memory pages.
+    /// Materialise the given guest pages from `memory` into the flat mirror.
     ///
-    /// On macOS with MAP_ANONYMOUS (no MAP_NORESERVE), each page in the 4GB
-    /// mmap'd region exists in the virtual address space but has no physical
-    /// page allocated until the first write. This method proactively touches
-    /// the last byte of each page in the range [guest_start, guest_start+size)
-    /// so that subsequent JIT writes do not trigger SIGBUS.
+    /// **On demand**: only the supplied pages are ever copied.  Contiguous
+    /// page runs are read from `MemoryImage` and copied into the mirror in a
+    /// single operations, so a dense block of N pages costs one sync
+    /// operation instead of N.  A partially/unmapped page is skipped exactly
+    /// like the previous per-page code did.
     ///
-    /// This is critical for performance: pre-faulting ~64K pages (~250MB) at
-    /// JIT session start costs ~6ms but eliminates thousands of SIGBUS signals
-    /// that would each cost ~100µs in kernel signal delivery overhead.
-    ///
-    /// # Parameters
-    /// * `guest_start` — guest virtual address (start of range, page-aligned)
-    /// * `size` — size in bytes (will be rounded up to page boundary)
-    pub fn prefault_range(&self, guest_start: u64, size: usize) {
-        if !self.valid {
-            return;
+    /// Updates [`GUEST_PAGES_MATERIALISED`], [`GUEST_SYNC_OPERATIONS`] and
+    /// [`GUEST_SYNC_BYTES_COPIED`].
+    pub fn materialise_pages(&self, memory: &MemoryImage, pages: &[u64]) -> GuestMemoryTelemetry {
+        let mut stats = GuestMemoryTelemetry::default();
+        if !self.valid || pages.is_empty() {
+            return stats;
         }
-        let page_size: u64 = 4096;
-        let start_page = guest_start & !(page_size - 1);
-        let end = guest_start.saturating_add(size as u64);
-        let end_page = end.saturating_add(page_size - 1) & !(page_size - 1);
 
-        let mut page = start_page;
-        while page < end_page {
-            let offset = page as usize;
-            // SAFETY: Checked arithmetic — offset + 4095 must not overflow
-            // usize, and the resulting pointer must be within the mmap'd region.
-            if let Some(end_offset) = offset.checked_add(4095)
-                && end_offset < self.size
-            {
-                unsafe {
-                    std::ptr::write_volatile(self.base.add(end_offset), 0u8);
+        // Page-aligned, in-bounds, sorted, deduplicated page list.
+        let mut sorted: Vec<u64> = pages
+            .iter()
+            .filter_map(|&page| {
+                let aligned = page & !0xfff;
+                ((aligned as usize) < self.size).then_some(aligned)
+            })
+            .collect();
+        if sorted.is_empty() {
+            return stats;
+        }
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut index = 0usize;
+        while index < sorted.len() {
+            // Coalesce the maximal contiguous run starting at sorted[index].
+            let run_start = sorted[index];
+            let mut run_end = run_start + 4096;
+            let mut run_end_index = index + 1;
+            while run_end_index < sorted.len() && sorted[run_end_index] == run_end {
+                run_end += 4096;
+                run_end_index += 1;
+            }
+            let run_len = (run_end - run_start) as usize;
+            // Bound the scratch buffer: a single sync never allocates more
+            // than MAX_BATCH_BYTES even for a multi-gigabyte contiguous run.
+            let mut offset = 0usize;
+            while offset < run_len {
+                let chunk_len = (run_len - offset).min(MAX_BATCH_BYTES);
+                let chunk_start = run_start + offset as u64;
+                scratch.resize(chunk_len, 0);
+                match memory.read_into(chunk_start, &mut scratch[..chunk_len]) {
+                    Ok(()) => {
+                        // One batched operation per contiguous chunk.
+                        self.sync_from_memory_image(chunk_start, &scratch[..chunk_len]);
+                        let chunk_pages = (chunk_len / 4096) as u64;
+                        for page_index in 0..chunk_pages {
+                            self.mark_page_materialised_signal_safe(
+                                chunk_start + page_index * 4096,
+                            );
+                        }
+                        stats.pages_materialised += chunk_pages;
+                        stats.sync_operations += 1;
+                        stats.bytes_copied += chunk_len as u64;
+                    }
+                    Err(_) => {
+                        // A gap inside the chunk (partially mapped pages):
+                        // fall back to per-page sync, preserving the previous
+                        // semantics of skipping any page that is not fully
+                        // readable.
+                        for page_index in 0..(chunk_len / 4096) {
+                            let page = chunk_start + (page_index as u64) * 4096;
+                            if memory.read_into(page, &mut scratch[..4096]).is_ok() {
+                                self.sync_from_memory_image(page, &scratch[..4096]);
+                                self.mark_page_materialised_signal_safe(page);
+                                stats.pages_materialised += 1;
+                                stats.sync_operations += 1;
+                                stats.bytes_copied += 4096;
+                            }
+                        }
+                    }
                 }
+                offset += chunk_len;
             }
-            page += page_size;
+            index = run_end_index;
         }
-    }
 
-    /// Pre-fault **every page** in the 4GB flat guest memory region.
-    ///
-    /// This writes a zero byte to the last byte of every 4KB page in the
-    /// entire 4GB flat memory mirror. After this completes, **no** guest
-    /// memory write can trigger a SIGBUS, because every virtual page has
-    /// been physically backed by the kernel (via lazy allocation during
-    /// the first write to each page).
-    ///
-    /// Without this, JIT-compiled code that writes to guest memory pages
-    /// outside the `prefault_range` set (e.g., dynamically allocated heap,
-    /// TLS data, PE sections at unexpected addresses, WOW64 thunk pages)
-    /// triggers SIGBUS, which adds ~100µs of kernel signal delivery
-    /// overhead per fault. For Steam's startup sequence (~100K+ page
-    /// writes), this results in a SIGBUS storm that consumes ~91% CPU
-    /// in `_sigtramp`, preventing forward progress.
-    ///
-    /// Pre-faulting all 1,048,576 pages in the 4GB region costs ~2-5
-    /// seconds at JIT session start but completely eliminates SIGBUS
-    /// for guest memory writes. This is a one-time cost that pays for
-    /// itself within the first few seconds of Steam execution.
-    ///
-    /// Uses `write_bytes` (compiles to `memset`) for efficiency — the
-    /// sequential access pattern allows the kernel to batch page
-    /// allocation efficiently, and the CPU's write-combining buffer
-    /// minimizes memory bus overhead.
-    pub fn prefault_all(&self) {
-        if !self.valid {
-            return;
-        }
-        let page_size = 4096;
-        // Touch the last byte of each page in the entire 4GB region.
-        // We use a tight loop with write_volatile to ensure the compiler
-        // doesn't optimize away the writes. Each write touches a single
-        // byte at the end of a 4KB page, forcing the kernel to allocate
-        // a physical page (zero-filled) via lazy allocation.
-        //
-        // Total pages: 4GB / 4KB = 1,048,576 pages.
-        // Each iteration: one STRB instruction + kernel page fault.
-        // Estimated time: 2-5 seconds on Apple Silicon.
-        let pages = self.size / page_size;
-        let base_ptr = self.base;
-        for page_idx in 0..pages {
-            let offset = page_idx * page_size + (page_size - 1);
-            // SAFETY: page_idx ranges from 0 to pages-1, so offset ranges
-            // from 4095 to (pages*page_size - 1) = self.size - 1, which is
-            // within the mmap'd region. write_volatile prevents the compiler
-            // from eliding the write. Writing 0 to a zero-initialized page
-            // is harmless.
-            unsafe {
-                std::ptr::write_volatile(base_ptr.add(offset), 0u8);
-            }
-        }
+        GUEST_PAGES_MATERIALISED.fetch_add(stats.pages_materialised, Ordering::Relaxed);
+        GUEST_SYNC_OPERATIONS.fetch_add(stats.sync_operations, Ordering::Relaxed);
+        GUEST_SYNC_BYTES_COPIED.fetch_add(stats.bytes_copied, Ordering::Relaxed);
+        stats
     }
 
     pub fn size(&self) -> usize {
@@ -4489,191 +4622,43 @@ impl JitRuntime {
     }
 
     /// Sync a page from MemoryImage to the flat guest memory region.
-    pub fn sync_page_to_flat(&self, memory: &MemoryImage, page_addr: u64) {
-        let page_size = 4096;
-        let mut page_data = vec![0u8; page_size];
-        if memory.read_into(page_addr, &mut page_data).is_ok() {
-            self.flat_memory
-                .sync_from_memory_image(page_addr, &page_data);
-        }
+    ///
+    /// On-demand: this materialises exactly the requested page (batched
+    /// through [`FlatGuestMemory::materialise_pages`]) and records it in
+    /// `synced_pages`.
+    pub fn sync_page_to_flat(&mut self, memory: &MemoryImage, page_addr: u64) {
+        let aligned = page_addr & !0xfff;
+        self.flat_memory.materialise_pages(memory, &[aligned]);
+        self.synced_pages.insert(aligned);
     }
 
-    /// Sync **all** committed pages from `MemoryImage` into the flat guest
-    /// memory region. Called once at JIT session start to establish the
-    /// baseline sync. Updates `synced_pages` to track which pages have
-    /// been synced.
+    /// Materialise **all committed (guest-touched) pages** from `MemoryImage`
+    /// into the flat guest mirror.  Called before native execution to
+    /// establish the baseline copy.
     ///
-    /// This is O(committed pages) and typically involves a few hundred pages
-    /// for a PE executable with standard sections (.text, .data, .rdata,
-    /// .rsrc, heap, stack, TEB/PEB, etc.).
+    /// This is O(committed pages, batched) and never touches guest pages that
+    /// were never committed: the former whole-4-GiB `prefault_all` pass (one
+    /// write per 1,048,576 pages on **every** call) is gone.  Contiguous
+    /// committed runs are copied in a single read+sync operation; only
+    /// genuinely touched pages are materialised.
     pub fn sync_all_pages_to_flat(&mut self, memory: &MemoryImage) {
-        let page_size = 4096;
-        let mut page_data = vec![0u8; page_size];
-        for page_addr in memory.committed_page_addresses() {
-            if memory.read_into(page_addr, &mut page_data).is_ok() {
-                self.flat_memory
-                    .sync_from_memory_image(page_addr, &page_data);
-                // Pre-fault: touch the last byte to ensure the OS commits
-                // the physical page, preventing SIGBUS from lazy allocation.
-                let offset = page_addr as usize;
-                let flat_size = self.flat_memory.size();
-                // Use checked arithmetic: offset + 4095 must not overflow
-                // usize, and the resulting pointer must fall within the
-                // flat memory region (end_offset < flat_size).
-                if let Some(end_offset) = offset.checked_add(4095)
-                    && end_offset < flat_size
-                {
-                    // SAFETY: end_offset < flat_size guarantees the
-                    // pointer base + end_offset is within the mmap'd
-                    // region. write_volatile forces physical page
-                    // allocation. Writing 0 to a zero-initialized
-                    // page is harmless.
-                    unsafe {
-                        std::ptr::write_volatile(
-                            (self.flat_memory.base() as *mut u8).add(end_offset),
-                            0u8,
-                        );
-                    }
-                }
-            }
-            page_data.fill(0);
-        }
-        // Record all current pages as synced
-        self.synced_pages = memory.committed_page_addresses().into_iter().collect();
-
-        // ── Proactive pre-fault of known guest memory regions ──────────────
-        //
-        // After syncing all pages from MemoryImage, we proactively pre-fault
-        // (physically back) well-known guest memory regions that the JIT is
-        // likely to access during execution but that may NOT be in
-        // committed_page_addresses() yet.
-        //
-        // On macOS, MAP_ANONYMOUS pages have no physical backing until first
-        // write. Without this pre-fault, every JIT write to an unbacked page
-        // in these regions triggers a SIGBUS (signal delivery overhead ~100µs).
-        // Pre-faulting ~256K pages (~1GB) at startup costs ~25ms but eliminates
-        // thousands of SIGBUS events.
-        //
-        // The regions below are derived from pe_runtime.rs constants and
-        // Windows PE memory layout conventions.
-        //
-        // x64 regions:
-        let x64_regions: &[(u64, usize)] = &[
-            // Low memory: DOS/PE headers, low allocations (0x000000-0x1000000 = 16MB)
-            (0x000000, 0x100_0000),
-            // x64 stack: 1MB base + 1MB growth margin (2MB total)
-            (0x0000_7fff_1000_0000, 0x20_0000),
-            // x64 thunk region: 16MB
-            (0x0000_7fff_8000_0000, 0x100_0000),
-            // x64 CRT data: 16MB
-            (0x0000_7fff_8100_0000, 0x100_0000),
-            // x64 CRT heap: 32MB
-            (0x0000_7fff_8200_0000, 0x200_0000),
-            // x64 private pages: 32MB
-            (0x0000_7fff_8400_0000, 0x200_0000),
-        ];
-        // x86 (WOW64) regions:
-        let x86_regions: &[(u64, usize)] = &[
-            // x86 stack: 1MB base + 1MB growth margin (2MB total)
-            (0x7000_0000, 0x20_0000),
-            // x86 secondary heap: 32MB
-            (0x2000_0000, 0x200_0000),
-            // x86 thunk region: 16MB
-            (0x7100_0000, 0x100_0000),
-            // x86 CRT data: 16MB
-            (0x7200_0000, 0x100_0000),
-            // x86 CRT heap: 32MB
-            (0x7300_0000, 0x200_0000),
-            // x86 private pages: 32MB
-            (0x7400_0000, 0x200_0000),
-        ];
-        for &(start, size) in x64_regions.iter().chain(x86_regions.iter()) {
-            self.flat_memory.prefault_range(start, size);
-        }
-
-        // ── Comprehensive prefault: ALL 1,048,576 pages in the 4GB region ─
-        //
-        // The targeted region pre-faults above cover ~210MB of well-known
-        // guest memory areas (stack, heap, thunk, CRT, private pages).
-        // However, Steam's PE loader allocates pages at many addresses
-        // across the full 4GB space — for example:
-        //
-        //   - TLS data for 100+ loaded DLLs
-        //   - VirtualAlloc calls from Steam/stub (arbitrary addresses)
-        //   - Memory-mapped files (PE images mapped at random offsets)
-        //   - Process Environment Block (PEB) on x64
-        //   - Thread Environment Blocks (TEB) per thread
-        //   - SEH handler chain pages
-        //   - WOW64 heap pages on x86
-        //
-        // Pre-faulting the entire 4GB eliminates ALL SIGBUS faults for
-        // guest memory writes. This adds ~2-5 seconds to JIT session
-        // start but is a one-time cost that eliminates the ~91% CPU
-        // overhead from SIGBUS storms during Steam execution.
-        let diag_prefault_msg = format!(
-            "[JIT] Pre-faulting entire 4GB flat guest memory region ({} pages)...",
-            self.flat_memory.size() / 4096,
-        );
-        eprintln!("{}", diag_prefault_msg);
-        write_diag_file(&diag_prefault_msg);
-        let start = std::time::Instant::now();
-        self.flat_memory.prefault_all();
-        let elapsed = start.elapsed();
-        let diag_complete_msg = format!(
-            "[JIT] Pre-fault of 4GB complete in {}.{:03}s",
-            elapsed.as_secs(),
-            elapsed.subsec_millis(),
-        );
-        eprintln!("{}", diag_complete_msg);
-        write_diag_file(&diag_complete_msg);
+        let pages = memory.committed_page_addresses();
+        self.flat_memory.materialise_pages(memory, &pages);
+        self.synced_pages = pages.into_iter().collect();
     }
 
-    /// Incremental sync: only sync pages that have been added to MemoryImage
-    /// since the last sync. This is O(new pages) instead of O(all pages),
-    /// dramatically reducing per-block overhead for long-running processes
-    /// with many committed pages.
-    ///
-    /// Also re-syncs pages that the host thunk layer may have modified
-    /// (detected via `synced_pages` set difference). After a host thunk
-    /// modifies MemoryImage, the next call to this method will detect new
-    /// pages and sync them.
+    /// Incremental sync: only materialise pages that are new since the last
+    /// sync (`synced_pages` set difference), batched over contiguous runs.
+    /// This is O(new pages) instead of O(all committed pages).
     pub fn sync_new_pages_to_flat(&mut self, memory: &MemoryImage) {
         let current_pages: BTreeSet<u64> = memory.committed_page_addresses().into_iter().collect();
-        let mut page_data = [0u8; 4096];
-
-        // Refresh EVERY committed page from MemoryImage into the flat mirror,
-        // not just pages not yet seen.  Previously this only synced *new*
-        // pages, which left the flat mirror holding stale data for pages that
-        // a host thunk (running in the interpreter between JIT blocks) had
-        // modified in MemoryImage.  The subsequent write-back then overwrote
-        // the thunk's write with that stale flat data, corrupting guest
-        // memory and hanging counted loops.  Because the JIT block is about to
-        // run against flat, flat must be an exact, fresh copy of MemoryImage.
-        for page_addr in &current_pages {
-            if memory.read_into(*page_addr, &mut page_data).is_ok() {
-                self.flat_memory
-                    .sync_from_memory_image(*page_addr, &page_data);
-                // Pre-fault: write last byte to force physical page allocation
-                // (read_volatile is insufficient on macOS with MAP_NORESERVE)
-                let offset = *page_addr as usize;
-                let flat_size = self.flat_memory.size();
-                if let Some(end_offset) = offset.checked_add(4095)
-                    && end_offset < flat_size
-                {
-                    // SAFETY: end_offset < flat_size guarantees the pointer
-                    // base + end_offset is within the mmap'd region.
-                    unsafe {
-                        std::ptr::write_volatile(
-                            (self.flat_memory.base() as *mut u8).add(end_offset),
-                            0u8,
-                        );
-                    }
-                }
-            }
-            page_data.fill(0);
+        let new_pages: Vec<u64> = current_pages
+            .difference(&self.synced_pages)
+            .copied()
+            .collect();
+        if !new_pages.is_empty() {
+            self.flat_memory.materialise_pages(memory, &new_pages);
         }
-
-        // Update synced set to current state
         self.synced_pages = current_pages;
     }
 
@@ -4690,13 +4675,15 @@ impl JitRuntime {
     /// stores, global variable updates, etc.) are visible to the host-side
     /// interpreter and thunk dispatch.
     ///
-    /// Only writes back pages that are in the `synced_pages` set (i.e.,
-    /// pages that were synced to flat memory and may have been modified
-    /// by JIT code). This avoids writing back pages that were never
-    /// touched by JIT, reducing overhead.
+    /// Only pages that were actually materialised are read back — a page the
+    /// flat mirror never received must not overwrite its `MemoryImage`
+    /// contents with the mirror's zeros.
     pub fn sync_all_flat_to_memory(&self, memory: &mut MemoryImage) {
         let mut page_data = [0u8; 4096];
         for page_addr in memory.committed_page_addresses() {
+            if !self.flat_memory.is_page_materialised(page_addr) {
+                continue;
+            }
             self.flat_memory.read(page_addr, &mut page_data);
             // Use the internal page write which only touches mapped ranges
             // and avoids re-allocating pages that already exist.
@@ -4705,12 +4692,16 @@ impl JitRuntime {
     }
 
     /// Incremental write-back: only sync pages that are in the `synced_pages`
-    /// set back to MemoryImage. This is O(synced pages) but typically much
-    /// less than O(committed pages) because many pages are read-only (code,
-    /// resources) and don't need write-back every block.
+    /// set (and were actually materialised) back to MemoryImage. This is
+    /// O(synced pages) but typically much less than O(committed pages)
+    /// because many pages are read-only (code, resources) and don't need
+    /// write-back every block.
     pub fn sync_synced_flat_to_memory(&self, memory: &mut MemoryImage) {
         let mut page_data = [0u8; 4096];
         for page_addr in &self.synced_pages {
+            if !self.flat_memory.is_page_materialised(*page_addr) {
+                continue;
+            }
             self.flat_memory.read(*page_addr, &mut page_data);
             memory.map_bytes(*page_addr, &page_data);
         }
@@ -6667,6 +6658,10 @@ struct FastThunkEntry {
 /// through the full guest→host dispatch loop.
 pub struct FastThunkTable {
     entries: Vec<FastThunkEntry>,
+    /// Resolved-target cache: guest (x86) address → trampoline address.
+    /// Maintained at registration time so repeat resolutions bypass both the
+    /// linear entry scan and the global-map mutex.
+    guest_index: HashMap<u64, usize>,
     /// mmap'd executable code zone for thunks.
     code_zone: Option<*mut u8>,
     code_zone_size: usize,
@@ -6693,6 +6688,7 @@ impl FastThunkTable {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            guest_index: HashMap::new(),
             code_zone: None,
             code_zone_size: 0,
             code_zone_used: 0,
@@ -6854,6 +6850,11 @@ impl FastThunkTable {
         if let Some(entry) = self.entries.get_mut(idx) {
             entry.guest_addr = Some(guest_addr);
         }
+        if let Some(thunk_addr) = self.thunk_address(idx) {
+            // Populate the in-table resolved-target cache so repeat
+            // resolutions are an O(1) hash lookup with no lock.
+            self.guest_index.insert(guest_addr, thunk_addr);
+        }
         {
             // Propagate lock poisoning as an explicit error — the caller
             // needs to know that the thunk registration may not have
@@ -6873,14 +6874,28 @@ impl FastThunkTable {
     }
 
     /// Look up the ARM64 trampoline address for a given guest thunk address.
+    ///
+    /// The resolved-target index populated by
+    /// [`FastThunkTable::register_with_guest_addr`] is consulted first: a
+    /// repeat resolution is a single hash lookup that bypasses both the
+    /// linear entry scan and the global-map mutex.  The entry scan / global
+    /// map remain as the fallback for tables that were not populated through
+    /// `register_with_guest_addr`.
     pub fn find_thunk_by_guest(&self, guest_addr: u64) -> Option<usize> {
-        // First try the in-memory entries (fast path, no lock).
+        // Fast path: resolved-target cache (no scan, no lock).
+        if let Some(thunk_addr) = self.guest_index.get(&guest_addr) {
+            THUNK_RESOLVE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(*thunk_addr);
+        }
+        THUNK_RESOLVE_MISSES.fetch_add(1, Ordering::Relaxed);
+        // Fallback 1: in-memory entries (may have been populated by a table
+        // instance that did not go through `register_with_guest_addr`).
         for entry in &self.entries {
             if entry.guest_addr == Some(guest_addr) {
                 return Some(entry.thunk_addr);
             }
         }
-        // Fall back to the global map (may have been populated by another
+        // Fallback 2: the global map (may have been populated by another
         // table instance). This method returns Option, so we recover from
         // a poisoned lock (returning None) rather than propagating an error,
         // since the caller already handles the "not found" case.
@@ -6918,9 +6933,11 @@ impl FastThunkTable {
 
     /// Returns true if the given guest address has a registered fast-thunk.
     pub fn contains_guest_addr(&self, guest_addr: u64) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.guest_addr == Some(guest_addr))
+        self.guest_index.contains_key(&guest_addr)
+            || self
+                .entries
+                .iter()
+                .any(|e| e.guest_addr == Some(guest_addr))
     }
 }
 
@@ -7974,16 +7991,17 @@ mod tests {
         assert!(
             fault_offset + std::mem::size_of::<Option<u64>>() <= std::mem::size_of::<CpuState>()
         );
-        // Historical anchors: the 16-byte fault channel shifts gpr 32→48 and
-        // xmm 160→176; the derived constants pin the emitted-code contract.
+        // Historical anchors: the 16-byte fault channel shifted gpr 32→48 and
+        // xmm 160→176; the lazy-flag field (`pending_flags`) then shifted them
+        // to 80/208.  The derived constants pin the emitted-code contract.
         assert_eq!(
             JitCompiler::GPR_BASE,
-            48,
+            80,
             "gpr base in JIT code must match the actual CpuState layout"
         );
         assert_eq!(
             JitCompiler::XMM_BASE,
-            176,
+            208,
             "xmm base in JIT code must match the actual CpuState layout"
         );
     }
@@ -10686,6 +10704,203 @@ mod tests {
         assert!(
             result.is_ok(),
             "compile_block should fall back to EXIT_THUNK even if global map missing entry"
+        );
+    }
+
+    // =====================================================================
+    // On-demand guest-page materialisation
+    // =====================================================================
+
+    /// Serialises the tests that assert exact telemetry values: the
+    /// materialisation counters are process-global (also incremented by the
+    /// SIGBUS handler), so exact assertions need mutual exclusion.
+    static GUEST_MEMORY_TELEMETRY_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A large *sparse* guest image must materialise only the pages that were
+    /// actually committed — never the whole 4 GiB flat region.  Before the
+    /// on-demand work, every sync pre-faulted all 1,048,576 pages.
+    #[test]
+    fn sparse_guest_memory_materialises_only_committed_pages() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut memory = MemoryImage::default();
+        for i in 0..16u64 {
+            memory.map_bytes(i * 0x0800_0000, &[0xABu8; 4096]);
+        }
+        assert_eq!(memory.committed_page_addresses().len(), 16);
+
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        reset_guest_memory_telemetry();
+        runtime.sync_all_pages_to_flat(&memory);
+
+        let telemetry = guest_memory_telemetry();
+        assert_eq!(
+            telemetry.pages_materialised, 16,
+            "only the 16 committed pages may be materialised"
+        );
+        assert_eq!(
+            telemetry.sync_operations, 16,
+            "16 isolated pages form 16 runs"
+        );
+        assert_eq!(telemetry.bytes_copied, 16 * 4096);
+        assert_eq!(runtime.flat_memory.materialised_page_count(), 16);
+        assert_eq!(
+            runtime.flat_memory.total_page_count(),
+            1_048_576,
+            "the flat region is still the full 4 GiB"
+        );
+        assert!(
+            telemetry.pages_materialised < runtime.flat_memory.total_page_count() / 1000,
+            "materialisation must not be proportional to the flat region"
+        );
+        assert!(runtime.flat_memory.is_page_materialised(0));
+        assert!(!runtime.flat_memory.is_page_materialised(0x1000));
+        assert!(
+            !runtime
+                .flat_memory
+                .is_page_materialised(0x0800_0000 + 0x1000)
+        );
+
+        // The committed bytes really made it into the mirror.
+        let mut buf = [0u8; 8];
+        runtime.flat_memory.read(0, &mut buf);
+        assert_eq!(buf, [0xAB; 8]);
+    }
+
+    /// Contiguous pages must be batched into a single sync operation.
+    #[test]
+    fn contiguous_guest_pages_sync_in_one_operation() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut memory = MemoryImage::default();
+        let base = 0x2000_0000u64;
+        for i in 0..32u64 {
+            memory.map_bytes(base + i * 0x1000, &[(i as u8) ^ 0x5A; 4096]);
+        }
+
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        reset_guest_memory_telemetry();
+        runtime.sync_all_pages_to_flat(&memory);
+
+        let telemetry = guest_memory_telemetry();
+        assert_eq!(telemetry.pages_materialised, 32);
+        assert_eq!(
+            telemetry.sync_operations, 1,
+            "32 contiguous pages must batch into one sync operation"
+        );
+        assert_eq!(telemetry.bytes_copied, 32 * 4096);
+
+        for i in 0..32u64 {
+            let mut byte = [0u8; 1];
+            runtime.flat_memory.read(base + i * 0x1000, &mut byte);
+            assert_eq!(
+                byte[0],
+                (i as u8) ^ 0x5A,
+                "page {i} content mismatch after batched sync"
+            );
+        }
+    }
+
+    /// A contiguous run longer than one bounded batch is split into chunks,
+    /// each of which is still a single read+copy operation.
+    #[test]
+    fn large_contiguous_run_is_chunked_into_bounded_batches() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 300 contiguous pages = 1,228,800 bytes → two bounded batches.
+        let mut memory = MemoryImage::default();
+        let base = 0x4000_0000u64;
+        for i in 0..300u64 {
+            memory.map_bytes(base + i * 0x1000, &[0x77; 4096]);
+        }
+
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        reset_guest_memory_telemetry();
+        runtime.sync_all_pages_to_flat(&memory);
+
+        let telemetry = guest_memory_telemetry();
+        assert_eq!(telemetry.pages_materialised, 300);
+        assert_eq!(
+            telemetry.sync_operations, 2,
+            "a 300-page run must split into two bounded batches"
+        );
+        assert_eq!(telemetry.bytes_copied, 300 * 4096);
+    }
+
+    /// A partially-mapped page is skipped exactly like the previous per-page
+    /// sync (it must not be materialised as zeros over live data).
+    #[test]
+    fn partially_mapped_page_is_not_materialised() {
+        let _guard = GUEST_MEMORY_TELEMETRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut memory = MemoryImage::default();
+        // Only the first 16 bytes of the page are mapped.
+        memory.map_bytes(0x3000_0000, &[0x11u8; 16]);
+
+        let mut runtime = JitRuntime::new(GuestArch::X64);
+        reset_guest_memory_telemetry();
+        runtime.sync_all_pages_to_flat(&memory);
+
+        let telemetry = guest_memory_telemetry();
+        assert_eq!(telemetry.pages_materialised, 0);
+        assert_eq!(telemetry.bytes_copied, 0);
+        assert!(!runtime.flat_memory.is_page_materialised(0x3000_0000));
+    }
+
+    /// Repeat resolutions of registered guest thunk addresses are served from
+    /// the resolved-target index (O(1), no entry scan, no global-map lock).
+    #[test]
+    fn thunk_resolve_cache_serves_repeat_lookups() {
+        static THUNK_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = THUNK_RESOLVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut table = FastThunkTable::new();
+        let host_fn = thunk_test_target as *const () as usize;
+        let mut expected = Vec::new();
+        for i in 0..4u64 {
+            let guest = 0x5000 + i * 0x100;
+            let idx = table
+                .register_with_guest_addr(host_fn, guest)
+                .expect("register");
+            expected.push((guest, table.thunk_address(idx).expect("thunk address")));
+        }
+
+        reset_thunk_resolve_telemetry();
+        // Other tests may resolve thunks concurrently, so these counters are
+        // asserted as deltas rather than exact global values.  Our own 40
+        // lookups guarantee the lower bound.
+        let (hits_before, _) = thunk_resolve_telemetry();
+        for _ in 0..10 {
+            for (guest, thunk) in &expected {
+                assert_eq!(table.find_thunk_by_guest(*guest), Some(*thunk));
+            }
+        }
+        let (hits_after, _) = thunk_resolve_telemetry();
+        assert!(
+            hits_after.saturating_sub(hits_before) >= 40,
+            "every repeat lookup must be a resolved-cache hit"
+        );
+
+        let (_, misses_before_unregistered) = thunk_resolve_telemetry();
+        // Deliberately obscure address: unlike 0xDEAD_BEEF it is not used as
+        // a guest thunk address by any other test (the global fallback map is
+        // process-wide).
+        let unregistered = 0xF00D_BAAD_0000_0001u64;
+        assert!(table.find_thunk_by_guest(unregistered).is_none());
+        let (_, misses_after) = thunk_resolve_telemetry();
+        assert!(
+            misses_after > misses_before_unregistered,
+            "the unregistered lookup must take the slow path"
         );
     }
 }

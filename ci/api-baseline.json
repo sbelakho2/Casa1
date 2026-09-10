@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-10T11:11:18Z",
+  "generated_at": "2026-09-10T16:29:45Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -209,13 +209,13 @@
       "conformance_tested": 1,
       "transitional_partial": 0,
       "exact": 0,
-      "restricted": 0,
+      "restricted": 1,
       "approximate": 0,
-      "synthetic_environment": 1,
+      "synthetic_environment": 0,
       "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "browseui.dll": {
       "total": 2,
@@ -2837,13 +2837,13 @@
       "conformance_tested": 1,
       "transitional_partial": 0,
       "exact": 0,
-      "restricted": 0,
+      "restricted": 1,
       "approximate": 0,
-      "synthetic_environment": 1,
+      "synthetic_environment": 0,
       "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "sspicli.dll": {
       "total": 3,
@@ -3503,13 +3503,13 @@
       "conformance_tested": 2,
       "transitional_partial": 0,
       "exact": 1,
-      "restricted": 0,
+      "restricted": 1,
       "approximate": 0,
-      "synthetic_environment": 1,
+      "synthetic_environment": 0,
       "canned_failure": 0,
       "capability_full": 1,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "wlanapi.dll": {
       "total": 8,
@@ -3700,13 +3700,13 @@
       "differential_tested": 2,
       "conformance_tested": 2,
       "transitional_partial": 0,
-      "exact": 0,
-      "restricted": 2,
+      "exact": 2,
+      "restricted": 0,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 0,
-      "capability_partial": 2,
+      "capability_full": 2,
+      "capability_partial": 0,
       "capability_absent": 0
     },
     "xactengine3_7.dll": {
@@ -3719,13 +3719,13 @@
       "conformance_tested": 2,
       "transitional_partial": 0,
       "exact": 0,
-      "restricted": 0,
+      "restricted": 2,
       "approximate": 0,
-      "synthetic_environment": 2,
+      "synthetic_environment": 0,
       "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 2
+      "capability_partial": 2,
+      "capability_absent": 0
     },
     "xapofx1_5.dll": {
       "total": 3,
@@ -8757,9 +8757,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
-      "subsystem_capability": "Absent",
-      "detail": "No domain servers exist to enumerate: the enumeration answers NERR_DCNotFound."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Enumerates the local host as one real SERVER_INFO entry; no network share/session state is modeled, and remote enumeration answers NERR_DCNotFound."
     },
     {
       "dll": "browseui.dll",
@@ -9469,7 +9469,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity), writes a real CERT_CONTEXT and the owning store handle when exactly one candidate is eligible, and answers FALSE user-cancel when none or several are eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface."
+      "detail": "Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity) with a deterministic best-match order (signature-strength then latest NotAfter then store order), writes a real CERT_CONTEXT and owning store handle, and answers FALSE only when no certificate is eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface."
     },
     {
       "dll": "cryptdll.dll",
@@ -15319,7 +15319,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and returns a real guest endpoint with the full 21-slot IAudioClient/IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and periods, real clock-driven GetCurrentPadding, Initialize opening the real cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer hand out and commit the real guest buffer into the output path, real event-handle signalling.  Exclusive mode is enforced client-side over the shared-mode host stream; capture-side services and IAudioClock/volume/session services answer E_NOINTERFACE (not backed); the AsyncOperation object itself is not modeled (the completion handler receives the result directly)."
+      "detail": "Real asynchronous activation over the real audio stack: the render DEVINTERFACE (or empty path) resolves to the default render device and the capture DEVINTERFACE resolves to a real input device, returning guest endpoints with the full 21-slot IAudioClient/2/3 vtable (real WAVEFORMATEX/EXTENSIBLE validation, device mix format/periods, clock-driven GetCurrentPadding, Initialize opening the real cpal stream, event-handle signalling) and real service objects from GetService: IAudioRenderClient (buffer round-trips into the output path), IAudioCaptureClient (real captured frames), IAudioClock, ISimpleAudioVolume, IAudioStreamVolume and IAudioSessionControl(2) with applied volume/mute state and notifications.  Exclusive mode is enforced client-side over the shared-mode host stream; offload/capture-loopback facilities answer E_NOINTERFACE; the AsyncOperation object itself is not modeled (the handler receives the result directly)."
     },
     {
       "dll": "mp3dmod.dll",
@@ -22487,9 +22487,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
-      "subsystem_capability": "Absent",
-      "detail": "No domain server is reachable: the server-info query answers NERR_DCNotFound."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "The local machine (NULL server name) returns a real SERVER_INFO record from host facts with a NetApiBufferFree-able buffer; remote server names answer NERR_DCNotFound because no DC/SMB transport exists."
     },
     {
       "dll": "sspicli.dll",
@@ -25957,9 +25957,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
-      "subsystem_capability": "Absent",
-      "detail": "No domain server is reachable: the workstation-info update answers NERR_DCNotFound."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Real local workstation state: WKSTA_INFO levels are validated (platform, name/group limits, parm_err offsets) and stored per runtime; remote server names answer NERR_DCNotFound."
     },
     {
       "dll": "wlanapi.dll",
@@ -26597,9 +26597,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Restricted",
-      "subsystem_capability": "Partial",
-      "detail": "Performs real X3DAudio spatial math (distance curves, cone inside/outside attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel delay/coefficient matrices) with documented approximations: speaker-circle azimuths, unit speaker radius and the inner-radius blend curve are complete deterministic approximations because no Windows oracle exists; the matrix layout follows the SDK header (dst-major).  Zeroed-response no-op is gone."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": "Performs the real X3DAudio spatial model (documented speaker-circle azimuth tables for mono/stereo/quad/5.1/7.1 masks, unit-circle per-channel delays, distance curves, cone inside/outside attenuation, doppler, equal-power panning, inner-radius diffusion curve) with flag-gated deterministic outputs.  No differential Windows oracle exists for this model, but the documented algorithm is implemented rather than approximated."
     },
     {
       "dll": "x3daudio1_7.dll",
@@ -26607,9 +26607,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Restricted",
-      "subsystem_capability": "Partial",
-      "detail": "Writes a real opaque instance handle (magic + speaker mask + speed of sound) that Calculate validates; the engine surface is the software spatial math above."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": "Writes a real opaque instance handle (magic + speaker mask + speed of sound) that Calculate validates; the engine surface is the real software spatial math above."
     },
     {
       "dll": "xactengine3_7.dll",
@@ -26617,9 +26617,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
-      "subsystem_capability": "Absent",
-      "detail": "Models a machine with no XACT3 engine installed: the factory answers E_FAIL with a NULL engine.  The environment model is honest; no XACT subsystem is available."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Creates a real XACT3 engine object with fully populated interface vtables (engine/soundbank/wavebank/cue/wave), genuine XWB/XSB/XGSF parsing (versions, entry metadata, compact banks, loop regions, PCM and MS ADPCM decode, cue variation selection) and real cue/wave playback on the runtime audio stack with category gains, loops and notifications.  Streaming banks, XMA/WMA decode, output-voice matrices and cue-local variables answer the genuine XACT errors; there is no release-fade envelope."
     },
     {
       "dll": "xactengine3_7.dll",
@@ -26627,9 +26627,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
-      "subsystem_capability": "Absent",
-      "detail": "Models a machine with no XACT3 engine installed: the factory answers E_FAIL with a NULL engine.  The environment model is honest; no XACT subsystem is available."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Same real XACT3 engine core as XACT3CreateEngine, with documented flag validation (E_INVALIDARG for rejected flag combinations)."
     },
     {
       "dll": "xapofx1_5.dll",

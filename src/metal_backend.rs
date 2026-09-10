@@ -27,6 +27,7 @@ use crate::reason::ReasonCode;
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_graphics_types::geometry::CGSize;
+use metal::foreign_types::ForeignType;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -535,6 +536,9 @@ pub struct MetalCapabilityReport {
     pub supports_mac2: bool,
     /// Whether argument buffers are supported (always true on modern macOS).
     pub supports_argument_buffers: bool,
+    /// Whether the device exposes MTLBinaryArchive
+    /// (`newBinaryArchiveWithDescriptor:error:`, macOS 11+).
+    pub supports_binary_archives: bool,
 }
 
 impl std::fmt::Display for MetalCapabilityReport {
@@ -601,6 +605,15 @@ impl std::fmt::Display for MetalCapabilityReport {
                 "no"
             }
         )?;
+        writeln!(
+            f,
+            "  Binary Archives: {}",
+            if self.supports_binary_archives {
+                "yes"
+            } else {
+                "no"
+            }
+        )?;
         Ok(())
     }
 }
@@ -626,6 +639,7 @@ pub fn report_metal_device_capabilities() -> AppResult<MetalCapabilityReport> {
         supports_mac1: device.device().supports_family(metal::MTLGPUFamily::Mac1),
         supports_mac2: device.device().supports_family(metal::MTLGPUFamily::Mac2),
         supports_argument_buffers: true, // Available since macOS 10.13
+        supports_binary_archives: device_supports_binary_archives(device.device()),
     })
 }
 
@@ -1683,35 +1697,59 @@ pub struct MetalGpuBackend {
     /// Persistent compute-pipeline cache: identical (library, function)
     /// requests reuse the compiled pipeline state.
     compute_pipeline_cache: std::collections::HashMap<ComputePipelineCacheKey, u64>,
+    /// Registered MTLBinaryArchive objects (Feature 14). Bounded like the
+    /// other registries; an archive holds compiled pipeline binaries, never
+    /// references into this backend's resource registries.
+    pipeline_archives: BTreeMap<u64, MetalPipelineArchive>,
+    /// The registered archive that `add_*_pipeline_to_archive` and
+    /// `serialize_archive` operate on.
+    active_pipeline_archive: Option<u64>,
+    /// Path of the persisted archive loaded for pipeline creation, when
+    /// configured through `set_pipeline_archive_path`.
+    pipeline_archive_path: Option<std::path::PathBuf>,
+    /// The archive loaded from `pipeline_archive_path`; attached to pipeline
+    /// descriptors so the device can reuse its compiled binaries instead of
+    /// compiling from source.
+    loaded_pipeline_archive: Option<MetalPipelineArchive>,
     /// Number of render-pipeline creation requests satisfied from the cache.
     pub pipeline_cache_hits: u64,
     /// Number of shader-library requests satisfied from the cache.
     pub shader_cache_hits: u64,
+    /// Pipeline creations verified served from the loaded archive
+    /// (`MTLPipelineOptionFailOnBinaryArchiveMiss` succeeded).
+    pub pipeline_archive_hits: u64,
+    /// Pipeline creations where the loaded archive was attached but could
+    /// not serve the request; the pipeline was JIT-compiled instead.
+    pub pipeline_archive_misses: u64,
+    /// Pipeline creations with an archive attached where the options-based
+    /// creation API was unavailable, so no hit/miss verdict was possible.
+    pub pipeline_archive_unverified: u64,
+    /// Pipelines successfully added to a registered archive.
+    pub pipeline_archive_records: u64,
+    /// Successful `serialize_archive` writes.
+    pub pipeline_archive_serializations: u64,
 }
 
 /// Cache key for a render pipeline state: the pipeline output configuration
 /// plus the (library, entry-point) identity it was compiled from.
+///
+/// Public because the persistent-archive API records pipelines by key:
+/// reconstructing the exact descriptor a pipeline was created from is what
+/// `MTLBinaryArchive addRenderPipelineFunctionsWithDescriptor:` requires.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RenderPipelineCacheKey {
-    library_id: u64,
-    vertex_fn: String,
-    fragment_fn: String,
-    color_format: u64,
-    depth_format: Option<u64>,
+pub struct RenderPipelineCacheKey {
+    pub library_id: u64,
+    pub vertex_fn: String,
+    pub fragment_fn: String,
+    pub color_format: metal::MTLPixelFormat,
+    pub depth_format: Option<metal::MTLPixelFormat>,
 }
 
 /// Cache key for a compute pipeline state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ComputePipelineCacheKey {
-    library_id: u64,
-    compute_fn: String,
-}
-
-/// Format an `MTLPixelFormat` into a hashable raw value for cache keys.
-fn pixel_format_key(format: metal::MTLPixelFormat) -> u64 {
-    // `MTLPixelFormat` is a C-style enum in the metal crate; its raw value
-    // is stable for a given Metal SDK and is what the descriptor compares.
-    format as u64
+pub struct ComputePipelineCacheKey {
+    pub library_id: u64,
+    pub compute_fn: String,
 }
 
 /// Maximum number of entries kept in each persistent cache.
@@ -1778,8 +1816,17 @@ impl MetalGpuBackend {
             shader_library_cache: std::collections::HashMap::new(),
             render_pipeline_cache: std::collections::HashMap::new(),
             compute_pipeline_cache: std::collections::HashMap::new(),
+            pipeline_archives: BTreeMap::new(),
+            active_pipeline_archive: None,
+            pipeline_archive_path: None,
+            loaded_pipeline_archive: None,
             pipeline_cache_hits: 0,
             shader_cache_hits: 0,
+            pipeline_archive_hits: 0,
+            pipeline_archive_misses: 0,
+            pipeline_archive_unverified: 0,
+            pipeline_archive_records: 0,
+            pipeline_archive_serializations: 0,
         })
     }
 
@@ -1911,55 +1958,16 @@ impl MetalGpuBackend {
             library_id,
             vertex_fn: vertex_fn_name.to_string(),
             fragment_fn: fragment_fn_name.to_string(),
-            color_format: pixel_format_key(color_format),
-            depth_format: depth_format.map(pixel_format_key),
+            color_format,
+            depth_format,
         };
         if let Some(&cached) = self.render_pipeline_cache.get(&key) {
             self.pipeline_cache_hits += 1;
             return Ok(cached);
         }
 
-        let library = self.libraries.get(&library_id).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("library {library_id} not found"),
-            )
-        })?;
-
-        let vertex_fn = library.get_function(vertex_fn_name, None).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("vertex function '{vertex_fn_name}' not found: {e}"),
-            )
-        })?;
-
-        let fragment_fn = library.get_function(fragment_fn_name, None).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("fragment function '{fragment_fn_name}' not found: {e}"),
-            )
-        })?;
-
-        let descriptor = metal::RenderPipelineDescriptor::new();
-        descriptor.set_vertex_function(Some(&vertex_fn));
-        descriptor.set_fragment_function(Some(&fragment_fn));
-
-        if let Some(color_attachment) = descriptor.color_attachments().object_at(0) {
-            color_attachment.set_pixel_format(color_format);
-            color_attachment.set_blending_enabled(true);
-            color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-            color_attachment
-                .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-            color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-            color_attachment
-                .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        }
-
-        if let Some(depth_fmt) = depth_format {
-            descriptor.set_depth_attachment_pixel_format(depth_fmt);
-        }
-
-        let pipeline = self.device.create_render_pipeline_state(&descriptor)?;
+        let descriptor = self.build_render_pipeline_descriptor(&key)?;
+        let pipeline = self.create_render_pipeline_state_with_optional_archive(&descriptor)?;
         let id = alloc_gpu_id();
         cap_registry(&mut self.render_pipelines);
         self.render_pipelines.insert(id, pipeline);
@@ -2005,7 +2013,7 @@ impl MetalGpuBackend {
             )
         })?;
 
-        let pipeline = self.device.create_compute_pipeline_state(&compute_fn)?;
+        let pipeline = self.create_compute_pipeline_state_with_optional_archive(&compute_fn)?;
         let id = alloc_gpu_id();
         cap_registry(&mut self.compute_pipelines);
         self.compute_pipelines.insert(id, pipeline);
@@ -2017,6 +2025,118 @@ impl MetalGpuBackend {
     /// Get a compute pipeline by ID.
     pub fn get_compute_pipeline(&self, id: u64) -> Option<&metal::ComputePipelineStateRef> {
         self.compute_pipelines.get(&id).map(|p| p.as_ref())
+    }
+
+    /// Rebuild the exact render-pipeline descriptor a cache key was created
+    /// from (entry points, color/depth formats, blending). Used both by
+    /// creation and by `add_render_pipeline_to_archive`, because
+    /// `MTLBinaryArchive` records pipelines from descriptors, not from
+    /// already-created pipeline state objects.
+    fn build_render_pipeline_descriptor(
+        &self,
+        key: &RenderPipelineCacheKey,
+    ) -> AppResult<metal::RenderPipelineDescriptor> {
+        let library = self.libraries.get(&key.library_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("library {} not found", key.library_id),
+            )
+        })?;
+
+        let vertex_fn = library.get_function(&key.vertex_fn, None).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("vertex function '{}' not found: {e}", key.vertex_fn),
+            )
+        })?;
+
+        let fragment_fn = library.get_function(&key.fragment_fn, None).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("fragment function '{}' not found: {e}", key.fragment_fn),
+            )
+        })?;
+
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&vertex_fn));
+        descriptor.set_fragment_function(Some(&fragment_fn));
+
+        if let Some(color_attachment) = descriptor.color_attachments().object_at(0) {
+            color_attachment.set_pixel_format(key.color_format);
+            color_attachment.set_blending_enabled(true);
+            color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+            color_attachment
+                .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+            color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+            color_attachment
+                .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        }
+
+        if let Some(depth_fmt) = key.depth_format {
+            descriptor.set_depth_attachment_pixel_format(depth_fmt);
+        }
+
+        Ok(descriptor)
+    }
+
+    /// Create a render pipeline state, attaching the persisted archive when
+    /// one is loaded.
+    ///
+    /// With an archive attached, creation first tries
+    /// `MTLPipelineOptionFailOnBinaryArchiveMiss`: success proves the device
+    /// reused a binary from the archive (`pipeline_archive_hits`), while
+    /// failure means the archive could not serve this exact descriptor and
+    /// the pipeline is compiled from source instead (`pipeline_archive_misses`).
+    fn create_render_pipeline_state_with_optional_archive(
+        &mut self,
+        descriptor: &metal::RenderPipelineDescriptorRef,
+    ) -> AppResult<metal::RenderPipelineState> {
+        let Some(archive) = self.loaded_pipeline_archive.as_ref() else {
+            return self.device.create_render_pipeline_state(descriptor);
+        };
+        descriptor.set_binary_archives(&[archive.archive()]);
+        match try_create_render_pipeline_using_archive(self.device.metal_device(), descriptor) {
+            Ok(Some(pipeline)) => {
+                self.pipeline_archive_hits += 1;
+                Ok(pipeline)
+            }
+            Ok(None) => {
+                self.pipeline_archive_unverified += 1;
+                self.device.create_render_pipeline_state(descriptor)
+            }
+            Err(_archive_miss) => {
+                self.pipeline_archive_misses += 1;
+                self.device.create_render_pipeline_state(descriptor)
+            }
+        }
+    }
+
+    /// Compute-pipeline counterpart of
+    /// [`Self::create_render_pipeline_state_with_optional_archive`].
+    fn create_compute_pipeline_state_with_optional_archive(
+        &mut self,
+        compute_fn: &metal::FunctionRef,
+    ) -> AppResult<metal::ComputePipelineState> {
+        let Some(archive) = self.loaded_pipeline_archive.as_ref() else {
+            return self.device.create_compute_pipeline_state(compute_fn);
+        };
+        let descriptor = metal::ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(compute_fn));
+        descriptor.set_binary_archives(&[archive.archive()]);
+        match try_create_compute_pipeline_using_archive(self.device.metal_device(), &descriptor) {
+            Ok(Some(pipeline)) => {
+                self.pipeline_archive_hits += 1;
+                Ok(pipeline)
+            }
+            Ok(None) => {
+                self.pipeline_archive_unverified += 1;
+                self.device.create_compute_pipeline_state(compute_fn)
+            }
+            Err(_archive_miss) => {
+                self.pipeline_archive_misses += 1;
+                self.device.create_compute_pipeline_state(compute_fn)
+            }
+        }
     }
 
     /// Destroy a buffer.
@@ -6767,6 +6887,646 @@ impl MetalGpuBackend {
 }
 
 // ===========================================================================
+// Feature 14: MTLBinaryArchive — persistent compiled-pipeline serialization
+// ===========================================================================
+//
+// The in-memory shader/pipeline caches accelerate one process lifetime. A
+// binary archive persists the device's compiled pipeline binaries to disk so
+// a later process can reuse them instead of recompiling from MSL.
+//
+// The metal 0.31 crate binds the MTLBinaryArchive surface this feature
+// needs (descriptor with URL, device creation, add render/compute pipeline
+// functions, serializeToURL), but the device is still probed for
+// `newBinaryArchiveWithDescriptor:error:` before any message is sent, so a
+// host without the API (pre-macOS 11) fails with
+// [`ReasonCode::RcUnsupportedPlatformApi`] instead of an unrecognized
+// selector. The options-based pipeline creation methods are not bound by the
+// crate, so hit/miss detection drives them through the objc runtime with
+// `MTLPipelineOptionFailOnBinaryArchiveMiss`: creation succeeds only when
+// the device served the pipeline from the attached archive, which makes the
+// counters real instrumentation rather than a guess.
+//
+// Recording flow:
+//   create_pipeline_archive(url) -> create_*_pipeline -> add_*_pipeline_to_archive
+//   -> serialize_archive(url)
+// Reuse flow (typically the next process):
+//   set_pipeline_archive_path(url) -> create_*_pipeline (archive attached)
+//
+// A loaded archive is attached to every pipeline descriptor while it is
+// configured, but it never replaces the in-memory caches: cache hits still
+// return the already-registered state without touching the archive.
+
+/// Probe whether a Metal device exposes MTLBinaryArchive creation.
+///
+/// Checks both the descriptor class and
+/// `newBinaryArchiveWithDescriptor:error:` on the device, so the answer is
+/// real capability information rather than an OS-version guess.
+pub fn device_supports_binary_archives(device: &metal::DeviceRef) -> bool {
+    if objc::runtime::Class::get("MTLBinaryArchiveDescriptor").is_none() {
+        return false;
+    }
+    let device_object = (device as *const metal::DeviceRef) as *mut objc::runtime::Object;
+    unsafe {
+        let has_api: bool = msg_send![
+            device_object,
+            respondsToSelector: sel!(newBinaryArchiveWithDescriptor:error:)
+        ];
+        has_api
+    }
+}
+
+/// The error returned when the device does not expose MTLBinaryArchive.
+fn binary_archive_unsupported_error() -> AppError {
+    AppError::new(
+        ReasonCode::RcUnsupportedPlatformApi,
+        "this Metal device does not expose newBinaryArchiveWithDescriptor:error: \
+         (MTLBinaryArchive); persistent pipeline archives are unavailable",
+    )
+}
+
+/// Build an owned (+1) `NSURL` for a local file path. The caller must release
+/// the result. Returns `None` on allocation failure or non-UTF-8 paths.
+fn objc_file_url_owned(path: &std::path::Path) -> Option<*mut objc::runtime::Object> {
+    let class = objc::runtime::Class::get("NSURL")?;
+    let path_str = path.to_str()?;
+    let ns_path = objc_nsstring_owned(path_str)?;
+    unsafe {
+        let url: *mut objc::runtime::Object = msg_send![class, fileURLWithPath: ns_path];
+        let _: () = msg_send![ns_path, release];
+        if url.is_null() {
+            return None;
+        }
+        // `fileURLWithPath:` returns an autoreleased object; take a +1
+        // reference so the owned `metal::URL` wrapper can balance it.
+        let retained: *mut objc::runtime::Object = msg_send![url, retain];
+        Some(retained)
+    }
+}
+
+/// Wrap a local file path in an owned `metal::URL` (released on drop).
+fn url_owned_from_path(path: &std::path::Path) -> AppResult<metal::URL> {
+    let url_object = objc_file_url_owned(path).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("could not build a file URL for {}", path.display()),
+        )
+    })?;
+    unsafe { Ok(metal::URL::from_ptr(url_object as *mut metal::NSURL)) }
+}
+
+/// Read the `localizedDescription` of an NSError produced by a Metal call.
+fn objc_error_message(error: *mut objc::runtime::Object) -> String {
+    if error.is_null() {
+        return "unknown Metal error".to_string();
+    }
+    unsafe {
+        let description: *mut objc::runtime::Object = msg_send![error, localizedDescription];
+        if description.is_null() {
+            return "unknown Metal error".to_string();
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![description, UTF8String];
+        if utf8.is_null() {
+            return "unknown Metal error".to_string();
+        }
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// RAII handle to a real MTLBinaryArchive (owns the +1 Objective-C object
+/// returned by `newBinaryArchiveWithDescriptor:error:`).
+pub struct MetalPipelineArchive {
+    archive: metal::BinaryArchive,
+    write_url: std::path::PathBuf,
+}
+
+// The owned MTLBinaryArchive object is thread-safe for messaging and release,
+// exactly like the metal crate's own wrappers (declared Sync + Send).
+unsafe impl Send for MetalPipelineArchive {}
+unsafe impl Sync for MetalPipelineArchive {}
+
+impl std::fmt::Debug for MetalPipelineArchive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalPipelineArchive")
+            .field("label", &self.label())
+            .field("write_url", &self.write_url)
+            .finish()
+    }
+}
+
+impl MetalPipelineArchive {
+    fn from_archive(archive: metal::BinaryArchive, write_url: std::path::PathBuf) -> Self {
+        Self { archive, write_url }
+    }
+
+    /// The archive's label.
+    pub fn label(&self) -> String {
+        self.archive.as_ref().label().to_string()
+    }
+
+    /// The destination recorded when the archive was created.
+    pub fn write_url(&self) -> &std::path::Path {
+        &self.write_url
+    }
+
+    /// The underlying MTLBinaryArchive.
+    pub fn archive(&self) -> &metal::BinaryArchiveRef {
+        self.archive.as_ref()
+    }
+
+    /// Record the compiled render pipeline described by `descriptor`.
+    fn add_render_pipeline(
+        &self,
+        descriptor: &metal::RenderPipelineDescriptorRef,
+    ) -> AppResult<()> {
+        self.archive
+            .add_render_pipeline_functions_with_descriptor(descriptor)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("MTLBinaryArchive rejected the render pipeline: {e}"),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Record the compiled compute pipeline described by `descriptor`.
+    fn add_compute_pipeline(
+        &self,
+        descriptor: &metal::ComputePipelineDescriptorRef,
+    ) -> AppResult<()> {
+        self.archive
+            .add_compute_pipeline_functions_with_descriptor(descriptor)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("MTLBinaryArchive rejected the compute pipeline: {e}"),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Write the compiled archive to `path`, verifying a non-empty file
+    /// actually landed on disk.
+    fn serialize_to_path(&self, path: &std::path::Path) -> AppResult<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "could not create archive directory {}: {e}",
+                            parent.display()
+                        ),
+                    )
+                })?;
+            }
+        }
+        let url = url_owned_from_path(path)?;
+        self.archive.serialize_to_url(&url).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("MTLBinaryArchive.serializeToURL failed: {e}"),
+            )
+        })?;
+        let length = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if length == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "MTLBinaryArchive.serializeToURL reported success but {} is missing or empty",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Create a new empty MTLBinaryArchive for recording pipelines.
+///
+/// `write_url` is only recorded as the default serialization destination
+/// (`serialize_archive`); it is not touched until serialization.
+///
+/// Errors with [`ReasonCode::RcUnsupportedPlatformApi`] when the device does
+/// not expose `newBinaryArchiveWithDescriptor:error:`.
+pub fn create_pipeline_archive(
+    device: &metal::DeviceRef,
+    label: Option<&str>,
+    write_url: &std::path::Path,
+) -> AppResult<MetalPipelineArchive> {
+    if !device_supports_binary_archives(device) {
+        return Err(binary_archive_unsupported_error());
+    }
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    let archive = device
+        .new_binary_archive_with_descriptor(&descriptor)
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to create MTLBinaryArchive: {e}"),
+            )
+        })?;
+    if metal::foreign_types::ForeignType::as_ptr(&archive).is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            "the Metal device returned a nil MTLBinaryArchive",
+        ));
+    }
+    if let Some(text) = label {
+        archive.as_ref().set_label(text);
+    }
+    Ok(MetalPipelineArchive::from_archive(
+        archive,
+        write_url.to_path_buf(),
+    ))
+}
+
+/// Load a persisted MTLBinaryArchive from disk for pipeline reuse.
+///
+/// Errors with [`ReasonCode::RcUnsupportedPlatformApi`] when the device does
+/// not expose `newBinaryArchiveWithDescriptor:error:`; a missing, empty, or
+/// unreadable file is reported as [`ReasonCode::RcIo`] (or
+/// [`ReasonCode::RcGeNotFound`] when the path does not exist).
+pub fn load_pipeline_archive(
+    device: &metal::DeviceRef,
+    path: &std::path::Path,
+) -> AppResult<MetalPipelineArchive> {
+    if !device_supports_binary_archives(device) {
+        return Err(binary_archive_unsupported_error());
+    }
+    if !path.exists() {
+        return Err(AppError::new(
+            ReasonCode::RcGeNotFound,
+            format!("pipeline archive {} does not exist", path.display()),
+        ));
+    }
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("could not read pipeline archive {}: {e}", path.display()),
+        )
+    })?;
+    if metadata.len() == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            format!("pipeline archive {} is empty", path.display()),
+        ));
+    }
+
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    let url = url_owned_from_path(path)?;
+    descriptor.set_url(url.as_ref());
+    let archive = device
+        .new_binary_archive_with_descriptor(&descriptor)
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "failed to load MTLBinaryArchive from {}: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+    if metal::foreign_types::ForeignType::as_ptr(&archive).is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            format!(
+                "the Metal device returned a nil MTLBinaryArchive for {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(MetalPipelineArchive::from_archive(
+        archive,
+        path.to_path_buf(),
+    ))
+}
+
+/// Create a render pipeline using only binaries from the attached archives.
+///
+/// Returns `Ok(None)` when the device does not expose
+/// `newRenderPipelineStateWithDescriptor:options:reflection:error:`, so the
+/// caller can fall back to plain creation without a hit/miss verdict.
+/// Returns `Err` when the archive cannot serve the descriptor (a real miss).
+fn try_create_render_pipeline_using_archive(
+    device: &metal::DeviceRef,
+    descriptor: &metal::RenderPipelineDescriptorRef,
+) -> AppResult<Option<metal::RenderPipelineState>> {
+    let device_object = (device as *const metal::DeviceRef) as *mut objc::runtime::Object;
+    unsafe {
+        let supports_options: bool = msg_send![
+            device_object,
+            respondsToSelector: sel!(newRenderPipelineStateWithDescriptor:options:reflection:error:)
+        ];
+        if !supports_options {
+            return Ok(None);
+        }
+        let descriptor_object =
+            metal::foreign_types::ForeignTypeRef::as_ptr(descriptor) as *mut objc::runtime::Object;
+        let options = metal::MTLPipelineOption::FailOnBinaryArchiveMiss.bits();
+        let reflection: *mut objc::runtime::Object = std::ptr::null_mut();
+        let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
+        let pipeline_object: *mut metal::MTLRenderPipelineState = msg_send![
+            device_object,
+            newRenderPipelineStateWithDescriptor: descriptor_object
+            options: options
+            reflection: reflection
+            error: &mut error
+        ];
+        if pipeline_object.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "binary archive could not serve the render pipeline: {}",
+                    objc_error_message(error)
+                ),
+            ));
+        }
+        Ok(Some(metal::RenderPipelineState::from_ptr(pipeline_object)))
+    }
+}
+
+/// Compute-pipeline counterpart of
+/// [`try_create_render_pipeline_using_archive`].
+fn try_create_compute_pipeline_using_archive(
+    device: &metal::DeviceRef,
+    descriptor: &metal::ComputePipelineDescriptorRef,
+) -> AppResult<Option<metal::ComputePipelineState>> {
+    let device_object = (device as *const metal::DeviceRef) as *mut objc::runtime::Object;
+    unsafe {
+        let supports_options: bool = msg_send![
+            device_object,
+            respondsToSelector: sel!(newComputePipelineStateWithDescriptor:options:reflection:error:)
+        ];
+        if !supports_options {
+            return Ok(None);
+        }
+        let descriptor_object =
+            metal::foreign_types::ForeignTypeRef::as_ptr(descriptor) as *mut objc::runtime::Object;
+        let options = metal::MTLPipelineOption::FailOnBinaryArchiveMiss.bits();
+        let reflection: *mut objc::runtime::Object = std::ptr::null_mut();
+        let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
+        let pipeline_object: *mut metal::MTLComputePipelineState = msg_send![
+            device_object,
+            newComputePipelineStateWithDescriptor: descriptor_object
+            options: options
+            reflection: reflection
+            error: &mut error
+        ];
+        if pipeline_object.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "binary archive could not serve the compute pipeline: {}",
+                    objc_error_message(error)
+                ),
+            ));
+        }
+        Ok(Some(metal::ComputePipelineState::from_ptr(pipeline_object)))
+    }
+}
+
+/// Pipeline-archive instrumentation snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineArchiveStats {
+    /// Number of registered write archives.
+    pub registered_archives: u64,
+    /// The active write archive id, if any.
+    pub active_archive: Option<u64>,
+    /// Path configured through `set_pipeline_archive_path`.
+    pub loaded_path: Option<String>,
+    /// Whether a persisted archive is currently attached to pipeline creation.
+    pub archive_loaded: bool,
+    /// Pipeline creations verified served from the loaded archive.
+    pub hits: u64,
+    /// Pipeline creations where the loaded archive could not serve the request.
+    pub misses: u64,
+    /// Creations with an archive attached but no options API to verify.
+    pub unverified: u64,
+    /// Pipelines successfully added to a registered archive.
+    pub records: u64,
+    /// Successful `serialize_archive` writes.
+    pub serializations: u64,
+}
+
+impl std::fmt::Display for PipelineArchiveStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Pipeline Archive Stats")?;
+        writeln!(f, "=====================")?;
+        writeln!(f, "  Registered archives: {}", self.registered_archives)?;
+        writeln!(
+            f,
+            "  Active archive: {}",
+            self.active_archive
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )?;
+        writeln!(
+            f,
+            "  Loaded path: {}",
+            self.loaded_path.as_deref().unwrap_or("none")
+        )?;
+        writeln!(f, "  Archive loaded: {}", self.archive_loaded)?;
+        writeln!(f, "  Hits: {}", self.hits)?;
+        writeln!(f, "  Misses: {}", self.misses)?;
+        writeln!(f, "  Unverified: {}", self.unverified)?;
+        writeln!(f, "  Pipelines recorded: {}", self.records)?;
+        writeln!(f, "  Serializations: {}", self.serializations)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-archive API on MetalGpuBackend
+// ---------------------------------------------------------------------------
+
+impl MetalGpuBackend {
+    fn pipeline_archive(&self, id: u64) -> AppResult<&MetalPipelineArchive> {
+        self.pipeline_archives.get(&id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("pipeline archive {id} not found"),
+            )
+        })
+    }
+
+    /// Create and register a new empty writable MTLBinaryArchive, and make it
+    /// the active archive for `add_*_pipeline_to_archive`/`serialize_archive`.
+    ///
+    /// `url` is the destination recorded for later serialization; no file is
+    /// touched here.
+    pub fn create_pipeline_archive(&mut self, url: &std::path::Path) -> AppResult<u64> {
+        let archive = create_pipeline_archive(self.device.metal_device(), None, url)?;
+        let id = alloc_gpu_id();
+        cap_registry(&mut self.pipeline_archives);
+        // The cap evicts oldest-first; never leave the active pointer on an
+        // archive that was just evicted.
+        if let Some(active) = self.active_pipeline_archive {
+            if !self.pipeline_archives.contains_key(&active) {
+                self.active_pipeline_archive = None;
+            }
+        }
+        self.pipeline_archives.insert(id, archive);
+        self.active_pipeline_archive = Some(id);
+        Ok(id)
+    }
+
+    /// Get a registered write archive.
+    pub fn get_pipeline_archive(&self, id: u64) -> Option<&MetalPipelineArchive> {
+        self.pipeline_archives.get(&id)
+    }
+
+    /// The active write archive id (`add_*_to_archive`/`serialize_archive`).
+    pub fn get_active_pipeline_archive_id(&self) -> Option<u64> {
+        self.active_pipeline_archive
+    }
+
+    /// Release a registered write archive.
+    pub fn destroy_pipeline_archive(&mut self, id: u64) -> AppResult<()> {
+        if self.pipeline_archives.remove(&id).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("pipeline archive {id} not found"),
+            ));
+        }
+        if self.active_pipeline_archive == Some(id) {
+            self.active_pipeline_archive = None;
+        }
+        Ok(())
+    }
+
+    /// Record a registered render pipeline in the active archive.
+    ///
+    /// `MTLBinaryArchive` records pipelines from their creation descriptors,
+    /// so the descriptor is rebuilt from `key`; `pipeline_id` must name a
+    /// render pipeline this backend created, which guarantees the rebuilt
+    /// descriptor matches what was compiled.
+    pub fn add_render_pipeline_to_archive(
+        &mut self,
+        pipeline_id: u64,
+        key: &RenderPipelineCacheKey,
+    ) -> AppResult<()> {
+        if !self.render_pipelines.contains_key(&pipeline_id) {
+            return Err(AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("render pipeline {pipeline_id} not found"),
+            ));
+        }
+        let archive_id = self.active_pipeline_archive.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                "no active pipeline archive; call create_pipeline_archive first",
+            )
+        })?;
+        let descriptor = self.build_render_pipeline_descriptor(key)?;
+        self.pipeline_archive(archive_id)?
+            .add_render_pipeline(&descriptor)?;
+        self.pipeline_archive_records += 1;
+        Ok(())
+    }
+
+    /// Record a registered compute pipeline in the active archive.
+    ///
+    /// The descriptor is rebuilt from `key`; `pipeline_id` must name a
+    /// compute pipeline this backend created.
+    pub fn add_compute_pipeline_to_archive(
+        &mut self,
+        pipeline_id: u64,
+        key: &ComputePipelineCacheKey,
+    ) -> AppResult<()> {
+        if !self.compute_pipelines.contains_key(&pipeline_id) {
+            return Err(AppError::new(
+                ReasonCode::RcGeNotFound,
+                format!("compute pipeline {pipeline_id} not found"),
+            ));
+        }
+        let archive_id = self.active_pipeline_archive.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                "no active pipeline archive; call create_pipeline_archive first",
+            )
+        })?;
+        let library = self.libraries.get(&key.library_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("library {} not found", key.library_id),
+            )
+        })?;
+        let compute_fn = library.get_function(&key.compute_fn, None).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("compute function '{}' not found: {e}", key.compute_fn),
+            )
+        })?;
+        let descriptor = metal::ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&compute_fn));
+        self.pipeline_archive(archive_id)?
+            .add_compute_pipeline(&descriptor)?;
+        self.pipeline_archive_records += 1;
+        Ok(())
+    }
+
+    /// Serialize a registered archive to `url` and verify the file landed.
+    pub fn serialize_pipeline_archive(
+        &mut self,
+        archive_id: u64,
+        url: &std::path::Path,
+    ) -> AppResult<()> {
+        self.pipeline_archive(archive_id)?.serialize_to_path(url)?;
+        self.pipeline_archive_serializations += 1;
+        Ok(())
+    }
+
+    /// Serialize the active archive to `url` and verify the file landed.
+    pub fn serialize_archive(&mut self, url: &std::path::Path) -> AppResult<()> {
+        let archive_id = self.active_pipeline_archive.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGeNotFound,
+                "no active pipeline archive; call create_pipeline_archive first",
+            )
+        })?;
+        self.serialize_pipeline_archive(archive_id, url)
+    }
+
+    /// Load a persisted archive from `path` and attach it to every pipeline
+    /// the backend creates from now on, so the device can reuse its compiled
+    /// binaries. The in-memory caches keep priority: a cache hit returns
+    /// before the archive is consulted.
+    pub fn set_pipeline_archive_path(&mut self, path: &std::path::Path) -> AppResult<()> {
+        let archive = load_pipeline_archive(self.device.metal_device(), path)?;
+        self.loaded_pipeline_archive = Some(archive);
+        self.pipeline_archive_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Detach any loaded archive; pipeline creation returns to source
+    /// compilation (and the in-memory caches).
+    pub fn clear_pipeline_archive_path(&mut self) {
+        self.loaded_pipeline_archive = None;
+        self.pipeline_archive_path = None;
+    }
+
+    /// Pipeline-archive instrumentation snapshot.
+    pub fn pipeline_archive_stats(&self) -> PipelineArchiveStats {
+        PipelineArchiveStats {
+            registered_archives: self.pipeline_archives.len() as u64,
+            active_archive: self.active_pipeline_archive,
+            loaded_path: self
+                .pipeline_archive_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            archive_loaded: self.loaded_pipeline_archive.is_some(),
+            hits: self.pipeline_archive_hits,
+            misses: self.pipeline_archive_misses,
+            unverified: self.pipeline_archive_unverified,
+            records: self.pipeline_archive_records,
+            serializations: self.pipeline_archive_serializations,
+        }
+    }
+}
+
+// ===========================================================================
 // Feature 13: MTLParallelRenderCommandEncoder — parallel command recording
 // ===========================================================================
 //
@@ -9181,6 +9941,580 @@ mod tests {
         backend.destroy_residency_set(set_id).expect("destroy set");
         assert!(backend.destroy_residency_set(set_id).is_err());
         assert!(backend.residency_set_commit(set_id).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 14: MTLBinaryArchive persistent-pipeline tests (real device)
+    // -----------------------------------------------------------------------
+
+    /// Whether this host really exposes MTLBinaryArchive.
+    fn binary_archives_available() -> bool {
+        match MetalDevice::system_default() {
+            Ok(device) => device_supports_binary_archives(device.metal_device()),
+            Err(_) => false,
+        }
+    }
+
+    /// Unique temp file path for an archive, removed on drop.
+    struct TempArchivePath(std::path::PathBuf);
+
+    impl TempArchivePath {
+        fn new(tag: &str) -> Self {
+            static NEXT_TEMP_ARCHIVE: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT_TEMP_ARCHIVE.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "casa1-pipeline-archive-{}-{sequence}-{tag}.metalarchive",
+                std::process::id(),
+            )))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempArchivePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Encode one full-viewport triangle with `pipeline_id` into a 16x16
+    /// render target, blit it back, and return the top-left BGRA pixel.
+    fn render_pipeline_top_left_pixel(backend: &mut MetalGpuBackend, pipeline_id: u64) -> [u8; 4] {
+        let texture_id = backend.create_texture(
+            16,
+            16,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            metal::MTLTextureUsage::RenderTarget,
+        );
+        let command = backend.command_queue().new_command_buffer();
+        let pass = render_pass_for(backend.get_texture(texture_id).expect("texture"));
+        let encoder = command.new_render_command_encoder(&pass);
+        encoder.set_render_pipeline_state(
+            backend
+                .get_render_pipeline(pipeline_id)
+                .expect("render pipeline"),
+        );
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(
+            command.status(),
+            metal::MTLCommandBufferStatus::Completed,
+            "render encode with the archive-restored pipeline must complete"
+        );
+
+        let readback_id =
+            backend.create_empty_buffer(16 * 16 * 4, metal::MTLResourceOptions::StorageModeShared);
+        let copy = backend.command_queue().new_command_buffer();
+        let blit = copy.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            backend.get_texture(texture_id).expect("texture"),
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize::new(16, 16, 1),
+            backend.get_buffer(readback_id).expect("readback buffer"),
+            0,
+            16 * 4,
+            16 * 16 * 4,
+            metal::MTLBlitOption::None,
+        );
+        blit.end_encoding();
+        copy.commit();
+        copy.wait_until_completed();
+        assert_eq!(copy.status(), metal::MTLCommandBufferStatus::Completed);
+
+        let buffer = backend.get_buffer(readback_id).expect("readback buffer");
+        let pixels =
+            unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, 16 * 16 * 4) };
+        [pixels[0], pixels[1], pixels[2], pixels[3]]
+    }
+
+    #[test]
+    fn pipeline_archive_device_capability_probe() {
+        let device = MetalDevice::system_default().expect("metal device");
+        let supported = device_supports_binary_archives(device.metal_device());
+        let report = report_metal_device_capabilities().expect("capability report");
+        assert_eq!(
+            report.supports_binary_archives, supported,
+            "capability report must agree with the live respondsToSelector: probe"
+        );
+        let display = format!("{report}");
+        assert!(display.contains("Binary Archives: "));
+
+        let temp = TempArchivePath::new("probe");
+        if supported {
+            let archive =
+                create_pipeline_archive(device.metal_device(), Some("casa1-probe"), temp.path())
+                    .expect("probe reported support but archive creation failed");
+            assert_eq!(archive.label(), "casa1-probe");
+            assert_eq!(archive.write_url(), temp.path());
+            assert!(!metal::foreign_types::ForeignTypeRef::as_ptr(archive.archive()).is_null());
+        } else {
+            let error = create_pipeline_archive(device.metal_device(), None, temp.path())
+                .expect_err("archive creation must fail when the API is absent");
+            assert_eq!(error.code, ReasonCode::RcUnsupportedPlatformApi);
+        }
+    }
+
+    #[test]
+    fn pipeline_archive_object_lifecycle() {
+        if !binary_archives_available() {
+            return;
+        }
+        let device = MetalDevice::system_default().expect("metal device");
+        let temp = TempArchivePath::new("lifecycle");
+        let archive = create_pipeline_archive(
+            device.metal_device(),
+            Some("casa1-archive-object"),
+            temp.path(),
+        )
+        .expect("create archive");
+        assert_eq!(archive.label(), "casa1-archive-object");
+        assert_eq!(archive.write_url(), temp.path());
+
+        // Metal refuses to serialize an archive with no recorded pipelines;
+        // that is a real device error, not a silent empty write.
+        let empty_error = archive
+            .serialize_to_path(temp.path())
+            .expect_err("empty archive must not serialize");
+        assert_eq!(empty_error.code, ReasonCode::RcIo);
+        assert!(!temp.path().exists());
+
+        // Record a real compiled pipeline through the free-function layer,
+        // serialize, and load the file back.
+        let library = device
+            .compile_shader_library(
+                r#"
+                    #include <metal_stdlib>
+                    using namespace metal;
+                    vertex float4 lifecycle_vertex(uint vid [[vertex_id]]) {
+                        return float4(0.0, 0.0, 0.0, 1.0);
+                    }
+                    fragment float4 lifecycle_fragment() {
+                        return float4(1.0, 1.0, 1.0, 1.0);
+                    }
+                "#,
+            )
+            .expect("shader library");
+        let vertex_fn = library
+            .get_function("lifecycle_vertex", None)
+            .expect("vertex");
+        let fragment_fn = library
+            .get_function("lifecycle_fragment", None)
+            .expect("fragment");
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&vertex_fn));
+        descriptor.set_fragment_function(Some(&fragment_fn));
+        descriptor
+            .color_attachments()
+            .object_at(0)
+            .expect("color attachment")
+            .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        archive
+            .add_render_pipeline(&descriptor)
+            .expect("record render pipeline");
+        archive
+            .serialize_to_path(temp.path())
+            .expect("serialize archive");
+        assert!(temp.path().exists(), "serialize must create the file");
+        assert!(
+            std::fs::metadata(temp.path()).expect("metadata").len() > 0,
+            "serialized archive must not be empty"
+        );
+        let reloaded = load_pipeline_archive(device.metal_device(), temp.path())
+            .expect("reload serialized archive");
+        assert_eq!(reloaded.write_url(), temp.path());
+
+        let missing = TempArchivePath::new("lifecycle-missing");
+        let error = load_pipeline_archive(device.metal_device(), missing.path())
+            .expect_err("missing archive must be rejected");
+        assert_eq!(error.code, ReasonCode::RcGeNotFound);
+    }
+
+    #[test]
+    fn pipeline_archive_render_roundtrip_across_backends() {
+        if !binary_archives_available() {
+            return;
+        }
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 archive_vertex(uint vid [[vertex_id]]) {
+                float2 positions[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) };
+                return float4(positions[vid], 0.0, 1.0);
+            }
+            fragment float4 archive_fragment() {
+                return float4(0.0, 1.0, 0.0, 1.0);
+            }
+        "#;
+        let temp = TempArchivePath::new("render");
+
+        // First backend: compile and record the pipeline, then serialize.
+        {
+            let mut backend = create_backend();
+            let archive_id = backend
+                .create_pipeline_archive(temp.path())
+                .expect("create archive");
+            assert_eq!(backend.get_active_pipeline_archive_id(), Some(archive_id));
+            let library = backend.compile_shader(source).expect("shader");
+            let pipeline = backend
+                .create_render_pipeline(
+                    "archive_vertex",
+                    "archive_fragment",
+                    library,
+                    metal::MTLPixelFormat::BGRA8Unorm,
+                    None,
+                )
+                .expect("render pipeline");
+            let key = RenderPipelineCacheKey {
+                library_id: library,
+                vertex_fn: "archive_vertex".to_string(),
+                fragment_fn: "archive_fragment".to_string(),
+                color_format: metal::MTLPixelFormat::BGRA8Unorm,
+                depth_format: None,
+            };
+            backend
+                .add_render_pipeline_to_archive(pipeline, &key)
+                .expect("record render pipeline");
+            assert_eq!(backend.pipeline_archive_records, 1);
+            backend.serialize_archive(temp.path()).expect("serialize");
+
+            let stats = backend.pipeline_archive_stats();
+            assert_eq!(stats.records, 1);
+            assert_eq!(stats.serializations, 1);
+            assert_eq!(
+                stats.hits, 0,
+                "no archive was loaded on the recording backend"
+            );
+        }
+        assert!(
+            std::fs::metadata(temp.path()).expect("metadata").len() > 0,
+            "serialized archive must contain real compiled data"
+        );
+
+        // Second backend (simulated process restart): fresh library id, same
+        // source; the archive must serve the pipeline.
+        let mut backend = create_backend();
+        let library = backend.compile_shader(source).expect("shader");
+        backend
+            .set_pipeline_archive_path(temp.path())
+            .expect("load archive");
+        let pipeline = backend
+            .create_render_pipeline(
+                "archive_vertex",
+                "archive_fragment",
+                library,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("pipeline from archive");
+        let stats = backend.pipeline_archive_stats();
+        assert!(stats.archive_loaded);
+        assert_eq!(
+            stats.loaded_path.as_deref(),
+            Some(temp.path().display().to_string().as_str())
+        );
+        assert_eq!(
+            stats.hits, 1,
+            "the loaded archive must serve the render pipeline"
+        );
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.unverified, 0);
+
+        // In-memory caching is intact: the same request is served by the
+        // cache and does not re-consult the archive.
+        let cached = backend
+            .create_render_pipeline(
+                "archive_vertex",
+                "archive_fragment",
+                library,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("cached pipeline");
+        assert_eq!(cached, pipeline);
+        assert_eq!(backend.pipeline_cache_hits, 1);
+        assert_eq!(backend.pipeline_archive_stats().hits, 1);
+
+        // The archive-restored pipeline really encodes on the GPU.
+        assert_eq!(
+            render_pipeline_top_left_pixel(&mut backend, pipeline),
+            [0, 255, 0, 255],
+            "fragment must have painted green through the archive-restored pipeline"
+        );
+    }
+
+    #[test]
+    fn pipeline_archive_compute_roundtrip_across_backends() {
+        if !binary_archives_available() {
+            return;
+        }
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void archive_compute(device float* output [[buffer(0)]],
+                                        uint gid [[thread_position_in_grid]]) {
+                output[gid] = float(gid);
+            }
+        "#;
+        let temp = TempArchivePath::new("compute");
+
+        {
+            let mut backend = create_backend();
+            backend
+                .create_pipeline_archive(temp.path())
+                .expect("create archive");
+            let library = backend.compile_shader(source).expect("shader");
+            let pipeline = backend
+                .create_compute_pipeline("archive_compute", library)
+                .expect("compute pipeline");
+            let key = ComputePipelineCacheKey {
+                library_id: library,
+                compute_fn: "archive_compute".to_string(),
+            };
+            backend
+                .add_compute_pipeline_to_archive(pipeline, &key)
+                .expect("record compute pipeline");
+            backend.serialize_archive(temp.path()).expect("serialize");
+            assert_eq!(backend.pipeline_archive_stats().records, 1);
+        }
+
+        let mut backend = create_backend();
+        let library = backend.compile_shader(source).expect("shader");
+        backend
+            .set_pipeline_archive_path(temp.path())
+            .expect("load archive");
+        let pipeline = backend
+            .create_compute_pipeline("archive_compute", library)
+            .expect("compute pipeline from archive");
+        let stats = backend.pipeline_archive_stats();
+        assert_eq!(
+            stats.hits, 1,
+            "the loaded archive must serve the compute pipeline"
+        );
+        assert_eq!(stats.misses, 0);
+
+        // Real dispatch with the archive-restored pipeline: output[gid] = gid.
+        let output_id =
+            backend.create_empty_buffer(16 * 4, metal::MTLResourceOptions::StorageModeShared);
+        let command = backend.command_queue().new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(
+            backend
+                .get_compute_pipeline(pipeline)
+                .expect("compute pipeline"),
+        );
+        encoder.set_buffer(0, Some(backend.get_buffer(output_id).expect("output")), 0);
+        encoder.dispatch_threads(metal::MTLSize::new(4, 1, 1), metal::MTLSize::new(4, 1, 1));
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+        let buffer = backend.get_buffer(output_id).expect("output");
+        let values = unsafe { std::slice::from_raw_parts(buffer.contents() as *const f32, 4) };
+        assert_eq!(
+            values,
+            &[0.0, 1.0, 2.0, 3.0],
+            "the GPU must have executed the archive-restored compute pipeline"
+        );
+    }
+
+    #[test]
+    fn pipeline_archive_miss_is_counted_and_falls_back() {
+        if !binary_archives_available() {
+            return;
+        }
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 archive_vertex(uint vid [[vertex_id]]) {
+                float2 positions[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) };
+                return float4(positions[vid], 0.0, 1.0);
+            }
+            fragment float4 archive_fragment() {
+                return float4(0.0, 1.0, 0.0, 1.0);
+            }
+            fragment float4 archive_fragment_alt() {
+                return float4(1.0, 0.0, 0.0, 1.0);
+            }
+        "#;
+        let temp = TempArchivePath::new("miss");
+
+        {
+            let mut backend = create_backend();
+            backend
+                .create_pipeline_archive(temp.path())
+                .expect("create archive");
+            let library = backend.compile_shader(source).expect("shader");
+            let pipeline = backend
+                .create_render_pipeline(
+                    "archive_vertex",
+                    "archive_fragment",
+                    library,
+                    metal::MTLPixelFormat::BGRA8Unorm,
+                    None,
+                )
+                .expect("pipeline");
+            let key = RenderPipelineCacheKey {
+                library_id: library,
+                vertex_fn: "archive_vertex".to_string(),
+                fragment_fn: "archive_fragment".to_string(),
+                color_format: metal::MTLPixelFormat::BGRA8Unorm,
+                depth_format: None,
+            };
+            backend
+                .add_render_pipeline_to_archive(pipeline, &key)
+                .expect("record");
+            backend.serialize_archive(temp.path()).expect("serialize");
+        }
+
+        let mut backend = create_backend();
+        let library = backend.compile_shader(source).expect("shader");
+        backend
+            .set_pipeline_archive_path(temp.path())
+            .expect("load archive");
+
+        let hit_pipeline = backend
+            .create_render_pipeline(
+                "archive_vertex",
+                "archive_fragment",
+                library,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("hit pipeline");
+        assert_eq!(backend.pipeline_archive_stats().hits, 1);
+
+        // A descriptor the archive never saw must be reported as a real miss
+        // (the fail-on-miss probe failed) and still compile successfully.
+        let miss_pipeline = backend
+            .create_render_pipeline(
+                "archive_vertex",
+                "archive_fragment_alt",
+                library,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                None,
+            )
+            .expect("missed pipeline must fall back to compilation");
+        let stats = backend.pipeline_archive_stats();
+        assert_eq!(
+            stats.hits, 1,
+            "only the recorded pipeline may count as a hit"
+        );
+        assert_eq!(
+            stats.misses, 1,
+            "the unrecorded pipeline must count as a miss"
+        );
+        assert_ne!(hit_pipeline, miss_pipeline);
+
+        // The JIT-compiled fallback pipeline is fully usable.
+        assert_eq!(
+            render_pipeline_top_left_pixel(&mut backend, miss_pipeline),
+            [0, 0, 255, 255],
+            "fallback pipeline must paint its own fragment output"
+        );
+    }
+
+    #[test]
+    fn pipeline_archive_error_paths() {
+        let mut backend = create_backend();
+        let temp = TempArchivePath::new("errors");
+
+        if !binary_archives_available() {
+            let error = backend
+                .create_pipeline_archive(temp.path())
+                .expect_err("archive creation must fail without the platform API");
+            assert_eq!(error.code, ReasonCode::RcUnsupportedPlatformApi);
+            return;
+        }
+
+        // No active archive yet.
+        assert!(backend.serialize_archive(temp.path()).is_err());
+        let compute_key = ComputePipelineCacheKey {
+            library_id: 0,
+            compute_fn: "missing".to_string(),
+        };
+        let render_key = RenderPipelineCacheKey {
+            library_id: 0,
+            vertex_fn: "missing".to_string(),
+            fragment_fn: "missing".to_string(),
+            color_format: metal::MTLPixelFormat::BGRA8Unorm,
+            depth_format: None,
+        };
+        assert!(
+            backend
+                .add_render_pipeline_to_archive(1, &render_key)
+                .is_err()
+        );
+        assert!(
+            backend
+                .add_compute_pipeline_to_archive(1, &compute_key)
+                .is_err()
+        );
+
+        let archive_id = backend
+            .create_pipeline_archive(temp.path())
+            .expect("create archive");
+        assert_eq!(
+            backend
+                .add_render_pipeline_to_archive(999_999, &render_key)
+                .expect_err("unknown pipeline")
+                .code,
+            ReasonCode::RcGeNotFound
+        );
+        assert_eq!(
+            backend
+                .add_compute_pipeline_to_archive(999_999, &compute_key)
+                .expect_err("unknown pipeline")
+                .code,
+            ReasonCode::RcGeNotFound
+        );
+        assert_eq!(
+            backend
+                .destroy_pipeline_archive(999_999)
+                .expect_err("unknown archive")
+                .code,
+            ReasonCode::RcGeNotFound
+        );
+        assert!(backend.get_pipeline_archive(999_999).is_none());
+
+        // Loading a missing file reports not-found, not a crash.
+        let missing = TempArchivePath::new("errors-missing");
+        assert_eq!(
+            backend
+                .set_pipeline_archive_path(missing.path())
+                .expect_err("missing archive")
+                .code,
+            ReasonCode::RcGeNotFound
+        );
+        // Loading a garbage file is a real load failure.
+        let garbage = TempArchivePath::new("errors-garbage");
+        std::fs::write(garbage.path(), b"this is not a Metal binary archive").expect("write");
+        assert_eq!(
+            backend
+                .set_pipeline_archive_path(garbage.path())
+                .expect_err("garbage archive")
+                .code,
+            ReasonCode::RcIo
+        );
+        assert!(!backend.pipeline_archive_stats().archive_loaded);
+
+        backend
+            .destroy_pipeline_archive(archive_id)
+            .expect("destroy archive");
+        assert_eq!(
+            backend
+                .destroy_pipeline_archive(archive_id)
+                .expect_err("double destroy")
+                .code,
+            ReasonCode::RcGeNotFound
+        );
+        assert!(backend.serialize_archive(temp.path()).is_err());
     }
 
     // -----------------------------------------------------------------------

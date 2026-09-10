@@ -15,6 +15,7 @@ use crate::metal_backend::{
     dxgi_to_metal_format,
 };
 use crate::reason::ReasonCode;
+use crate::video_decoder::{VideoFrame, record_cpu_copy_avoided, yuv_to_rgb_coeffs};
 
 // ---------------------------------------------------------------------------
 // Rendering types
@@ -273,6 +274,20 @@ impl IndexFormat {
 // Metal rendering context
 // ---------------------------------------------------------------------------
 
+/// Counters for the hardware-video present path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoPresentStats {
+    /// Frames presented by binding an IOSurface-backed Metal texture directly,
+    /// with no CPU pixel copy.
+    pub iosurface_presents: u64,
+    /// Frames presented through a non-IOSurface Metal texture (already on GPU).
+    pub texture_presents: u64,
+    /// Frames presented through a full-frame CPU upload (`replace_region`).
+    pub cpu_upload_presents: u64,
+    /// Subset of `iosurface_presents` that used two-plane NV12 textures.
+    pub nv12_presents: u64,
+}
+
 /// A complete Metal rendering context that manages the GPU pipeline state.
 pub struct MetalRenderContext {
     device: MetalDevice,
@@ -286,6 +301,16 @@ pub struct MetalRenderContext {
     cef_overlay_pipeline: Option<metal::RenderPipelineState>,
     cef_texture_width: u32,
     cef_texture_height: u32,
+    // Hardware-video present path (decoded IOSurface → Metal texture)
+    video_pipeline: Option<metal::RenderPipelineState>,
+    video_pipeline_nv12: Option<metal::RenderPipelineState>,
+    video_texture: Option<metal::Texture>,
+    video_texture_width: u32,
+    video_texture_height: u32,
+    video_iosurface_presents: u64,
+    video_texture_presents: u64,
+    video_cpu_upload_presents: u64,
+    video_nv12_presents: u64,
     // Async pipeline compiler for non-blocking PSO creation
     pipeline_compiler: Option<AsyncPipelineCompiler>,
     /// Request ID for the CEF overlay pipeline submission (0 = none / not yet submitted).
@@ -311,6 +336,15 @@ impl MetalRenderContext {
             cef_overlay_pipeline: None,
             cef_texture_width: 0,
             cef_texture_height: 0,
+            video_pipeline: None,
+            video_pipeline_nv12: None,
+            video_texture: None,
+            video_texture_width: 0,
+            video_texture_height: 0,
+            video_iosurface_presents: 0,
+            video_texture_presents: 0,
+            video_cpu_upload_presents: 0,
+            video_nv12_presents: 0,
             pipeline_compiler,
             cef_pipeline_request_id: 0,
         })
@@ -747,6 +781,369 @@ impl MetalRenderContext {
         self.cef_texture_width = width;
         self.cef_texture_height = height;
     }
+
+    // -----------------------------------------------------------------------
+    // Hardware-video present path (decoded IOSurface → Metal texture)
+    // -----------------------------------------------------------------------
+
+    /// Counters for the decoded-video present path.
+    ///
+    /// `iosurface_presents` counts frames bound directly from their
+    /// IOSurface-backed Metal texture (no CPU copy); `cpu_upload_presents`
+    /// counts frames that had to be uploaded from CPU pixels.
+    pub fn video_present_stats(&self) -> VideoPresentStats {
+        VideoPresentStats {
+            iosurface_presents: self.video_iosurface_presents,
+            texture_presents: self.video_texture_presents,
+            cpu_upload_presents: self.video_cpu_upload_presents,
+            nv12_presents: self.video_nv12_presents,
+        }
+    }
+
+    /// Lazily create the video present pipeline (BGRA or NV12 variant).
+    fn ensure_video_pipeline(&mut self, nv12: bool) -> AppResult<()> {
+        let cached = if nv12 {
+            self.video_pipeline_nv12.is_some()
+        } else {
+            self.video_pipeline.is_some()
+        };
+        if cached {
+            return Ok(());
+        }
+
+        let library = self
+            .device
+            .compile_shader_library(VIDEO_PRESENT_SHADER_SOURCE)?;
+        let vertex = library
+            .get_function("video_present_vertex", None)
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    "failed to find video_present_vertex in MSL library",
+                )
+            })?;
+        let fragment_name = if nv12 {
+            "video_present_fragment_nv12"
+        } else {
+            "video_present_fragment_bgra"
+        };
+        let fragment = library.get_function(fragment_name, None).map_err(|_| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to find {fragment_name} in MSL library"),
+            )
+        })?;
+
+        let descriptor = build_video_pipeline_descriptor(&vertex, &fragment);
+        let pipeline = self
+            .device
+            .device()
+            .new_render_pipeline_state(&descriptor)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to create video present pipeline: {e:?}"),
+                )
+            })?;
+
+        if nv12 {
+            self.video_pipeline_nv12 = Some(pipeline);
+        } else {
+            self.video_pipeline = Some(pipeline);
+        }
+        Ok(())
+    }
+
+    /// Ensure the CPU-upload fallback texture matches the frame dimensions.
+    fn ensure_video_texture(&mut self, width: u32, height: u32) {
+        if self.video_texture.is_some()
+            && self.video_texture_width == width
+            && self.video_texture_height == height
+        {
+            return;
+        }
+        self.video_texture = Some(self.device.create_texture(
+            width as u64,
+            height as u64,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            metal::MTLTextureUsage::ShaderRead,
+            metal::MTLStorageMode::Shared,
+        ));
+        self.video_texture_width = width;
+        self.video_texture_height = height;
+    }
+
+    /// Encode a full-screen draw of an already-created video texture into
+    /// `target` on `command_buffer` using the given pipeline.
+    ///
+    /// The texture is a borrowed reference: the caller (the frame) keeps
+    /// ownership, so no retain/release happens here.
+    fn encode_video_texture(
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
+        texture: &metal::TextureRef,
+        texture_uv: Option<&metal::TextureRef>,
+        pipeline: &metal::RenderPipelineState,
+        color_space: crate::video_decoder::ColorSpace,
+    ) {
+        let pass = metal::RenderPassDescriptor::new();
+        let color_attachment = pass.color_attachments().object_at(0).unwrap();
+        color_attachment.set_texture(Some(target));
+        // Video frames are composited over existing content (game surface).
+        color_attachment.set_load_action(metal::MTLLoadAction::Load);
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+        let encoder = command_buffer.new_render_command_encoder(&pass);
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_fragment_texture(0, Some(texture));
+        if let Some(uv) = texture_uv {
+            encoder.set_fragment_texture(1, Some(uv));
+            let (cr, cg_u, cg_v, cb) = yuv_to_rgb_coeffs(color_space);
+            let coeffs: [f32; 4] = [cr, cg_u, cg_v, cb];
+            encoder.set_fragment_bytes(
+                0,
+                std::mem::size_of::<[f32; 4]>() as u64,
+                coeffs.as_ptr() as *const std::ffi::c_void,
+            );
+        }
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+    }
+
+    /// Render a decoded video frame into an arbitrary render target with no
+    /// CPU pixel upload when the frame carries an IOSurface-backed texture.
+    ///
+    /// This is the presentation primitive used by [`present_video_frame`];
+    /// it is also used by tests with an offscreen target.
+    pub fn render_video_frame_to_texture(
+        &mut self,
+        frame: &VideoFrame,
+        target: &metal::TextureRef,
+    ) -> AppResult<()> {
+        use metal::foreign_types::ForeignTypeRef;
+
+        if frame.width == 0 || frame.height == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "cannot present a zero-sized video frame",
+            ));
+        }
+
+        if let Some(texture_ptr) = frame.metal_texture {
+            let nv12 = frame.has_uv_plane();
+            self.ensure_video_pipeline(nv12)?;
+            // SAFETY: `frame` owns a +1 reference on these textures for its
+            // whole lifetime; we only borrow them for the encode below.
+            let texture =
+                unsafe { metal::TextureRef::from_ptr(texture_ptr as *mut metal::MTLTexture) };
+            let texture_uv = frame
+                .uv_texture_ptr()
+                .map(|ptr| unsafe { metal::TextureRef::from_ptr(ptr as *mut metal::MTLTexture) });
+
+            let command_buffer = self.create_command_buffer().to_owned();
+            let pipeline = if nv12 {
+                self.video_pipeline_nv12.as_ref().unwrap()
+            } else {
+                self.video_pipeline.as_ref().unwrap()
+            };
+            Self::encode_video_texture(
+                &command_buffer,
+                target,
+                texture,
+                texture_uv,
+                pipeline,
+                frame.color_space,
+            );
+            command_buffer.commit();
+
+            if frame.is_iosurface_backed() {
+                self.video_iosurface_presents += 1;
+                if nv12 {
+                    self.video_nv12_presents += 1;
+                }
+                record_cpu_copy_avoided();
+            } else {
+                self.video_texture_presents += 1;
+            }
+            return Ok(());
+        }
+
+        // CPU fallback: upload the frame's RGBA pixels (converted to BGRA)
+        // into a cached texture. This path copies the full frame once.
+        if frame.data.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "video frame has neither a Metal texture nor CPU pixel data",
+            ));
+        }
+        let needed = (frame.width as usize)
+            .saturating_mul(frame.height as usize)
+            .saturating_mul(4);
+        if frame.data.len() < needed {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("video frame has {} bytes, need {needed}", frame.data.len()),
+            ));
+        }
+        self.ensure_video_pipeline(false)?;
+        self.ensure_video_texture(frame.width, frame.height);
+
+        let mut bgra = frame.data[..needed].to_vec();
+        rgba_to_bgra_in_place(&mut bgra);
+        let region = metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: frame.width as u64,
+                height: frame.height as u64,
+                depth: 1,
+            },
+        };
+        let texture = self.video_texture.as_ref().unwrap();
+        texture.replace_region(
+            region,
+            0,
+            bgra.as_ptr() as *const std::ffi::c_void,
+            (frame.width as u64) * 4,
+        );
+
+        let command_buffer = self.create_command_buffer().to_owned();
+        let pipeline = self.video_pipeline.as_ref().unwrap();
+        Self::encode_video_texture(
+            &command_buffer,
+            target,
+            texture,
+            None,
+            pipeline,
+            frame.color_space,
+        );
+        command_buffer.commit();
+        self.video_cpu_upload_presents += 1;
+        Ok(())
+    }
+
+    /// Present a decoded video frame to the swapchain.
+    ///
+    /// When `frame.metal_texture` is set (hardware VideoToolbox decode or a
+    /// CoreVideo-backed software frame), the frame's IOSurface texture is
+    /// bound directly: no CPU pixel copy occurs. Frames carrying only CPU
+    /// pixels are uploaded once and counted in `cpu_upload_presents`.
+    pub fn present_video_frame(&mut self, frame: &VideoFrame) -> AppResult<()> {
+        use metal::foreign_types::ForeignTypeRef;
+
+        if frame.width == 0 || frame.height == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "cannot present a zero-sized video frame",
+            ));
+        }
+
+        if let Some(texture_ptr) = frame.metal_texture {
+            let nv12 = frame.has_uv_plane();
+            self.ensure_video_pipeline(nv12)?;
+            // SAFETY: `frame` owns a +1 reference on these textures; they stay
+            // alive until the command buffer has been encoded and presented.
+            let texture =
+                unsafe { metal::TextureRef::from_ptr(texture_ptr as *mut metal::MTLTexture) };
+            let texture_uv = frame
+                .uv_texture_ptr()
+                .map(|ptr| unsafe { metal::TextureRef::from_ptr(ptr as *mut metal::MTLTexture) });
+
+            // Acquire the drawable last: the borrow of `self` it creates must
+            // end (via `present_drawable`) before the counters are updated.
+            let drawable = {
+                let swapchain = self
+                    .swapchain
+                    .as_ref()
+                    .ok_or_else(|| AppError::new(ReasonCode::RcIo, "no swapchain created"))?;
+                swapchain.next_drawable()?
+            };
+            let command_buffer = self.create_command_buffer().to_owned();
+            let pipeline = if nv12 {
+                self.video_pipeline_nv12.as_ref().unwrap()
+            } else {
+                self.video_pipeline.as_ref().unwrap()
+            };
+            Self::encode_video_texture(
+                &command_buffer,
+                drawable.texture(),
+                texture,
+                texture_uv,
+                pipeline,
+                frame.color_space,
+            );
+            command_buffer.present_drawable(drawable);
+            command_buffer.commit();
+
+            if frame.is_iosurface_backed() {
+                self.video_iosurface_presents += 1;
+                if nv12 {
+                    self.video_nv12_presents += 1;
+                }
+                record_cpu_copy_avoided();
+            } else {
+                self.video_texture_presents += 1;
+            }
+            return Ok(());
+        }
+
+        // CPU fallback: upload once into the cached texture, then present.
+        if frame.data.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "video frame has neither a Metal texture nor CPU pixel data",
+            ));
+        }
+        let needed = (frame.width as usize)
+            .saturating_mul(frame.height as usize)
+            .saturating_mul(4);
+        if frame.data.len() < needed {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("video frame has {} bytes, need {needed}", frame.data.len()),
+            ));
+        }
+        self.ensure_video_pipeline(false)?;
+        self.ensure_video_texture(frame.width, frame.height);
+        let mut bgra = frame.data[..needed].to_vec();
+        rgba_to_bgra_in_place(&mut bgra);
+        let region = metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: frame.width as u64,
+                height: frame.height as u64,
+                depth: 1,
+            },
+        };
+        self.video_texture.as_ref().unwrap().replace_region(
+            region,
+            0,
+            bgra.as_ptr() as *const std::ffi::c_void,
+            (frame.width as u64) * 4,
+        );
+
+        let drawable = {
+            let swapchain = self
+                .swapchain
+                .as_ref()
+                .ok_or_else(|| AppError::new(ReasonCode::RcIo, "no swapchain created"))?;
+            swapchain.next_drawable()?
+        };
+        let command_buffer = self.create_command_buffer().to_owned();
+        let pipeline = self.video_pipeline.as_ref().unwrap();
+        let texture = self.video_texture.as_ref().unwrap();
+        Self::encode_video_texture(
+            &command_buffer,
+            drawable.texture(),
+            texture,
+            None,
+            pipeline,
+            frame.color_space,
+        );
+        command_buffer.present_drawable(drawable);
+        command_buffer.commit();
+        self.video_cpu_upload_presents += 1;
+        Ok(())
+    }
 }
 
 /// Build a `RenderPipelineDescriptor` for the CEF overlay compositing pass.
@@ -812,6 +1209,84 @@ fragment float4 cef_overlay_fragment(VertexOut in [[stage_in]],
     constexpr sampler s(address::clamp_to_edge, filter::linear);
     float4 color = overlay.sample(s, in.texcoord);
     return color;
+}
+"#;
+
+/// Build a `RenderPipelineDescriptor` for the decoded-video present pass.
+///
+/// The video is drawn as an opaque full-screen triangle (no blending): the
+/// decoded frame replaces the drawable content, matching a video playback
+/// surface.
+fn build_video_pipeline_descriptor(
+    vertex_fn: &metal::FunctionRef,
+    fragment_fn: &metal::FunctionRef,
+) -> metal::RenderPipelineDescriptor {
+    let pipeline_desc = metal::RenderPipelineDescriptor::new();
+    pipeline_desc.set_vertex_function(Some(vertex_fn));
+    pipeline_desc.set_fragment_function(Some(fragment_fn));
+
+    let color_attachment = pipeline_desc.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_blending_enabled(false);
+
+    pipeline_desc
+}
+
+/// Inline Metal Shading Language source for the decoded-video present pass.
+///
+/// Two fragment variants are provided: a single-texture BGRA sampler and a
+/// two-plane NV12 sampler used when the hardware decoder emits `'420v'`
+/// IOSurface-backed pixel buffers. Both sample directly from the
+/// IOSurface-backed textures with no intermediate blit.
+const VIDEO_PRESENT_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VideoVertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+/// Full-screen triangle vertex shader (3 vertices, no vertex buffer).
+vertex VideoVertexOut video_present_vertex(uint vertex_id [[vertex_id]]) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0)
+    };
+    float2 texcoords[3] = {
+        float2(0.0, 1.0),
+        float2(2.0, 1.0),
+        float2(0.0, -1.0)
+    };
+    VideoVertexOut out;
+    out.position = float4(positions[vertex_id], 0.0, 1.0);
+    out.texcoord = texcoords[vertex_id];
+    return out;
+}
+
+/// Single-plane BGRA frame (VideoToolbox BGRA output or a CoreVideo software
+/// frame): sample the IOSurface-backed texture directly.
+fragment float4 video_present_fragment_bgra(VideoVertexOut in [[stage_in]],
+                                            texture2d<float> src [[texture(0)]]) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    return float4(src.sample(s, in.texcoord).rgb, 1.0);
+}
+
+/// Bi-planar NV12 frame: sample the luma (R8Unorm) and interleaved chroma
+/// (RG8Unorm) planes and convert with the same full-range coefficients the
+/// CPU path uses (`cr, cg_u, cg_v, cb` passed in buffer 0).
+fragment float4 video_present_fragment_nv12(VideoVertexOut in [[stage_in]],
+                                            texture2d<float> y_tex [[texture(0)]],
+                                            texture2d<float> uv_tex [[texture(1)]],
+                                            constant float4 &coeffs [[buffer(0)]]) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float y = y_tex.sample(s, in.texcoord).r;
+    float2 uv = uv_tex.sample(s, in.texcoord).rg - float2(0.5, 0.5);
+    float r = y + coeffs.x * uv.y;
+    float g = y - coeffs.y * uv.x - coeffs.z * uv.y;
+    float b = y + coeffs.w * uv.x;
+    return float4(clamp(float3(r, g, b), 0.0, 1.0), 1.0);
 }
 "#;
 
@@ -1538,5 +2013,220 @@ mod tests {
         assert!(ds.depth_write_enable);
         assert_eq!(ds.depth_func, ComparisonFunc::Less);
         assert!(!ds.stencil_enable);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hardware-video present path tests
+    // -----------------------------------------------------------------------
+
+    /// Build a deterministic RGBA test pattern.
+    fn video_test_pattern(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.push((x.wrapping_mul(7).wrapping_add(seed)) as u8);
+                rgba.push((y.wrapping_mul(11).wrapping_add(seed)) as u8);
+                rgba.push(seed.wrapping_add(23) as u8);
+                rgba.push(255);
+            }
+        }
+        rgba
+    }
+
+    fn offscreen_bgra_target(ctx: &MetalRenderContext, width: u32, height: u32) -> metal::Texture {
+        ctx.device().create_texture(
+            width as u64,
+            height as u64,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget,
+            metal::MTLStorageMode::Shared,
+        )
+    }
+
+    #[test]
+    fn video_present_iosurface_zero_copy() {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::video_decoder::{
+                ColorSpace, create_corevideo_frame_from_rgba, zero_copy_stats,
+            };
+
+            if !crate::video_decoder::probe_zero_copy_status().is_available() {
+                eprintln!(
+                    "skipping IOSurface present test: {}",
+                    crate::video_decoder::probe_zero_copy_status().reason()
+                );
+                return;
+            }
+
+            let mut ctx = MetalRenderContext::new().unwrap();
+            let (width, height) = (32u32, 16u32);
+            let rgba = video_test_pattern(width, height, 9);
+            let frame = create_corevideo_frame_from_rgba(
+                width,
+                height,
+                &rgba,
+                0,
+                33_333,
+                ColorSpace::Rec709,
+            )
+            .expect("CoreVideo frame creation");
+            assert!(frame.is_iosurface_backed());
+            assert!(frame.metal_texture.is_some());
+            assert!(frame.data.is_empty());
+
+            let target = offscreen_bgra_target(&ctx, width, height);
+            let before = zero_copy_stats().cpu_copies_avoided;
+            ctx.render_video_frame_to_texture(&frame, &target)
+                .expect("render IOSurface-backed video frame");
+
+            let stats = ctx.video_present_stats();
+            assert_eq!(
+                stats.iosurface_presents, 1,
+                "IOSurface-backed frame must be bound directly"
+            );
+            assert_eq!(
+                stats.cpu_upload_presents, 0,
+                "no CPU upload may happen for an IOSurface-backed frame"
+            );
+            assert!(
+                zero_copy_stats().cpu_copies_avoided > before,
+                "the present path must record an avoided CPU copy"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping IOSurface present test off macOS");
+        }
+    }
+
+    #[test]
+    fn video_present_nv12_zero_copy() {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::video_decoder::{ColorSpace, create_corevideo_nv12_frame};
+
+            if !crate::video_decoder::probe_zero_copy_status().is_available() {
+                eprintln!(
+                    "skipping NV12 present test: {}",
+                    crate::video_decoder::probe_zero_copy_status().reason()
+                );
+                return;
+            }
+
+            let mut ctx = MetalRenderContext::new().unwrap();
+            let (width, height) = (32u32, 16u32);
+            let y_plane = vec![128u8; (width * height) as usize];
+            let uv_plane = vec![96u8; ((width / 2) * (height / 2) * 2) as usize];
+            let frame = create_corevideo_nv12_frame(
+                width,
+                height,
+                &y_plane,
+                &uv_plane,
+                0,
+                33_333,
+                ColorSpace::Rec709,
+            )
+            .expect("NV12 frame creation");
+            assert!(frame.has_uv_plane());
+
+            let target = offscreen_bgra_target(&ctx, width, height);
+            ctx.render_video_frame_to_texture(&frame, &target)
+                .expect("render NV12 IOSurface frame");
+
+            let stats = ctx.video_present_stats();
+            assert_eq!(stats.iosurface_presents, 1);
+            assert_eq!(stats.nv12_presents, 1);
+            assert_eq!(stats.cpu_upload_presents, 0);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping NV12 present test off macOS");
+        }
+    }
+
+    #[test]
+    fn video_present_cpu_upload_is_counted() {
+        use crate::video_decoder::ColorSpace;
+
+        let mut ctx = MetalRenderContext::new().unwrap();
+        let (width, height) = (8u32, 8u32);
+        let frame = VideoFrame {
+            width,
+            height,
+            data: video_test_pattern(width, height, 3),
+            pts: 0,
+            duration: 33_333,
+            texture_id: None,
+            metal_texture: None,
+            color_space: ColorSpace::Rec709,
+        };
+        let target = offscreen_bgra_target(&ctx, width, height);
+        ctx.render_video_frame_to_texture(&frame, &target)
+            .expect("render CPU frame");
+
+        let stats = ctx.video_present_stats();
+        assert_eq!(stats.cpu_upload_presents, 1);
+        assert_eq!(stats.iosurface_presents, 0);
+    }
+
+    #[test]
+    fn video_present_rejects_empty_frame() {
+        use crate::video_decoder::ColorSpace;
+
+        let mut ctx = MetalRenderContext::new().unwrap();
+        let frame = VideoFrame {
+            width: 4,
+            height: 4,
+            data: Vec::new(),
+            pts: 0,
+            duration: 0,
+            texture_id: None,
+            metal_texture: None,
+            color_space: ColorSpace::Rec709,
+        };
+        let target = offscreen_bgra_target(&ctx, 4, 4);
+        assert!(ctx.render_video_frame_to_texture(&frame, &target).is_err());
+        assert_eq!(ctx.video_present_stats().cpu_upload_presents, 0);
+    }
+
+    #[test]
+    fn video_present_to_swapchain_capability_gated() {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::video_decoder::{ColorSpace, create_corevideo_frame_from_rgba};
+
+            if !crate::video_decoder::probe_zero_copy_status().is_available() {
+                eprintln!(
+                    "skipping swapchain present test: {}",
+                    crate::video_decoder::probe_zero_copy_status().reason()
+                );
+                return;
+            }
+
+            let mut ctx = MetalRenderContext::new().unwrap();
+            ctx.create_swapchain(32, 16);
+            let rgba = video_test_pattern(32, 16, 5);
+            let frame =
+                create_corevideo_frame_from_rgba(32, 16, &rgba, 0, 33_333, ColorSpace::Rec709)
+                    .expect("CoreVideo frame creation");
+
+            match ctx.present_video_frame(&frame) {
+                Ok(()) => {
+                    let stats = ctx.video_present_stats();
+                    assert_eq!(stats.iosurface_presents, 1);
+                    assert_eq!(stats.cpu_upload_presents, 0);
+                }
+                Err(error) => {
+                    // No drawable available (headless/offscreen); the
+                    // offscreen render test above already proves the bind path.
+                    eprintln!("skipping swapchain present (no drawable): {error}");
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipping swapchain present test off macOS");
+        }
     }
 }
