@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 40 entries deviate from exact/full — fidelity Exact 3, Restricted 12, SyntheticEnvironment 25, capability Full 1, Partial 18, Absent 21.
+**Counts**: 39 entries deviate from exact/full — fidelity Exact 3, Restricted 11, SyntheticEnvironment 25, capability Full 1, Partial 17, Absent 21.
 
 
 ### actxprxy.dll
@@ -51,9 +51,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### gdiplus.dll
 
-- `GdipCreateHICONFromBitmap` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: no pixel-icon registry exists for arbitrary HICONs (module-resource icons only).
-- `GdipMeasureCharacterRanges` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: character-range measurement needs creatable GpRegion objects.
-- `GdipSetClipPath` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: non-rectangular GpRegion clip paths are not creatable (no GdipCreateRegion is exported on this surface).
+- `GdipMeasureCharacterRanges` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Builds real GpRegion objects per CharacterRange (per-line runs for ranges spanning newlines) from the same lattice metrics DrawString rasterizes with; the regions are queryable through the region surface and are honored as clips.  Lattice advances are not hinted font metrics and the layout rect does not clip the range regions.
 
 ### kerberos.dll
 
@@ -70,7 +68,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mmdevapi.dll
 
-- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and builds a real guest endpoint object for IID_IAudioClient/IAudioClient2/IAudioClient3 with a working vtable; the completion handler is invoked asynchronously through the runtime's queue/drain machinery (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object and no per-method IAudioClient host thunks exist yet.
+- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and returns a real guest endpoint with the full 21-slot IAudioClient/IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and periods, real clock-driven GetCurrentPadding, Initialize opening the real cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer hand out and commit the real guest buffer into the output path, real event-handle signalling.  Exclusive mode is enforced client-side over the shared-mode host stream; capture-side services and IAudioClock/volume/session services answer E_NOINTERFACE (not backed); the AsyncOperation object itself is not modeled (the completion handler receives the result directly).
 
 ### mscoree.dll
 
@@ -95,7 +93,8 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### ntdll.dll
 
-- `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths.  The native contract's primary-thread creation is NtCreateThread's job (no native-thread surface exists) and no host subprocess runner is spawned (the contract carries no command line), so the process object is a record-only guest process with full query/terminate semantics.
+- `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths, and the first NtCreateThreadEx on the child launches the real casa1-runner host execution of the image with the child's exit code bridged to the process handle.  Remaining native blast radius: the host child starts at the image entry point (the recorded start routine/parameter are not injected), CREATE_SUSPENDED is recorded but the host child starts immediately, additional threads get real thread objects without injection into the running child, terminating the child records the exit code without killing an already-spawned runner, and non-NULL image-backed sections are not modeled (STATUS_INVALID_IMAGE_FORMAT).
+- `NtCreateThreadEx` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real native thread creation on a process object: real handle/client id, suspend count and full NtSuspend/NtResume/NtTerminate semantics; real guest thread records (TEB, stack from StackReserve, CPU state, start routine and parameter) scheduled through the guest thread scheduler for bare entries and the first thread on an image-backed native child launches the real host child execution.  Start routines are not injected into a running host child and host-launched child threads report parent-process query fields.
 
 ### riched32.dll
 

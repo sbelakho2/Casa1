@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-10T02:02:22Z",
+  "generated_at": "2026-09-10T11:11:18Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -1198,13 +1198,13 @@
       "differential_tested": 118,
       "conformance_tested": 118,
       "transitional_partial": 0,
-      "exact": 115,
-      "restricted": 3,
+      "exact": 117,
+      "restricted": 1,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 115,
-      "capability_partial": 3,
+      "capability_full": 117,
+      "capability_partial": 1,
       "capability_absent": 0
     },
     "glu32.dll": {
@@ -2242,13 +2242,13 @@
       "differential_tested": 69,
       "conformance_tested": 69,
       "transitional_partial": 0,
-      "exact": 68,
-      "restricted": 1,
+      "exact": 67,
+      "restricted": 2,
       "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 68,
-      "capability_partial": 1,
+      "capability_full": 67,
+      "capability_partial": 2,
       "capability_absent": 0
     },
     "ntdsapi.dll": {
@@ -12147,9 +12147,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Restricted",
-      "subsystem_capability": "Partial",
-      "detail": "Returns the genuine GDI+ NotImplemented status: no pixel-icon registry exists for arbitrary HICONs (module-resource icons only)."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": "Registers a real pixel icon: the bitmap's 32-bpp BGRA pixels and real width/height/bpp are stored in the icon table and the HICON handle is returned; invalid bitmaps or null out-pointers answer InvalidParameter; destroying drops the registry entry."
     },
     {
       "dll": "gdiplus.dll",
@@ -12749,7 +12749,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Returns the genuine GDI+ NotImplemented status: character-range measurement needs creatable GpRegion objects."
+      "detail": "Builds real GpRegion objects per CharacterRange (per-line runs for ranges spanning newlines) from the same lattice metrics DrawString rasterizes with; the regions are queryable through the region surface and are honored as clips.  Lattice advances are not hinted font metrics and the layout rect does not clip the range regions."
     },
     {
       "dll": "gdiplus.dll",
@@ -12857,9 +12857,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Restricted",
-      "subsystem_capability": "Partial",
-      "detail": "Returns the genuine GDI+ NotImplemented status: non-rectangular GpRegion clip paths are not creatable (no GdipCreateRegion is exported on this surface)."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": "Real scanned-region clip: the GpPath is flattened, world-transformed and scan-converted (agreeing pixel-for-pixel with fill path scanlines) and all six combine modes (Replace/Intersect/Union/Xor/Exclude/Complement) apply through per-pixel region clipping honored by every later draw; clip bounds and Save/Restore/containers carry the region.  The legacy GdipGetClip byte encoding round-trips a scanned path clip as its finite bounding rectangle (membership and drawing themselves are exact)."
     },
     {
       "dll": "gdiplus.dll",
@@ -15319,7 +15319,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and builds a real guest endpoint object for IID_IAudioClient/IAudioClient2/IAudioClient3 with a working vtable; the completion handler is invoked asynchronously through the runtime's queue/drain machinery (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object and no per-method IAudioClient host thunks exist yet."
+      "detail": "Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and returns a real guest endpoint with the full 21-slot IAudioClient/IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and periods, real clock-driven GetCurrentPadding, Initialize opening the real cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer hand out and commit the real guest buffer into the output path, real event-handle signalling.  Exclusive mode is enforced client-side over the shared-mode host stream; capture-side services and IAudioClock/volume/session services answer E_NOINTERFACE (not backed); the AsyncOperation object itself is not modeled (the completion handler receives the result directly)."
     },
     {
       "dll": "mp3dmod.dll",
@@ -18327,9 +18327,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "Required",
-      "semantic_fidelity": "Exact",
-      "subsystem_capability": "Full",
-      "detail": null
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Real native thread creation on a process object: real handle/client id, suspend count and full NtSuspend/NtResume/NtTerminate semantics; real guest thread records (TEB, stack from StackReserve, CPU state, start routine and parameter) scheduled through the guest thread scheduler for bare entries and the first thread on an image-backed native child launches the real host child execution.  Start routines are not injected into a running host child and host-launched child threads report parent-process query fields."
     },
     {
       "dll": "ntdll.dll",
@@ -18849,7 +18849,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths.  The native contract's primary-thread creation is NtCreateThread's job (no native-thread surface exists) and no host subprocess runner is spawned (the contract carries no command line), so the process object is a record-only guest process with full query/terminate semantics."
+      "detail": "Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths, and the first NtCreateThreadEx on the child launches the real casa1-runner host execution of the image with the child's exit code bridged to the process handle.  Remaining native blast radius: the host child starts at the image entry point (the recorded start routine/parameter are not injected), CREATE_SUSPENDED is recorded but the host child starts immediately, additional threads get real thread objects without injection into the running child, terminating the child records the exit code without killing an already-spawned runner, and non-NULL image-backed sections are not modeled (STATUS_INVALID_IMAGE_FORMAT)."
     },
     {
       "dll": "mfplat.dll",

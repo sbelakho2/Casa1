@@ -360,7 +360,6 @@ fn windows_pe_images_run_through_casa1_pe_runtime_branch() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_pe_runs_through_actual_imports() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-imports");
@@ -408,7 +407,6 @@ fn real_external_windows_pe_runs_through_actual_imports() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built indirect-import probe hangs (>20 min at <1% CPU)
 fn indirect_import_calls_land_on_pe_host_thunks() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-indirect-imports");
@@ -1666,7 +1664,6 @@ fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn stock_crt_linked_windows_pe_runs_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-crt");
@@ -1708,7 +1705,6 @@ fn stock_crt_linked_windows_pe_runs_through_pe_runtime() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_ui_audio_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-ui-audio");
@@ -1763,7 +1759,6 @@ fn real_external_windows_ui_audio_imports_trace_through_pe_runtime() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_xaudio2_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-xaudio2");
@@ -1833,7 +1828,6 @@ fn real_external_windows_xaudio2_imports_trace_through_pe_runtime() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_d3d11_imports_present_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11");
@@ -1922,7 +1916,6 @@ fn real_external_windows_d3d11_imports_present_through_pe_runtime() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_d3d11_shader_bindings_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11-shader-bindings");
@@ -2179,7 +2172,6 @@ fn real_external_windows_d3d11_shader_bindings_trace_through_pe_runtime() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_d3d11_create_device_without_swapchain_traces_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11-no-swapchain");
@@ -2242,7 +2234,6 @@ fn real_external_windows_d3d11_create_device_without_swapchain_traces_through_pe
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_tetris_runs_separately_through_casa1() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-tetris");
@@ -2358,7 +2349,6 @@ fn real_external_windows_tetris_runs_separately_through_casa1() {
 }
 
 #[test]
-#[ignore] // emulated execution of the zig-built real Windows PE hangs (>20 min at <1% CPU)
 fn real_external_windows_user32_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-user32");

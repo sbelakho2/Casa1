@@ -26,23 +26,6 @@ constraints that are unlikely to be resolved in the near term.
 - Every Vulkan/OpenGL extension
 - Every Windows application
 
-### block v0.1.6 Future Compatibility
-
-**Limitation**: The `block` crate v0.1.6 (a transitive dependency) produces a
-warning during compilation: *"the following packages contain code that will be
-rejected by a future version of Rust: block v0.1.6"*.
-
-**Reason**: This is a pre-existing transitive dependency issue originating from
-upstream crates that depend on `block` v0.1.6. The crate uses older Rust idioms
-that trigger compiler deprecation warnings. This is not actionable within Casa1
-itself — it will be resolved automatically when upstream dependencies update
-their `block` crate dependency to a newer, compatible version.
-
-**Impact**: The warning is cosmetic only. It does not affect correctness,
-safety, or functionality of Casa1 builds. CI warning-count checking should
-be configured to ignore this known upstream warning, or the relevant CI step
-should tolerate this specific transitive dependency warning.
-
 ## CPU Emulation
 
 ### No x86-on-x86 JIT

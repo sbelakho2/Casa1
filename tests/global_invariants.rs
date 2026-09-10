@@ -194,7 +194,6 @@ fn i5_1_soak_gate_keeps_rss_growth_under_five_percent_and_gpu_live_set_stable() 
 }
 
 #[test]
-#[ignore = "requires AppKit on main thread"]
 fn i5_2_curated_rotation_24_logical_hours_records_guest_crashes_without_host_failure() {
     let temp_dir = TempDir::new().expect("temp dir");
     let mut steam = SteamClient::new("C:/GEs/RotationSteam");

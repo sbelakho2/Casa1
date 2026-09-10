@@ -13,11 +13,19 @@
 //!   for `x3daudio1_7.dll`).  There is no Windows oracle in this repo, so
 //!   the implementation is a complete documented model — never an "exact"
 //!   claim — and every call records what it computed in the trace.
-//! - **NtCreateProcess** — real native child-process object creation
-//!   through the same `win32.create_process_w` machinery `CreateProcessW`
-//!   uses: a genuine child process record (pid, handle, image), real
-//!   NTSTATUS failure paths, and the runtime's standard process-control
-//!   surface (query/terminate) on the returned handle.
+//! - **NtCreateProcess / NtCreateThreadEx** — real native child-process
+//!   object creation through the same `win32.create_process_w` machinery
+//!   `CreateProcessW` uses: a genuine child process record (pid, handle,
+//!   image), real NTSTATUS failure paths, and the runtime's standard
+//!   process-control surface (query/terminate) on the returned handle.
+//!   Creating a thread on the native child (`NtCreateThreadEx`) mints a real
+//!   thread object with a real client id, TEB/stack/start-routine record and
+//!   full suspend/resume/terminate semantics, and lifts the record-only child
+//!   into real execution through the same host-runner contract
+//!   `CreateProcessW` uses (`RunnerJob` + `casa1-runner`, or a direct host
+//!   spawn for non-PE images); the child's exit code is delivered to the
+//!   exit-sync pair installed on the process object so waits on the
+//!   `NtCreateProcess` handle observe the real child exit.
 //! - **CertDigestDigest** — the real digest helper: MD5/SHA-1/SHA-256 over
 //!   the supplied guest buffer (the `src/crypto.rs` digests), writing real
 //!   digest bytes back to the guest.
@@ -60,6 +68,18 @@ const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 /// STATUS_INVALID_IMAGE_FORMAT — the status `NtCreateProcess` reports for a
 /// section that is not an executable image.
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
+/// STATUS_PROCESS_IS_TERMINATING — `NtCreateThreadEx` on a process that has
+/// already exited.
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xc000_010a;
+/// STATUS_OBJECT_TYPE_MISMATCH — a handle of the wrong object type was passed
+/// where the native contract requires a process handle.
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xc000_0024;
+/// STATUS_ACCESS_DENIED — the target process handle lacks the access the
+/// native contract requires (`PROCESS_CREATE_THREAD`).
+const STATUS_ACCESS_DENIED: u32 = 0xc000_0022;
+/// `PROCESS_CREATE_THREAD` — the access `NtCreateThreadEx` needs on the target
+/// process handle.
+const PROCESS_CREATE_THREAD: u32 = 0x0002;
 /// Win32 error codes.
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -1941,17 +1961,23 @@ impl PeHostRuntime {
     /// guest pid, a real kernel handle, an image, and full process-control
     /// semantics (query/terminate/duplicate).  A NULL section handle (or
     /// `NtCurrentProcess`) creates the child from the parent's own image.
+    /// `InheritObjectTable` is honored by recording the parent's inheritable
+    /// handles on the child exactly as `CreateProcessW(bInheritHandles)`
+    /// does.
     ///
-    /// Documented model bounds: the runtime's section objects are anonymous
+    /// `NtCreateProcess` itself creates no primary thread (the native
+    /// contract leaves that to `NtCreateThread`); the child is not launched
+    /// until a thread is created on it.  `NtCreateThreadEx` on the returned
+    /// handle creates the real thread object AND lifts the child into real
+    /// execution through the host-runner machinery
+    /// (`spawn_native_child_image`), with the real exit code delivered to
+    /// the exit-sync pair installed here.
+    ///
+    /// Documented model bound: the runtime's section objects are anonymous
     /// data sections (no image-backed `NtCreateSection` exists in this
     /// runtime), so a non-NULL section cannot be resolved to an image and
     /// fails with `STATUS_INVALID_IMAGE_FORMAT` — the exact status real
-    /// Windows reports for a section that is not an image section.  Native
-    /// children are process records: `NtCreateProcess` itself creates no
-    /// primary thread (the native contract leaves that to `NtCreateThread`),
-    /// and this runtime has no native-thread-creation surface to attach one,
-    /// so no `casa1-runner` host subprocess is spawned — a record-only child
-    /// is the deepest real behavior the runtime's model supports.
+    /// Windows reports for a section that is not an image section.
     pub(crate) fn dispatch_nt_create_process(
         &mut self,
         state: &mut CpuState,
@@ -1961,7 +1987,7 @@ impl PeHostRuntime {
         let desired_access = guest_call_arg_u32(state, memory, 1)?;
         let _object_attributes = guest_call_arg(state, memory, 2)?;
         let parent_process = guest_call_arg_u32(state, memory, 3)?;
-        let _inherit_object_table = guest_call_arg_u32(state, memory, 4)?;
+        let inherit_object_table = guest_call_arg_u32(state, memory, 4)? != 0;
         let section_handle = guest_call_arg_u32(state, memory, 5)?;
         let debug_port = guest_call_arg_u32(state, memory, 6)?;
         let exception_port = guest_call_arg_u32(state, memory, 7)?;
@@ -2035,13 +2061,15 @@ impl PeHostRuntime {
         };
 
         // Create the real child process object through the CreateProcessW
-        // machinery (no host subprocess — see the method documentation).
+        // machinery.  The host execution is deferred: `NtCreateProcess`
+        // creates no primary thread, so the child is spawned for real only
+        // when `NtCreateThreadEx` creates one on this handle.
         let result = match self.win32.create_process_w(
             &image,
             &image,
             &self.process_environment,
             &self.current_directory,
-            false,
+            inherit_object_table,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -2063,11 +2091,25 @@ impl PeHostRuntime {
             }
         };
         // Install the exit-sync pair exactly like launch_guest_child_process
-        // so WaitForSingleObject can block on this child's handle.
+        // so WaitForSingleObject can block on this child's handle, and keep
+        // the same pair for the host-runner monitor that
+        // `NtCreateThreadEx` starts: the real child's exit code lands in it.
         let sync = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         let _ = self
             .win32
-            .install_process_exit_sync(result.process_handle, sync);
+            .install_process_exit_sync(result.process_handle, sync.clone());
+        native_child_launch_register(
+            self.guest_pid,
+            result.process_id,
+            NativeChildLaunch {
+                image: image.clone(),
+                cwd: self.current_directory.clone(),
+                environment: self.process_environment.clone(),
+                process_id: result.process_id,
+                sync,
+                launched: false,
+            },
+        );
         write_guest_pointer(
             memory,
             process_handle_ptr,
@@ -2094,9 +2136,356 @@ impl PeHostRuntime {
                 ("section".to_string(), json!("NULL (parent image)")),
                 ("process_handle".to_string(), json!(result.process_handle)),
                 ("process_id".to_string(), json!(result.process_id)),
+                (
+                    "inherit_object_table".to_string(),
+                    json!(inherit_object_table),
+                ),
             ]),
             json!(0),
         );
+        Ok(())
+    }
+
+    /// `NtCreateThreadEx` — native thread creation with a real,
+    /// process-targeted thread object.
+    ///
+    /// `NtCurrentProcess` (`NULL` / `(HANDLE)-1` / the open current-process
+    /// handle) keeps the runtime's scheduler-backed thread path
+    /// (`dispatch_nt_create_thread_ex`).  A thread created on a native child
+    /// process — an `NtCreateProcess` object carrying an image — mints a real
+    /// thread object in the runtime's thread tables (real client id, handle,
+    /// priority, suspend count) and prepares the guest thread record (TEB,
+    /// stack honoring the thread-creation stack parameters, start routine and
+    /// parameter).  The FIRST thread on an unlaunched native child also lifts
+    /// the child into real execution through the same host-runner contract
+    /// `CreateProcessW` uses (`spawn_native_child_image`); when the image
+    /// cannot run on the host (missing image / missing runner), the start
+    /// routine is scheduled through the runtime's existing guest thread
+    /// scheduler as the bare-entry fallback.
+    ///
+    /// The host runner executes the image from its entry point — exactly what
+    /// Windows does for a process created from an image section with no
+    /// command line (argv is the image alone).  The NT thread object still
+    /// carries the caller's start routine/parameter for query, suspend,
+    /// resume and terminate semantics.
+    pub(crate) fn dispatch_nt_create_thread_ex_on_process(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let process_handle = guest_call_arg_u32(state, memory, 3)?;
+        if process_handle == 0
+            || process_handle == u32::MAX
+            || process_handle == self.win32.current_process_handle()
+        {
+            return self.dispatch_nt_create_thread_ex(state, memory);
+        }
+        let process = match self.win32.process_state(process_handle) {
+            Ok(process) => process,
+            Err(_) => {
+                // A live handle of the wrong type answers the type mismatch;
+                // a dead handle answers STATUS_INVALID_HANDLE.
+                let status = if self.win32.handle_object_type(process_handle).is_ok() {
+                    STATUS_OBJECT_TYPE_MISMATCH
+                } else {
+                    STATUS_INVALID_HANDLE
+                };
+                self.nt_create_thread_fail(state, status, "invalid process handle", process_handle);
+                return Ok(());
+            }
+        };
+        if process.process_id == self.guest_pid {
+            // A second, independent handle to the current process: the
+            // scheduler-backed thread path.
+            return self.dispatch_nt_create_thread_ex(state, memory);
+        }
+        // The native contract requires PROCESS_CREATE_THREAD on the target
+        // handle (the runtime's process objects carry access masks, so a
+        // restricted OpenProcess handle is refused exactly like Windows).
+        if self
+            .win32
+            .describe_handle(process_handle)
+            .is_ok_and(|descriptor| descriptor.access_mask & PROCESS_CREATE_THREAD == 0)
+        {
+            self.nt_create_thread_fail(
+                state,
+                STATUS_ACCESS_DENIED,
+                "process handle lacks PROCESS_CREATE_THREAD",
+                process_handle,
+            );
+            return Ok(());
+        }
+
+        let thread_handle_ptr = guest_call_arg(state, memory, 0)?;
+        let _desired_access = guest_call_arg_u32(state, memory, 1)?;
+        let _object_attributes = guest_call_arg(state, memory, 2)?;
+        let start_address = guest_call_arg(state, memory, 4)?;
+        let parameter = guest_call_arg(state, memory, 5)?;
+        let create_suspended = guest_call_arg_u32(state, memory, 6)? != 0;
+        let _stack_zero_bits = guest_call_arg_u32(state, memory, 7)?;
+        let _stack_commit = guest_call_arg(state, memory, 8)?;
+        let stack_reserve = guest_call_arg(state, memory, 9)?;
+
+        if start_address == 0 {
+            self.nt_create_thread_fail(
+                state,
+                STATUS_INVALID_PARAMETER,
+                "null start routine",
+                process_handle,
+            );
+            return Ok(());
+        }
+        if process.exit_code.is_some() {
+            self.nt_create_thread_fail(
+                state,
+                STATUS_PROCESS_IS_TERMINATING,
+                "target process has exited",
+                process_handle,
+            );
+            return Ok(());
+        }
+
+        // A real thread object: client id in the runtime's thread tables with
+        // full query / suspend / resume / terminate semantics.
+        let thread_handle = self.win32.create_thread(
+            crate::win32::ThreadPlan {
+                exit_code: None,
+                priority: 0,
+                signaled: false,
+            },
+            false,
+        );
+        let thread_id = self.win32.thread_id_for_handle(thread_handle)?;
+
+        // Lift the record-only native child into real execution: only the
+        // FIRST thread on an unlaunched `NtCreateProcess` child spawns the
+        // host run; later threads get real thread records (a host-runner
+        // child cannot be injected with a new guest thread).
+        let registered = native_child_launch_registered(self.guest_pid, process.process_id);
+        let mut host_launched = false;
+        let mut launch_note: Option<String> = None;
+        if registered {
+            if let Some(claim) = native_child_launch_claim(self.guest_pid, process.process_id) {
+                match self.spawn_native_child_image(
+                    claim.process_id,
+                    &claim.image,
+                    &claim.environment,
+                    &claim.cwd,
+                    claim.sync.clone(),
+                ) {
+                    Ok(()) => host_launched = true,
+                    Err(error) => {
+                        native_child_launch_unclaim(self.guest_pid, process.process_id);
+                        launch_note = Some(error.message.clone());
+                    }
+                }
+            } else {
+                launch_note = Some("native child already launched".to_string());
+            }
+        }
+
+        // The runtime-side thread record: a real TEB/stack/CPU state for the
+        // start routine.  When the real execution runs outside this runtime
+        // (a host-runner / already-running child), the record is kept in the
+        // runtime's external-child thread table; only a native child whose
+        // host run could not start falls back to the runtime's existing guest
+        // thread scheduler (bare-entry scheduling).
+        let external_execution = !registered || host_launched;
+        let mut scheduled = false;
+        if self.guest_arch == GuestArch::X86 {
+            match self.prepare_guest_thread_entry(
+                memory,
+                thread_handle,
+                stack_reserve,
+                start_address,
+                parameter,
+            ) {
+                Ok(mut pending) => {
+                    if create_suspended {
+                        pending.suspended = 1;
+                        let _ = self.win32.set_thread_suspend_count(thread_id, 1);
+                    }
+                    if external_execution {
+                        native_child_thread_retain(self.guest_pid, thread_handle, pending);
+                    } else {
+                        self.pending_guest_threads.push_back(pending);
+                        scheduled = true;
+                    }
+                }
+                Err(error) => {
+                    launch_note = Some(format!("guest thread record unavailable: {error}"));
+                }
+            }
+        }
+
+        if thread_handle_ptr != 0 {
+            write_u32(memory, thread_handle_ptr, thread_handle);
+        }
+        self.emit_event(crate::runtime_events::RuntimeEvent::ThreadCreated { thread_id });
+        state.set(Register::Rax, 0); // STATUS_SUCCESS
+        self.last_error = 0;
+        let mut trace_params = BTreeMap::from([
+            (
+                "process_handle".to_string(),
+                json!(format!("{process_handle:#x}")),
+            ),
+            ("process_id".to_string(), json!(process.process_id)),
+            ("thread_handle".to_string(), json!(thread_handle)),
+            ("thread_id".to_string(), json!(thread_id)),
+            (
+                "start_address".to_string(),
+                json!(format!("{start_address:#x}")),
+            ),
+            ("parameter".to_string(), json!(format!("{parameter:#x}"))),
+            ("create_suspended".to_string(), json!(create_suspended)),
+            ("host_launched".to_string(), json!(host_launched)),
+            ("external_execution".to_string(), json!(external_execution)),
+            ("scheduled".to_string(), json!(scheduled)),
+        ]);
+        if let Some(note) = launch_note {
+            trace_params.insert("launch_note".to_string(), json!(note));
+        }
+        self.push_trace("process", "NtCreateThreadEx", trace_params, json!(0));
+        Ok(())
+    }
+
+    /// Spawn the real execution of a native child's image through the exact
+    /// host-runner contract `CreateProcessW` uses (see
+    /// `launch_guest_child_process`): PE images run under `casa1-runner` with
+    /// a serialized `RunnerJob`; non-PE host binaries spawn directly.  The
+    /// exit code is delivered to the `sync` pair installed on the
+    /// `NtCreateProcess` process object, so waits on that handle observe the
+    /// real child exit.
+    ///
+    /// `NtCreateProcess` carries no command line: the child's argv is exactly
+    /// the image (argv[0]) with no extra arguments, matching Windows for a
+    /// process created from an image section with no parameters.  The runner
+    /// protocol's `args` vector is empty for that reason.
+    fn spawn_native_child_image(
+        &mut self,
+        process_id: u32,
+        image: &str,
+        environment: &BTreeMap<String, String>,
+        cwd: &str,
+        sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+    ) -> AppResult<()> {
+        let host_program = self.win32.guest_path_to_host_path(image)?;
+        if !host_program.exists() {
+            return Err(AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("child executable not found: {}", host_program.display()),
+            ));
+        }
+        let host_cwd = self
+            .win32
+            .guest_path_to_host_path(cwd)
+            .ok()
+            .or_else(|| host_program.parent().map(|parent| parent.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        if is_pe_image(&host_program)? {
+            // PE images run under casa1-runner (real process isolation), the
+            // same contract launch_guest_child_process uses.
+            let runner_path = find_casa1_runner_binary()?;
+            let mut env = environment.clone();
+            if let Some(run_id) = self.process_environment.get("CASA1_RUN_ID").cloned() {
+                env.insert("CASA1_RUN_ID".to_string(), run_id);
+            }
+            env.insert(
+                "CASA1_PARENT_PID".to_string(),
+                self.win32.current_process_id().to_string(),
+            );
+            let ge = self.win32.ge().clone();
+            let dtm = self.dtm;
+            let child_test_base = env
+                .get("CASA1_TEST_ID")
+                .map(String::as_str)
+                .filter(|id| !id.is_empty())
+                .unwrap_or("native-child")
+                .to_string();
+            let child_test_id = format!("{child_test_base}-child-{process_id}");
+            let job = crate::runner::RunnerJob {
+                ge_name: ge.config.name.clone(),
+                ge_root: ge.root.clone(),
+                program: host_program.clone(),
+                // NtCreateProcess carries no command line: no extra args.
+                args: Vec::new(),
+                cwd: host_cwd.clone(),
+                env,
+                dtm,
+                intent: crate::runner::RunIntent::Run,
+                trace_categories: Vec::new(),
+                test_id: child_test_id,
+                jit_mode: crate::runner::JitMode::Auto,
+                steam_ipc: false,
+                window_width: None,
+                window_height: None,
+            };
+            let job_json = serde_json::to_string(&job).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcRunnerProtocolInvalid,
+                    format!("failed to serialise native child runner job: {error}"),
+                )
+            })?;
+            let job_dir = std::env::temp_dir().join("casa1-createprocess");
+            std::fs::create_dir_all(&job_dir).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to create job dir {}", job_dir.display()),
+                    &error,
+                )
+            })?;
+            let job_path = job_dir.join(format!("native-child-{process_id}.json"));
+            std::fs::write(&job_path, &job_json).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to write runner job to {}", job_path.display()),
+                    &error,
+                )
+            })?;
+            std::thread::spawn(move || {
+                let exit_code = Self::spawn_runner_and_wait(&runner_path, &job_path);
+                let _ = std::fs::remove_file(&job_path);
+                let (lock, cvar) = &*sync;
+                let mut guard = lock.lock().unwrap();
+                *guard = Some(exit_code);
+                cvar.notify_all();
+            });
+        } else {
+            // Non-PE host executable: spawn directly, like the native-child
+            // branch of launch_guest_child_process.
+            let mut command = std::process::Command::new(&host_program);
+            command
+                .current_dir(&host_cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, value) in environment {
+                command.env(key, value);
+            }
+            std::thread::spawn(move || {
+                let exit_code = match command.spawn() {
+                    Ok(mut child) => match child.wait() {
+                        Ok(status) => status.code().map(|code| code as u32).unwrap_or(u32::MAX),
+                        Err(error) => {
+                            eprintln!(
+                                "[pe_runtime] failed to wait for native child {host_program:?}: {error:?}"
+                            );
+                            u32::MAX
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "[pe_runtime] failed to spawn native child {host_program:?}: {error:?}"
+                        );
+                        u32::MAX
+                    }
+                };
+                let (lock, cvar) = &*sync;
+                let mut guard = lock.lock().unwrap();
+                *guard = Some(exit_code);
+                cvar.notify_all();
+            });
+        }
         Ok(())
     }
 
@@ -2344,6 +2733,30 @@ impl PeHostRuntime {
             "process",
             "NtCreateProcess",
             BTreeMap::from([("failure".to_string(), json!(why))]),
+            json!(format!("{status:#x}")),
+        );
+    }
+
+    /// Trace an `NtCreateThreadEx` NTSTATUS failure.
+    fn nt_create_thread_fail(
+        &mut self,
+        state: &mut CpuState,
+        status: u32,
+        why: &str,
+        process_handle: u32,
+    ) {
+        state.set(Register::Rax, u64::from(status));
+        self.last_error = status;
+        self.push_trace(
+            "process",
+            "NtCreateThreadEx",
+            BTreeMap::from([
+                ("failure".to_string(), json!(why)),
+                (
+                    "process_handle".to_string(),
+                    json!(format!("{process_handle:#x}")),
+                ),
+            ]),
             json!(format!("{status:#x}")),
         );
     }
@@ -3508,6 +3921,123 @@ fn cng_audit_records_for(runtime_pid: u32) -> Vec<CngAuditRecord> {
             .unwrap_or_default()
     } else {
         Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native child-process launch state
+// ---------------------------------------------------------------------------
+
+/// Launch state for a native child process created by `NtCreateProcess`
+/// before a thread makes it runnable: the image/cwd/environment its host run
+/// must use, the exit-sync pair installed on its process object, and whether
+/// the real host execution has been spawned.
+struct NativeChildLaunch {
+    image: String,
+    cwd: String,
+    environment: BTreeMap<String, String>,
+    process_id: u32,
+    /// Exit-sync pair installed on the child's process object.  The
+    /// host-runner monitor signals it with the real exit code.
+    sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+    /// Set once a thread has spawned the real child execution; later threads
+    /// on the same process only get thread records (a running host child
+    /// cannot be injected with new guest threads).
+    launched: bool,
+}
+
+/// The per-runtime native-child launch table, keyed by
+/// `(runtime guest pid, child process id)` so concurrent runtimes in one host
+/// process never alias (every runtime owns a distinct monotonic guest pid) and
+/// any handle to the child object (including a later `OpenProcess` handle)
+/// resolves the same launch state.
+fn native_child_launch_store() -> &'static std::sync::Mutex<BTreeMap<(u32, u32), NativeChildLaunch>>
+{
+    use std::sync::LazyLock;
+    static STORE: LazyLock<std::sync::Mutex<BTreeMap<(u32, u32), NativeChildLaunch>>> =
+        LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    &STORE
+}
+
+/// Register a freshly created `NtCreateProcess` child.  Bounded per runtime:
+/// if a guest creates more unlaunched children than the cap, launched (or
+/// stale) entries are pruned first.
+fn native_child_launch_register(runtime_pid: u32, process_id: u32, launch: NativeChildLaunch) {
+    const MAX_CHILDREN_PER_RUNTIME: usize = 1024;
+    if let Ok(mut store) = native_child_launch_store().lock() {
+        let same_runtime = store.keys().filter(|(pid, _)| *pid == runtime_pid).count();
+        if same_runtime >= MAX_CHILDREN_PER_RUNTIME {
+            store.retain(|(pid, _), entry| *pid != runtime_pid || !entry.launched);
+        }
+        store.insert((runtime_pid, process_id), launch);
+    }
+}
+
+/// The fields needed to spawn a claimed launch (owned, so the store lock is
+/// never held across the host spawn).
+struct NativeChildClaim {
+    image: String,
+    cwd: String,
+    environment: BTreeMap<String, String>,
+    process_id: u32,
+    sync: Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+}
+
+/// Claim the first launch of an unlaunched native child.  Returns `None` for
+/// process ids that are not registered `NtCreateProcess` children or were
+/// already claimed; the claim is reverted with
+/// [`native_child_launch_unclaim`] when the host spawn fails, so a later
+/// thread creation can retry.
+fn native_child_launch_claim(runtime_pid: u32, process_id: u32) -> Option<NativeChildClaim> {
+    let mut store = native_child_launch_store().lock().ok()?;
+    let entry = store.get_mut(&(runtime_pid, process_id))?;
+    if entry.launched {
+        return None;
+    }
+    entry.launched = true;
+    Some(NativeChildClaim {
+        image: entry.image.clone(),
+        cwd: entry.cwd.clone(),
+        environment: entry.environment.clone(),
+        process_id: entry.process_id,
+        sync: entry.sync.clone(),
+    })
+}
+
+/// Revert an optimistic claim after a failed host spawn.
+fn native_child_launch_unclaim(runtime_pid: u32, process_id: u32) {
+    if let Ok(mut store) = native_child_launch_store().lock()
+        && let Some(entry) = store.get_mut(&(runtime_pid, process_id))
+    {
+        entry.launched = false;
+    }
+}
+
+/// Whether `process_id` is a registered `NtCreateProcess` child (launched or
+/// not) for this runtime.
+fn native_child_launch_registered(runtime_pid: u32, process_id: u32) -> bool {
+    native_child_launch_store()
+        .lock()
+        .map(|store| store.contains_key(&(runtime_pid, process_id)))
+        .unwrap_or(false)
+}
+
+/// The runtime-side thread records for child threads whose real execution
+/// runs outside this runtime (spawned host-runner children, already-running
+/// children, or a native child whose host run could not start): real
+/// TEB/stack/CPU state owned by the runtime, keyed by
+/// `(runtime guest pid, thread handle)`.
+fn native_child_thread_store() -> &'static std::sync::Mutex<BTreeMap<(u32, u32), PendingGuestThread>>
+{
+    use std::sync::LazyLock;
+    static STORE: LazyLock<std::sync::Mutex<BTreeMap<(u32, u32), PendingGuestThread>>> =
+        LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    &STORE
+}
+
+fn native_child_thread_retain(runtime_pid: u32, thread_handle: u32, thread: PendingGuestThread) {
+    if let Ok(mut store) = native_child_thread_store().lock() {
+        store.insert((runtime_pid, thread_handle), thread);
     }
 }
 

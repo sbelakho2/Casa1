@@ -1210,7 +1210,6 @@ const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-const DRIVE_FIXED: u32 = 3;
 const DRIVE_UNKNOWN: u32 = 0;
 const WIN32_FIND_DATAW_FILE_NAME_CHARS: usize = 260;
 const WIN32_FIND_DATAW_ALT_FILE_NAME_CHARS: usize = 14;
@@ -5619,6 +5618,30 @@ pub enum HostThunk {
     CngAuditLog,
     GdipCreateGraphics,
     ActivateAudioInterfaceAsync,
+    // ── IAudioClient / IAudioRenderClient methods of an activated audio
+    //    endpoint (real host thunks; see `crate::audio_activation`) ──
+    AudioClientQueryInterface,
+    AudioClientInitialize,
+    AudioClientGetBufferSize,
+    AudioClientGetStreamLatency,
+    AudioClientGetCurrentPadding,
+    AudioClientIsFormatSupported,
+    AudioClientGetMixFormat,
+    AudioClientGetDevicePeriod,
+    AudioClientStart,
+    AudioClientStop,
+    AudioClientReset,
+    AudioClientSetEventHandle,
+    AudioClientGetService,
+    AudioRenderClientQueryInterface,
+    AudioRenderClientGetBuffer,
+    AudioRenderClientReleaseBuffer,
+    AudioClientIsOffloadCapable,
+    AudioClientSetClientProperties,
+    AudioClientGetBufferSizeLimits,
+    AudioClientGetSharedModeEnginePeriod,
+    AudioClientGetCurrentSharedModeEnginePeriod,
+    AudioClientInitializeSharedAudioStream,
     MsftEditRegisterClass,
     RichEditAnsiWndClass,
     NetServerGetInfo,
@@ -18844,6 +18867,77 @@ impl PeHostRuntime {
                     }
                 }
                 self.last_error = 0;
+            }
+            // ── IAudioClient / IAudioRenderClient — the real WASAPI method
+            //    surface of an `ActivateAudioInterfaceAsync` endpoint.  The
+            //    endpoint object's vtable slots are these thunks; the state
+            //    behind them lives in `crate::audio_activation`.
+            HostThunk::AudioClientQueryInterface => {
+                self.dispatch_audio_client_query_interface(state, memory)?;
+            }
+            HostThunk::AudioClientInitialize => {
+                self.dispatch_audio_client_initialize(state, memory)?;
+            }
+            HostThunk::AudioClientGetBufferSize => {
+                self.dispatch_audio_client_get_buffer_size(state, memory)?;
+            }
+            HostThunk::AudioClientGetStreamLatency => {
+                self.dispatch_audio_client_get_stream_latency(state, memory)?;
+            }
+            HostThunk::AudioClientGetCurrentPadding => {
+                self.dispatch_audio_client_get_current_padding(state, memory)?;
+            }
+            HostThunk::AudioClientIsFormatSupported => {
+                self.dispatch_audio_client_is_format_supported(state, memory)?;
+            }
+            HostThunk::AudioClientGetMixFormat => {
+                self.dispatch_audio_client_get_mix_format(state, memory)?;
+            }
+            HostThunk::AudioClientGetDevicePeriod => {
+                self.dispatch_audio_client_get_device_period(state, memory)?;
+            }
+            HostThunk::AudioClientStart => {
+                self.dispatch_audio_client_start(state, memory)?;
+            }
+            HostThunk::AudioClientStop => {
+                self.dispatch_audio_client_stop(state, memory)?;
+            }
+            HostThunk::AudioClientReset => {
+                self.dispatch_audio_client_reset(state, memory)?;
+            }
+            HostThunk::AudioClientSetEventHandle => {
+                self.dispatch_audio_client_set_event_handle(state, memory)?;
+            }
+            HostThunk::AudioClientGetService => {
+                self.dispatch_audio_client_get_service(state, memory)?;
+            }
+            HostThunk::AudioRenderClientQueryInterface => {
+                self.dispatch_audio_render_client_query_interface(state, memory)?;
+            }
+            HostThunk::AudioRenderClientGetBuffer => {
+                self.dispatch_audio_render_client_get_buffer(state, memory)?;
+            }
+            HostThunk::AudioRenderClientReleaseBuffer => {
+                self.dispatch_audio_render_client_release_buffer(state, memory)?;
+            }
+            // IAudioClient2 / IAudioClient3 extension methods.
+            HostThunk::AudioClientIsOffloadCapable => {
+                self.dispatch_audio_client_is_offload_capable(state, memory)?;
+            }
+            HostThunk::AudioClientSetClientProperties => {
+                self.dispatch_audio_client_set_client_properties(state, memory)?;
+            }
+            HostThunk::AudioClientGetBufferSizeLimits => {
+                self.dispatch_audio_client_get_buffer_size_limits(state, memory)?;
+            }
+            HostThunk::AudioClientGetSharedModeEnginePeriod => {
+                self.dispatch_audio_client_get_shared_mode_engine_period(state, memory)?;
+            }
+            HostThunk::AudioClientGetCurrentSharedModeEnginePeriod => {
+                self.dispatch_audio_client_get_current_shared_mode_engine_period(state, memory)?;
+            }
+            HostThunk::AudioClientInitializeSharedAudioStream => {
+                self.dispatch_audio_client_initialize_shared_audio_stream(state, memory)?;
             }
             // -- DirectInput8 (Phase 4.3) --
             HostThunk::DirectInput8Create => {
@@ -55662,7 +55756,7 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::NtCreateThreadEx => {
-                self.dispatch_nt_create_thread_ex(state, memory)?;
+                self.dispatch_nt_create_thread_ex_on_process(state, memory)?;
             }
             HostThunk::NtSetInformationThread => {
                 self.dispatch_nt_set_information_thread(state, memory)?;
@@ -58369,18 +58463,19 @@ impl PeHostRuntime {
                     return Ok(None);
                 };
                 let cm = info.state.cm;
-                // The engine's regions are the encodings GdipGetClip writes
-                // (type 0 = infinite, type 1 = rect).  Decode and fill.
+                // The engine's regions are real sets: handles resolve through
+                // the object table, the byte encodings GdipGetClip writes
+                // (type 0 = infinite, type 1 = rect) decode too.  Fill exactly.
                 let status = match self.gdiplus_decode_region(memory, region) {
                     Err(()) => GdiplusStatus::InvalidParameter,
-                    Ok(None) => {
+                    Ok(GdiplusDecodedRegion::Infinite) => {
                         // Infinite region: fill the whole surface.
                         let r = self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
                             crate::gdiplus_render::fill_rect(px, pw, ph, ps, 0.0, 0.0, pw as f32, ph as f32, color, cm);
                         });
                         if r != GdiplusStatus::Ok { r } else { GdiplusStatus::Ok }
                     }
-                    Ok(Some(rect)) => {
+                    Ok(GdiplusDecodedRegion::Rect(rect)) => {
                         let pts = vec![
                             GdiplusPointF { x: rect.0, y: rect.1 },
                             GdiplusPointF { x: rect.0 + rect.2, y: rect.1 },
@@ -58388,6 +58483,14 @@ impl PeHostRuntime {
                             GdiplusPointF { x: rect.0, y: rect.1 + rect.3 },
                         ];
                         self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                    }
+                    Ok(GdiplusDecodedRegion::Scanned(scanned)) => {
+                        // A scanned region paints its real runs (device space).
+                        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                            crate::gdiplus_render::fill_region(
+                                px, pw, ph, ps, &scanned, color, cm,
+                            );
+                        })
                     }
                 };
                 state.set(Register::Rax, status.to_u32() as u64);
@@ -59002,6 +59105,75 @@ impl PeHostRuntime {
                 let w = f32::from_bits(arg(3) as u32);
                 let h = f32::from_bits(arg(4) as u32);
                 let combine_mode = arg(5) as u32;
+                // When a scanned (path) clip is active the rect has to fold
+                // into the region algebra; otherwise the rect fast path below
+                // handles Replace/Intersect/Union.  Xor (3) / Exclude (4) /
+                // Complement (5) remain genuinely NotImplemented for the rect
+                // surface (the rect engine reports them; only path clips
+                // support the full combine set).
+                let scanned_clip = matches!(
+                    self.user32.gdiplus_state.get(graphics_handle),
+                    Some(GdiplusObject::Graphics(g)) if g.clip_region.is_some()
+                );
+                if scanned_clip && combine_mode <= 2 {
+                    let world = self.gdiplus_world_matrix(graphics_handle);
+                    let rect_region = if gdiplus_matrix_axis_aligned(&world) {
+                        let (bx, by, bw, bh) = gdiplus_matrix_rect_bounds(&world, x, y, w, h);
+                        crate::user32::GdiplusRegion::from_rect(bx, by, bw, bh)
+                    } else {
+                        let corners = [
+                            gdiplus_matrix_apply(&world, x, y),
+                            gdiplus_matrix_apply(&world, x + w, y),
+                            gdiplus_matrix_apply(&world, x + w, y + h),
+                            gdiplus_matrix_apply(&world, x, y + h),
+                        ];
+                        let points: Vec<GdiplusPointF> = corners
+                            .iter()
+                            .map(|&(cx, cy)| GdiplusPointF { x: cx, y: cy })
+                            .collect();
+                        crate::user32::GdiplusRegion::from_spans(
+                            crate::gdiplus_render::polygon_scanlines(&points),
+                            false,
+                        )
+                    };
+                    let status = if let Some(GdiplusObject::Graphics(gfx)) =
+                        self.user32.gdiplus_state.get_mut(graphics_handle)
+                    {
+                        match combine_mode {
+                            0 => {
+                                gfx.clip_region = None;
+                                gfx.clip_rect = Some((x, y, w, h));
+                                GdiplusStatus::Ok
+                            }
+                            1 => {
+                                let current = gfx
+                                    .clip_region
+                                    .as_ref()
+                                    .map(|r| (**r).clone())
+                                    .unwrap_or_else(crate::user32::GdiplusRegion::infinite);
+                                gfx.clip_region =
+                                    Some(Box::new(current.intersect(&rect_region)));
+                                gfx.clip_rect = None;
+                                GdiplusStatus::Ok
+                            }
+                            _ => {
+                                let current = gfx
+                                    .clip_region
+                                    .as_ref()
+                                    .map(|r| (**r).clone())
+                                    .unwrap_or_else(crate::user32::GdiplusRegion::infinite);
+                                gfx.clip_region = Some(Box::new(current.union(&rect_region)));
+                                gfx.clip_rect = None;
+                                GdiplusStatus::Ok
+                            }
+                        }
+                    } else {
+                        GdiplusStatus::InvalidParameter
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
                     // CombineMode: 0 Replace, 1 Intersect, 2 Union.  The other
                     // modes produce non-rectangular regions the rect clip
@@ -59011,6 +59183,7 @@ impl PeHostRuntime {
                     let status = match combine_mode {
                         0 => {
                             gfx.clip_rect = Some(new_rect);
+                            gfx.clip_region = None;
                             GdiplusStatus::Ok
                         }
                         1 => {
@@ -59048,14 +59221,56 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GdipSetClipPath => {
-                // A path clip is a non-rectangular region; the software clip
-                // engine holds rect clips, so path clipping is genuinely
-                // unimplemented and reports NotImplemented.
                 let graphics_handle = arg(0);
-                let _path = arg(1);
-                let _combine_mode = arg(2) as u32;
-                if self.user32.gdiplus_state.get(graphics_handle).is_some() {
-                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                let path_handle = arg(1);
+                let combine_mode = arg(2) as u32;
+                if combine_mode > 5 {
+                    // GDI+ validates CombineMode; values outside the enum are
+                    // InvalidParameter rather than a silent clip change.
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(path) = (match self.user32.gdiplus_state.get(path_handle) {
+                    Some(GdiplusObject::Path(p)) => Some((**p).clone()),
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if self.user32.gdiplus_state.get(graphics_handle).is_none() {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // The path is genuine geometry: flatten it exactly as
+                // GdipFillPath does and scan-convert it through the world
+                // transform into device-space runs.  The clip is stored as
+                // that scanned region, so later draws can test every pixel.
+                let world = self.gdiplus_world_matrix(graphics_handle);
+                let path_region = crate::user32::GdiplusRegion::from_spans(
+                    crate::gdiplus_render::fill_path_scanlines(&path, &world),
+                    false,
+                );
+                let current = self
+                    .gdiplus_effective_clip_region(graphics_handle)
+                    .unwrap_or_else(crate::user32::GdiplusRegion::infinite);
+                let new_region = match combine_mode {
+                    0 => path_region,                                  // Replace
+                    1 => current.intersect(&path_region),              // Intersect
+                    2 => current.union(&path_region),                  // Union
+                    3 => current.xor(&path_region),                    // Xor
+                    4 => current.subtract(&path_region),               // Exclude
+                    _ => path_region.subtract(&current),               // Complement
+                };
+                if let Some(GdiplusObject::Graphics(gfx)) =
+                    self.user32.gdiplus_state.get_mut(graphics_handle)
+                {
+                    gfx.clip_region = Some(Box::new(new_region));
+                    // The scanned region subsumes the rect clip.
+                    gfx.clip_rect = None;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
                 }
@@ -59068,13 +59283,23 @@ impl PeHostRuntime {
                 let decoded = self.gdiplus_decode_region(memory, region);
                 let status = if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
                     match decoded {
-                        Ok(None) => {
+                        Ok(GdiplusDecodedRegion::Infinite) => {
                             // Infinite region: no clipping.
                             gfx.clip_rect = None;
+                            gfx.clip_region = None;
                             GdiplusStatus::Ok
                         }
-                        Ok(Some(rect)) => {
+                        Ok(GdiplusDecodedRegion::Rect(rect)) => {
                             gfx.clip_rect = Some(rect);
+                            gfx.clip_region = None;
+                            GdiplusStatus::Ok
+                        }
+                        Ok(GdiplusDecodedRegion::Scanned(scanned)) => {
+                            // A real scanned region (character-range output or
+                            // a region round-tripped from a path clip): the
+                            // pixel mask applies as-is.
+                            gfx.clip_rect = None;
+                            gfx.clip_region = Some(scanned);
                             GdiplusStatus::Ok
                         }
                         Err(()) => GdiplusStatus::InvalidParameter,
@@ -59089,6 +59314,7 @@ impl PeHostRuntime {
                 let graphics_handle = arg(0);
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
                     gfx.clip_rect = None;
+                    gfx.clip_region = None;
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -59099,7 +59325,16 @@ impl PeHostRuntime {
                 let graphics_handle = arg(0);
                 let rect_ptr = arg(1);
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
-                    let (x, y, w, h) = gfx.clip_rect.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    // Scanned regions report their (finite) bounding rect; an
+                    // unbounded inverted region reports the same zero rect as
+                    // an unclipped graphics (its complement reaches the whole
+                    // plane, so there is no finite bound to report).
+                    let bounds = match (&gfx.clip_region, gfx.clip_rect) {
+                        (Some(region), _) => region.rect_bounds(),
+                        (None, Some(rect)) => Some(rect),
+                        (None, None) => None,
+                    };
+                    let (x, y, w, h) = bounds.unwrap_or((0.0, 0.0, 0.0, 0.0));
                     if rect_ptr != 0 {
                         write_u32(memory, rect_ptr, x.to_bits());
                         write_u32(memory, rect_ptr + 4, y.to_bits());
@@ -59127,7 +59362,12 @@ impl PeHostRuntime {
                         self.last_error = 0;
                         return Ok(None);
                     }
-                    if let Some(clip_rect) = gfx.clip_rect {
+                    let clip_rect = match (&gfx.clip_region, gfx.clip_rect) {
+                        (Some(region), _) => region.rect_bounds(),
+                        (None, Some(rect)) => Some(rect),
+                        (None, None) => None,
+                    };
+                    if let Some(clip_rect) = clip_rect {
                         write_u32(memory, region_ptr, 1); // RegionDataTypeRect
                         write_u32(memory, region_ptr + 4, clip_rect.0 as i32 as u32);
                         write_u32(memory, region_ptr + 8, clip_rect.1 as i32 as u32);
@@ -59155,6 +59395,7 @@ impl PeHostRuntime {
                         pixel_offset_mode: gfx.pixel_offset_mode,
                         text_rendering_hint: gfx.text_rendering_hint,
                         clip_rect: gfx.clip_rect,
+                        clip_region: gfx.clip_region.clone(),
                         world_transform: gfx.world_transform,
                     };
                     if state_ptr != 0 {
@@ -59185,6 +59426,7 @@ impl PeHostRuntime {
                         gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
                         gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
                         gfx.clip_rect = container.saved_state.clip_rect;
+                        gfx.clip_region = container.saved_state.clip_region.clone();
                         gfx.world_transform = container.saved_state.world_transform;
                     }
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
@@ -59208,6 +59450,7 @@ impl PeHostRuntime {
                         pixel_offset_mode: gfx.pixel_offset_mode,
                         text_rendering_hint: gfx.text_rendering_hint,
                         clip_rect: gfx.clip_rect,
+                        clip_region: gfx.clip_region.clone(),
                         world_transform: gfx.world_transform,
                     };
                     if state_ptr != 0 {
@@ -59237,6 +59480,7 @@ impl PeHostRuntime {
                         gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
                         gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
                         gfx.clip_rect = container.saved_state.clip_rect;
+                        gfx.clip_region = container.saved_state.clip_region.clone();
                         gfx.world_transform = container.saved_state.world_transform;
                     }
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
@@ -59868,11 +60112,113 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GdipMeasureCharacterRanges => {
-                // MeasureCharacterRanges creates GpRegion objects for every
-                // measured range; region objects are not creatable through the
-                // exported surface (no GdipCreateRegion), so the operation is
-                // genuinely unimplemented.
-                state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                let graphics = arg(0);
+                let string_ptr = arg(1);
+                let length = arg(2) as i32;
+                let font_handle = arg(3);
+                let layout_rect_ptr = arg(4);
+                let _string_format = arg(5);
+                let region_count = arg(6) as i32;
+                let character_ranges = arg(7);
+                let regions_ptr = arg(8);
+                if region_count <= 0 || character_ranges == 0 || regions_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some((em_size, unit)) = (match self.user32.gdiplus_state.get(font_handle) {
+                    Some(GdiplusObject::Font(f)) => Some((f.em_size, f.unit)),
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if self.gdiplus_graphics_info(graphics).is_none() {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // Read the requested ranges (CharacterRange: LONG first; LONG
+                // length).
+                let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(region_count as usize);
+                for index in 0..region_count as u64 {
+                    let base = character_ranges + index * 8;
+                    let (Ok(first), Ok(range_len)) =
+                        (read_u32(memory, base), read_u32(memory, base + 4))
+                    else {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    };
+                    ranges.push((first, range_len));
+                }
+                let (lx, ly) = if layout_rect_ptr != 0 {
+                    (
+                        f32::from_bits(memory.read_u32(layout_rect_ptr).unwrap_or(0)),
+                        f32::from_bits(memory.read_u32(layout_rect_ptr + 4).unwrap_or(0)),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                // The lattice metrics are the same ones DrawString rasterises
+                // with: advance 6·s per character, line height 8·s.
+                let text = read_guest_utf16_string(memory, string_ptr, length);
+                let em_px = gdiplus_unit_to_pixels(em_size, unit);
+                let s = gdiplus_text_scale(em_px).max(1);
+                // Per-character layout position (line, column); newlines reset
+                // the column and start a new line without an advance.
+                let mut positions: Vec<(i32, i32, bool)> = Vec::new();
+                let (mut line, mut column) = (0i32, 0i32);
+                for ch in text.chars() {
+                    let newline = ch == '\n';
+                    positions.push((line, column, newline));
+                    if newline {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                    }
+                }
+                let origin_x = lx.round() as i32;
+                let origin_y = ly.round() as i32;
+                for (index, &(first, range_len)) in ranges.iter().enumerate() {
+                    let start = (first as usize).min(positions.len());
+                    let end = (first as usize)
+                        .saturating_add(range_len as usize)
+                        .min(positions.len());
+                    // Collect the covered column run on every line the range
+                    // touches (a range spanning a newline yields one run per
+                    // line, a single-line range exactly one rectangle).
+                    let mut line_runs: std::collections::BTreeMap<i32, (i32, i32)> =
+                        std::collections::BTreeMap::new();
+                    for &(char_line, char_col, newline) in &positions[start..end] {
+                        if newline {
+                            continue;
+                        }
+                        let run = line_runs
+                            .entry(char_line)
+                            .or_insert((char_col, char_col + 1));
+                        run.0 = run.0.min(char_col);
+                        run.1 = run.1.max(char_col + 1);
+                    }
+                    let mut spans: Vec<(i32, i32, i32)> = Vec::new();
+                    for (char_line, (col0, col1)) in line_runs {
+                        let y0 = origin_y + char_line * 8 * s;
+                        let x0 = origin_x + col0 * 6 * s;
+                        let x1 = origin_x + col1 * 6 * s;
+                        for y in y0..y0 + 8 * s {
+                            spans.push((y, x0, x1));
+                        }
+                    }
+                    let region = crate::user32::GdiplusRegion::from_spans(spans, false);
+                    let handle = self
+                        .user32
+                        .gdiplus_state
+                        .alloc_handle(GdiplusObject::Region(Box::new(region)));
+                    write_u64(memory, regions_ptr + index as u64 * 8, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Image attributes ───────────────────────────────────────────────
@@ -60549,13 +60895,44 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GdipCreateHICONFromBitmap => {
-                // Creating an HICON from arbitrary pixels requires the icon
-                // object registry the engine keeps for module icon resources;
-                // exporting new pixel icons through it is genuinely
-                // unimplemented.
-                let _bitmap = arg(0);
-                let _hicon_ptr = arg(1);
-                state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                let bitmap_handle = arg(0);
+                let hicon_ptr = arg(1);
+                if hicon_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some((width, height, pixels)) = (match self.user32.gdiplus_state.get(bitmap_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((b.width, b.height, b.pixels.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                // A real pixel-backed HICON: the icon registry entry carries
+                // the bitmap's 32-bpp pixels (top-down BGRA, the canonical
+                // GDI+ buffer order) at the bitmap's size.  GetIconInfo /
+                // DrawIconEx consumers do not exist on this surface, so this
+                // registry entry is the observable HICON state.
+                let handle = self.next_icon_handle;
+                self.next_icon_handle += 1;
+                self.icons.insert(
+                    handle,
+                    crate::icon::IconImage {
+                        width,
+                        height,
+                        bpp: 32,
+                        data: pixels,
+                        is_png_compressed: false,
+                        xor_mask: None,
+                    },
+                );
+                write_u64(memory, hicon_ptr, handle);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateHBITMAPFromBitmap => {
@@ -63161,6 +63538,15 @@ impl PeHostRuntime {
             }
         }
 
+        // The activated audio endpoint (ActivateAudioInterfaceAsync) is
+        // dispatched by the final-scraps handler; attach the real
+        // IAudioClient method surface and per-endpoint real client state
+        // here, from the audio region, without touching the activation
+        // handler itself.
+        if matches!(thunk, HostThunk::ActivateAudioInterfaceAsync) {
+            self.attach_activated_audio_client_surface(state, memory)?;
+        }
+
         if self.guest_arch == GuestArch::X86 && caller_rva == 0x0016_b192 {
             self.push_trace(
                 "process",
@@ -63483,6 +63869,10 @@ impl PeHostRuntime {
         // are delivered here — asynchronously, from the runtime servicing
         // point, never inline inside the activating call.
         let _ = self.drain_pending_audio_activations(state, memory)?;
+        // Event-driven WASAPI clients are driven from the same servicing
+        // point: a running client whose buffer has free space raises its
+        // ready event so a guest blocked in WaitForSingleObject wakes.
+        self.tick_audio_client_events();
         // Windows semantics: a spinning thread's time still moves.  Advance
         // the guest clock by the measured wall elapsed (capped) so
         // GetTickCount/QPC advance during guest spins and Sleeping
@@ -63557,6 +63947,7 @@ impl PeHostRuntime {
         // (ActivateAudioInterfaceAsync) during message-loop idle — the
         // same servicing point the timer/wait callbacks use.
         let _ = self.drain_pending_audio_activations(state, memory)?;
+        self.tick_audio_client_events();
         self.win32.sleep_ex(16, false, None)?;
         // Always yield the CPU between GetMessageW polls to prevent
         // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
@@ -66491,7 +66882,11 @@ impl PeHostRuntime {
                 self.destroy_shell_link_interface_object(address)?
             }
             GuestObjectKind::DirectSound8 => {
-                // Stateless COM wrapper — no associated state to tear down.
+                // Stateless for DirectSound objects — but an activated audio
+                // endpoint (or its IAudioRenderClient service object) owns
+                // real per-endpoint client state that drops with its last
+                // guest reference.
+                crate::audio_activation::release_audio_object(self.guest_pid, address);
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::FileDialog => {
@@ -76726,16 +77121,70 @@ impl PeHostRuntime {
             None
         };
         Some(GdiplusGraphicsInfo {
-            hdc: gfx.hdc,
             target,
             state: GdiplusRenderState {
                 cm: gfx.compositing_mode,
                 sm: gfx.smoothing_mode,
                 interp: gfx.interpolation_mode,
                 clip: gfx.clip_rect,
+                clip_region: gfx.clip_region.clone(),
                 world,
             },
         })
+    }
+
+    /// The world transform of a graphics object (identity when unset).
+    fn gdiplus_world_matrix(&self, graphics: u64) -> [f32; 6] {
+        match self.user32.gdiplus_state.get(graphics) {
+            Some(GdiplusObject::Graphics(gfx)) => match gfx.world_transform {
+                Some(handle) => match self.user32.gdiplus_state.get(handle) {
+                    Some(GdiplusObject::Matrix(m)) => m.elements,
+                    _ => gdiplus_matrix_identity(),
+                },
+                None => gdiplus_matrix_identity(),
+            },
+            _ => gdiplus_matrix_identity(),
+        }
+    }
+
+    /// The graphics object's current clip as a device-space scanned region:
+    /// the rect clip (mapped through the world transform) intersected with any
+    /// scanned region.  `None` when the graphics handle is invalid.
+    fn gdiplus_effective_clip_region(&self, graphics: u64) -> Option<crate::user32::GdiplusRegion> {
+        let gfx = match self.user32.gdiplus_state.get(graphics) {
+            Some(GdiplusObject::Graphics(g)) => g,
+            _ => return None,
+        };
+        let world = self.gdiplus_world_matrix(graphics);
+        let rect_region = gfx.clip_rect.map(|(x, y, w, h)| {
+            if gdiplus_matrix_axis_aligned(&world) {
+                // An axis-aligned rect clip maps to an exact half-open rect.
+                let (bx, by, bw, bh) = gdiplus_matrix_rect_bounds(&world, x, y, w, h);
+                crate::user32::GdiplusRegion::from_rect(bx, by, bw, bh)
+            } else {
+                let corners = [
+                    gdiplus_matrix_apply(&world, x, y),
+                    gdiplus_matrix_apply(&world, x + w, y),
+                    gdiplus_matrix_apply(&world, x + w, y + h),
+                    gdiplus_matrix_apply(&world, x, y + h),
+                ];
+                let points: Vec<GdiplusPointF> = corners
+                    .iter()
+                    .map(|&(cx, cy)| GdiplusPointF { x: cx, y: cy })
+                    .collect();
+                crate::user32::GdiplusRegion::from_spans(
+                    crate::gdiplus_render::polygon_scanlines(&points),
+                    false,
+                )
+            }
+        });
+        let region = match (&gfx.clip_region, rect_region) {
+            (Some(region), Some(rect)) => region.intersect(&rect),
+            (Some(region), None) => (**region).clone(),
+            (None, Some(rect)) => rect,
+            (None, None) => crate::user32::GdiplusRegion::infinite(),
+        };
+        Some(region)
     }
 
     /// Resolve a pen into concrete drawing style, sampling brush-backed pens
@@ -76820,6 +77269,7 @@ impl PeHostRuntime {
         let Some(target) = info.target else {
             return GdiplusStatus::InvalidParameter;
         };
+        let clip_region = info.state.clip_region.clone();
         match target {
             GdiplusTargetKind::Bitmap(handle) => {
                 let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(handle)
@@ -76829,7 +77279,14 @@ impl PeHostRuntime {
                 let GdiplusImage::Bitmap(bmp) = &mut **img else {
                     return GdiplusStatus::InvalidParameter;
                 };
-                op(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride);
+                gdiplus_paint_with_region_clip(
+                    &mut bmp.pixels,
+                    bmp.width,
+                    bmp.height,
+                    bmp.stride,
+                    clip_region.as_deref(),
+                    op,
+                );
             }
             GdiplusTargetKind::Window(hwnd) => {
                 let preview = match self
@@ -76859,11 +77316,15 @@ impl PeHostRuntime {
                     surface.real_pixels = false;
                 }
                 let stride = (surface.width * 4) as i32;
-                op(
+                let width = surface.width as u32;
+                let height = surface.height as u32;
+                gdiplus_paint_with_region_clip(
                     &mut surface.bytes,
-                    surface.width as u32,
-                    surface.height as u32,
+                    width,
+                    height,
                     stride,
+                    clip_region.as_deref(),
+                    op,
                 );
                 surface.real_pixels = true;
                 self.publish_live_window_preview_if_needed();
@@ -76889,7 +77350,14 @@ impl PeHostRuntime {
                 let h = bitmap.height as u32;
                 let mut scratch = gdiplus_bitmap_to_argb(bitmap).unwrap_or_default();
                 if scratch.len() >= w as usize * h as usize * 4 {
-                    op(&mut scratch, w, h, w as i32 * 4);
+                    gdiplus_paint_with_region_clip(
+                        &mut scratch,
+                        w,
+                        h,
+                        w as i32 * 4,
+                        clip_region.as_deref(),
+                        op,
+                    );
                 }
                 if let Some(native) = gdiplus_argb_to_bitmap(bitmap, &scratch) {
                     bitmap.bytes = native;
@@ -77134,23 +77602,36 @@ impl PeHostRuntime {
         })
     }
 
-    /// Decode a GDI+ region pointer.  The engine's regions are the byte
-    /// encodings `GdipGetClip` writes (u32 type: 0 = infinite, 1 = rect
-    /// followed by four i32 bounds).  Returns the region rect, or `None` for
-    /// an infinite region, or `Err` for an undecodable pointer.
+    /// Decode a GpRegion reference.  Two representations exist:
+    ///
+    /// * a live region handle from the GDI+ object table (created by
+    ///   `GdipMeasureCharacterRanges` and the path-clip machinery), or
+    /// * the byte encoding `GdipGetClip` writes (u32 type: 0 = infinite,
+    ///   1 = rect followed by four i32 bounds).
+    ///
+    /// `Err` is an undecodable pointer/handle.
     fn gdiplus_decode_region(
         &self,
         memory: &MemoryImage,
         region: u64,
-    ) -> Result<Option<(f32, f32, f32, f32)>, ()> {
+    ) -> Result<GdiplusDecodedRegion, ()> {
         if region == 0 {
             return Err(());
+        }
+        // A live region handle resolves through the object table first; its
+        // exact rectangle is exposed when the spans form one, otherwise the
+        // scanned region is returned as-is.
+        if let Some(GdiplusObject::Region(scanned)) = self.user32.gdiplus_state.get(region) {
+            return Ok(match scanned.as_rect() {
+                Some(rect) => GdiplusDecodedRegion::Rect(rect),
+                None => GdiplusDecodedRegion::Scanned(Box::new((**scanned).clone())),
+            });
         }
         let Ok(region_type) = read_u32(memory, region) else {
             return Err(());
         };
         match region_type {
-            0 => Ok(None), // RegionDataTypeInfinite
+            0 => Ok(GdiplusDecodedRegion::Infinite), // RegionDataTypeInfinite
             1 => {
                 let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
                     read_u32(memory, region + 4),
@@ -77160,7 +77641,7 @@ impl PeHostRuntime {
                 ) else {
                     return Err(());
                 };
-                Ok(Some((
+                Ok(GdiplusDecodedRegion::Rect((
                     x as i32 as f32,
                     y as i32 as f32,
                     w as i32 as f32,
@@ -77180,104 +77661,6 @@ impl PeHostRuntime {
         }
     }
 
-    /// Resolve the drawing target bitmap handle, compositing mode, smoothing mode,
-    /// pen width, and color for a GDI+ drawing operation.
-    ///
-    /// Returns `(Option<(bitmap_handle, compositing_mode, smoothing_mode, pen_width, color)>, _, _, _)`
-    /// where the trailing three values are unused (kept for destructuring compatibility).
-    #[allow(clippy::type_complexity)]
-    fn resolve_gdiplus_draw_target(
-        &mut self,
-        graphics_handle: u64,
-        pen_handle: u64,
-        brush_handle: Option<u64>,
-    ) -> (Option<(u64, u32, u32, f32, u32)>, u32, f32, u32) {
-        // Get graphics context
-        let gfx = match self.user32.gdiplus_state.get(graphics_handle) {
-            Some(GdiplusObject::Graphics(g)) => g,
-            _ => return (None, 0, 0.0, 0),
-        };
-        let target_bitmap = match gfx.target_bitmap {
-            Some(h) => h,
-            None => return (None, 0, 0.0, 0),
-        };
-        let compositing_mode = gfx.compositing_mode;
-        let smoothing_mode = gfx.smoothing_mode;
-
-        // Resolve pen (if provided)
-        if pen_handle != 0
-            && let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle)
-        {
-            let pw = pen.width.max(1.0);
-            let color = crate::gdiplus_render::pen_color(pen, 0.0, 0.0);
-            return (
-                Some((target_bitmap, compositing_mode, smoothing_mode, pw, color)),
-                0,
-                0.0,
-                0,
-            );
-        }
-
-        // Resolve brush (if provided)
-        if let Some(bh) = brush_handle
-            && let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh)
-        {
-            // For texture brushes, try to look up the bitmap pixels
-            let tex_data: Option<(&[u8], u32, u32, i32)> = match brush.as_ref() {
-                GdiplusBrush::Texture(tb) => self
-                    .user32
-                    .gdiplus_state
-                    .get(tb.image_handle)
-                    .and_then(|obj| {
-                        if let GdiplusObject::Image(img) = obj {
-                            match img.as_ref() {
-                                GdiplusImage::Bitmap(bmp) => {
-                                    Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    }),
-                _ => None,
-            };
-            let color = crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0, tex_data);
-            return (
-                Some((target_bitmap, compositing_mode, smoothing_mode, 1.0, color)),
-                0,
-                0.0,
-                0,
-            );
-        }
-
-        // Default: red pen width 1
-        (
-            Some((
-                target_bitmap,
-                compositing_mode,
-                smoothing_mode,
-                1.0,
-                0xFFFF0000,
-            )),
-            0,
-            0.0,
-            0,
-        )
-    }
-
-    /// Resolve the graphics drawing target for path operations.
-    /// Returns the bitmap handle, compositing mode, and smoothing mode, or None if invalid.
-    fn resolve_gdiplus_graphics_target(&mut self, graphics_handle: u64) -> Option<(u64, u32, u32)> {
-        let gfx = self.user32.gdiplus_state.get(graphics_handle)?;
-        let gfx = if let GdiplusObject::Graphics(g) = gfx {
-            g
-        } else {
-            return None;
-        };
-        let target_bitmap = gfx.target_bitmap?;
-        Some((target_bitmap, gfx.compositing_mode, gfx.smoothing_mode))
-    }
     fn overlapped_event_handle(&self, memory: &MemoryImage, overlapped: u64) -> Option<u32> {
         if overlapped == 0 {
             return None;
@@ -77364,6 +77747,983 @@ impl PeHostRuntime {
             ReasonCode::RcWin32InvalidHandle,
             format!("unknown module handle {module_handle:#x}"),
         ))
+    }
+
+    // ── IAudioClient / IAudioRenderClient dispatch ──────────────────────────
+    //
+    // The methods below implement the real WASAPI method surface of an audio
+    // endpoint activated by `ActivateAudioInterfaceAsync`.  The per-endpoint
+    // state (parsed format, real buffer geometry, playback clock, service
+    // objects) lives in `crate::audio_activation`; these handlers marshal the
+    // guest arguments, touch guest memory, and route the ready-event signal
+    // through the runtime's real guest event machinery.
+
+    /// `IAudioClient::QueryInterface(riid, ppv)`.
+    fn dispatch_audio_client_query_interface(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_CLIENT,
+            IID_IAUDIO_CLIENT_2, IID_IAUDIO_CLIENT_3, IID_IUNKNOWN,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let riid = match memory.read_bytes(riid_ptr, 16) {
+            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let supported = riid == IID_IUNKNOWN
+            || riid == IID_IAUDIO_CLIENT
+            || riid == IID_IAUDIO_CLIENT_2
+            || riid == IID_IAUDIO_CLIENT_3;
+        if supported {
+            self.add_ref_guest_object(object)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+            }
+            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+        } else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+            }
+            state.set(Register::Rax, u64::from(ACTIVATION_E_NOINTERFACE));
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// Read a guest `WAVEFORMATEX`/`WAVEFORMATEXTENSIBLE` pointer and parse
+    /// it for real (extending to the 40-byte form when the tag says so).
+    fn read_guest_wave_format(
+        &self,
+        memory: &MemoryImage,
+        format_ptr: u64,
+    ) -> Result<crate::audio_activation::AudioClientFormat, u32> {
+        use crate::audio_activation::{
+            AUDCLNT_E_POINTER, WAVE_FORMAT_EXTENSIBLE, parse_wave_format,
+        };
+        if format_ptr == 0 {
+            return Err(AUDCLNT_E_POINTER);
+        }
+        let mut bytes = memory
+            .read_bytes(format_ptr, 18)
+            .map_err(|_| AUDCLNT_E_POINTER)?;
+        if bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == WAVE_FORMAT_EXTENSIBLE {
+            // Fall back to the short read when the guest only mapped the
+            // base structure; the parser then rejects it for real.
+            if let Ok(extended) = memory.read_bytes(format_ptr, 40) {
+                bytes = extended;
+            }
+        }
+        parse_wave_format(&bytes)
+    }
+
+    /// Allocate the real guest render buffer for an initialization plan and
+    /// commit the successful `Initialize`.
+    fn commit_audio_client_initialize(
+        &mut self,
+        memory: &mut MemoryImage,
+        object: u64,
+        plan: &crate::audio_activation::AudioInitializePlan,
+        format: &crate::audio_activation::AudioClientFormat,
+    ) -> AppResult<u32> {
+        let buffer_bytes = (plan.buffer_frames as u64)
+            .saturating_mul(plan.block_align as u64)
+            .max(1);
+        let buffer_address = self.alloc_zeroed(memory, buffer_bytes as usize, 16)?;
+        Ok(crate::audio_activation::commit_initialize(
+            self.guest_pid,
+            object,
+            plan,
+            format,
+            buffer_address,
+            buffer_bytes,
+        ))
+    }
+
+    /// `IAudioClient::Initialize(share_mode, stream_flags, buffer_duration,
+    /// periodicity, format, session_guid)`.
+    fn dispatch_audio_client_initialize(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{AUDCLNT_E_POINTER, plan_initialize};
+        let object = guest_call_arg(state, memory, 0)?;
+        let share_mode = guest_call_arg_u32(state, memory, 1)?;
+        let stream_flags = guest_call_arg_u32(state, memory, 2)?;
+        let duration_hns = guest_call_arg(state, memory, 3)? as i64;
+        let periodicity_hns = guest_call_arg(state, memory, 4)? as i64;
+        let format_ptr = guest_call_arg(state, memory, 5)?;
+        let _session_guid = guest_call_arg(state, memory, 6)?;
+        let fail = |state: &mut CpuState, hr: u32| {
+            state.set(Register::Rax, u64::from(hr));
+        };
+        if format_ptr == 0 {
+            fail(state, AUDCLNT_E_POINTER);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let format = match self.read_guest_wave_format(memory, format_ptr) {
+            Ok(format) => format,
+            Err(hr) => {
+                fail(state, hr);
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let plan = match plan_initialize(
+            self.guest_pid,
+            object,
+            share_mode,
+            stream_flags,
+            duration_hns,
+            periodicity_hns,
+            &format,
+        ) {
+            Ok(plan) => plan,
+            Err(hr) => {
+                fail(state, hr);
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let hr = self.commit_audio_client_initialize(memory, object, &plan, &format)?;
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace(
+            "audio",
+            "IAudioClient::Initialize",
+            BTreeMap::from([
+                ("share_mode".to_string(), json!(share_mode)),
+                ("stream_flags".to_string(), json!(stream_flags)),
+                ("buffer_frames".to_string(), json!(plan.buffer_frames)),
+                ("channels".to_string(), json!(format.channels)),
+                ("sample_rate".to_string(), json!(format.sample_rate)),
+                ("bits_per_sample".to_string(), json!(format.bits_per_sample)),
+            ]),
+            json!(hr),
+        );
+        Ok(())
+    }
+
+    /// `IAudioClient::GetBufferSize(pNumBufferFrames)`.
+    fn dispatch_audio_client_get_buffer_size(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_buffer_size};
+        let object = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+        } else {
+            match get_buffer_size(self.guest_pid, object) {
+                Ok(frames) => {
+                    write_u32(memory, out, frames);
+                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                }
+                Err(hr) => state.set(Register::Rax, u64::from(hr)),
+            }
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient::GetStreamLatency(phnsLatency)`.
+    fn dispatch_audio_client_get_stream_latency(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_stream_latency};
+        let object = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+        } else {
+            match get_stream_latency(self.guest_pid, object) {
+                Ok(latency_hns) => {
+                    write_u64(memory, out, latency_hns);
+                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                }
+                Err(hr) => state.set(Register::Rax, u64::from(hr)),
+            }
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient::GetCurrentPadding(pNumPaddingFrames)`.
+    fn dispatch_audio_client_get_current_padding(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_current_padding};
+        let object = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+        } else {
+            match get_current_padding(self.guest_pid, object) {
+                Ok(padding) => {
+                    write_u32(memory, out, padding);
+                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                }
+                Err(hr) => state.set(Register::Rax, u64::from(hr)),
+            }
+        }
+        // The guest observed the buffer state; if the drain freed space the
+        // ready event is raised through the real event machinery.
+        self.signal_audio_ready_event(object);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient::IsFormatSupported(share_mode, format, ppClosestMatch)`.
+    fn dispatch_audio_client_is_format_supported(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER, AUDCLNT_S_FALSE,
+            WAVE_FORMAT_EXTENSIBLE, audio_format_support, device_of, mix_format_for_device,
+            parse_wave_format, wave_format_bytes,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let share_mode = guest_call_arg_u32(state, memory, 1)?;
+        let format_ptr = guest_call_arg(state, memory, 2)?;
+        let closest_out = guest_call_arg(state, memory, 3)?;
+        if share_mode > crate::audio_activation::AUDCLNT_SHAREMODE_EXCLUSIVE {
+            state.set(
+                Register::Rax,
+                u64::from(crate::audio_activation::AUDCLNT_E_INVALIDARG),
+            );
+            self.last_error = 0;
+            return Ok(());
+        }
+        if format_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let mut bytes = match memory.read_bytes(format_ptr, 18) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        if bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == WAVE_FORMAT_EXTENSIBLE {
+            if let Ok(extended) = memory.read_bytes(format_ptr, 40) {
+                bytes = extended;
+            }
+        }
+        let format = match parse_wave_format(&bytes) {
+            Ok(format) => format,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let Some(device) = device_of(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
+            self.last_error = 0;
+            return Ok(());
+        };
+        let hr = audio_format_support(&device, &format, share_mode);
+        if closest_out != 0 {
+            if hr == AUDCLNT_S_FALSE {
+                // The engine would convert; the real closest match is the
+                // device's own mix format.
+                let mix = mix_format_for_device(&device);
+                let mix_bytes = wave_format_bytes(&mix);
+                let address = self.alloc_zeroed(memory, mix_bytes.len(), 16)?;
+                memory.map_bytes(address, &mix_bytes);
+                write_guest_pointer(memory, closest_out, address, self.guest_arch)?;
+            } else {
+                write_guest_pointer(memory, closest_out, 0, self.guest_arch)?;
+            }
+        }
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient::GetMixFormat(ppDeviceFormat)`.
+    fn dispatch_audio_client_get_mix_format(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER, device_of,
+            mix_format_for_device, wave_format_bytes,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let Some(device) = device_of(self.guest_pid, object) else {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
+            self.last_error = 0;
+            return Ok(());
+        };
+        let format = mix_format_for_device(&device);
+        let bytes = wave_format_bytes(&format);
+        let address = self.alloc_zeroed(memory, bytes.len(), 16)?;
+        memory.map_bytes(address, &bytes);
+        write_guest_pointer(memory, out, address, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+        self.last_error = 0;
+        self.push_trace(
+            "audio",
+            "IAudioClient::GetMixFormat",
+            BTreeMap::from([
+                ("channels".to_string(), json!(format.channels)),
+                ("sample_rate".to_string(), json!(format.sample_rate)),
+            ]),
+            json!(ACTIVATION_S_OK),
+        );
+        Ok(())
+    }
+
+    /// `IAudioClient::GetDevicePeriod(phnsDefault, phnsMinimum)`.
+    fn dispatch_audio_client_get_device_period(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_device_period};
+        let object = guest_call_arg(state, memory, 0)?;
+        let default_out = guest_call_arg(state, memory, 1)?;
+        let minimum_out = guest_call_arg(state, memory, 2)?;
+        if default_out == 0 && minimum_out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+        } else {
+            match get_device_period(self.guest_pid, object) {
+                Ok((default_hns, minimum_hns)) => {
+                    if default_out != 0 {
+                        write_u64(memory, default_out, default_hns);
+                    }
+                    if minimum_out != 0 {
+                        write_u64(memory, minimum_out, minimum_hns);
+                    }
+                    state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                }
+                Err(hr) => state.set(Register::Rax, u64::from(hr)),
+            }
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient::Start()`.
+    fn dispatch_audio_client_start(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let hr = crate::audio_activation::start(self.guest_pid, object);
+        self.signal_audio_ready_event(object);
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace("audio", "IAudioClient::Start", BTreeMap::new(), json!(hr));
+        Ok(())
+    }
+
+    /// `IAudioClient::Stop()`.
+    fn dispatch_audio_client_stop(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let hr = crate::audio_activation::stop(self.guest_pid, object);
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace("audio", "IAudioClient::Stop", BTreeMap::new(), json!(hr));
+        Ok(())
+    }
+
+    /// `IAudioClient::Reset()`.
+    fn dispatch_audio_client_reset(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let hr = crate::audio_activation::reset(self.guest_pid, object);
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace("audio", "IAudioClient::Reset", BTreeMap::new(), json!(hr));
+        Ok(())
+    }
+
+    /// `IAudioClient::SetEventHandle(eventHandle)`.
+    fn dispatch_audio_client_set_event_handle(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let object = guest_call_arg(state, memory, 0)?;
+        let handle = guest_call_arg(state, memory, 1)?;
+        let hr = crate::audio_activation::set_event_handle(self.guest_pid, object, handle);
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace(
+            "audio",
+            "IAudioClient::SetEventHandle",
+            BTreeMap::from([("handle".to_string(), json!(format!("{handle:#x}")))]),
+            json!(hr),
+        );
+        Ok(())
+    }
+
+    /// `IAudioClient::GetService(riid, ppv)` — real service objects.
+    fn dispatch_audio_client_get_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_RENDER_CLIENT,
+            IID_IUNKNOWN, audio_render_client_methods, bind_render_service, render_service_for,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 || riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let riid = match memory.read_bytes(riid_ptr, 16) {
+            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let hr = if riid == IID_IUNKNOWN {
+            self.add_ref_guest_object(object)?;
+            write_guest_pointer(memory, out, object, self.guest_arch)?;
+            ACTIVATION_S_OK
+        } else if riid == IID_IAUDIO_RENDER_CLIENT {
+            let cached = render_service_for(self.guest_pid, object)
+                .filter(|service| self.guest_objects.contains_key(service));
+            let service = match cached {
+                Some(service) => {
+                    self.add_ref_guest_object(service)?;
+                    service
+                }
+                None => {
+                    let vtable = self.alloc_guest_vtable(memory, audio_render_client_methods())?;
+                    let service =
+                        self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
+                    bind_render_service(self.guest_pid, object, service);
+                    service
+                }
+            };
+            write_guest_pointer(memory, out, service, self.guest_arch)?;
+            ACTIVATION_S_OK
+        } else {
+            write_guest_pointer(memory, out, 0, self.guest_arch)?;
+            ACTIVATION_E_NOINTERFACE
+        };
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace(
+            "audio",
+            "IAudioClient::GetService",
+            BTreeMap::from([(
+                "riid".to_string(),
+                json!(crate::audio_activation::activation_riid_name(&riid)),
+            )]),
+            json!(hr),
+        );
+        Ok(())
+    }
+
+    /// `IAudioRenderClient::QueryInterface(riid, ppv)`.
+    fn dispatch_audio_render_client_query_interface(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK, AUDCLNT_E_POINTER, IID_IAUDIO_RENDER_CLIENT,
+            IID_IUNKNOWN,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let riid_ptr = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if riid_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let riid = match memory.read_bytes(riid_ptr, 16) {
+            Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0_u8; 16]),
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let hr = if riid == IID_IUNKNOWN || riid == IID_IAUDIO_RENDER_CLIENT {
+            self.add_ref_guest_object(object)?;
+            if out != 0 {
+                write_guest_pointer(memory, out, object, self.guest_arch)?;
+            }
+            ACTIVATION_S_OK
+        } else {
+            if out != 0 {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+            }
+            ACTIVATION_E_NOINTERFACE
+        };
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioRenderClient::GetBuffer(NumFramesRequested, ppData)`.
+    fn dispatch_audio_render_client_get_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, render_get_buffer};
+        let service = guest_call_arg(state, memory, 0)?;
+        let frames_requested = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        match render_get_buffer(self.guest_pid, service, frames_requested) {
+            Ok((address, _frames)) => {
+                write_guest_pointer(memory, out, address, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => {
+                write_guest_pointer(memory, out, 0, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(hr));
+            }
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioRenderClient::ReleaseBuffer(NumFramesWritten, dwFlags)`.
+    fn dispatch_audio_render_client_release_buffer(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, push_real_render_samples, render_release_buffer,
+        };
+        let service = guest_call_arg(state, memory, 0)?;
+        let frames_written = guest_call_arg_u32(state, memory, 1)?;
+        let flags = guest_call_arg_u32(state, memory, 2)?;
+        match render_release_buffer(self.guest_pid, service, frames_written, flags) {
+            Ok(release) => {
+                let channels = release.channels.max(1) as usize;
+                let sample_count = release.frames as usize * channels;
+                let samples = if release.silent {
+                    vec![0.0f32; sample_count]
+                } else {
+                    let byte_len = release.frames as usize * release.block_align.max(1) as usize;
+                    match memory.read_bytes(release.buffer_address, byte_len) {
+                        Ok(bytes) => crate::real_audio::pcm_bytes_to_float(
+                            &bytes,
+                            release.wave_format_tag,
+                            release.bits_per_sample,
+                            release.channels,
+                        ),
+                        Err(_) => Vec::new(),
+                    }
+                };
+                if !samples.is_empty()
+                    && let Some(device_id) = release.real_device_id
+                {
+                    push_real_render_samples(
+                        device_id,
+                        &samples,
+                        release.channels,
+                        release.sample_rate,
+                    );
+                }
+                self.signal_audio_ready_event(release.endpoint);
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    // ── IAudioClient2 / IAudioClient3 extension methods ────────────────────
+    //
+    // A guest that activated `IID_IAudioClient2` / `IID_IAudioClient3` gets
+    // these real extension slots on the same endpoint object.
+
+    /// `IAudioClient2::IsOffloadCapable(category, pbOffloadCapable)`.
+    fn dispatch_audio_client_is_offload_capable(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_POINTER,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let _category = guest_call_arg_u32(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
+        if out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+        } else if !crate::audio_activation::has_audio_client(self.guest_pid, object) {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_DEVICE_INVALIDATED));
+        } else {
+            // The host has no hardware offload engine: report FALSE.
+            write_u32(memory, out, 0);
+            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient2::SetClientProperties(pProperties)`.
+    fn dispatch_audio_client_set_client_properties(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            AUDCLNT_E_INVALIDARG, AUDCLNT_E_POINTER, set_client_properties,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let properties = guest_call_arg(state, memory, 1)?;
+        if properties == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let bytes = match memory.read_bytes(properties, 12) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let cb_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if cb_size < 12 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_INVALIDARG));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let offload_requested = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) != 0;
+        let category = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let hr = set_client_properties(self.guest_pid, object, category, offload_requested);
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient2::GetBufferSizeLimits(pFormat, bEventDriven, pMin, pMax)`.
+    fn dispatch_audio_client_get_buffer_size_limits(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_buffer_size_limits};
+        let object = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let _event_driven = guest_call_arg_u32(state, memory, 2)?;
+        let minimum_out = guest_call_arg(state, memory, 3)?;
+        let maximum_out = guest_call_arg(state, memory, 4)?;
+        if minimum_out == 0 && maximum_out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let format = match self.read_guest_wave_format(memory, format_ptr) {
+            Ok(format) => format,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        match get_buffer_size_limits(self.guest_pid, object, &format) {
+            Ok((minimum_hns, maximum_hns)) => {
+                if minimum_out != 0 {
+                    write_u64(memory, minimum_out, minimum_hns);
+                }
+                if maximum_out != 0 {
+                    write_u64(memory, maximum_out, maximum_hns);
+                }
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient3::GetSharedModeEnginePeriod(pFormat, pDefault,
+    /// pFundamental, pMin, pMax)`.
+    fn dispatch_audio_client_get_shared_mode_engine_period(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, AUDCLNT_E_POINTER, get_shared_mode_engine_period,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let default_out = guest_call_arg(state, memory, 2)?;
+        let fundamental_out = guest_call_arg(state, memory, 3)?;
+        let minimum_out = guest_call_arg(state, memory, 4)?;
+        let maximum_out = guest_call_arg(state, memory, 5)?;
+        if default_out == 0 && fundamental_out == 0 && minimum_out == 0 && maximum_out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let format = match self.read_guest_wave_format(memory, format_ptr) {
+            Ok(format) => format,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        match get_shared_mode_engine_period(self.guest_pid, object, &format) {
+            Ok((default_frames, fundamental_frames, minimum_frames, maximum_frames)) => {
+                if default_out != 0 {
+                    write_u32(memory, default_out, default_frames);
+                }
+                if fundamental_out != 0 {
+                    write_u32(memory, fundamental_out, fundamental_frames);
+                }
+                if minimum_out != 0 {
+                    write_u32(memory, minimum_out, minimum_frames);
+                }
+                if maximum_out != 0 {
+                    write_u32(memory, maximum_out, maximum_frames);
+                }
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient3::GetCurrentSharedModeEnginePeriod(ppFormat,
+    /// pCurrentPeriod)`.
+    fn dispatch_audio_client_get_current_shared_mode_engine_period(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, AUDCLNT_E_POINTER, current_shared_mode_engine_period,
+            wave_format_bytes,
+        };
+        let object = guest_call_arg(state, memory, 0)?;
+        let format_out = guest_call_arg(state, memory, 1)?;
+        let period_out = guest_call_arg(state, memory, 2)?;
+        if format_out == 0 || period_out == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        match current_shared_mode_engine_period(self.guest_pid, object) {
+            Ok((mix, current_frames)) => {
+                let bytes = wave_format_bytes(&mix);
+                let address = self.alloc_zeroed(memory, bytes.len(), 16)?;
+                memory.map_bytes(address, &bytes);
+                write_guest_pointer(memory, format_out, address, self.guest_arch)?;
+                write_u32(memory, period_out, current_frames);
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            }
+            Err(hr) => state.set(Register::Rax, u64::from(hr)),
+        }
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// `IAudioClient3::InitializeSharedAudioStream(flags, period_frames,
+    /// format, session_guid)`.
+    fn dispatch_audio_client_initialize_shared_audio_stream(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{AUDCLNT_E_POINTER, plan_initialize_shared_audio_stream};
+        let object = guest_call_arg(state, memory, 0)?;
+        let stream_flags = guest_call_arg_u32(state, memory, 1)?;
+        let period_frames = guest_call_arg_u32(state, memory, 2)?;
+        let format_ptr = guest_call_arg(state, memory, 3)?;
+        let _session_guid = guest_call_arg(state, memory, 4)?;
+        if format_ptr == 0 {
+            state.set(Register::Rax, u64::from(AUDCLNT_E_POINTER));
+            self.last_error = 0;
+            return Ok(());
+        }
+        let format = match self.read_guest_wave_format(memory, format_ptr) {
+            Ok(format) => format,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let plan = match plan_initialize_shared_audio_stream(
+            self.guest_pid,
+            object,
+            stream_flags,
+            period_frames,
+            &format,
+        ) {
+            Ok(plan) => plan,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
+        let hr = self.commit_audio_client_initialize(memory, object, &plan, &format)?;
+        state.set(Register::Rax, u64::from(hr));
+        self.last_error = 0;
+        self.push_trace(
+            "audio",
+            "IAudioClient3::InitializeSharedAudioStream",
+            BTreeMap::from([
+                ("stream_flags".to_string(), json!(stream_flags)),
+                ("period_frames".to_string(), json!(period_frames)),
+                ("buffer_frames".to_string(), json!(plan.buffer_frames)),
+            ]),
+            json!(hr),
+        );
+        Ok(())
+    }
+
+    /// Raise the endpoint's ready event through the runtime's real guest
+    /// event machinery (a no-op when the buffer is full or no event handle is
+    /// bound; invalid handles are reported, never silently treated as
+    /// success).
+    fn signal_audio_ready_event(&mut self, endpoint: u64) {
+        let Some(handle) = crate::audio_activation::take_ready_event(self.guest_pid, endpoint)
+        else {
+            return;
+        };
+        let handle = handle as u32;
+        if let Err(error) = self.win32.set_event(handle) {
+            eprintln!(
+                "[RealAudio] audio-client ready event {handle:#x} cannot be signaled: {error}"
+            );
+        }
+    }
+
+    /// Servicing-point tick: every running event-driven audio client whose
+    /// buffer has free space raises its ready event through the real guest
+    /// event machinery, so a guest blocked in a wait wakes when the real
+    /// playback clock frees a buffer.
+    fn tick_audio_client_events(&mut self) {
+        for handle in crate::audio_activation::take_ready_events(self.guest_pid) {
+            if let Err(error) = self.win32.set_event(handle as u32) {
+                eprintln!(
+                    "[RealAudio] audio-client ready event {handle:#x} cannot be signaled: {error}"
+                );
+            }
+        }
+    }
+
+    /// Attach the real IAudioClient method surface to the endpoint object an
+    /// `ActivateAudioInterfaceAsync` dispatch produced: replace the activation
+    /// wrapper vtable with the full method vtable and bind the per-endpoint
+    /// real client state (bound device, riid, real period/latency values).
+    fn attach_activated_audio_client_surface(
+        &mut self,
+        state: &CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_S_OK, audio_client_methods, endpoint_record, has_audio_client,
+            register_audio_client,
+        };
+        if state.get(Register::Rax) != u64::from(ACTIVATION_S_OK) {
+            return Ok(());
+        }
+        let operation_out = guest_call_arg(state, memory, 4)?;
+        if operation_out == 0 {
+            return Ok(());
+        }
+        let object = read_guest_pointer(memory, operation_out, self.guest_arch)?;
+        if object == 0 || has_audio_client(self.guest_pid, object) {
+            return Ok(());
+        }
+        let Some(record) = endpoint_record(self.guest_pid, object) else {
+            return Ok(());
+        };
+        let vtable = self.alloc_guest_vtable(memory, audio_client_methods())?;
+        write_guest_pointer(memory, object, vtable, self.guest_arch)?;
+        register_audio_client(self.guest_pid, object, record.device, record.requested_riid);
+        Ok(())
+    }
+
+    /// Allocate a guest audio endpoint object carrying the full real
+    /// IAudioClient method vtable and bind its real client state.  Used by the
+    /// audio-client tests to build endpoints deterministically (the
+    /// activation path attaches the same surface to the object the
+    /// final-scraps activation produced).
+    #[cfg(test)]
+    fn alloc_audio_client_endpoint(
+        &mut self,
+        memory: &mut MemoryImage,
+        device: &crate::real_audio::RealAudioDevice,
+        requested_riid: [u8; 16],
+    ) -> AppResult<u64> {
+        let vtable =
+            self.alloc_guest_vtable(memory, crate::audio_activation::audio_client_methods())?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
+        crate::audio_activation::register_audio_client(
+            self.guest_pid,
+            object,
+            device.clone(),
+            requested_riid,
+        );
+        Ok(object)
     }
 }
 
@@ -88909,6 +90269,26 @@ impl HostThunk {
             Self::StrRChrW => 12,
             Self::SHRegGetValueW | Self::SHRegSetValueW => 28,
             Self::UrlCombineW => 20,
+            // IAudioClient / IAudioRenderClient methods (this = first arg).
+            Self::AudioClientQueryInterface
+            | Self::AudioClientGetService
+            | Self::AudioRenderClientQueryInterface
+            | Self::AudioRenderClientGetBuffer
+            | Self::AudioRenderClientReleaseBuffer
+            | Self::AudioClientIsOffloadCapable
+            | Self::AudioClientGetCurrentSharedModeEnginePeriod => 12,
+            Self::AudioClientInitialize => 28,
+            Self::AudioClientGetBufferSize
+            | Self::AudioClientGetStreamLatency
+            | Self::AudioClientGetCurrentPadding
+            | Self::AudioClientGetMixFormat
+            | Self::AudioClientSetEventHandle
+            | Self::AudioClientSetClientProperties => 8,
+            Self::AudioClientIsFormatSupported => 16,
+            Self::AudioClientGetDevicePeriod | Self::AudioClientGetBufferSizeLimits => 12,
+            Self::AudioClientStart | Self::AudioClientStop | Self::AudioClientReset => 4,
+            Self::AudioClientGetSharedModeEnginePeriod => 24,
+            Self::AudioClientInitializeSharedAudioStream => 20,
             _ => 0,
         }
     }
@@ -118157,9 +119537,9 @@ mod tests {
                 &[0, path_out as u32],
             );
             let path = read_u64(&memory, path_out).expect("path");
-            // Path clipping is a non-rectangular region; the software clip
-            // engine holds rect clips, so GdipSetClipPath reports
-            // NotImplemented (6) instead of faking the clip.
+            // A path clip is now a real scanned region.  This path has no
+            // figures, so replacing the clip with it yields an empty clip
+            // (everything clipped away) and returns Ok.
             let set_clip_path = runtime.alloc_host_thunk(HostThunk::GdipSetClipPath);
             assert_eq!(
                 dispatch_x86_thunk(
@@ -118168,8 +119548,21 @@ mod tests {
                     set_clip_path,
                     &[graphics as u32, path as u32, 0]
                 ),
-                6,
-                "GdipSetClipPath reports NotImplemented"
+                0,
+                "GdipSetClipPath accepts a real path"
+            );
+            let empty_clip = 0x30_510_u64;
+            memory.map_bytes(empty_clip, &[0_u8; 16]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_bounds,
+                &[graphics as u32, empty_clip as u32],
+            );
+            assert_eq!(
+                memory.read_u32(empty_clip + 8).expect("w"),
+                f32_bits(0.0),
+                "the empty path clips to an empty region"
             );
             // Rect-encoded regions (the GdipGetClip encoding) drive
             // GdipSetClipRegion: type 1 + rect sets the clip, an infinite
@@ -118220,6 +119613,776 @@ mod tests {
                 0,
                 "GdipResetClip returns Ok"
             );
+        })
+    }
+
+    #[test]
+    fn gdiplus_set_clip_path_scanned_region_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-clippath",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+            let bmp_out = 0x30_010_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[16, 16, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+            let brush_out = 0x30_020_u64;
+            let solid = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                solid,
+                &[0xFFFF_0000, brush_out as u32],
+            );
+            let red = read_u64(&memory, brush_out).expect("red brush");
+
+            // An ellipse path: genuinely non-rectangular geometry.
+            let path_out = 0x30_030_u64;
+            let create_path = runtime.alloc_host_thunk(HostThunk::GdipCreatePath);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_path,
+                &[0, path_out as u32],
+            );
+            let ellipse_path = read_u64(&memory, path_out).expect("path");
+            let add_ellipse = runtime.alloc_host_thunk(HostThunk::GdipAddPathEllipse);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_ellipse,
+                &[
+                    ellipse_path as u32,
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    f32_bits(12.0),
+                    f32_bits(12.0),
+                ],
+            );
+
+            let set_clip_path = runtime.alloc_host_thunk(HostThunk::GdipSetClipPath);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_path,
+                    &[graphics as u32, ellipse_path as u32, 0 /* Replace */]
+                ),
+                0,
+                "GdipSetClipPath with a real path returns Ok"
+            );
+            // Combine modes are validated like GDI+ does.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_path,
+                    &[graphics as u32, ellipse_path as u32, 7]
+                ),
+                2,
+                "an out-of-range CombineMode reports InvalidParameter"
+            );
+
+            // The clip's bounds are the real rasterised geometry bounds.
+            let bounds = 0x30_040_u64;
+            memory.map_bytes(bounds, &[0_u8; 16]);
+            let get_bounds = runtime.alloc_host_thunk(HostThunk::GdipGetClipBounds);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_bounds,
+                    &[graphics as u32, bounds as u32]
+                ),
+                0,
+                "GdipGetClipBounds returns Ok for a path clip"
+            );
+            assert_eq!(memory.read_u32(bounds).expect("x"), f32_bits(2.0));
+            assert_eq!(memory.read_u32(bounds + 4).expect("y"), f32_bits(2.0));
+            let clip_w = f32::from_bits(memory.read_u32(bounds + 8).expect("w"));
+            let clip_h = f32::from_bits(memory.read_u32(bounds + 12).expect("h"));
+            assert!(
+                clip_w >= 12.0 && clip_w <= 13.0,
+                "the ellipse clip spans its real width, got {clip_w}"
+            );
+            assert!(
+                clip_h >= 12.0 && clip_h <= 13.0,
+                "the ellipse clip spans its real height, got {clip_h}"
+            );
+
+            // Fill the whole surface: only the ellipse interior may paint.
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 8, 8),
+                0xFFFF_0000,
+                "inside the ellipse clip the fill paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 0, 0),
+                0,
+                "outside the ellipse clip nothing paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 15, 8),
+                0,
+                "past the ellipse's right edge nothing paints"
+            );
+
+            // Intersect with a left-half rectangle path.
+            let rect_path_out = 0x30_050_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_path,
+                &[0, rect_path_out as u32],
+            );
+            let rect_path = read_u64(&memory, rect_path_out).expect("rect path");
+            let add_rect = runtime.alloc_host_thunk(HostThunk::GdipAddPathRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_rect,
+                &[
+                    rect_path as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(8.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_path,
+                    &[graphics as u32, rect_path as u32, 1 /* Intersect */]
+                ),
+                0,
+                "GdipSetClipPath Intersect returns Ok"
+            );
+            let green_out = 0x30_058_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                solid,
+                &[0xFF00_FF00, green_out as u32],
+            );
+            let green = read_u64(&memory, green_out).expect("green brush");
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    green as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 2, 8),
+                0xFF00_FF00,
+                "inside ellipse ∩ half-rect the green fill paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 12, 8),
+                0xFFFF_0000,
+                "the ellipse area outside the rect keeps the earlier fill"
+            );
+
+            // Exclude on a fresh surface: the complement of the ellipse.
+            let gfx2_out = 0x30_060_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x22, gfx2_out as u32],
+            );
+            let graphics2 = read_u64(&memory, gfx2_out).expect("graphics2");
+            let bmp2_out = 0x30_068_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[16, 16, graphics2 as u32, bmp2_out as u32],
+            );
+            let bmp2 = read_u64(&memory, bmp2_out).expect("bitmap2");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_path,
+                    &[graphics2 as u32, ellipse_path as u32, 4 /* Exclude */]
+                ),
+                0,
+                "GdipSetClipPath Exclude returns Ok"
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics2 as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 0, 0),
+                0xFFFF_0000,
+                "outside the excluded ellipse the fill paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 8, 8),
+                0,
+                "the excluded ellipse interior stays clear"
+            );
+
+            // Complement (path − current); with no clip set the current region
+            // is the whole plane, so the result is empty.  Paint the surface a
+            // known colour first so an empty clip shows up as "nothing changed".
+            let reset_clip = runtime.alloc_host_thunk(HostThunk::GdipResetClip);
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_clip, &[graphics2 as u32]);
+            let blue_out = 0x30_070_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                solid,
+                &[0xFF00_00FF, blue_out as u32],
+            );
+            let blue2 = read_u64(&memory, blue_out).expect("blue brush");
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics2 as u32,
+                    blue2 as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(gdiplus_pixel(&runtime, bmp2, 8, 8), 0xFF00_00FF);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_path,
+                    &[
+                        graphics2 as u32,
+                        ellipse_path as u32,
+                        5 /* Complement */
+                    ]
+                ),
+                0,
+                "GdipSetClipPath Complement returns Ok"
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics2 as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 8, 8),
+                0xFF00_00FF,
+                "path − infinite is empty, so the red fill changes nothing"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 0, 0),
+                0xFF00_00FF,
+                "path − infinite is empty everywhere"
+            );
+
+            // After a reset the surface draws unclipped again.
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_clip, &[graphics2 as u32]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics2 as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 8, 8),
+                0xFFFF_0000,
+                "GdipResetClip restores unclipped drawing"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_measure_character_ranges_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-ranges",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let family_name = 0x30_000_u64;
+            memory.map_bytes(family_name, &utf16_bytes("Arial"));
+            let family_out = 0x30_010_u64;
+            let create_family = runtime.alloc_host_thunk(HostThunk::GdipCreateFontFamilyFromName);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_family,
+                &[family_name as u32, 0, family_out as u32],
+            );
+            let family = read_u64(&memory, family_out).expect("family");
+            let font_out = 0x30_020_u64;
+            let create_font = runtime.alloc_host_thunk(HostThunk::GdipCreateFont);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_font,
+                &[family as u32, f32_bits(16.0), 0, 0, font_out as u32],
+            );
+            let font = read_u64(&memory, font_out).expect("font");
+
+            let gfx_out = 0x30_030_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+            let bmp_out = 0x30_038_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[32, 32, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+            let layout = 0x30_040_u64;
+            memory.map_bytes(layout, &[0_u8; 16]);
+            write_u32(&mut memory, layout, f32_bits(0.0));
+            write_u32(&mut memory, layout + 4, f32_bits(0.0));
+
+            let text = runtime.alloc_utf16_string(&mut memory, "AB").expect("text");
+            let ranges = 0x30_100_u64;
+            memory.map_bytes(ranges, &[0_u8; 16]);
+            write_u32(&mut memory, ranges, 0);
+            write_u32(&mut memory, ranges + 4, 1);
+            write_u32(&mut memory, ranges + 8, 1);
+            write_u32(&mut memory, ranges + 12, 1);
+            let regions = 0x30_200_u64;
+            memory.map_bytes(regions, &[0_u8; 16]);
+
+            let measure_ranges = runtime.alloc_host_thunk(HostThunk::GdipMeasureCharacterRanges);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    measure_ranges,
+                    &[
+                        graphics as u32,
+                        text as u32,
+                        2,
+                        font as u32,
+                        layout as u32,
+                        0,
+                        2,
+                        ranges as u32,
+                        regions as u32,
+                    ]
+                ),
+                0,
+                "GdipMeasureCharacterRanges returns Ok"
+            );
+            let region0 = read_u64(&memory, regions).expect("region 0");
+            let region1 = read_u64(&memory, regions + 8).expect("region 1");
+            assert_ne!(region0, 0);
+            assert_ne!(region1, 0);
+            // The lattice metrics DrawString uses: 16 em → s=2, advance 12,
+            // line height 16.  Each range's region is exactly its advance rect.
+            let bounds0 = match runtime.user32.gdiplus_state.get(region0) {
+                Some(GdiplusObject::Region(r)) => r.as_rect().expect("range 0 is a rect"),
+                _ => panic!("range 0 handle must be a region"),
+            };
+            let bounds1 = match runtime.user32.gdiplus_state.get(region1) {
+                Some(GdiplusObject::Region(r)) => r.as_rect().expect("range 1 is a rect"),
+                _ => panic!("range 1 handle must be a region"),
+            };
+            assert_eq!(bounds0, (0.0, 0.0, 12.0, 16.0));
+            assert_eq!(bounds1, (12.0, 0.0, 12.0, 16.0));
+
+            // The regions are queryable through the engine's region surface:
+            // GdipSetClipRegion accepts the real handle and the clip reports
+            // the measured bounds back.
+            let set_clip_region = runtime.alloc_host_thunk(HostThunk::GdipSetClipRegion);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_region,
+                    &[graphics as u32, region0 as u32, 0]
+                ),
+                0,
+                "GdipSetClipRegion accepts a measured region handle"
+            );
+            let bounds_out = 0x30_300_u64;
+            memory.map_bytes(bounds_out, &[0_u8; 16]);
+            let get_bounds = runtime.alloc_host_thunk(HostThunk::GdipGetClipBounds);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_bounds,
+                &[graphics as u32, bounds_out as u32],
+            );
+            assert_eq!(memory.read_u32(bounds_out).expect("x"), f32_bits(0.0));
+            assert_eq!(memory.read_u32(bounds_out + 8).expect("w"), f32_bits(12.0));
+            assert_eq!(memory.read_u32(bounds_out + 12).expect("h"), f32_bits(16.0));
+
+            // Drawing honours the measured range: filling the whole surface
+            // only paints the first range's advance.
+            let brush_out = 0x30_400_u64;
+            let solid = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                solid,
+                &[0xFF00_00FF, brush_out as u32],
+            );
+            let blue = read_u64(&memory, brush_out).expect("brush");
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    blue as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(32.0),
+                    f32_bits(32.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 2, 2),
+                0xFF00_00FF,
+                "inside the first character's range the fill paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 14, 2),
+                0,
+                "outside the first range nothing paints"
+            );
+
+            // The measured regions track the real drawn glyphs: every painted
+            // pixel of DrawString lies inside the region of its character.
+            let draw_bmp_out = 0x30_410_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[32, 32, graphics as u32, draw_bmp_out as u32],
+            );
+            let draw_bmp = read_u64(&memory, draw_bmp_out).expect("draw bitmap");
+            let draw_string = runtime.alloc_host_thunk(HostThunk::GdipDrawString);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    draw_string,
+                    &[
+                        graphics as u32,
+                        text as u32,
+                        2,
+                        font as u32,
+                        layout as u32,
+                        0,
+                        blue as u32,
+                    ]
+                ),
+                0,
+                "GdipDrawString returns Ok"
+            );
+            let ranges_region0 = match runtime.user32.gdiplus_state.get(region0) {
+                Some(GdiplusObject::Region(r)) => (**r).clone(),
+                _ => panic!("region 0"),
+            };
+            let ranges_region1 = match runtime.user32.gdiplus_state.get(region1) {
+                Some(GdiplusObject::Region(r)) => (**r).clone(),
+                _ => panic!("region 1"),
+            };
+            let pixels = gdiplus_bitmap_pixels(&runtime, draw_bmp);
+            for y in 0..32i32 {
+                for x in 0..32i32 {
+                    let idx = (y * 32 + x) as usize * 4;
+                    if pixels[idx + 3] == 0 {
+                        continue;
+                    }
+                    let expected = if x < 12 {
+                        &ranges_region0
+                    } else {
+                        &ranges_region1
+                    };
+                    assert!(
+                        expected.contains(x, y),
+                        "painted glyph pixel ({x},{y}) lies inside its range region"
+                    );
+                }
+            }
+
+            // A range spanning two lines produces a scanned (multi-run)
+            // region: the newline splits it into per-line runs.
+            let text2 = runtime
+                .alloc_utf16_string(&mut memory, "AB\nC")
+                .expect("text2");
+            write_u32(&mut memory, ranges, 0);
+            write_u32(&mut memory, ranges + 4, 4);
+            memory.map_bytes(regions, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    measure_ranges,
+                    &[
+                        graphics as u32,
+                        text2 as u32,
+                        4,
+                        font as u32,
+                        layout as u32,
+                        0,
+                        1,
+                        ranges as u32,
+                        regions as u32,
+                    ]
+                ),
+                0,
+                "a multi-line range measures Ok"
+            );
+            let multiline = read_u64(&memory, regions).expect("multiline region");
+            let multiline_rect = match runtime.user32.gdiplus_state.get(multiline) {
+                Some(GdiplusObject::Region(r)) => r.as_rect(),
+                _ => panic!("multiline region handle"),
+            };
+            assert!(
+                multiline_rect.is_none(),
+                "a two-line range is not a single rectangle"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_region,
+                    &[graphics as u32, multiline as u32, 0]
+                ),
+                0,
+                "the scanned region applies as a clip"
+            );
+            // Repaint the original bitmap with the scanned clip: line 0's
+            // range covers two advances (24 px), line 1's one (12 px).
+            let bmp2_out = 0x30_420_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[32, 32, graphics as u32, bmp2_out as u32],
+            );
+            let bmp2 = read_u64(&memory, bmp2_out).expect("bitmap2");
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    blue as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(32.0),
+                    f32_bits(32.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 20, 2),
+                0xFF00_00FF,
+                "the first line's two-character range paints 24 px wide"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 8, 18),
+                0xFF00_00FF,
+                "the second line's one-character range paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 18, 18),
+                0,
+                "the second line's range is only one advance (12 px) wide"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp2, 18, 2),
+                0xFF00_00FF,
+                "the first line's range extends past 12 px"
+            );
+
+            let delete_font = runtime.alloc_host_thunk(HostThunk::GdipDeleteFont);
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_font, &[font as u32]);
+            let delete_family = runtime.alloc_host_thunk(HostThunk::GdipDeleteFontFamily);
+            dispatch_x86_thunk(&mut runtime, &mut memory, delete_family, &[family as u32]);
+        })
+    }
+
+    #[test]
+    fn gdiplus_create_hicon_from_bitmap_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-hicon",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            // A 3×2 bitmap built from real guest Scan0 bytes.
+            let scan0 = 0x30_000_u64;
+            memory.map_bytes(scan0, &[0_u8; 24]);
+            let bmp_out = 0x30_100_u64;
+            let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_scan0,
+                &[3, 2, 12, 0x0026_2009, scan0 as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+            let set_pixel = runtime.alloc_host_thunk(HostThunk::GdipBitmapSetPixel);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[bmp as u32, 0, 0, 0xFF00_00FF],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[bmp as u32, 2, 1, 0xFFFF_0000],
+            );
+
+            let hicon = runtime.alloc_host_thunk(HostThunk::GdipCreateHICONFromBitmap);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[0xDEAD, 0]),
+                2,
+                "an invalid bitmap reports InvalidParameter"
+            );
+            let hicon_out = 0x30_200_u64;
+            memory.map_bytes(hicon_out, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    hicon,
+                    &[bmp as u32, hicon_out as u32]
+                ),
+                0,
+                "GdipCreateHICONFromBitmap returns Ok"
+            );
+            let handle = read_u64(&memory, hicon_out).expect("hicon");
+            assert_ne!(handle, 0);
+            let icon = runtime.icons.get(&handle).expect("registry entry");
+            assert_eq!((icon.width, icon.height, icon.bpp), (3, 2, 32));
+            assert_eq!(icon.data.len(), 24);
+            // Pixel (0, 0) is blue, pixel (2, 1) is red: top-down BGRA.
+            assert_eq!(&icon.data[0..4], &[255, 0, 0, 255]);
+            let red = ((1 * 3) + 2) * 4;
+            assert_eq!(&icon.data[red..red + 4], &[0, 0, 255, 255]);
+
+            // A second creation mints a distinct handle over the same pixels.
+            let hicon_out2 = 0x30_208_u64;
+            memory.map_bytes(hicon_out2, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    hicon,
+                    &[bmp as u32, hicon_out2 as u32]
+                ),
+                0,
+                "a second HICON creation returns Ok"
+            );
+            let handle2 = read_u64(&memory, hicon_out2).expect("hicon 2");
+            assert_ne!(handle2, handle);
+            assert!(runtime.icons.contains_key(&handle2));
+
+            // DestroyIcon has no dispatch surface: destroying drops the
+            // registry entry, releasing the pixels.
+            assert!(runtime.icons.remove(&handle).is_some());
+            assert!(!runtime.icons.contains_key(&handle));
+            assert!(runtime.icons.remove(&handle2).is_some());
         })
     }
 
@@ -119215,8 +121378,8 @@ mod tests {
                 "16 em text measures 16 tall, got {height}"
             );
 
-            // MeasureCharacterRanges creates GpRegion objects, which are not
-            // creatable through the exported surface: NotImplemented.
+            // MeasureCharacterRanges validates its counters/pointers first:
+            // a zero region count is InvalidParameter.
             let measure_ranges = runtime.alloc_host_thunk(HostThunk::GdipMeasureCharacterRanges);
             assert_eq!(
                 dispatch_x86_thunk(
@@ -119235,8 +121398,8 @@ mod tests {
                         0
                     ]
                 ),
-                6,
-                "GdipMeasureCharacterRanges reports NotImplemented"
+                2,
+                "GdipMeasureCharacterRanges with a zero region count reports InvalidParameter"
             );
 
             let delete_font = runtime.alloc_host_thunk(HostThunk::GdipDeleteFont);
@@ -119644,15 +121807,45 @@ mod tests {
                 &[bmp as u32, 1, 1, 0xFFFF_0000],
             );
 
-            // HICON-from-bitmap needs the pixel-icon object registry, which
-            // the engine only keeps for module icon resources:
-            // NotImplemented, not a fake Ok.
+            // HICON-from-bitmap registers a real pixel-backed icon at the
+            // bitmap's size; a null out pointer is InvalidParameter.
             let hicon = runtime.alloc_host_thunk(HostThunk::GdipCreateHICONFromBitmap);
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[bmp as u32, 0]),
-                6,
-                "GdipCreateHICONFromBitmap reports NotImplemented"
+                2,
+                "GdipCreateHICONFromBitmap with a null out pointer reports InvalidParameter"
             );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[0xDEAD, 0]),
+                2,
+                "GdipCreateHICONFromBitmap with an invalid bitmap reports InvalidParameter"
+            );
+            let hicon_out = 0x30_218_u64;
+            memory.map_bytes(hicon_out, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    hicon,
+                    &[bmp as u32, hicon_out as u32]
+                ),
+                0,
+                "GdipCreateHICONFromBitmap returns Ok"
+            );
+            let hicon_handle = read_u64(&memory, hicon_out).expect("hicon");
+            let pixel_icon = runtime.icons.get(&hicon_handle).expect("pixel HICON");
+            assert_eq!((pixel_icon.width, pixel_icon.height), (2, 2));
+            assert_eq!(pixel_icon.bpp, 32);
+            let red_index = (2 + 1) * 4; // pixel (1, 1), top-down
+            assert_eq!(
+                &pixel_icon.data[red_index..red_index + 4],
+                &[0, 0, 255, 255],
+                "the HICON carries the bitmap's real BGRA pixels"
+            );
+            // DestroyIcon has no dispatch surface here; dropping the registry
+            // entry releases the HICON.
+            assert!(runtime.icons.remove(&hicon_handle).is_some());
+            assert!(!runtime.icons.contains_key(&hicon_handle));
 
             // HBITMAP-from-bitmap mints a real GDI HBITMAP in the GDI bitmap
             // table (usable with SelectObject/BitBlt afterwards).
@@ -132591,6 +134784,201 @@ mod tests {
                 "termination must set the child's exit code"
             );
 
+            // ── native threads: NtCreateThreadEx lifts the record-only child
+            //    (the old documented limitation) ──
+            // The child record still carries no primary thread, but a real
+            // thread object can now be created on it: real client id, real
+            // process-targeted record, full lifecycle semantics.
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(status, 0, "STATUS_SUCCESS");
+            let child2 = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            assert_ne!(child2, 0);
+            let child2_state = runtime
+                .win32
+                .process_state(child2)
+                .expect("second child record");
+            assert_ne!(child2_state.process_id, state.process_id);
+
+            let thread_handle_ptr = 0x42_000_u64;
+            // NtCreateThreadEx(&thread, THREAD_ALL_ACCESS, NULL, child,
+            // start, param, create_suspended=FALSE, 0, 0, stack_reserve).
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    child2,
+                    0x40_200,
+                    0x1234,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0, "STATUS_SUCCESS");
+            assert_eq!(runtime.last_error, 0);
+            let thread_handle =
+                read_guest_pointer(&memory, thread_handle_ptr, GuestArch::X86).unwrap() as u32;
+            assert_ne!(thread_handle, 0, "a real thread handle must be returned");
+            let thread_id = runtime
+                .win32
+                .thread_id_for_handle(thread_handle)
+                .expect("thread record exists in the runtime thread tables");
+            assert_ne!(thread_id, runtime.win32.current_thread_id());
+            assert_eq!(
+                runtime.win32.get_exit_code_thread(thread_handle).unwrap(),
+                None,
+                "the new thread is running"
+            );
+
+            // The host image does not exist on this host (the test image is a
+            // guest path only), so the host run cannot start and the start
+            // routine is scheduled through the runtime's guest thread
+            // scheduler as the bare-entry fallback.
+            let scheduled = runtime
+                .pending_guest_threads
+                .iter()
+                .find(|thread| thread.handle == thread_handle)
+                .expect("the native child thread is scheduled in the runtime");
+            assert_eq!(scheduled.start_address, 0x40_200);
+            assert_eq!(scheduled.parameter, 0x1234);
+            assert_ne!(scheduled.initial_rsp, 0, "a real guest stack is allocated");
+            assert_ne!(scheduled.teb_base, 0, "a real guest TEB is allocated");
+
+            // Lifecycle: suspend / resume / terminate all operate on the real
+            // thread object and its client id.
+            assert_eq!(runtime.win32.thread_suspend_count(thread_id).unwrap(), 0);
+            assert_eq!(runtime.win32.suspend_thread(thread_handle).unwrap(), 0);
+            assert_eq!(runtime.win32.thread_suspend_count(thread_id).unwrap(), 1);
+            assert_eq!(runtime.win32.resume_thread(thread_handle).unwrap(), 1);
+            assert_eq!(runtime.win32.thread_suspend_count(thread_id).unwrap(), 0);
+            runtime
+                .win32
+                .terminate_thread(thread_handle, 7)
+                .expect("terminate native child thread");
+            assert_eq!(
+                runtime.win32.get_exit_code_thread(thread_handle).unwrap(),
+                Some(7)
+            );
+
+            // ── thread-creation failure paths return real NTSTATUSes ──
+            // Invalid process handle → STATUS_INVALID_HANDLE.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    0xDEAD,
+                    0x40_200,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0xC000_0008);
+            assert_eq!(runtime.last_error, 0xC000_0008);
+            // NULL start routine → STATUS_INVALID_PARAMETER.
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    child2,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0xC000_000D);
+            // A live handle of the wrong object type → STATUS_OBJECT_TYPE_MISMATCH.
+            let (event_handle, _) = runtime.win32.create_event(false, false, false, None);
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    event_handle,
+                    0x40_200,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0xC000_0024);
+            // A restricted process handle without PROCESS_CREATE_THREAD →
+            // STATUS_ACCESS_DENIED.
+            let restricted = runtime
+                .win32
+                .open_process(0x1000, false, child2_state.process_id)
+                .expect("open restricted process handle");
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    restricted,
+                    0x40_200,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0xC000_0022);
+            // A terminated process → STATUS_PROCESS_IS_TERMINATING.
+            runtime
+                .win32
+                .terminate_process(child2, 3)
+                .expect("terminate second child");
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    child2,
+                    0x40_200,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0xC000_010A);
+
             // ── failure paths return real NTSTATUSes ──
             // Null process-handle pointer → STATUS_INVALID_PARAMETER.
             let status = dispatch_x86_thunk(
@@ -132646,6 +135034,115 @@ mod tests {
                 &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0x1234, 0],
             );
             assert_eq!(status, 0xC000_000D);
+        })
+    }
+
+    /// The native child really runs: `NtCreateThreadEx` on an unlaunched
+    /// `NtCreateProcess` child spawns the child's image through the host-runner
+    /// contract (here a real non-PE host executable, the same direct-spawn
+    /// branch `CreateProcessW` uses), and the exit-sync installed on the
+    /// `NtCreateProcess` handle observes the real child exit.
+    #[cfg(unix)]
+    #[test]
+    fn nt_create_thread_ex_spawns_the_native_child_for_real() {
+        with_big_stack(|| {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (mut runtime, temp) = test_runtime("nt-native-child-spawn");
+            let image = "C:\\Games\\NativeDemo\\native-child.sh";
+            runtime.main_module_path = image.to_string();
+            let mut memory = MemoryImage::default();
+            let nt_create_process = runtime.alloc_host_thunk(HostThunk::NtCreateProcess);
+            let nt_create_thread = runtime.alloc_host_thunk(HostThunk::NtCreateThreadEx);
+            let handle_out = 0x41_000_u64;
+
+            // Stage the guest image as a real host executable: a tiny shell
+            // script that records its own execution and exits 0.
+            let host_program = runtime
+                .win32
+                .guest_path_to_host_path(image)
+                .expect("resolve guest image");
+            std::fs::create_dir_all(host_program.parent().expect("image parent"))
+                .expect("create image dirs");
+            let marker = temp.path().join("native-child-ran.txt");
+            std::fs::write(
+                &host_program,
+                format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display()),
+            )
+            .expect("write child image");
+            let mut permissions = std::fs::metadata(&host_program)
+                .expect("child image metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&host_program, permissions).expect("make child executable");
+
+            // NtCreateProcess(&handle, PROCESS_ALL_ACCESS, NULL, NULL parent,
+            // FALSE, NULL section, NULL, NULL).
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_process,
+                &[handle_out as u32, 0x1F1FFF, 0, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(status, 0, "STATUS_SUCCESS");
+            let child = read_guest_pointer(&memory, handle_out, GuestArch::X86).unwrap() as u32;
+            assert!(!marker.exists(), "a record-only child runs nothing yet");
+
+            let thread_handle_ptr = 0x42_000_u64;
+            let status = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                nt_create_thread,
+                &[
+                    thread_handle_ptr as u32,
+                    0x1F03FF,
+                    0,
+                    child,
+                    0x40_200,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x1000,
+                ],
+            );
+            assert_eq!(status, 0, "STATUS_SUCCESS");
+            let thread_handle =
+                read_guest_pointer(&memory, thread_handle_ptr, GuestArch::X86).unwrap() as u32;
+            assert!(runtime.win32.thread_id_for_handle(thread_handle).is_ok());
+
+            // The real child exits and signals the NtCreateProcess handle
+            // through its exit-sync pair (instead of waiting forever) …
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut signaled = false;
+            while std::time::Instant::now() < deadline {
+                if let Ok(crate::win32::WaitStatus::Object0) =
+                    runtime.win32.wait_for_single_object(child, 50, false, None)
+                {
+                    signaled = true;
+                    break;
+                }
+            }
+            assert!(
+                signaled,
+                "the spawned child must exit and signal the process handle"
+            );
+            // … and the image genuinely ran on the host.
+            assert_eq!(
+                std::fs::read_to_string(&marker).expect("child ran marker"),
+                "ran\n"
+            );
+
+            // The host-launched thread did not double-run in this runtime:
+            // its real TEB/stack record lives in the native-child thread table
+            // instead of the pending scheduler queue.
+            assert!(
+                !runtime
+                    .pending_guest_threads
+                    .iter()
+                    .any(|thread| thread.handle == thread_handle),
+                "a host-launched child thread must not also run in this runtime"
+            );
         })
     }
 
@@ -134155,6 +136652,1043 @@ mod tests {
             let ret = dispatch_x86_thunk(&mut bad_runtime, &mut bad_memory, bad_thunk, &[0, 0, 1]);
             assert_eq!(ret, 0x8007_0057, "reserved flags are E_INVALIDARG");
             assert!(bad_runtime.explorer_taskband().is_none());
+        })
+    }
+
+    // ── IAudioClient / IAudioRenderClient — real method surface of an
+    //    activated audio endpoint ────────────────────────────────────────────
+
+    const AUDIO_CLIENT_FMT_ADDR: u64 = 0x71_000;
+    const AUDIO_CLIENT_OUT_ADDR: u64 = 0x72_000;
+    const AUDIO_CLIENT_RIID_ADDR: u64 = 0x73_000;
+    const AUDIO_CLIENT_HANDLER_OBJECT: u64 = 0x74_000;
+    const AUDIO_CLIENT_HANDLER_VTABLE: u64 = 0x74_100;
+    const AUDIO_CLIENT_HANDLER_STUB: u64 = 0x74_200;
+    const AUDIO_CLIENT_OP_OUT: u64 = 0x75_000;
+
+    fn audio_client_test_device() -> crate::real_audio::RealAudioDevice {
+        crate::real_audio::RealAudioDevice {
+            id: 1,
+            key: "Casa1 Test Synth|2|48000".to_string(),
+            name: "Casa1 Test Synth".to_string(),
+            channels: 2,
+            sample_rate: 48_000,
+            is_default: true,
+        }
+    }
+
+    /// A real 18-byte PCM16 WAVEFORMATEX for `channels` at `rate`.
+    fn pcm16_wave_format_bytes(channels: u16, rate: u32) -> Vec<u8> {
+        let block_align = channels * 2;
+        let mut bytes = Vec::with_capacity(18);
+        bytes.extend_from_slice(&crate::audio_activation::WAVE_FORMAT_PCM.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * block_align as u32).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    /// Dispatch one IAudioClient / IAudioRenderClient method through the real
+    /// import path (x86 stack arguments) and return the HRESULT in EAX.
+    fn audio_client_call(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        method: HostThunk,
+        args: &[u32],
+    ) -> u64 {
+        let thunk = runtime.alloc_host_thunk(method);
+        dispatch_x86_thunk(runtime, memory, thunk, args)
+    }
+
+    /// Initialize a real audio-client endpoint for the synthetic test device
+    /// and return `(endpoint, buffer_address, buffer_frames)`.
+    fn initialized_audio_client_endpoint(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        rate: u32,
+        duration_hns: u32,
+        stream_flags: u32,
+    ) -> (u64, u64, u32) {
+        let device = audio_client_test_device();
+        let endpoint = runtime
+            .alloc_audio_client_endpoint(
+                &mut *memory,
+                &device,
+                crate::audio_activation::IID_IAUDIO_CLIENT,
+            )
+            .expect("alloc endpoint");
+        memory.map_bytes(
+            AUDIO_CLIENT_FMT_ADDR,
+            &pcm16_wave_format_bytes(device.channels, rate),
+        );
+        let hr = audio_client_call(
+            runtime,
+            memory,
+            HostThunk::AudioClientInitialize,
+            &[
+                endpoint as u32,
+                crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                duration_hns,
+                0,
+                AUDIO_CLIENT_FMT_ADDR as u32,
+                0,
+            ],
+        );
+        assert_eq!(hr, 0, "Initialize succeeds for a real PCM16 format");
+        let snapshot = crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+            .expect("bound client state");
+        assert!(snapshot.initialized);
+        (endpoint, snapshot.buffer_address, snapshot.buffer_frames)
+    }
+
+    #[test]
+    fn audio_client_endpoint_vtable_carries_full_real_method_surface() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-vtable");
+            let mut memory = MemoryImage::default();
+            let endpoint = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &audio_client_test_device(),
+                    crate::audio_activation::IID_IAUDIO_CLIENT,
+                )
+                .expect("alloc endpoint");
+            let vtable =
+                read_guest_pointer(&memory, endpoint, GuestArch::X86).expect("endpoint vtable");
+            assert_ne!(vtable, 0, "the endpoint vtable is real");
+            let expected = crate::audio_activation::audio_client_methods();
+            assert_eq!(
+                expected.len(),
+                21,
+                "IUnknown + 12 IAudioClient + 6 IAudioClient2/3 methods"
+            );
+            for (slot, method) in expected.iter().enumerate() {
+                let thunk_address =
+                    read_guest_pointer(&memory, vtable + slot as u64 * 4, GuestArch::X86)
+                        .expect("vtable slot");
+                assert_ne!(thunk_address, 0, "slot {slot} is populated");
+                let resolved = runtime
+                    .host_thunks
+                    .get(&thunk_address)
+                    .unwrap_or_else(|| panic!("vtable slot {slot} resolves to a host thunk"));
+                assert_eq!(
+                    std::mem::discriminant(resolved),
+                    std::mem::discriminant(method),
+                    "vtable slot {slot} routes to {method:?}"
+                );
+            }
+
+            // GetService(IID_IAudioRenderClient) hands out the real render
+            // client object with its own full vtable.
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_RENDER_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetService,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_RIID_ADDR as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                ],
+            );
+            assert_eq!(hr, 0, "GetService(IAudioRenderClient) succeeds");
+            let service =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            assert_ne!(service, 0);
+            assert_ne!(service, endpoint, "the render client is its own object");
+            let service_vtable =
+                read_guest_pointer(&memory, service, GuestArch::X86).expect("service vtable");
+            for (slot, method) in crate::audio_activation::audio_render_client_methods()
+                .iter()
+                .enumerate()
+            {
+                let thunk_address =
+                    read_guest_pointer(&memory, service_vtable + slot as u64 * 4, GuestArch::X86)
+                        .expect("render vtable slot");
+                let resolved = runtime.host_thunks.get(&thunk_address).unwrap_or_else(|| {
+                    panic!("render vtable slot {slot} resolves to a host thunk")
+                });
+                assert_eq!(
+                    std::mem::discriminant(resolved),
+                    std::mem::discriminant(method),
+                    "render vtable slot {slot} routes to {method:?}"
+                );
+            }
+            // A cached service object is returned AddRef'd by identity.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetService,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_RIID_ADDR as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap(),
+                service,
+                "the cached render client is returned by identity"
+            );
+        })
+    }
+
+    #[test]
+    fn audio_client_reports_real_format_buffer_latency_and_period() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-values");
+            let mut memory = MemoryImage::default();
+            let (endpoint, buffer_address, buffer_frames) =
+                initialized_audio_client_endpoint(&mut runtime, &mut memory, 48_000, 100_000, 0);
+            assert_eq!(buffer_frames, 480, "10 ms at 48 kHz");
+            assert_ne!(buffer_address, 0, "the real guest render buffer is bound");
+
+            // GetBufferSize.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetBufferSize,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(),
+                buffer_frames
+            );
+
+            // GetStreamLatency: the real stream latency in 100 ns units.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetStreamLatency,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let latency_hns = read_u64(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            assert!(latency_hns > 0, "real stream latency is positive");
+
+            // GetDevicePeriod: the real device default/minimum periods.
+            let min_out = AUDIO_CLIENT_OUT_ADDR + 8;
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetDevicePeriod,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    min_out as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let default_hns = read_u64(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            let minimum_hns = read_u64(&memory, min_out).unwrap();
+            assert!(default_hns > 0, "real default device period");
+            assert!(
+                minimum_hns > 0 && minimum_hns <= default_hns,
+                "minimum {minimum_hns} <= default {default_hns}"
+            );
+
+            // GetCurrentPadding starts empty.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(), 0);
+
+            // GetMixFormat writes the real device mix format.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetMixFormat,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let format_ptr =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            assert_ne!(format_ptr, 0);
+            let format_bytes = memory.read_bytes(format_ptr, 40).expect("mix format bytes");
+            let mix = crate::audio_activation::parse_wave_format(&format_bytes)
+                .expect("the mix format parses");
+            assert_eq!(mix.channels, 2);
+            assert_eq!(mix.sample_rate, 48_000);
+            assert_eq!(mix.bits_per_sample, 32);
+            assert!(mix.is_float(), "the real mix format is 32-bit float");
+
+            // IsFormatSupported: PCM16 converts (S_FALSE), the float mix
+            // format is exact (S_OK), an unbacked tag is rejected.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientIsFormatSupported,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, crate::audio_activation::AUDCLNT_S_FALSE as u64);
+            memory.map_bytes(AUDIO_CLIENT_FMT_ADDR + 64, &format_bytes);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientIsFormatSupported,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    (AUDIO_CLIENT_FMT_ADDR + 64) as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0, "the device mix format is bit-exact");
+        })
+    }
+
+    #[test]
+    fn audio_client_start_advances_padding_over_real_elapsed_time() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-clock");
+            let mut memory = MemoryImage::default();
+            let (endpoint, buffer_address, buffer_frames) =
+                initialized_audio_client_endpoint(&mut runtime, &mut memory, 8_000, 1_000_000, 0);
+            assert_eq!(buffer_frames, 800, "100 ms at 8 kHz");
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_RENDER_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetService,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_RIID_ADDR as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let service =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStart,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0, "Start succeeds");
+
+            // Hand out the real buffer, write a real PCM16 frame pattern and
+            // release it: the padding is real committed-frame accounting.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientGetBuffer,
+                &[service as u32, buffer_frames, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let data = read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            assert_eq!(data, buffer_address, "GetBuffer hands out the bound buffer");
+            let byte_len = buffer_frames as usize * 4;
+            let mut pcm = Vec::with_capacity(byte_len);
+            for index in 0..buffer_frames {
+                let sample = ((index % 16) as i16 - 8) * 100;
+                pcm.extend_from_slice(&sample.to_le_bytes());
+                pcm.extend_from_slice(&sample.to_le_bytes());
+            }
+            memory.map_bytes(data, &pcm);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientReleaseBuffer,
+                &[service as u32, buffer_frames, 0],
+            );
+            assert_eq!(hr, 0, "ReleaseBuffer accepts the written frames");
+            assert_eq!(
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+                    .unwrap()
+                    .submitted_frames,
+                buffer_frames as u64,
+                "the released frames are committed"
+            );
+            // The bytes the guest wrote stayed in the real guest buffer.
+            let readback = memory.read_bytes(data, byte_len).expect("buffer bytes");
+            assert_eq!(readback, pcm, "GetBuffer/ReleaseBuffer round-trip bytes");
+
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let padding = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            assert!(padding > 0, "committed frames are padded");
+
+            // Poll with a bounded loop: the real playback clock drains the
+            // buffer (100 ms of audio at 8 kHz).
+            let mut drained = false;
+            for _ in 0..400 {
+                audio_client_call(
+                    &mut runtime,
+                    &mut memory,
+                    HostThunk::AudioClientGetCurrentPadding,
+                    &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+                );
+                if read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap() == 0 {
+                    drained = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(drained, "the real clock drained the committed buffer");
+
+            // Stop halts the advance: a new submission stays padded.
+            memory.map_bytes(data, &pcm);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientGetBuffer,
+                &[service as u32, buffer_frames, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientReleaseBuffer,
+                &[service as u32, buffer_frames, 0],
+            );
+            assert_eq!(hr, 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStop,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0, "Stop succeeds");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let frozen = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(
+                read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(),
+                frozen,
+                "a stopped client's padding never advances"
+            );
+
+            // Reset discards the buffered frames; Reset while running fails.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientReset,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0, "Reset while stopped succeeds");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(), 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStart,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientReset,
+                &[endpoint as u32],
+            );
+            assert_eq!(
+                hr,
+                crate::audio_activation::AUDCLNT_E_NOT_STOPPED as u64,
+                "Reset while running is rejected"
+            );
+        })
+    }
+
+    #[test]
+    fn audio_client_set_event_handle_signals_the_real_guest_event() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-event");
+            let mut memory = MemoryImage::default();
+            let (handle, _existed) = runtime.win32.create_event(true, false, false, None);
+            let (endpoint, _buffer_address, _buffer_frames) = initialized_audio_client_endpoint(
+                &mut runtime,
+                &mut memory,
+                48_000,
+                100_000,
+                crate::audio_activation::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            );
+            assert!(!runtime.win32.event_previous_state(handle).unwrap());
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientSetEventHandle,
+                &[endpoint as u32, handle],
+            );
+            assert_eq!(hr, 0, "SetEventHandle stores the real guest event");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStart,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0);
+            assert!(
+                runtime.win32.event_previous_state(handle).unwrap(),
+                "the buffer-ready event is signaled through the runtime event machinery"
+            );
+            assert_eq!(
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+                    .unwrap()
+                    .event_handle,
+                u64::from(handle)
+            );
+        })
+    }
+
+    #[test]
+    fn audio_client_initialize_rejects_unsupported_formats() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-bad-format");
+            let mut memory = MemoryImage::default();
+            let endpoint = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &audio_client_test_device(),
+                    crate::audio_activation::IID_IAUDIO_CLIENT,
+                )
+                .expect("alloc endpoint");
+
+            // Unbacked compressed format tag (ADPCM).
+            let mut adpcm = pcm16_wave_format_bytes(2, 48_000);
+            adpcm[0] = 0x02;
+            memory.map_bytes(AUDIO_CLIENT_FMT_ADDR, &adpcm);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(
+                hr,
+                crate::audio_activation::AUDCLNT_E_UNSUPPORTED_FORMAT as u64,
+                "ADPCM is not backed"
+            );
+
+            // Zero channels.
+            let mut zero_channels = pcm16_wave_format_bytes(0, 48_000);
+            zero_channels[12] = 0;
+            zero_channels[13] = 0;
+            memory.map_bytes(AUDIO_CLIENT_FMT_ADDR, &zero_channels);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(
+                hr,
+                crate::audio_activation::AUDCLNT_E_UNSUPPORTED_FORMAT as u64
+            );
+
+            // IsFormatSupported reports the same unbacked format.
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientIsFormatSupported,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(
+                hr,
+                crate::audio_activation::AUDCLNT_E_UNSUPPORTED_FORMAT as u64
+            );
+
+            // A double Initialize on a valid format is rejected.
+            memory.map_bytes(AUDIO_CLIENT_FMT_ADDR, &pcm16_wave_format_bytes(2, 48_000));
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(
+                hr,
+                crate::audio_activation::AUDCLNT_E_ALREADY_INITIALIZED as u64
+            );
+        })
+    }
+
+    #[test]
+    fn audio_client2_and_3_extension_methods_are_real() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("audio-client-extensions");
+            let mut memory = MemoryImage::default();
+            let device = audio_client_test_device();
+            let endpoint = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &device,
+                    crate::audio_activation::IID_IAUDIO_CLIENT_3,
+                )
+                .expect("alloc endpoint");
+            memory.map_bytes(
+                AUDIO_CLIENT_FMT_ADDR,
+                &pcm16_wave_format_bytes(device.channels, device.sample_rate),
+            );
+
+            // IAudioClient3::GetSharedModeEnginePeriod — real frame periods at
+            // the requested format's rate.
+            let fundamental_out = AUDIO_CLIENT_OUT_ADDR + 4;
+            let minimum_out = AUDIO_CLIENT_OUT_ADDR + 8;
+            let maximum_out = AUDIO_CLIENT_OUT_ADDR + 12;
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 32]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetSharedModeEnginePeriod,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    fundamental_out as u32,
+                    minimum_out as u32,
+                    maximum_out as u32,
+                ],
+            );
+            assert_eq!(hr, 0, "GetSharedModeEnginePeriod succeeds");
+            let default_frames = read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            let fundamental_frames = read_u32(&memory, fundamental_out).unwrap();
+            let minimum_frames = read_u32(&memory, minimum_out).unwrap();
+            let maximum_frames = read_u32(&memory, maximum_out).unwrap();
+            assert!(default_frames > 0, "real default engine period");
+            assert_eq!(fundamental_frames, minimum_frames);
+            assert!(minimum_frames <= default_frames);
+            assert!(maximum_frames >= default_frames);
+
+            // IAudioClient3::GetCurrentSharedModeEnginePeriod — real mix
+            // format plus the current engine period.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 16]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentSharedModeEnginePeriod,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let mix_ptr =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            let mix = crate::audio_activation::parse_wave_format(
+                &memory.read_bytes(mix_ptr, 40).unwrap(),
+            )
+            .expect("current mix format parses");
+            assert_eq!(mix.channels, device.channels);
+            assert_eq!(mix.sample_rate, device.sample_rate);
+            assert!(mix.is_float());
+            assert_eq!(
+                read_u32(&memory, AUDIO_CLIENT_OUT_ADDR + 8).unwrap(),
+                default_frames,
+                "the current engine period is the default period"
+            );
+
+            // IAudioClient2::GetBufferSizeLimits — real minimum period up to
+            // the engine's two-second maximum.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 16]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetBufferSizeLimits,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                    (AUDIO_CLIENT_OUT_ADDR + 8) as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let minimum_hns = read_u64(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap();
+            let maximum_hns = read_u64(&memory, AUDIO_CLIENT_OUT_ADDR + 8).unwrap();
+            assert!(minimum_hns > 0);
+            assert_eq!(maximum_hns, 20_000_000, "the engine max is two seconds");
+
+            // IAudioClient2::IsOffloadCapable — no host offload engine, so the
+            // real answer is FALSE (never a canned success).
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0xFF_u8; 4]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientIsOffloadCapable,
+                &[endpoint as u32, 0, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap(), 0);
+
+            // IAudioClient2::SetClientProperties — a real property structure.
+            let props = AUDIO_CLIENT_OUT_ADDR + 16;
+            memory.map_bytes(props, &[12, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientSetClientProperties,
+                &[endpoint as u32, props as u32],
+            );
+            assert_eq!(hr, 0);
+
+            // IAudioClient3::InitializeSharedAudioStream — a real shared-mode
+            // initialization at the requested period in frames.
+            let stream_endpoint = runtime
+                .alloc_audio_client_endpoint(
+                    &mut memory,
+                    &device,
+                    crate::audio_activation::IID_IAUDIO_CLIENT_3,
+                )
+                .expect("alloc endpoint");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitializeSharedAudioStream,
+                &[
+                    stream_endpoint as u32,
+                    0,
+                    240,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0, "InitializeSharedAudioStream succeeds");
+            assert_eq!(
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, stream_endpoint)
+                    .unwrap()
+                    .buffer_frames,
+                240,
+                "the requested period is the real buffer size"
+            );
+        })
+    }
+
+    /// Install a real guest completion-handler object whose ActivateCompleted
+    /// slot (vtable slot 3) is x86 stub code (copied from the activation test
+    /// harness) so `ActivateAudioInterfaceAsync` can be driven end to end.
+    fn install_audio_activation_handler(memory: &mut MemoryImage) {
+        memory.map_bytes(0x44_000, &[0_u8; 12]);
+        memory.map_bytes(AUDIO_CLIENT_HANDLER_OBJECT, &[0_u8; 8]);
+        memory.map_bytes(AUDIO_CLIENT_HANDLER_VTABLE, &[0_u8; 16]);
+        let mut stub = vec![0x90_u8; 0x40];
+        stub[..36].copy_from_slice(&[
+            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (result hr)
+            0xA3, 0x00, 0x40, 0x04, 0x00, // mov [0x44000], eax
+            0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]  (interface object)
+            0xA3, 0x04, 0x40, 0x04, 0x00, // mov [0x44004], eax
+            0xA1, 0x08, 0x40, 0x04, 0x00, // mov eax, [0x44008] (count)
+            0x05, 0x01, 0x00, 0x00, 0x00, // add eax, 1
+            0xA3, 0x08, 0x40, 0x04, 0x00, // mov [0x44008], eax
+            0x31, 0xC0, // xor eax, eax
+            0xC3, // ret
+        ]);
+        memory.map_bytes(AUDIO_CLIENT_HANDLER_STUB, &stub);
+        write_u32(
+            memory,
+            AUDIO_CLIENT_HANDLER_OBJECT,
+            AUDIO_CLIENT_HANDLER_VTABLE as u32,
+        );
+        write_u32(
+            memory,
+            AUDIO_CLIENT_HANDLER_VTABLE + 12,
+            AUDIO_CLIENT_HANDLER_STUB as u32,
+        );
+    }
+
+    fn real_default_device_available() -> bool {
+        match crate::real_audio::RealAudioBackend::new() {
+            Ok(backend) => backend
+                .enumerate_devices()
+                .iter()
+                .any(|device| device.is_default),
+            Err(error) => {
+                eprintln!("audio activation test skipped: no audio services ({error})");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn activation_endpoint_exposes_real_audio_client_methods() {
+        with_big_stack(|| {
+            if !real_default_device_available() {
+                eprintln!("skipping activation endpoint test: no real default render device");
+                return;
+            }
+            let (mut runtime, _tmp) = test_runtime("audio-client-activation");
+            let mut memory = MemoryImage::default();
+            install_audio_activation_handler(&mut memory);
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OP_OUT, &[0_u8; 8]);
+            let stack = 0x50_000_u64;
+            memory.map_bytes(stack, &[0_u8; 0x200]);
+            write_u32(&mut memory, stack, 0xDEAD_BEEF);
+            write_guest_pointer(&mut memory, stack + 4, 0, GuestArch::X86).unwrap();
+            write_guest_pointer(
+                &mut memory,
+                stack + 8,
+                AUDIO_CLIENT_RIID_ADDR,
+                GuestArch::X86,
+            )
+            .unwrap();
+            write_guest_pointer(&mut memory, stack + 12, 0, GuestArch::X86).unwrap();
+            write_guest_pointer(
+                &mut memory,
+                stack + 16,
+                AUDIO_CLIENT_HANDLER_OBJECT,
+                GuestArch::X86,
+            )
+            .unwrap();
+            write_guest_pointer(&mut memory, stack + 20, AUDIO_CLIENT_OP_OUT, GuestArch::X86)
+                .unwrap();
+            let thunk = runtime.alloc_host_thunk(HostThunk::ActivateAudioInterfaceAsync);
+            let mut cpu = CpuState::new(GuestArch::X86);
+            cpu.set(Register::Rsp, stack);
+            runtime
+                .dispatch_import(thunk, &mut cpu, &mut memory)
+                .expect("dispatch ActivateAudioInterfaceAsync");
+            assert_eq!(cpu.get(Register::Rax), 0, "activation starts (S_OK)");
+            let endpoint =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(endpoint, 0, "the activation produced an endpoint");
+            let record = crate::audio_activation::endpoint_record(runtime.guest_pid, endpoint)
+                .expect("real device record bound to the endpoint");
+            assert_eq!(
+                record.requested_riid,
+                crate::audio_activation::IID_IAUDIO_CLIENT
+            );
+            // The activation attached the real method surface (slot 3 is
+            // IAudioClient::Initialize).
+            let vtable = read_guest_pointer(&memory, endpoint, GuestArch::X86).expect("vtable");
+            let initialize_thunk =
+                read_guest_pointer(&memory, vtable + 12, GuestArch::X86).unwrap();
+            let resolved = runtime
+                .host_thunks
+                .get(&initialize_thunk)
+                .expect("Initialize dispatches to a host thunk");
+            assert_eq!(
+                std::mem::discriminant(resolved),
+                std::mem::discriminant(&HostThunk::AudioClientInitialize),
+                "the activated endpoint's vtable carries the real methods"
+            );
+            let snapshot =
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+                    .expect("client state attached");
+            assert!(
+                snapshot.submitted_frames == 0,
+                "the activated client is fresh"
+            );
+
+            // GetMixFormat on the activated endpoint reports the real device
+            // rate and channel count.
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetMixFormat,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let format_ptr =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            let mix = crate::audio_activation::parse_wave_format(
+                &memory.read_bytes(format_ptr, 40).unwrap(),
+            )
+            .expect("activated mix format parses");
+            assert_eq!(mix.channels, record.device.channels);
+            assert_eq!(mix.sample_rate, record.device.sample_rate);
+
+            // Initialize with a real format, start the clock and stop it.
+            memory.map_bytes(
+                AUDIO_CLIENT_FMT_ADDR,
+                &pcm16_wave_format_bytes(record.device.channels, record.device.sample_rate),
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientInitialize,
+                &[
+                    endpoint as u32,
+                    crate::audio_activation::AUDCLNT_SHAREMODE_SHARED,
+                    0,
+                    100_000,
+                    0,
+                    AUDIO_CLIENT_FMT_ADDR as u32,
+                    0,
+                ],
+            );
+            assert_eq!(hr, 0, "Initialize on the activated endpoint");
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStart,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0);
+
+            // GetService + GetBuffer/ReleaseBuffer on the activated endpoint:
+            // the released frames flow into the real output path (silence, so
+            // the test is inaudible) and the real clock accounts for them.
+            memory.map_bytes(
+                AUDIO_CLIENT_RIID_ADDR,
+                &crate::audio_activation::IID_IAUDIO_RENDER_CLIENT,
+            );
+            memory.map_bytes(AUDIO_CLIENT_OUT_ADDR, &[0_u8; 8]);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetService,
+                &[
+                    endpoint as u32,
+                    AUDIO_CLIENT_RIID_ADDR as u32,
+                    AUDIO_CLIENT_OUT_ADDR as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let service =
+                read_guest_pointer(&memory, AUDIO_CLIENT_OUT_ADDR, GuestArch::X86).unwrap();
+            let buffer_frames =
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+                    .unwrap()
+                    .buffer_frames;
+            assert!(buffer_frames > 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientGetBuffer,
+                &[service as u32, buffer_frames, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioRenderClientReleaseBuffer,
+                &[
+                    service as u32,
+                    buffer_frames,
+                    crate::audio_activation::AUDCLNT_BUFFERFLAGS_SILENT,
+                ],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                crate::audio_activation::test_client_snapshot(runtime.guest_pid, endpoint)
+                    .unwrap()
+                    .submitted_frames,
+                u64::from(buffer_frames),
+            );
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientGetCurrentPadding,
+                &[endpoint as u32, AUDIO_CLIENT_OUT_ADDR as u32],
+            );
+            assert_eq!(hr, 0);
+            assert!(read_u32(&memory, AUDIO_CLIENT_OUT_ADDR).unwrap() > 0);
+
+            let hr = audio_client_call(
+                &mut runtime,
+                &mut memory,
+                HostThunk::AudioClientStop,
+                &[endpoint as u32],
+            );
+            assert_eq!(hr, 0);
+
+            // The completion handler is delivered from the runtime servicing
+            // point (the async contract is untouched by the method surface).
+            let mut drain_cpu = CpuState::new(GuestArch::X86);
+            drain_cpu.set(Register::Rsp, stack);
+            runtime
+                .drain_pending_audio_activations(&mut drain_cpu, &mut memory)
+                .expect("drain activation completions");
+            assert_eq!(read_u32(&memory, 0x44_008).unwrap(), 1);
+            assert_eq!(read_u32(&memory, 0x44_004).unwrap(), endpoint as u32);
         })
     }
 }
@@ -137824,12 +141358,15 @@ struct GdiplusStrokeStyle {
 }
 
 /// The graphics state that shapes rasterise under.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GdiplusRenderState {
     cm: u32,
     sm: u32,
     interp: u32,
     clip: Option<(f32, f32, f32, f32)>,
+    /// Scanned device-space clip (path clips and scanned regions).  Applied
+    /// as a real per-pixel test by `gdiplus_paint`.
+    clip_region: Option<Box<crate::user32::GdiplusRegion>>,
     world: [f32; 6],
 }
 
@@ -137842,11 +141379,43 @@ enum GdiplusTargetKind {
     MemoryDc(u64),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GdiplusGraphicsInfo {
-    hdc: u64,
     target: Option<GdiplusTargetKind>,
     state: GdiplusRenderState,
+}
+
+/// A decoded GpRegion reference: the infinite region, a rectangle, or a real
+/// scanned region (character-range output / path clip).
+enum GdiplusDecodedRegion {
+    Infinite,
+    Rect((f32, f32, f32, f32)),
+    Scanned(Box<crate::user32::GdiplusRegion>),
+}
+
+/// Run a raster operation under an optional scanned region clip.  The op is
+/// allowed to draw unconstrained into `pixels` (preserving its compositing
+/// arithmetic); afterwards every pixel outside the region is restored from a
+/// snapshot, so the region acts as a genuine per-pixel clip.
+fn gdiplus_paint_with_region_clip(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    region: Option<&crate::user32::GdiplusRegion>,
+    op: impl FnOnce(&mut [u8], u32, u32, i32),
+) {
+    match region {
+        // An unbounded region with no finite hole allows every pixel.
+        Some(region) if !(region.inverted && region.spans.is_empty()) => {
+            let snapshot = pixels.to_vec();
+            op(pixels, width, height, stride);
+            crate::gdiplus_render::restore_outside_region(
+                pixels, width, height, stride, &snapshot, region,
+            );
+        }
+        _ => op(pixels, width, height, stride),
+    }
 }
 
 // ── GDI+ geometry / state / codec helpers (shared by the phase-2.7 arms) ───
@@ -144575,12 +148144,12 @@ pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x1d240),
         },
         ExportSymbol {
-            ordinal: 1,
+            ordinal: 38,
             name: Some("IEnumVARIANT".to_string()),
             target: ExportTarget::Rva(0x2b000),
         },
         ExportSymbol {
-            ordinal: 2,
+            ordinal: 39,
             name: Some("IConnectionPoint".to_string()),
             target: ExportTarget::Rva(0x2b010),
         },

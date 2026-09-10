@@ -56,7 +56,6 @@ fn install_test_depot(client: &mut SteamClient) -> casa1::steam::DepotInstallRes
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_1_automated_steam_smoke_installs_logs_in_downloads_launches_and_reaches_checkpoint() {
     let mut client = SteamClient::new("C:/GEs/SteamFresh");
     client
@@ -101,7 +100,6 @@ fn t13_1_automated_steam_smoke_installs_logs_in_downloads_launches_and_reaches_c
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_2_steam_update_robustness_relaunches_after_success_and_logs_reason_code_on_failure() {
     let mut client = SteamClient::new("C:/GEs/SteamUpdate");
     client.boot().expect("initial boot");
@@ -147,7 +145,6 @@ fn t13_2_steam_update_robustness_relaunches_after_success_and_logs_reason_code_o
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_3_depot_integrity_matches_windows_reference_and_preserves_install_path_rules() {
     let mut client = SteamClient::new("C:/GEs/SteamDepot");
     let installed = install_test_depot(&mut client);
@@ -172,7 +169,6 @@ fn t13_3_depot_integrity_matches_windows_reference_and_preserves_install_path_ru
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_4_driver_required_steam_titles_fail_fast_with_stable_reason_code() {
     let mut client = SteamClient::new("C:/GEs/SteamDriverRequired");
     client
@@ -207,7 +203,6 @@ fn t13_4_driver_required_steam_titles_fail_fast_with_stable_reason_code() {
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_5_launch_game_auto_installs_first_run_prerequisites() {
     let mut client = SteamClient::new("C:/GEs/SteamAutoPrereq");
     client
@@ -269,7 +264,6 @@ fn t13_5_launch_game_auto_installs_first_run_prerequisites() {
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_6_zero_touch_downloaded_steam_setup_installs_updates_and_launches_without_manual_steps() {
     let mut client = SteamClient::new_uninstalled("C:/GEs/SteamZeroTouch");
     assert_eq!(
@@ -364,7 +358,6 @@ fn t13_6_zero_touch_downloaded_steam_setup_installs_updates_and_launches_without
 }
 
 #[test]
-#[ignore] // hangs in test processes: SteamClient::new constructs a User32Subsystem (src/steam.rs:201), which dispatches AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session
 fn t13_7_multi_library_install_launches_from_registered_library_without_user_input() {
     let mut client = SteamClient::new("C:/GEs/SteamLibrariesPrimary");
     client.register_library_folder("C:/GEs/SteamLibrariesArcade");

@@ -1419,12 +1419,16 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         SubsystemCapability::Partial,
         "Real asynchronous activation over the real audio stack: resolves the default \
          render device (or the render DEVINTERFACE GUID) to an enumerated cpal device \
-         record and builds a real guest endpoint object for IID_IAudioClient/\
-         IAudioClient2/IAudioClient3 with a working vtable; the completion handler is \
-         invoked asynchronously through the runtime's queue/drain machinery \
-         (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, \
-         E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object \
-         and no per-method IAudioClient host thunks exist yet.",
+         record and returns a real guest endpoint with the full 21-slot IAudioClient/\
+         IAudioClient2/IAudioClient3 vtable — real WAVEFORMATEX/EXTENSIBLE parsing and \
+         validation (AUDCLNT_E_UNSUPPORTED_FORMAT), device-derived mix format and \
+         periods, real clock-driven GetCurrentPadding, Initialize opening the real \
+         cpal stream, GetService→IAudioRenderClient whose GetBuffer/ReleaseBuffer \
+         hand out and commit the real guest buffer into the output path, real \
+         event-handle signalling.  Exclusive mode is enforced client-side over the \
+         shared-mode host stream; capture-side services and IAudioClock/volume/session \
+         services answer E_NOINTERFACE (not backed); the AsyncOperation object itself \
+         is not modeled (the completion handler receives the result directly).",
     ),
     // ── CLR: a machine with no CLR installed ───────────────────────────────
     semantic_override(
@@ -1510,17 +1514,20 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
          real session rate state; genuinely unowned service GUIDs answer \
          MF_E_UNSUPPORTED_SERVICE.",
     ),
-    // ── GDI+: the drawing surface is real; three calls stay genuinely \
-    // NotImplemented (documented limits of the modeled object set) ──────────
+    // ── GDI+: the drawing surface is real and the former limits are too ─────
     semantic_override(
         "gdiplus.dll",
         "GdipSetClipPath",
         None,
-        SemanticFidelity::Restricted,
-        SubsystemCapability::Partial,
-        "Returns the genuine GDI+ NotImplemented status: non-rectangular \
-         GpRegion clip paths are not creatable (no GdipCreateRegion is exported \
-         on this surface).",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        "Real scanned-region clip: the GpPath is flattened, world-transformed and \
+         scan-converted (agreeing pixel-for-pixel with fill path scanlines) and all \
+         six combine modes (Replace/Intersect/Union/Xor/Exclude/Complement) apply \
+         through per-pixel region clipping honored by every later draw; clip bounds \
+         and Save/Restore/containers carry the region.  The legacy GdipGetClip \
+         byte encoding round-trips a scanned path clip as its finite bounding \
+         rectangle (membership and drawing themselves are exact).",
     ),
     semantic_override(
         "gdiplus.dll",
@@ -1528,17 +1535,22 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Returns the genuine GDI+ NotImplemented status: character-range \
-         measurement needs creatable GpRegion objects.",
+        "Builds real GpRegion objects per CharacterRange (per-line runs for ranges \
+         spanning newlines) from the same lattice metrics DrawString rasterizes \
+         with; the regions are queryable through the region surface and are honored \
+         as clips.  Lattice advances are not hinted font metrics and the layout \
+         rect does not clip the range regions.",
     ),
     semantic_override(
         "gdiplus.dll",
         "GdipCreateHICONFromBitmap",
         None,
-        SemanticFidelity::Restricted,
-        SubsystemCapability::Partial,
-        "Returns the genuine GDI+ NotImplemented status: no pixel-icon registry \
-         exists for arbitrary HICONs (module-resource icons only).",
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        "Registers a real pixel icon: the bitmap's 32-bpp BGRA pixels and real \
+         width/height/bpp are stored in the icon table and the HICON handle is \
+         returned; invalid bitmaps or null out-pointers answer InvalidParameter; \
+         destroying drops the registry entry.",
     ),
     // ── NT native process creation: a real native child now ────────────────
     semantic_override(
@@ -1549,11 +1561,29 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         SubsystemCapability::Partial,
         "Creates a real child guest process through the same machinery CreateProcessW \
          uses (real pid, image, environment/cwd, kernel handle, exit sync) with real \
-         NTSTATUS failure paths.  The native contract's primary-thread creation is \
-         NtCreateThread's job (no native-thread surface exists) and no host \
-         subprocess runner is spawned (the contract carries no command line), so the \
-         process object is a record-only guest process with full query/terminate \
-         semantics.",
+         NTSTATUS failure paths, and the first NtCreateThreadEx on the child launches \
+         the real casa1-runner host execution of the image with the child's exit code \
+         bridged to the process handle.  Remaining native blast radius: the host \
+         child starts at the image entry point (the recorded start routine/parameter \
+         are not injected), CREATE_SUSPENDED is recorded but the host child starts \
+         immediately, additional threads get real thread objects without injection \
+         into the running child, terminating the child records the exit code without \
+         killing an already-spawned runner, and non-NULL image-backed sections are \
+         not modeled (STATUS_INVALID_IMAGE_FORMAT).",
+    ),
+    semantic_override(
+        "ntdll.dll",
+        "NtCreateThreadEx",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Real native thread creation on a process object: real handle/client id, \
+         suspend count and full NtSuspend/NtResume/NtTerminate semantics; real guest \
+         thread records (TEB, stack from StackReserve, CPU state, start routine and \
+         parameter) scheduled through the guest thread scheduler for bare entries and \
+         the first thread on an image-backed native child launches the real host \
+         child execution.  Start routines are not injected into a running host child \
+         and host-launched child threads report parent-process query fields.",
     ),
     // ── shell UI helpers: canned failure without any shell-UI operation ────
     semantic_override(

@@ -138,3 +138,9 @@ path = "src/bin/casa1-test-guest.rs"
 [[bin]]
 name = "casa1-oracle"
 path = "src/bin/casa1-oracle.rs"
+
+[patch.crates-io]
+# Upstream block 0.1.6 declares an uninhabited static (`static _NSConcreteStackBlock:
+# Class`), a future Rust error; the vendored copy fixes only that declaration (the
+# value is used solely for its address).  metal 0.31 depends on this crate too.
+block = { path = "vendor/block" }

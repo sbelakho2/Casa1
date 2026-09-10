@@ -30,7 +30,7 @@ use casa1::compatibility_profile::CompatibilityProfile;
 use casa1::ge::GameEnvironment;
 use casa1::host_thunks::ImplementationLevel;
 use casa1::import_coverage::{
-    BinaryCoverageReport, WorkloadId, coverage_for_pe_with_runtime_trace,
+    BinaryCoverageReport, WorkloadId, coverage_for_pe, coverage_for_pe_with_runtime_trace,
     invoked_api_names_from_trace,
 };
 use casa1::pe::{self, ApiSetResolver, ImportSymbol};
@@ -146,10 +146,29 @@ fn run_steam_with_budget(budget: u64) -> PeExecutionResult {
 // same budget), so the run is shared through a once-guard. This keeps the suite
 // practical: previously every smoke test re-executed Steam.exe, and 15 runs of
 // the PE runtime each took >60 s of wall time.
+/// Run a closure on a worker thread with a large stack.  The bounded Steam
+/// run's guest-dispatch/loader path is stack-hungry in debug builds: the run
+/// aborts with a stack overflow on a default 2 MiB libtest thread and
+/// completes on 8 MiB+.  Scoped so the closure can borrow the GE/path/env.
+fn run_with_large_stack<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn_scoped(scope, f)
+            .expect("spawn large-stack worker")
+            .join()
+            .expect("large-stack worker panicked")
+    })
+}
+
 static SMOKE_RESULT: OnceLock<PeExecutionResult> = OnceLock::new();
 
 fn steam_smoke_result() -> &'static PeExecutionResult {
-    SMOKE_RESULT.get_or_init(|| run_steam_with_budget(1_000_000))
+    SMOKE_RESULT.get_or_init(|| run_with_large_stack(|| run_steam_with_budget(1_000_000)))
 }
 
 /// Assert the documented smoke-run invariants for a bounded Steam.exe execution:
@@ -225,8 +244,6 @@ fn t24_01_kernel32_coverage() {
     verify_dll_coverage("kernel32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_01_kernel32_smoke() {
     if !require_steam_ge() {
@@ -254,8 +271,6 @@ fn t24_02_user32_coverage() {
     verify_dll_coverage("user32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_02_user32_smoke() {
     if !require_steam_ge() {
@@ -278,8 +293,6 @@ fn t24_03_ws2_32_coverage() {
     verify_dll_coverage("ws2_32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_03_ws2_32_smoke() {
     if !require_steam_ge() {
@@ -302,8 +315,6 @@ fn t24_04_gdi32_coverage() {
     verify_dll_coverage("gdi32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_04_gdi32_smoke() {
     if !require_steam_ge() {
@@ -326,8 +337,6 @@ fn t24_05_advapi32_coverage() {
     verify_dll_coverage("advapi32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_05_advapi32_smoke() {
     if !require_steam_ge() {
@@ -350,8 +359,6 @@ fn t24_06_crypt32_coverage() {
     verify_dll_coverage("crypt32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_06_crypt32_smoke() {
     if !require_steam_ge() {
@@ -374,8 +381,6 @@ fn t24_07_shell32_coverage() {
     verify_dll_coverage("shell32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_07_shell32_smoke() {
     if !require_steam_ge() {
@@ -398,8 +403,6 @@ fn t24_08_psapi_coverage() {
     verify_dll_coverage("psapi.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_08_psapi_smoke() {
     if !require_steam_ge() {
@@ -422,8 +425,6 @@ fn t24_09_bcrypt_coverage() {
     verify_dll_coverage("bcrypt.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_09_bcrypt_smoke() {
     if !require_steam_ge() {
@@ -446,8 +447,6 @@ fn t24_10_comctl32_coverage() {
     verify_dll_coverage("comctl32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_10_comctl32_smoke() {
     if !require_steam_ge() {
@@ -470,8 +469,6 @@ fn t24_11_ole32_coverage() {
     verify_dll_coverage("ole32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_11_ole32_smoke() {
     if !require_steam_ge() {
@@ -494,8 +491,6 @@ fn t24_12_oleaut32_coverage() {
     verify_dll_coverage("oleaut32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_12_oleaut32_smoke() {
     if !require_steam_ge() {
@@ -518,8 +513,6 @@ fn t24_13_version_coverage() {
     verify_dll_coverage("version.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_13_version_smoke() {
     if !require_steam_ge() {
@@ -542,8 +535,6 @@ fn t24_14_wsock32_coverage() {
     verify_dll_coverage("wsock32.dll");
 }
 
-#[ignore]
-// extremely slow: executes the full Steam.exe PE emulation with a 1M-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 #[test]
 fn t24_14_wsock32_smoke() {
     if !require_steam_ge() {
@@ -625,7 +616,6 @@ fn t24_15_aggregate_coverage() {
 // sensible values.
 
 #[test]
-#[ignore] // extremely slow: executes the full Steam.exe PE emulation with a 500K-instruction budget (many minutes per run); the runtime also returns an Err when the budget is exhausted, so these cannot pass in CI. Run manually on a GE machine with -- --ignored.
 fn t24_16_kernel32_key_functions() {
     if !require_steam_ge() {
         return;
@@ -636,24 +626,29 @@ fn t24_16_kernel32_key_functions() {
     assert!(path.is_file(), "Steam.exe not found at {path:?}");
 
     let mut env = BTreeMap::new();
-    env.insert("CASA1_PE_RUNTIME_BUDGET".to_string(), "500_000".to_string());
+    env.insert(
+        "CASA1_PE_RUNTIME_BUDGET".to_string(),
+        500_000_u64.to_string(),
+    );
     env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
     env.insert(
         "CASA1_TRACE_CATEGORIES".to_string(),
         "steam_api_init".to_string(),
     );
 
-    let result = pe_runtime::execute_with_options(
-        &path,
-        &[],
-        &ge,
-        &ge.root.join("drive_c"),
-        &env,
-        true,
-        "t24_16_kernel32_key",
-        PeExecutionOptions::default(),
-    )
-    .expect("Steam.exe execution failed");
+    let result = run_with_large_stack(|| {
+        pe_runtime::execute_with_options(
+            &path,
+            &[],
+            &ge,
+            &ge.root.join("drive_c"),
+            &env,
+            true,
+            "t24_16_kernel32_key",
+            PeExecutionOptions::default(),
+        )
+        .expect("Steam.exe execution failed")
+    });
 
     eprintln!(
         "[kernel32 key-funcs] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -861,12 +856,13 @@ fn t24_17_tracked_fixture_import_quality() {
     );
 
     // No E2E trace is available in CI for the tracked fixture, so the
-    // runtime-reached set is empty; t24_18 (ignored, GE smoke) supplies a real
-    // one.
+    // runtime-reached set is empty; t24_18 (GE smoke) supplies a real one.
+    // The static-scan entry point is used deliberately: the other smoke tests
+    // in this binary execute Steam.exe in parallel and populate the shared
+    // dynamic-import log, which the runtime-trace variant would consume.
     let workload = WorkloadId::new("steam-fixture");
     let target = CompatibilityProfile::win10_legacy_desktop();
-    let report =
-        coverage_for_pe_with_runtime_trace(&path, &workload, target, &[]).expect("coverage report");
+    let report = coverage_for_pe(&path, &workload, target).expect("coverage report");
 
     print_quality_telemetry("tracked-fixture (invoked set: empty)", &report);
 
@@ -903,11 +899,6 @@ fn t24_17_tracked_fixture_import_quality() {
 }
 
 #[test]
-#[ignore]
-// slow: re-executes the full Steam.exe PE emulation (shared 1M-budget smoke
-// run, many minutes); the runtime also returns an Err when the budget is
-// exhausted, so this cannot pass in CI. Run manually on a GE machine with
-// -- --ignored.  Supplies the trace-derived invoked set for (b)/(c).
 fn t24_18_tracked_fixture_import_quality_with_trace() {
     if !require_steam_ge() {
         return;

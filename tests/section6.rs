@@ -110,7 +110,6 @@ fn hotas_spec(name: &str, serial: &str) -> ControllerSpec {
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_1_message_ordering_oracle_matches_expected_focus_resize_and_input_sequence() {
     let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
     assert_eq!(
@@ -190,7 +189,6 @@ fn t6_1_message_ordering_oracle_matches_expected_focus_resize_and_input_sequence
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_reference() {
     let cases = vec![
         (
@@ -382,7 +380,6 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_3_raw_mouse_delta_clipcursor_and_1000hz_queue_stress_match_reference() {
     let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
     user32.register_class_ex_w("mouse");
@@ -485,7 +482,6 @@ fn t6_3_raw_mouse_delta_clipcursor_and_1000hz_queue_stress_match_reference() {
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference() {
     let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
     user32.register_class_ex_w("pad");
@@ -607,8 +603,10 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
             .any(|device| device.xinput_slot.is_none() && device.name == "HID Only Pad")
     );
 
-    // Assert concrete xinput values: packet number starts at 1 on attach,
-    // buttons/battery/keystroke match the injected controller specs.
+    // Assert concrete xinput values: the attach event seeds the packet
+    // number at 1 and XInputGetState advances it on every poll (see
+    // User32Subsystem::xinput_get_state), so the first observed poll after
+    // attach reports 2; buttons/battery/keystroke match the injected specs.
     for device in devices.iter().filter(|device| device.xinput_slot.is_some()) {
         let slot = device.xinput_slot.expect("slot assigned");
         let capabilities = user32
@@ -616,7 +614,10 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
             .expect("xinput capabilities");
         assert!(capabilities.supports_rumble);
         let state = user32.xinput_get_state(slot).expect("xinput state");
-        assert_eq!(state.packet_number, 1, "packet starts at 1 on attach");
+        assert_eq!(
+            state.packet_number, 2,
+            "first poll advances the attach packet 1 -> 2"
+        );
         let expected_buttons = match device.name.as_str() {
             "Xbox USB" => {
                 assert_eq!(
@@ -682,13 +683,14 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
             right_motor: 20_000,
         }
     );
-    // Rumble updates advance the packet number.
+    // The rumble update advances the packet number (2 -> 3) and the poll
+    // that observes it advances once more, so the reading is 4.
     assert_eq!(
         user32
             .xinput_get_state(preferred_slot)
             .expect("xinput state after rumble")
             .packet_number,
-        2
+        4
     );
 
     assert!(user32.claim_input_owner("steam"));
@@ -712,7 +714,6 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_5_directinput_joystick_axis_ranges_guid_stability_and_enumeration_match_reference() {
     let spec = hotas_spec("HOTAS Warthog", "hotas-stable");
     let mut first = User32Subsystem::new(KeyboardLayoutId::Us);
@@ -781,7 +782,6 @@ fn t6_5_directinput_joystick_axis_ranges_guid_stability_and_enumeration_match_re
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_6_force_feedback_negative_tests_return_exact_unsupported_errors() {
     let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
     let guid = user32
@@ -849,7 +849,6 @@ fn t6_6_force_feedback_negative_tests_return_exact_unsupported_errors() {
 }
 
 #[test]
-#[ignore] // hangs: User32Subsystem::new/create_window_ex_w dispatch AppKit calls to a main-thread work queue (mac_window::run_on_main) that is only pumped by the live host session, never by a test process
 fn t6_7_recorded_hid_stream_replays_exactly() {
     let mut first = User32Subsystem::new(KeyboardLayoutId::Us);
     first.register_class_ex_w("ReplayWindow");

@@ -24,7 +24,9 @@
 
 mod support;
 
-use casa1::pe_runtime::HostThunk;
+use casa1::cpu::GuestArch;
+use casa1::ge::{GameEnvironment, GeArch};
+use casa1::pe_runtime::{HostThunk, NtThunkSession};
 use casa1::user32::{
     GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
     GDIPLUS_COMPOSITING_QUALITY_DEFAULT, GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY,
@@ -36,13 +38,14 @@ use casa1::user32::{
     GDIPLUS_SMOOTHING_MODE_DEFAULT, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
     GDIPLUS_TEXT_RENDERING_HINT_ANTI_ALIAS, GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT,
     GDIPLUS_UNIT_PIXEL, GDIPLUS_WRAP_MODE_CLAMP, GDIPLUS_WRAP_MODE_TILE, GdiplusBitmap,
-    GdiplusBrush, GdiplusColorMatrix, GdiplusContainer, GdiplusFont, GdiplusFontFamily,
-    GdiplusGraphicsState, GdiplusImage, GdiplusImageAttributes, GdiplusLineBrush, GdiplusMatrix,
-    GdiplusObject, GdiplusPath, GdiplusPathElement, GdiplusPen, GdiplusPointF, GdiplusRectF,
-    GdiplusSolidFill, GdiplusStartupInput, GdiplusState, GdiplusStatus, GdiplusTextureBrush,
+    GdiplusBrush, GdiplusColorMatrix, GdiplusFont, GdiplusFontFamily, GdiplusImage,
+    GdiplusImageAttributes, GdiplusLineBrush, GdiplusMatrix, GdiplusObject, GdiplusPath,
+    GdiplusPathElement, GdiplusPen, GdiplusPointF, GdiplusRectF, GdiplusSolidFill,
+    GdiplusStartupInput, GdiplusState, GdiplusStatus, GdiplusTextureBrush,
 };
 
 use std::collections::BTreeMap;
+use tempfile::TempDir;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper: create a fresh GdiplusState
@@ -53,41 +56,178 @@ fn fresh_state() -> GdiplusState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Dispatch harness — drive the REAL Gdip* host-thunk arms
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The lifecycle/matrix/transform/clip/container/quality operations live in the
+// runtime's private dispatch arms, not in `GdiplusState` itself.  The public
+// `NtThunkSession` test harness allocates a guest thunk per HostThunk variant
+// and drives it through the real `dispatch_import` path with the x86 calling
+// convention, so these tests exercise the same code a guest binary reaches.
+
+/// Create a scratch PE host runtime for GDI+ dispatch tests.  The temp dir
+/// owns the GE and must stay alive for the duration of the test.
+fn dispatch_session() -> (TempDir, NtThunkSession) {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let ge = GameEnvironment::create_in(
+        temp_dir.path(),
+        "gdiplus-dispatch",
+        GeArch::X86,
+        "win11-23h2",
+    )
+    .expect("create GE");
+    let mut session = NtThunkSession::new(ge);
+    session.set_guest_arch(GuestArch::X86);
+    (temp_dir, session)
+}
+
+/// Run `f` on an 8 MiB worker stack with a fresh GDI+ dispatch session.  The
+/// real host-thunk match has a large debug-build frame (the same reason
+/// section49/section50 dispatch through explicit big-stack threads), which
+/// overflows libtest's 2 MiB test thread stack.  `NtThunkSession` is not
+/// `Send`, so the session is created inside the worker thread and the closure
+/// borrows it there.
+fn with_dispatch_session<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut NtThunkSession) -> R + Send,
+    R: Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                let (_temp_dir, mut session) = dispatch_session();
+                f(&mut session)
+            })
+            .expect("spawn dispatch thread")
+            .join()
+            .expect("dispatch thread panicked")
+    })
+}
+
+/// Guest arena addresses used for thunk in/out parameters (the session maps
+/// the 0x30_000..0x40_000 arena).
+const GDI_OUT: u64 = 0x30_000; // u64 handle / token out
+const GDI_ELEMS: u64 = 0x30_100; // 6 × f32 matrix elements
+const GDI_RECT: u64 = 0x30_200; // 4 × f32 rect
+const GDI_MODE: u64 = 0x30_300; // u32 mode out
+const GDI_STATE: u64 = 0x30_400; // u32 container/state id out
+
+fn read_u32_guest(session: &NtThunkSession, address: u64) -> u32 {
+    let bytes = session.read_guest(address, 4);
+    assert_eq!(bytes.len(), 4, "guest read at {address:#x}");
+    u32::from_le_bytes(bytes.try_into().expect("u32"))
+}
+
+fn read_u64_guest(session: &NtThunkSession, address: u64) -> u64 {
+    let bytes = session.read_guest(address, 8);
+    assert_eq!(bytes.len(), 8, "guest read at {address:#x}");
+    u64::from_le_bytes(bytes.try_into().expect("u64"))
+}
+
+fn read_f32_guest(session: &NtThunkSession, address: u64) -> f32 {
+    f32::from_bits(read_u32_guest(session, address))
+}
+
+fn read_matrix_guest(session: &NtThunkSession, address: u64) -> [f32; 6] {
+    let mut elements = [0.0_f32; 6];
+    for (index, element) in elements.iter_mut().enumerate() {
+        *element = read_f32_guest(session, address + index as u64 * 4);
+    }
+    elements
+}
+
+/// Create a graphics object bound to a synthetic HDC via the real
+/// `GdipCreateFromHDC` arm and return its handle.
+fn dispatch_create_graphics(session: &mut NtThunkSession) -> u64 {
+    let create = session.alloc_thunk(HostThunk::GdipCreateFromHDC);
+    let status = session.call_x86(create, &[0x1234, GDI_OUT as u32]);
+    assert_eq!(
+        status,
+        GdiplusStatus::Ok.to_u32(),
+        "GdipCreateFromHDC must succeed"
+    );
+    let handle = read_u64_guest(session, GDI_OUT);
+    assert_ne!(handle, 0, "GdipCreateFromHDC must write a handle");
+    handle
+}
+
+/// Create an identity matrix via the real `GdipCreateMatrix` arm.
+fn dispatch_create_identity_matrix(session: &mut NtThunkSession) -> u64 {
+    let create = session.alloc_thunk(HostThunk::GdipCreateMatrix);
+    let status = session.call_x86(create, &[GDI_OUT as u32]);
+    assert_eq!(
+        status,
+        GdiplusStatus::Ok.to_u32(),
+        "GdipCreateMatrix must succeed"
+    );
+    read_u64_guest(session, GDI_OUT)
+}
+
+/// Read a matrix back through the real `GdipGetMatrixElements` arm.
+fn dispatch_matrix_elements(session: &mut NtThunkSession, matrix: u64) -> [f32; 6] {
+    let get = session.alloc_thunk(HostThunk::GdipGetMatrixElements);
+    let status = session.call_x86(get, &[matrix as u32, GDI_ELEMS as u32]);
+    assert_eq!(
+        status,
+        GdiplusStatus::Ok.to_u32(),
+        "GdipGetMatrixElements must succeed"
+    );
+    read_matrix_guest(session, GDI_ELEMS)
+}
+
+/// Read a u32 graphics mode back through its real getter arm.
+fn dispatch_get_mode(session: &mut NtThunkSession, graphics: u64, getter: HostThunk) -> u32 {
+    let label = format!("{getter:?}");
+    let get = session.alloc_thunk(getter);
+    let status = session.call_x86(get, &[graphics as u32, GDI_MODE as u32]);
+    assert_eq!(status, GdiplusStatus::Ok.to_u32(), "{label} must succeed");
+    read_u32_guest(session, GDI_MODE)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // t33_01 — GdiplusStartup / GdiplusShutdown lifecycle
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: the real GDI+ lifecycle logic lives in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdiplusStartup/GdiplusShutdown,
-// src/pe_runtime.rs:2456-2457, dispatch at ~43600) and is not reachable from
-// integration tests (PeHostRuntime and its dispatch entry point are private).
-// This test previously simulated the lifecycle by hand-editing GdiplusState
-// fields, which verified nothing but the test's own writes. It is #[ignore]d
-// until a public GDI+ dispatch entry point exists.
+// The lifecycle is driven through the real GdiplusStartup/GdiplusShutdown
+// host-thunk arms on the public NtThunkSession dispatch harness.  The startup
+// token lands in guest memory and shutdown must drop every live GDI+ object,
+// observable through a getter that then reports InvalidParameter.
 #[test]
-#[ignore] // no public Gdip* dispatch API: lifecycle logic lives in the private PeHostRuntime dispatch arms
 fn t33_01_startup_shutdown_lifecycle() {
-    let mut state = fresh_state();
-    assert!(!state.initialized, "should start uninitialized");
+    with_dispatch_session(|session| {
+        let startup = session.alloc_thunk(HostThunk::GdiplusStartup);
+        let status = session.call_x86(startup, &[GDI_OUT as u32, 0, 0]);
+        assert_eq!(
+            status,
+            GdiplusStatus::Ok.to_u32(),
+            "GdiplusStartup must succeed"
+        );
+        let token = read_u64_guest(session, GDI_OUT);
+        assert_eq!(token, 0xABCD_0001, "startup must return the runtime token");
 
-    // Simulate GdiplusStartup
-    state.initialized = true;
-    state.token = 0xABCD_0001;
-    assert!(state.initialized, "should be initialized after startup");
-    assert_eq!(state.token, 0xABCD_0001);
+        // An object allocated while initialized is live.
+        let matrix = dispatch_create_identity_matrix(session);
+        assert_ne!(matrix, 0, "matrix handle");
+        let _ = dispatch_matrix_elements(session, matrix);
 
-    // Allocate an object while initialized
-    let h = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
-        GdiplusSolidFill { color: 0xFF0000 },
-    ))));
-    assert!(state.get(h).is_some());
+        let shutdown = session.alloc_thunk(HostThunk::GdiplusShutdown);
+        let status = session.call_x86(shutdown, &[token as u32]);
+        assert_eq!(
+            status,
+            GdiplusStatus::Ok.to_u32(),
+            "GdiplusShutdown must succeed"
+        );
 
-    // Simulate GdiplusShutdown
-    state.initialized = false;
-    state.objects.clear();
-    state.graphics_from_hdc.clear();
-    state.hdc_to_graphics.clear();
-    assert!(!state.initialized, "should be uninitialized after shutdown");
-    assert!(state.objects.is_empty(), "all objects should be freed");
+        // Shutdown drops every live object: reading the matrix now fails.
+        let get = session.alloc_thunk(HostThunk::GdipGetMatrixElements);
+        let status = session.call_x86(get, &[matrix as u32, GDI_ELEMS as u32]);
+        assert_eq!(
+            status,
+            GdiplusStatus::InvalidParameter.to_u32(),
+            "shutdown must free every GDI+ object"
+        );
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -387,170 +527,126 @@ fn t33_12_matrix_identity() {
     assert!((m.elements[5] - 0.0).abs() < f32::EPSILON);
 }
 
-// KNOWN-ISSUE: matrix operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
-// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
-// a plain data struct with only `identity()`. This test previously hand-rolled
-// the operation on struct fields, verifying nothing but its own writes.
+// Matrix mutations are driven through the real Gdip* dispatch arms on the
+// public NtThunkSession harness and read back through GdipGetMatrixElements.
 #[test]
-#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_13_matrix_set_elements() {
-    let mut state = fresh_state();
-    let m = GdiplusMatrix::identity();
-    let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
-
-    if let Some(GdiplusObject::Matrix(matrix)) = state.get_mut(handle) {
-        matrix.elements = [2.0, 0.0, 0.0, 3.0, 10.0, 20.0];
-    }
-
-    match state.get(handle).expect("matrix should exist") {
-        GdiplusObject::Matrix(matrix) => {
-            assert!((matrix.elements[0] - 2.0).abs() < f32::EPSILON);
-            assert!((matrix.elements[3] - 3.0).abs() < f32::EPSILON);
-            assert!((matrix.elements[4] - 10.0).abs() < f32::EPSILON);
-            assert!((matrix.elements[5] - 20.0).abs() < f32::EPSILON);
+    with_dispatch_session(|session| {
+        let matrix = dispatch_create_identity_matrix(session);
+        let set = session.alloc_thunk(HostThunk::GdipSetMatrixElements);
+        let status = session.call_x86(
+            set,
+            &[
+                matrix as u32,
+                2.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                3.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                20.0_f32.to_bits(),
+            ],
+        );
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipSetMatrixElements");
+        let elements = dispatch_matrix_elements(session, matrix);
+        for (actual, expected) in elements.iter().zip([2.0, 0.0, 0.0, 3.0, 10.0, 20.0]) {
+            assert!((actual - expected).abs() < f32::EPSILON, "{elements:?}");
         }
-        _ => panic!("expected Matrix object"),
-    }
+    });
 }
 
-// KNOWN-ISSUE: matrix operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
-// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
-// a plain data struct with only `identity()`. This test previously hand-rolled
-// the operation on struct fields, verifying nothing but its own writes.
 #[test]
-#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_14_matrix_get_elements() {
-    let mut state = fresh_state();
-    let m = GdiplusMatrix {
-        elements: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-    };
-    let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
-
-    match state.get(handle).expect("matrix should exist") {
-        GdiplusObject::Matrix(matrix) => {
-            let elems = matrix.elements;
-            assert!((elems[0] - 1.0).abs() < f32::EPSILON);
-            assert!((elems[3] - 4.0).abs() < f32::EPSILON);
+    with_dispatch_session(|session| {
+        let matrix = dispatch_create_identity_matrix(session);
+        let set = session.alloc_thunk(HostThunk::GdipSetMatrixElements);
+        let status = session.call_x86(
+            set,
+            &[
+                matrix as u32,
+                1.0_f32.to_bits(),
+                2.0_f32.to_bits(),
+                3.0_f32.to_bits(),
+                4.0_f32.to_bits(),
+                5.0_f32.to_bits(),
+                6.0_f32.to_bits(),
+            ],
+        );
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipSetMatrixElements");
+        let elements = dispatch_matrix_elements(session, matrix);
+        for (actual, expected) in elements.iter().zip([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]) {
+            assert!((actual - expected).abs() < f32::EPSILON, "{elements:?}");
         }
-        _ => panic!("expected Matrix object"),
-    }
+    });
 }
 
-// KNOWN-ISSUE: matrix operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
-// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
-// a plain data struct with only `identity()`. This test previously hand-rolled
-// the operation on struct fields, verifying nothing but its own writes.
 #[test]
-#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_15_matrix_translate() {
-    let mut state = fresh_state();
-    let m = GdiplusMatrix::identity();
-    let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
-
-    if let Some(GdiplusObject::Matrix(matrix)) = state.get_mut(handle) {
-        matrix.elements[4] += 5.0; // dx
-        matrix.elements[5] += 10.0; // dy
-    }
-
-    match state.get(handle).expect("matrix should exist") {
-        GdiplusObject::Matrix(matrix) => {
-            assert!((matrix.elements[4] - 5.0).abs() < f32::EPSILON);
-            assert!((matrix.elements[5] - 10.0).abs() < f32::EPSILON);
-        }
-        _ => panic!("expected Matrix object"),
-    }
+    with_dispatch_session(|session| {
+        let matrix = dispatch_create_identity_matrix(session);
+        let translate = session.alloc_thunk(HostThunk::GdipTranslateMatrix);
+        let status = session.call_x86(
+            translate,
+            &[matrix as u32, 5.0_f32.to_bits(), 10.0_f32.to_bits(), 0],
+        );
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipTranslateMatrix");
+        let elements = dispatch_matrix_elements(session, matrix);
+        assert!((elements[4] - 5.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[5] - 10.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[0] - 1.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[3] - 1.0).abs() < f32::EPSILON, "{elements:?}");
+    });
 }
 
-// KNOWN-ISSUE: matrix operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
-// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
-// a plain data struct with only `identity()`. This test previously hand-rolled
-// the operation on struct fields, verifying nothing but its own writes.
 #[test]
-#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_16_matrix_scale() {
-    let mut state = fresh_state();
-    let m = GdiplusMatrix::identity();
-    let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
-
-    if let Some(GdiplusObject::Matrix(matrix)) = state.get_mut(handle) {
-        matrix.elements[0] *= 2.0; // scale x
-        matrix.elements[3] *= 3.0; // scale y
-    }
-
-    match state.get(handle).expect("matrix should exist") {
-        GdiplusObject::Matrix(matrix) => {
-            assert!((matrix.elements[0] - 2.0).abs() < f32::EPSILON);
-            assert!((matrix.elements[3] - 3.0).abs() < f32::EPSILON);
-        }
-        _ => panic!("expected Matrix object"),
-    }
+    with_dispatch_session(|session| {
+        let matrix = dispatch_create_identity_matrix(session);
+        let scale = session.alloc_thunk(HostThunk::GdipScaleMatrix);
+        let status = session.call_x86(
+            scale,
+            &[matrix as u32, 2.0_f32.to_bits(), 3.0_f32.to_bits(), 0],
+        );
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipScaleMatrix");
+        let elements = dispatch_matrix_elements(session, matrix);
+        assert!((elements[0] - 2.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[3] - 3.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[4] - 0.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[5] - 0.0).abs() < f32::EPSILON, "{elements:?}");
+    });
 }
 
-// KNOWN-ISSUE: matrix operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
-// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
-// a plain data struct with only `identity()`. This test previously hand-rolled
-// the operation on struct fields, verifying nothing but its own writes.
 #[test]
-#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_17_matrix_invert() {
-    let mut state = fresh_state();
-    // Create a simple scale+translate matrix and invert it
-    let m = GdiplusMatrix {
-        elements: [2.0, 0.0, 0.0, 4.0, 10.0, 20.0],
-    };
-    let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
+    with_dispatch_session(|session| {
+        let matrix = dispatch_create_identity_matrix(session);
+        let set = session.alloc_thunk(HostThunk::GdipSetMatrixElements);
+        let status = session.call_x86(
+            set,
+            &[
+                matrix as u32,
+                2.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                4.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                20.0_f32.to_bits(),
+            ],
+        );
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipSetMatrixElements");
 
-    if let Some(GdiplusObject::Matrix(matrix)) = state.get_mut(handle) {
-        let e = &matrix.elements;
-        let det = e[0] * e[3] - e[1] * e[2];
-        assert!(det.abs() > f32::EPSILON, "matrix should be invertible");
-        let inv_det = 1.0 / det;
-        matrix.elements = [
-            e[3] * inv_det,
-            -e[1] * inv_det,
-            -e[2] * inv_det,
-            e[0] * inv_det,
-            (e[2] * e[5] - e[3] * e[4]) * inv_det,
-            (e[1] * e[4] - e[0] * e[5]) * inv_det,
-        ];
-    }
+        let invert = session.alloc_thunk(HostThunk::GdipInvertMatrix);
+        let status = session.call_x86(invert, &[matrix as u32]);
+        assert_eq!(status, GdiplusStatus::Ok.to_u32(), "GdipInvertMatrix");
 
-    // After inversion, multiplying back should give identity
-    match state.get(handle).expect("matrix should exist") {
-        GdiplusObject::Matrix(matrix) => {
-            // Approximate check: inverted * original ≈ identity
-            let a = 2.0;
-            let b = 0.0;
-            let c = 0.0;
-            let d = 4.0;
-            let tx = 10.0;
-            let ty = 20.0;
-            let det = a * d - b * c;
-            let inv_det = 1.0 / det;
-            let expected = [
-                d * inv_det,
-                -b * inv_det,
-                -c * inv_det,
-                a * inv_det,
-                (c * ty - d * tx) * inv_det,
-                (b * tx - a * ty) * inv_det,
-            ];
-            for i in 0..6 {
-                assert!(
-                    (matrix.elements[i] - expected[i]).abs() < 0.001,
-                    "element {i} mismatch: {} vs {}",
-                    matrix.elements[i],
-                    expected[i]
-                );
-            }
+        let elements = dispatch_matrix_elements(session, matrix);
+        let expected = [0.5, 0.0, 0.0, 0.25, -5.0, -5.0];
+        for (index, (actual, expected)) in elements.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "element {index} mismatch: {actual} vs {expected} ({elements:?})"
+            );
         }
-        _ => panic!("expected Matrix object"),
-    }
+    });
 }
 
 #[test]
@@ -566,272 +662,299 @@ fn t33_18_matrix_delete() {
 // t33_19 — Transform (set/reset/get world transform)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: world-transform operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetWorldTransform/
-// GdipResetWorldTransform/GdipGetWorldTransform, src/pe_runtime.rs:2517-2519).
-// This test previously wrote the transform fields by hand, verifying nothing
-// but its own writes.
+// World-transform operations are driven through the real dispatch arms and
+// read back through GdipGetWorldTransform.
 #[test]
-#[ignore] // no public Gdip* dispatch API: transform ops live in the private PeHostRuntime dispatch arms
 fn t33_19_world_transform() {
-    let mut state = fresh_state();
-    let hdc: u64 = 0x100;
-    let gfx_handle = state.create_graphics_from_hdc(hdc);
-    let matrix_handle =
-        state.alloc_handle(GdiplusObject::Matrix(Box::new(GdiplusMatrix::identity())));
+    with_dispatch_session(|session| {
+        let graphics = dispatch_create_graphics(session);
+        let matrix = dispatch_create_identity_matrix(session);
+        let translate = session.alloc_thunk(HostThunk::GdipTranslateMatrix);
+        assert_eq!(
+            session.call_x86(
+                translate,
+                &[matrix as u32, 7.0_f32.to_bits(), 9.0_f32.to_bits(), 0],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
 
-    // Set world transform
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.world_transform = Some(matrix_handle);
-    }
+        let set = session.alloc_thunk(HostThunk::GdipSetWorldTransform);
+        assert_eq!(
+            session.call_x86(set, &[graphics as u32, matrix as u32]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipSetWorldTransform"
+        );
 
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.world_transform, Some(matrix_handle));
+        let get = session.alloc_thunk(HostThunk::GdipGetWorldTransform);
+        assert_eq!(
+            session.call_x86(get, &[graphics as u32, GDI_OUT as u32]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipGetWorldTransform"
+        );
+        let returned = read_u64_guest(session, GDI_OUT);
+        assert_eq!(returned, matrix, "world transform must round-trip");
+        let elements = dispatch_matrix_elements(session, returned);
+        assert!((elements[4] - 7.0).abs() < f32::EPSILON, "{elements:?}");
+        assert!((elements[5] - 9.0).abs() < f32::EPSILON, "{elements:?}");
+
+        // Reset: a following get allocates a fresh identity matrix.
+        let reset = session.alloc_thunk(HostThunk::GdipResetWorldTransform);
+        assert_eq!(
+            session.call_x86(reset, &[graphics as u32]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipResetWorldTransform"
+        );
+        assert_eq!(
+            session.call_x86(get, &[graphics as u32, GDI_OUT as u32]),
+            GdiplusStatus::Ok.to_u32()
+        );
+        let identity = read_u64_guest(session, GDI_OUT);
+        assert_ne!(identity, matrix, "reset must return a fresh matrix");
+        let elements = dispatch_matrix_elements(session, identity);
+        for (actual, expected) in elements.iter().zip([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]) {
+            assert!((actual - expected).abs() < f32::EPSILON, "{elements:?}");
         }
-        _ => panic!("expected Graphics object"),
-    }
-
-    // Reset world transform
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.world_transform = None;
-    }
-
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert!(gfx.world_transform.is_none());
-        }
-        _ => panic!("expected Graphics object"),
-    }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t33_20 — Clipping operations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: clip operations are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetClipRect/GdipResetClip,
-// src/pe_runtime.rs:2521-2524). This test previously wrote the clip fields by
-// hand, verifying nothing but its own writes.
+// Clip operations are driven through the real GdipSetClipRect/GdipGetClipBounds/
+// GdipResetClip arms.
 #[test]
-#[ignore] // no public Gdip* dispatch API: clip ops live in the private PeHostRuntime dispatch arms
 fn t33_20_clip_rect_reset_and_bounds() {
-    let mut state = fresh_state();
-    let hdc: u64 = 0x200;
-    let gfx_handle = state.create_graphics_from_hdc(hdc);
-
-    // Initially no clip rect
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert!(gfx.clip_rect.is_none());
+    with_dispatch_session(|session| {
+        let graphics = dispatch_create_graphics(session);
+        let get_bounds = session.alloc_thunk(HostThunk::GdipGetClipBounds);
+        let status = session.call_x86(get_bounds, &[graphics as u32, GDI_RECT as u32]);
+        assert_eq!(status, GdiplusStatus::Ok.to_u32());
+        // Initially no clip: bounds are all zero.
+        for index in 0..4 {
+            assert_eq!(
+                read_f32_guest(session, GDI_RECT + index as u64 * 4),
+                0.0,
+                "no clip must report zero bounds"
+            );
         }
-        _ => panic!("expected Graphics object"),
-    }
 
-    // Set clip rect
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.clip_rect = Some((10.0, 20.0, 100.0, 200.0));
-    }
-
-    // Verify clip bounds
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            let (x, y, w, h) = gfx.clip_rect.unwrap();
-            assert!((x - 10.0).abs() < f32::EPSILON);
-            assert!((y - 20.0).abs() < f32::EPSILON);
-            assert!((w - 100.0).abs() < f32::EPSILON);
-            assert!((h - 200.0).abs() < f32::EPSILON);
+        // Set clip rect 10,20,100,200 (combine mode Replace).
+        let set_clip = session.alloc_thunk(HostThunk::GdipSetClipRect);
+        assert_eq!(
+            session.call_x86(
+                set_clip,
+                &[
+                    graphics as u32,
+                    10.0_f32.to_bits(),
+                    20.0_f32.to_bits(),
+                    100.0_f32.to_bits(),
+                    200.0_f32.to_bits(),
+                    0,
+                ],
+            ),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipSetClipRect"
+        );
+        assert_eq!(
+            session.call_x86(get_bounds, &[graphics as u32, GDI_RECT as u32]),
+            GdiplusStatus::Ok.to_u32()
+        );
+        let expected = [10.0_f32, 20.0, 100.0, 200.0];
+        for (index, expected) in expected.into_iter().enumerate() {
+            let actual = read_f32_guest(session, GDI_RECT + index as u64 * 4);
+            assert!(
+                (actual - expected).abs() < f32::EPSILON,
+                "{actual} != {expected}"
+            );
         }
-        _ => panic!("expected Graphics object"),
-    }
 
-    // Reset clip
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.clip_rect = None;
-    }
-
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert!(gfx.clip_rect.is_none(), "clip should be reset");
+        // Reset clip: bounds return to zero.
+        let reset = session.alloc_thunk(HostThunk::GdipResetClip);
+        assert_eq!(
+            session.call_x86(reset, &[graphics as u32]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipResetClip"
+        );
+        assert_eq!(
+            session.call_x86(get_bounds, &[graphics as u32, GDI_RECT as u32]),
+            GdiplusStatus::Ok.to_u32()
+        );
+        for index in 0..4 {
+            assert_eq!(
+                read_f32_guest(session, GDI_RECT + index as u64 * 4),
+                0.0,
+                "clip must be reset to zero bounds"
+            );
         }
-        _ => panic!("expected Graphics object"),
-    }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t33_21 — Graphics save/restore (containers)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: the real GdipSaveGraphics/GdipRestoreGraphics logic lives in
-// the private `PeHostRuntime` dispatch arms (src/pe_runtime.rs:43937-43963,
-// 43965+) and is not reachable from integration tests. This test previously
-// re-implemented the save/restore algorithm by hand, verifying nothing but
-// its own writes. #[ignore]d until a public GDI+ dispatch entry point exists.
+// Save/restore runs through the real GdipSaveGraphics/GdipRestoreGraphics arms;
+// the state id comes back through guest memory and the quality getters prove
+// the restore.
 #[test]
-#[ignore] // no public Gdip* dispatch API: save/restore logic lives in the private PeHostRuntime dispatch arms
 fn t33_21_graphics_save_restore() {
-    let mut state = fresh_state();
-    let hdc: u64 = 0x300;
-    let gfx_handle = state.create_graphics_from_hdc(hdc);
+    with_dispatch_session(|session| {
+        let graphics = dispatch_create_graphics(session);
+        let set_smoothing = session.alloc_thunk(HostThunk::GdipSetSmoothingMode);
+        let set_compositing = session.alloc_thunk(HostThunk::GdipSetCompositingMode);
+        let set_interpolation = session.alloc_thunk(HostThunk::GdipSetInterpolationMode);
 
-    // Modify state
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.smoothing_mode = GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY;
-        gfx.compositing_mode = GDIPLUS_COMPOSITING_MODE_SOURCE_COPY;
-        gfx.interpolation_mode = GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC;
-    }
+        assert_eq!(
+            session.call_x86(
+                set_smoothing,
+                &[graphics as u32, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            session.call_x86(
+                set_compositing,
+                &[graphics as u32, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            session.call_x86(
+                set_interpolation,
+                &[graphics as u32, GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
 
-    // Save state
-    let mut saved_state_id: u32 = 0;
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        let saved = GdiplusGraphicsState {
-            smoothing_mode: gfx.smoothing_mode,
-            compositing_mode: gfx.compositing_mode,
-            compositing_quality: gfx.compositing_quality,
-            interpolation_mode: gfx.interpolation_mode,
-            pixel_offset_mode: gfx.pixel_offset_mode,
-            text_rendering_hint: gfx.text_rendering_hint,
-            clip_rect: gfx.clip_rect,
-            world_transform: gfx.world_transform,
-        };
-        saved_state_id = gfx.next_container;
-        gfx.container_stack.push(GdiplusContainer {
-            id: gfx.next_container,
-            saved_state: Box::new(saved),
-        });
-        gfx.next_container += 1;
+        // Save: the arm writes the saved-state id to guest memory.
+        let save = session.alloc_thunk(HostThunk::GdipSaveGraphics);
+        assert_eq!(
+            session.call_x86(save, &[graphics as u32, GDI_STATE as u32]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipSaveGraphics"
+        );
+        let state_id = read_u32_guest(session, GDI_STATE);
+        assert_ne!(state_id, 0, "save must return a state id");
 
-        // Now modify state further
-        gfx.smoothing_mode = GDIPLUS_SMOOTHING_MODE_DEFAULT;
-        gfx.compositing_mode = GDIPLUS_COMPOSITING_MODE_SOURCE_OVER;
-    }
+        // Mutate after the save; the getters observe the new values.
+        assert_eq!(
+            session.call_x86(
+                set_smoothing,
+                &[graphics as u32, GDIPLUS_SMOOTHING_MODE_DEFAULT],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            session.call_x86(
+                set_compositing,
+                &[graphics as u32, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetSmoothingMode),
+            GDIPLUS_SMOOTHING_MODE_DEFAULT
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetCompositingMode),
+            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER
+        );
 
-    // Verify modified
-    match state
-        .get(gfx_handle)
-        .expect("graphics should exist")
-        .clone()
-    {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_DEFAULT);
-        }
-        _ => panic!("expected Graphics object"),
-    }
-
-    // Restore state
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle)
-        && let Some(pos) = gfx
-            .container_stack
-            .iter()
-            .position(|c| c.id == saved_state_id)
-    {
-        let container = gfx.container_stack.remove(pos);
-        gfx.smoothing_mode = container.saved_state.smoothing_mode;
-        gfx.compositing_mode = container.saved_state.compositing_mode;
-        gfx.compositing_quality = container.saved_state.compositing_quality;
-        gfx.interpolation_mode = container.saved_state.interpolation_mode;
-        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
-        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
-        gfx.clip_rect = container.saved_state.clip_rect;
-        gfx.world_transform = container.saved_state.world_transform;
-    }
-
-    // Verify restored
-    match state
-        .get(gfx_handle)
-        .expect("graphics should exist")
-        .clone()
-    {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY);
-            assert_eq!(gfx.compositing_mode, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
-            assert_eq!(
-                gfx.interpolation_mode,
-                GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC
-            );
-        }
-        _ => panic!("expected Graphics object"),
-    }
+        // Restore: the saved settings come back.
+        let restore = session.alloc_thunk(HostThunk::GdipRestoreGraphics);
+        assert_eq!(
+            session.call_x86(restore, &[graphics as u32, state_id]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipRestoreGraphics"
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetSmoothingMode),
+            GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetCompositingMode),
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetInterpolationMode),
+            GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC
+        );
+    });
 }
 
-// KNOWN-ISSUE: the real GdipBeginContainer/GdipEndContainer logic lives in
-// the private `PeHostRuntime` dispatch arms (src/pe_runtime.rs:2530-2531) and
-// is not reachable from integration tests. This test previously re-implemented
-// the container algorithm by hand, verifying nothing but its own writes.
-// #[ignore]d until a public GDI+ dispatch entry point exists.
+// Begin/end container runs through the real GdipBeginContainer/GdipEndContainer
+// arms; the container id comes back through guest memory and the quality
+// getters prove the restore.
 #[test]
-#[ignore] // no public Gdip* dispatch API: container logic lives in the private PeHostRuntime dispatch arms
 fn t33_22_graphics_begin_end_container() {
-    let mut state = fresh_state();
-    let hdc: u64 = 0x400;
-    let gfx_handle = state.create_graphics_from_hdc(hdc);
+    with_dispatch_session(|session| {
+        let graphics = dispatch_create_graphics(session);
+        let set_smoothing = session.alloc_thunk(HostThunk::GdipSetSmoothingMode);
+        let set_pixel_offset = session.alloc_thunk(HostThunk::GdipSetPixelOffsetMode);
 
-    // Set initial state
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.smoothing_mode = GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY;
-    }
+        assert_eq!(
+            session.call_x86(
+                set_smoothing,
+                &[graphics as u32, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
 
-    // Begin container (save state)
-    let mut container_id: u32 = 0;
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        let saved = GdiplusGraphicsState {
-            smoothing_mode: gfx.smoothing_mode,
-            compositing_mode: gfx.compositing_mode,
-            compositing_quality: gfx.compositing_quality,
-            interpolation_mode: gfx.interpolation_mode,
-            pixel_offset_mode: gfx.pixel_offset_mode,
-            text_rendering_hint: gfx.text_rendering_hint,
-            clip_rect: gfx.clip_rect,
-            world_transform: gfx.world_transform,
-        };
-        container_id = gfx.next_container;
-        gfx.container_stack.push(GdiplusContainer {
-            id: gfx.next_container,
-            saved_state: Box::new(saved),
-        });
-        gfx.next_container += 1;
+        let begin = session.alloc_thunk(HostThunk::GdipBeginContainer);
+        assert_eq!(
+            session.call_x86(
+                begin,
+                &[graphics as u32, 0, 0, GDIPLUS_UNIT_PIXEL, GDI_STATE as u32],
+            ),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipBeginContainer"
+        );
+        let container_id = read_u32_guest(session, GDI_STATE);
+        assert_ne!(container_id, 0, "begin container must return an id");
 
-        // Change state inside container
-        gfx.smoothing_mode = GDIPLUS_SMOOTHING_MODE_DEFAULT;
-        gfx.pixel_offset_mode = GDIPLUS_PIXEL_OFFSET_HALF;
-    }
+        // Change state inside the container.
+        assert_eq!(
+            session.call_x86(
+                set_smoothing,
+                &[graphics as u32, GDIPLUS_SMOOTHING_MODE_DEFAULT],
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            session.call_x86(
+                set_pixel_offset,
+                &[graphics as u32, GDIPLUS_PIXEL_OFFSET_HALF]
+            ),
+            GdiplusStatus::Ok.to_u32()
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetSmoothingMode),
+            GDIPLUS_SMOOTHING_MODE_DEFAULT
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetPixelOffsetMode),
+            GDIPLUS_PIXEL_OFFSET_HALF
+        );
 
-    // End container (restore state)
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle)
-        && let Some(pos) = gfx
-            .container_stack
-            .iter()
-            .position(|c| c.id == container_id)
-    {
-        let container = gfx.container_stack.remove(pos);
-        gfx.smoothing_mode = container.saved_state.smoothing_mode;
-        gfx.compositing_mode = container.saved_state.compositing_mode;
-        gfx.compositing_quality = container.saved_state.compositing_quality;
-        gfx.interpolation_mode = container.saved_state.interpolation_mode;
-        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
-        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
-        gfx.clip_rect = container.saved_state.clip_rect;
-        gfx.world_transform = container.saved_state.world_transform;
-    }
-
-    // Verify state is restored
-    match state
-        .get(gfx_handle)
-        .expect("graphics should exist")
-        .clone()
-    {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(
-                gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
-                "smoothing mode should be restored"
-            );
-            assert_eq!(
-                gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_DEFAULT,
-                "pixel offset should be restored"
-            );
-        }
-        _ => panic!("expected Graphics object"),
-    }
+        // End container: state is restored.
+        let end = session.alloc_thunk(HostThunk::GdipEndContainer);
+        assert_eq!(
+            session.call_x86(end, &[graphics as u32, container_id]),
+            GdiplusStatus::Ok.to_u32(),
+            "GdipEndContainer"
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetSmoothingMode),
+            GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+            "smoothing mode must be restored"
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetPixelOffsetMode),
+            GDIPLUS_PIXEL_OFFSET_DEFAULT,
+            "pixel offset must be restored"
+        );
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1085,57 +1208,90 @@ fn t33_29_image_attributes_color_matrix() {
 // t33_30 — Quality settings
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// KNOWN-ISSUE: quality setters are only implemented in the private
-// `PeHostRuntime` dispatch arms (HostThunk::GdipSetSmoothingMode/
-// GdipSetCompositingMode etc., src/pe_runtime.rs:49178-49215). The
-// default-value assertions are covered by
-// t33_36 (which exercises the real `create_graphics_from_hdc`); the
-// set-and-read-back part previously wrote fields by hand.
+// Quality settings are driven through the real setter/getter dispatch arms.
+// Defaults are what GdipCreateFromHDC installs; every set is read back through
+// the matching GdipGet* arm.
 #[test]
-#[ignore] // no public Gdip* dispatch API: quality setters live in the private PeHostRuntime dispatch arms
 fn t33_30_quality_settings() {
-    let mut state = fresh_state();
-    let hdc: u64 = 0x600;
-    let gfx_handle = state.create_graphics_from_hdc(hdc);
+    with_dispatch_session(|session| {
+        let graphics = dispatch_create_graphics(session);
 
-    // Verify defaults
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_DEFAULT);
-            assert_eq!(gfx.compositing_mode, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER);
-            assert_eq!(gfx.compositing_quality, GDIPLUS_COMPOSITING_QUALITY_DEFAULT);
-            assert_eq!(gfx.interpolation_mode, GDIPLUS_INTERPOLATION_DEFAULT);
-            assert_eq!(gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_DEFAULT);
-        }
-        _ => panic!("expected Graphics object"),
-    }
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetSmoothingMode),
+            GDIPLUS_SMOOTHING_MODE_DEFAULT
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetCompositingMode),
+            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetCompositingQuality),
+            GDIPLUS_COMPOSITING_QUALITY_DEFAULT
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetInterpolationMode),
+            GDIPLUS_INTERPOLATION_DEFAULT
+        );
+        assert_eq!(
+            dispatch_get_mode(session, graphics, HostThunk::GdipGetPixelOffsetMode),
+            GDIPLUS_PIXEL_OFFSET_DEFAULT
+        );
 
-    // Set all quality properties
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        gfx.smoothing_mode = GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY;
-        gfx.compositing_mode = GDIPLUS_COMPOSITING_MODE_SOURCE_COPY;
-        gfx.compositing_quality = GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY;
-        gfx.interpolation_mode = GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC;
-        gfx.pixel_offset_mode = GDIPLUS_PIXEL_OFFSET_HALF;
-    }
-
-    // Verify all set values
-    match state.get(gfx_handle).expect("graphics should exist") {
-        GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY);
-            assert_eq!(gfx.compositing_mode, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        for (thunk, value, expected) in [
+            (
+                HostThunk::GdipSetSmoothingMode,
+                GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+                (
+                    HostThunk::GdipGetSmoothingMode,
+                    GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+                ),
+            ),
+            (
+                HostThunk::GdipSetCompositingMode,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+                (
+                    HostThunk::GdipGetCompositingMode,
+                    GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+                ),
+            ),
+            (
+                HostThunk::GdipSetCompositingQuality,
+                GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY,
+                (
+                    HostThunk::GdipGetCompositingQuality,
+                    GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY,
+                ),
+            ),
+            (
+                HostThunk::GdipSetInterpolationMode,
+                GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC,
+                (
+                    HostThunk::GdipGetInterpolationMode,
+                    GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC,
+                ),
+            ),
+            (
+                HostThunk::GdipSetPixelOffsetMode,
+                GDIPLUS_PIXEL_OFFSET_HALF,
+                (HostThunk::GdipGetPixelOffsetMode, GDIPLUS_PIXEL_OFFSET_HALF),
+            ),
+        ] {
+            let set_label = format!("{thunk:?}");
+            let set = session.alloc_thunk(thunk);
             assert_eq!(
-                gfx.compositing_quality,
-                GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY
+                session.call_x86(set, &[graphics as u32, value]),
+                GdiplusStatus::Ok.to_u32(),
+                "{set_label}"
             );
+            let (getter, expected) = expected;
+            let getter_label = format!("{getter:?}");
             assert_eq!(
-                gfx.interpolation_mode,
-                GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC
+                dispatch_get_mode(session, graphics, getter),
+                expected,
+                "{getter_label} must round-trip"
             );
-            assert_eq!(gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_HALF);
         }
-        _ => panic!("expected Graphics object"),
-    }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

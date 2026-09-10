@@ -8256,6 +8256,65 @@ mod tests {
             "remove on invalid handle should return None"
         );
     }
+
+    #[test]
+    fn gdiplus_region_rect_membership_and_bounds() {
+        let region = GdiplusRegion::from_rect(2.0, 3.0, 4.0, 5.0);
+        assert!(region.contains(2, 3), "top-left pixel is covered");
+        assert!(region.contains(5, 7), "last covered pixel is inclusive");
+        assert!(!region.contains(1, 3), "left of the rect is outside");
+        assert!(!region.contains(6, 7), "right edge is half-open");
+        assert!(!region.contains(2, 8), "below the rect is outside");
+        assert_eq!(region.as_rect(), Some((2.0, 3.0, 4.0, 5.0)));
+        assert_eq!(region.rect_bounds(), Some((2.0, 3.0, 4.0, 5.0)));
+        assert!(!region.is_empty());
+        assert!(GdiplusRegion::empty().is_empty());
+        assert!(!GdiplusRegion::empty().contains(0, 0));
+    }
+
+    #[test]
+    fn gdiplus_region_algebra() {
+        let a = GdiplusRegion::from_rect(0.0, 0.0, 4.0, 4.0);
+        let b = GdiplusRegion::from_rect(2.0, 2.0, 4.0, 4.0);
+        let intersection = a.intersect(&b);
+        assert!(intersection.contains(3, 3));
+        assert!(!intersection.contains(1, 1));
+        assert_eq!(intersection.as_rect(), Some((2.0, 2.0, 2.0, 2.0)));
+
+        let union = a.union(&b);
+        assert!(union.contains(0, 0) && union.contains(5, 5));
+        assert!(
+            !union.contains(5, 1),
+            "union is not its bounding box (b starts at y=2)"
+        );
+
+        let difference = a.subtract(&b);
+        assert!(difference.contains(1, 1));
+        assert!(!difference.contains(3, 3));
+
+        let xor = a.xor(&b);
+        assert!(xor.contains(1, 1) && xor.contains(5, 5));
+        assert!(!xor.contains(3, 3));
+
+        // The complement representation is unbounded but still answers real
+        // membership tests.
+        let complement = a.complement();
+        assert!(complement.inverted);
+        assert!(!complement.contains(1, 1));
+        assert!(complement.contains(99, 99));
+        assert_eq!(complement.rect_bounds(), None);
+        let back = complement.complement();
+        assert!(!back.inverted);
+        assert!(back.contains(1, 1) && !back.contains(99, 99));
+
+        // Infinite ∪ rect == infinite; infinite ∩ rect == rect.
+        let infinite = GdiplusRegion::infinite();
+        let infinite_union = infinite.union(&a);
+        assert!(infinite_union.inverted && infinite_union.contains(1, 1));
+        let infinite_intersection = infinite.intersect(&a);
+        assert!(!infinite_intersection.inverted);
+        assert_eq!(infinite_intersection.as_rect(), Some((0.0, 0.0, 4.0, 4.0)));
+    }
 }
 
 fn compose_dead_char(dead: char, base: char) -> Option<char> {
@@ -8915,6 +8974,11 @@ pub struct GdiplusGraphics {
     pub pixel_offset_mode: u32,
     pub text_rendering_hint: u32,
     pub clip_rect: Option<(f32, f32, f32, f32)>,
+    /// Scanned (non-rectangular) clip region in device space, set by
+    /// `GdipSetClipPath` and scanned regions passed to `GdipSetClipRegion`.
+    /// When both a rect and a region clip are present the intersection of the
+    /// two applies.
+    pub clip_region: Option<Box<GdiplusRegion>>,
     pub world_transform: Option<u64>,
     pub container_stack: Vec<GdiplusContainer>,
     pub next_container: u32,
@@ -8937,6 +9001,7 @@ pub struct GdiplusGraphicsState {
     pub pixel_offset_mode: u32,
     pub text_rendering_hint: u32,
     pub clip_rect: Option<(f32, f32, f32, f32)>,
+    pub clip_region: Option<Box<GdiplusRegion>>,
     pub world_transform: Option<u64>,
 }
 
@@ -9060,6 +9125,367 @@ pub struct GdiplusPath {
     pub elements: Vec<GdiplusPathElement>,
 }
 
+/// The scanned-region coordinate limit: rasterised regions are clamped to
+/// ±2^20 device pixels.  That is far beyond any surface this engine presents
+/// (window and bitmap dimensions are capped well below it), so pixel tests
+/// inside real targets are unaffected while pathological guest coordinates
+/// can never make scan conversion loop over billions of rows.
+pub const GDIPLUS_REGION_COORD_LIMIT: i32 = 1 << 20;
+
+/// A GDI+ region in device space, stored as horizontal scanline runs.
+///
+/// `spans` holds one `(y, x_start, x_end)` run per covered scanline, with
+/// `x_end` exclusive.  Runs are normalised: sorted by row then `x_start`,
+/// merged when they touch or overlap, and empty runs dropped.  A region with
+/// `inverted` set is the complement of `spans` over the whole plane (the
+/// representation Xor/Exclude/Complement clip combinations produce); such a
+/// region is unbounded so `bounds` is `None`.
+#[derive(Debug, Clone)]
+pub struct GdiplusRegion {
+    pub spans: Vec<(i32, i32, i32)>,
+    pub inverted: bool,
+    /// Bounding box `(left, top, right, bottom)` with right/bottom exclusive.
+    /// `Some((0, 0, 0, 0))` for a bounded empty region; `None` when unbounded.
+    pub bounds: Option<(i32, i32, i32, i32)>,
+}
+
+impl GdiplusRegion {
+    /// A bounded, empty region (clips everything away).
+    pub fn empty() -> Self {
+        Self {
+            spans: Vec::new(),
+            inverted: false,
+            bounds: Some((0, 0, 0, 0)),
+        }
+    }
+
+    /// The whole plane (clips nothing).
+    pub fn infinite() -> Self {
+        Self {
+            spans: Vec::new(),
+            inverted: true,
+            bounds: None,
+        }
+    }
+
+    /// Build a region from raw runs, normalising them.
+    pub fn from_spans(spans: Vec<(i32, i32, i32)>, inverted: bool) -> Self {
+        let spans = gdiplus_normalize_spans(spans);
+        let bounds = if inverted {
+            None
+        } else {
+            Some(gdiplus_span_bounds(&spans))
+        };
+        Self {
+            spans,
+            inverted,
+            bounds,
+        }
+    }
+
+    /// Build an axis-aligned rectangular region.  The rectangle is rounded to
+    /// whole device pixels with a half-open extent (pixel `x` is covered when
+    /// `x0 <= x < x1`).  Non-finite or degenerate input yields an empty region.
+    pub fn from_rect(x: f32, y: f32, w: f32, h: f32) -> Self {
+        if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() {
+            return Self::empty();
+        }
+        let limit = GDIPLUS_REGION_COORD_LIMIT;
+        let left = (x.round() as i64).clamp(-(limit as i64), limit as i64) as i32;
+        let right = ((x + w).round() as i64).clamp(-(limit as i64), limit as i64) as i32;
+        let top = (y.round() as i64).clamp(-(limit as i64), limit as i64) as i32;
+        let bottom = ((y + h).round() as i64).clamp(-(limit as i64), limit as i64) as i32;
+        if right <= left || bottom <= top {
+            return Self::empty();
+        }
+        let spans = (top..bottom).map(|yy| (yy, left, right)).collect();
+        Self::from_spans(spans, false)
+    }
+
+    /// True when the region contains no pixels at all.
+    pub fn is_empty(&self) -> bool {
+        !self.inverted && self.spans.is_empty()
+    }
+
+    /// Membership test for a device pixel.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        gdiplus_spans_contain(&self.spans, x, y) != self.inverted
+    }
+
+    /// The complement of this region over the whole plane.
+    pub fn complement(&self) -> Self {
+        Self::from_spans(self.spans.clone(), !self.inverted)
+    }
+
+    /// Set union.
+    pub fn union(&self, other: &Self) -> Self {
+        match (self.inverted, other.inverted) {
+            (false, false) => {
+                Self::from_spans(gdiplus_spans_union(&self.spans, &other.spans), false)
+            }
+            // U−A ∪ B = U−(A−B)
+            (true, false) => {
+                Self::from_spans(gdiplus_spans_subtract(&self.spans, &other.spans), true)
+            }
+            (false, true) => {
+                Self::from_spans(gdiplus_spans_subtract(&other.spans, &self.spans), true)
+            }
+            // (U−A) ∪ (U−B) = U−(A ∩ B)
+            (true, true) => {
+                Self::from_spans(gdiplus_spans_intersect(&self.spans, &other.spans), true)
+            }
+        }
+    }
+
+    /// Set intersection.
+    pub fn intersect(&self, other: &Self) -> Self {
+        match (self.inverted, other.inverted) {
+            (false, false) => {
+                Self::from_spans(gdiplus_spans_intersect(&self.spans, &other.spans), false)
+            }
+            // A ∩ (U−B) = A−B
+            (false, true) => {
+                Self::from_spans(gdiplus_spans_subtract(&self.spans, &other.spans), false)
+            }
+            (true, false) => {
+                Self::from_spans(gdiplus_spans_subtract(&other.spans, &self.spans), false)
+            }
+            // (U−A) ∩ (U−B) = U−(A ∪ B)
+            (true, true) => Self::from_spans(gdiplus_spans_union(&self.spans, &other.spans), true),
+        }
+    }
+
+    /// Set difference `self − other`.
+    pub fn subtract(&self, other: &Self) -> Self {
+        self.intersect(&other.complement())
+    }
+
+    /// Symmetric difference.
+    pub fn xor(&self, other: &Self) -> Self {
+        self.union(other).subtract(&self.intersect(other))
+    }
+
+    /// The rectangular bounds of the finite region, in the region's own
+    /// coordinate space.  `None` for unbounded (inverted) regions.
+    pub fn rect_bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        self.bounds.map(|(left, top, right, bottom)| {
+            (
+                left as f32,
+                top as f32,
+                (right - left) as f32,
+                (bottom - top) as f32,
+            )
+        })
+    }
+
+    /// The region expressed as a single rectangle, when it is exactly one
+    /// (a rectangular region from `GdipMeasureCharacterRanges` or a decoded
+    /// rectangle).  `None` for empty, multi-rectangle or inverted regions.
+    pub fn as_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.inverted || self.spans.is_empty() {
+            return None;
+        }
+        let (left, top, right) = (self.spans[0].1, self.spans[0].0, self.spans[0].2);
+        for (index, &(y, l, r)) in self.spans.iter().enumerate() {
+            if l != left || r != right || y != top + index as i32 {
+                return None;
+            }
+        }
+        let bottom = top + self.spans.len() as i32;
+        Some((
+            left as f32,
+            top as f32,
+            (right - left) as f32,
+            (bottom - top) as f32,
+        ))
+    }
+}
+
+/// Sort, clamp and merge raw scanline runs.
+fn gdiplus_normalize_spans(mut spans: Vec<(i32, i32, i32)>) -> Vec<(i32, i32, i32)> {
+    let limit = GDIPLUS_REGION_COORD_LIMIT;
+    spans.retain(|&(y, x0, x1)| y >= -limit && y <= limit && x0 < x1 && x1 > -limit && x0 < limit);
+    for span in spans.iter_mut() {
+        span.1 = span.1.max(-limit);
+        span.2 = span.2.min(limit);
+    }
+    spans.retain(|&(_, x0, x1)| x0 < x1);
+    spans.sort_unstable();
+    let mut out: Vec<(i32, i32, i32)> = Vec::with_capacity(spans.len());
+    for (y, x0, x1) in spans {
+        match out.last_mut() {
+            Some(last) if last.0 == y && x0 <= last.2 => {
+                if x1 > last.2 {
+                    last.2 = x1;
+                }
+            }
+            _ => out.push((y, x0, x1)),
+        }
+    }
+    out
+}
+
+fn gdiplus_span_bounds(spans: &[(i32, i32, i32)]) -> (i32, i32, i32, i32) {
+    if spans.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    let left = spans.iter().map(|s| s.1).min().unwrap_or(0);
+    let right = spans.iter().map(|s| s.2).max().unwrap_or(0);
+    let top = spans.first().map(|s| s.0).unwrap_or(0);
+    let bottom = spans.last().map(|s| s.0 + 1).unwrap_or(0);
+    (left, top, right, bottom)
+}
+
+fn gdiplus_spans_contain(spans: &[(i32, i32, i32)], x: i32, y: i32) -> bool {
+    // Runs are sorted by (y, x0): locate the first run at row `y`, then scan
+    // the (few) runs on that row.
+    let start = spans.partition_point(|&(sy, _, _)| sy < y);
+    for &(sy, x0, x1) in spans[start..].iter() {
+        if sy != y {
+            break;
+        }
+        if x0 <= x && x < x1 {
+            return true;
+        }
+        if x0 > x {
+            break;
+        }
+    }
+    false
+}
+
+/// Group runs by scanline, merging intervals on each row.
+fn gdiplus_spans_rows(
+    spans: &[(i32, i32, i32)],
+) -> std::collections::BTreeMap<i32, Vec<(i32, i32)>> {
+    let mut rows: std::collections::BTreeMap<i32, Vec<(i32, i32)>> =
+        std::collections::BTreeMap::new();
+    for &(y, x0, x1) in spans {
+        rows.entry(y).or_default().push((x0, x1));
+    }
+    for intervals in rows.values_mut() {
+        intervals.sort_unstable();
+        let mut merged: Vec<(i32, i32)> = Vec::with_capacity(intervals.len());
+        for &(x0, x1) in intervals.iter() {
+            match merged.last_mut() {
+                Some(last) if x0 <= last.1 => {
+                    if x1 > last.1 {
+                        last.1 = x1;
+                    }
+                }
+                _ => merged.push((x0, x1)),
+            }
+        }
+        *intervals = merged;
+    }
+    rows
+}
+
+fn gdiplus_flatten_rows(
+    rows: std::collections::BTreeMap<i32, Vec<(i32, i32)>>,
+) -> Vec<(i32, i32, i32)> {
+    let mut out = Vec::new();
+    for (y, intervals) in rows {
+        for (x0, x1) in intervals {
+            if x0 < x1 {
+                out.push((y, x0, x1));
+            }
+        }
+    }
+    out
+}
+
+fn gdiplus_spans_union(a: &[(i32, i32, i32)], b: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+    let mut rows = gdiplus_spans_rows(a);
+    for (y, intervals) in gdiplus_spans_rows(b) {
+        rows.entry(y).or_default().extend(intervals);
+    }
+    let mut merged_rows = std::collections::BTreeMap::new();
+    for (y, mut intervals) in rows {
+        intervals.sort_unstable();
+        let mut merged: Vec<(i32, i32)> = Vec::with_capacity(intervals.len());
+        for (x0, x1) in intervals {
+            match merged.last_mut() {
+                Some(last) if x0 <= last.1 => {
+                    if x1 > last.1 {
+                        last.1 = x1;
+                    }
+                }
+                _ => merged.push((x0, x1)),
+            }
+        }
+        merged_rows.insert(y, merged);
+    }
+    gdiplus_flatten_rows(merged_rows)
+}
+
+fn gdiplus_spans_intersect(a: &[(i32, i32, i32)], b: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+    let rows_a = gdiplus_spans_rows(a);
+    let rows_b = gdiplus_spans_rows(b);
+    let mut rows = std::collections::BTreeMap::new();
+    for (y, intervals_a) in rows_a {
+        let Some(intervals_b) = rows_b.get(&y) else {
+            continue;
+        };
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < intervals_a.len() && j < intervals_b.len() {
+            let (a0, a1) = intervals_a[i];
+            let (b0, b1) = intervals_b[j];
+            let x0 = a0.max(b0);
+            let x1 = a1.min(b1);
+            if x0 < x1 {
+                out.push((x0, x1));
+            }
+            if a1 < b1 {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        if !out.is_empty() {
+            rows.insert(y, out);
+        }
+    }
+    gdiplus_flatten_rows(rows)
+}
+
+fn gdiplus_spans_subtract(a: &[(i32, i32, i32)], b: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+    let rows_a = gdiplus_spans_rows(a);
+    let rows_b = gdiplus_spans_rows(b);
+    let mut rows = std::collections::BTreeMap::new();
+    for (y, intervals_a) in rows_a {
+        let empty: Vec<(i32, i32)> = Vec::new();
+        let intervals_b = rows_b.get(&y).unwrap_or(&empty);
+        let mut out = Vec::new();
+        for &(a0, a1) in &intervals_a {
+            let mut cursor = a0;
+            for &(b0, b1) in intervals_b {
+                if b1 <= cursor {
+                    continue;
+                }
+                if b0 >= a1 {
+                    break;
+                }
+                if b0 > cursor {
+                    out.push((cursor, b0.min(a1)));
+                }
+                cursor = cursor.max(b1);
+                if cursor >= a1 {
+                    break;
+                }
+            }
+            if cursor < a1 {
+                out.push((cursor, a1));
+            }
+        }
+        if !out.is_empty() {
+            rows.insert(y, out);
+        }
+    }
+    gdiplus_flatten_rows(rows)
+}
+
 /// A GDI+ matrix (3x3 affine transform).
 #[derive(Debug, Clone)]
 pub struct GdiplusMatrix {
@@ -9140,6 +9566,9 @@ pub enum GdiplusObject {
     FontFamily(Box<GdiplusFontFamily>),
     Image(Box<GdiplusImage>),
     ImageAttributes(Box<GdiplusImageAttributes>),
+    /// A real scanned region: character-range measurement output, path-clip
+    /// geometry and the engine's region surface all resolve through it.
+    Region(Box<GdiplusRegion>),
 }
 
 /// GDI+ startup input structure.
@@ -9239,6 +9668,7 @@ impl GdiplusState {
             pixel_offset_mode: GDIPLUS_PIXEL_OFFSET_DEFAULT,
             text_rendering_hint: GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT,
             clip_rect: None,
+            clip_region: None,
             world_transform: None,
             container_stack: Vec::new(),
             next_container: 1,

@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 const STEAM_GE: &str = "steam";
 
 #[test]
-#[ignore = "requires live Steam E2E environment"]
 fn steam_first_divergence_diagnostic() {
     if std::env::var("CASA1_STEAM_E2E").as_deref() != Ok("1") {
         eprintln!("skipped: set CASA1_STEAM_E2E=1 to run the live Steam diagnostic");

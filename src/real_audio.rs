@@ -63,6 +63,25 @@ pub struct RealAudioDevice {
     pub is_default: bool,
 }
 
+/// Real period/latency values of the device backing a WASAPI audio client,
+/// in `REFERENCE_TIME` (100 ns) units.
+///
+/// The values come from the cpal device's own output configuration (its
+/// supported buffer-size range when the host exposes one); a sample-rate
+/// derived default (10 ms default / 3 ms minimum) is used only when the
+/// device cannot be queried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePeriodInfo {
+    /// Device sample rate the periods are measured at.
+    pub sample_rate: u32,
+    /// Default device period.
+    pub default_period_hns: u64,
+    /// Minimum device period.
+    pub minimum_period_hns: u64,
+    /// Stream latency of a buffer-sized period on this device.
+    pub stream_latency_hns: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Real audio backend
 // ---------------------------------------------------------------------------
@@ -675,6 +694,61 @@ impl RealAudioBackend {
             0
         };
         Ok(latency_ms.min(50))
+    }
+
+    /// The most recent latency the backend recorded for a device.
+    pub fn last_latency_ms(&self, device_id: DeviceId) -> Option<u32> {
+        self.latency_log
+            .iter()
+            .rev()
+            .find(|record| record.device_id == device_id)
+            .map(|record| record.measured_ms)
+    }
+
+    /// The real period/latency values of a device, in `REFERENCE_TIME` units.
+    ///
+    /// Queries the cpal device's default output configuration and uses its
+    /// supported buffer-size range when the host exposes one (CoreAudio
+    /// reports a range; WASAPI reports a range too).  When the device cannot
+    /// be queried (headless host / stale snapshot) the values are derived
+    /// from the device's own sample rate: a 10 ms default period and a 3 ms
+    /// minimum, which is the documented Windows shared-mode fallback.
+    pub fn device_period_info(&self, device: &RealAudioDevice) -> DevicePeriodInfo {
+        let sample_rate = device.sample_rate.max(1);
+        let fallback = |rate: u32| DevicePeriodInfo {
+            sample_rate: rate,
+            default_period_hns: hns_from_frames(rate as u64 / 100, rate),
+            minimum_period_hns: hns_from_frames(rate as u64 * 3 / 1000, rate),
+            stream_latency_hns: hns_from_frames(rate as u64 / 100, rate),
+        };
+        let Some(backend_device) = self
+            .devices
+            .values()
+            .find(|candidate| candidate.key == device.key)
+        else {
+            return fallback(sample_rate);
+        };
+        let Ok(cpal_device) = self.find_cpal_device(backend_device.id) else {
+            return fallback(sample_rate);
+        };
+        let Ok(config) = cpal_device.default_output_config() else {
+            return fallback(sample_rate);
+        };
+        let rate = config.sample_rate().0.max(1);
+        let default_frames = match config.config().buffer_size {
+            cpal::BufferSize::Fixed(frames) => frames.max(1),
+            cpal::BufferSize::Default => (rate / 100).max(1),
+        };
+        let minimum_frames = match config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, .. } => (*min).max(1),
+            cpal::SupportedBufferSize::Unknown => default_frames,
+        };
+        DevicePeriodInfo {
+            sample_rate: rate,
+            default_period_hns: hns_from_frames(default_frames as u64, rate),
+            minimum_period_hns: hns_from_frames(minimum_frames as u64, rate),
+            stream_latency_hns: hns_from_frames(default_frames as u64, rate),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4152,6 +4226,14 @@ fn measure_latency_ms(sample_rate: u32, buffered_frames: usize) -> u32 {
     ((((buffered_frames as f32 / sample_rate as f32) * 1000.0).round() as u32) + 10).min(50)
 }
 
+/// Convert a frame count to `REFERENCE_TIME` (100 ns units) at `rate`.
+fn hns_from_frames(frames: u64, rate: u32) -> u64 {
+    if rate == 0 {
+        return 0;
+    }
+    (frames.saturating_mul(10_000_000) / rate as u64).max(1)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5481,5 +5563,77 @@ mod tests {
         assert!(!resolved.name.is_empty());
         // The snapshot used for resolution is the same real device list.
         assert!(snapshot.iter().any(|device| device.id == resolved.id));
+    }
+
+    #[test]
+    fn device_period_info_falls_back_to_the_device_sample_rate() {
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping device_period_info fallback: no audio services ({error})");
+                return;
+            }
+        };
+        // A device key that cannot match a live enumeration uses the
+        // sample-rate derived fallback: 10 ms default, 3 ms minimum.
+        let device = RealAudioDevice {
+            id: 999_999,
+            key: "Casa1 Nonexistent Device|2|48000".to_string(),
+            name: "Casa1 Nonexistent Device".to_string(),
+            channels: 2,
+            sample_rate: 48_000,
+            is_default: false,
+        };
+        let info = backend.device_period_info(&device);
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.default_period_hns, 100_000);
+        assert_eq!(info.minimum_period_hns, 30_000);
+        assert!(info.minimum_period_hns <= info.default_period_hns);
+        // Half the rate: the periods scale with the real device sample rate.
+        let device_8k = RealAudioDevice {
+            sample_rate: 8_000,
+            ..device
+        };
+        let info_8k = backend.device_period_info(&device_8k);
+        assert_eq!(info_8k.default_period_hns, 100_000);
+        assert_eq!(info_8k.minimum_period_hns, 30_000);
+    }
+
+    #[test]
+    fn device_period_info_uses_the_live_device_when_present() {
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping device_period_info live: no audio services ({error})");
+                return;
+            }
+        };
+        let Some(live) = backend
+            .activation_device_snapshot()
+            .into_iter()
+            .find(|device| device.is_default)
+        else {
+            eprintln!("skipping device_period_info live: no default audio device");
+            return;
+        };
+        let info = backend.device_period_info(&live);
+        assert!(info.sample_rate > 0);
+        assert!(info.default_period_hns > 0);
+        assert!(info.minimum_period_hns > 0);
+        assert!(info.minimum_period_hns <= info.default_period_hns);
+        assert_eq!(info.stream_latency_hns, info.default_period_hns);
+    }
+
+    #[test]
+    fn last_latency_ms_reports_the_backend_record_for_a_device() {
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping last_latency_ms: no audio services ({error})");
+                return;
+            }
+        };
+        // An unknown device has no latency record.
+        assert_eq!(backend.last_latency_ms(999_999), None);
     }
 }

@@ -15,10 +15,10 @@
 
 use crate::user32::{
     GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-    GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
-    GDIPLUS_WRAP_MODE_CLAMP, GDIPLUS_WRAP_MODE_TILE, GDIPLUS_WRAP_MODE_TILE_FLIP_X,
-    GDIPLUS_WRAP_MODE_TILE_FLIP_XY, GDIPLUS_WRAP_MODE_TILE_FLIP_Y, GdiplusBrush, GdiplusPath,
-    GdiplusPathElement, GdiplusPen, GdiplusPointF,
+    GDIPLUS_REGION_COORD_LIMIT, GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+    GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY, GDIPLUS_WRAP_MODE_CLAMP, GDIPLUS_WRAP_MODE_TILE,
+    GDIPLUS_WRAP_MODE_TILE_FLIP_X, GDIPLUS_WRAP_MODE_TILE_FLIP_XY, GDIPLUS_WRAP_MODE_TILE_FLIP_Y,
+    GdiplusBrush, GdiplusPath, GdiplusPathElement, GdiplusPen, GdiplusPointF, GdiplusRegion,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1888,6 +1888,199 @@ pub fn draw_image_ex(
                 compositing_mode,
             );
         }
+    }
+}
+
+// ── Scanned-region helpers ──────────────────────────────────────────────────
+
+/// Scan-convert one transformed polygon into device-space scanline runs,
+/// mirroring the edge arithmetic of [`fill_polygon`] so a filled path and the
+/// clip region rasterised from the same path cover the same pixels.  Runs are
+/// `(y, x_start, x_end)` with `x_end` exclusive.
+pub fn polygon_scanlines(points: &[GdiplusPointF]) -> Vec<(i32, i32, i32)> {
+    scanline_runs(&[points.to_vec()])
+}
+
+/// Flatten a path exactly as [`fill_path`] does, transform the resulting
+/// figures through `world` (device = world so the scan conversion happens in
+/// device space) and scan-convert them into scanline runs.  This is the real
+/// geometry behind `GdipSetClipPath`'s non-rectangular clip.
+pub fn fill_path_scanlines(path: &GdiplusPath, world: &[f32; 6]) -> Vec<(i32, i32, i32)> {
+    let figures = flatten_path_for_fill(path);
+    let mut transformed: Vec<Vec<GdiplusPointF>> = Vec::with_capacity(figures.len());
+    for figure in figures {
+        let mut mapped = Vec::with_capacity(figure.len());
+        for point in figure {
+            mapped.push(GdiplusPointF {
+                x: world[0] * point.x + world[1] * point.y + world[4],
+                y: world[2] * point.x + world[3] * point.y + world[5],
+            });
+        }
+        transformed.push(mapped);
+    }
+    scanline_runs(&transformed)
+}
+
+/// Shared scan conversion: collect edge crossings per scanline, pair them
+/// (even-odd, matching [`fill_polygon`]) and emit half-open runs.
+fn scanline_runs(figures: &[Vec<GdiplusPointF>]) -> Vec<(i32, i32, i32)> {
+    let limit = GDIPLUS_REGION_COORD_LIMIT as i64;
+    let mut rows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
+    for points in figures {
+        if points.len() < 3 {
+            continue;
+        }
+        let mut edges: Vec<(i32, i32, i64, i64)> = Vec::new();
+        for i in 0..points.len() {
+            let j = (i + 1) % points.len();
+            let y1 = points[i].y.round() as i32;
+            let y2 = points[j].y.round() as i32;
+            if y1 == y2 {
+                continue;
+            }
+            let (y_min, y_max, x_at_min, x_at_max) = if y1 < y2 {
+                (y1, y2, points[i].x, points[j].x)
+            } else {
+                (y2, y1, points[j].x, points[i].x)
+            };
+            let dx = (x_at_max - x_at_min) / (y_max - y_min) as f32;
+            edges.push((y_min, y_max, x_at_min.round() as i64, dx as i64));
+        }
+        for &(y_min, y_max, x_at_min, step) in &edges {
+            let start = (y_min as i64).max(-limit);
+            let end = (y_max as i64).min(limit);
+            if start >= end {
+                continue;
+            }
+            for scan_y in start..end {
+                let x = x_at_min
+                    .saturating_add(step.saturating_mul(scan_y - y_min as i64))
+                    .clamp(-limit, limit);
+                rows.entry(scan_y as i32).or_default().push(x as i32);
+            }
+        }
+    }
+    let mut spans = Vec::new();
+    for (y, mut crossings) in rows {
+        crossings.sort_unstable();
+        for chunk in crossings.chunks(2) {
+            if chunk.len() == 2 && chunk[0] <= chunk[1] {
+                // `fill_polygon` paints `x0..=x1`, so the half-open run ends
+                // at `x1 + 1` and covers the same pixels.
+                spans.push((y, chunk[0], chunk[1].saturating_add(1)));
+            }
+        }
+    }
+    spans
+}
+
+/// After an unclipped draw into `pixels`, restore every pixel *outside*
+/// `region` from `snapshot`.  This applies the scanned clip as a real
+/// per-pixel test without constraining the compositing arithmetic of the
+/// draw itself.
+pub fn restore_outside_region(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    snapshot: &[u8],
+    region: &GdiplusRegion,
+) {
+    restore_region_pixels(pixels, width, height, stride, snapshot, region, false);
+}
+
+/// Restore every pixel *inside* `region` from `snapshot` (used when filling an
+/// inverted region by painting the surface and then taking the hole back).
+pub fn restore_inside_region(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    snapshot: &[u8],
+    region: &GdiplusRegion,
+) {
+    restore_region_pixels(pixels, width, height, stride, snapshot, region, true);
+}
+
+fn restore_region_pixels(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    snapshot: &[u8],
+    region: &GdiplusRegion,
+    inside: bool,
+) {
+    if snapshot.len() != pixels.len() {
+        return;
+    }
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if region.contains(x, y) != inside {
+                continue;
+            }
+            let row = if stride < 0 {
+                (height as i64 - 1 - y as i64) * stride as i64
+            } else {
+                y as i64 * stride as i64
+            };
+            let idx = row.saturating_add(x as i64 * 4);
+            if idx < 0 {
+                continue;
+            }
+            let idx = idx as usize;
+            if idx + 4 <= pixels.len() && idx + 4 <= snapshot.len() {
+                pixels[idx..idx + 4].copy_from_slice(&snapshot[idx..idx + 4]);
+            }
+        }
+    }
+}
+
+/// Fill a scanned region with `color`.  Finite regions paint their runs
+/// directly; inverted regions paint the visible surface and take the finite
+/// hole back from a snapshot.
+pub fn fill_region(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    region: &GdiplusRegion,
+    color: u32,
+    compositing_mode: u32,
+) {
+    if region.inverted {
+        let snapshot = pixels.to_vec();
+        fill_rect(
+            pixels,
+            width,
+            height,
+            stride,
+            0.0,
+            0.0,
+            width as f32,
+            height as f32,
+            color,
+            compositing_mode,
+        );
+        restore_inside_region(pixels, width, height, stride, &snapshot, region);
+        return;
+    }
+    for &(y, x0, x1) in &region.spans {
+        if x0 >= x1 {
+            continue;
+        }
+        fill_rect(
+            pixels,
+            width,
+            height,
+            stride,
+            x0 as f32,
+            y as f32,
+            (x1 - x0) as f32,
+            1.0,
+            color,
+            compositing_mode,
+        );
     }
 }
 

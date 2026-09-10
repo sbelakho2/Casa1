@@ -32,9 +32,9 @@
 //! [`SteamAcceptanceResult`] plus run identity — the CI workflow consumes
 //! this line; it never re-derives S0-S13 by regex over stdout.
 //!
-//! Gated twice: `#[ignore]` keeps it out of the default suite, and the
-//! `CASA1_STEAM_E2E=1` environment gate skips it (with a message) even
-//! when `--ignored` forces the run.
+//! Gated at runtime: the `CASA1_STEAM_E2E=1` environment gate skips it
+//! (with a message) when the live E2E environment is absent; the default
+//! suite runs the capability probe and skips cleanly.
 //!
 //! Usage:
 //! ```bash
@@ -85,7 +85,6 @@ fn e2e_ge_root() -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires live Steam E2E environment"]
 fn t41_steam_e2e_acceptance() {
     if !steam_e2e_gate() {
         return;
