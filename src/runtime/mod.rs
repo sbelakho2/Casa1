@@ -75,14 +75,13 @@ use crate::user32::DeviceAxis;
 use crate::user32::DirectInputDataFormat;
 use crate::user32::RawInputRegistration;
 use crate::user32::{
-    GDIPLUS_DASH_STYLE_SOLID, GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_JOIN_MITER,
-    GDIPLUS_PIXEL_FORMAT_32BPP_ARGB, GWL_WNDPROC, GdiplusBitmap, GdiplusBrush, GdiplusContainer,
-    GdiplusFont, GdiplusFontFamily, GdiplusGraphicsState, GdiplusImage, GdiplusImageAttributes,
-    GdiplusLineBrush, GdiplusMatrix, GdiplusObject, GdiplusPath, GdiplusPathElement, GdiplusPen,
-    GdiplusPointF, GdiplusSolidFill, GdiplusStatus, GdiplusTextureBrush, KeyModifiers,
-    KeyboardDevice, KeyboardLayoutId, Message, MessageKind, MouseButton, MouseButtonEvent,
-    MouseDevice, Rect, User32Subsystem, WS_VISIBLE, WindowClassInfo, WindowPlacement,
-    WindowPreview,
+    GDIPLUS_DASH_STYLE_SOLID, GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_JOIN_MITER, GWL_WNDPROC,
+    GdiplusBitmap, GdiplusBrush, GdiplusContainer, GdiplusGraphicsState, GdiplusImage,
+    GdiplusImageAttributes, GdiplusLineBrush, GdiplusMatrix, GdiplusObject, GdiplusPath,
+    GdiplusPathElement, GdiplusPen, GdiplusPointF, GdiplusSolidFill, GdiplusStatus,
+    GdiplusTextureBrush, KeyModifiers, KeyboardDevice, KeyboardLayoutId, Message, MessageKind,
+    MouseButton, MouseButtonEvent, MouseDevice, Rect, User32Subsystem, WS_VISIBLE, WindowClassInfo,
+    WindowPlacement, WindowPreview,
 };
 use crate::util;
 use crate::win32::{
@@ -5865,6 +5864,11 @@ pub enum HostThunk {
     MfClockStart,
     MfClockStop,
     MfSessionGetClock,
+    MfRateControlSetRate,
+    MfRateControlGetRate,
+    MfRateSupportGetSlowestRate,
+    MfRateSupportGetFastestRate,
+    MfRateSupportIsRateSupported,
     MfSessionStart,
     MfSessionPause,
     MfSessionStop,
@@ -11983,7 +11987,7 @@ impl PeHostRuntime {
                     }
                     // bottom-up: row (height-1-ty)
                     let d_row = bitmap.height - 1 - ty;
-                    let bpp = bitmap.bpp.max(1);
+                    let bpp = gdiplus_memory_bpp_bytes(&bitmap);
                     let d_idx = (d_row * bmp_w + tx) * bpp;
                     let s_idx = (sy * src_w + sx) * 4;
                     if d_idx + bpp <= bitmap.bytes.len() && s_idx + 3 < src_pixels.len() {
@@ -12033,7 +12037,7 @@ impl PeHostRuntime {
         let (_obj, bitmap) = self.refresh_dc_bitmap(memory, hdc)?;
         let w = bitmap.width;
         let h = bitmap.height;
-        let bpp = bitmap.bpp.max(1);
+        let bpp = gdiplus_memory_bpp_bytes(&bitmap);
         let mut out = vec![0u8; w * h * 4];
         // Convert native (bottom-up) bitmap → top-down BGRA.
         for y in 0..h {
@@ -12142,7 +12146,7 @@ impl PeHostRuntime {
             if x >= bitmap.width || y >= bitmap.height {
                 return 0xFFFF_FFFF;
             }
-            let bpp = bitmap.bpp.max(1);
+            let bpp = gdiplus_memory_bpp_bytes(&bitmap);
             // Bitmaps are bottom-up: row 0 is the bottom of the image.
             let row = bitmap.height - 1 - y;
             let index = (row * bitmap.width + x) * bpp;
@@ -12213,7 +12217,7 @@ impl PeHostRuntime {
             if x >= bitmap.width || y >= bitmap.height {
                 return 0xFFFF_FFFF;
             }
-            let bpp = bitmap.bpp.max(1);
+            let bpp = gdiplus_memory_bpp_bytes(&bitmap);
             let row = bitmap.height - 1 - y;
             let index = (row * bitmap.width + x) * bpp;
             if index + bpp > bitmap.bytes.len() {
@@ -28888,7 +28892,7 @@ impl PeHostRuntime {
                     self.push_trace("ole32", "CoCreateGuid", BTreeMap::new(), json!(0));
                 }
             }
-            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceControl | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceEvents | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MftTransformUnsupported) => {
+            ref thunk @ (HostThunk::MfSessionSetTopology | HostThunk::MfSessionGetSessionCapabilities | HostThunk::MfSessionGetFullTopology | HostThunk::MfSessionGetDescriptorFromTopology | HostThunk::MfSinkWriterSetInputMediaType | HostThunk::MfSinkWriterFlush | HostThunk::MfSinkWriterGetStatistics | HostThunk::MfSinkWriterSendStreamSample | HostThunk::MfSinkWriterNotifyEndOfSegment | HostThunk::MfSinkWriterGetServiceForStream | HostThunk::IDispatchGetTypeInfoCount | HostThunk::IDispatchGetTypeInfo | HostThunk::MfMediaSourceGetCharacteristics | HostThunk::MfMediaSourceCreatePresentationDescriptor | HostThunk::MfMediaSourceControl | HostThunk::MfMediaSourceShutdown | HostThunk::MfMediaSourceEvents | HostThunk::MfSourceResolverBegin | HostThunk::MftStreamAttributes | HostThunk::MftFixedStreams | HostThunk::MftProcessEvent | HostThunk::MfStartup | HostThunk::MfShutdown | HostThunk::MfRequireProtectedEnvironment | HostThunk::MfGetService | HostThunk::MfAddPeriodicCallback | HostThunk::MfCancelPeriodicCallback | HostThunk::MfGetSystemTime | HostThunk::MfCreateAttributes | HostThunk::MfCreateMediaType | HostThunk::MfCreateMemoryBuffer | HostThunk::MfCreateSample | HostThunk::MfCreateEventQueue | HostThunk::MfCreatePresentationClock | HostThunk::MfCreateTopology | HostThunk::MfCreateTopologyNode | HostThunk::MfCreateSourceResolver | HostThunk::MfCreateMediaSession | HostThunk::MfCreateSourceReaderFromUrl | HostThunk::MfCreateSourceReaderFromByteStream | HostThunk::MfCreateSinkWriterFromUrl | HostThunk::MfCreatePresentationDescriptor | HostThunk::MfCreateMfByteStreamOnStream | HostThunk::MfCreateMediaBufferFromMediaType | HostThunk::MfCreateDxgiDeviceManager | HostThunk::MfDxgiDeviceManagerResetDevice | HostThunk::MfDxgiDeviceManagerOpenDeviceHandle | HostThunk::MfDxgiDeviceManagerCloseDeviceHandle | HostThunk::MfDxgiDeviceManagerTestDevice | HostThunk::MfDxgiDeviceManagerLockDevice | HostThunk::MfDxgiDeviceManagerUnlockDevice | HostThunk::MfDxgiDeviceManagerGetVideoService | HostThunk::MftEnumEx | HostThunk::MfEnumDeviceSources | HostThunk::MfCreateSinkWriterFromMediaSink | HostThunk::MfCreateSourceReaderFromMfByteStream | HostThunk::MfAttrGetCount | HostThunk::MfAttrGetItemByIndex | HostThunk::MfAttrGetUint32 | HostThunk::MfAttrGetUint64 | HostThunk::MfAttrGetDouble | HostThunk::MfAttrGetGuid | HostThunk::MfAttrGetStringLength | HostThunk::MfAttrGetString | HostThunk::MfAttrGetBlobSize | HostThunk::MfAttrGetBlob | HostThunk::MfAttrSetUint32 | HostThunk::MfAttrSetUint64 | HostThunk::MfAttrSetDouble | HostThunk::MfAttrSetGuid | HostThunk::MfAttrSetString | HostThunk::MfAttrSetBlob | HostThunk::MfAttrDeleteItem | HostThunk::MfMediaTypeGetMajorType | HostThunk::MfMediaTypeIsCompressedFormat | HostThunk::MfBufferGetMaxLength | HostThunk::MfBufferLock | HostThunk::MfBufferUnlock | HostThunk::MfBufferGetCurrentLength | HostThunk::MfBufferSetCurrentLength | HostThunk::MfSampleGetBufferCount | HostThunk::MfSampleGetBufferByIndex | HostThunk::MfSampleAddBuffer | HostThunk::MfSampleRemoveBufferByIndex | HostThunk::MfSampleRemoveAllBuffers | HostThunk::MfSampleGetSampleTime | HostThunk::MfSampleSetSampleTime | HostThunk::MfSampleGetSampleDuration | HostThunk::MfSampleSetSampleDuration | HostThunk::MfEventQueueGetEvent | HostThunk::MfEventQueueQueueEvent | HostThunk::MfClockGetTime | HostThunk::MfClockStart | HostThunk::MfClockStop | HostThunk::MfSessionGetClock | HostThunk::MfSessionStart | HostThunk::MfSessionPause | HostThunk::MfSessionStop | HostThunk::MfSessionClose | HostThunk::MfSessionShutdown | HostThunk::MfSourceReaderGetCurrentMediaType | HostThunk::MfSourceReaderGetNativeMediaType | HostThunk::MfSourceReaderReadSample | HostThunk::MfSinkWriterAddStream | HostThunk::MfSinkWriterBeginWriting | HostThunk::MfSinkWriterWriteSample | HostThunk::MfSinkWriterEndWriting | HostThunk::MfByteStreamGetCurrentPosition | HostThunk::MfByteStreamRead | HostThunk::MfByteStreamGetLength | HostThunk::MfTopologyAddNode | HostThunk::MfTopologyGetNodeCount | HostThunk::MfTopologyNodeGetObject | HostThunk::MfTopologyNodeSetObject | HostThunk::MfSourceResolverCreateObjectFromUrl | HostThunk::MfAttrGetItem | HostThunk::MfAttrGetItemType | HostThunk::MfAttrCompareItem | HostThunk::MfAttrCompare | HostThunk::MfAttrGetAllocatedString | HostThunk::MfAttrGetAllocatedBlob | HostThunk::MfAttrGetUnknown | HostThunk::MfAttrSetItem | HostThunk::MfAttrSetUnknown | HostThunk::MfAttrDeleteAllItems | HostThunk::MfAttrLockStore | HostThunk::MfAttrUnlockStore | HostThunk::MfAttrCopyAllItems | HostThunk::MfSampleSetSampleFlags | HostThunk::MfSampleGetSampleFlags | HostThunk::MfSampleGetTotalLength | HostThunk::MfSampleCopyToBuffer | HostThunk::MfSampleConvertToContiguousBuffer | HostThunk::MfMediaTypeIsEqual | HostThunk::MfMediaTypeGetRepresentation | HostThunk::MfMediaTypeFreeRepresentation | HostThunk::MfPresentationDescriptorGetStreamDescriptorCount | HostThunk::MfEventGetType | HostThunk::MfActivateGetCount | HostThunk::MfActivateGetItem | HostThunk::MfActivateGetGuid | HostThunk::MfActivateGetString | HostThunk::MfActivateActivateObject | HostThunk::MfActivateShutdownObject | HostThunk::MfTransformGetStreamLimits | HostThunk::MfTransformGetStreamCounts | HostThunk::MfTransformGetStreamIds | HostThunk::MfTransformGetStreamInfo | HostThunk::MfTransformGetAttributes | HostThunk::MfTransformGetInputAvailableType | HostThunk::MfTransformGetOutputAvailableType | HostThunk::MfTransformSetInputType | HostThunk::MfTransformSetOutputType | HostThunk::MfTransformGetInputCurrentType | HostThunk::MfTransformGetOutputCurrentType | HostThunk::MfTransformGetInputStatus | HostThunk::MfTransformGetOutputStatus | HostThunk::MfTransformProcessInput | HostThunk::MfTransformProcessOutput | HostThunk::MfTransformProcessMessage | HostThunk::MfRateControlSetRate | HostThunk::MfRateControlGetRate | HostThunk::MfRateSupportGetSlowestRate | HostThunk::MfRateSupportGetFastestRate | HostThunk::MfRateSupportIsRateSupported | HostThunk::MftTransformUnsupported) => {
 
                 self.dispatch_mf_or_com(thunk, state, memory)?;
             }
@@ -28988,7 +28992,7 @@ impl PeHostRuntime {
             ref thunk @ (HostThunk::AtlModuleAddTermFunc | HostThunk::AtlModuleLoadTypeLib | HostThunk::AtlModuleRegisterServer | HostThunk::AtlModuleRegisterTypeLib | HostThunk::AtlModuleUnregisterServer | HostThunk::AtlModuleUnregisterTypeLib | HostThunk::AtlModuleUpdateRegistryFromResource | HostThunk::WicCreateAvifDecoder | HostThunk::WicCreateAvifEncoder | HostThunk::WicCreateHeifDecoder | HostThunk::WicCreateHeifEncoder | HostThunk::WicCreateWebpDecoder | HostThunk::WicCreateWebpEncoder | HostThunk::DllInstall | HostThunk::OverlayCreateHook | HostThunk::OverlayHookWindow | HostThunk::OverlayPresent | HostThunk::OverlayReset | HostThunk::OverlayUnhookWindow | HostThunk::CndInit | HostThunk::MtxDestroy | HostThunk::MtxInit | HostThunk::MtxLock | HostThunk::MtxUnlock | HostThunk::SteamBGetSteamId | HostThunk::SteamBIsSubscribedApp | HostThunk::SteamBLoggedOn | HostThunk::SteamNotifyOfLogin | HostThunk::SteamNotifyOfLogoff | HostThunk::CCSpecificHandler | HostThunk::CurrentException | HostThunk::CurrentExceptionContext | HostThunk::ProcessingThrow | HostThunk::Chkstk | HostThunk::CertSrvBackupEnd | HostThunk::CertSrvBackupPrepare | HostThunk::CertSrvRestoreEnd | HostThunk::CertSrvRestorePrepare | HostThunk::D3dx10CompileFromFile | HostThunk::D3dx10CreateTextureFromFileW | HostThunk::D3dx10GetImageInfoFromFile | HostThunk::D3dx10SaveTextureToMemory | HostThunk::GameuxShfolderpath | HostThunk::GameExplorerInitialize | HostThunk::GameExplorerSetUserAccess | HostThunk::GameExplorerVerifyAccess | HostThunk::ClrCreateManagedInstance | HostThunk::GetClrRuntimeHost | HostThunk::CreateHtmlPropertyPage | HostThunk::IeFrameFactoryConstructor | HostThunk::ShowHtmlDialogEx | HostThunk::IhtmlDocument2 | HostThunk::DsBind | HostThunk::DsBindWithCred | HostThunk::DsMakeSpnW | HostThunk::DsUnbind | HostThunk::AdsBuildEnumerator | HostThunk::AdsGetObject | HostThunk::AdsOpenObject | HostThunk::CertSrvAdminGetCa | HostThunk::CertSrvAdminGetCert | HostThunk::CertSrvAdminSetCa | HostThunk::D3d10CreateDevice1 | HostThunk::D3d10CreateDeviceAndSwapChain1 | HostThunk::Dhcpv6ReleaseParams | HostThunk::Dhcpv6RenewParams | HostThunk::Dhcpv6RequestParams | HostThunk::GetdfDIJoystick | HostThunk::FwpsFilter | HostThunk::FwpsOpenToken | HostThunk::FwpsQueryTokenInformation | HostThunk::IeGetFrameComponent | HostThunk::IeGetWriteableHlink | HostThunk::IeHlink | HostThunk::LoadPerfCounterTextStringsW | HostThunk::SetServiceAsTrusted | HostThunk::UnloadPerfCounterTextStringsW | HostThunk::MsiFormatRecordW | HostThunk::MsiGetLastErrorRecord | HostThunk::MsiProcessMessage | HostThunk::ApplyPatchToFileExW | HostThunk::ApplyPatchToFileW | HostThunk::GetPatchFileSignature | HostThunk::PrintUiEntry | HostThunk::PrintUiToDevice | HostThunk::PrintUiToFile | HostThunk::SamCloseHandle | HostThunk::SamConnect | HostThunk::SamOpenDomain | HostThunk::ScGenerateRelativeName | HostThunk::ScRemoveAllPrivileges | HostThunk::ScSetSecurityDescriptor | HostThunk::RnrCancelQuery | HostThunk::RnrInitialize | HostThunk::RnrQuery | HostThunk::WinStationCloseServer | HostThunk::WinStationEnumerate | HostThunk::WinStationOpenServer | HostThunk::CreateFx) => {
                 self.dispatch_long_tail(thunk, state, memory)?;
             }
-            ref thunk @ (HostThunk::ShCreateExplorerTaskband | HostThunk::ShOpenFolderWindow | HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::CertSelectCertificate | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::ShCreateLinks | HostThunk::ShNavigateToFavorite | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
+            ref thunk @ (HostThunk::CredSspGetClientCredential | HostThunk::CredSspGetServerCredential | HostThunk::DirectPlayCreate | HostThunk::DirectPlayEnumerateW | HostThunk::KerbLogon | HostThunk::KerbRetrieveTicket | HostThunk::NetGetAnyDcName | HostThunk::NetGetDcName | HostThunk::NetWkstaSetInfo | HostThunk::X3dAudioInitialize | HostThunk::Xact3CreateEngine | HostThunk::Xact3CreateEngineWithFlags | HostThunk::NtCreateFileMapping | HostThunk::ImfAsyncResult | HostThunk::ImfGetService | HostThunk::BrowserServerEnum | HostThunk::GdipCreateGraphics | HostThunk::ActivateAudioInterfaceAsync | HostThunk::NetServerGetInfo | HostThunk::DsBindToTopology | HostThunk::IPersistFile | HostThunk::IActiveScript | HostThunk::ID3d12Heap | HostThunk::ImfMediaSink) => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
             }
             // ── the real dispatches that left the final-scraps group: each
@@ -29005,6 +29009,26 @@ impl PeHostRuntime {
             }
             HostThunk::CngAuditLog => {
                 self.dispatch_cng_audit_log(state, memory)?;
+            }
+            // ── the certificate picker: real selection over the runtime's
+            //    certificate-store state (see `dispatch::final_scraps`) ──
+            HostThunk::CertSelectCertificate => {
+                self.dispatch_cert_select_certificate(state, memory)?;
+            }
+            // ── the shell surfaces: real shell links, the favorites store,
+            //    the folder-window registry and the taskband registry (see
+            //    `dispatch::final_scraps` for the implementations) ──
+            HostThunk::ShCreateLinks => {
+                self.dispatch_sh_create_links(state, memory)?;
+            }
+            HostThunk::ShNavigateToFavorite => {
+                self.dispatch_sh_navigate_to_favorite(state, memory)?;
+            }
+            HostThunk::ShOpenFolderWindow => {
+                self.dispatch_sh_open_folder_window(state, memory)?;
+            }
+            HostThunk::ShCreateExplorerTaskband => {
+                self.dispatch_sh_create_explorer_taskband(state, memory)?;
             }
             ref thunk @ (HostThunk::MsftEditRegisterClass | HostThunk::RichEditAnsiWndClass) => {
                 self.dispatch_richedit_register_class(thunk, state, memory)?;
@@ -57817,13 +57841,17 @@ impl PeHostRuntime {
                 let y1 = f32::from_bits(arg(3) as u32);
                 let x2 = f32::from_bits(arg(4) as u32);
                 let y2 = f32::from_bits(arg(5) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x1, y1, x2, y2, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let status = match self.gdiplus_pen_style(pen_handle, (x1 + x2) * 0.5, (y1 + y2) * 0.5) {
+                    Some(style) => {
+                        let pts = [
+                            GdiplusPointF { x: x1, y: y1 },
+                            GdiplusPointF { x: x2, y: y2 },
+                        ];
+                        self.gdiplus_paint_stroke(memory, graphics, &style, &pts, false)
+                    }
+                    None => GdiplusStatus::InvalidParameter,
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawLines => {
@@ -57831,15 +57859,19 @@ impl PeHostRuntime {
                 let pen_handle = arg(1);
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
-                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
-                self.last_error = 0;
+                if count < 2 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                    let mid = pts.get(pts.len() / 2).copied().unwrap_or(GdiplusPointF { x: 0.0, y: 0.0 });
+                    let status = match self.gdiplus_pen_style(pen_handle, mid.x, mid.y) {
+                        Some(style) => self.gdiplus_paint_stroke(memory, graphics, &style, &pts, false),
+                        None => GdiplusStatus::InvalidParameter,
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipDrawRectangle => {
                 let graphics = arg(0);
@@ -57848,13 +57880,19 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(3) as u32);
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let status = match self.gdiplus_pen_style(pen_handle, x + w * 0.5, y + h * 0.5) {
+                    Some(style) => {
+                        let pts = [
+                            GdiplusPointF { x, y },
+                            GdiplusPointF { x: x + w, y },
+                            GdiplusPointF { x: x + w, y: y + h },
+                            GdiplusPointF { x, y: y + h },
+                        ];
+                        self.gdiplus_paint_stroke(memory, graphics, &style, &pts, true)
+                    }
+                    None => GdiplusStatus::InvalidParameter,
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipFillRectangle => {
@@ -57864,13 +57902,44 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(3) as u32);
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
-                let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(color), Some(info)) = (
+                    self.gdiplus_brush_color(brush_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let cm = info.state.cm;
+                let status = if gdiplus_matrix_axis_aligned(&info.state.world) {
+                    let (rx, ry, rw, rh) =
+                        gdiplus_matrix_rect_bounds(&info.state.world, x, y, w, h);
+                    let mut vis = (rx, ry, rw, rh);
+                    if let Some(clip) = info.state.clip {
+                        let (cx, cy, cw, ch) = gdiplus_matrix_rect_bounds(&info.state.world, clip.0, clip.1, clip.2, clip.3);
+                        let nx0 = vis.0.max(cx);
+                        let ny0 = vis.1.max(cy);
+                        let nx1 = (vis.0 + vis.2).min(cx + cw);
+                        let ny1 = (vis.1 + vis.3).min(cy + ch);
+                        vis = (nx0, ny0, (nx1 - nx0).max(0.0), (ny1 - ny0).max(0.0));
+                    }
+                    if vis.2 <= 0.0 || vis.3 <= 0.0 {
+                        GdiplusStatus::Ok
+                    } else {
+                        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                            crate::gdiplus_render::fill_rect(px, pw, ph, ps, vis.0, vis.1, vis.2, vis.3, color, cm);
+                        })
+                    }
+                } else {
+                    let pts = vec![
+                        GdiplusPointF { x, y },
+                        GdiplusPointF { x: x + w, y },
+                        GdiplusPointF { x: x + w, y: y + h },
+                        GdiplusPointF { x, y: y + h },
+                    ];
+                    self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawEllipse => {
@@ -57880,13 +57949,28 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(3) as u32);
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(style), Some(info)) = (
+                    self.gdiplus_pen_style(pen_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                    && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::draw_ellipse(
+                            px, pw, ph, ps, x, y, w, h, style.color, style.width_px, style.cm, style.sm,
+                        );
+                    })
+                } else {
+                    let pts = crate::gdiplus_render::ellipse_points(x, y, w, h);
+                    self.gdiplus_paint_stroke(memory, graphics, &style, &pts, true)
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipFillEllipse => {
@@ -57896,13 +57980,37 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(3) as u32);
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
-                let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::fill_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(color), Some(info)) = (
+                    self.gdiplus_brush_color(brush_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let cm = info.state.cm;
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::fill_ellipse(px, pw, ph, ps, x, y, w, h, color, cm);
+                    })
+                } else if gdiplus_matrix_axis_aligned(&info.state.world) {
+                    let (rx, ry, rw, rh) =
+                        gdiplus_matrix_rect_bounds(&info.state.world, x, y, w, h);
+                    if info.state.clip.is_none() {
+                        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                            crate::gdiplus_render::fill_ellipse(px, pw, ph, ps, rx, ry, rw, rh, color, cm);
+                        })
+                    } else {
+                        let pts = crate::gdiplus_render::ellipse_points(rx, ry, rw, rh);
+                        self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                    }
+                } else {
+                    let pts = crate::gdiplus_render::ellipse_points(x, y, w, h);
+                    self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawPie => {
@@ -57914,13 +58022,31 @@ impl PeHostRuntime {
                 let h = f32::from_bits(arg(5) as u32);
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(style), Some(info)) = (
+                    self.gdiplus_pen_style(pen_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                    && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::draw_pie(
+                            px, pw, ph, ps, x, y, w, h, start_angle, sweep_angle,
+                            style.color, style.width_px, style.cm, style.sm,
+                        );
+                    })
+                } else {
+                    let pts = crate::gdiplus_render::arc_to_line_segments(
+                        x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0, start_angle, sweep_angle, true,
+                    );
+                    self.gdiplus_paint_stroke(memory, graphics, &style, &pts, true)
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipFillPie => {
@@ -57932,13 +58058,28 @@ impl PeHostRuntime {
                 let h = f32::from_bits(arg(5) as u32);
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
-                let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::fill_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, cm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(color), Some(info)) = (
+                    self.gdiplus_brush_color(brush_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let cm = info.state.cm;
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::fill_pie(px, pw, ph, ps, x, y, w, h, start_angle, sweep_angle, color, cm);
+                    })
+                } else {
+                    let pts = crate::gdiplus_render::arc_to_line_segments(
+                        x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0, start_angle, sweep_angle, true,
+                    );
+                    self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawPolygon => {
@@ -57946,18 +58087,19 @@ impl PeHostRuntime {
                 let pen_handle = arg(1);
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
-                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
-                            if pts.len() >= 2 {
-                                crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm, sm);
-                            }
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
-                self.last_error = 0;
+                if count < 3 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                    let mid = pts.get(pts.len() / 2).copied().unwrap_or(GdiplusPointF { x: 0.0, y: 0.0 });
+                    let status = match self.gdiplus_pen_style(pen_handle, mid.x, mid.y) {
+                        Some(style) => self.gdiplus_paint_stroke(memory, graphics, &style, &pts, true),
+                        None => GdiplusStatus::InvalidParameter,
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipFillPolygon => {
                 let graphics = arg(0);
@@ -57965,15 +58107,37 @@ impl PeHostRuntime {
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
                 let _fill_mode = arg(4) as u32;
-                let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
-                            crate::gdiplus_render::fill_polygon(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, cm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
-                self.last_error = 0;
+                if count < 3 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                    let mut center = GdiplusPointF { x: 0.0, y: 0.0 };
+                    for p in &pts {
+                        center.x += p.x / pts.len() as f32;
+                        center.y += p.y / pts.len() as f32;
+                    }
+                    let (Some(color), Some(info)) = (
+                        self.gdiplus_brush_color(brush_handle, center.x, center.y),
+                        self.gdiplus_graphics_info(graphics),
+                    ) else {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    };
+                    let cm = info.state.cm;
+                    let status = if gdiplus_matrix_is_identity(&info.state.world)
+                        && info.state.clip.is_none()
+                    {
+                        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                            crate::gdiplus_render::fill_polygon(px, pw, ph, ps, &pts, color, cm);
+                        })
+                    } else {
+                        self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipDrawArc => {
                 let graphics = arg(0);
@@ -57984,13 +58148,31 @@ impl PeHostRuntime {
                 let h = f32::from_bits(arg(5) as u32);
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_arc(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let (Some(style), Some(info)) = (
+                    self.gdiplus_pen_style(pen_handle, x + w * 0.5, y + h * 0.5),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                    && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::draw_arc(
+                            px, pw, ph, ps, x, y, w, h, start_angle, sweep_angle,
+                            style.color, style.width_px, style.cm, style.sm,
+                        );
+                    })
+                } else {
+                    let pts = crate::gdiplus_render::arc_to_line_segments(
+                        x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0, start_angle, sweep_angle, false,
+                    );
+                    self.gdiplus_paint_stroke(memory, graphics, &style, &pts, false)
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawCurve => {
@@ -57999,15 +58181,19 @@ impl PeHostRuntime {
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
                 let _tension = f32::from_bits(arg(4) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
-                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
-                self.last_error = 0;
+                if count < 2 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                    let mid = pts.get(pts.len() / 2).copied().unwrap_or(GdiplusPointF { x: 0.0, y: 0.0 });
+                    let status = match self.gdiplus_pen_style(pen_handle, mid.x, mid.y) {
+                        Some(style) => self.gdiplus_paint_stroke(memory, graphics, &style, &pts, false),
+                        None => GdiplusStatus::InvalidParameter,
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipDrawClosedCurve => {
                 let graphics = arg(0);
@@ -58015,18 +58201,19 @@ impl PeHostRuntime {
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
                 let _tension = f32::from_bits(arg(4) as u32);
-                let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
-                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
-                            if pts.len() >= 2 {
-                                crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm, sm);
-                            }
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
-                self.last_error = 0;
+                if count < 3 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                    let mid = pts.get(pts.len() / 2).copied().unwrap_or(GdiplusPointF { x: 0.0, y: 0.0 });
+                    let status = match self.gdiplus_pen_style(pen_handle, mid.x, mid.y) {
+                        Some(style) => self.gdiplus_paint_stroke(memory, graphics, &style, &pts, true),
+                        None => GdiplusStatus::InvalidParameter,
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipDrawString => {
                 let graphics = arg(0);
@@ -58034,29 +58221,81 @@ impl PeHostRuntime {
                 let length = arg(2) as i32;
                 let font_handle = arg(3);
                 let layout_rect_ptr = arg(4);
-                let _format_ptr = arg(5);
+                let format_ptr = arg(5);
                 let brush_handle = arg(6);
-                // Read font size and layout rect BEFORE getting mutable bitmap
-                let font_size = self.user32.gdiplus_state.get(font_handle).and_then(|obj| {
-                    if let GdiplusObject::Font(f) = obj { Some(f.em_size) } else { None }
-                }).unwrap_or(12.0);
                 let text = read_guest_utf16_string(memory, string_ptr, length);
-                let (lx, ly, _lw, _lh) = if layout_rect_ptr != 0 {
+                let Some(font) = (match self.user32.gdiplus_state.get(font_handle) {
+                    Some(GdiplusObject::Font(f)) => Some((f.em_size, f.unit)),
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let em_px = gdiplus_unit_to_pixels(font.0, font.1);
+                let (lx, ly, lw, lh) = if layout_rect_ptr != 0 {
                     let lx = f32::from_bits(memory.read_u32(layout_rect_ptr).unwrap_or(0));
                     let ly = f32::from_bits(memory.read_u32(layout_rect_ptr + 4).unwrap_or(0));
                     let lw = f32::from_bits(memory.read_u32(layout_rect_ptr + 8).unwrap_or(100));
                     let lh = f32::from_bits(memory.read_u32(layout_rect_ptr + 12).unwrap_or(20));
                     (lx, ly, lw, lh)
                 } else {
-                    (0.0, 0.0, 100.0, 20.0)
+                    (0.0, 0.0, 0.0, 0.0)
                 };
-                let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            crate::gdiplus_render::draw_string(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &text, lx, ly, font_size, col, cm);
-                        }
-                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                let format_flags = if format_ptr != 0 {
+                    read_u32(memory, format_ptr).unwrap_or(0)
+                } else {
+                    0
+                };
+                let color = match self.gdiplus_brush_color(brush_handle, lx, ly) {
+                    Some(c) => c,
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if !gdiplus_matrix_axis_aligned(&info.state.world) {
+                    // The lattice text engine rasterises axis-aligned text.
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let (dx, dy) = gdiplus_matrix_apply(&info.state.world, lx, ly);
+                let scale = gdiplus_matrix_scale(&info.state.world);
+                let em_px = if scale > 0.0 && (scale - 1.0).abs() > 1e-4 {
+                    em_px * scale
+                } else {
+                    em_px
+                };
+                let cm = info.state.cm;
+                // Default StringFormat clips into the layout rect unless the
+                // NO_CLIP flag is set; the layout rect is mapped like geometry.
+                let text_clip = if format_flags & 0x0000_4000 != 0 {
+                    None
+                } else if layout_rect_ptr == 0 {
+                    None
+                } else {
+                    let (cx, cy) = gdiplus_matrix_apply(&info.state.world, lx, ly);
+                    let (cx2, cy2) = gdiplus_matrix_apply(&info.state.world, lx + lw, ly + lh);
+                    Some((
+                        cx.min(cx2),
+                        cy.min(cy2),
+                        (cx2 - cx).abs(),
+                        (cy2 - cy).abs(),
+                    ))
+                };
+                let status = self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                    gdiplus_draw_lattice_text(
+                        px, pw, ph, ps, &text, dx, dy, em_px, color, cm, text_clip,
+                    );
+                });
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Brushes ────────────────────────────────────────────────────────
@@ -58115,75 +58354,54 @@ impl PeHostRuntime {
             HostThunk::GdipFillRegion => {
                 let graphics = arg(0);
                 let brush_handle = arg(1);
-                let _region = arg(2);
-                // Extract brush color and clip rect BEFORE getting mutable bitmap
-                let brush_color = {
-                    // Phase 1: check if this is a texture brush and get image handle
-                    let tex_image_handle = self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
-                        if let GdiplusObject::Brush(brush) = obj {
-                            match brush.as_ref() {
-                                GdiplusBrush::Texture(tb) => Some(tb.image_handle),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    });
-                    // Phase 2: look up texture data separately (no borrow conflict)
-                    let tex_data: Option<(&[u8], u32, u32, i32)> =
-                        tex_image_handle.and_then(|img_h| {
-                            self.user32.gdiplus_state.get(img_h).and_then(|obj| {
-                                if let GdiplusObject::Image(img) = obj {
-                                    match img.as_ref() {
-                                        GdiplusImage::Bitmap(bmp) => {
-                                            Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                    // Phase 3: compute the colour (borrow state again, quickly)
-                    self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
-                        if let GdiplusObject::Brush(brush) = obj {
-                            Some(crate::gdiplus_render::brush_color_at(
-                                brush, 0.0, 0.0, tex_data,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                }.unwrap_or(0x00000000);  // was 0xFFFF00FF (opaque magenta sentinel) — paint nothing rather than purple on brush-lookup miss
-                let clip_rect = self.user32.gdiplus_state.get(graphics).and_then(|obj| {
-                    if let GdiplusObject::Graphics(gfx) = obj {
-                        gfx.clip_rect
-                    } else {
-                        None
+                let region = arg(2);
+                let color = match self.gdiplus_brush_color(brush_handle, 0.0, 0.0) {
+                    Some(c) => c,
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
                     }
-                });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            if let Some((cx, cy, cw, ch)) = clip_rect {
-                                crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, cx, cy, cw, ch, brush_color, cm);
-                            } else {
-                                // No clip rect set: fill entire bitmap
-                                crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, 0.0, 0.0, bmp.width as f32, bmp.height as f32, brush_color, cm);
-                            }
-                        }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let cm = info.state.cm;
+                // The engine's regions are the encodings GdipGetClip writes
+                // (type 0 = infinite, type 1 = rect).  Decode and fill.
+                let status = match self.gdiplus_decode_region(memory, region) {
+                    Err(()) => GdiplusStatus::InvalidParameter,
+                    Ok(None) => {
+                        // Infinite region: fill the whole surface.
+                        let r = self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                            crate::gdiplus_render::fill_rect(px, pw, ph, ps, 0.0, 0.0, pw as f32, ph as f32, color, cm);
+                        });
+                        if r != GdiplusStatus::Ok { r } else { GdiplusStatus::Ok }
+                    }
+                    Ok(Some(rect)) => {
+                        let pts = vec![
+                            GdiplusPointF { x: rect.0, y: rect.1 },
+                            GdiplusPointF { x: rect.0 + rect.2, y: rect.1 },
+                            GdiplusPointF { x: rect.0 + rect.2, y: rect.1 + rect.3 },
+                            GdiplusPointF { x: rect.0, y: rect.1 + rect.3 },
+                        ];
+                        self.gdiplus_paint_fill(memory, graphics, color, &[pts])
+                    }
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Pens ───────────────────────────────────────────────────────────
             HostThunk::GdipCreatePen1 => {
                 let color = arg(0) as u32;
                 let width = f32::from_bits(arg(1) as u32);
-                let _unit = arg(2) as u32;
+                let unit = arg(2) as u32;
                 let pen_ptr = arg(3);
                 let pen = GdiplusPen {
                     width,
+                    unit,
                     color,
                     brush_handle: None,
                     dash_style: GDIPLUS_DASH_STYLE_SOLID,
@@ -58202,10 +58420,11 @@ impl PeHostRuntime {
             HostThunk::GdipCreatePen2 => {
                 let brush_handle = arg(0);
                 let width = f32::from_bits(arg(1) as u32);
-                let _unit = arg(2) as u32;
+                let unit = arg(2) as u32;
                 let pen_ptr = arg(3);
                 let pen = GdiplusPen {
                     width,
+                    unit,
                     color: 0,
                     brush_handle: Some(brush_handle),
                     dash_style: GDIPLUS_DASH_STYLE_SOLID,
@@ -58467,90 +58686,128 @@ impl PeHostRuntime {
                 let graphics = arg(0);
                 let pen_handle = arg(1);
                 let path_handle = arg(2);
-                // Extract pen and path data BEFORE getting mutable bitmap
-                let pen_info = self.user32.gdiplus_state.get(pen_handle).and_then(|obj| {
-                    if let GdiplusObject::Pen(pen) = obj {
-                        Some((crate::gdiplus_render::pen_color(pen, 0.0, 0.0), pen.width.max(1.0)))
-                    } else {
-                        None
+                let path_obj = match self.user32.gdiplus_state.get(path_handle) {
+                    Some(GdiplusObject::Path(p)) => p.clone(),
+                    _ => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
                     }
-                });
-                // Clone path data to avoid borrow conflict
-                let path_clone = self.user32.gdiplus_state.get(path_handle).and_then(|obj| {
-                    if let GdiplusObject::Path(p) = obj {
-                        Some(p.clone())
-                    } else {
-                        None
+                };
+                let mut cx = 0.0f32;
+                let mut cy = 0.0f32;
+                let mut n = 0u32;
+                for element in &path_obj.elements {
+                    match element {
+                        GdiplusPathElement::Line { x1, y1, x2, y2 } => {
+                            cx += x1 + x2; cy += y1 + y2; n += 2;
+                        }
+                        GdiplusPathElement::Rectangle { x, y, w, h } | GdiplusPathElement::Ellipse { x, y, w, h } => {
+                            cx += x + w / 2.0; cy += y + h / 2.0; n += 1;
+                        }
+                        GdiplusPathElement::Pie { x, y, w, h, .. } | GdiplusPathElement::Arc { x, y, w, h, .. } => {
+                            cx += x + w / 2.0; cy += y + h / 2.0; n += 1;
+                        }
+                        _ => {}
                     }
-                });
-                if let (Some((color, pw)), Some(path_obj)) = (pen_info, path_clone)
-                    && let Some((bmp_handle, cm, sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                        && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                            && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                                crate::gdiplus_render::draw_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, color, pw, cm, sm);
-                            }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                }
+                let sample = if n > 0 {
+                    (cx / n as f32, cy / n as f32)
+                } else {
+                    (0.0, 0.0)
+                };
+                let (Some(style), Some(info)) = (
+                    self.gdiplus_pen_style(pen_handle, sample.0, sample.1),
+                    self.gdiplus_graphics_info(graphics),
+                ) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let native = gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                    && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID
+                    && style.start_cap == crate::user32::GDIPLUS_LINE_CAP_FLAT
+                    && style.end_cap == crate::user32::GDIPLUS_LINE_CAP_FLAT
+                    && style.join == crate::user32::GDIPLUS_LINE_JOIN_MITER;
+                let status = if native {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::draw_path(
+                            px, pw, ph, ps, &path_obj, style.color, style.width_px, style.cm, style.sm,
+                        );
+                    })
+                } else {
+                    let mut status = GdiplusStatus::Ok;
+                    for (figure, closed) in crate::gdiplus_render::flatten_path_for_stroke(&path_obj) {
+                        let s = self.gdiplus_paint_stroke(memory, graphics, &style, &figure, closed);
+                        if s != GdiplusStatus::Ok {
+                            status = s;
+                            break;
+                        }
+                    }
+                    status
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipFillPath => {
                 let graphics = arg(0);
                 let brush_handle = arg(1);
                 let path_handle = arg(2);
-                // Extract brush color and path data BEFORE getting mutable bitmap
-                let brush_color = {
-                    // Phase 1: check if this is a texture brush and get image handle
-                    let tex_image_handle = self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
-                        if let GdiplusObject::Brush(brush) = obj {
-                            match brush.as_ref() {
-                                GdiplusBrush::Texture(tb) => Some(tb.image_handle),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    });
-                    // Phase 2: look up texture data separately (no borrow conflict)
-                    let tex_data: Option<(&[u8], u32, u32, i32)> =
-                        tex_image_handle.and_then(|img_h| {
-                            self.user32.gdiplus_state.get(img_h).and_then(|obj| {
-                                if let GdiplusObject::Image(img) = obj {
-                                    match img.as_ref() {
-                                        GdiplusImage::Bitmap(bmp) => {
-                                            Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                    // Phase 3: compute the colour (borrow state again, quickly)
-                    self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
-                        if let GdiplusObject::Brush(brush) = obj {
-                            Some(crate::gdiplus_render::brush_color_at(
-                                brush, 0.0, 0.0, tex_data,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                }.unwrap_or(0x00000000);  // was 0xFFFF00FF (opaque magenta sentinel) — paint nothing rather than purple on brush-lookup miss
-                // Clone path data to avoid borrow conflict
-                let path_clone = self.user32.gdiplus_state.get(path_handle).and_then(|obj| {
-                    if let GdiplusObject::Path(p) = obj {
-                        Some(p.clone())
-                    } else {
-                        None
+                let path_obj = match self.user32.gdiplus_state.get(path_handle) {
+                    Some(GdiplusObject::Path(p)) => p.clone(),
+                    _ => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
                     }
-                });
-                if let Some(path_obj) = path_clone
-                    && let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                        && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                            && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                                crate::gdiplus_render::fill_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, brush_color, cm);
-                            }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                };
+                let mut cx = 0.0f32;
+                let mut cy = 0.0f32;
+                let mut n = 0u32;
+                for element in &path_obj.elements {
+                    match element {
+                        GdiplusPathElement::Rectangle { x, y, w, h } | GdiplusPathElement::Ellipse { x, y, w, h } => {
+                            cx += x + w / 2.0; cy += y + h / 2.0; n += 1;
+                        }
+                        GdiplusPathElement::Pie { x, y, w, h, .. } => {
+                            cx += x + w / 2.0; cy += y + h / 2.0; n += 1;
+                        }
+                        GdiplusPathElement::Line { x1, y1, x2, y2 } => {
+                            cx += (x1 + x2) / 2.0; cy += (y1 + y2) / 2.0; n += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let sample = if n > 0 {
+                    (cx / n as f32, cy / n as f32)
+                } else {
+                    (0.0, 0.0)
+                };
+                let color = match self.gdiplus_brush_color(brush_handle, sample.0, sample.1) {
+                    Some(c) => c,
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = if gdiplus_matrix_is_identity(&info.state.world)
+                    && info.state.clip.is_none()
+                {
+                    self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+                        crate::gdiplus_render::fill_path(px, pw, ph, ps, &path_obj, color, info.state.cm);
+                    })
+                } else {
+                    let figures = crate::gdiplus_render::flatten_path_for_fill(&path_obj);
+                    self.gdiplus_paint_fill(memory, graphics, color, &figures)
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Transforms ─────────────────────────────────────────────────────
@@ -58605,10 +58862,13 @@ impl PeHostRuntime {
                 let matrix_handle = arg(0);
                 let dx = f32::from_bits(arg(1) as u32);
                 let dy = f32::from_bits(arg(2) as u32);
-                let _order = arg(3) as u32;
+                let order = arg(3) as u32;
                 if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
-                    matrix.elements[4] += dx;
-                    matrix.elements[5] += dy;
+                    matrix.elements = gdiplus_matrix_compose(
+                        &matrix.elements,
+                        &gdiplus_matrix_translation(dx, dy),
+                        order,
+                    );
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -58617,9 +58877,14 @@ impl PeHostRuntime {
             }
             HostThunk::GdipRotateMatrix => {
                 let matrix_handle = arg(0);
-                let _angle = f32::from_bits(arg(1) as u32);
-                let _order = arg(2) as u32;
-                if let Some(GdiplusObject::Matrix(_)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                let angle = f32::from_bits(arg(1) as u32);
+                let order = arg(2) as u32;
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    matrix.elements = gdiplus_matrix_compose(
+                        &matrix.elements,
+                        &gdiplus_matrix_rotation(angle),
+                        order,
+                    );
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -58630,12 +58895,13 @@ impl PeHostRuntime {
                 let matrix_handle = arg(0);
                 let sx = f32::from_bits(arg(1) as u32);
                 let sy = f32::from_bits(arg(2) as u32);
-                let _order = arg(3) as u32;
+                let order = arg(3) as u32;
                 if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
-                    matrix.elements[0] *= sx;
-                    matrix.elements[1] *= sx;
-                    matrix.elements[2] *= sy;
-                    matrix.elements[3] *= sy;
+                    matrix.elements = gdiplus_matrix_compose(
+                        &matrix.elements,
+                        &gdiplus_matrix_scaling(sx, sy),
+                        order,
+                    );
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -58663,9 +58929,22 @@ impl PeHostRuntime {
             }
             HostThunk::GdipMultiplyMatrix => {
                 let matrix_handle = arg(0);
-                let _matrix_b = arg(1);
-                let _order = arg(2) as u32;
-                if let Some(GdiplusObject::Matrix(_)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                let matrix_b = arg(1);
+                let order = arg(2) as u32;
+                let b_elements = match self.user32.gdiplus_state.get(matrix_b) {
+                    Some(GdiplusObject::Matrix(m)) => m.elements,
+                    _ => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    matrix.elements = if order == 0 {
+                        gdiplus_matrix_mul(&b_elements, &matrix.elements)
+                    } else {
+                        gdiplus_matrix_mul(&matrix.elements, &b_elements)
+                    };
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -58722,21 +59001,61 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(2) as u32);
                 let w = f32::from_bits(arg(3) as u32);
                 let h = f32::from_bits(arg(4) as u32);
-                let _combine_mode = arg(5) as u32;
+                let combine_mode = arg(5) as u32;
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
-                    gfx.clip_rect = Some((x, y, w, h));
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    // CombineMode: 0 Replace, 1 Intersect, 2 Union.  The other
+                    // modes produce non-rectangular regions the rect clip
+                    // model cannot represent (Xor 3 / Exclude 4 /
+                    // Complement 5) and report NotImplemented.
+                    let new_rect = (x, y, w, h);
+                    let status = match combine_mode {
+                        0 => {
+                            gfx.clip_rect = Some(new_rect);
+                            GdiplusStatus::Ok
+                        }
+                        1 => {
+                            let current = gfx.clip_rect.unwrap_or(new_rect);
+                            let nx0 = current.0.max(new_rect.0);
+                            let ny0 = current.1.max(new_rect.1);
+                            let nx1 = (current.0 + current.2).min(new_rect.0 + new_rect.2);
+                            let ny1 = (current.1 + current.3).min(new_rect.1 + new_rect.3);
+                            gfx.clip_rect = if nx1 > nx0 && ny1 > ny0 {
+                                Some((nx0, ny0, nx1 - nx0, ny1 - ny0))
+                            } else {
+                                None
+                            };
+                            GdiplusStatus::Ok
+                        }
+                        2 => {
+                            match gfx.clip_rect {
+                                None => {}
+                                Some(current) => {
+                                    let nx0 = current.0.min(new_rect.0);
+                                    let ny0 = current.1.min(new_rect.1);
+                                    let nx1 = (current.0 + current.2).max(new_rect.0 + new_rect.2);
+                                    let ny1 = (current.1 + current.3).max(new_rect.1 + new_rect.3);
+                                    gfx.clip_rect = Some((nx0, ny0, nx1 - nx0, ny1 - ny0));
+                                }
+                            }
+                            GdiplusStatus::Ok
+                        }
+                        _ => GdiplusStatus::NotImplemented,
+                    };
+                    state.set(Register::Rax, status.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
                 }
                 self.last_error = 0;
             }
             HostThunk::GdipSetClipPath => {
+                // A path clip is a non-rectangular region; the software clip
+                // engine holds rect clips, so path clipping is genuinely
+                // unimplemented and reports NotImplemented.
                 let graphics_handle = arg(0);
                 let _path = arg(1);
                 let _combine_mode = arg(2) as u32;
-                if let Some(GdiplusObject::Graphics(_)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                if self.user32.gdiplus_state.get(graphics_handle).is_some() {
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
                 }
@@ -58744,13 +59063,26 @@ impl PeHostRuntime {
             }
             HostThunk::GdipSetClipRegion => {
                 let graphics_handle = arg(0);
-                let _region = arg(1);
+                let region = arg(1);
                 let _combine_mode = arg(2) as u32;
-                if let Some(GdiplusObject::Graphics(_)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                let decoded = self.gdiplus_decode_region(memory, region);
+                let status = if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    match decoded {
+                        Ok(None) => {
+                            // Infinite region: no clipping.
+                            gfx.clip_rect = None;
+                            GdiplusStatus::Ok
+                        }
+                        Ok(Some(rect)) => {
+                            gfx.clip_rect = Some(rect);
+                            GdiplusStatus::Ok
+                        }
+                        Err(()) => GdiplusStatus::InvalidParameter,
+                    }
                 } else {
-                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
-                }
+                    GdiplusStatus::InvalidParameter
+                };
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipResetClip => {
@@ -58773,6 +59105,10 @@ impl PeHostRuntime {
                         write_u32(memory, rect_ptr + 4, y.to_bits());
                         write_u32(memory, rect_ptr + 8, w.to_bits());
                         write_u32(memory, rect_ptr + 12, h.to_bits());
+                    } else {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
                     }
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
@@ -58783,21 +59119,22 @@ impl PeHostRuntime {
             HostThunk::GdipGetClip => {
                 let graphics = arg(0);
                 let region_ptr = arg(1);
-                // Fill the region with the graphics object's clip rectangle.
+                // Fill the region object with the graphics object's clip
+                // rectangle (the region encoding `gdiplus_decode_region` reads).
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics) {
-                    if region_ptr != 0 {
-                        if let Some(clip_rect) = gfx.clip_rect {
-                            // GpRegion encoding: header (4 bytes type = 1 for rect)
-                            // followed by Gdiplus::Rect (4 x i32 = 16 bytes)
-                            write_u32(memory, region_ptr, 1); // RegionDataTypeRect
-                            write_u32(memory, region_ptr + 4, clip_rect.0 as i32 as u32);
-                            write_u32(memory, region_ptr + 8, clip_rect.1 as i32 as u32);
-                            write_u32(memory, region_ptr + 12, clip_rect.2 as i32 as u32);
-                            write_u32(memory, region_ptr + 16, clip_rect.3 as i32 as u32);
-                        } else {
-                            // No clip rect = infinite region
-                            write_u32(memory, region_ptr, 0); // RegionDataTypeInfinite
-                        }
+                    if region_ptr == 0 {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                    if let Some(clip_rect) = gfx.clip_rect {
+                        write_u32(memory, region_ptr, 1); // RegionDataTypeRect
+                        write_u32(memory, region_ptr + 4, clip_rect.0 as i32 as u32);
+                        write_u32(memory, region_ptr + 8, clip_rect.1 as i32 as u32);
+                        write_u32(memory, region_ptr + 12, clip_rect.2 as i32 as u32);
+                        write_u32(memory, region_ptr + 16, clip_rect.3 as i32 as u32);
+                    } else {
+                        write_u32(memory, region_ptr, 0); // RegionDataTypeInfinite
                     }
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
@@ -58910,44 +59247,96 @@ impl PeHostRuntime {
             }
             // ── Bitmap interop ─────────────────────────────────────────────────
             HostThunk::GdipCreateBitmapFromHBITMAP => {
-                let _hbm = arg(0);
+                let hbm = arg(0);
                 let _hpal = arg(1);
                 let bitmap_ptr = arg(2);
-                // Create a placeholder bitmap
+                let result = self.gdi_bitmaps.get(&hbm).and_then(|bitmap| {
+                    let argb = gdiplus_bitmap_to_argb(bitmap)?;
+                    let width = bitmap.width as u32;
+                    let height = bitmap.height as u32;
+                    let pixel_format = if gdiplus_memory_bpp_bytes(bitmap) == 3 {
+                        crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB
+                    } else {
+                        crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
+                    };
+                    Some((width, height, pixel_format, argb))
+                });
+                let Some((width, height, pixel_format, argb)) = result else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
                 let bitmap = GdiplusBitmap {
-                    width: 1,
-                    height: 1,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-                    stride: 4,
-                    pixels: vec![0; 4],
+                    width,
+                    height,
+                    pixel_format,
+                    stride: (width * 4) as i32,
+                    pixels: argb,
                     locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: 0,
                 };
                 let handle = self.user32.gdiplus_state.alloc_handle(
                     GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
                 );
                 if bitmap_ptr != 0 {
                     write_u64(memory, bitmap_ptr, handle);
+                } else {
+                    self.user32.gdiplus_state.remove(handle);
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateBitmapFromFile => {
-                let _filename_ptr = arg(0);
+                let filename_ptr = arg(0);
                 let bitmap_ptr = arg(1);
+                if filename_ptr == 0 || bitmap_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let filename = read_utf16_string(memory, filename_ptr).unwrap_or_default();
+                if filename.is_empty() {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Ok(host_path) = self.win32.guest_path_to_host_path(&filename) else {
+                    state.set(Register::Rax, GdiplusStatus::FileNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Ok(bytes) = std::fs::read(&host_path) else {
+                    state.set(Register::Rax, GdiplusStatus::FileNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some((kind, width, height, pixels)) = gdiplus_decode_image(&bytes) else {
+                    state.set(Register::Rax, GdiplusStatus::UnknownImageFormat.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
                 let bitmap = GdiplusBitmap {
-                    width: 1,
-                    height: 1,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-                    stride: 4,
-                    pixels: vec![0xFF; 4],
+                    width,
+                    height,
+                    pixel_format: crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: (width * 4) as i32,
+                    pixels,
                     locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: kind,
                 };
                 let handle = self.user32.gdiplus_state.alloc_handle(
                     GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
                 );
-                if bitmap_ptr != 0 {
-                    write_u64(memory, bitmap_ptr, handle);
-                }
+                write_u64(memory, bitmap_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -58956,25 +59345,38 @@ impl PeHostRuntime {
                 let height = arg(1) as u32;
                 let graphics = arg(2);
                 let bitmap_ptr = arg(3);
+                if width == 0 || height == 0 || bitmap_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(GdiplusObject::Graphics(_)) = self.user32.gdiplus_state.get(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
                 let bitmap = GdiplusBitmap {
                     width,
                     height,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    pixel_format: crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
                     stride: (width * 4) as i32,
                     pixels: vec![0; (width * height * 4) as usize],
                     locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: 0,
                 };
                 let handle = self.user32.gdiplus_state.alloc_handle(
                     GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
                 );
-                // Set target_bitmap on the graphics object so drawing operations
-                // render into this bitmap's pixel buffer.
+                // The graphics object's drawing target is bound to this new
+                // bitmap (the engine's `GraphicsFromImage` equivalent), so
+                // later drawing calls rasterize into the bitmap's pixels.
                 if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics) {
                     gfx.target_bitmap = Some(handle);
                 }
-                if bitmap_ptr != 0 {
-                    write_u64(memory, bitmap_ptr, handle);
-                }
+                write_u64(memory, bitmap_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -59106,56 +59508,212 @@ impl PeHostRuntime {
             }
             HostThunk::GdipBitmapLockBits => {
                 let bitmap_handle = arg(0);
-                let _rect_ptr = arg(1);
-                let _flags = arg(2) as u32;
-                let _format = arg(3) as u32;
+                let rect_ptr = arg(1);
+                let flags = arg(2) as u32;
+                let format = arg(3) as u32;
                 let locked_data_ptr = arg(4);
-                let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            if bmp.locked {
-                                return None; // Already locked
-                            }
-                            bmp.locked = true;
-                            // For USER_INPUT_BUF, the scan0 comes from the rect or the external pointer.
-                            // We'll use the bitmap's own pixel data as the scan0 buffer.
-                            // The guest will read/write directly via scan0.
-                            let scan0 = bmp.pixels.as_ptr() as u64;
-                            if locked_data_ptr != 0 {
-                                write_u32(memory, locked_data_ptr, bmp.width);
-                                write_u32(memory, locked_data_ptr + 4, bmp.height);
-                                write_u32(memory, locked_data_ptr + 8, bmp.stride as u32);
-                                write_u32(memory, locked_data_ptr + 12, bmp.pixel_format);
-                                write_u64(memory, locked_data_ptr + 16, scan0);
-                                write_u64(memory, locked_data_ptr + 24, 0); // Reserved
-                            }
-                            return Some(());
-                        }
-                    None
-                });
-                state.set(Register::Rax, if result.is_some() {
-                    GdiplusStatus::Ok.to_u32()
+                if locked_data_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let lock_bpp = match Self::gdiplus_pixel_count(format) {
+                    Some(bits) => bits / 8,
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                } as usize;
+                // Resolve the lock region (bitmap dimensions need only a
+                // transient immutable borrow).
+                let bitmap_dims = match self.user32.gdiplus_state.get(bitmap_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((b.width, b.height)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some((bmp_width, bmp_height)) = bitmap_dims else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let (rx, ry, rw, rh) = if rect_ptr != 0 {
+                    let x = memory.read_u32(rect_ptr).unwrap_or(0);
+                    let y = memory.read_u32(rect_ptr + 4).unwrap_or(0);
+                    let w = memory.read_u32(rect_ptr + 8).unwrap_or(bmp_width);
+                    let h = memory.read_u32(rect_ptr + 12).unwrap_or(bmp_height);
+                    (x, y, w, h)
                 } else {
-                    GdiplusStatus::InvalidParameter.to_u32()
-                } as u64);
+                    (0, 0, bmp_width, bmp_height)
+                };
+                if rw == 0 || rh == 0 || rx + rw > bmp_width || ry + rh > bmp_height {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let stride = (rw * lock_bpp as u32) as i32;
+                let buffer_len = stride as usize * rh as usize;
+                // USER_INPUT_BUF: the guest supplies the scan0 buffer in the
+                // BitmapData it passed; otherwise allocate guest-visible memory.
+                let user_scan0 = if flags & crate::user32::GDIPLUS_IMAGE_LOCK_MODE_USER_INPUT_BUF != 0
+                {
+                    memory.read_u64(locked_data_ptr + 16).ok()
+                } else {
+                    None
+                };
+                let guest_scan0 = match user_scan0 {
+                    Some(ptr) if ptr != 0 => ptr,
+                    _ => match self.alloc_heap(memory, buffer_len, true) {
+                        Ok(ptr) => ptr,
+                        Err(_) => {
+                            state.set(Register::Rax, GdiplusStatus::OutOfMemory.to_u32() as u64);
+                            self.last_error = 0;
+                            return Ok(None);
+                        }
+                    },
+                };
+                let Some(GdiplusObject::Image(img)) =
+                    self.user32.gdiplus_state.get_mut(bitmap_handle)
+                else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let GdiplusImage::Bitmap(bmp) = &mut **img else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if bmp.locked {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // Seed the buffer with the current pixels (read semantics).
+                let src_stride = bmp.stride;
+                for row in 0..rh {
+                    let mut packed: Vec<u8> = Vec::with_capacity(rw as usize * lock_bpp);
+                    for x in 0..rw {
+                        let s_idx =
+                            ((ry + row) as i64 * src_stride as i64 + (rx + x) as i64 * 4) as usize;
+                        if s_idx + 3 >= bmp.pixels.len() {
+                            packed.extend(std::iter::repeat(0u8).take(lock_bpp));
+                            continue;
+                        }
+                        let (b, g, r, a) = (
+                            bmp.pixels[s_idx],
+                            bmp.pixels[s_idx + 1],
+                            bmp.pixels[s_idx + 2],
+                            bmp.pixels[s_idx + 3],
+                        );
+                        match lock_bpp {
+                            3 => packed.extend_from_slice(&[b, g, r]),
+                            _ => packed.extend_from_slice(&[b, g, r, a]),
+                        }
+                    }
+                    for (i, byte) in packed.iter().enumerate() {
+                        memory.write_u8(
+                            guest_scan0 + (row as u64 * stride as u64) + i as u64,
+                            *byte,
+                        );
+                    }
+                }
+                bmp.locked = true;
+                bmp.scan0_guest = guest_scan0;
+                bmp.lock_x = rx;
+                bmp.lock_y = ry;
+                write_u32(memory, locked_data_ptr, rw);
+                write_u32(memory, locked_data_ptr + 4, rh);
+                write_u32(memory, locked_data_ptr + 8, stride as u32);
+                write_u32(memory, locked_data_ptr + 12, format);
+                write_u64(memory, locked_data_ptr + 16, guest_scan0);
+                write_u64(memory, locked_data_ptr + 24, 0); // Reserved
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipBitmapUnlockBits => {
                 let bitmap_handle = arg(0);
-                let _locked_data_ptr = arg(1);
-                let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj
-                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            bmp.locked = false;
-                            return Some(());
-                        }
-                    None
-                });
-                state.set(Register::Rax, if result.is_some() {
-                    GdiplusStatus::Ok.to_u32()
+                let locked_data_ptr = arg(1);
+                let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bitmap_handle) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let GdiplusImage::Bitmap(bmp) = &mut **img else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if !bmp.locked || bmp.scan0_guest == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // Copy the guest buffer back into the canonical ARGB pixels.
+                let lock_format = if locked_data_ptr != 0 {
+                    memory.read_u32(locked_data_ptr + 12).unwrap_or(crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB)
                 } else {
-                    GdiplusStatus::InvalidParameter.to_u32()
-                } as u64);
+                    crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
+                };
+                let lock_bpp = match Self::gdiplus_pixel_count(lock_format) {
+                    Some(bits) => bits / 8,
+                    None => 4,
+                };
+                let stride = memory.read_u32(locked_data_ptr + 8).unwrap_or(bmp.width * 4) as i32;
+                let rw = memory.read_u32(locked_data_ptr).unwrap_or(bmp.width);
+                let rh = memory.read_u32(locked_data_ptr + 4).unwrap_or(bmp.height);
+                let rx = bmp.lock_x;
+                let ry = bmp.lock_y;
+                if rw == 0 || rh == 0 {
+                    bmp.locked = false;
+                    bmp.scan0_guest = 0;
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let buffer_len = stride.unsigned_abs() as usize * rh as usize;
+                let mut buffer = vec![0u8; buffer_len];
+                for (i, byte) in buffer.iter_mut().enumerate() {
+                    *byte = memory.read_u8(bmp.scan0_guest + i as u64).unwrap_or(0);
+                }
+                for row in 0..rh {
+                    for x in 0..rw {
+                        let s_idx = (row as i32 * stride + x as i32 * lock_bpp as i32) as usize;
+                        if s_idx + lock_bpp as usize > buffer.len() {
+                            continue;
+                        }
+                        let (b, g, r, a) = if lock_bpp == 3 {
+                            (buffer[s_idx], buffer[s_idx + 1], buffer[s_idx + 2], 0xff)
+                        } else {
+                            (buffer[s_idx], buffer[s_idx + 1], buffer[s_idx + 2], buffer[s_idx + 3])
+                        };
+                        let premul = lock_format == crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB;
+                        let (b, g, r) = if premul && a != 0 && a != 255 {
+                            let scale = a as u32;
+                            (
+                                (b as u32 * 255 / scale) as u8,
+                                (g as u32 * 255 / scale) as u8,
+                                (r as u32 * 255 / scale) as u8,
+                            )
+                        } else {
+                            (b, g, r)
+                        };
+                        let d_idx = ((ry + row) as u64 * bmp.stride as u64 + (rx + x) as u64 * 4) as usize;
+                        if d_idx + 3 < bmp.pixels.len() {
+                            bmp.pixels[d_idx] = b;
+                            bmp.pixels[d_idx + 1] = g;
+                            bmp.pixels[d_idx + 2] = r;
+                            bmp.pixels[d_idx + 3] = a;
+                        }
+                    }
+                }
+                bmp.locked = false;
+                bmp.scan0_guest = 0;
+                bmp.lock_x = 0;
+                bmp.lock_y = 0;
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Text / Font ─────────────────────────────────────────────────────
@@ -59165,37 +59723,99 @@ impl PeHostRuntime {
                 let style = arg(2) as u32;
                 let unit = arg(3) as u32;
                 let font_ptr = arg(4);
-                let font = GdiplusFont { family_handle, em_size, style, unit };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Font(Box::new(font)));
-                if font_ptr != 0 {
-                    write_u64(memory, font_ptr, handle);
+                if font_ptr == 0
+                    || em_size.is_nan()
+                    || em_size.is_infinite()
+                    || em_size <= 0.0
+                {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                let Some(GdiplusObject::FontFamily(_)) = self.user32.gdiplus_state.get(family_handle) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let font = crate::user32::GdiplusFont {
+                    family_handle,
+                    em_size,
+                    unit,
+                    style,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Font(Box::new(font)));
+                write_u64(memory, font_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDeleteFont => {
-                let font = arg(0);
-                self.user32.gdiplus_state.remove(font);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                self.last_error = 0;
+                let font_handle = arg(0);
+                if font_handle == 0 {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else if self.user32.gdiplus_state.remove(font_handle).is_some() {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipCreateFontFamilyFromName => {
-                let _name_ptr = arg(0);
+                let name_ptr = arg(0);
                 let _font_collection = arg(1);
                 let family_ptr = arg(2);
-                let family = GdiplusFontFamily { name: "Arial".to_string() };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::FontFamily(Box::new(family)));
-                if family_ptr != 0 {
-                    write_u64(memory, family_ptr, handle);
+                if name_ptr == 0 || family_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                let name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+                // The lattice text engine ships a generic family catalogue:
+                // common UI families resolve, unknown names get the genuine
+                // FontFamilyNotFound status.
+                let known = name.is_empty()
+                    || matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "arial"
+                            | "arial narrow"
+                            | "calibri"
+                            | "courier new"
+                            | "gdi+ lattice"
+                            | "microsoft sans serif"
+                            | "ms sans serif"
+                            | "ms shell dlg"
+                            | "segoe ui"
+                            | "tahoma"
+                            | "times new roman"
+                            | "trebuchet ms"
+                            | "verdana"
+                    );
+                if !known {
+                    state.set(Register::Rax, GdiplusStatus::FontFamilyNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let family = crate::user32::GdiplusFontFamily {
+                    name: if name.is_empty() { "Arial".to_string() } else { name },
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::FontFamily(Box::new(family)));
+                write_u64(memory, family_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDeleteFontFamily => {
-                let family = arg(0);
-                self.user32.gdiplus_state.remove(family);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                self.last_error = 0;
+                let family_handle = arg(0);
+                if family_handle == 0 {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else if self.user32.gdiplus_state.remove(family_handle).is_some() {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipSetTextRenderingHint => {
                 let graphics_handle = arg(0);
@@ -59209,99 +59829,132 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::GdipMeasureString => {
-                let _graphics = arg(0);
+                let graphics = arg(0);
                 let string_ptr = arg(1);
                 let length = arg(2) as i32;
                 let font_handle = arg(3);
-                let layout_rect_ptr = arg(4);
-                let _format_ptr = arg(5);
-                let bounding_rect_ptr = arg(6);
-                let _codepoints_fitted_ptr = arg(7);
-                // Read the text and font size for approximate measurement
+                let _layout_rect_ptr = arg(4);
+                let _string_format = arg(5);
+                let bounding_box = arg(6);
+                let _codepoints_fitted = arg(7);
+                let _lines_filled = arg(8);
                 let text = read_guest_utf16_string(memory, string_ptr, length);
-                let font_size = self.user32.gdiplus_state.get(font_handle).and_then(|obj| {
-                    if let GdiplusObject::Font(f) = obj { Some(f.em_size) } else { None }
-                }).unwrap_or(12.0);
-                // Approximate measurement: character width ≈ font_size * 0.6, height ≈ font_size * 1.3
-                let char_w = font_size * 0.6;
-                let char_h = font_size * 1.3;
-                let text_width = (text.chars().count() as f32 * char_w).max(1.0);
-                let text_height = char_h.max(1.0);
-                // Use layout rect origin if available
-                let (lx, ly) = if layout_rect_ptr != 0 {
-                    let lx = f32::from_bits(memory.read_u32(layout_rect_ptr).unwrap_or(0));
-                    let ly = f32::from_bits(memory.read_u32(layout_rect_ptr + 4).unwrap_or(0));
-                    (lx, ly)
-                } else {
-                    (0.0, 0.0)
+                let Some(font) = (match self.user32.gdiplus_state.get(font_handle) {
+                    Some(GdiplusObject::Font(f)) => Some((f.em_size, f.unit)),
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 };
-                if bounding_rect_ptr != 0 {
-                    write_u32(memory, bounding_rect_ptr, lx.to_bits());
-                    write_u32(memory, bounding_rect_ptr + 4, ly.to_bits());
-                    write_u32(memory, bounding_rect_ptr + 8, text_width.to_bits());
-                    write_u32(memory, bounding_rect_ptr + 12, text_height.to_bits());
+                let Some(_info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let em_px = gdiplus_unit_to_pixels(font.0, font.1);
+                let (width, height) = gdiplus_measure_lattice(&text, em_px);
+                if bounding_box != 0 {
+                    write_u32(memory, bounding_box, 0.0f32.to_bits());
+                    write_u32(memory, bounding_box + 4, 0.0f32.to_bits());
+                    write_u32(memory, bounding_box + 8, width.to_bits());
+                    write_u32(memory, bounding_box + 12, height.to_bits());
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipMeasureCharacterRanges => {
-                let _graphics = arg(0);
-                let _string_ptr = arg(1);
-                let _length = arg(2) as i32;
-                let _font = arg(3);
-                let _layout_rect_ptr = arg(4);
-                let _format_ptr = arg(5);
-                let _range_count = arg(6) as u32;
-                let _ranges_ptr = arg(7);
-                let _region_count = arg(8);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                // MeasureCharacterRanges creates GpRegion objects for every
+                // measured range; region objects are not creatable through the
+                // exported surface (no GdipCreateRegion), so the operation is
+                // genuinely unimplemented.
+                state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Image attributes ───────────────────────────────────────────────
             HostThunk::GdipCreateImageAttributes => {
                 let attr_ptr = arg(0);
-                let attrs = GdiplusImageAttributes {
+                if attr_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let attributes = GdiplusImageAttributes {
                     color_keys: BTreeMap::new(),
                     color_matrix: None,
                 };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::ImageAttributes(Box::new(attrs)));
-                if attr_ptr != 0 {
-                    write_u64(memory, attr_ptr, handle);
-                }
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::ImageAttributes(Box::new(attributes)));
+                write_u64(memory, attr_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDisposeImageAttributes => {
-                let attr = arg(0);
-                self.user32.gdiplus_state.remove(attr);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                self.last_error = 0;
+                let attr_handle = arg(0);
+                if attr_handle == 0 {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else if self.user32.gdiplus_state.remove(attr_handle).is_some() {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                }
             }
             HostThunk::GdipSetImageAttributesColorKeys => {
                 let attr_handle = arg(0);
-                let _type = arg(1) as u32;
-                let _enable_flag = arg(2) as u32;
-                let _color_low = arg(3) as u32;
-                let _color_high = arg(4) as u32;
-                if let Some(GdiplusObject::ImageAttributes(_)) = self.user32.gdiplus_state.get_mut(attr_handle) {
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                } else {
+                let color_adjust_type = arg(1) as u32;
+                let enable = arg(2) as u32;
+                let color_low = arg(3) as u32;
+                let color_high = arg(4) as u32;
+                let Some(GdiplusObject::ImageAttributes(attributes)) =
+                    self.user32.gdiplus_state.get_mut(attr_handle)
+                else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if enable != 0 {
+                    attributes.color_keys.insert(color_adjust_type, (color_low, color_high));
+                } else {
+                    attributes.color_keys.remove(&color_adjust_type);
                 }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipSetImageAttributesColorMatrix => {
                 let attr_handle = arg(0);
-                let _type = arg(1) as u32;
-                let _enable_flag = arg(2) as u32;
-                let _color_matrix_ptr = arg(3);
-                let _gray_matrix_ptr = arg(4);
-                let _flags = arg(5) as u32;
-                if let Some(GdiplusObject::ImageAttributes(_)) = self.user32.gdiplus_state.get_mut(attr_handle) {
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                } else {
+                let color_adjust_type = arg(1) as u32;
+                let enable = arg(2) as u32;
+                let color_matrix_ptr = arg(3);
+                let _color_matrix_flags = arg(4) as u32;
+                let _adjust = arg(5) as u32;
+                let Some(GdiplusObject::ImageAttributes(attributes)) =
+                    self.user32.gdiplus_state.get_mut(attr_handle)
+                else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if enable == 0 || color_matrix_ptr == 0 {
+                    attributes.color_matrix = None;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                let mut cm = [[0.0f32; 5]; 5];
+                for row in 0..5 {
+                    for col in 0..5 {
+                        cm[row][col] =
+                            f32::from_bits(memory.read_u32(color_matrix_ptr + (row * 5 + col) as u64 * 4).unwrap_or(0));
+                    }
+                }
+                attributes.color_matrix = Some((color_adjust_type, crate::user32::GdiplusColorMatrix { m: cm }));
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             // ── Quality settings ───────────────────────────────────────────────
@@ -59431,25 +60084,47 @@ impl PeHostRuntime {
                 let image_handle = arg(1);
                 let x = f32::from_bits(arg(2) as u32);
                 let y = f32::from_bits(arg(3) as u32);
-                // Extract source image data BEFORE getting mutable target bitmap
-                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &**img {
-                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
-                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
-                                crate::gdiplus_render::draw_image(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, cm);
-                            }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                let Some(image) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((
+                            b.pixels.clone(),
+                            b.width,
+                            b.height,
+                            b.stride,
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = self.gdiplus_blit_image(
+                    memory,
+                    graphics,
+                    &info,
+                    image.0,
+                    image.1,
+                    image.2,
+                    image.3,
+                    0.0,
+                    0.0,
+                    image.1 as f32,
+                    image.2 as f32,
+                    x,
+                    y,
+                    image.1 as f32,
+                    image.2 as f32,
+                    None,
+                    None,
+                );
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawImageRect => {
@@ -59459,70 +60134,144 @@ impl PeHostRuntime {
                 let y = f32::from_bits(arg(3) as u32);
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
-                // Extract source image data BEFORE getting mutable target bitmap
-                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &**img {
-                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
-                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
-                                crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, w, h, cm);
-                            }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                let Some(image) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((
+                            b.pixels.clone(),
+                            b.width,
+                            b.height,
+                            b.stride,
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let status = self.gdiplus_blit_image(
+                    memory,
+                    graphics,
+                    &info,
+                    image.0,
+                    image.1,
+                    image.2,
+                    image.3,
+                    0.0,
+                    0.0,
+                    image.1 as f32,
+                    image.2 as f32,
+                    x,
+                    y,
+                    w,
+                    h,
+                    None,
+                    None,
+                );
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipDrawImageRectRect => {
                 let graphics = arg(0);
                 let image_handle = arg(1);
-                let _src_x = f32::from_bits(arg(2) as u32);
-                let _src_y = f32::from_bits(arg(3) as u32);
-                let _src_w = f32::from_bits(arg(4) as u32);
-                let _src_h = f32::from_bits(arg(5) as u32);
+                let src_x = f32::from_bits(arg(2) as u32);
+                let src_y = f32::from_bits(arg(3) as u32);
+                let src_w = f32::from_bits(arg(4) as u32);
+                let src_h = f32::from_bits(arg(5) as u32);
                 let dst_x = f32::from_bits(arg(6) as u32);
                 let dst_y = f32::from_bits(arg(7) as u32);
                 let dst_w = f32::from_bits(arg(8) as u32);
                 let dst_h = f32::from_bits(arg(9) as u32);
-                let _src_unit = arg(10) as u32;
-                let _attr = arg(11);
+                let src_unit = arg(10) as u32;
+                let attr_handle = arg(11);
                 let _callback = arg(12);
                 let _callback_data = arg(13);
-                // Extract source image data BEFORE getting mutable target bitmap
-                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &**img {
-                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                let Some(image) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((
+                            b.pixels.clone(),
+                            b.width,
+                            b.height,
+                            b.stride,
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some(info) = self.gdiplus_graphics_info(graphics) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                // Source coordinates are expressed in `src_unit` pixels at
+                // 96 dpi when the unit is not Pixel/World/Display.
+                let src_scale = gdiplus_unit_to_pixels(1.0, src_unit);
+                let (sx, sy, sw, sh) = (
+                    src_x * src_scale,
+                    src_y * src_scale,
+                    (src_w * src_scale).max(0.0),
+                    (src_h * src_scale).max(0.0),
+                );
+                // Image attributes: colour key (default or bitmap type) and
+                // colour matrix are applied during the blit.
+                let (color_key, color_matrix) = match self.user32.gdiplus_state.get(attr_handle) {
+                    Some(GdiplusObject::ImageAttributes(attributes)) => {
+                        let key = attributes
+                            .color_keys
+                            .get(&1)
+                            .or_else(|| attributes.color_keys.get(&0))
+                            .copied();
+                        let matrix = attributes
+                            .color_matrix
+                            .as_ref()
+                            .filter(|(t, _)| *t == 1 || *t == 0)
+                            .map(|(_, m)| m.m);
+                        (key, matrix)
                     }
-                });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
-                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
-                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
-                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
-                                crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, dst_x, dst_y, dst_w, dst_h, cm);
-                            }
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    _ => (None, None),
+                };
+                let status = self.gdiplus_blit_image(
+                    memory,
+                    graphics,
+                    &info,
+                    image.0,
+                    image.1,
+                    image.2,
+                    image.3,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
+                    dst_x,
+                    dst_y,
+                    dst_w,
+                    dst_h,
+                    color_key,
+                    color_matrix,
+                );
+                state.set(Register::Rax, status.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipGetImageType => {
                 let image_handle = arg(0);
                 let type_ptr = arg(1);
                 if let Some(GdiplusObject::Image(_)) = self.user32.gdiplus_state.get(image_handle) {
-                    if type_ptr != 0 {
-                        write_u32(memory, type_ptr, 1); // ImageTypeBitmap = 1
+                    if type_ptr == 0 {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
                     }
+                    write_u32(memory, type_ptr, 1); // ImageTypeBitmap
                     state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 } else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
@@ -59531,52 +60280,212 @@ impl PeHostRuntime {
             }
             HostThunk::GdipGetImageRawFormat => {
                 let image_handle = arg(0);
-                let _format_ptr = arg(1);
-                if let Some(GdiplusObject::Image(_)) = self.user32.gdiplus_state.get(image_handle) {
-                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
-                } else {
+                let format_ptr = arg(1);
+                let Some(raw_kind) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some(b.raw_kind),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
                     state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if format_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                for (i, byte) in gdiplus_raw_format_guid(raw_kind).iter().enumerate() {
+                    memory.write_u8(format_ptr + i as u64, *byte);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCloneImage => {
                 let image_handle = arg(0);
                 let clone_ptr = arg(1);
-                // Shallow clone: just reuse same handle
-                if clone_ptr != 0 {
-                    write_u64(memory, clone_ptr, image_handle);
+                let Some(cloned) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some(GdiplusImage::Bitmap(crate::user32::GdiplusBitmap {
+                            width: b.width,
+                            height: b.height,
+                            pixel_format: b.pixel_format,
+                            stride: b.stride,
+                            pixels: b.pixels.clone(),
+                            locked: false,
+                            scan0_guest: 0,
+                            lock_x: 0,
+                            lock_y: 0,
+                            raw_kind: b.raw_kind,
+                        })),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if clone_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(cloned)));
+                write_u64(memory, clone_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipSaveImageToFile => {
-                let _image = arg(0);
-                let _filename_ptr = arg(1);
-                let _clsid_ptr = arg(2);
+                let image_handle = arg(0);
+                let filename_ptr = arg(1);
+                let clsid_ptr = arg(2);
                 let _encoder_params = arg(3);
+                if filename_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let filename = read_utf16_string(memory, filename_ptr).unwrap_or_default();
+                if filename.is_empty() {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some((width, height, pixels)) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((b.width, b.height, b.pixels.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let mut clsid = [0u8; 16];
+                if clsid_ptr != 0 {
+                    for (i, slot) in clsid.iter_mut().enumerate() {
+                        *slot = memory.read_u8(clsid_ptr + i as u64).unwrap_or(0);
+                    }
+                }
+                let encoder = gdiplus_encoder_kind(if clsid_ptr != 0 { Some(clsid) } else { None });
+                if encoder == 0 {
+                    // JPEG/GIF/TIFF encoders do not exist in the engine; the
+                    // save is genuinely unsupported rather than silently fake.
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Ok(host_path) = self.win32.guest_path_to_host_path(&filename) else {
+                    state.set(Register::Rax, GdiplusStatus::FileNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let bytes = if encoder == 2 {
+                    gdiplus_encode_png(width, height, &pixels)
+                } else {
+                    gdiplus_encode_bmp(width, height, &pixels)
+                };
+                let Some(bytes) = bytes else {
+                    state.set(Register::Rax, GdiplusStatus::OutOfMemory.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if std::fs::write(&host_path, bytes).is_err() {
+                    state.set(Register::Rax, GdiplusStatus::GenericError.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipSaveImageToStream => {
-                let _image = arg(0);
-                let _stream = arg(1);
-                let _clsid_ptr = arg(2);
+                let image_handle = arg(0);
+                let stream = arg(1);
+                let clsid_ptr = arg(2);
                 let _encoder_params = arg(3);
+                let Some((width, height, pixels)) = (match self.user32.gdiplus_state.get(image_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((b.width, b.height, b.pixels.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let mut clsid = [0u8; 16];
+                if clsid_ptr != 0 {
+                    for (i, slot) in clsid.iter_mut().enumerate() {
+                        *slot = memory.read_u8(clsid_ptr + i as u64).unwrap_or(0);
+                    }
+                }
+                let encoder = gdiplus_encoder_kind(if clsid_ptr != 0 { Some(clsid) } else { None });
+                if encoder == 0 {
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some(bytes) = (if encoder == 2 {
+                    gdiplus_encode_png(width, height, &pixels)
+                } else {
+                    gdiplus_encode_bmp(width, height, &pixels)
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::OutOfMemory.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some(state_entry) = self.com_streams.get_mut(&stream) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                state_entry.data = bytes;
+                state_entry.position = state_entry.data.len() as u64;
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateBitmapFromStream => {
-                let _stream = arg(0);
+                let stream = arg(0);
                 let bitmap_ptr = arg(1);
-                let bitmap = GdiplusBitmap {
-                    width: 1, height: 1,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-                    stride: 4,
-                    pixels: vec![0xFF; 4],
-                    locked: false,
+                if bitmap_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let bytes = match self.com_streams.get(&stream) {
+                    Some(state_entry) => state_entry.data.clone(),
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
                 };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
-                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                let Some((kind, width, height, pixels)) = gdiplus_decode_image(&bytes) else {
+                    state.set(Register::Rax, GdiplusStatus::UnknownImageFormat.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let bitmap = GdiplusBitmap {
+                    width,
+                    height,
+                    pixel_format: crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: (width * 4) as i32,
+                    pixels,
+                    locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: kind,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                write_u64(memory, bitmap_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -59587,76 +60496,295 @@ impl PeHostRuntime {
                 let format = arg(3) as u32;
                 let scan0 = arg(4);
                 let bitmap_ptr = arg(5);
-                let pixel_count = (stride.unsigned_abs() * height) as usize;
-                let pixels = if scan0 != 0 {
-                    // Copy from guest memory
-                    (0..pixel_count).map(|i| memory.read_u8(scan0 + i as u64).unwrap_or(0)).collect()
+                if bitmap_ptr == 0 || width == 0 || height == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let supported = matches!(
+                    format,
+                    crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
+                        | crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB
+                        | crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB
+                );
+                if !supported {
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let stride_abs = stride.unsigned_abs();
+                let pixel_bytes = (stride_abs * height) as usize;
+                let source = if scan0 != 0 {
+                    let mut bytes = vec![0u8; pixel_bytes];
+                    for (i, byte) in bytes.iter_mut().enumerate() {
+                        *byte = memory.read_u8(scan0 + i as u64).unwrap_or(0);
+                    }
+                    bytes
                 } else {
-                    vec![0; pixel_count]
+                    vec![0u8; pixel_bytes]
+                };
+                let pixels = match gdiplus_scan0_to_canonical(width, height, stride, format, &source) {
+                    Some(px) => px,
+                    None => {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
                 };
                 let bitmap = GdiplusBitmap {
-                    width, height, pixel_format: format,
-                    stride, pixels, locked: false,
+                    width,
+                    height,
+                    pixel_format: format,
+                    stride: (width * 4) as i32,
+                    pixels,
+                    locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: 0,
                 };
                 let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
-                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                write_u64(memory, bitmap_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateHICONFromBitmap => {
+                // Creating an HICON from arbitrary pixels requires the icon
+                // object registry the engine keeps for module icon resources;
+                // exporting new pixel icons through it is genuinely
+                // unimplemented.
                 let _bitmap = arg(0);
                 let _hicon_ptr = arg(1);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateHBITMAPFromBitmap => {
-                let _bitmap = arg(0);
-                let _hbm_ptr = arg(1);
-                let _background = arg(2) as u32;
+                let bitmap_handle = arg(0);
+                let _background = arg(1) as u32;
+                let hbm_ptr = arg(2);
+                if hbm_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Some((width, height, pixels, bpp)) = (match self.user32.gdiplus_state.get(bitmap_handle) {
+                    Some(GdiplusObject::Image(img)) => match img.as_ref() {
+                        GdiplusImage::Bitmap(b) => Some((
+                            b.width,
+                            b.height,
+                            b.pixels.clone(),
+                            if b.pixel_format == crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB { 3 } else { 4 },
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let native = if bpp == 3 {
+                    gdiplus_argb_to_bgr24_bottom_up(width, height, &pixels)
+                } else {
+                    // 32-bpp GDI bitmaps are bottom-up BGRA: flip rows only.
+                    let w = width as usize;
+                    let h = height as usize;
+                    let mut out = vec![0u8; w * h * 4];
+                    for y in 0..h {
+                        let src = y * w * 4;
+                        let dst = (h - 1 - y) * w * 4;
+                        out[dst..dst + w * 4].copy_from_slice(&pixels[src..src + w * 4]);
+                    }
+                    Some(out)
+                };
+                let Some(native) = native else {
+                    state.set(Register::Rax, GdiplusStatus::OutOfMemory.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                // Register a real GDI HBITMAP (row 0 = bottom) so the handle
+                // can be selected into a memory DC and BitBlt'd.
+                let bitmap_handle = self.next_gdi_handle;
+                self.next_gdi_handle += 1;
+                self.gdi_objects.insert(bitmap_handle, "GdiplusHBITMAP".to_string());
+                self.gdi_bitmaps.insert(
+                    bitmap_handle,
+                    MemoryBitmap {
+                        width: width as usize,
+                        height: height as usize,
+                        bpp,
+                        bytes: native,
+                        guest_pixel_ptr: 0,
+                    },
+                );
+                write_u64(memory, hbm_ptr, bitmap_handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateImageFromFile => {
-                let _filename_ptr = arg(0);
+                let filename_ptr = arg(0);
                 let image_ptr = arg(1);
-                let bitmap = GdiplusBitmap {
-                    width: 1, height: 1,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-                    stride: 4, pixels: vec![0xFF; 4],
-                    locked: false,
+                if filename_ptr == 0 || image_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let filename = read_utf16_string(memory, filename_ptr).unwrap_or_default();
+                if filename.is_empty() {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let Ok(host_path) = self.win32.guest_path_to_host_path(&filename) else {
+                    state.set(Register::Rax, GdiplusStatus::FileNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
-                if image_ptr != 0 { write_u64(memory, image_ptr, handle); }
+                let Ok(bytes) = std::fs::read(&host_path) else {
+                    state.set(Register::Rax, GdiplusStatus::FileNotFound.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let Some((kind, width, height, pixels)) = gdiplus_decode_image(&bytes) else {
+                    state.set(Register::Rax, GdiplusStatus::UnknownImageFormat.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                let bitmap = GdiplusBitmap {
+                    width,
+                    height,
+                    pixel_format: crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: (width * 4) as i32,
+                    pixels,
+                    locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: kind,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                write_u64(memory, image_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipImageForceValidation => {
-                let _image = arg(0);
-                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                let image_handle = arg(0);
+                if self.user32.gdiplus_state.get(image_handle).is_some() {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
                 self.last_error = 0;
             }
             HostThunk::GdipGetFontHeight => {
-                let _font = arg(0);
+                let font_handle = arg(0);
                 let _graphics = arg(1);
                 let height_ptr = arg(2);
-                if height_ptr != 0 {
-                    write_u32(memory, height_ptr, 16.0f32.to_bits()); // Default font height
+                let Some((em_size, unit)) = (match self.user32.gdiplus_state.get(font_handle) {
+                    Some(GdiplusObject::Font(f)) => Some((f.em_size, f.unit)),
+                    _ => None,
+                }) else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                };
+                if height_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
                 }
+                // The lattice engine's line height: `em_px` mapped through the
+                // 5×7 glyph grid scale (the metric DrawString/MeasureString
+                // share), at the engine's 96 dpi.
+                let em_px = gdiplus_unit_to_pixels(em_size, unit);
+                let s = gdiplus_text_scale(em_px);
+                let line_height = (8 * s) as f32;
+                write_u32(memory, height_ptr, line_height.to_bits());
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
             HostThunk::GdipCreateBitmapFromGdiDib => {
-                let _gdi_bitmap_info = arg(0);
-                let _gdi_bitmap_data = arg(1);
+                let gdi_bitmap_info = arg(0);
+                let gdi_bitmap_data = arg(1);
                 let bitmap_ptr = arg(2);
-                let bitmap = GdiplusBitmap {
-                    width: 1, height: 1,
-                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-                    stride: 4, pixels: vec![0xFF; 4],
-                    locked: false,
+                if gdi_bitmap_info == 0 || gdi_bitmap_data == 0 || bitmap_ptr == 0 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                // BITMAPINFOHEADER: 40-byte header, optional palette.
+                let bi_size = memory.read_u32(gdi_bitmap_info).unwrap_or(0);
+                if bi_size < 40 {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let width = memory.read_u32(gdi_bitmap_info + 4).unwrap_or(0) as i32;
+                let height_raw = memory.read_u32(gdi_bitmap_info + 8).unwrap_or(0) as i32;
+                let bpp = memory.read_u16(gdi_bitmap_info + 14).unwrap_or(0);
+                if width <= 0 || height_raw == 0 || !matches!(bpp, 24 | 32) {
+                    // The engine imports 24/32-bpp BI_RGB DIBs; other formats
+                    // report NotImplemented rather than fabricating pixels.
+                    state.set(Register::Rax, GdiplusStatus::NotImplemented.to_u32() as u64);
+                    self.last_error = 0;
+                    return Ok(None);
+                }
+                let height = if height_raw > 0 { height_raw as u32 } else { height_raw.unsigned_abs() };
+                let bottom_up = height_raw > 0;
+                let row_size = (width as u32 * bpp as u32).div_ceil(32) * 4;
+                let pixel_bytes = row_size * height;
+                let mut bytes = vec![0u8; pixel_bytes as usize];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = memory.read_u8(gdi_bitmap_data + i as u64).unwrap_or(0);
+                }
+                let bytes_per_px = (bpp / 8) as usize;
+                let w = width as usize;
+                let h = height as usize;
+                let mut pixels = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    let src_y = if bottom_up { h - 1 - y } else { y };
+                    for x in 0..w {
+                        let s = src_y * row_size as usize + x * bytes_per_px;
+                        if s + bytes_per_px > bytes.len() {
+                            continue;
+                        }
+                        let d = (y * w + x) * 4;
+                        if bytes_per_px == 3 {
+                            pixels[d] = bytes[s];
+                            pixels[d + 1] = bytes[s + 1];
+                            pixels[d + 2] = bytes[s + 2];
+                            pixels[d + 3] = 0xff;
+                        } else {
+                            pixels[d] = bytes[s];
+                            pixels[d + 1] = bytes[s + 1];
+                            pixels[d + 2] = bytes[s + 2];
+                            pixels[d + 3] = bytes[s + 3];
+                        }
+                    }
+                }
+                let pixel_format = if bpp == 24 {
+                    crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB
+                } else {
+                    crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
                 };
-                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
-                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                let bitmap = GdiplusBitmap {
+                    width: w as u32,
+                    height: h as u32,
+                    pixel_format,
+                    stride: (w * 4) as i32,
+                    pixels,
+                    locked: false,
+                    scan0_guest: 0,
+                    lock_x: 0,
+                    lock_y: 0,
+                    raw_kind: 3,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                write_u64(memory, bitmap_ptr, handle);
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -62351,6 +63479,10 @@ impl PeHostRuntime {
         }
         let _ = self.deliver_current_thread_apcs(state, memory)?;
         let _ = self.poll_guest_timers()?;
+        // Audio-interface activation completions (ActivateAudioInterfaceAsync)
+        // are delivered here — asynchronously, from the runtime servicing
+        // point, never inline inside the activating call.
+        let _ = self.drain_pending_audio_activations(state, memory)?;
         // Windows semantics: a spinning thread's time still moves.  Advance
         // the guest clock by the measured wall elapsed (capped) so
         // GetTickCount/QPC advance during guest spins and Sleeping
@@ -62421,6 +63553,10 @@ impl PeHostRuntime {
             }
             return Ok(GetMessagePumpOutcome::Idle);
         }
+        // Deliver audio-interface activation completions
+        // (ActivateAudioInterfaceAsync) during message-loop idle — the
+        // same servicing point the timer/wait callbacks use.
+        let _ = self.drain_pending_audio_activations(state, memory)?;
         self.win32.sleep_ex(16, false, None)?;
         // Always yield the CPU between GetMessageW polls to prevent
         // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
@@ -65291,6 +66427,13 @@ impl PeHostRuntime {
                 self.guest_objects.remove(&address);
                 let _ = kind;
             }
+            GuestObjectKind::ImfRateControlService => {
+                // The rate-control service objects are per-session service
+                // objects: dropping the last guest reference forgets the
+                // owner-session registration alongside the object.
+                self.mf_rate_services.remove(&address);
+                self.guest_objects.remove(&address);
+            }
             GuestObjectKind::DxgiFactory => self.destroy_dxgi_factory_object(address)?,
             GuestObjectKind::DxgiAdapter => self.destroy_dxgi_adapter_object(address)?,
             GuestObjectKind::D3d11Device => self.destroy_d3d11_device_object(address)?,
@@ -66075,59 +67218,20 @@ impl PeHostRuntime {
             .get_file_metadata(&state.path)
             .map(|metadata| metadata.last_write_time_ticks)
             .unwrap_or(0);
-        let mut link_flags = 0x0000_0002_u32 | 0x0000_0080_u32;
-        if !state.description.is_empty() {
-            link_flags |= 0x0000_0004;
-        }
-        if !state.working_directory.is_empty() {
-            link_flags |= 0x0000_0010;
-        }
-        if !state.arguments.is_empty() {
-            link_flags |= 0x0000_0020;
-        }
-        if !state.icon_location.is_empty() {
-            link_flags |= 0x0000_0040;
-        }
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&0x4c_u32.to_le_bytes());
-        bytes.extend_from_slice(&[
-            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x46,
-        ]);
-        bytes.extend_from_slice(&link_flags.to_le_bytes());
-        bytes.extend_from_slice(&target_attributes.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&target_write_time.to_le_bytes());
-        bytes.extend_from_slice(&target_size.to_le_bytes());
-        bytes.extend_from_slice(&state.icon_index.to_le_bytes());
-        bytes.extend_from_slice(
-            &(if state.show_cmd == 0 {
-                SW_SHOWNORMAL
-            } else {
-                state.show_cmd
-            })
-            .to_le_bytes(),
-        );
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&build_shell_link_link_info(&state.path));
-        if !state.description.is_empty() {
-            append_shell_link_string(&mut bytes, &state.description);
-        }
-        if !state.working_directory.is_empty() {
-            append_shell_link_string(&mut bytes, &state.working_directory);
-        }
-        if !state.arguments.is_empty() {
-            append_shell_link_string(&mut bytes, &state.arguments);
-        }
-        if !state.icon_location.is_empty() {
-            append_shell_link_string(&mut bytes, &state.icon_location);
-        }
-        Ok(bytes)
+        // The canonical shell-link writer (src/lnk.rs) — the same bytes
+        // the SHCreateLinks export and every IPersistFile::Save produce.
+        Ok(crate::lnk::encode(&crate::lnk::ShellLinkData {
+            target_path: state.path.clone(),
+            description: state.description.clone(),
+            working_directory: state.working_directory.clone(),
+            arguments: state.arguments.clone(),
+            icon_location: state.icon_location.clone(),
+            icon_index: state.icon_index,
+            show_cmd: state.show_cmd,
+            file_attributes: target_attributes,
+            file_size: target_size,
+            write_time_ticks: target_write_time,
+        }))
     }
 
     fn alloc_xaudio2_engine_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
@@ -75592,6 +76696,489 @@ impl PeHostRuntime {
     }
 
     // ── GDI+ drawing helpers ──────────────────────────────────────────
+
+    /// Resolve a graphics object's drawing environment: the raster target
+    /// (GDI+ bitmap, window surface, or memory-DC bitmap), the compositing /
+    /// smoothing modes, the world transform and the world-space clip rect.
+    fn gdiplus_graphics_info(&self, graphics: u64) -> Option<GdiplusGraphicsInfo> {
+        let gfx = match self.user32.gdiplus_state.get(graphics) {
+            Some(GdiplusObject::Graphics(g)) => g,
+            _ => return None,
+        };
+        let world = match gfx.world_transform {
+            Some(handle) => match self.user32.gdiplus_state.get(handle) {
+                Some(GdiplusObject::Matrix(m)) => m.elements,
+                _ => gdiplus_matrix_identity(),
+            },
+            None => gdiplus_matrix_identity(),
+        };
+        let target = if let Some(tb) = gfx.target_bitmap {
+            Some(GdiplusTargetKind::Bitmap(tb))
+        } else if gfx.hdc != 0 {
+            if let Some(hwnd) = self.device_contexts.get(&gfx.hdc).copied().flatten() {
+                Some(GdiplusTargetKind::Window(hwnd))
+            } else if self.dc_selected_objects.contains_key(&gfx.hdc) {
+                Some(GdiplusTargetKind::MemoryDc(gfx.hdc))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Some(GdiplusGraphicsInfo {
+            hdc: gfx.hdc,
+            target,
+            state: GdiplusRenderState {
+                cm: gfx.compositing_mode,
+                sm: gfx.smoothing_mode,
+                interp: gfx.interpolation_mode,
+                clip: gfx.clip_rect,
+                world,
+            },
+        })
+    }
+
+    /// Resolve a pen into concrete drawing style, sampling brush-backed pens
+    /// at `(sample_x, sample_y)` (world coordinates).
+    fn gdiplus_pen_style(
+        &self,
+        pen_handle: u64,
+        sample_x: f32,
+        sample_y: f32,
+    ) -> Option<GdiplusStrokeStyle> {
+        let pen = match self.user32.gdiplus_state.get(pen_handle) {
+            Some(GdiplusObject::Pen(p)) => p,
+            _ => return None,
+        };
+        let color = match pen.brush_handle {
+            Some(brush_handle) => self.gdiplus_brush_color(brush_handle, sample_x, sample_y),
+            None => None,
+        }
+        .unwrap_or(pen.color);
+        Some(GdiplusStrokeStyle {
+            color,
+            width_px: gdiplus_unit_to_pixels(pen.width, pen.unit).max(0.0),
+            dash: pen.dash_style,
+            join: pen.line_join,
+            start_cap: pen.start_cap,
+            end_cap: pen.end_cap,
+            cm: 0,
+            sm: 0,
+        })
+    }
+
+    /// Resolve a brush's colour at a world-space point (solid brushes are
+    /// exact; linear-gradient and texture brushes are sampled at the point,
+    /// with texture data read from the brush's image).
+    fn gdiplus_brush_color(&self, brush_handle: u64, px: f32, py: f32) -> Option<u32> {
+        let tex_image_handle = match self.user32.gdiplus_state.get(brush_handle) {
+            Some(GdiplusObject::Brush(brush)) => match brush.as_ref() {
+                GdiplusBrush::Texture(tb) => Some(tb.image_handle),
+                _ => None,
+            },
+            _ => return None,
+        };
+        let tex_data: Option<(&[u8], u32, u32, i32)> = tex_image_handle.and_then(|image_handle| {
+            self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                if let GdiplusObject::Image(img) = obj {
+                    match img.as_ref() {
+                        GdiplusImage::Bitmap(bmp) => {
+                            Some((bmp.pixels.as_slice(), bmp.width, bmp.height, bmp.stride))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        });
+        self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
+            if let GdiplusObject::Brush(brush) = obj {
+                Some(crate::gdiplus_render::brush_color_at(
+                    brush, px, py, tex_data,
+                ))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Run a raster operation against the pixels of a graphics object's
+    /// surface.  The closure receives the raw top-down ARGB pixel buffer and
+    /// its geometry; memory-DC targets are refreshed from guest memory before
+    /// the draw and mirrored back afterwards, and window surfaces are marked
+    /// as carrying real guest pixels and published to the live channel.
+    fn gdiplus_paint(
+        &mut self,
+        memory: &mut MemoryImage,
+        graphics: u64,
+        op: impl FnOnce(&mut [u8], u32, u32, i32),
+    ) -> GdiplusStatus {
+        let Some(info) = self.gdiplus_graphics_info(graphics) else {
+            return GdiplusStatus::InvalidParameter;
+        };
+        let Some(target) = info.target else {
+            return GdiplusStatus::InvalidParameter;
+        };
+        match target {
+            GdiplusTargetKind::Bitmap(handle) => {
+                let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(handle)
+                else {
+                    return GdiplusStatus::InvalidParameter;
+                };
+                let GdiplusImage::Bitmap(bmp) = &mut **img else {
+                    return GdiplusStatus::InvalidParameter;
+                };
+                op(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride);
+            }
+            GdiplusTargetKind::Window(hwnd) => {
+                let preview = match self
+                    .user32
+                    .window_previews()
+                    .into_iter()
+                    .find(|window| window.hwnd == hwnd)
+                {
+                    Some(p) => p,
+                    None => return GdiplusStatus::InvalidParameter,
+                };
+                let w = (preview.width as usize).max(1);
+                let h = (preview.height as usize).max(1);
+                let surface = self
+                    .window_surfaces
+                    .entry(hwnd)
+                    .or_insert_with(|| WindowSurface {
+                        width: w,
+                        height: h,
+                        bytes: vec![0; w.saturating_mul(h).saturating_mul(4)],
+                        real_pixels: false,
+                    });
+                if surface.width != w || surface.height != h {
+                    surface.width = w;
+                    surface.height = h;
+                    surface.bytes = vec![0; w.saturating_mul(h).saturating_mul(4)];
+                    surface.real_pixels = false;
+                }
+                let stride = (surface.width * 4) as i32;
+                op(
+                    &mut surface.bytes,
+                    surface.width as u32,
+                    surface.height as u32,
+                    stride,
+                );
+                surface.real_pixels = true;
+                self.publish_live_window_preview_if_needed();
+            }
+            GdiplusTargetKind::MemoryDc(hdc) => {
+                let object = match self.dc_selected_objects.get(&hdc).copied() {
+                    Some(o) => o,
+                    None => return GdiplusStatus::InvalidParameter,
+                };
+                let Some(bitmap) = self.gdi_bitmaps.get_mut(&object) else {
+                    return GdiplusStatus::InvalidParameter;
+                };
+                // Refresh the host mirror: the guest may have written the DIB
+                // pixels directly through the DIB section pointer.
+                if bitmap.guest_pixel_ptr != 0
+                    && !bitmap.bytes.is_empty()
+                    && let Ok(slice) = memory.read_bytes(bitmap.guest_pixel_ptr, bitmap.bytes.len())
+                    && slice.len() == bitmap.bytes.len()
+                {
+                    bitmap.bytes.copy_from_slice(&slice);
+                }
+                let w = bitmap.width as u32;
+                let h = bitmap.height as u32;
+                let mut scratch = gdiplus_bitmap_to_argb(bitmap).unwrap_or_default();
+                if scratch.len() >= w as usize * h as usize * 4 {
+                    op(&mut scratch, w, h, w as i32 * 4);
+                }
+                if let Some(native) = gdiplus_argb_to_bitmap(bitmap, &scratch) {
+                    bitmap.bytes = native;
+                }
+                // Mirror the result back into guest memory.
+                if bitmap.guest_pixel_ptr != 0 && !bitmap.bytes.is_empty() {
+                    for (i, &byte) in bitmap.bytes.iter().enumerate() {
+                        memory.write_u8(bitmap.guest_pixel_ptr + i as u64, byte);
+                    }
+                }
+            }
+        }
+        GdiplusStatus::Ok
+    }
+
+    /// Stroke a world-space polyline through the full pipeline: world
+    /// transform, dash pattern, device-space clipping and pen caps/joins.
+    /// Closed polylines join their last point back to the first.
+    fn gdiplus_paint_stroke(
+        &mut self,
+        memory: &mut MemoryImage,
+        graphics: u64,
+        style: &GdiplusStrokeStyle,
+        world_points: &[GdiplusPointF],
+        closed: bool,
+    ) -> GdiplusStatus {
+        if world_points.len() < 2 {
+            return GdiplusStatus::Ok;
+        }
+        let Some(info) = self.gdiplus_graphics_info(graphics) else {
+            return GdiplusStatus::InvalidParameter;
+        };
+        let scale = gdiplus_matrix_scale(&info.state.world);
+        let width_px = if scale > 0.0 && (scale - 1.0).abs() > 1e-4 {
+            style.width_px * scale
+        } else {
+            style.width_px
+        };
+        let mut style = *style;
+        style.width_px = width_px.max(0.01);
+        style.cm = info.state.cm;
+        style.sm = info.state.sm;
+        let world = &info.state.world;
+        let dev: Vec<GdiplusPointF> = world_points
+            .iter()
+            .map(|p| {
+                let (x, y) = gdiplus_matrix_apply(world, p.x, p.y);
+                GdiplusPointF { x, y }
+            })
+            .collect();
+        let clip_quad = gdiplus_device_clip_quad(world, info.state.clip);
+        if clip_quad.is_none() && style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID {
+            // Draw the (possibly closed) polyline directly.
+            let mut chain = dev.clone();
+            if closed && chain.len() >= 2 {
+                let first = chain[0];
+                chain.push(first);
+            }
+            return self.gdiplus_paint(memory, graphics, |px, w, h, s| {
+                gdiplus_render_stroke_chain(px, w, h, s, &chain, &style, false, false);
+            });
+        }
+        // Dash first (device space), then clip each span.
+        let mut chains: Vec<Vec<GdiplusPointF>> =
+            if style.dash == crate::user32::GDIPLUS_DASH_STYLE_SOLID {
+                vec![dev.clone()]
+            } else {
+                gdiplus_dash_spans(&dev, closed, style.dash, style.width_px)
+            };
+        if chains.is_empty() {
+            return GdiplusStatus::Ok;
+        }
+        if let Some(clip) = &clip_quad {
+            chains = chains
+                .into_iter()
+                .flat_map(|span| {
+                    let mut clipped: Vec<Vec<GdiplusPointF>> = Vec::new();
+                    let mut run: Vec<GdiplusPointF> = Vec::new();
+                    for pair in span.windows(2) {
+                        if let Some(((ax, ay), (bx, by))) =
+                            gdiplus_clip_segment(pair[0].x, pair[0].y, pair[1].x, pair[1].y, clip)
+                        {
+                            if run.is_empty() {
+                                run.push(GdiplusPointF { x: ax, y: ay });
+                            }
+                            run.push(GdiplusPointF { x: bx, y: by });
+                        } else if !run.is_empty() {
+                            clipped.push(std::mem::take(&mut run));
+                        }
+                    }
+                    if !run.is_empty() {
+                        clipped.push(run);
+                    }
+                    clipped
+                })
+                .collect();
+        }
+        if chains.is_empty() {
+            return GdiplusStatus::Ok;
+        }
+        self.gdiplus_paint(memory, graphics, |px, w, h, s| {
+            for chain in &chains {
+                gdiplus_render_stroke_chain(
+                    px,
+                    w,
+                    h,
+                    s,
+                    chain,
+                    &style,
+                    true,
+                    style.dash != crate::user32::GDIPLUS_DASH_STYLE_SOLID,
+                );
+            }
+        })
+    }
+
+    /// Fill world-space polygons through the transform + clip pipeline.
+    /// Each polygon is treated as a closed figure.
+    fn gdiplus_paint_fill(
+        &mut self,
+        memory: &mut MemoryImage,
+        graphics: u64,
+        color: u32,
+        world_figures: &[Vec<GdiplusPointF>],
+    ) -> GdiplusStatus {
+        let Some(info) = self.gdiplus_graphics_info(graphics) else {
+            return GdiplusStatus::InvalidParameter;
+        };
+        let world = &info.state.world;
+        let clip_quad = gdiplus_device_clip_quad(world, info.state.clip);
+        let mut dev_figures: Vec<Vec<GdiplusPointF>> = Vec::new();
+        for figure in world_figures {
+            if figure.len() < 3 {
+                continue;
+            }
+            let mapped: Vec<GdiplusPointF> = figure
+                .iter()
+                .map(|p| {
+                    let (x, y) = gdiplus_matrix_apply(world, p.x, p.y);
+                    GdiplusPointF { x, y }
+                })
+                .collect();
+            if let Some(clip) = &clip_quad {
+                let clipped = gdiplus_clip_polygon(&mapped, clip);
+                if clipped.len() >= 3 {
+                    dev_figures.push(clipped);
+                }
+            } else {
+                dev_figures.push(mapped);
+            }
+        }
+        if dev_figures.is_empty() {
+            return GdiplusStatus::Ok;
+        }
+        self.gdiplus_paint(memory, graphics, |px, w, h, s| {
+            for figure in &dev_figures {
+                crate::gdiplus_render::fill_polygon(px, w, h, s, figure, color, info.state.cm);
+            }
+        })
+    }
+
+    /// Blit a source bitmap through the world transform with optional clip,
+    /// colour key and colour matrix.  Axis-aligned destinations are exact
+    /// (destination rect ∩ clip rect with a proportional source crop);
+    /// rotated destinations are genuinely unsupported by the software
+    /// rasterizer and report NotImplemented.
+    #[allow(clippy::too_many_arguments)]
+    fn gdiplus_blit_image(
+        &mut self,
+        memory: &mut MemoryImage,
+        graphics: u64,
+        info: &GdiplusGraphicsInfo,
+        src_pixels: Vec<u8>,
+        src_width: u32,
+        src_height: u32,
+        src_stride: i32,
+        src_x: f32,
+        src_y: f32,
+        src_w: f32,
+        src_h: f32,
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+        color_key: Option<(u32, u32)>,
+        color_matrix: Option<[[f32; 5]; 5]>,
+    ) -> GdiplusStatus {
+        if dst_w <= 0.0 || dst_h <= 0.0 || src_w <= 0.0 || src_h <= 0.0 {
+            return GdiplusStatus::Ok;
+        }
+        let world = &info.state.world;
+        if !gdiplus_matrix_axis_aligned(world) {
+            return GdiplusStatus::NotImplemented;
+        }
+        let (ddx, ddy, ddw, ddh) = gdiplus_matrix_rect_bounds(world, dst_x, dst_y, dst_w, dst_h);
+        let mut vis = (ddx, ddy, ddw, ddh);
+        if let Some(clip) = info.state.clip {
+            let (cx, cy, cw, ch) =
+                gdiplus_matrix_rect_bounds(world, clip.0, clip.1, clip.2, clip.3);
+            let nx0 = vis.0.max(cx);
+            let ny0 = vis.1.max(cy);
+            let nx1 = (vis.0 + vis.2).min(cx + cw);
+            let ny1 = (vis.1 + vis.3).min(cy + ch);
+            vis = (nx0, ny0, (nx1 - nx0).max(0.0), (ny1 - ny0).max(0.0));
+        }
+        if vis.2 <= 0.0 || vis.3 <= 0.0 {
+            return GdiplusStatus::Ok;
+        }
+        // Crop the source to the visible destination region.
+        let crop_sx = src_x + (vis.0 - ddx) / ddw * src_w;
+        let crop_sy = src_y + (vis.1 - ddy) / ddh * src_h;
+        let crop_sw = src_w * vis.2 / ddw;
+        let crop_sh = src_h * vis.3 / ddh;
+        let bilinear = matches!(
+            info.state.interp,
+            2 | 3 | 4 | 6 | 7 // HighQuality/Bilinear/Bicubic/HighQualityBilinear/HighQualityBicubic
+        );
+        let cm = info.state.cm;
+        self.gdiplus_paint(memory, graphics, |px, pw, ph, ps| {
+            crate::gdiplus_render::draw_image_ex(
+                px,
+                pw,
+                ph,
+                ps,
+                &src_pixels,
+                src_width,
+                src_height,
+                src_stride,
+                crop_sx,
+                crop_sy,
+                crop_sw,
+                crop_sh,
+                vis.0,
+                vis.1,
+                vis.2,
+                vis.3,
+                color_key,
+                color_matrix,
+                bilinear,
+                cm,
+            );
+        })
+    }
+
+    /// Decode a GDI+ region pointer.  The engine's regions are the byte
+    /// encodings `GdipGetClip` writes (u32 type: 0 = infinite, 1 = rect
+    /// followed by four i32 bounds).  Returns the region rect, or `None` for
+    /// an infinite region, or `Err` for an undecodable pointer.
+    fn gdiplus_decode_region(
+        &self,
+        memory: &MemoryImage,
+        region: u64,
+    ) -> Result<Option<(f32, f32, f32, f32)>, ()> {
+        if region == 0 {
+            return Err(());
+        }
+        let Ok(region_type) = read_u32(memory, region) else {
+            return Err(());
+        };
+        match region_type {
+            0 => Ok(None), // RegionDataTypeInfinite
+            1 => {
+                let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                    read_u32(memory, region + 4),
+                    read_u32(memory, region + 8),
+                    read_u32(memory, region + 12),
+                    read_u32(memory, region + 16),
+                ) else {
+                    return Err(());
+                };
+                Ok(Some((
+                    x as i32 as f32,
+                    y as i32 as f32,
+                    w as i32 as f32,
+                    h as i32 as f32,
+                )))
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn gdiplus_pixel_count(format: u32) -> Option<u32> {
+        match format {
+            crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB => Some(24),
+            crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
+            | crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB => Some(32),
+            _ => None,
+        }
+    }
 
     /// Resolve the drawing target bitmap handle, compositing mode, smoothing mode,
     /// pen width, and color for a GDI+ drawing operation.
@@ -115606,7 +117193,7 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     lock,
-                    &[bmp as u32, 0, 0, 0, locked as u32]
+                    &[bmp as u32, 0, 3, 0x0026_2009, locked as u32]
                 ),
                 0,
                 "GdipBitmapLockBits returns Ok"
@@ -115615,12 +117202,16 @@ mod tests {
             assert_eq!(memory.read_u32(locked + 4).expect("height"), 2);
             assert_eq!(memory.read_u32(locked + 8).expect("stride"), 8);
             assert_eq!(memory.read_u32(locked + 12).expect("format"), 0x0026_2009);
-            assert_ne!(
-                memory.read_u64(locked + 16).expect("scan0"),
-                0,
-                "BitmapData.scan0 is the pixel buffer"
+            let scan0 = memory.read_u64(locked + 16).expect("scan0");
+            assert_ne!(scan0, 0, "BitmapData.scan0 is a guest-visible buffer");
+            // Write through the locked buffer, then unlock: the pixels must
+            // land in the bitmap (guest-visible round trip).
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 0, 0),
+                0x0000_0000,
+                "the corner is clear before the lock write"
             );
-
+            write_u32(&mut memory, scan0, 0xFF00_00FF);
             let unlock = runtime.alloc_host_thunk(HostThunk::GdipBitmapUnlockBits);
             assert_eq!(
                 dispatch_x86_thunk(
@@ -115631,6 +117222,21 @@ mod tests {
                 ),
                 0,
                 "GdipBitmapUnlockBits returns Ok"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 0, 0),
+                0xFF00_00FF,
+                "unlock copies the lock buffer back into the pixels"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    unlock,
+                    &[bmp as u32, locked as u32]
+                ),
+                2,
+                "a second unlock on an unlocked bitmap reports InvalidParameter"
             );
 
             let dispose = runtime.alloc_host_thunk(HostThunk::GdipDisposeImage);
@@ -115748,13 +117354,39 @@ mod tests {
                 "ImageTypeBitmap"
             );
 
+            // The raw format of a Scan0-created bitmap is ImageFormatMemoryBMP.
+            let format_buf = 0x30_280_u64;
+            memory.map_bytes(format_buf, &[0_u8; 16]);
+            // The raw format of a Scan0-created bitmap is ImageFormatMemoryBMP.
+            let format_buf = 0x30_280_u64;
+            memory.map_bytes(format_buf, &[0_u8; 16]);
+            // The raw format of a Scan0-created bitmap is ImageFormatMemoryBMP.
+            let format_buf = 0x30_280_u64;
+            memory.map_bytes(format_buf, &[0_u8; 16]);
             let raw_format = runtime.alloc_host_thunk(HostThunk::GdipGetImageRawFormat);
             assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, raw_format, &[bmp as u32, 0]),
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    raw_format,
+                    &[bmp as u32, format_buf as u32]
+                ),
                 0,
                 "GdipGetImageRawFormat returns Ok"
             );
+            assert_eq!(
+                memory.read_u8(format_buf).expect("guid byte"),
+                0xaa,
+                "MemoryBMP raw-format GUID"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, raw_format, &[bmp as u32, 0]),
+                2,
+                "GdipGetImageRawFormat with a null buffer reports InvalidParameter"
+            );
 
+            // CloneImage deep-copies the pixels: the clone is an independent
+            // object.
             let clone_out = 0x30_300_u64;
             let clone = runtime.alloc_host_thunk(HostThunk::GdipCloneImage);
             assert_eq!(
@@ -115767,27 +117399,86 @@ mod tests {
                 0,
                 "GdipCloneImage returns Ok"
             );
+            let cloned = read_u64(&memory, clone_out).expect("clone");
+            created.push(cloned);
+            assert_ne!(
+                cloned, bmp,
+                "the clone is a new image object, not the original handle"
+            );
+            let set_pixel = runtime.alloc_host_thunk(HostThunk::GdipBitmapSetPixel);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[cloned as u32, 0, 0, 0xFF11_2233],
+            );
             assert_eq!(
-                read_u64(&memory, clone_out).expect("clone"),
-                bmp,
-                "the shallow clone reuses the image handle"
+                gdiplus_pixel(&runtime, bmp, 0, 0),
+                0,
+                "writing the clone leaves the original untouched"
             );
 
-            let placeholder_out = 0x30_400_u64;
+            // HBITMAP interop: a real GDI bitmap (24-bpp) imports its pixels.
+            let hbm = 0x0D00_0001_u64;
+            let mut gdi_bytes = vec![0u8; 4 * 3 * 3]; // 3x3 24bpp padded rows
+            for y in 0..3u32 {
+                for x in 0..3u32 {
+                    let row = (2 - y) as usize * 12; // bottom-up rows
+                    gdi_bytes[row + x as usize * 3] = 0x00; // B
+                    gdi_bytes[row + x as usize * 3 + 1] = 0xFF; // G
+                    gdi_bytes[row + x as usize * 3 + 2] = 0x00; // R
+                }
+            }
+            runtime.gdi_bitmaps.insert(
+                hbm,
+                MemoryBitmap {
+                    width: 3,
+                    height: 3,
+                    bpp: 3,
+                    bytes: gdi_bytes,
+                    guest_pixel_ptr: 0,
+                },
+            );
+            let from_hbitmap_out = 0x30_400_u64;
             let from_hbitmap = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromHBITMAP);
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
                     &mut memory,
                     from_hbitmap,
-                    &[0, 0, placeholder_out as u32]
+                    &[hbm as u32, 0, from_hbitmap_out as u32]
                 ),
                 0,
                 "GdipCreateBitmapFromHBITMAP returns Ok"
             );
-            let placeholder = read_u64(&memory, placeholder_out).expect("placeholder");
-            created.push(placeholder);
+            let imported = read_u64(&memory, from_hbitmap_out).expect("imported");
+            created.push(imported);
+            assert_eq!(gdiplus_pixel(&runtime, imported, 1, 1), 0xFF00_FF00);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_hbitmap,
+                    &[0x0D00_0002, 0, from_hbitmap_out as u32]
+                ),
+                2,
+                "GdipCreateBitmapFromHBITMAP with an unknown handle reports InvalidParameter"
+            );
 
+            // File interop: a real BMP file decodes; a missing file reports
+            // FileNotFound.
+            let host_dir = runtime
+                .win32
+                .guest_path_to_host_path("C:\\images")
+                .expect("host dir");
+            std::fs::create_dir_all(&host_dir).expect("mkdir images");
+            // Top-down ARGB buffer: row 0 = red, green; row 1 = blue, white.
+            let source_argb: [u8; 16] = [
+                0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF,
+            ];
+            let bmp_bytes = gdiplus_encode_bmp(2, 2, &source_argb).expect("bmp encode");
+            std::fs::write(host_dir.join("green.bmp"), &bmp_bytes).expect("write bmp");
             let from_file_out = 0x30_410_u64;
             let from_file = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromFile);
             assert_eq!(
@@ -115797,11 +117488,76 @@ mod tests {
                     from_file,
                     &[0, from_file_out as u32]
                 ),
-                0,
-                "GdipCreateBitmapFromFile returns Ok"
+                2,
+                "GdipCreateBitmapFromFile with a null name reports InvalidParameter"
             );
-            created.push(read_u64(&memory, from_file_out).expect("from file"));
+            let file_name = 0x30_500_u64;
+            memory.map_bytes(file_name, &utf16_bytes("C:\\images\\missing.png"));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_file,
+                    &[file_name as u32, from_file_out as u32]
+                ),
+                10,
+                "GdipCreateBitmapFromFile with a missing file reports FileNotFound"
+            );
+            let file_name2 = 0x30_520_u64;
+            memory.map_bytes(file_name2, &utf16_bytes("C:\\images\\green.bmp"));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_file,
+                    &[file_name2 as u32, from_file_out as u32]
+                ),
+                0,
+                "GdipCreateBitmapFromFile decodes the BMP"
+            );
+            let file_bmp = read_u64(&memory, from_file_out).expect("file bmp");
+            created.push(file_bmp);
+            // Encode + decode is an exact round trip of the ARGB buffer.
+            assert_eq!(
+                gdiplus_bitmap_pixels(&runtime, file_bmp),
+                source_argb,
+                "the BMP encode/decode round-trips the pixels"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    raw_format,
+                    &[file_bmp as u32, format_buf as u32]
+                ),
+                0,
+                "GdipGetImageRawFormat returns Ok for the file bitmap"
+            );
+            assert_eq!(
+                memory.read_u8(format_buf).expect("guid byte"),
+                0xab,
+                "BMP raw-format GUID"
+            );
 
+            // Stream interop: IStream payloads decode like files.
+            let stream_handle = 0x60_001_u64;
+            let mut stream_png = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut stream_png, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder.write_header().expect("png header");
+                writer
+                    .write_image_data(&[0, 0, 0xFF, 0xFF])
+                    .expect("png data");
+            }
+            runtime.com_streams.insert(
+                stream_handle,
+                ComStreamState {
+                    data: stream_png,
+                    position: 0,
+                },
+            );
             let from_stream_out = 0x30_420_u64;
             let from_stream = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromStream);
             assert_eq!(
@@ -115809,13 +117565,42 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     from_stream,
-                    &[0, from_stream_out as u32]
+                    &[stream_handle as u32, from_stream_out as u32]
                 ),
                 0,
-                "GdipCreateBitmapFromStream returns Ok"
+                "GdipCreateBitmapFromStream decodes the PNG stream"
             );
-            created.push(read_u64(&memory, from_stream_out).expect("from stream"));
+            let stream_bmp = read_u64(&memory, from_stream_out).expect("stream bmp");
+            created.push(stream_bmp);
+            assert_eq!(gdiplus_pixel(&runtime, stream_bmp, 0, 0), 0xFF00_00FF);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_stream,
+                    &[0x60_0099, from_stream_out as u32]
+                ),
+                2,
+                "GdipCreateBitmapFromStream with an unknown stream reports InvalidParameter"
+            );
 
+            // GDI-DIB interop: a 24-bpp bottom-up DIB imports with rows
+            // flipped and reports its 24-bpp pixel format.
+            let dib_info = 0x30_600_u64;
+            memory.map_bytes(dib_info, &[0_u8; 48]);
+            let dib_data = 0x30_700_u64;
+            memory.map_bytes(dib_data, &[0_u8; 16]); // 2x2 24bpp, rows padded to 8
+            write_u32(&mut memory, dib_info, 40); // biSize
+            write_u32(&mut memory, dib_info + 4, 2); // biWidth
+            write_u32(&mut memory, dib_info + 8, 2); // biHeight (bottom-up)
+            write_u16(&mut memory, dib_info + 12, 1); // biPlanes
+            write_u16(&mut memory, dib_info + 14, 24); // biBitCount
+            write_u32(&mut memory, dib_info + 16, 0); // BI_RGB
+            // Row 0 (bottom): blue; row 1 (top): red.
+            write_u32(&mut memory, dib_data, 0x0000_00FF); // bottom row: B=FF -> blue
+            write_u32(&mut memory, dib_data + 4, 0);
+            write_u32(&mut memory, dib_data + 8, 0x00FF_0000); // top row: R=FF -> red
+            write_u32(&mut memory, dib_data + 12, 0);
             let from_dib_out = 0x30_430_u64;
             let from_dib = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGdiDib);
             assert_eq!(
@@ -115823,13 +117608,34 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     from_dib,
-                    &[0, 0, from_dib_out as u32]
+                    &[dib_info as u32, dib_data as u32, from_dib_out as u32]
                 ),
                 0,
                 "GdipCreateBitmapFromGdiDib returns Ok"
             );
-            created.push(read_u64(&memory, from_dib_out).expect("from dib"));
+            let dib_bmp = read_u64(&memory, from_dib_out).expect("dib bmp");
+            created.push(dib_bmp);
+            assert_eq!(gdiplus_pixel(&runtime, dib_bmp, 0, 0), 0xFFFF_0000);
+            assert_eq!(
+                gdiplus_pixel(&runtime, dib_bmp, 0, 1),
+                0xFF00_00FF,
+                "the bottom-up DIB row lands at the bottom"
+            );
+            let dib_format = 0x30_800_u64;
+            let get_format = runtime.alloc_host_thunk(HostThunk::GdipGetImagePixelFormat);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_format,
+                &[dib_bmp as u32, dib_format as u32],
+            );
+            assert_eq!(
+                memory.read_u32(dib_format).expect("format"),
+                0x0002_1808,
+                "24-bpp DIB imports report Format24bppRGB"
+            );
 
+            // FromImageFile mirrors FromBitmapFromFile decoding.
             let image_out = 0x30_440_u64;
             let from_file_image = runtime.alloc_host_thunk(HostThunk::GdipCreateImageFromFile);
             assert_eq!(
@@ -115839,16 +117645,34 @@ mod tests {
                     from_file_image,
                     &[0, image_out as u32]
                 ),
-                0,
-                "GdipCreateImageFromFile returns Ok"
+                2,
+                "GdipCreateImageFromFile with a null name reports InvalidParameter"
             );
-            created.push(read_u64(&memory, image_out).expect("image from file"));
+            let file_name3 = 0x30_540_u64;
+            memory.map_bytes(file_name3, &utf16_bytes("C:\\images\\green.bmp"));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_file_image,
+                    &[file_name3 as u32, image_out as u32]
+                ),
+                0,
+                "GdipCreateImageFromFile decodes the file"
+            );
+            let image = read_u64(&memory, image_out).expect("image");
+            created.push(image);
 
             let validate = runtime.alloc_host_thunk(HostThunk::GdipImageForceValidation);
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, validate, &[bmp as u32]),
                 0,
                 "GdipImageForceValidation returns Ok"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, validate, &[0xDD01_0099]),
+                2,
+                "GdipImageForceValidation with an unknown image reports InvalidParameter"
             );
 
             let dispose = runtime.alloc_host_thunk(HostThunk::GdipDisposeImage);
@@ -116333,6 +118157,9 @@ mod tests {
                 &[0, path_out as u32],
             );
             let path = read_u64(&memory, path_out).expect("path");
+            // Path clipping is a non-rectangular region; the software clip
+            // engine holds rect clips, so GdipSetClipPath reports
+            // NotImplemented (6) instead of faking the clip.
             let set_clip_path = runtime.alloc_host_thunk(HostThunk::GdipSetClipPath);
             assert_eq!(
                 dispatch_x86_thunk(
@@ -116341,10 +118168,41 @@ mod tests {
                     set_clip_path,
                     &[graphics as u32, path as u32, 0]
                 ),
-                0,
-                "GdipSetClipPath returns Ok"
+                6,
+                "GdipSetClipPath reports NotImplemented"
             );
+            // Rect-encoded regions (the GdipGetClip encoding) drive
+            // GdipSetClipRegion: type 1 + rect sets the clip, an infinite
+            // region (type 0) clears it.
+            memory.write_u32(region + 4, 10);
+            memory.write_u32(region + 8, 20);
+            memory.write_u32(region + 12, 30);
+            memory.write_u32(region + 16, 40);
             let set_clip_region = runtime.alloc_host_thunk(HostThunk::GdipSetClipRegion);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_clip_region,
+                    &[graphics as u32, region as u32, 0]
+                ),
+                0,
+                "GdipSetClipRegion with a rect region returns Ok"
+            );
+            let clip_after_region = 0x30_600_u64;
+            memory.map_bytes(clip_after_region, &[0_u8; 16]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_bounds,
+                &[graphics as u32, clip_after_region as u32],
+            );
+            assert_eq!(
+                memory.read_u32(clip_after_region).expect("x"),
+                f32_bits(10.0),
+                "the region rect becomes the clip"
+            );
+            // An invalid region pointer is rejected, not silently accepted.
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
@@ -116352,8 +118210,8 @@ mod tests {
                     set_clip_region,
                     &[graphics as u32, 0, 0]
                 ),
-                0,
-                "GdipSetClipRegion returns Ok"
+                2,
+                "GdipSetClipRegion with a null region reports InvalidParameter"
             );
 
             let reset_clip = runtime.alloc_host_thunk(HostThunk::GdipResetClip);
@@ -116986,8 +118844,53 @@ mod tests {
             );
             assert_eq!(gdiplus_pixel(&runtime, bmp, 12, 4), 0xFFFF_0000);
 
-            // FillRegion without a clip rect fills the whole bitmap.
+            // An infinite region (the GdipGetClip encoding, type 0) fills the
+            // whole bitmap; a null region pointer is rejected.
+            let region_mem = 0x30_140_u64;
+            memory.map_bytes(region_mem, &[0_u8; 20]);
+            write_u32(&mut memory, region_mem, 0); // RegionDataTypeInfinite
             let fill_region = runtime.alloc_host_thunk(HostThunk::GdipFillRegion);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    fill_region,
+                    &[graphics as u32, brush as u32, region_mem as u32]
+                ),
+                0,
+                "GdipFillRegion with an infinite region returns Ok"
+            );
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 15, 15), 0xFFFF_0000);
+
+            // A rect-encoded region fills exactly its rectangle.
+            let rect_region = 0x30_160_u64;
+            memory.map_bytes(rect_region, &[0_u8; 20]);
+            write_u32(&mut memory, rect_region, 1); // RegionDataTypeRect
+            write_u32(&mut memory, rect_region + 4, 0);
+            write_u32(&mut memory, rect_region + 8, 0);
+            write_u32(&mut memory, rect_region + 12, 4);
+            write_u32(&mut memory, rect_region + 16, 4);
+            let red_brush_out = 0x30_180_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFF00_FF00, red_brush_out as u32],
+            );
+            let green_brush = read_u64(&memory, red_brush_out).expect("brush");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    fill_region,
+                    &[graphics as u32, green_brush as u32, rect_region as u32]
+                ),
+                0,
+                "GdipFillRegion with a rect region returns Ok"
+            );
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 2, 2), 0xFF00_FF00);
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 3, 3), 0xFF00_FF00);
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
@@ -116995,10 +118898,9 @@ mod tests {
                     fill_region,
                     &[graphics as u32, brush as u32, 0]
                 ),
-                0,
-                "GdipFillRegion returns Ok"
+                2,
+                "GdipFillRegion with a null region reports InvalidParameter"
             );
-            assert_eq!(gdiplus_pixel(&runtime, bmp, 15, 15), 0xFFFF_0000);
         })
     }
 
@@ -117141,6 +119043,10 @@ mod tests {
             configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
             let mut memory = MemoryImage::default();
 
+            let family_name = 0x30_010_u64;
+            memory.map_bytes(family_name, &utf16_bytes("Arial"));
+            let unknown_name = 0x30_020_u64;
+            memory.map_bytes(unknown_name, &utf16_bytes("NoSuchFontXyz"));
             let family_out = 0x30_000_u64;
             let family = runtime.alloc_host_thunk(HostThunk::GdipCreateFontFamilyFromName);
             assert_eq!(
@@ -117148,10 +119054,30 @@ mod tests {
                     &mut runtime,
                     &mut memory,
                     family,
-                    &[0, 0, family_out as u32]
+                    &[family_name as u32, 0, family_out as u32]
                 ),
                 0,
-                "GdipCreateFontFamilyFromName returns Ok"
+                "GdipCreateFontFamilyFromName returns Ok for a known family"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    family,
+                    &[unknown_name as u32, 0, family_out as u32]
+                ),
+                14,
+                "an unknown family reports FontFamilyNotFound"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    family,
+                    &[0, 0, family_out as u32]
+                ),
+                2,
+                "a null family name reports InvalidParameter"
             );
             let family_handle = read_u64(&memory, family_out).expect("family");
 
@@ -117277,15 +119203,20 @@ mod tests {
             );
             let width = f32::from_bits(memory.read_u32(bounds + 8).expect("width"));
             let height = f32::from_bits(memory.read_u32(bounds + 12).expect("height"));
+            // The lattice engine shares one metric: em=16 maps to glyphs at
+            // pitch s=2 (5x7 dots), so 4 chars measure 4*12 - 2 wide and
+            // 8*s = 16 tall - exactly what DrawString rasterises.
             assert!(
-                (width - 38.4).abs() < 0.01,
-                "4 chars at 16pt measure ~38.4 wide, got {width}"
+                (width - 46.0).abs() < 0.01,
+                "4 chars at 16 em measure 46 wide, got {width}"
             );
             assert!(
-                (height - 20.8).abs() < 0.01,
-                "16pt text measures ~20.8 tall, got {height}"
+                (height - 16.0).abs() < 0.01,
+                "16 em text measures 16 tall, got {height}"
             );
 
+            // MeasureCharacterRanges creates GpRegion objects, which are not
+            // creatable through the exported surface: NotImplemented.
             let measure_ranges = runtime.alloc_host_thunk(HostThunk::GdipMeasureCharacterRanges);
             assert_eq!(
                 dispatch_x86_thunk(
@@ -117304,8 +119235,8 @@ mod tests {
                         0
                     ]
                 ),
-                0,
-                "GdipMeasureCharacterRanges returns Ok"
+                6,
+                "GdipMeasureCharacterRanges reports NotImplemented"
             );
 
             let delete_font = runtime.alloc_host_thunk(HostThunk::GdipDeleteFont);
@@ -117693,31 +119624,1463 @@ mod tests {
                 "GdipDisposeImageAttributes returns Ok"
             );
 
-            // Documented no-op / placeholder operations still report Ok and
-            // must not corrupt the object table.
+            // A 2x2 red bitmap for the save/export interop checks.
+            let scan0 = 0x30_200_u64;
+            memory.map_bytes(scan0, &[0_u8; 16]);
+            let bmp_out = 0x30_210_u64;
+            let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_scan0,
+                &[2, 2, 8, 0x0026_2009, scan0 as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+            let set_pixel = runtime.alloc_host_thunk(HostThunk::GdipBitmapSetPixel);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_pixel,
+                &[bmp as u32, 1, 1, 0xFFFF_0000],
+            );
+
+            // HICON-from-bitmap needs the pixel-icon object registry, which
+            // the engine only keeps for module icon resources:
+            // NotImplemented, not a fake Ok.
             let hicon = runtime.alloc_host_thunk(HostThunk::GdipCreateHICONFromBitmap);
             assert_eq!(
-                dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[0, 0]),
-                0,
-                "GdipCreateHICONFromBitmap returns Ok"
+                dispatch_x86_thunk(&mut runtime, &mut memory, hicon, &[bmp as u32, 0]),
+                6,
+                "GdipCreateHICONFromBitmap reports NotImplemented"
             );
+
+            // HBITMAP-from-bitmap mints a real GDI HBITMAP in the GDI bitmap
+            // table (usable with SelectObject/BitBlt afterwards).
             let hbitmap = runtime.alloc_host_thunk(HostThunk::GdipCreateHBITMAPFromBitmap);
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, hbitmap, &[0, 0, 0]),
+                2,
+                "GdipCreateHBITMAPFromBitmap with a null bitmap reports InvalidParameter"
+            );
+            let hbm_out = 0x30_220_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    hbitmap,
+                    &[bmp as u32, 0, hbm_out as u32]
+                ),
                 0,
                 "GdipCreateHBITMAPFromBitmap returns Ok"
             );
+            let hbm = read_u64(&memory, hbm_out).expect("hbm");
+            let exported = runtime
+                .gdi_bitmaps
+                .get(&hbm)
+                .expect("exported HBITMAP is registered");
+            assert_eq!(exported.width, 2);
+            assert_eq!(exported.height, 2);
+            assert_eq!(exported.bpp, 4);
+
+            // SaveImageToFile: PNG encoder round-trips through a real file.
             let save_file = runtime.alloc_host_thunk(HostThunk::GdipSaveImageToFile);
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, save_file, &[0, 0, 0, 0]),
-                0,
-                "GdipSaveImageToFile returns Ok"
+                2,
+                "GdipSaveImageToFile with a null image reports InvalidParameter"
             );
+            let png_clsid = 0x30_230_u64;
+            memory.map_bytes(
+                png_clsid,
+                &gdiplus_guid_bytes("557cf406-1a04-11d3-9a73-0000f81ef32e"),
+            );
+            let host_dir = runtime
+                .win32
+                .guest_path_to_host_path(r"C:\images")
+                .expect("host dir");
+            std::fs::create_dir_all(&host_dir).expect("mkdir");
+            let out_name = 0x30_240_u64;
+            memory.map_bytes(out_name, &utf16_bytes(r"C:\images\roundtrip.png"));
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    save_file,
+                    &[bmp as u32, out_name as u32, png_clsid as u32, 0]
+                ),
+                0,
+                "GdipSaveImageToFile encodes the PNG"
+            );
+            assert!(
+                host_dir.join("roundtrip.png").exists(),
+                "the PNG file is written"
+            );
+            let from_file = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromFile);
+            let reload_out = 0x30_250_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    from_file,
+                    &[out_name as u32, reload_out as u32]
+                ),
+                0,
+                "the saved PNG reloads"
+            );
+            let reloaded = read_u64(&memory, reload_out).expect("reloaded");
+            assert_eq!(
+                gdiplus_pixel(&runtime, reloaded, 1, 1),
+                0xFFFF_0000,
+                "the saved pixel round-trips"
+            );
+            // Unsupported encoders (JPEG/GIF/TIFF) report NotImplemented.
+            let jpeg_clsid = 0x30_260_u64;
+            memory.map_bytes(
+                jpeg_clsid,
+                &gdiplus_guid_bytes("557cf401-1a04-11d3-9a73-0000f81ef32e"),
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    save_file,
+                    &[bmp as u32, out_name as u32, jpeg_clsid as u32, 0]
+                ),
+                6,
+                "GdipSaveImageToFile with the JPEG encoder reports NotImplemented"
+            );
+
+            // SaveImageToStream writes the encoded payload into the IStream.
             let save_stream = runtime.alloc_host_thunk(HostThunk::GdipSaveImageToStream);
             assert_eq!(
                 dispatch_x86_thunk(&mut runtime, &mut memory, save_stream, &[0, 0, 0, 0]),
+                2,
+                "GdipSaveImageToStream with a null image reports InvalidParameter"
+            );
+            let stream_handle = 0x60_007_u64;
+            runtime.com_streams.insert(
+                stream_handle,
+                ComStreamState {
+                    data: Vec::new(),
+                    position: 0,
+                },
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    save_stream,
+                    &[bmp as u32, stream_handle as u32, png_clsid as u32, 0]
+                ),
                 0,
-                "GdipSaveImageToStream returns Ok"
+                "GdipSaveImageToStream encodes into the stream"
+            );
+            let stream_data = &runtime
+                .com_streams
+                .get(&stream_handle)
+                .expect("stream")
+                .data;
+            assert_eq!(
+                &stream_data[0..8],
+                &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+                "the stream holds PNG bytes"
+            );
+            assert!(stream_data.len() > 60, "the stream holds a PNG payload");
+
+            let dispose_bmp = runtime.alloc_host_thunk(HostThunk::GdipDisposeImage);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, dispose_bmp, &[reloaded as u32]),
+                0,
+                "dispose of the reloaded image"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_create_graphics_surface_and_state_dispatch() {
+        with_big_stack(|| {
+            // GdipCreateGraphics (the final-scraps routed entry) creates the
+            // same real handle-model graphics object GdipCreateFromHDC does:
+            // drawing resolves the HDC's raster surface, and graphics state
+            // ops work on it.  Without any surface the drawing calls report
+            // InvalidParameter instead of pretending.
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-creategfx",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateGraphics);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create_gfx, &[0, gfx_out as u32]),
+                0,
+                "GdipCreateGraphics returns Ok"
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+            assert_ne!(graphics, 0, "the graphics handle is real");
+            assert!(
+                runtime.user32.gdiplus_state.get(graphics).is_some(),
+                "the graphics object lives in the GDI+ object table"
+            );
+
+            // State operations round-trip on the object.
+            let clip = runtime.alloc_host_thunk(HostThunk::GdipSetClipRect);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    clip,
+                    &[
+                        graphics as u32,
+                        f32_bits(1.0),
+                        f32_bits(2.0),
+                        f32_bits(3.0),
+                        f32_bits(4.0),
+                        0
+                    ]
+                ),
+                0,
+                "GdipSetClipRect returns Ok"
+            );
+            let save = runtime.alloc_host_thunk(HostThunk::GdipSaveGraphics);
+            let state_token_out = 0x30_100_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                save,
+                &[graphics as u32, state_token_out as u32],
+            );
+            let token = read_u32(&memory, state_token_out).expect("token");
+            assert_ne!(token, 0);
+            let reset_clip = runtime.alloc_host_thunk(HostThunk::GdipResetClip);
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_clip, &[graphics as u32]);
+            let restore = runtime.alloc_host_thunk(HostThunk::GdipRestoreGraphics);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    restore,
+                    &[graphics as u32, token]
+                ),
+                0,
+                "GdipRestoreGraphics returns Ok"
+            );
+            let bounds = 0x30_110_u64;
+            memory.map_bytes(bounds, &[0_u8; 16]);
+            let get_bounds = runtime.alloc_host_thunk(HostThunk::GdipGetClipBounds);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_bounds,
+                &[graphics as u32, bounds as u32],
+            );
+            assert_eq!(
+                memory.read_u32(bounds + 8).expect("w"),
+                f32_bits(3.0),
+                "the restored clip rectangle is back"
+            );
+
+            // A graphics with no bindable surface cannot rasterise: real
+            // InvalidParameter instead of a silent no-op.
+            let pen_out = 0x30_120_u64;
+            let create_pen = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_pen,
+                &[0xFFFF_0000, f32_bits(1.0), 0, pen_out as u32],
+            );
+            let pen = read_u64(&memory, pen_out).expect("pen");
+            let draw_line = runtime.alloc_host_thunk(HostThunk::GdipDrawLine);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    draw_line,
+                    &[
+                        graphics as u32,
+                        pen as u32,
+                        f32_bits(0.0),
+                        f32_bits(0.0),
+                        f32_bits(4.0),
+                        f32_bits(4.0)
+                    ]
+                ),
+                2,
+                "drawing without a surface reports InvalidParameter"
+            );
+
+            let delete = runtime.alloc_host_thunk(HostThunk::GdipDeleteGraphics);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[graphics as u32]),
+                0,
+                "GdipDeleteGraphics returns Ok"
+            );
+            assert!(
+                runtime.user32.gdiplus_state.get(graphics).is_none(),
+                "the graphics object is gone after delete"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_window_dc_surface_drawing_dispatch() {
+        with_big_stack(|| {
+            // GDI+ over a window DC graphics object rasterises into the same
+            // window surface the GDI blitters write, so shapes reach the
+            // guest-visible window pixels.
+            const WS_CHILD: u32 = 0x4000_0000;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-window",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime.user32.register_class_ex_w("GdiPlusTarget");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_styled(
+                    "GdiPlusTarget",
+                    "gdiplus",
+                    64,
+                    32,
+                    true,
+                    false,
+                    None,
+                    1,
+                    WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create target");
+            while runtime.user32.get_message_w().is_some() {}
+
+            let get_dc = runtime.alloc_host_thunk(HostThunk::GetDC);
+            let hdc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc, &[hwnd]);
+            assert_ne!(hdc, 0, "GetDC returns a window DC");
+            assert_eq!(
+                runtime.device_contexts.get(&hdc).copied().flatten(),
+                Some(hwnd),
+                "the DC resolves to the window"
+            );
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_gfx,
+                    &[hdc as u32, gfx_out as u32]
+                ),
+                0,
+                "GdipCreateFromHDC returns Ok"
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let brush_out = 0x30_100_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFF00_00FF, brush_out as u32],
+            );
+            let blue = read_u64(&memory, brush_out).expect("brush");
+
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    fill_rect,
+                    &[
+                        graphics as u32,
+                        blue as u32,
+                        f32_bits(4.0),
+                        f32_bits(4.0),
+                        f32_bits(8.0),
+                        f32_bits(8.0)
+                    ]
+                ),
+                0,
+                "GdipFillRectangle into the window DC returns Ok"
+            );
+            let (inside, below) = {
+                let surface = runtime
+                    .window_surfaces
+                    .get(&hwnd)
+                    .expect("the window has a surface");
+                assert!(surface.real_pixels, "the surface carries real guest pixels");
+                let stride = surface.width * 4;
+                let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+                    let off = (y * stride + x * 4) as usize;
+                    [
+                        surface.bytes[off],
+                        surface.bytes[off + 1],
+                        surface.bytes[off + 2],
+                        surface.bytes[off + 3],
+                    ]
+                };
+                (pixel_at(6, 6), pixel_at(6, 14))
+            };
+            // Blue fill: BGRA bytes [FF, 00, 00, FF].
+            assert_eq!(inside, [0xFF, 0x00, 0x00, 0xFF], "inside the fill");
+            assert_eq!(
+                below,
+                [0x00, 0x00, 0x00, 0x00],
+                "below the fill the surface stays clear"
+            );
+
+            // A red stroke on top lands in the same surface.
+            let pen_out = 0x30_110_u64;
+            let create_pen = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_pen,
+                &[0xFFFF_0000, f32_bits(2.0), 0, pen_out as u32],
+            );
+            let pen = read_u64(&memory, pen_out).expect("pen");
+            let draw_line = runtime.alloc_host_thunk(HostThunk::GdipDrawLine);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_line,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(20.0),
+                    f32_bits(63.0),
+                    f32_bits(20.0),
+                ],
+            );
+            let line_pixel = {
+                let surface = runtime
+                    .window_surfaces
+                    .get(&hwnd)
+                    .expect("the window has a surface");
+                let stride = surface.width * 4;
+                let off = (20 * stride + 20 * 4) as usize;
+                [
+                    surface.bytes[off],
+                    surface.bytes[off + 1],
+                    surface.bytes[off + 2],
+                    surface.bytes[off + 3],
+                ]
+            };
+            assert_eq!(
+                line_pixel,
+                [0x00, 0x00, 0xFF, 0xFF],
+                "the red line crosses the surface"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_memory_dc_bitmap_drawing_dispatch() {
+        with_big_stack(|| {
+            // GDI+ graphics bound to a memory-DC HDC rasterise into the DIB
+            // section selected in that DC, and BitBlt carries the pixels to a
+            // window: GDI+ -> GDI end-to-end with guest-visible results.
+            const WS_CHILD: u32 = 0x4000_0000;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-memdc",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            runtime.user32.register_class_ex_w("GdiPlusMemTarget");
+            let hwnd = runtime
+                .user32
+                .create_window_ex_styled(
+                    "GdiPlusMemTarget",
+                    "gdiplus-mem",
+                    32,
+                    32,
+                    true,
+                    false,
+                    None,
+                    1,
+                    WS_CHILD,
+                    0,
+                    None,
+                )
+                .expect("create target");
+            while runtime.user32.get_message_w().is_some() {}
+
+            let create_compatible_dc = runtime.alloc_host_thunk(HostThunk::CreateCompatibleDC);
+            let mem_dc = dispatch_x86_thunk(&mut runtime, &mut memory, create_compatible_dc, &[0]);
+            assert_ne!(mem_dc, 0, "CreateCompatibleDC returns an HDC");
+
+            let bmi_ptr = 0x42_000_u64;
+            let mut bmi = vec![0_u8; 40];
+            bmi[0..4].copy_from_slice(&40_u32.to_le_bytes());
+            bmi[4..8].copy_from_slice(&16_u32.to_le_bytes());
+            bmi[8..12].copy_from_slice(&16_u32.to_le_bytes());
+            bmi[14..16].copy_from_slice(&32_u16.to_le_bytes());
+            memory.map_bytes(bmi_ptr, &bmi);
+            let bits_ptr = 0x42_100_u64;
+            memory.map_bytes(bits_ptr, &[0; 4]);
+            let create_dib = runtime.alloc_host_thunk(HostThunk::CreateDIBSection);
+            let dib = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_dib,
+                &[mem_dc as u32, bmi_ptr as u32, 0, bits_ptr as u32, 0, 0],
+            );
+            assert_ne!(dib, 0, "CreateDIBSection returns an HBITMAP");
+            let select_object = runtime.alloc_host_thunk(HostThunk::SelectObject);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select_object,
+                &[mem_dc as u32, dib as u32],
+            );
+
+            // Draw with GDI+ through a graphics object created from the
+            // memory DC.
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[mem_dc as u32, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let brush_out = 0x30_100_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFF00_FF00, brush_out as u32],
+            );
+            let green = read_u64(&memory, brush_out).expect("brush");
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    fill_rect,
+                    &[
+                        graphics as u32,
+                        green as u32,
+                        f32_bits(6.0),
+                        f32_bits(6.0),
+                        f32_bits(4.0),
+                        f32_bits(4.0)
+                    ]
+                ),
+                0,
+                "GdipFillRectangle into the DIB-backed DC returns Ok"
+            );
+            let dib_pixel = {
+                let dib_bitmap = runtime
+                    .gdi_bitmaps
+                    .get(&dib)
+                    .expect("the DIB is registered");
+                // Memory row 0 is the bottom row; screen y=7 sits at row 16-1-7.
+                let off = ((16 - 1 - 7) * 16 + 7) * 4;
+                [
+                    dib_bitmap.bytes[off],
+                    dib_bitmap.bytes[off + 1],
+                    dib_bitmap.bytes[off + 2],
+                    dib_bitmap.bytes[off + 3],
+                ]
+            };
+            assert_eq!(
+                dib_pixel,
+                [0x00, 0xFF, 0x00, 0xFF],
+                "GDI+ pixels landed in the DIB (bottom-up)"
+            );
+
+            // BitBlt the DIB into the window DC: the window surface shows the
+            // GDI+ drawing.
+            let bitblt = runtime.alloc_host_thunk(HostThunk::BitBlt);
+            let get_dc = runtime.alloc_host_thunk(HostThunk::GetDC);
+            let wdc = dispatch_x86_thunk(&mut runtime, &mut memory, get_dc, &[hwnd]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    bitblt,
+                    &[
+                        wdc as u32,
+                        0,
+                        0,
+                        16,
+                        16,
+                        mem_dc as u32,
+                        0,
+                        0,
+                        0x00CC_0020 /* SRCCOPY */
+                    ]
+                ),
+                1,
+                "BitBlt SRCCOPY returns TRUE"
+            );
+            let surface = runtime.window_surfaces.get(&hwnd).expect("window surface");
+            let stride = surface.width * 4;
+            let off = (7 * stride + 7 * 4) as usize;
+            assert_eq!(
+                &surface.bytes[off..off + 4],
+                &[0x00, 0xFF, 0x00, 0xFF],
+                "the window surface received the GDI+ pixels"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_world_transform_applied_to_drawing_dispatch() {
+        with_big_stack(|| {
+            // The world transform genuinely moves geometry: a translate of
+            // (10, 0) shifts a filled rect, and a rotation turns the fill
+            // around the origin.  Without the transform the same rect would
+            // land at the origin instead.
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-worlddraw",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let bmp_out = 0x30_100_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[16, 16, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+            let matrix_out = 0x30_110_u64;
+            let create_matrix = runtime.alloc_host_thunk(HostThunk::GdipCreateMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_matrix,
+                &[matrix_out as u32],
+            );
+            let matrix = read_u64(&memory, matrix_out).expect("matrix");
+            let translate = runtime.alloc_host_thunk(HostThunk::GdipTranslateMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                translate,
+                &[matrix as u32, f32_bits(10.0), f32_bits(0.0), 0],
+            );
+            let set_world = runtime.alloc_host_thunk(HostThunk::GdipSetWorldTransform);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_world,
+                &[graphics as u32, matrix as u32],
+            );
+
+            let brush_out = 0x30_120_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFFFF_0000, brush_out as u32],
+            );
+            let red = read_u64(&memory, brush_out).expect("brush");
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 11, 1),
+                0xFFFF_0000,
+                "the fill moved by the translation"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 1, 1),
+                0,
+                "the origin is empty under the translated world"
+            );
+
+            // A pure 90-degree clockwise rotation maps world (+x) to device
+            // (+y, growing down the screen) and world (+y) to device (-x), so
+            // the rect drawn just above the origin lands just right of it:
+            // world rect (0,-4,2,2) -> device rect x 2..4, y 0..2.
+            let reset_world = runtime.alloc_host_thunk(HostThunk::GdipResetWorldTransform);
+            dispatch_x86_thunk(&mut runtime, &mut memory, reset_world, &[graphics as u32]);
+            let rot_out = 0x30_130_u64;
+            let create_matrix = runtime.alloc_host_thunk(HostThunk::GdipCreateMatrix);
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_matrix, &[rot_out as u32]);
+            let rot = read_u64(&memory, rot_out).expect("rot matrix");
+            let rotate = runtime.alloc_host_thunk(HostThunk::GdipRotateMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                rotate,
+                &[rot as u32, f32_bits(90.0), 0],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_world,
+                &[graphics as u32, rot as u32],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(-4.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 3, 1),
+                0xFFFF_0000,
+                "the rotated world paints at the rotated position"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 1, 1),
+                0,
+                "nothing paints at the unrotated spot"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_clip_applied_to_drawing_dispatch() {
+        with_big_stack(|| {
+            // The clip rect genuinely limits rasterisation: fills and strokes
+            // outside the clip stay clear, inside they paint.
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-clipdraw",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let bmp_out = 0x30_100_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[16, 16, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+            let set_clip = runtime.alloc_host_thunk(HostThunk::GdipSetClipRect);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_clip,
+                &[
+                    graphics as u32,
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                    1, /* CombineModeIntersect */
+                ],
+            );
+
+            let brush_out = 0x30_110_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFFFF_0000, brush_out as u32],
+            );
+            let red = read_u64(&memory, brush_out).expect("brush");
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    red as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(16.0),
+                    f32_bits(16.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 3, 3),
+                0xFFFF_0000,
+                "inside the clip the fill paints"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 1, 1),
+                0,
+                "outside the clip the fill stays clear"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 7, 7),
+                0,
+                "past the clip edge the fill stays clear"
+            );
+
+            // A diagonal stroke crossing the clip is cut at the boundary.
+            let pen_out = 0x30_120_u64;
+            let create_pen = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_pen,
+                &[0xFF00_FF00, f32_bits(1.0), 0, pen_out as u32],
+            );
+            let green_pen = read_u64(&memory, pen_out).expect("pen");
+            let draw_line = runtime.alloc_host_thunk(HostThunk::GdipDrawLine);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_line,
+                &[
+                    graphics as u32,
+                    green_pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(15.0),
+                    f32_bits(15.0),
+                ],
+            );
+            // (3,3) sits inside the clip on the diagonal; (7,7) is outside.
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 3, 3),
+                0xFF00_FF00,
+                "the clipped stroke paints inside the clip"
+            );
+            assert_ne!(
+                gdiplus_pixel(&runtime, bmp, 7, 7),
+                0xFF00_FF00,
+                "the stroke does not leak past the clip"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_dash_and_brush_pen_drawing_dispatch() {
+        with_big_stack(|| {
+            // Dash patterns really split strokes, and brush-backed pens
+            // (GdipCreatePen2) draw with their brush colour.
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-dash",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let bmp_out = 0x30_100_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[48, 16, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+            let pen_out = 0x30_110_u64;
+            let create_pen = runtime.alloc_host_thunk(HostThunk::GdipCreatePen1);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_pen,
+                &[0xFFFF_0000, f32_bits(2.0), 0, pen_out as u32],
+            );
+            let pen = read_u64(&memory, pen_out).expect("pen");
+            let set_dash = runtime.alloc_host_thunk(HostThunk::GdipSetPenDashStyle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_dash,
+                &[pen as u32, 4 /* DashDot: 3/1/1/1 (x width) */],
+            );
+            let draw_line = runtime.alloc_host_thunk(HostThunk::GdipDrawLine);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_line,
+                &[
+                    graphics as u32,
+                    pen as u32,
+                    f32_bits(0.0),
+                    f32_bits(8.0),
+                    f32_bits(47.0),
+                    f32_bits(8.0),
+                ],
+            );
+            // DashDot at width 2: on [0,6) off [6,8) on [8,10) off [10,12)
+            // (converted to pixels: the dash strokes cover 0..6 and 8..10,
+            // leaving clear gap pixels at 7 and 11).
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 3, 8), 0xFFFF_0000, "dash on");
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 7, 8), 0, "dash gap");
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 9, 8), 0xFFFF_0000, "dot on");
+            assert_eq!(gdiplus_pixel(&runtime, bmp, 11, 8), 0, "second gap");
+
+            // Brush-backed pen: green solid brush, Pen2 width 2.
+            let brush_out = 0x30_120_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0xFF00_FF00, brush_out as u32],
+            );
+            let green = read_u64(&memory, brush_out).expect("brush");
+            let pen2_out = 0x30_130_u64;
+            let create_pen2 = runtime.alloc_host_thunk(HostThunk::GdipCreatePen2);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_pen2,
+                &[green as u32, f32_bits(2.0), 0, pen2_out as u32],
+            );
+            let pen2 = read_u64(&memory, pen2_out).expect("pen2");
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_line,
+                &[
+                    graphics as u32,
+                    pen2 as u32,
+                    f32_bits(0.0),
+                    f32_bits(14.0),
+                    f32_bits(47.0),
+                    f32_bits(14.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 10, 14),
+                0xFF00_FF00,
+                "the brush-backed pen paints green"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_alpha_compositing_and_lattice_text_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-alpha-text",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+
+            let bmp_out = 0x30_100_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[32, 16, graphics as u32, bmp_out as u32],
+            );
+            let bmp = read_u64(&memory, bmp_out).expect("bitmap");
+
+            // SOURCE_COPY stores the semi-transparent colour verbatim.
+            let set_mode = runtime.alloc_host_thunk(HostThunk::GdipSetCompositingMode);
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_mode, &[graphics as u32, 1]);
+            let brush_out = 0x30_110_u64;
+            let create_brush = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_brush,
+                &[0x8000_FF00, brush_out as u32],
+            );
+            let half_green = read_u64(&memory, brush_out).expect("brush");
+            let fill_rect = runtime.alloc_host_thunk(HostThunk::GdipFillRectangle);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fill_rect,
+                &[
+                    graphics as u32,
+                    half_green as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(4.0),
+                    f32_bits(4.0),
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 2, 2),
+                0x8000_FF00,
+                "SOURCE_COPY keeps the alpha byte"
+            );
+
+            // Lattice text rasterises with the shared 5x7 glyph metrics:
+            // an "A" at (8,0) em 16 (scale 2) paints dots in its glyph box.
+            let text = runtime.alloc_utf16_string(&mut memory, "A").expect("text");
+            let layout = 0x30_200_u64;
+            memory.map_bytes(layout, &[0_u8; 16]);
+            write_u32(&mut memory, layout, f32_bits(8.0));
+            write_u32(&mut memory, layout + 4, f32_bits(0.0));
+            write_u32(&mut memory, layout + 8, f32_bits(16.0));
+            write_u32(&mut memory, layout + 12, f32_bits(16.0));
+            let family_out = 0x30_070_u64;
+            let family_name = 0x30_080_u64;
+            memory.map_bytes(family_name, &utf16_bytes("Arial"));
+            let create_family = runtime.alloc_host_thunk(HostThunk::GdipCreateFontFamilyFromName);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_family,
+                &[family_name as u32, 0, family_out as u32],
+            );
+            let family = read_u64(&memory, family_out).expect("family");
+            let font_out = 0x30_0A0_u64;
+            let font = runtime.alloc_host_thunk(HostThunk::GdipCreateFont);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                font,
+                &[family as u32, f32_bits(16.0), 0, 0, font_out as u32],
+            );
+            let font_handle = read_u64(&memory, font_out).expect("font");
+            assert_ne!(font_handle, 0);
+            let white_brush_out = 0x30_0B0_u64;
+            let create_white = runtime.alloc_host_thunk(HostThunk::GdipCreateSolidFill);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_white,
+                &[0xFFFF_FFFF, white_brush_out as u32],
+            );
+            let white = read_u64(&memory, white_brush_out).expect("brush");
+            let draw_string = runtime.alloc_host_thunk(HostThunk::GdipDrawString);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    draw_string,
+                    &[
+                        graphics as u32,
+                        text as u32,
+                        1,
+                        font_handle as u32,
+                        layout as u32,
+                        0,
+                        white as u32,
+                    ]
+                ),
+                0,
+                "GdipDrawString returns Ok"
+            );
+            // The 'A' lattice: a dot at the top apex (col 2, row 0) and one
+            // at the bottom left (col 1, row 6) — scaled by 2 from (8,0).
+            let mut saw_any = false;
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    if gdiplus_pixel(&runtime, bmp, x, y) == 0xFFFF_FFFF {
+                        saw_any = true;
+                    }
+                }
+            }
+            assert!(saw_any, "glyph dots rasterise into the bitmap");
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 8 + 2 * 2, 0 + 0 * 2),
+                0xFFFF_FFFF,
+                "the apex dot of the A is drawn"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, bmp, 8 + 0 * 2, 0 + 6 * 2),
+                0xFFFF_FFFF,
+                "the left leg dot of the A is drawn"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_rotate_multiply_matrix_math_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-matrixmath",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let m_out = 0x30_000_u64;
+            let create = runtime.alloc_host_thunk(HostThunk::GdipCreateMatrix);
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[m_out as u32]);
+            let m = read_u64(&memory, m_out).expect("matrix");
+
+            let rotate = runtime.alloc_host_thunk(HostThunk::GdipRotateMatrix);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    rotate,
+                    &[m as u32, f32_bits(90.0), 0]
+                ),
+                0,
+                "GdipRotateMatrix returns Ok"
+            );
+            let elems = 0x30_100_u64;
+            memory.map_bytes(elems, &[0_u8; 24]);
+            let get_elems = runtime.alloc_host_thunk(HostThunk::GdipGetMatrixElements);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_elems,
+                &[m as u32, elems as u32],
+            );
+            let read_elem =
+                |i: u64| -> f32 { f32::from_bits(memory.read_u32(elems + i * 4).expect("elem")) };
+            assert!(
+                (read_elem(0) - 0.0).abs() < 1e-3 && (read_elem(1) + 1.0).abs() < 1e-3,
+                "90-degree rotation: m11=0, m12=-1 (got {}, {})",
+                read_elem(0),
+                read_elem(1)
+            );
+            assert!(
+                (read_elem(2) - 1.0).abs() < 1e-3 && (read_elem(3) - 0.0).abs() < 1e-3,
+                "90-degree rotation: m21=1, m22=0 (got {}, {})",
+                read_elem(2),
+                read_elem(3)
+            );
+
+            // Multiply honours the MatrixOrder: Prepend applies the operand
+            // first, Append last.  t = translate(10,0), s = scale(2,2).
+            let t_out = 0x30_110_u64;
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[t_out as u32]);
+            let t = read_u64(&memory, t_out).expect("t");
+            let translate = runtime.alloc_host_thunk(HostThunk::GdipTranslateMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                translate,
+                &[t as u32, f32_bits(10.0), f32_bits(0.0), 1],
+            );
+            let s_out = 0x30_120_u64;
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[s_out as u32]);
+            let s = read_u64(&memory, s_out).expect("s");
+            let scale = runtime.alloc_host_thunk(HostThunk::GdipScaleMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                scale,
+                &[s as u32, f32_bits(2.0), f32_bits(2.0), 0],
+            );
+            let multiply = runtime.alloc_host_thunk(HostThunk::GdipMultiplyMatrix);
+            // Append: t stays the world-space translation of the scaled
+            // space: point (1,0) -> (12, 0) under T*S? (append: p' = T(S p)).
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                multiply,
+                &[t as u32, s as u32, 1 /* Append */],
+            );
+            let appended = 0x30_200_u64;
+            memory.map_bytes(appended, &[0_u8; 24]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_elems,
+                &[t as u32, appended as u32],
+            );
+            let a_elem = |i: u64| -> f32 {
+                f32::from_bits(memory.read_u32(appended + i * 4).expect("elem"))
+            };
+            assert!(
+                (a_elem(0) - 2.0).abs() < 1e-3 && (a_elem(4) - 10.0).abs() < 1e-3,
+                "append keeps the translation after the scale"
+            );
+            // Prepend: scale applies after the translation: (1,0) -> (22, 0).
+            let t2_out = 0x30_130_u64;
+            dispatch_x86_thunk(&mut runtime, &mut memory, create, &[t2_out as u32]);
+            let t2 = read_u64(&memory, t2_out).expect("t2");
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                translate,
+                &[t2 as u32, f32_bits(10.0), f32_bits(0.0), 1],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                multiply,
+                &[t2 as u32, s as u32, 0 /* Prepend */],
+            );
+            let prepended = 0x30_210_u64;
+            memory.map_bytes(prepended, &[0_u8; 24]);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_elems,
+                &[t2 as u32, prepended as u32],
+            );
+            let p_elem = |i: u64| -> f32 {
+                f32::from_bits(memory.read_u32(prepended + i * 4).expect("elem"))
+            };
+            assert!(
+                (p_elem(0) - 2.0).abs() < 1e-3 && (p_elem(4) - 20.0).abs() < 1e-3,
+                "prepend scales the translation too"
+            );
+        })
+    }
+
+    #[test]
+    fn gdiplus_image_color_key_and_matrix_drawing_dispatch() {
+        with_big_stack(|| {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let ge = GameEnvironment::create_in(
+                temp_dir.path(),
+                "gdiplus-attrdraw",
+                GeArch::X86,
+                "win11-23h2",
+            )
+            .expect("create ge");
+            let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+            configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+            let mut memory = MemoryImage::default();
+
+            let gfx_out = 0x30_000_u64;
+            let create_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateFromHDC);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_gfx,
+                &[0x21, gfx_out as u32],
+            );
+            let graphics = read_u64(&memory, gfx_out).expect("graphics");
+            let dst_out = 0x30_100_u64;
+            let from_gfx = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromGraphics);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_gfx,
+                &[8, 8, graphics as u32, dst_out as u32],
+            );
+            let dst = read_u64(&memory, dst_out).expect("dst");
+
+            // Source: 2x2 with a magenta key pixel at (1,0) and red at (0,0).
+            let scan0 = 0x40_000_u64;
+            let mut src_bytes = [0u8; 16];
+            src_bytes[0..4].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+            src_bytes[4..8].copy_from_slice(&0xFFFF_00FFu32.to_le_bytes());
+            // bottom row stays transparent black
+            memory.map_bytes(scan0, &src_bytes);
+            let src_out = 0x30_110_u64;
+            let from_scan0 = runtime.alloc_host_thunk(HostThunk::GdipCreateBitmapFromScan0);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                from_scan0,
+                &[2, 2, 8, 0x0026_2009, scan0 as u32, src_out as u32],
+            );
+            let src = read_u64(&memory, src_out).expect("src");
+
+            let attrs_out = 0x30_120_u64;
+            let create_attrs = runtime.alloc_host_thunk(HostThunk::GdipCreateImageAttributes);
+            dispatch_x86_thunk(&mut runtime, &mut memory, create_attrs, &[attrs_out as u32]);
+            let attrs = read_u64(&memory, attrs_out).expect("attrs");
+            let set_keys = runtime.alloc_host_thunk(HostThunk::GdipSetImageAttributesColorKeys);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_keys,
+                    &[attrs as u32, 0, 1, 0xFFFF_00FF, 0xFFFF_00FF]
+                ),
+                0,
+                "GdipSetImageAttributesColorKeys returns Ok"
+            );
+            let draw_rect_rect = runtime.alloc_host_thunk(HostThunk::GdipDrawImageRectRect);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_rect_rect,
+                &[
+                    graphics as u32,
+                    src as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    2, /* UnitPixel */
+                    attrs as u32,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, dst, 0, 0),
+                0xFFFF_0000,
+                "the non-keyed source pixel draws"
+            );
+            assert_eq!(
+                gdiplus_pixel(&runtime, dst, 1, 0),
+                0,
+                "the keyed magenta pixel becomes transparent"
+            );
+
+            // A colour matrix that halves alpha: same blit with the alpha
+            // scale matrix (identity + row 3 col 3 = 0.5).
+            let matrix_mem = 0x40_100_u64;
+            let mut matrix = vec![0u8; 100];
+            let mut write = |r: usize, c: usize, v: f32| {
+                matrix[(r * 5 + c) * 4..(r * 5 + c) * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            for i in 0..5 {
+                write(i, i, 1.0);
+            }
+            write(3, 3, 0.5);
+            memory.map_bytes(matrix_mem, &matrix);
+            let attrs2_out = 0x30_130_u64;
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_attrs,
+                &[attrs2_out as u32],
+            );
+            let attrs2 = read_u64(&memory, attrs2_out).expect("attrs2");
+            let set_matrix = runtime.alloc_host_thunk(HostThunk::GdipSetImageAttributesColorMatrix);
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_matrix,
+                &[attrs2 as u32, 0, 1, matrix_mem as u32, 0, 0],
+            );
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                draw_rect_rect,
+                &[
+                    graphics as u32,
+                    src as u32,
+                    f32_bits(0.0),
+                    f32_bits(0.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    f32_bits(4.0),
+                    f32_bits(0.0),
+                    f32_bits(2.0),
+                    f32_bits(2.0),
+                    2,
+                    attrs2 as u32,
+                    0,
+                    0,
+                ],
+            );
+            // The software compositor blends SourceOver in premultiplied
+            // form, so a 0x80-alpha red over transparent black lands as
+            // premultiplied red (0x80800000).
+            assert_eq!(
+                gdiplus_pixel(&runtime, dst, 4, 0),
+                0x8080_0000,
+                "the colour matrix halves the alpha"
             );
         })
     }
@@ -130044,6 +133407,756 @@ mod tests {
             );
         })
     }
+
+    // ── CertSelectCertificate: real certificate selection ────────────────
+
+    /// Build a structurally real, parseable X.509 certificate DER with the
+    /// requested subject CN and validity offsets (seconds relative to now;
+    /// negative offsets reach into the past, positive into the future).
+    /// The signature is real RSA but nothing verifies it here — the
+    /// selection path parses structure + validity, exactly as Windows'
+    /// cert store APIs do.
+    fn build_test_cert_der(serial: u64, cn: &str, nb_offset: i64, na_offset: i64) -> Vec<u8> {
+        use der::{Decode, Encode};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        use sha2::Sha256;
+        use spki::SubjectPublicKeyInfoOwned;
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::{Time, Validity};
+
+        let mut rng = StdRng::seed_from_u64(0x51A7_0000 + serial);
+        let key = RsaPrivateKey::new(&mut rng, 1024).expect("rsa key");
+        let signer = SigningKey::<Sha256>::new(key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            RsaPublicKey::from(&key)
+                .to_public_key_der()
+                .expect("spki der")
+                .as_bytes(),
+        )
+        .expect("spki");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock");
+        let at = |offset: i64| -> SystemTime {
+            if offset >= 0 {
+                std::time::UNIX_EPOCH + now + std::time::Duration::from_secs(offset as u64)
+            } else {
+                std::time::UNIX_EPOCH + now - std::time::Duration::from_secs(offset.unsigned_abs())
+            }
+        };
+        let validity = Validity {
+            not_before: Time::try_from(at(nb_offset)).expect("notBefore"),
+            not_after: Time::try_from(at(na_offset)).expect("notAfter"),
+        };
+        let builder = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(serial as u32),
+            validity,
+            Name::from_str(&format!("CN={cn}")).expect("subject"),
+            spki,
+            &signer,
+        )
+        .expect("builder");
+        builder.build().expect("certificate").to_der().expect("der")
+    }
+
+    /// The x86 CRYPTUI_SELECTCERTIFICATE_STRUCT offsets this model reads.
+    const SEL_X86_CSTORES: u64 = 40;
+    const SEL_X86_RGHSTORES: u64 = 44;
+    const SEL_X86_HSELECTED: u64 = 56;
+
+    fn write_x86_select_request(
+        memory: &mut MemoryImage,
+        base: u64,
+        stores: &[u64],
+        display_stores: &[u64],
+    ) {
+        memory.map_bytes(base, &[0; 64]);
+        write_u32(memory, base, 60); // dwSize
+        write_u32(memory, base + SEL_X86_CSTORES, stores.len() as u32);
+        if !stores.is_empty() {
+            let array = base + 0x80;
+            memory.map_bytes(array, &[0; 64]);
+            for (index, store) in stores.iter().enumerate() {
+                write_u32(memory, array + (index as u64 * 4), *store as u32);
+            }
+            write_u32(memory, base + SEL_X86_RGHSTORES, array as u32);
+        }
+        if !display_stores.is_empty() {
+            let array = base + 0xC0;
+            memory.map_bytes(array, &[0; 64]);
+            for (index, store) in display_stores.iter().enumerate() {
+                write_u32(memory, array + (index as u64 * 4), *store as u32);
+            }
+            write_u32(memory, base + 32, display_stores.len() as u32); // cDisplayStores
+            write_u32(memory, base + 36, array as u32); // rghDisplayStores
+        }
+    }
+
+    #[test]
+    fn cert_select_certificate_selects_the_single_eligible_certificate() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("cert-select");
+            let mut memory = MemoryImage::default();
+            let select = runtime.alloc_host_thunk(HostThunk::CertSelectCertificate);
+
+            // Two certificates: one valid for ten years from now, one that
+            // expired ten days ago.  Only the first is selectable.
+            let valid_der = build_test_cert_der(1, "Valid Game Cert", -60, 86400 * 3650);
+            let expired_der =
+                build_test_cert_der(2, "Expired Game Cert", -86400 * 400, -86400 * 10);
+            let store_handle = runtime.cert_store_manager.open_store("SELECT_TEST_A");
+            runtime
+                .cert_store_manager
+                .add_certificate(store_handle, &valid_der)
+                .expect("add valid cert");
+            runtime
+                .cert_store_manager
+                .add_certificate(store_handle, &expired_der)
+                .expect("add expired cert");
+
+            let request = 0x60_000_u64;
+            let selected_out = 0x60_100_u64;
+            write_x86_select_request(&mut memory, request, &[store_handle], &[]);
+            memory.map_bytes(selected_out, &[0; 4]);
+
+            // Real selection: TRUE + a real certificate context.
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 1, "exactly one best candidate is selected");
+            assert_eq!(runtime.last_error, 0);
+            let context = read_u32(&memory, selected_out).expect("selected ctx") as u64;
+            assert_ne!(context, 0);
+            assert_eq!(read_u32(&memory, context).expect("magic"), 0x4345_5254);
+            assert_eq!(
+                read_u32(&memory, context + 4).expect("der len") as usize,
+                valid_der.len()
+            );
+            assert_eq!(
+                memory
+                    .read_bytes(context + 64, valid_der.len())
+                    .expect("der"),
+                valid_der,
+                "the selected context carries the winning DER"
+            );
+            assert_eq!(
+                runtime
+                    .cert_contexts
+                    .get(&context)
+                    .expect("registered context"),
+                &valid_der
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, request + SEL_X86_HSELECTED, GuestArch::X86).unwrap(),
+                store_handle,
+                "hSelectedCertStore names the winning store"
+            );
+
+            // The selection is deterministic: an identical second request
+            // selects the same certificate again.
+            let second_out = 0x60_200_u64;
+            memory.map_bytes(second_out, &[0; 4]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, second_out as u32],
+            );
+            assert_eq!(ret, 1);
+            assert_eq!(
+                runtime
+                    .cert_contexts
+                    .get(&(read_u32(&memory, second_out).expect("ctx") as u64))
+                    .expect("second context"),
+                &valid_der
+            );
+        })
+    }
+
+    #[test]
+    fn cert_select_certificate_user_cancel_and_real_failure_modes() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("cert-select-cancel");
+            let mut memory = MemoryImage::default();
+            let select = runtime.alloc_host_thunk(HostThunk::CertSelectCertificate);
+
+            // Null request and null out pointer: parameter failures.
+            let request = 0x60_000_u64;
+            let selected_out = 0x60_100_u64;
+            memory.map_bytes(selected_out, &[0; 4]);
+            let ret =
+                dispatch_x86_thunk(&mut runtime, &mut memory, select, &[0, selected_out as u32]);
+            assert_eq!(ret, 0);
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, select, &[request as u32, 0]);
+            assert_eq!(ret, 0);
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+
+            // No stores requested: nothing is offered, so the pick is
+            // cancelled (FALSE, no error).
+            write_x86_select_request(&mut memory, request, &[], &[]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 0, "an empty picker cancels");
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(read_u32(&memory, selected_out).unwrap(), 0);
+
+            // A store handle that does not exist is a real failure.
+            write_x86_select_request(&mut memory, request, &[0xdead_beef], &[]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 0);
+            assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+
+            // Two simultaneously eligible certificates: no single best
+            // candidate exists, so nothing is auto-selected.
+            let first = build_test_cert_der(3, "First Eligible", -60, 86400 * 3650);
+            let second = build_test_cert_der(4, "Second Eligible", -60, 86400 * 3650);
+            let store_handle = runtime.cert_store_manager.open_store("SELECT_TEST_B");
+            runtime
+                .cert_store_manager
+                .add_certificate(store_handle, &first)
+                .expect("add first");
+            runtime
+                .cert_store_manager
+                .add_certificate(store_handle, &second)
+                .expect("add second");
+            write_x86_select_request(&mut memory, request, &[store_handle], &[]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 0, "an ambiguous pick must not claim a selection");
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(read_u32(&memory, selected_out).unwrap(), 0);
+
+            // Only expired certificates: none is selectable (cancel).
+            let only_expired = build_test_cert_der(5, "Only Expired", -86400 * 400, -86400 * 10);
+            let expired_store = runtime.cert_store_manager.open_store("SELECT_TEST_C");
+            runtime
+                .cert_store_manager
+                .add_certificate(expired_store, &only_expired)
+                .expect("add expired");
+            write_x86_select_request(&mut memory, request, &[expired_store], &[]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 0, "expired-only stores cancel");
+            assert_eq!(runtime.last_error, 0);
+
+            // The certificates of the display-store list participate in
+            // the selection exactly like the rghStores list.
+            let valid_der = build_test_cert_der(6, "Display Store Cert", -60, 86400 * 3650);
+            let display_store = runtime.cert_store_manager.open_store("SELECT_TEST_D");
+            runtime
+                .cert_store_manager
+                .add_certificate(display_store, &valid_der)
+                .expect("add display cert");
+            write_x86_select_request(&mut memory, request, &[], &[display_store]);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                select,
+                &[request as u32, selected_out as u32],
+            );
+            assert_eq!(ret, 1, "display-store certificates are candidates");
+            let context = read_u32(&memory, selected_out).expect("ctx") as u64;
+            assert_eq!(read_u32(&memory, context).expect("magic"), 0x4345_5254);
+            assert_eq!(
+                memory
+                    .read_bytes(context + 64, valid_der.len())
+                    .expect("der"),
+                valid_der
+            );
+        })
+    }
+
+    // ── SHCreateLinks: real persistent .lnk files ─────────────────────────
+
+    #[test]
+    fn sh_create_links_writes_a_real_parseable_lnk_file() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("sh-create-links");
+            let mut memory = MemoryImage::default();
+            let create_links = runtime.alloc_host_thunk(HostThunk::ShCreateLinks);
+            let user = runtime.win32.ge().config.user_name.clone();
+            let desktop = format!("C:\\Users\\{user}\\Desktop");
+            runtime
+                .win32
+                .create_directory_w(&desktop)
+                .expect("create desktop");
+
+            // A real target file: the .lnk header must carry its real size.
+            let target = format!("{desktop}\\game.exe");
+            runtime
+                .win32
+                .write_file_overwrite_w(&target, b"0123456789")
+                .expect("target file");
+
+            let link_path = format!("{desktop}\\Game.lnk");
+            let target_ptr = runtime
+                .alloc_utf16_string(&mut memory, &target)
+                .expect("ptr");
+            let link_ptr = runtime
+                .alloc_utf16_string(&mut memory, &link_path)
+                .expect("ptr");
+            let description_ptr = runtime
+                .alloc_utf16_string(&mut memory, "Game")
+                .expect("ptr");
+
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_links,
+                &[target_ptr as u32, link_ptr as u32, description_ptr as u32],
+            );
+            assert_eq!(ret, 0, "SHCreateLinks returns S_OK");
+            assert_eq!(runtime.last_error, 0);
+
+            // The link is a real persistent file with the documented .lnk
+            // binary layout, parseable back through src/lnk.rs.
+            let host_link = runtime
+                .win32
+                .guest_path_to_host_path(&link_path)
+                .expect("link host path");
+            let bytes = fs::read(&host_link).expect("read the written .lnk");
+            let parsed = crate::lnk::parse(&bytes).expect("the written .lnk parses");
+            assert_eq!(&bytes[0..4], &0x4C_u32.to_le_bytes());
+            assert!(parsed.target_path.is_some());
+            assert_eq!(
+                parsed.target_path.as_deref().unwrap().to_lowercase(),
+                target.to_lowercase(),
+                "the .lnk points back at the requested target"
+            );
+            assert_eq!(parsed.description.as_deref(), Some("Game"));
+            assert_eq!(parsed.file_size, 10, "the header carries the target size");
+            assert_eq!(parsed.show_cmd, 1, "SW_SHOWNORMAL");
+            assert_eq!(parsed.icon_index, 0);
+
+            // The COM-layer encoder and this export share one writer: an
+            // IPersistFile-style save of the same content is byte-identical
+            // in structure (same magic + LinkInfo layout).
+            let snapshot = crate::runtime::state::GuestShellLinkState {
+                shell_link_object: 0,
+                persist_file_object: None,
+                refcount: 0,
+                path: target.clone(),
+                arguments: String::new(),
+                description: "Game".to_string(),
+                working_directory: String::new(),
+                hotkey: 0,
+                icon_location: String::new(),
+                icon_index: 0,
+                show_cmd: SW_SHOWNORMAL,
+                current_file: None,
+                dirty: true,
+            };
+            let com_bytes = runtime
+                .shell_link_file_bytes(&snapshot)
+                .expect("shell link bytes");
+            assert_eq!(com_bytes, bytes, "one shared .lnk writer");
+
+            // Real error codes for real invalid arguments.
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_links,
+                &[0, link_ptr as u32, description_ptr as u32],
+            );
+            assert_eq!(ret, 0x8007_0057, "null target is E_INVALIDARG");
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_links,
+                &[target_ptr as u32, 0, description_ptr as u32],
+            );
+            assert_eq!(ret, 0x8007_0057, "null link path is E_INVALIDARG");
+
+            // A destination whose parent folder does not exist cannot be
+            // written: the same E_ACCESSDENIED the COM Save path reports.
+            let missing = format!("C:\\Users\\{user}\\NoSuchFolder\\x.lnk");
+            let missing_ptr = runtime
+                .alloc_utf16_string(&mut memory, &missing)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_links,
+                &[target_ptr as u32, missing_ptr as u32, 0],
+            );
+            assert_eq!(ret, 0x8007_0005, "unwritable destination is E_ACCESSDENIED");
+            assert_eq!(runtime.last_error, ERROR_ACCESS_DENIED);
+        })
+    }
+
+    // ── SHNavigateToFavorite: the real favorites store ────────────────────
+
+    #[test]
+    fn sh_navigate_to_favorite_adds_lists_and_removes_real_records() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("sh-favorites");
+            let mut memory = MemoryImage::default();
+            let navigate = runtime.alloc_host_thunk(HostThunk::ShNavigateToFavorite);
+            let user = runtime.win32.ge().config.user_name.clone();
+            let favorites_dir = format!("C:\\Users\\{user}\\Favorites");
+            assert!(runtime.favorite_records().is_empty());
+
+            let url = "https://example.com/game";
+            let title = "Casa1 Game";
+            let url_ptr = runtime.alloc_utf16_string(&mut memory, url).expect("ptr");
+            let title_ptr = runtime.alloc_utf16_string(&mut memory, title).expect("ptr");
+
+            // Add: S_OK + one real record + a real persisted .url file.
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                navigate,
+                &[url_ptr as u32, title_ptr as u32, 0],
+            );
+            assert_eq!(ret, 0, "adding a favorite returns S_OK");
+            assert_eq!(runtime.last_error, 0);
+            let records = runtime.favorite_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].url, url);
+            assert_eq!(records[0].title, title);
+            assert_eq!(records[0].user, user);
+            assert!(records[0].added_at_ms > 0);
+            assert_eq!(records[0].updated_at_ms, records[0].added_at_ms);
+
+            let favorite_file = format!("{favorites_dir}\\{title}.url");
+            let host_file = runtime
+                .win32
+                .guest_path_to_host_path(&favorite_file)
+                .expect("favorite host path");
+            assert_eq!(
+                fs::read_to_string(&host_file).expect("read favorite file"),
+                format!("[InternetShortcut]\r\nURL={url}\r\n"),
+                "the favorite persists as a real Windows .url file"
+            );
+
+            // The same URL again updates the title and keeps one record.
+            let title2 = "Casa1 Game Renamed";
+            let title2_ptr = runtime
+                .alloc_utf16_string(&mut memory, title2)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                navigate,
+                &[url_ptr as u32, title2_ptr as u32, 0],
+            );
+            assert_eq!(ret, 0);
+            let records = runtime.favorite_records();
+            assert_eq!(records.len(), 1, "one record per URL");
+            assert_eq!(records[0].title, title2);
+            assert!(records[0].updated_at_ms >= records[0].added_at_ms);
+            assert!(!host_file.exists(), "the old .url is removed on rename");
+            let renamed_file = format!("{favorites_dir}\\{title2}.url");
+            assert!(
+                runtime
+                    .win32
+                    .guest_path_to_host_path(&renamed_file)
+                    .expect("renamed host path")
+                    .exists()
+            );
+
+            // A title-less add stores the URL as the display title.
+            let bare_url = "https://example.org/plain";
+            let bare_ptr = runtime
+                .alloc_utf16_string(&mut memory, bare_url)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                navigate,
+                &[bare_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0);
+            let records = runtime.favorite_records();
+            assert_eq!(records.len(), 2);
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.url == bare_url && record.title == bare_url)
+            );
+
+            // Remove: S_OK + the record and file are gone.
+            let ret =
+                dispatch_x86_thunk(&mut runtime, &mut memory, navigate, &[url_ptr as u32, 0, 1]);
+            assert_eq!(ret, 0, "removing an existing favorite returns S_OK");
+            let records = runtime.favorite_records();
+            assert_eq!(records.len(), 1);
+            assert!(!records.iter().any(|record| record.url == url));
+
+            // Removing again: nothing existed → S_FALSE (not an error).
+            let ret =
+                dispatch_x86_thunk(&mut runtime, &mut memory, navigate, &[url_ptr as u32, 0, 1]);
+            assert_eq!(ret, 1, "removing a missing favorite answers S_FALSE");
+            assert_eq!(runtime.last_error, 0);
+
+            // Real argument failures: null URL, unknown flag bits.
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, navigate, &[0, 0, 0]);
+            assert_eq!(ret, 0x8007_0057);
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                navigate,
+                &[bare_ptr as u32, 0, 0x2],
+            );
+            assert_eq!(ret, 0x8007_0057, "unknown action flags are E_INVALIDARG");
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+        })
+    }
+
+    // ── SHOpenFolderWindow: the folder-window session registry ────────────
+
+    #[test]
+    fn sh_open_folder_window_opens_and_closes_real_window_sessions() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("sh-folder-window");
+            let mut memory = MemoryImage::default();
+            let open_window = runtime.alloc_host_thunk(HostThunk::ShOpenFolderWindow);
+            let user = runtime.win32.ge().config.user_name.clone();
+            let desktop = format!("C:\\Users\\{user}\\Desktop");
+            runtime
+                .win32
+                .create_directory_w(&desktop)
+                .expect("create desktop");
+            let other = format!("C:\\Users\\{user}\\Documents");
+            let _ = runtime.win32.create_directory_w(&other);
+
+            // Open the first folder window session.
+            let folder_ptr = runtime
+                .alloc_utf16_string(&mut memory, &desktop)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[folder_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0, "SHOpenFolderWindow returns S_OK");
+            assert_eq!(runtime.last_error, 0);
+            let windows = runtime.folder_window_records();
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].folder.to_lowercase(), desktop.to_lowercase());
+            assert!(windows[0].visible);
+            assert!(windows[0].closed_at_ms.is_none());
+            assert_eq!(windows[0].events.len(), 1);
+            assert_eq!(windows[0].events[0].kind, "open");
+            let first_id = windows[0].id;
+
+            // A second folder opens a second, distinct session.
+            let other_ptr = runtime
+                .alloc_utf16_string(&mut memory, &other)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[other_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0);
+            let windows = runtime.folder_window_records();
+            assert_eq!(windows.len(), 2);
+            assert_ne!(windows[1].id, first_id, "monotonic session ids");
+            assert!(windows.iter().all(|window| window.visible));
+
+            // Close one session: real close transition, hidden window.
+            assert!(runtime.close_folder_window(first_id));
+            let windows = runtime.folder_window_records();
+            let closed = windows
+                .iter()
+                .find(|window| window.id == first_id)
+                .expect("window");
+            assert!(!closed.visible);
+            assert!(closed.closed_at_ms.is_some());
+            assert_eq!(closed.events.len(), 2);
+            assert_eq!(closed.events[1].kind, "close");
+            assert!(closed.events[1].at_ms >= closed.events[0].at_ms);
+            assert!(!runtime.close_folder_window(first_id), "already closed");
+
+            // Real failure modes: nonexistent folder (file-not-found when
+            // the parent exists), missing parent (path-not-found), null
+            // folder and reserved flags.
+            let missing = format!("C:\\Users\\{user}\\NoSuchFolder");
+            let missing_ptr = runtime
+                .alloc_utf16_string(&mut memory, &missing)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[missing_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0x8007_0002, "missing folder → ERROR_FILE_NOT_FOUND");
+            let deep_missing = "C:\\Missing\\X\\Y";
+            let deep_ptr = runtime
+                .alloc_utf16_string(&mut memory, deep_missing)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[deep_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0x8007_0003, "missing parent → ERROR_PATH_NOT_FOUND");
+            let ret = dispatch_x86_thunk(&mut runtime, &mut memory, open_window, &[0, 0, 0]);
+            assert_eq!(ret, 0x8007_0057, "null folder is E_INVALIDARG");
+            assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[folder_ptr as u32, 0, 1],
+            );
+            assert_eq!(ret, 0x8007_0057, "reserved flags are E_INVALIDARG");
+
+            // A file is not a folder window target.
+            let file_path = format!("{desktop}\\plain.txt");
+            runtime
+                .win32
+                .write_file_overwrite_w(&file_path, b"x")
+                .expect("target file");
+            let file_ptr = runtime
+                .alloc_utf16_string(&mut memory, &file_path)
+                .expect("ptr");
+            let ret = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                open_window,
+                &[file_ptr as u32, 0, 0],
+            );
+            assert_eq!(ret, 0x8007_010b, "a file is not a folder → ERROR_DIRECTORY");
+        })
+    }
+
+    // ── SHCreateExplorerTaskband: the taskband session ────────────────────
+
+    #[test]
+    fn sh_create_explorer_taskband_creates_one_real_taskband_session() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = test_runtime("sh-taskband");
+            let mut memory = MemoryImage::default();
+            let taskband = runtime.alloc_host_thunk(HostThunk::ShCreateExplorerTaskband);
+            assert!(runtime.explorer_taskband().is_none());
+
+            let first = "C:\\Games\\steam.exe -silent";
+            let second = "notepad.exe";
+            let first_ptr = runtime.alloc_utf16_string(&mut memory, first).expect("ptr");
+            let second_ptr = runtime
+                .alloc_utf16_string(&mut memory, second)
+                .expect("ptr");
+            let array = 0x60_200_u64;
+            memory.map_bytes(array, &[0; 8]);
+            write_u32(&mut memory, array, first_ptr as u32);
+            write_u32(&mut memory, array + 4, second_ptr as u32);
+
+            let ret =
+                dispatch_x86_thunk(&mut runtime, &mut memory, taskband, &[array as u32, 2, 0]);
+            assert_eq!(ret, 0, "the taskband session is created (S_OK)");
+            assert_eq!(runtime.last_error, 0);
+            let band = runtime.explorer_taskband().expect("taskband exists");
+            assert_eq!(band.tasks.len(), 2);
+            assert_eq!(band.tasks[0].command_line, first);
+            assert_eq!(band.tasks[0].display_name, "steam");
+            assert_eq!(band.tasks[1].command_line, second);
+            assert_eq!(band.tasks[1].display_name, "notepad");
+            assert!(band.created_at_ms > 0);
+
+            // One taskband per shell session: a second creation is S_FALSE
+            // and changes nothing.
+            let ret =
+                dispatch_x86_thunk(&mut runtime, &mut memory, taskband, &[array as u32, 2, 0]);
+            assert_eq!(ret, 1, "the existing session answers S_FALSE");
+            assert_eq!(runtime.last_error, 0);
+            assert_eq!(
+                runtime.explorer_taskband().expect("taskband").tasks.len(),
+                2
+            );
+
+            // A taskband with no tasks is a valid (empty) session on a
+            // fresh runtime.
+            let (mut empty_runtime, _tmp2) = test_runtime("sh-taskband-empty");
+            let mut empty_memory = MemoryImage::default();
+            let empty_thunk = empty_runtime.alloc_host_thunk(HostThunk::ShCreateExplorerTaskband);
+            let ret = dispatch_x86_thunk(
+                &mut empty_runtime,
+                &mut empty_memory,
+                empty_thunk,
+                &[0, 0, 0],
+            );
+            assert_eq!(ret, 0, "an empty task list creates an empty taskband");
+            assert!(empty_runtime.explorer_taskband().is_some());
+            assert!(
+                empty_runtime
+                    .explorer_taskband()
+                    .expect("taskband")
+                    .tasks
+                    .is_empty()
+            );
+
+            // Real argument failures on a fresh runtime.
+            let (mut bad_runtime, _tmp3) = test_runtime("sh-taskband-bad");
+            let mut bad_memory = MemoryImage::default();
+            let bad_thunk = bad_runtime.alloc_host_thunk(HostThunk::ShCreateExplorerTaskband);
+            let ret = dispatch_x86_thunk(&mut bad_runtime, &mut bad_memory, bad_thunk, &[0, 1, 0]);
+            assert_eq!(ret, 0x8007_0057, "count without an array is E_INVALIDARG");
+            let null_entry = 0x60_300_u64;
+            bad_memory.map_bytes(null_entry, &[0; 4]);
+            let ret = dispatch_x86_thunk(
+                &mut bad_runtime,
+                &mut bad_memory,
+                bad_thunk,
+                &[null_entry as u32, 1, 0],
+            );
+            assert_eq!(ret, 0x8007_0057, "null entries are E_INVALIDARG");
+            let empty = "";
+            let empty_ptr = bad_runtime
+                .alloc_utf16_string(&mut bad_memory, empty)
+                .expect("ptr");
+            let array = 0x60_400_u64;
+            bad_memory.map_bytes(array, &[0; 4]);
+            write_u32(&mut bad_memory, array, empty_ptr as u32);
+            let ret = dispatch_x86_thunk(
+                &mut bad_runtime,
+                &mut bad_memory,
+                bad_thunk,
+                &[array as u32, 1, 0],
+            );
+            assert_eq!(ret, 0x8007_0057, "empty command lines are E_INVALIDARG");
+            assert_eq!(bad_runtime.last_error, ERROR_INVALID_PARAMETER);
+            let ret = dispatch_x86_thunk(&mut bad_runtime, &mut bad_memory, bad_thunk, &[0, 0, 1]);
+            assert_eq!(ret, 0x8007_0057, "reserved flags are E_INVALIDARG");
+            assert!(bad_runtime.explorer_taskband().is_none());
+        })
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -133695,6 +137808,1129 @@ fn read_guest_utf16_string(memory: &MemoryImage, ptr: u64, length: i32) -> Strin
     String::from_utf16_lossy(&units)
 }
 
+// ── GDI+ paint-session types ────────────────────────────────────────────────
+
+/// Resolved pen properties for one drawing call (device-pixel width).
+#[derive(Debug, Clone, Copy)]
+struct GdiplusStrokeStyle {
+    color: u32,
+    width_px: f32,
+    dash: u32,
+    join: u32,
+    start_cap: u32,
+    end_cap: u32,
+    cm: u32,
+    sm: u32,
+}
+
+/// The graphics state that shapes rasterise under.
+#[derive(Debug, Clone, Copy)]
+struct GdiplusRenderState {
+    cm: u32,
+    sm: u32,
+    interp: u32,
+    clip: Option<(f32, f32, f32, f32)>,
+    world: [f32; 6],
+}
+
+/// Where a graphics object's pixels live: a GDI+ bitmap object, a window
+/// surface (window DC), or the GDI bitmap selected into a memory DC.
+#[derive(Debug, Clone, Copy)]
+enum GdiplusTargetKind {
+    Bitmap(u64),
+    Window(u32),
+    MemoryDc(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GdiplusGraphicsInfo {
+    hdc: u64,
+    target: Option<GdiplusTargetKind>,
+    state: GdiplusRenderState,
+}
+
+// ── GDI+ geometry / state / codec helpers (shared by the phase-2.7 arms) ───
+
+/// GDI+ unit → pixels at the engine's fixed 96 dpi.  `UnitWorld`,
+/// `UnitDisplay` and `UnitPixel` are 1:1; `UnitPoint`/`UnitInch`/
+/// `UnitDocument`/`UnitMillimeter` scale by their physical size.
+fn gdiplus_unit_to_pixels(value: f32, unit: u32) -> f32 {
+    match unit {
+        crate::user32::GDIPLUS_UNIT_POINT => value * 96.0 / 72.0,
+        crate::user32::GDIPLUS_UNIT_INCH => value * 96.0,
+        crate::user32::GDIPLUS_UNIT_DOCUMENT => value * 96.0 / 300.0,
+        crate::user32::GDIPLUS_UNIT_MILLIMETER => value * 96.0 / 25.4,
+        _ => value,
+    }
+}
+
+/// GDI+ world matrix elements are `[m11, m12, m21, m22, dx, dy]` with
+/// `x' = m11·x + m12·y + dx`, `y' = m21·x + m22·y + dy`.
+fn gdiplus_matrix_identity() -> [f32; 6] {
+    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+}
+
+/// True when the matrix leaves coordinates unchanged.
+fn gdiplus_matrix_is_identity(m: &[f32; 6]) -> bool {
+    (m[0] - 1.0).abs() < 1e-5
+        && m[1].abs() < 1e-5
+        && m[2].abs() < 1e-5
+        && (m[3] - 1.0).abs() < 1e-5
+        && m[4].abs() < 1e-5
+        && m[5].abs() < 1e-5
+}
+
+fn gdiplus_matrix_apply(m: &[f32; 6], x: f32, y: f32) -> (f32, f32) {
+    (m[0] * x + m[1] * y + m[4], m[2] * x + m[3] * y + m[5])
+}
+
+/// True when the transform is translate + axis-aligned scale only (no
+/// rotation or shear), so rectangles stay rectangles.
+fn gdiplus_matrix_axis_aligned(m: &[f32; 6]) -> bool {
+    m[1].abs() < 1e-5 && m[2].abs() < 1e-5
+}
+
+/// Uniform scale factor of a transform (√|det|), used to scale pen widths.
+fn gdiplus_matrix_scale(m: &[f32; 6]) -> f32 {
+    let det = m[0] * m[3] - m[1] * m[2];
+    det.abs().max(0.0).sqrt()
+}
+
+/// Bounding rect (device space) of a world-space rect mapped through `m`.
+fn gdiplus_matrix_rect_bounds(
+    m: &[f32; 6],
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> (f32, f32, f32, f32) {
+    let corners = [
+        gdiplus_matrix_apply(m, x, y),
+        gdiplus_matrix_apply(m, x + w, y),
+        gdiplus_matrix_apply(m, x + w, y + h),
+        gdiplus_matrix_apply(m, x, y + h),
+    ];
+    let min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Matrix multiply `a × b` (column-vector convention).
+fn gdiplus_matrix_mul(a: &[f32; 6], b: &[f32; 6]) -> [f32; 6] {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[0] * b[4] + a[1] * b[5] + a[4],
+        a[2] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+/// Compose `m` with an operation matrix `op`.  GDI+ order semantics:
+/// `MatrixOrderPrepend` (0) applies the operation first (`op × m`),
+/// `MatrixOrderAppend` (1) applies it last (`m × op`).
+fn gdiplus_matrix_compose(m: &[f32; 6], op: &[f32; 6], order: u32) -> [f32; 6] {
+    if order == 0 {
+        gdiplus_matrix_mul(op, m)
+    } else {
+        gdiplus_matrix_mul(m, op)
+    }
+}
+
+fn gdiplus_matrix_translation(dx: f32, dy: f32) -> [f32; 6] {
+    [1.0, 0.0, 0.0, 1.0, dx, dy]
+}
+
+fn gdiplus_matrix_scaling(sx: f32, sy: f32) -> [f32; 6] {
+    [sx, 0.0, 0.0, sy, 0.0, 0.0]
+}
+
+/// Rotation by `angle` degrees.  GDI+ positive angles rotate clockwise on
+/// screen (the guest y axis points down), so the matrix is the transpose of
+/// the standard math rotation.
+fn gdiplus_matrix_rotation(angle: f32) -> [f32; 6] {
+    let r = angle.to_radians();
+    [r.cos(), -r.sin(), r.sin(), r.cos(), 0.0, 0.0]
+}
+
+/// Clip a segment against a convex clip polygon (device space) with the
+/// half-plane parameter algorithm.  Returns the visible sub-segment.
+fn gdiplus_clip_segment(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    clip: &[GdiplusPointF; 4],
+) -> Option<((f32, f32), (f32, f32))> {
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let cross = |ex: f32, ey: f32, sx: f32, sy: f32, px: f32, py: f32| -> f32 {
+        (ex - sx) * (py - sy) - (ey - sy) * (px - sx)
+    };
+    for i in 0..4 {
+        let e0 = clip[i];
+        let e1 = clip[(i + 1) % 4];
+        let f0 = cross(e1.x, e1.y, e0.x, e0.y, x1, y1);
+        let f1 = cross(e1.x, e1.y, e0.x, e0.y, x2, y2);
+        if f0 < 0.0 && f1 < 0.0 {
+            return None;
+        }
+        if f0 < 0.0 {
+            // Entering the half-plane.
+            let t = f0 / (f0 - f1);
+            t0 = t0.max(t);
+        } else if f1 < 0.0 {
+            // Leaving the half-plane.
+            let t = f0 / (f0 - f1);
+            t1 = t1.min(t);
+        }
+    }
+    if t1 < t0 {
+        return None;
+    }
+    Some(((x1 + t0 * dx, y1 + t0 * dy), (x1 + t1 * dx, y1 + t1 * dy)))
+}
+
+/// Sutherland–Hodgman clipping of a subject polygon against a convex clip
+/// polygon (device space).
+fn gdiplus_clip_polygon(points: &[GdiplusPointF], clip: &[GdiplusPointF; 4]) -> Vec<GdiplusPointF> {
+    let mut subject: Vec<GdiplusPointF> = points.to_vec();
+    if subject.len() < 3 {
+        return subject;
+    }
+    let cross = |ex: f32, ey: f32, sx: f32, sy: f32, px: f32, py: f32| -> f32 {
+        (ex - sx) * (py - sy) - (ey - sy) * (px - sx)
+    };
+    for i in 0..4 {
+        if subject.is_empty() {
+            break;
+        }
+        let e0 = clip[i];
+        let e1 = clip[(i + 1) % 4];
+        let mut output: Vec<GdiplusPointF> = Vec::new();
+        let mut prev = subject[subject.len() - 1];
+        for &curr in &subject {
+            let prev_inside = cross(e1.x, e1.y, e0.x, e0.y, prev.x, prev.y) >= 0.0;
+            let curr_inside = cross(e1.x, e1.y, e0.x, e0.y, curr.x, curr.y) >= 0.0;
+            if curr_inside {
+                if !prev_inside {
+                    let (ix, iy) = gdiplus_line_intersection(
+                        prev.x, prev.y, curr.x, curr.y, e0.x, e0.y, e1.x, e1.y,
+                    );
+                    output.push(GdiplusPointF { x: ix, y: iy });
+                }
+                output.push(curr);
+            } else if prev_inside {
+                let (ix, iy) = gdiplus_line_intersection(
+                    prev.x, prev.y, curr.x, curr.y, e0.x, e0.y, e1.x, e1.y,
+                );
+                output.push(GdiplusPointF { x: ix, y: iy });
+            }
+            prev = curr;
+        }
+        subject = output;
+    }
+    subject
+}
+
+fn gdiplus_line_intersection(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    x3: f32,
+    y3: f32,
+    x4: f32,
+    y4: f32,
+) -> (f32, f32) {
+    let denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if denom.abs() < 1e-9 {
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+    }
+    let t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+    (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+}
+
+/// Device-space clip polygon of a graphics object: the world-space clip rect
+/// mapped through the world transform.
+fn gdiplus_device_clip_quad(
+    world: &[f32; 6],
+    clip: Option<(f32, f32, f32, f32)>,
+) -> Option<[GdiplusPointF; 4]> {
+    let (cx, cy, cw, ch) = clip?;
+    let corners = [(cx, cy), (cx + cw, cy), (cx + cw, cy + ch), (cx, cy + ch)];
+    let mut quad = [GdiplusPointF { x: 0.0, y: 0.0 }; 4];
+    for (i, &(x, y)) in corners.iter().enumerate() {
+        let (x, y) = gdiplus_matrix_apply(world, x, y);
+        quad[i] = GdiplusPointF { x, y };
+    }
+    Some(quad)
+}
+
+/// Dash pattern (on/off lengths in pen-width units) for the GDI+ dash styles.
+fn gdiplus_dash_pattern(dash: u32) -> &'static [f32] {
+    match dash {
+        crate::user32::GDIPLUS_DASH_STYLE_DASH => &[3.0, 1.0],
+        crate::user32::GDIPLUS_DASH_STYLE_DOT => &[1.0, 1.0],
+        crate::user32::GDIPLUS_DASH_STYLE_DASH_DOT => &[3.0, 1.0, 1.0, 1.0],
+        crate::user32::GDIPLUS_DASH_STYLE_DASH_DOT_DOT => &[3.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        _ => &[1.0],
+    }
+}
+
+/// Split a polyline into dash-on spans, following the cumulative distance
+/// along the line so the pattern continues across vertices.  When `closed`
+/// the last point joins back to the first before dashing.
+fn gdiplus_dash_spans(
+    points: &[GdiplusPointF],
+    closed: bool,
+    dash: u32,
+    width: f32,
+) -> Vec<Vec<GdiplusPointF>> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let pattern = gdiplus_dash_pattern(dash);
+    let unit = width.max(0.25);
+    let mut working: Vec<GdiplusPointF> = points.to_vec();
+    if closed && working.len() >= 2 {
+        let first = working[0];
+        working.push(first);
+    }
+    // Cumulative segment lengths.
+    let mut seg_len: Vec<f32> = Vec::with_capacity(working.len());
+    let mut total = 0.0f32;
+    for pair in working.windows(2) {
+        let d = ((pair[1].x - pair[0].x).powi(2) + (pair[1].y - pair[0].y).powi(2)).sqrt();
+        seg_len.push(d);
+        total += d;
+    }
+    if total <= 1e-6 {
+        return Vec::new();
+    }
+    let pat_scaled: Vec<f32> = pattern.iter().map(|p| p * unit).collect();
+    let period: f32 = pat_scaled.iter().sum();
+    let mut spans: Vec<Vec<GdiplusPointF>> = Vec::new();
+    // Walk the polyline in distance space, emitting points inside "on" runs.
+    let mut cursor = 0.0f32; // distance into the current pattern cycle
+    let mut current_span: Option<Vec<GdiplusPointF>> = None;
+    for i in 0..working.len() - 1 {
+        let (p0, p1) = (working[i], working[i + 1]);
+        let mut d = seg_len[i];
+        let mut from = 0.0f32;
+        while d > 1e-6 {
+            let on = gdiplus_pattern_on(cursor, &pat_scaled);
+            let into_run = gdiplus_run_end(cursor, &pat_scaled) - cursor;
+            if into_run < 1e-6 {
+                // Advance to the next pattern transition.
+                let step = period - cursor;
+                let consume = step.min(d);
+                from += consume;
+                d -= consume;
+                cursor = (cursor + consume) % period;
+                continue;
+            }
+            let consume = into_run.min(d);
+            let t0 = from / seg_len[i];
+            let t1 = (from + consume) / seg_len[i];
+            let seg_p0 = GdiplusPointF {
+                x: p0.x + (p1.x - p0.x) * t0,
+                y: p0.y + (p1.y - p0.y) * t0,
+            };
+            let seg_p1 = GdiplusPointF {
+                x: p0.x + (p1.x - p0.x) * t1,
+                y: p0.y + (p1.y - p0.y) * t1,
+            };
+            if on {
+                gdiplus_span_push(&mut current_span, seg_p0);
+                gdiplus_span_push(&mut current_span, seg_p1);
+            } else if let Some(span) = current_span.take() {
+                if span.len() >= 2 {
+                    spans.push(span);
+                }
+            }
+            from += consume;
+            d -= consume;
+            cursor = (cursor + consume) % period;
+        }
+        // Snap to the true vertex (float drift).
+        if let Some(span) = current_span.as_mut() {
+            if let Some(last) = span.last_mut() {
+                if (last.x - p1.x).abs() > 1e-3 || (last.y - p1.y).abs() > 1e-3 {
+                    *last = p1;
+                }
+            }
+        }
+    }
+    if let Some(span) = current_span.take() {
+        if span.len() >= 2 {
+            spans.push(span);
+        }
+    }
+    spans
+}
+
+fn gdiplus_span_push(span: &mut Option<Vec<GdiplusPointF>>, pt: GdiplusPointF) {
+    if span.is_none() {
+        *span = Some(Vec::new());
+    }
+    if let Some(s) = span.as_mut() {
+        let dup = s
+            .last()
+            .map(|last| last.x == pt.x && last.y == pt.y)
+            .unwrap_or(false);
+        if !dup {
+            s.push(pt);
+        }
+    }
+}
+
+fn gdiplus_pattern_on(cursor: f32, pattern: &[f32]) -> bool {
+    let mut acc = 0.0f32;
+    for (i, &len) in pattern.iter().enumerate() {
+        acc += len;
+        if cursor < acc {
+            return i % 2 == 0;
+        }
+    }
+    true
+}
+
+fn gdiplus_run_end(cursor: f32, pattern: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for &len in pattern.iter() {
+        acc += len;
+        if cursor < acc {
+            return acc;
+        }
+    }
+    acc
+}
+
+/// The lattice-text scale: an em square maps to the 8-row glyph grid
+/// (`s = max(1, round(em_px / 8))`), giving 5×7 dot glyphs at pitch `s`.
+fn gdiplus_text_scale(em_px: f32) -> i32 {
+    if em_px.is_nan() || em_px.is_infinite() || em_px <= 0.0 {
+        1
+    } else {
+        (em_px / 8.0).round().max(1.0) as i32
+    }
+}
+
+/// Measure lattice text: per line `chars·6s − s` wide (the trailing advance
+/// is not part of the text), `lines·8s` tall.
+fn gdiplus_measure_lattice(text: &str, em_px: f32) -> (f32, f32) {
+    let s = gdiplus_text_scale(em_px).max(1) as f32;
+    let mut max_width = 0.0f32;
+    let mut line_chars = 0u32;
+    let mut line_count = 1u32;
+    for ch in text.chars() {
+        if ch == '\n' {
+            let w = (line_chars as f32 * 6.0 * s - s).max(0.0);
+            max_width = max_width.max(w);
+            line_chars = 0;
+            line_count += 1;
+        } else {
+            line_chars += 1;
+        }
+    }
+    let w = (line_chars as f32 * 6.0 * s - s).max(0.0);
+    max_width = max_width.max(w);
+    (max_width, line_count as f32 * 8.0 * s)
+}
+
+/// Render text with the 5×7 lattice glyphs at the given scale.  Glyph dots
+/// are blended through `gdiplus_render::put_pixel`, honouring the
+/// compositing mode.  When `clip` is set (layout-rect clipping for the
+/// default StringFormat), dots outside it are skipped.
+#[allow(clippy::too_many_arguments)]
+fn gdiplus_draw_lattice_text(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    text: &str,
+    x: f32,
+    y: f32,
+    em_px: f32,
+    color: u32,
+    compositing_mode: u32,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    let s = gdiplus_text_scale(em_px).max(1);
+    let ox = x.round() as i32;
+    let oy = y.round() as i32;
+    let mut cursor_x = ox;
+    let mut cursor_y = oy;
+    let inside = |px: i32, py: i32| -> bool {
+        match clip {
+            Some((cx, cy, cw, ch)) => {
+                let fx = px as f32;
+                let fy = py as f32;
+                fx >= cx && fy >= cy && fx < cx + cw && fy < cy + ch
+            }
+            None => true,
+        }
+    };
+    for ch in text.chars() {
+        if ch == '\n' {
+            cursor_x = ox;
+            cursor_y += 8 * s;
+            continue;
+        }
+        let Some(rows) = glyph_5x7(ch) else {
+            cursor_x += 6 * s;
+            continue;
+        };
+        for (ri, row) in rows.iter().enumerate() {
+            for col in 0..5 {
+                if row & (1 << (4 - col)) == 0 {
+                    continue;
+                }
+                let gx = cursor_x + col as i32 * s;
+                let gy = cursor_y + ri as i32 * s;
+                for dy in 0..s {
+                    for dx in 0..s {
+                        if inside(gx + dx, gy + dy) {
+                            crate::gdiplus_render::put_pixel(
+                                pixels,
+                                width,
+                                height,
+                                stride,
+                                gx + dx,
+                                gy + dy,
+                                color,
+                                compositing_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += 6 * s;
+    }
+}
+
+/// Canonicalise guest Scan0 bytes into the engine's top-down 32-bpp ARGB
+/// buffer.  Handles negative strides (bottom-up sources are flipped),
+/// 24-bpp BGR expansion and 32-bpp PARGB un-premultiplication.  Unsupported
+/// source formats return `None`.
+fn gdiplus_scan0_to_canonical(
+    width: u32,
+    height: u32,
+    stride: i32,
+    format: u32,
+    source: &[u8],
+) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    let stride_abs = stride.unsigned_abs() as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let bpp = match format {
+        crate::user32::GDIPLUS_PIXEL_FORMAT_24BPP_RGB => 3,
+        crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_ARGB
+        | crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB => 4,
+        _ => return None,
+    };
+    let bytes = bpp * w;
+    if stride_abs < bytes {
+        return None;
+    }
+    if source.len() < h * stride_abs {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 4];
+    let premul = format == crate::user32::GDIPLUS_PIXEL_FORMAT_32BPP_PARGB;
+    for y in 0..h {
+        // Source row: bottom-up when the stride is negative.
+        let src_y = if stride < 0 { h - 1 - y } else { y };
+        let row_off = src_y * stride_abs;
+        for x in 0..w {
+            let s = row_off + x * bpp;
+            let d = (y * w + x) * 4;
+            if s + bpp > source.len() {
+                continue;
+            }
+            let (b, g, r, a) = if bpp == 3 {
+                (source[s], source[s + 1], source[s + 2], 0xff)
+            } else {
+                (source[s], source[s + 1], source[s + 2], source[s + 3])
+            };
+            if premul && a != 0 && a != 255 {
+                let scale = a as u32;
+                out[d] = (b as u32 * 255 / scale) as u8;
+                out[d + 1] = (g as u32 * 255 / scale) as u8;
+                out[d + 2] = (r as u32 * 255 / scale) as u8;
+            } else {
+                out[d] = b;
+                out[d + 1] = g;
+                out[d + 2] = r;
+            }
+            out[d + 3] = a;
+        }
+    }
+    Some(out)
+}
+
+/// Read the ARGB colour of a canonical 32-bpp ARGB pixel.
+#[allow(dead_code)]
+fn gdiplus_argb_at(pixels: &[u8], width: u32, stride: i32, x: u32, y: u32) -> Option<u32> {
+    if x >= width {
+        return None;
+    }
+    let idx = (y as i64 * stride as i64 + x as i64 * 4) as usize;
+    if idx + 3 >= pixels.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]))
+}
+
+/// BMP decode (BITMAPFILEHEADER + BITMAPINFOHEADER, BI_RGB).  Returns
+/// `(width, height, top-down 32-bpp ARGB)`.
+fn gdiplus_decode_bmp(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if data.len() < 14 || &data[0..2] != b"BM" {
+        return None;
+    }
+    let pixel_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    if data.len() < 14 + 40 {
+        return None;
+    }
+    let header = &data[14..];
+    let bi_size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if bi_size < 40 {
+        return None; // OS/2 headers are not decoded by the engine.
+    }
+    let width = i32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let height_raw = i32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    let planes = u16::from_le_bytes([header[12], header[13]]);
+    let bpp = u16::from_le_bytes([header[14], header[15]]);
+    let compression = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    if width <= 0 || height_raw == 0 || planes != 1 {
+        return None;
+    }
+    if compression != 0 {
+        return None; // BI_RLE / BI_BITFIELDS not decoded.
+    }
+    let (height, bottom_up) = if height_raw > 0 {
+        (height_raw as u32, true)
+    } else {
+        (height_raw.unsigned_abs(), false)
+    };
+    let palette_colors = if bpp <= 8 {
+        let used = u32::from_le_bytes([header[32], header[33], header[34], header[35]]);
+        if used != 0 {
+            used.min(1 << bpp)
+        } else {
+            1 << bpp
+        }
+    } else {
+        0
+    } as usize;
+    let palette_off = 14 + bi_size as usize;
+    let row_size = (width as u32 * bpp as u32).div_ceil(32) * 4;
+    let w = width as usize;
+    let h = height as usize;
+    if pixel_offset + row_size as usize * h > data.len() {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 4];
+    let bytes_per_px = bpp / 8;
+    for y in 0..h {
+        let src_y = if bottom_up { h - 1 - y } else { y };
+        let row = pixel_offset + src_y * row_size as usize;
+        for x in 0..w {
+            let d = (y * w + x) * 4;
+            match bpp {
+                32 => {
+                    let s = row + x * 4;
+                    out[d] = data[s];
+                    out[d + 1] = data[s + 1];
+                    out[d + 2] = data[s + 2];
+                    out[d + 3] = data[s + 3];
+                }
+                24 => {
+                    let s = row + x * 3;
+                    out[d] = data[s];
+                    out[d + 1] = data[s + 1];
+                    out[d + 2] = data[s + 2];
+                    out[d + 3] = 0xff;
+                }
+                16 => {
+                    let s = row + x * 2;
+                    let v = u16::from_le_bytes([data[s], data[s + 1]]);
+                    let r = ((v >> 10) & 0x1f) as u32 * 255 / 31;
+                    let g = ((v >> 5) & 0x1f) as u32 * 255 / 31;
+                    let b = (v & 0x1f) as u32 * 255 / 31;
+                    out[d] = b as u8;
+                    out[d + 1] = g as u8;
+                    out[d + 2] = r as u8;
+                    out[d + 3] = 0xff;
+                }
+                8 | 4 | 1 => {
+                    let index = if bpp == 8 {
+                        data[row + x] as usize
+                    } else if bpp == 4 {
+                        let byte = data[row + x / 2];
+                        if x % 2 == 0 {
+                            (byte >> 4) as usize
+                        } else {
+                            (byte & 0x0f) as usize
+                        }
+                    } else {
+                        let byte = data[row + x / 8];
+                        ((byte >> (7 - (x % 8))) & 1) as usize
+                    };
+                    if let Some(entry) = palette_off
+                        .checked_add(index * 4)
+                        .and_then(|pp| data.get(pp..pp + 4))
+                    {
+                        out[d] = entry[0];
+                        out[d + 1] = entry[1];
+                        out[d + 2] = entry[2];
+                        out[d + 3] = 0xff;
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    let _ = palette_colors;
+    let _ = bytes_per_px;
+    Some((width as u32, height, out))
+}
+
+/// BMP encode of a top-down 32-bpp ARGB buffer (32-bpp BI_RGB file).
+fn gdiplus_encode_bmp(width: u32, height: u32, argb: &[u8]) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || argb.len() < w * h * 4 {
+        return None;
+    }
+    let row_size = w * 4;
+    let pixel_bytes = row_size * h;
+    let file_size = 14 + 40 + pixel_bytes;
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    // Bottom-up rows: row 0 of the file is the bottom image row.
+    for y in (0..h).rev() {
+        let row = y * row_size;
+        out.extend_from_slice(&argb[row..row + row_size]);
+    }
+    Some(out)
+}
+
+/// PNG decode (any colour type, expanded to RGBA8).  Returns
+/// `(width, height, top-down 32-bpp ARGB)`.
+fn gdiplus_decode_png(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(data));
+    let mut reader = decoder.read_info().ok()?;
+    let mut out = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut out).ok()?;
+    let width = info.width;
+    let height = info.height;
+    let pixels = &out[..info.buffer_size()];
+    let channels = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        _ => return None,
+    };
+    let mut argb = vec![0u8; width as usize * height as usize * 4];
+    for (i, chunk) in pixels.chunks(channels).enumerate() {
+        let (r, g, b, a) = match channels {
+            4 => (chunk[0], chunk[1], chunk[2], chunk[3]),
+            3 => (chunk[0], chunk[1], chunk[2], 255),
+            2 => (chunk[0], chunk[0], chunk[0], chunk[1]),
+            _ => (chunk[0], chunk[0], chunk[0], 255),
+        };
+        let d = i * 4;
+        argb[d] = b;
+        argb[d + 1] = g;
+        argb[d + 2] = r;
+        argb[d + 3] = a;
+    }
+    Some((width, height, argb))
+}
+
+/// PNG encode of a top-down 32-bpp ARGB buffer (RGBA8 PNG).
+fn gdiplus_encode_png(width: u32, height: u32, argb: &[u8]) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || argb.len() < w * h * 4 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for px in argb.chunks(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    let mut png_bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(&rgba).ok()?;
+    drop(writer);
+    Some(png_bytes)
+}
+
+/// Decode an image payload by magic bytes.  Returns
+/// `(raw_kind, width, height, top-down ARGB)`; `raw_kind` is 1 for BMP and
+/// 2 for PNG.
+fn gdiplus_decode_image(data: &[u8]) -> Option<(u32, u32, u32, Vec<u8>)> {
+    if data.len() >= 8 && data[0] == 0x89 && &data[1..4] == b"PNG" {
+        gdiplus_decode_png(data).map(|(w, h, px)| (2, w, h, px))
+    } else if data.starts_with(b"BM") {
+        gdiplus_decode_bmp(data).map(|(w, h, px)| (1, w, h, px))
+    } else {
+        None
+    }
+}
+
+/// Raw-format GUID of a bitmap (`GdipGetImageRawFormat` output), keyed by
+/// the bitmap's `raw_kind`.
+fn gdiplus_raw_format_guid(kind: u32) -> [u8; 16] {
+    match kind {
+        1 => gdiplus_guid_bytes("b96b3cab-0728-11d3-9d7b-0000f81ef32e"), // ImageFormatBMP
+        2 => gdiplus_guid_bytes("b96b3caf-0728-11d3-9d7b-0000f81ef32e"), // ImageFormatPNG
+        _ => gdiplus_guid_bytes("b96b3caa-0728-11d3-9d7b-0000f81ef32e"), // ImageFormatMemoryBMP
+    }
+}
+
+/// Parse a GUID string into its 16 little-endian bytes.
+fn gdiplus_guid_bytes(guid: &str) -> [u8; 16] {
+    let clean: String = guid
+        .chars()
+        .filter(|c| *c != '-' && *c != '{' && *c != '}')
+        .collect();
+    let mut out = [0u8; 16];
+    let mut hex = [0u8; 32];
+    for (i, ch) in clean.chars().enumerate() {
+        if i < 32 {
+            hex[i] = ch as u8;
+        }
+    }
+    let byte = |h: u8, l: u8| -> u8 {
+        let hd = (h as char).to_digit(16).unwrap_or(0) as u8;
+        let ld = (l as char).to_digit(16).unwrap_or(0) as u8;
+        hd << 4 | ld
+    };
+    for i in 0..16 {
+        out[i] = byte(hex[i * 2], hex[i * 2 + 1]);
+    }
+    // GUID memory layout: u32/u16 fields are little-endian in the byte
+    // stream, the final 8 bytes stay in order.
+    out.swap(0, 3);
+    out.swap(1, 2);
+    out.swap(4, 5);
+    out.swap(6, 7);
+    out
+}
+
+/// Encoder-CLSID → format family for `GdipSaveImageToFile` / `ToStream`:
+/// 0 = unknown, 1 = BMP, 2 = PNG.
+fn gdiplus_encoder_kind(clsid: Option<[u8; 16]>) -> u32 {
+    let Some(clsid) = clsid else {
+        return 1; // NULL CLSID selects the BMP encoder, like GDI+.
+    };
+    if clsid == gdiplus_guid_bytes("557cf406-1a04-11d3-9a73-0000f81ef32e") {
+        2 // PNG encoder
+    } else if clsid == gdiplus_guid_bytes("557cf400-1a04-11d3-9a73-0000f81ef32e") {
+        1 // BMP encoder
+    } else {
+        0
+    }
+}
+
+/// Convert a bitmap's canonical ARGB pixels to packed 24-bpp BGR rows
+/// (bottom-up, `height` rows of `stride` bytes), used by the HBITMAP
+/// interop path.
+fn gdiplus_argb_to_bgr24_bottom_up(width: u32, height: u32, argb: &[u8]) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || argb.len() < w * h * 4 {
+        return None;
+    }
+    let row_size = w * 3;
+    let padded = row_size.div_ceil(4) * 4;
+    let mut out = vec![0u8; padded * h];
+    for y in 0..h {
+        let dst_y = h - 1 - y; // bottom-up
+        let src = y * w * 4;
+        for x in 0..w {
+            let d = dst_y * padded + x * 3;
+            out[d] = argb[src + x * 4];
+            out[d + 1] = argb[src + x * 4 + 1];
+            out[d + 2] = argb[src + x * 4 + 2];
+        }
+    }
+    Some(out)
+}
+
+/// The byte-width of a `MemoryBitmap` pixel.  GDI bitmaps are registered
+/// with either a byte bpp (1..=4) or a bit bpp (8/16/24/32) depending on
+/// the creation path; normalise both.
+fn gdiplus_memory_bpp_bytes(bitmap: &MemoryBitmap) -> usize {
+    if bitmap.bpp > 4 {
+        (bitmap.bpp / 8).max(1)
+    } else {
+        bitmap.bpp.max(1)
+    }
+}
+
+/// Convert a GDI `MemoryBitmap`'s native pixels (bottom-up, 1/2/3/4 bpp)
+/// into the engine's top-down 32-bpp ARGB layout, mirroring the mapping the
+/// GDI readback paths use.
+fn gdiplus_bitmap_to_argb(bitmap: &MemoryBitmap) -> Option<Vec<u8>> {
+    let w = bitmap.width;
+    let h = bitmap.height;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let bpp = gdiplus_memory_bpp_bytes(bitmap);
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let s_row = h - 1 - y; // bottom-up: memory row 0 is the bottom
+        for x in 0..w {
+            let s_idx = (s_row * w + x) * bpp;
+            if s_idx + bpp > bitmap.bytes.len() {
+                continue;
+            }
+            let px = &bitmap.bytes[s_idx..s_idx + bpp];
+            let d_idx = (y * w + x) * 4;
+            match bpp {
+                1 => {
+                    let v = px[0];
+                    out[d_idx] = v;
+                    out[d_idx + 1] = v;
+                    out[d_idx + 2] = v;
+                    out[d_idx + 3] = 0xff;
+                }
+                2 => {
+                    let v = u16::from_le_bytes([px[0], px[1]]);
+                    let r = ((v >> 10) & 0x1f) as u8 * 255 / 31;
+                    let g = ((v >> 5) & 0x1f) as u8 * 255 / 31;
+                    let b = (v & 0x1f) as u8 * 255 / 31;
+                    out[d_idx] = b;
+                    out[d_idx + 1] = g;
+                    out[d_idx + 2] = r;
+                    out[d_idx + 3] = 0xff;
+                }
+                3 => {
+                    out[d_idx] = px[0];
+                    out[d_idx + 1] = px[1];
+                    out[d_idx + 2] = px[2];
+                    out[d_idx + 3] = 0xff;
+                }
+                _ => {
+                    out[d_idx] = px[0];
+                    out[d_idx + 1] = px[1];
+                    out[d_idx + 2] = px[2];
+                    out[d_idx + 3] = if px.len() >= 4 { px[3] } else { 0xff };
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Convert engine ARGB (top-down) pixels back into a GDI `MemoryBitmap`'s
+/// native bottom-up layout.  32-bpp content keeps its BGRA byte order;
+/// other depths are truncated to the target bpp.
+fn gdiplus_argb_to_bitmap(bitmap: &MemoryBitmap, argb: &[u8]) -> Option<Vec<u8>> {
+    let w = bitmap.width;
+    let h = bitmap.height;
+    if w == 0 || h == 0 || argb.len() < w * h * 4 {
+        return None;
+    }
+    let bpp = gdiplus_memory_bpp_bytes(bitmap);
+    let mut out = vec![0u8; w * h * bpp];
+    for y in 0..h {
+        let d_row = h - 1 - y;
+        for x in 0..w {
+            let s_idx = (y * w + x) * 4;
+            let d_idx = (d_row * w + x) * bpp;
+            if d_idx + bpp > out.len() {
+                continue;
+            }
+            let b = argb[s_idx];
+            let g = argb[s_idx + 1];
+            let r = argb[s_idx + 2];
+            let a = argb[s_idx + 3];
+            match bpp {
+                1 => out[d_idx] = (r.max(g).max(b) + a) / 2,
+                2 => {
+                    // 16bpp RGB555 packing (matches the read mapping).
+                    let v = ((r as u16 >> 3) << 10) | ((g as u16 >> 3) << 5) | (b as u16 >> 3);
+                    out[d_idx] = v as u8;
+                    out[d_idx + 1] = (v >> 8) as u8;
+                }
+                3 => {
+                    out[d_idx] = b;
+                    out[d_idx + 1] = g;
+                    out[d_idx + 2] = r;
+                }
+                _ => {
+                    out[d_idx] = b;
+                    out[d_idx + 1] = g;
+                    out[d_idx + 2] = r;
+                    out[d_idx + 3] = a;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Stroke device-space polylines with caps/joins handled by the rasterizer:
+/// flat caps/joins draw the raw chain, square caps extend the end segments
+/// by half the pen width, round caps/joins stamp discs.  When `already_split`
+/// is set (clip boundaries cut the chain) no cap/join decoration is applied.
+fn gdiplus_render_stroke_chain(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    stride: i32,
+    points: &[GdiplusPointF],
+    style: &GdiplusStrokeStyle,
+    already_split: bool,
+    dash_shrink: bool,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let width_px = style.width_px.max(1.0);
+    let cm = style.cm;
+    let sm = style.sm;
+    // Extend for square caps when the chain is not split.
+    let mut chain: Vec<GdiplusPointF> = points.to_vec();
+    if !already_split && chain.len() >= 2 {
+        if style.start_cap == crate::user32::GDIPLUS_LINE_CAP_SQUARE {
+            let (dx, dy) = (chain[1].x - chain[0].x, chain[1].y - chain[0].y);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let extend = width_px * 0.5 / len;
+            chain[0].x -= dx * extend;
+            chain[0].y -= dy * extend;
+        }
+        if style.end_cap == crate::user32::GDIPLUS_LINE_CAP_SQUARE {
+            let n = chain.len();
+            let (dx, dy) = (
+                chain[n - 1].x - chain[n - 2].x,
+                chain[n - 1].y - chain[n - 2].y,
+            );
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let extend = width_px * 0.5 / len;
+            chain[n - 1].x += dx * extend;
+            chain[n - 1].y += dy * extend;
+        }
+    }
+    for pair in chain.windows(2) {
+        let (mut x0, mut y0, mut x1, mut y1) = (pair[0].x, pair[0].y, pair[1].x, pair[1].y);
+        if dash_shrink {
+            // The rasterizer's square pen stamps extend half a width past
+            // segment endpoints, so inset dash spans by half a width at each
+            // end (a dash shorter than the pen becomes a centred dot).
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-6 {
+                let inset = (width_px * 0.5).min(len * 0.5);
+                if len - 2.0 * inset < 0.5 {
+                    let cxm = (x0 + x1) * 0.5;
+                    let cym = (y0 + y1) * 0.5;
+                    let reach = 0.25;
+                    x0 = cxm - reach;
+                    x1 = cxm + reach;
+                    y0 = cym - reach * dy / len.max(1e-6);
+                    y1 = cym + reach * dy / len.max(1e-6);
+                } else {
+                    x0 += dx / len * inset;
+                    y0 += dy / len * inset;
+                    x1 -= dx / len * inset;
+                    y1 -= dy / len * inset;
+                }
+            }
+        }
+        crate::gdiplus_render::draw_line(
+            pixels,
+            width,
+            height,
+            stride,
+            x0,
+            y0,
+            x1,
+            y1,
+            style.color,
+            width_px,
+            cm,
+            sm,
+        );
+    }
+    if already_split {
+        return;
+    }
+    let mut disc = |x: f32, y: f32| {
+        let r = width_px * 0.5;
+        crate::gdiplus_render::fill_ellipse(
+            pixels,
+            width,
+            height,
+            stride,
+            x - r,
+            y - r,
+            width_px,
+            width_px,
+            style.color,
+            cm,
+        );
+    };
+    if style.join == crate::user32::GDIPLUS_LINE_JOIN_ROUND {
+        // Round joins stamp discs at every interior vertex of the chain.
+        for p in &chain[1..chain.len().saturating_sub(1)] {
+            disc(p.x, p.y);
+        }
+    }
+    if style.start_cap == crate::user32::GDIPLUS_LINE_CAP_ROUND {
+        disc(chain[0].x, chain[0].y);
+    }
+    if style.end_cap == crate::user32::GDIPLUS_LINE_CAP_ROUND && chain.len() >= 2 {
+        let last = chain.len() - 1;
+        disc(chain[last].x, chain[last].y);
+    }
+}
+
 fn write_i16(memory: &mut MemoryImage, address: u64, value: i16) {
     memory.map_bytes(address, &value.to_le_bytes());
 }
@@ -135737,85 +140973,6 @@ fn find_case_fold_substring(haystack: &str, needle: &str, case_insensitive: bool
     } else {
         haystack.find(needle)
     }
-}
-
-fn build_shell_link_link_info(path: &str) -> Vec<u8> {
-    let normalized = normalize_windows_path(path);
-    let (local_base_path, common_path_suffix) =
-        if let Some((parent, leaf)) = normalized.rsplit_once('\\') {
-            let base = format!("{parent}\\");
-            (base, leaf.to_string())
-        } else {
-            (normalized.clone(), String::new())
-        };
-    let local_base_path_ansi = local_base_path.as_bytes().to_vec();
-    let common_path_suffix_ansi = common_path_suffix.as_bytes().to_vec();
-    let local_base_path_unicode = encode_shell_link_utf16(&local_base_path);
-    let common_path_suffix_unicode = encode_shell_link_utf16(&common_path_suffix);
-    let volume_id = build_shell_link_volume_id(&normalized);
-
-    let volume_id_offset = 0x24_u32;
-    let local_base_path_offset = volume_id_offset + volume_id.len() as u32;
-    let common_path_suffix_offset = local_base_path_offset + local_base_path_ansi.len() as u32 + 1;
-    let local_base_path_offset_unicode =
-        common_path_suffix_offset + common_path_suffix_ansi.len() as u32 + 1;
-    let common_path_suffix_offset_unicode =
-        local_base_path_offset_unicode + local_base_path_unicode.len() as u32;
-    let link_info_size =
-        common_path_suffix_offset_unicode + common_path_suffix_unicode.len() as u32;
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&link_info_size.to_le_bytes());
-    bytes.extend_from_slice(&0x24_u32.to_le_bytes());
-    bytes.extend_from_slice(&0x0000_0001_u32.to_le_bytes());
-    bytes.extend_from_slice(&volume_id_offset.to_le_bytes());
-    bytes.extend_from_slice(&local_base_path_offset.to_le_bytes());
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    bytes.extend_from_slice(&common_path_suffix_offset.to_le_bytes());
-    bytes.extend_from_slice(&local_base_path_offset_unicode.to_le_bytes());
-    bytes.extend_from_slice(&common_path_suffix_offset_unicode.to_le_bytes());
-    bytes.extend_from_slice(&volume_id);
-    bytes.extend_from_slice(&local_base_path_ansi);
-    bytes.push(0);
-    bytes.extend_from_slice(&common_path_suffix_ansi);
-    bytes.push(0);
-    bytes.extend_from_slice(&local_base_path_unicode);
-    bytes.extend_from_slice(&common_path_suffix_unicode);
-    bytes
-}
-
-fn build_shell_link_volume_id(path: &str) -> Vec<u8> {
-    let volume_label = windows_drive_prefix(path)
-        .map(|prefix| prefix.trim_end_matches(':'))
-        .unwrap_or("C")
-        .as_bytes()
-        .to_vec();
-    let volume_id_size = 0x10_u32 + volume_label.len() as u32 + 1;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&volume_id_size.to_le_bytes());
-    bytes.extend_from_slice(&DRIVE_FIXED.to_le_bytes());
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    bytes.extend_from_slice(&0x10_u32.to_le_bytes());
-    bytes.extend_from_slice(&volume_label);
-    bytes.push(0);
-    bytes
-}
-
-fn append_shell_link_string(bytes: &mut Vec<u8>, value: &str) {
-    let code_units = value.encode_utf16().collect::<Vec<_>>();
-    bytes.extend_from_slice(&(code_units.len() as u16).to_le_bytes());
-    for code_unit in code_units {
-        bytes.extend_from_slice(&code_unit.to_le_bytes());
-    }
-}
-
-fn encode_shell_link_utf16(value: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for code_unit in value.encode_utf16() {
-        bytes.extend_from_slice(&code_unit.to_le_bytes());
-    }
-    bytes.extend_from_slice(&0_u16.to_le_bytes());
-    bytes
 }
 
 fn file_attributes_mask(attributes: &[String]) -> u32 {

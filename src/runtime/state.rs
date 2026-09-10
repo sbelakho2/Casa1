@@ -209,6 +209,11 @@ pub(crate) enum GuestObjectKind {
     ImfByteStream,
     ImfTopologyNode,
     ImfDxgiDeviceManager,
+    /// A guest IMFRateControl / IMFRateSupport service object handed out by
+    /// the media-session rate-control service (MFGetService with
+    /// MF_RATE_CONTROL_SERVICE).  The object's owner session is recorded in
+    /// `PeHostRuntime::mf_rate_services`.
+    ImfRateControlService,
     DshowClassFactory,
     DshowFilterGraph,
     WicFactory,
@@ -1662,6 +1667,9 @@ pub(crate) struct PeHostRuntime {
     pub(crate) mf_event_queues: HashMap<u64, crate::media::MfEventQueue>,
     /// Guest IMFMediaSession object -> session.
     pub(crate) mf_sessions: HashMap<u64, crate::media::MfMediaSession>,
+    /// Guest IMFRateControl/IMFRateSupport service object (MFGetService,
+    /// MF_RATE_CONTROL_SERVICE) -> the owning session object.
+    pub(crate) mf_rate_services: HashMap<u64, u64>,
     /// Guest IMFPresentationClock object -> clock.
     pub(crate) mf_clocks: HashMap<u64, crate::media::PresentationClock>,
     /// Guest IMFSinkWriter object -> sink writer.
@@ -2328,6 +2336,7 @@ impl PeHostRuntime {
             mf_samples: HashMap::new(),
             mf_event_queues: HashMap::new(),
             mf_sessions: HashMap::new(),
+            mf_rate_services: HashMap::new(),
             mf_clocks: HashMap::new(),
             mf_sink_writers: HashMap::new(),
             mf_source_readers: HashMap::new(),

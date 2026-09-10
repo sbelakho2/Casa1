@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-09T18:47:59Z",
+  "generated_at": "2026-09-10T02:02:22Z",
   "per_dll": {
     "activeds.dll": {
       "total": 3,
@@ -219,21 +219,21 @@
     },
     "browseui.dll": {
       "total": 2,
-      "implemented": 0,
+      "implemented": 2,
       "partial": 0,
-      "stub": 2,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 0,
-      "conformance_tested": 0,
+      "differential_tested": 2,
+      "conformance_tested": 2,
       "transitional_partial": 0,
       "exact": 0,
       "restricted": 0,
       "approximate": 0,
-      "synthetic_environment": 0,
-      "canned_failure": 2,
+      "synthetic_environment": 2,
+      "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 2
+      "capability_partial": 2,
+      "capability_absent": 0
     },
     "certadm.dll": {
       "total": 3,
@@ -309,21 +309,21 @@
     },
     "cngaudit.dll": {
       "total": 1,
-      "implemented": 0,
+      "implemented": 1,
       "partial": 0,
-      "stub": 1,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 0,
-      "conformance_tested": 0,
+      "differential_tested": 1,
+      "conformance_tested": 1,
       "transitional_partial": 0,
-      "exact": 0,
+      "exact": 1,
       "restricted": 0,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 1,
+      "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "colorcnv.dll": {
       "total": 3,
@@ -435,21 +435,21 @@
     },
     "cryptdlg.dll": {
       "total": 2,
-      "implemented": 0,
+      "implemented": 2,
       "partial": 0,
-      "stub": 2,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 0,
-      "conformance_tested": 0,
+      "differential_tested": 2,
+      "conformance_tested": 2,
       "transitional_partial": 0,
-      "exact": 0,
-      "restricted": 0,
+      "exact": 1,
+      "restricted": 1,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 2,
-      "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 2
+      "canned_failure": 0,
+      "capability_full": 1,
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "cryptdll.dll": {
       "total": 3,
@@ -1198,13 +1198,13 @@
       "differential_tested": 118,
       "conformance_tested": 118,
       "transitional_partial": 0,
-      "exact": 117,
-      "restricted": 0,
-      "approximate": 1,
+      "exact": 115,
+      "restricted": 3,
+      "approximate": 0,
       "synthetic_environment": 0,
       "canned_failure": 0,
-      "capability_full": 117,
-      "capability_partial": 1,
+      "capability_full": 115,
+      "capability_partial": 3,
       "capability_absent": 0
     },
     "glu32.dll": {
@@ -1613,9 +1613,9 @@
       "conformance_tested": 1,
       "transitional_partial": 0,
       "exact": 0,
-      "restricted": 0,
+      "restricted": 1,
       "approximate": 0,
-      "synthetic_environment": 1,
+      "synthetic_environment": 0,
       "canned_failure": 0,
       "capability_full": 0,
       "capability_partial": 1,
@@ -1857,21 +1857,21 @@
     },
     "msftedit.dll": {
       "total": 1,
-      "implemented": 0,
+      "implemented": 1,
       "partial": 0,
-      "stub": 1,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 0,
-      "conformance_tested": 0,
+      "differential_tested": 1,
+      "conformance_tested": 1,
       "transitional_partial": 0,
-      "exact": 0,
+      "exact": 1,
       "restricted": 0,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 1,
+      "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "mshtml.dll": {
       "total": 4,
@@ -2235,18 +2235,18 @@
     },
     "ntdll.dll": {
       "total": 69,
-      "implemented": 68,
+      "implemented": 69,
       "partial": 0,
-      "stub": 1,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 68,
-      "conformance_tested": 68,
+      "differential_tested": 69,
+      "conformance_tested": 69,
       "transitional_partial": 0,
       "exact": 68,
-      "restricted": 0,
+      "restricted": 1,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 1,
+      "canned_failure": 0,
       "capability_full": 68,
       "capability_partial": 1,
       "capability_absent": 0
@@ -2559,21 +2559,21 @@
     },
     "riched32.dll": {
       "total": 1,
-      "implemented": 0,
+      "implemented": 1,
       "partial": 0,
-      "stub": 1,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 0,
-      "conformance_tested": 0,
+      "differential_tested": 1,
+      "conformance_tested": 1,
       "transitional_partial": 0,
-      "exact": 0,
+      "exact": 1,
       "restricted": 0,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 1,
+      "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 0,
-      "capability_absent": 1
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "rpcrt4.dll": {
       "total": 9,
@@ -2775,21 +2775,21 @@
     },
     "shdocvw.dll": {
       "total": 3,
-      "implemented": 1,
+      "implemented": 3,
       "partial": 0,
-      "stub": 2,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 1,
-      "conformance_tested": 1,
+      "differential_tested": 3,
+      "conformance_tested": 3,
       "transitional_partial": 0,
       "exact": 1,
-      "restricted": 0,
+      "restricted": 2,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 2,
-      "capability_full": 1,
-      "capability_partial": 0,
-      "capability_absent": 2
+      "canned_failure": 0,
+      "capability_full": 2,
+      "capability_partial": 1,
+      "capability_absent": 0
     },
     "shell32.dll": {
       "total": 44,
@@ -3693,21 +3693,21 @@
     },
     "x3daudio1_7.dll": {
       "total": 2,
-      "implemented": 1,
+      "implemented": 2,
       "partial": 0,
-      "stub": 1,
+      "stub": 0,
       "unsupported": 0,
-      "differential_tested": 1,
-      "conformance_tested": 1,
+      "differential_tested": 2,
+      "conformance_tested": 2,
       "transitional_partial": 0,
       "exact": 0,
-      "restricted": 1,
+      "restricted": 2,
       "approximate": 0,
       "synthetic_environment": 0,
-      "canned_failure": 1,
+      "canned_failure": 0,
       "capability_full": 0,
-      "capability_partial": 1,
-      "capability_absent": 1
+      "capability_partial": 2,
+      "capability_absent": 0
     },
     "xactengine3_7.dll": {
       "total": 2,
@@ -3857,75 +3857,8 @@
   "gate": {
     "shipping_violations": [],
     "shipping_violation_count": 0,
-    "completeness_violations": [
-      {
-        "dll": "browseui.dll",
-        "export": "SHCreateExplorerTaskband",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "browseui.dll!SHCreateExplorerTaskband is a documented Stub (guest-visible consequence: No explorer taskband is created: the operation answers E_FAIL without performing the shell-UI work.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "browseui.dll",
-        "export": "SHOpenFolderWindow",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "browseui.dll!SHOpenFolderWindow is a documented Stub (guest-visible consequence: No folder window is opened: the operation answers E_FAIL without performing the shell-UI work.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "cngaudit.dll",
-        "export": "CngAuditLog",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "cngaudit.dll!CngAuditLog is a documented Stub (guest-visible consequence: No audit record is written: the operation answers ERROR_SUCCESS without performing any audit-logging work (a silent no-op the guest sees as success).) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "cryptdlg.dll",
-        "export": "CertDigestDigest",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "cryptdlg.dll!CertDigestDigest is a documented Stub (guest-visible consequence: The digest helper is not implemented: the operation answers ERROR_NOT_FOUND without computing a digest.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "cryptdlg.dll",
-        "export": "CertSelectCertificate",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "cryptdlg.dll!CertSelectCertificate is a documented Stub (guest-visible consequence: No certificate-selection UI is shown and no selection is made: the operation answers FALSE without performing the documented dialog contract.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "msftedit.dll",
-        "export": "MsftEditRegisterClass",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "msftedit.dll!MsftEditRegisterClass is a documented Stub (guest-visible consequence: The rich-edit window class is not registered: the operation returns TRUE without performing the registration, so later class creation cannot succeed.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "ntdll.dll",
-        "export": "NtCreateProcess",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "ntdll.dll!NtCreateProcess is a documented Stub (guest-visible consequence: No child processes are creatable through the native surface: the call answers STATUS_INVALID_HANDLE without creating a process.  Process APIs exist through the Win32 layer; the native creation path is a canned failure the guest sees.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "riched32.dll",
-        "export": "RichEditANSIWndClass",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "riched32.dll!RichEditANSIWndClass is a documented Stub (guest-visible consequence: The ANSI rich-edit window class is not registered: the operation returns TRUE without performing the registration.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "shdocvw.dll",
-        "export": "SHCreateLinks",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "shdocvw.dll!SHCreateLinks is a documented Stub (guest-visible consequence: No shell links are created: the operation answers E_FAIL without performing the work.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "shdocvw.dll",
-        "export": "SHNavigateToFavorite",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "shdocvw.dll!SHNavigateToFavorite is a documented Stub (guest-visible consequence: No favorites navigation happens: the operation answers E_FAIL without performing the work.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      },
-      {
-        "dll": "x3daudio1_7.dll",
-        "export": "X3DAudioCalculate",
-        "kind": "StubNotDeliberatelyUnsupported",
-        "message": "x3daudio1_7.dll!X3DAudioCalculate is a documented Stub (guest-visible consequence: No listener/emitter sound-cone math is performed: the DSP settings are zeroed and S_OK is returned.  The guest sees a silent no-op instead of the spatial calculation the API documents.) — deliberate stubs ship, but the completeness gate requires a working, semantically proven implementation"
-      }
-    ],
-    "completeness_violation_count": 11
+    "completeness_violations": [],
+    "completeness_violation_count": 0
   },
   "registry": [
     {
@@ -8831,22 +8764,22 @@
     {
       "dll": "browseui.dll",
       "export": "SHCreateExplorerTaskband",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No explorer taskband is created: the operation answers E_FAIL without performing the shell-UI work."
+      "semantic_fidelity": "SyntheticEnvironment",
+      "subsystem_capability": "Partial",
+      "detail": "No explorer shell exists; the per-shell-session taskband registry with the guest's real task entries is the modeled behavior (single taskband, S_FALSE on repeat, real invalid-argument paths)."
     },
     {
       "dll": "browseui.dll",
       "export": "SHOpenFolderWindow",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No folder window is opened: the operation answers E_FAIL without performing the shell-UI work."
+      "semantic_fidelity": "SyntheticEnvironment",
+      "subsystem_capability": "Partial",
+      "detail": "No desktop shell exists; the folder-window session registry is the modeled behavior: monotonic session ids, resolved folder path, open/close visibility transitions and events, real path/flag failure codes."
     },
     {
       "dll": "certadm.dll",
@@ -9001,12 +8934,12 @@
     {
       "dll": "cngaudit.dll",
       "export": "CngAuditLog",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No audit record is written: the operation answers ERROR_SUCCESS without performing any audit-logging work (a silent no-op the guest sees as success)."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Partial",
+      "detail": "Appends a real audit record (timestamp, provider, action, result) to the runtime's bounded audit trail on every call; the trail is the runtime's own store rather than the Windows security-event log."
     },
     {
       "dll": "colorcnv.dll",
@@ -9521,22 +9454,22 @@
     {
       "dll": "cryptdlg.dll",
       "export": "CertDigestDigest",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "The digest helper is not implemented: the operation answers ERROR_NOT_FOUND without computing a digest."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": "Computes real MD5/SHA-1/SHA-256 digests over the guest buffer via the crypto layer, with size-probe mode, ERROR_INSUFFICIENT_BUFFER partial-write semantics and ERROR_NOT_SUPPORTED for unknown algorithms."
     },
     {
       "dll": "cryptdlg.dll",
       "export": "CertSelectCertificate",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No certificate-selection UI is shown and no selection is made: the operation answers FALSE without performing the documented dialog contract."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity), writes a real CERT_CONTEXT and the owning store handle when exactly one candidate is eligible, and answers FALSE user-cancel when none or several are eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface."
     },
     {
       "dll": "cryptdll.dll",
@@ -12194,9 +12127,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Approximate",
-      "subsystem_capability": "Partial",
-      "detail": "Creates a real GDI+ graphics object, but the object carries an empty vtable (no drawing methods) — the handle is real, the drawing surface is not."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Full",
+      "detail": null
     },
     {
       "dll": "gdiplus.dll",
@@ -12214,9 +12147,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Exact",
-      "subsystem_capability": "Full",
-      "detail": null
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Returns the genuine GDI+ NotImplemented status: no pixel-icon registry exists for arbitrary HICONs (module-resource icons only)."
     },
     {
       "dll": "gdiplus.dll",
@@ -12814,9 +12747,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Exact",
-      "subsystem_capability": "Full",
-      "detail": null
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Returns the genuine GDI+ NotImplemented status: character-range measurement needs creatable GpRegion objects."
     },
     {
       "dll": "gdiplus.dll",
@@ -12924,9 +12857,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "Exact",
-      "subsystem_capability": "Full",
-      "detail": null
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Returns the genuine GDI+ NotImplemented status: non-rectangular GpRegion clip paths are not creatable (no GdipCreateRegion is exported on this surface)."
     },
     {
       "dll": "gdiplus.dll",
@@ -14976,7 +14909,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Media Foundation objects exist, but no service provider is registered: the query answers MF_E_UNSUPPORTED_SERVICE."
+      "detail": "Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state with release-to-forget semantics; service GUIDs the object genuinely does not own answer MF_E_UNSUPPORTED_SERVICE (correct Windows behavior).  Media-source/sink services await those objects."
     },
     {
       "dll": "mf.dll",
@@ -15266,7 +15199,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Media Foundation objects exist, but no service provider is registered: the query answers MF_E_UNSUPPORTED_SERVICE."
+      "detail": "Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state; genuinely unowned service GUIDs answer MF_E_UNSUPPORTED_SERVICE."
     },
     {
       "dll": "mfplat.dll",
@@ -15384,9 +15317,9 @@
       "implementation": "Implemented",
       "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "SyntheticEnvironment",
+      "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "The runtime has an audio stack, but no device-activation endpoint: the activation answers AUDCLNT_E_DEVICE_INVALIDATED without invoking the callback."
+      "detail": "Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and builds a real guest endpoint object for IID_IAudioClient/IAudioClient2/IAudioClient3 with a working vtable; the completion handler is invoked asynchronously through the runtime's queue/drain machinery (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object and no per-method IAudioClient host thunks exist yet."
     },
     {
       "dll": "mp3dmod.dll",
@@ -16171,12 +16104,12 @@
     {
       "dll": "msftedit.dll",
       "export": "MsftEditRegisterClass",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "The rich-edit window class is not registered: the operation returns TRUE without performing the registration, so later class creation cannot succeed."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Partial",
+      "detail": "Registers the real RICHEDIT50W class through the user32 class registry and returns its real atom (idempotent re-registration, stable atom); window creation routes through the built-in rich-edit control path."
     },
     {
       "dll": "mshtml.dll",
@@ -18911,12 +18844,12 @@
     {
       "dll": "ntdll.dll",
       "export": "NtCreateProcess",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
+      "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "No child processes are creatable through the native surface: the call answers STATUS_INVALID_HANDLE without creating a process.  Process APIs exist through the Win32 layer; the native creation path is a canned failure the guest sees."
+      "detail": "Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths.  The native contract's primary-thread creation is NtCreateThread's job (no native-thread surface exists) and no host subprocess runner is spawned (the contract carries no command line), so the process object is a record-only guest process with full query/terminate semantics."
     },
     {
       "dll": "mfplat.dll",
@@ -21001,12 +20934,12 @@
     {
       "dll": "riched32.dll",
       "export": "RichEditANSIWndClass",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "The ANSI rich-edit window class is not registered: the operation returns TRUE without performing the registration."
+      "semantic_fidelity": "Exact",
+      "subsystem_capability": "Partial",
+      "detail": "Registers the real RICHEDIT class through the user32 class registry and returns its real atom; window creation routes through the built-in rich-edit control path."
     },
     {
       "dll": "rpcrt4.dll",
@@ -21661,22 +21594,22 @@
     {
       "dll": "shdocvw.dll",
       "export": "SHCreateLinks",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No shell links are created: the operation answers E_FAIL without performing the work."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Full",
+      "detail": "Writes a real persistent Windows .lnk (header + LinkInfo + flag-gated StringData) through the single src/lnk.rs writer shared with the COM IShellLink/IPersistFile save path, parse-back verified; the export's argument layout is a modeled contract and 'ANSI' path bytes are the UTF-8 guest path (no ANSI codepage)."
     },
     {
       "dll": "shdocvw.dll",
       "export": "SHNavigateToFavorite",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No favorites navigation happens: the operation answers E_FAIL without performing the work."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Adds/updates/removes real per-user favorites (in-runtime store plus persistent [InternetShortcut] .url files under the guest user's Favorites); no URL-navigation engine exists, so navigation itself is the stored record with S_FALSE on missing removes."
     },
     {
       "dll": "shell32.dll",
@@ -26661,12 +26594,12 @@
     {
       "dll": "x3daudio1_7.dll",
       "export": "X3DAudioCalculate",
-      "implementation": "Stub",
-      "semantic_test_coverage": "None",
+      "implementation": "Implemented",
+      "semantic_test_coverage": "Conformance",
       "support_policy": "OptionalFeature",
-      "semantic_fidelity": "CannedFailure",
-      "subsystem_capability": "Absent",
-      "detail": "No listener/emitter sound-cone math is performed: the DSP settings are zeroed and S_OK is returned.  The guest sees a silent no-op instead of the spatial calculation the API documents."
+      "semantic_fidelity": "Restricted",
+      "subsystem_capability": "Partial",
+      "detail": "Performs real X3DAudio spatial math (distance curves, cone inside/outside attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel delay/coefficient matrices) with documented approximations: speaker-circle azimuths, unit speaker radius and the inner-radius blend curve are complete deterministic approximations because no Windows oracle exists; the matrix layout follows the SDK header (dst-major).  Zeroed-response no-op is gone."
     },
     {
       "dll": "x3daudio1_7.dll",
@@ -26676,7 +26609,7 @@
       "support_policy": "OptionalFeature",
       "semantic_fidelity": "Restricted",
       "subsystem_capability": "Partial",
-      "detail": "Validates the output pointer and hands back an instance token derived from the channel mask, but the X3DAudio engine surface behind the handle is absent (calculate is a canned zeroed response)."
+      "detail": "Writes a real opaque instance handle (magic + speaker mask + speed of sound) that Calculate validates; the engine surface is the software spatial math above."
     },
     {
       "dll": "xactengine3_7.dll",

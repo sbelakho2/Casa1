@@ -2515,6 +2515,10 @@ pub struct MfMediaSession {
     start_time: Option<std::time::Instant>,
     /// Elapsed time when paused (for resume position tracking).
     paused_elapsed: u64,
+    /// The session's playback rate (IMFMediaSession rate-control service:
+    /// MFGetService(MF_RATE_CONTROL_SERVICE)).  Position advances at
+    /// `rate` x wall-clock while playing; the default session rate is 1.0.
+    rate: f32,
     /// Source URL for the current media.
     source_url: Option<String>,
     /// Whether a topology has been set on this session.
@@ -2533,6 +2537,7 @@ impl MfMediaSession {
             topology_loader: TopologyLoader::new(),
             start_time: None,
             paused_elapsed: 0,
+            rate: 1.0,
             source_url: None,
             has_topology: false,
         }
@@ -2585,11 +2590,8 @@ impl MfMediaSession {
             ));
         }
 
-        // Record elapsed time at pause
-        if let Some(start) = self.start_time {
-            self.paused_elapsed += start.elapsed().as_micros() as u64;
-        }
-
+        // Bank the position accrued at the current playback rate.
+        self.bank_position();
         self.state = MfSessionState::Paused;
         self.event_queue
             .queue_event_type(MediaEventType::SessionPaused);
@@ -2725,6 +2727,42 @@ impl MfMediaSession {
     }
 
     // =======================================================================
+    // Playback-rate control (the session rate-control service)
+    // =======================================================================
+
+    /// Set the session's playback rate (IMFMediaSession rate-control
+    /// service: `IMFRateControl::SetRate`).
+    ///
+    /// The rate applies to the position that accrues while the session is
+    /// playing.  To keep the accrued-position accounting exact when the rate
+    /// changes mid-play, the position reached so far is banked at the old
+    /// rate and a fresh wall-clock interval starts at the new rate.
+    pub fn set_rate(&mut self, rate: f32) {
+        if !rate.is_finite() {
+            return;
+        }
+        if self.state == MfSessionState::Playing {
+            self.bank_position();
+            self.start_time = Some(std::time::Instant::now());
+        }
+        self.rate = rate;
+    }
+
+    /// Get the session's current playback rate.
+    pub fn get_rate(&self) -> f32 {
+        self.rate
+    }
+
+    /// Bank the position accrued since the last start/resume at the current
+    /// playback rate, leaving the wall-clock interval open for the caller.
+    fn bank_position(&mut self) {
+        if let Some(start) = self.start_time {
+            let scaled = start.elapsed().as_micros() as f64 * self.rate as f64;
+            self.paused_elapsed = (self.paused_elapsed as f64 + scaled) as u64;
+        }
+    }
+
+    // =======================================================================
     // Query methods
     // =======================================================================
 
@@ -2739,9 +2777,9 @@ impl MfMediaSession {
             MfSessionState::Playing => {
                 let elapsed = self
                     .start_time
-                    .map(|s| s.elapsed().as_micros() as u64)
-                    .unwrap_or(0);
-                self.paused_elapsed + elapsed
+                    .map(|s| s.elapsed().as_micros() as f64 * self.rate as f64)
+                    .unwrap_or(0.0);
+                (self.paused_elapsed as f64 + elapsed) as u64
             }
             MfSessionState::Paused => self.paused_elapsed,
             _ => 0,

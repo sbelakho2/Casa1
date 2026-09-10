@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 39 entries deviate from exact/full — fidelity Restricted 3, Approximate 1, SyntheticEnvironment 24, CannedFailure 11, capability Partial 8, Absent 31.
+**Counts**: 40 entries deviate from exact/full — fidelity Exact 3, Restricted 12, SyntheticEnvironment 25, capability Full 1, Partial 18, Absent 21.
 
 
 ### actxprxy.dll
@@ -20,12 +20,12 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### browseui.dll
 
-- `SHCreateExplorerTaskband` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No explorer taskband is created: the operation answers E_FAIL without performing the shell-UI work.
-- `SHOpenFolderWindow` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No folder window is opened: the operation answers E_FAIL without performing the shell-UI work.
+- `SHCreateExplorerTaskband` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — No explorer shell exists; the per-shell-session taskband registry with the guest's real task entries is the modeled behavior (single taskband, S_FALSE on repeat, real invalid-argument paths).
+- `SHOpenFolderWindow` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — No desktop shell exists; the folder-window session registry is the modeled behavior: monotonic session ids, resolved folder path, open/close visibility transitions and events, real path/flag failure codes.
 
 ### cngaudit.dll
 
-- `CngAuditLog` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No audit record is written: the operation answers ERROR_SUCCESS without performing any audit-logging work (a silent no-op the guest sees as success).
+- `CngAuditLog` — level `Implemented`, fidelity `Exact`, capability `Partial` — Appends a real audit record (timestamp, provider, action, result) to the runtime's bounded audit trail on every call; the trail is the runtime's own store rather than the Windows security-event log.
 
 ### credssp.dll
 
@@ -34,8 +34,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### cryptdlg.dll
 
-- `CertDigestDigest` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The digest helper is not implemented: the operation answers ERROR_NOT_FOUND without computing a digest.
-- `CertSelectCertificate` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No certificate-selection UI is shown and no selection is made: the operation answers FALSE without performing the documented dialog contract.
+- `CertSelectCertificate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity), writes a real CERT_CONTEXT and the owning store handle when exactly one candidate is eligible, and answers FALSE user-cancel when none or several are eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface.
 
 ### dpaddr.dll
 
@@ -52,7 +51,9 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### gdiplus.dll
 
-- `GdipCreateGraphics` — level `Implemented`, fidelity `Approximate`, capability `Partial` — Creates a real GDI+ graphics object, but the object carries an empty vtable (no drawing methods) — the handle is real, the drawing surface is not.
+- `GdipCreateHICONFromBitmap` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: no pixel-icon registry exists for arbitrary HICONs (module-resource icons only).
+- `GdipMeasureCharacterRanges` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: character-range measurement needs creatable GpRegion objects.
+- `GdipSetClipPath` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Returns the genuine GDI+ NotImplemented status: non-rectangular GpRegion clip paths are not creatable (no GdipCreateRegion is exported on this surface).
 
 ### kerberos.dll
 
@@ -61,15 +62,15 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mf.dll
 
-- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Media Foundation objects exist, but no service provider is registered: the query answers MF_E_UNSUPPORTED_SERVICE.
+- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state with release-to-forget semantics; service GUIDs the object genuinely does not own answer MF_E_UNSUPPORTED_SERVICE (correct Windows behavior).  Media-source/sink services await those objects.
 
 ### mfplat.dll
 
-- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Media Foundation objects exist, but no service provider is registered: the query answers MF_E_UNSUPPORTED_SERVICE.
+- `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the session object graph: MFGetService resolves the owner (session, topology object, topology node) and returns real service objects — the session itself (MF_MEDIASESSION_SERVICE) and genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by real session rate state; genuinely unowned service GUIDs answer MF_E_UNSUPPORTED_SERVICE.
 
 ### mmdevapi.dll
 
-- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — The runtime has an audio stack, but no device-activation endpoint: the activation answers AUDCLNT_E_DEVICE_INVALIDATED without invoking the callback.
+- `ActivateAudioInterfaceAsync` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real asynchronous activation over the real audio stack: resolves the default render device (or the render DEVINTERFACE GUID) to an enumerated cpal device record and builds a real guest endpoint object for IID_IAudioClient/IAudioClient2/IAudioClient3 with a working vtable; the completion handler is invoked asynchronously through the runtime's queue/drain machinery (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object and no per-method IAudioClient host thunks exist yet.
 
 ### mscoree.dll
 
@@ -85,7 +86,7 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### msftedit.dll
 
-- `MsftEditRegisterClass` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The rich-edit window class is not registered: the operation returns TRUE without performing the registration, so later class creation cannot succeed.
+- `MsftEditRegisterClass` — level `Implemented`, fidelity `Exact`, capability `Partial` — Registers the real RICHEDIT50W class through the user32 class registry and returns its real atom (idempotent re-registration, stable atom); window creation routes through the built-in rich-edit control path.
 
 ### netutils.dll
 
@@ -94,16 +95,16 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### ntdll.dll
 
-- `NtCreateProcess` — level `Stub`, fidelity `CannedFailure`, capability `Partial` — No child processes are creatable through the native surface: the call answers STATUS_INVALID_HANDLE without creating a process.  Process APIs exist through the Win32 layer; the native creation path is a canned failure the guest sees.
+- `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths.  The native contract's primary-thread creation is NtCreateThread's job (no native-thread surface exists) and no host subprocess runner is spawned (the contract carries no command line), so the process object is a record-only guest process with full query/terminate semantics.
 
 ### riched32.dll
 
-- `RichEditANSIWndClass` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — The ANSI rich-edit window class is not registered: the operation returns TRUE without performing the registration.
+- `RichEditANSIWndClass` — level `Implemented`, fidelity `Exact`, capability `Partial` — Registers the real RICHEDIT class through the user32 class registry and returns its real atom; window creation routes through the built-in rich-edit control path.
 
 ### shdocvw.dll
 
-- `SHCreateLinks` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No shell links are created: the operation answers E_FAIL without performing the work.
-- `SHNavigateToFavorite` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No favorites navigation happens: the operation answers E_FAIL without performing the work.
+- `SHCreateLinks` — level `Implemented`, fidelity `Restricted`, capability `Full` — Writes a real persistent Windows .lnk (header + LinkInfo + flag-gated StringData) through the single src/lnk.rs writer shared with the COM IShellLink/IPersistFile save path, parse-back verified; the export's argument layout is a modeled contract and 'ANSI' path bytes are the UTF-8 guest path (no ANSI codepage).
+- `SHNavigateToFavorite` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Adds/updates/removes real per-user favorites (in-runtime store plus persistent [InternetShortcut] .url files under the guest user's Favorites); no URL-navigation engine exists, so navigation itself is the stored record with S_FALSE on missing removes.
 
 ### srvsvc.dll
 
@@ -115,8 +116,8 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### x3daudio1_7.dll
 
-- `X3DAudioCalculate` — level `Stub`, fidelity `CannedFailure`, capability `Absent` — No listener/emitter sound-cone math is performed: the DSP settings are zeroed and S_OK is returned.  The guest sees a silent no-op instead of the spatial calculation the API documents.
-- `X3DAudioInitialize` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Validates the output pointer and hands back an instance token derived from the channel mask, but the X3DAudio engine surface behind the handle is absent (calculate is a canned zeroed response).
+- `X3DAudioCalculate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Performs real X3DAudio spatial math (distance curves, cone inside/outside attenuation, doppler, equal-power pair pan, inner-radius blend, per-channel delay/coefficient matrices) with documented approximations: speaker-circle azimuths, unit speaker radius and the inner-radius blend curve are complete deterministic approximations because no Windows oracle exists; the matrix layout follows the SDK header (dst-major).  Zeroed-response no-op is gone.
+- `X3DAudioInitialize` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Writes a real opaque instance handle (magic + speaker mask + speed of sound) that Calculate validates; the engine surface is the software spatial math above.
 
 ### xactengine3_7.dll
 

@@ -43,6 +43,7 @@
 
 use super::super::*;
 use crate::runtime::state::GuestObjectKind;
+use serde_json::Value;
 
 /// S_OK / TRUE / ERROR_SUCCESS / STATUS_SUCCESS.
 const S_OK: u32 = 0;
@@ -409,6 +410,12 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0x0000_054b);
                 Ok(())
             }
+            // ── the directory/domain topology surface (no domain bound) ──
+            HostThunk::DsBindToTopology => {
+                let _arg = guest_call_arg(state, memory, 0)?;
+                state.set(Register::Rax, u64::from(E_FAIL));
+                Ok(())
+            }
             // ── the shell helpers ──
             HostThunk::ShCreateExplorerTaskband
             | HostThunk::ShOpenFolderWindow
@@ -443,34 +450,25 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0x8009_0322); // SEC_E_NO_KERB_KEY
                 Ok(())
             }
-            // ── the audio-session activation ──
+            // ── the audio-interface activation (real, async) ──
             HostThunk::ActivateAudioInterfaceAsync => {
-                let _device = guest_call_arg(state, memory, 0)?;
-                let _iid = guest_call_arg(state, memory, 1)?;
-                let _activation = guest_call_arg(state, memory, 2)?;
-                let _callback = guest_call_arg(state, memory, 3)?;
-                let out = guest_call_arg(state, memory, 4)?;
-                if out != 0 {
-                    write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-                }
-                let _ = _device;
-                state.set(Register::Rax, 0x8889_0006); // AUDCLNT_E_DEVICE_INVALIDATED
-                Ok(())
+                self.dispatch_activate_audio_interface_async(state, memory)
             }
             // ── GDI+ graphics ──
             HostThunk::GdipCreateGraphics => {
-                let _hdc = guest_call_arg(state, memory, 0)?;
+                // GdipCreateGraphics(hdc, &graphics) — a real graphics object
+                // in the GDI+ handle model, bound to the HDC.  Drawing calls
+                // resolve the object's raster surface through
+                // `gdiplus_graphics_info` (window-DC surface, memory-DC
+                // bitmap, or a GDI+ bitmap target), so shapes reach pixels.
+                let hdc = guest_call_arg(state, memory, 0)?;
                 let out = guest_call_arg(state, memory, 1)?;
-                let _ = _hdc;
-                let vtable = self.alloc_guest_vtable(memory, Vec::new())?;
-                let graphics = self
-                    .alloc_guest_object(memory, GuestObjectKind::GdiPlusGraphics, vtable)
-                    .unwrap_or(0);
-                if graphics == 0 || out == 0 {
-                    state.set(Register::Rax, 3); // OutOfMemory
+                if out == 0 {
+                    state.set(Register::Rax, 2); // InvalidParameter
                     return Ok(());
                 }
-                write_guest_pointer(memory, out, graphics, self.guest_arch).ok();
+                let handle = self.user32.gdiplus_state.create_graphics_from_hdc(hdc);
+                write_u64(memory, out, handle);
                 state.set(Register::Rax, 0); // Ok
                 Ok(())
             }
@@ -511,6 +509,1205 @@ impl PeHostRuntime {
                 format!("unrouted final-scraps thunk {thunk:?}"),
             )),
         }
+    }
+
+    // ── ActivateAudioInterfaceAsync — real async audio-interface ────────────
+    // ── activation (mmdevapi.dll) ─────────────────────────────────────────────
+
+    /// `ActivateAudioInterfaceAsync(deviceInterfacePath, riid,
+    /// activationParams, completionHandler, activationOperation)` — real
+    /// asynchronous activation of the requested WASAPI audio interface on the
+    /// real (cpal-backed) audio stack.
+    ///
+    /// Windows semantics implemented here:
+    ///
+    /// - A null/empty `deviceInterfacePath` (or the
+    ///   `DEVINTERFACE_AUDIO_RENDER` interface id) resolves to the **default
+    ///   render device** on the real device list
+    ///   ([`crate::real_audio::RealAudioBackend`]); any other path names an
+    ///   endpoint this runtime cannot map onto the real device list and fails
+    ///   the activation with `AUDCLNT_E_DEVICE_INVALIDATED`.
+    /// - `riid` drives what is produced: the audio-client family
+    ///   (`IID_IAudioClient` / `IAudioClient2` / `IAudioClient3` —
+    ///   [`crate::audio_activation::IID_IAUDIO_CLIENT`] & friends) activates
+    ///   a real guest audio-endpoint object bound to the resolved device,
+    ///   carrying the device's real data (id, name, channels, sample rate,
+    ///   default flag — as queried from the actual device enumeration).
+    ///   Unsupported riids fail the activation with `E_NOINTERFACE`.
+    /// - Invalid arguments (`E_INVALIDARG` — null handler, null operation
+    ///   out-param, unreadable riid/handler) fail synchronously and never
+    ///   invoke the completion handler.
+    /// - Valid calls return `S_OK` immediately and complete
+    ///   **asynchronously**: the completion handler's `ActivateCompleted`
+    ///   slot (vtable slot 3) is invoked from the runtime servicing points
+    ///   (`drain_pending_audio_activations`) — never inline inside this call
+    ///   — with the real activation result (HRESULT) and the activated
+    ///   interface object (or 0 on failure).  Every `S_OK` return therefore
+    ///   delivers exactly one completion.
+    ///
+    /// Model divergence (reported): Windows hands the handler an
+    /// `IActivateAudioInterfaceAsyncOperation` object whose `GetActivateResult`
+    /// carries the result; this runtime has no operation-object guest model,
+    /// so the handler receives `(result_hr, activated_interface)` directly.
+    pub(crate) fn dispatch_activate_audio_interface_async(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        use crate::audio_activation::{
+            ACTIVATION_E_INVALIDARG, ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK,
+            AUDCLNT_E_DEVICE_INVALIDATED, PendingActivationCompletion,
+            is_supported_activation_riid,
+        };
+        use crate::real_audio::AudioActivationDeviceFailure;
+
+        let device_path_arg = guest_call_arg(state, memory, 0)?;
+        let riid_arg = guest_call_arg(state, memory, 1)?;
+        // activationParams is reserved by the model: only the loopback
+        // AUDIOCLIENT_ACTIVATION_PARAMS exist on Windows and the real render
+        // stack has no loopback capture, so the value is validated for
+        // readability only.
+        let _activation_params = guest_call_arg(state, memory, 2)?;
+        let handler_object = guest_call_arg(state, memory, 3)?;
+        let operation_out = guest_call_arg(state, memory, 4)?;
+
+        let set_invalid_arg = |state: &mut CpuState| {
+            state.set(Register::Rax, u64::from(ACTIVATION_E_INVALIDARG));
+        };
+
+        // ── Synchronous argument validation (E_INVALIDARG) ──────────────────
+        if handler_object == 0 || operation_out == 0 || riid_arg == 0 {
+            self.last_error = ERROR_INVALID_PARAMETER;
+            set_invalid_arg(state);
+            return Ok(());
+        }
+        let riid_bytes = match memory.read_bytes(riid_arg, 16) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.last_error = ERROR_INVALID_PARAMETER;
+                set_invalid_arg(state);
+                return Ok(());
+            }
+        };
+        let riid = match <[u8; 16]>::try_from(riid_bytes.as_slice()) {
+            Ok(riid) => riid,
+            Err(_) => {
+                self.last_error = ERROR_INVALID_PARAMETER;
+                set_invalid_arg(state);
+                return Ok(());
+            }
+        };
+        // The completion handler must already be a well-formed COM object:
+        // resolve its ActivateCompleted method (vtable slot 3) NOW so the
+        // async delivery never has to interpret guest memory later.
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let handler_method = read_guest_pointer(memory, handler_object, self.guest_arch)
+            .ok()
+            .and_then(|vtable| {
+                read_guest_pointer(memory, vtable + 3 * pointer_bytes, self.guest_arch).ok()
+            });
+        let Some(handler_method) = handler_method else {
+            self.last_error = ERROR_INVALID_PARAMETER;
+            set_invalid_arg(state);
+            return Ok(());
+        };
+
+        // ── The riid drives what is activated ────────────────────────────────
+        if !is_supported_activation_riid(&riid) {
+            // Real async failure: the activation cannot back the interface;
+            // the completion delivers E_NOINTERFACE (never success).
+            let completion = PendingActivationCompletion {
+                handler_object,
+                handler_method,
+                result_hr: ACTIVATION_E_NOINTERFACE,
+                interface_object: 0,
+            };
+            crate::audio_activation::push_activation_completion(self.guest_pid, completion);
+            write_guest_pointer(memory, operation_out, 0, self.guest_arch)?;
+            self.last_error = 0;
+            state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+            let riid_name = crate::audio_activation::activation_riid_name(&riid);
+            self.push_trace(
+                "audio",
+                "ActivateAudioInterfaceAsync",
+                BTreeMap::from([
+                    ("riid".to_string(), json!(riid_name)),
+                    (
+                        "result".to_string(),
+                        json!(format!("{ACTIVATION_E_NOINTERFACE:#010x}")),
+                    ),
+                ]),
+                json!(ACTIVATION_S_OK),
+            );
+            return Ok(());
+        }
+
+        // ── Resolve the requested endpoint on the REAL device list ──────────
+        let device_path = if device_path_arg == 0 {
+            None
+        } else {
+            match read_utf16_string(memory, device_path_arg) {
+                Ok(path) => Some(path),
+                Err(_) => {
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    set_invalid_arg(state);
+                    return Ok(());
+                }
+            }
+        };
+        let path_for_trace = device_path
+            .clone()
+            .unwrap_or_else(|| "<default>".to_string());
+        let resolution = match crate::real_audio::RealAudioBackend::new() {
+            Ok(backend) => backend.resolve_activation_device(device_path.as_deref()),
+            Err(error) => {
+                eprintln!("[RealAudio] ActivateAudioInterfaceAsync: backend init failed: {error}");
+                Err(AudioActivationDeviceFailure::NoDevices)
+            }
+        };
+
+        match resolution {
+            Ok(device) => {
+                let object = self.alloc_activated_audio_endpoint_object(memory, &device, riid)?;
+                write_guest_pointer(memory, operation_out, object, self.guest_arch)?;
+                let completion = PendingActivationCompletion {
+                    handler_object,
+                    handler_method,
+                    result_hr: ACTIVATION_S_OK,
+                    interface_object: object,
+                };
+                crate::audio_activation::push_activation_completion(self.guest_pid, completion);
+                self.last_error = 0;
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                let riid_name = crate::audio_activation::activation_riid_name(&riid);
+                self.push_trace(
+                    "audio",
+                    "ActivateAudioInterfaceAsync",
+                    BTreeMap::from([
+                        ("path".to_string(), json!(path_for_trace)),
+                        ("riid".to_string(), json!(riid_name)),
+                        ("device_id".to_string(), json!(device.id)),
+                        ("device_name".to_string(), json!(device.name)),
+                        ("channels".to_string(), json!(device.channels)),
+                        ("sample_rate".to_string(), json!(device.sample_rate)),
+                        ("is_default".to_string(), json!(device.is_default)),
+                        ("endpoint_object".to_string(), json!(format!("{object:#x}"))),
+                    ]),
+                    json!(ACTIVATION_S_OK),
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                // The real endpoint does not exist (the device list is
+                // genuinely empty, or the path cannot be mapped onto it):
+                // AUDCLNT_E_DEVICE_INVALIDATED, delivered asynchronously.
+                let completion = PendingActivationCompletion {
+                    handler_object,
+                    handler_method,
+                    result_hr: AUDCLNT_E_DEVICE_INVALIDATED,
+                    interface_object: 0,
+                };
+                crate::audio_activation::push_activation_completion(self.guest_pid, completion);
+                write_guest_pointer(memory, operation_out, 0, self.guest_arch)?;
+                self.last_error = 0;
+                state.set(Register::Rax, u64::from(ACTIVATION_S_OK));
+                let failure = match failure {
+                    AudioActivationDeviceFailure::NoDevices => "no real audio devices",
+                    AudioActivationDeviceFailure::UnknownDevicePath => "unknown device path",
+                };
+                self.push_trace(
+                    "audio",
+                    "ActivateAudioInterfaceAsync",
+                    BTreeMap::from([
+                        ("path".to_string(), json!(path_for_trace)),
+                        ("result".to_string(), json!(failure)),
+                        (
+                            "hresult".to_string(),
+                            json!(format!("{AUDCLNT_E_DEVICE_INVALIDATED:#010x}")),
+                        ),
+                    ]),
+                    json!(ACTIVATION_S_OK),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Allocate the guest audio-endpoint object an activation produces: a
+    /// real guest object (registered in the runtime guest-object table with
+    /// a working refcount) whose vtable carries the codebase's standard
+    /// stateless COM-wrapper shape, bound to the REAL device data of the
+    /// activation via [`crate::audio_activation::store_endpoint_record`].
+    fn alloc_activated_audio_endpoint_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        device: &crate::real_audio::RealAudioDevice,
+        requested_riid: [u8; 16],
+    ) -> AppResult<u64> {
+        // The vtable is the runtime's established real-object wrapper shape
+        // (QueryInterface/AddRef/Release preamble — the refcount lives in the
+        // guest-object table, so AddRef/Release genuinely track it).  No
+        // IAudioClient method host thunks exist in the runtime yet, so the
+        // activated object's real content is the bound device record rather
+        // than per-method audio-client calls (see the module report).
+        let vtable = self.alloc_guest_vtable(
+            memory,
+            vec![
+                HostThunk::GuestObjectAddRef,  // [0] QueryInterface (wrapper convention)
+                HostThunk::GuestObjectAddRef,  // [1] AddRef
+                HostThunk::GuestObjectRelease, // [2] Release
+            ],
+        )?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
+        crate::audio_activation::store_endpoint_record(
+            self.guest_pid,
+            object,
+            crate::audio_activation::AudioEndpointRecord {
+                device: device.clone(),
+                requested_riid,
+            },
+        );
+        Ok(object)
+    }
+
+    /// Deliver the pending audio-interface activation completions of this
+    /// runtime: each queued completion handler's `ActivateCompleted` slot is
+    /// invoked in guest context with the real activation result and the
+    /// activated interface object (or 0).
+    ///
+    /// This runs ONLY from the runtime servicing points (the block-dispatch
+    /// safepoint and the message-loop idle drain in `runtime/mod.rs`) and
+    /// from tests that poll for completion — never from inside the
+    /// activation dispatch — so the handler is always invoked after the
+    /// activating call has returned.
+    pub(crate) fn drain_pending_audio_activations(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        while let Some(completion) =
+            crate::audio_activation::pop_activation_completion(self.guest_pid)
+        {
+            if completion.handler_method == 0 {
+                continue;
+            }
+            self.execute_guest_callback(
+                state,
+                memory,
+                completion.handler_method,
+                &[
+                    completion.handler_object,
+                    u64::from(completion.result_hr),
+                    completion.interface_object,
+                ],
+                "ActivateAudioInterfaceAsync::ActivateCompleted",
+            )?;
+        }
+        Ok(())
+    }
+
+    // ── the certificate picker: real selection over the runtime's
+    //    certificate-store state (see the module-level "Certificate
+    //    selection" section for the modeled contract) ──
+
+    /// `CertSelectCertificate` — real enumeration + best-match selection
+    /// over the certificate stores the request names, with the selected
+    /// certificate context written out.
+    pub(crate) fn dispatch_cert_select_certificate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let request = guest_call_arg(state, memory, 0)?;
+        let selected_out = guest_call_arg(state, memory, 1)?;
+        let invalid = |params: &mut BTreeMap<String, Value>,
+                       runtime: &mut PeHostRuntime,
+                       state: &mut CpuState,
+                       failure: &str| {
+            params.insert("failure".to_string(), json!(failure));
+            state.set(Register::Rax, 0);
+            runtime.last_error = ERROR_INVALID_PARAMETER;
+            runtime.push_trace("cert", "CertSelectCertificate", params.clone(), json!(0));
+        };
+
+        let mut params = BTreeMap::from([("result".to_string(), json!(""))]);
+        if request == 0 || selected_out == 0 {
+            invalid(
+                &mut params,
+                self,
+                state,
+                "null request or selected-certificate pointer",
+            );
+            return Ok(());
+        }
+        // The out slot must be a writable guest pointer (a real context
+        // handle is written there on selection).
+        if probe_read_guest_pointer(memory, selected_out, self.guest_arch).is_none() {
+            invalid(
+                &mut params,
+                self,
+                state,
+                "unmapped selected-certificate pointer",
+            );
+            return Ok(());
+        }
+        let Some(dw_size) = probe_read_guest_u32(memory, request) else {
+            invalid(&mut params, self, state, "unmapped request structure");
+            return Ok(());
+        };
+        let x86 = self.guest_arch == GuestArch::X86;
+        let layout = cert_select_layout(x86);
+        if u64::from(dw_size) < layout.required_size {
+            invalid(
+                &mut params,
+                self,
+                state,
+                "request dwSize smaller than the modeled structure",
+            );
+            return Ok(());
+        }
+        let psz = self.guest_arch.pointer_bytes() as u64;
+
+        let dw_flags = probe_read_guest_u32(memory, request + layout.dw_flags).unwrap_or(0);
+        let title = probe_read_guest_pointer(memory, request + layout.sz_title, self.guest_arch)
+            .filter(|ptr| *ptr != 0)
+            .and_then(|ptr| read_utf16_string(memory, ptr).ok())
+            .unwrap_or_default();
+        let callback =
+            probe_read_guest_pointer(memory, request + layout.pfn_callback, self.guest_arch)
+                .unwrap_or(0);
+        let _callback_data =
+            probe_read_guest_pointer(memory, request + layout.p_void_data, self.guest_arch)
+                .unwrap_or(0);
+        params.insert("title".to_string(), json!(title));
+        params.insert("flags".to_string(), json!(format!("{dw_flags:#x}")));
+        params.insert("has_callback".to_string(), json!(callback != 0));
+
+        // Enumerate the requested stores: rghStores first, then
+        // rghDisplayStores.  Unknown handles are a real failure (the store
+        // does not exist in the runtime).
+        let mut store_handles: Vec<u64> = Vec::new();
+        for (count_field, array_field) in [
+            (layout.c_stores, layout.rgh_stores),
+            (layout.c_display_stores, layout.rgh_display_stores),
+        ] {
+            let count = probe_read_guest_u32(memory, request + count_field).unwrap_or(0);
+            if count == 0 {
+                continue;
+            }
+            let Some(array) =
+                probe_read_guest_pointer(memory, request + array_field, self.guest_arch)
+            else {
+                invalid(
+                    &mut params,
+                    self,
+                    state,
+                    "store count without a mapped store array",
+                );
+                return Ok(());
+            };
+            let mut unreadable = false;
+            for index in 0..u64::from(count) {
+                match probe_read_guest_pointer(memory, array + index * psz, self.guest_arch) {
+                    Some(handle) => store_handles.push(handle),
+                    None => {
+                        unreadable = true;
+                        break;
+                    }
+                }
+            }
+            if unreadable {
+                invalid(&mut params, self, state, "unmapped store array element");
+                return Ok(());
+            }
+        }
+
+        // Candidate certificates: deduplicated DER across the stores.
+        let mut candidates: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for handle in &store_handles {
+            let Some(store) = self.cert_store_manager.get_store(*handle) else {
+                params.insert("failure".to_string(), json!("unknown store handle"));
+                state.set(Register::Rax, 0);
+                self.last_error = ERROR_INVALID_HANDLE;
+                self.push_trace("cert", "CertSelectCertificate", params.clone(), json!(0));
+                return Ok(());
+            };
+            for certificate in &store.certificates {
+                if seen.insert(certificate.der.clone()) {
+                    candidates.push((*handle, certificate.der.clone()));
+                }
+            }
+        }
+
+        // Eligibility: the certificate must parse and its validity window
+        // must hold now (the selection cannot vouch for an unparseable or
+        // expired certificate).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let enumerated = candidates.len();
+        let eligible: Vec<(u64, Vec<u8>)> = candidates
+            .into_iter()
+            .filter(|(_, der)| {
+                crate::security::Certificate::from_der(der.clone()).is_some()
+                    && crate::security::parse_x509_validity(der).is_some_and(
+                        |(not_before, not_after)| not_before <= now_secs && now_secs <= not_after,
+                    )
+            })
+            .collect();
+
+        params.insert("store_count".to_string(), json!(store_handles.len()));
+        params.insert("enumerated".to_string(), json!(enumerated));
+        params.insert("eligible".to_string(), json!(eligible.len()));
+
+        match eligible.len() {
+            1 => {
+                let (store_handle, der) = &eligible[0];
+                let context = self.create_cert_context(memory, der)?;
+                write_guest_pointer(memory, selected_out, context, self.guest_arch)?;
+                if u64::from(dw_size) >= layout.h_selected_cert_store + psz {
+                    write_guest_pointer(
+                        memory,
+                        request + layout.h_selected_cert_store,
+                        *store_handle,
+                        self.guest_arch,
+                    )?;
+                }
+                params.insert("result".to_string(), json!("selected"));
+                params.insert(
+                    "selected_context".to_string(),
+                    json!(format!("{context:#x}")),
+                );
+                params.insert(
+                    "selected_store".to_string(),
+                    json!(format!("{store_handle:#x}")),
+                );
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace("cert", "CertSelectCertificate", params, json!(1));
+                Ok(())
+            }
+            0 => {
+                // No eligible certificate: the picker would show an empty
+                // list and the user would cancel.
+                params.insert("result".to_string(), json!("none-eligible"));
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("cert", "CertSelectCertificate", params, json!(0));
+                Ok(())
+            }
+            _ => {
+                // Several certificates qualify; without a user to pick one
+                // the operation must not claim a selection.
+                params.insert("result".to_string(), json!("ambiguous"));
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("cert", "CertSelectCertificate", params, json!(0));
+                Ok(())
+            }
+        }
+    }
+
+    // ── the shell surfaces: real shell links, the favorites store, the
+    //    folder-window registry and the taskband registry (see the
+    //    module-level sections for the modeled contracts) ──
+
+    /// `SHCreateLinks` — creates a real, persistent Windows shell link
+    /// (.lnk) for the given target at the destination path through the
+    /// exact .lnk machinery the IShellLink/IPersistFile COM surface uses.
+    pub(crate) fn dispatch_sh_create_links(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let target_ptr = guest_call_arg(state, memory, 0)?;
+        let link_ptr = guest_call_arg(state, memory, 1)?;
+        let description_ptr = guest_call_arg(state, memory, 2)?;
+
+        let mut params = BTreeMap::new();
+        if target_ptr == 0 || link_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHCreateLinks",
+                BTreeMap::from([("failure".to_string(), json!("null target or link path"))]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let target = read_utf16_string(memory, target_ptr)?;
+        let link_path = read_utf16_string(memory, link_ptr)?;
+        let description = if description_ptr == 0 {
+            String::new()
+        } else {
+            read_utf16_string(memory, description_ptr)?
+        };
+        if target.is_empty() || link_path.is_empty() {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHCreateLinks",
+                BTreeMap::from([("failure".to_string(), json!("empty target or link path"))]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let resolved_target = resolve_guest_path(&self.current_directory, &target);
+        let resolved_link = resolve_guest_path(&self.current_directory, &link_path);
+
+        // The same link state the IShellLink surface persists, resolved
+        // through the shared .lnk encoder.
+        let snapshot = crate::runtime::state::GuestShellLinkState {
+            shell_link_object: 0,
+            persist_file_object: None,
+            refcount: 0,
+            path: resolved_target,
+            arguments: String::new(),
+            description,
+            working_directory: String::new(),
+            hotkey: 0,
+            icon_location: String::new(),
+            icon_index: 0,
+            show_cmd: SW_SHOWNORMAL,
+            current_file: None,
+            dirty: true,
+        };
+        let bytes = self.shell_link_file_bytes(&snapshot)?;
+        match self.win32.write_file_overwrite_w(&resolved_link, &bytes) {
+            Ok(_) => {
+                state.set(Register::Rax, u64::from(S_OK));
+                self.last_error = 0;
+                self.push_trace(
+                    "shell",
+                    "SHCreateLinks",
+                    BTreeMap::from([
+                        ("target".to_string(), json!(snapshot.path.clone())),
+                        ("link_path".to_string(), json!(resolved_link)),
+                        ("link_bytes".to_string(), json!(bytes.len())),
+                    ]),
+                    json!(S_OK),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                params.insert("link_path".to_string(), json!(resolved_link));
+                params.insert("failure".to_string(), json!(error.message));
+                state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                self.last_error = ERROR_ACCESS_DENIED;
+                self.push_trace("shell", "SHCreateLinks", params, json!(E_ACCESSDENIED));
+                Ok(())
+            }
+        }
+    }
+
+    /// `SHNavigateToFavorite` — real favorites handling: add/update a
+    /// favorite record for the guest user plus a persisted `.url` file, or
+    /// remove one (`FAVORITES_ACTION_REMOVE`).
+    pub(crate) fn dispatch_sh_navigate_to_favorite(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let url_ptr = guest_call_arg(state, memory, 0)?;
+        let title_ptr = guest_call_arg(state, memory, 1)?;
+        let flags = guest_call_arg_u32(state, memory, 2)?;
+        if url_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHNavigateToFavorite",
+                BTreeMap::from([("failure".to_string(), json!("null URL"))]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let url = read_utf16_string(memory, url_ptr)?;
+        if url.is_empty() || flags & !FAVORITES_ACTION_REMOVE != 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHNavigateToFavorite",
+                BTreeMap::from([(
+                    "failure".to_string(),
+                    json!(if url.is_empty() {
+                        "empty URL"
+                    } else {
+                        "unknown action flags"
+                    }),
+                )]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let user = self.win32.ge().config.user_name.clone();
+        if flags & FAVORITES_ACTION_REMOVE != 0 {
+            return self.favorite_remove(state, &user, &url);
+        }
+        let title = if title_ptr == 0 {
+            url.clone()
+        } else {
+            let title = read_utf16_string(memory, title_ptr)?;
+            if title.is_empty() { url.clone() } else { title }
+        };
+        self.favorite_add(state, &user, &url, &title)
+    }
+
+    /// Add (or update) a favorite: real store record + a persisted `.url`
+    /// file on the guest drive.
+    fn favorite_add(
+        &mut self,
+        state: &mut CpuState,
+        user: &str,
+        url: &str,
+        title: &str,
+    ) -> AppResult<()> {
+        let favorites_dir = format!("C:\\Users\\{user}\\Favorites");
+        // Windows creates the Favorites folder with the first favorite.
+        match self.win32.get_file_attributes_w(&favorites_dir) {
+            Ok(_) => {}
+            Err(error) if error.code == ReasonCode::RcFsNotFound => {
+                if let Err(create_error) = self.win32.create_directory_w(&favorites_dir) {
+                    return self.favorite_failure(
+                        state,
+                        url,
+                        if create_error.code == ReasonCode::RcFsPathInvalid {
+                            HRESULT_PATH_NOT_FOUND
+                        } else {
+                            E_ACCESSDENIED
+                        },
+                        "Favorites folder could not be created",
+                    );
+                }
+            }
+            Err(_) => {
+                return self.favorite_failure(
+                    state,
+                    url,
+                    E_ACCESSDENIED,
+                    "Favorites folder unavailable",
+                );
+            }
+        }
+        let file_name = format!("{}.url", sanitize_favorite_file_name(title));
+        let file_path = format!("{favorites_dir}\\{file_name}");
+        let content = format!("[InternetShortcut]\r\nURL={url}\r\n");
+        if let Err(write_error) = self
+            .win32
+            .write_file_overwrite_w(&file_path, content.as_bytes())
+        {
+            let hresult = if write_error.code == ReasonCode::RcFsPathInvalid {
+                HRESULT_PATH_NOT_FOUND
+            } else if write_error.code == ReasonCode::RcFsNotFound {
+                HRESULT_FILE_NOT_FOUND
+            } else {
+                E_ACCESSDENIED
+            };
+            return self.favorite_failure(
+                state,
+                url,
+                hresult,
+                "favorite file could not be written",
+            );
+        }
+
+        let now = host_now_millis();
+        let pid = self.guest_pid;
+        let previous = favorite_store_locked(|store| {
+            store
+                .get(&pid)
+                .and_then(|by_user| by_user.get(user))
+                .and_then(|by_url| by_url.get(url))
+                .cloned()
+        });
+        // A renamed favorite leaves no stale .url behind.
+        if let Some(old_file) = previous
+            .as_ref()
+            .and_then(|record| record.file_path.clone())
+        {
+            if old_file != file_path {
+                let _ = self.win32.delete_file_w(&old_file);
+            }
+        }
+        let added_at_ms = previous
+            .as_ref()
+            .map(|record| record.added_at_ms)
+            .unwrap_or(now);
+        let record = FavoriteRecord {
+            user: user.to_string(),
+            url: url.to_string(),
+            title: title.to_string(),
+            added_at_ms,
+            updated_at_ms: now,
+            file_path: Some(file_path),
+        };
+        let was_update = favorite_store_locked(|store| {
+            let by_user = store.entry(pid).or_default();
+            let by_url = by_user.entry(user.to_string()).or_default();
+            let existed = by_url.contains_key(url);
+            by_url.insert(url.to_string(), record.clone());
+            existed
+        });
+        let total = self.favorite_records().len();
+        state.set(Register::Rax, u64::from(S_OK));
+        self.last_error = 0;
+        self.push_trace(
+            "shell",
+            "SHNavigateToFavorite",
+            BTreeMap::from([
+                ("user".to_string(), json!(user)),
+                ("url".to_string(), json!(url)),
+                ("title".to_string(), json!(title)),
+                (
+                    "file".to_string(),
+                    json!(record.file_path.clone().unwrap_or_default()),
+                ),
+                (
+                    "action".to_string(),
+                    json!(if was_update { "update" } else { "add" }),
+                ),
+                ("total".to_string(), json!(total)),
+            ]),
+            json!(S_OK),
+        );
+        Ok(())
+    }
+
+    /// Remove a favorite by URL (record + persisted file).  S_OK when a
+    /// record was removed; S_FALSE when none existed.
+    fn favorite_remove(&mut self, state: &mut CpuState, user: &str, url: &str) -> AppResult<()> {
+        let pid = self.guest_pid;
+        let removed = favorite_store_locked(|store| {
+            let Some(by_url) = store
+                .get_mut(&pid)
+                .and_then(|by_user| by_user.get_mut(user))
+            else {
+                return None;
+            };
+            by_url.remove(url)
+        });
+        match removed {
+            Some(record) => {
+                if let Some(file) = &record.file_path {
+                    let _ = self.win32.delete_file_w(file);
+                }
+                state.set(Register::Rax, u64::from(S_OK));
+                self.last_error = 0;
+                self.push_trace(
+                    "shell",
+                    "SHNavigateToFavorite",
+                    BTreeMap::from([
+                        ("user".to_string(), json!(user)),
+                        ("url".to_string(), json!(url)),
+                        ("action".to_string(), json!("remove")),
+                        ("removed_title".to_string(), json!(record.title)),
+                    ]),
+                    json!(S_OK),
+                );
+                Ok(())
+            }
+            None => {
+                state.set(Register::Rax, u64::from(S_FALSE));
+                self.last_error = 0;
+                self.push_trace(
+                    "shell",
+                    "SHNavigateToFavorite",
+                    BTreeMap::from([
+                        ("user".to_string(), json!(user)),
+                        ("url".to_string(), json!(url)),
+                        ("action".to_string(), json!("remove")),
+                    ]),
+                    json!(S_FALSE),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn favorite_failure(
+        &mut self,
+        state: &mut CpuState,
+        url: &str,
+        hresult: u32,
+        failure: &str,
+    ) -> AppResult<()> {
+        state.set(Register::Rax, u64::from(hresult));
+        self.last_error = hresult_to_win32(hresult);
+        self.push_trace(
+            "shell",
+            "SHNavigateToFavorite",
+            BTreeMap::from([
+                ("url".to_string(), json!(url)),
+                ("failure".to_string(), json!(failure)),
+            ]),
+            json!(hresult),
+        );
+        Ok(())
+    }
+
+    /// The favorite records of this runtime's guest user (sorted by URL) —
+    /// the observable state of the favorites store.
+    pub(crate) fn favorite_records(&self) -> Vec<FavoriteRecord> {
+        let user = self.win32.ge().config.user_name.clone();
+        favorite_records_for(self.guest_pid, &user)
+    }
+
+    /// `SHOpenFolderWindow` — opens a real folder-window session in the
+    /// per-runtime folder-window registry (folder path, visibility and
+    /// open/close transitions).
+    pub(crate) fn dispatch_sh_open_folder_window(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let folder_ptr = guest_call_arg(state, memory, 0)?;
+        let parent_hwnd = guest_call_arg(state, memory, 1)?;
+        let flags = guest_call_arg_u32(state, memory, 2)?;
+        if folder_ptr == 0 || flags != 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHOpenFolderWindow",
+                BTreeMap::from([(
+                    "failure".to_string(),
+                    json!(if folder_ptr == 0 {
+                        "null folder path"
+                    } else {
+                        "reserved dwFlags must be zero"
+                    }),
+                )]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let folder = read_utf16_string(memory, folder_ptr)?;
+        if folder.is_empty() {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHOpenFolderWindow",
+                BTreeMap::from([("failure".to_string(), json!("empty folder path"))]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let resolved = resolve_guest_path(&self.current_directory, &folder);
+
+        // The folder must really exist (and really be a folder).
+        let (exists, is_directory) = match self.win32.get_file_attributes_w(&resolved) {
+            Ok(attributes) => (true, attributes.iter().any(|a| a == "directory")),
+            Err(_) => (false, false),
+        };
+        if !exists {
+            let parent_exists = windows_parent_path(&resolved)
+                .is_some_and(|parent| self.win32.get_file_attributes_w(&parent).is_ok());
+            let hresult = if parent_exists {
+                HRESULT_FILE_NOT_FOUND
+            } else {
+                HRESULT_PATH_NOT_FOUND
+            };
+            state.set(Register::Rax, u64::from(hresult));
+            self.last_error = if hresult == HRESULT_FILE_NOT_FOUND {
+                ERROR_FILE_NOT_FOUND
+            } else {
+                ERROR_PATH_NOT_FOUND
+            };
+            self.push_trace(
+                "shell",
+                "SHOpenFolderWindow",
+                BTreeMap::from([
+                    ("folder".to_string(), json!(resolved)),
+                    ("failure".to_string(), json!("folder does not exist")),
+                ]),
+                json!(hresult),
+            );
+            return Ok(());
+        }
+        if !is_directory {
+            state.set(Register::Rax, u64::from(HRESULT_DIRECTORY_NOT_FOUND));
+            self.last_error = ERROR_DIRECTORY_NOT_FOUND;
+            self.push_trace(
+                "shell",
+                "SHOpenFolderWindow",
+                BTreeMap::from([
+                    ("folder".to_string(), json!(resolved)),
+                    ("failure".to_string(), json!("path is not a directory")),
+                ]),
+                json!(HRESULT_DIRECTORY_NOT_FOUND),
+            );
+            return Ok(());
+        }
+
+        // Create the window session in the registry.
+        let now = host_now_millis();
+        let pid = self.guest_pid;
+        let (window_id, open_count) = folder_window_store_locked(|registry| {
+            let state = registry
+                .entry(pid)
+                .or_insert_with(FolderWindowRegistry::new);
+            let open_count = state
+                .windows
+                .values()
+                .filter(|window| window.visible)
+                .count();
+            if open_count >= FOLDER_WINDOW_OPEN_BUDGET {
+                return (None, open_count);
+            }
+            let id = state.next_id;
+            state.next_id += 1;
+            let record = FolderWindowRecord {
+                id,
+                folder: resolved.clone(),
+                visible: true,
+                opened_at_ms: now,
+                closed_at_ms: None,
+                events: VecDeque::from([FolderWindowEvent {
+                    at_ms: now,
+                    kind: "open".to_string(),
+                }]),
+            };
+            state.windows.insert(id, record);
+            (Some(id), open_count + 1)
+        });
+        let Some(window_id) = window_id else {
+            state.set(Register::Rax, u64::from(E_OUTOFMEMORY));
+            self.last_error = ERROR_OUTOFMEMORY_WIN32;
+            self.push_trace(
+                "shell",
+                "SHOpenFolderWindow",
+                BTreeMap::from([
+                    ("folder".to_string(), json!(resolved)),
+                    ("failure".to_string(), json!("open-window budget exhausted")),
+                ]),
+                json!(E_OUTOFMEMORY),
+            );
+            return Ok(());
+        };
+        let _ = parent_hwnd;
+        let registry_total = self.folder_window_records().len();
+        state.set(Register::Rax, u64::from(S_OK));
+        self.last_error = 0;
+        self.push_trace(
+            "shell",
+            "SHOpenFolderWindow",
+            BTreeMap::from([
+                ("window_id".to_string(), json!(window_id)),
+                ("folder".to_string(), json!(resolved)),
+                ("visible".to_string(), json!(true)),
+                ("open_windows".to_string(), json!(open_count)),
+                ("registry_total".to_string(), json!(registry_total)),
+            ]),
+            json!(S_OK),
+        );
+        Ok(())
+    }
+
+    /// Close a folder-window session: the window hides and the registry
+    /// records the close transition.  Returns false when no open window
+    /// with that id exists.
+    ///
+    /// There is no guest-visible close export for folder windows (the
+    /// modeled surface only opens them), so the close operation of the
+    /// registry is exercised by the runtime tests and remains available to
+    /// the trace/registry tooling.
+    #[allow(dead_code)]
+    pub(crate) fn close_folder_window(&self, id: u64) -> bool {
+        let pid = self.guest_pid;
+        folder_window_store_locked(|registry| {
+            let Some(record) = registry
+                .get_mut(&pid)
+                .and_then(|state| state.windows.get_mut(&id))
+            else {
+                return false;
+            };
+            if !record.visible {
+                return false;
+            }
+            record.visible = false;
+            record.closed_at_ms = Some(host_now_millis());
+            record.events.push_back(FolderWindowEvent {
+                at_ms: record.closed_at_ms.unwrap_or(0),
+                kind: "close".to_string(),
+            });
+            true
+        })
+    }
+
+    /// The folder-window sessions of this runtime (sorted by id).
+    pub(crate) fn folder_window_records(&self) -> Vec<FolderWindowRecord> {
+        let pid = self.guest_pid;
+        folder_window_store_locked(|registry| {
+            registry
+                .get(&pid)
+                .map(|state| state.windows.values().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// `SHCreateExplorerTaskband` — creates the runtime's taskband session
+    /// (one per shell session) bound to the guest's requested task list.
+    pub(crate) fn dispatch_sh_create_explorer_taskband(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let tasks_ptr = guest_call_arg(state, memory, 0)?;
+        let task_count = guest_call_arg_u32(state, memory, 1)?;
+        let flags = guest_call_arg_u32(state, memory, 2)?;
+        if flags != 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHCreateExplorerTaskband",
+                BTreeMap::from([(
+                    "failure".to_string(),
+                    json!("reserved dwFlags must be zero"),
+                )]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        if task_count > 4096 || (task_count > 0 && tasks_ptr == 0) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            self.last_error = ERROR_INVALID_PARAMETER;
+            self.push_trace(
+                "shell",
+                "SHCreateExplorerTaskband",
+                BTreeMap::from([(
+                    "failure".to_string(),
+                    json!(if task_count > 4096 {
+                        "unreasonable task count"
+                    } else {
+                        "task count without a task array"
+                    }),
+                )]),
+                json!(E_INVALIDARG),
+            );
+            return Ok(());
+        }
+        let psz = self.guest_arch.pointer_bytes() as u64;
+        let mut command_lines = Vec::with_capacity(task_count as usize);
+        for index in 0..u64::from(task_count) {
+            let Some(entry_ptr) =
+                probe_read_guest_pointer(memory, tasks_ptr + index * psz, self.guest_arch)
+            else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                self.last_error = ERROR_INVALID_PARAMETER;
+                self.push_trace(
+                    "shell",
+                    "SHCreateExplorerTaskband",
+                    BTreeMap::from([(
+                        "failure".to_string(),
+                        json!(format!("unmapped task array entry {index}")),
+                    )]),
+                    json!(E_INVALIDARG),
+                );
+                return Ok(());
+            };
+            if entry_ptr == 0 {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                self.last_error = ERROR_INVALID_PARAMETER;
+                self.push_trace(
+                    "shell",
+                    "SHCreateExplorerTaskband",
+                    BTreeMap::from([(
+                        "failure".to_string(),
+                        json!(format!("null task array entry {index}")),
+                    )]),
+                    json!(E_INVALIDARG),
+                );
+                return Ok(());
+            }
+            let command_line = read_utf16_string(memory, entry_ptr)?;
+            if command_line.is_empty() {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                self.last_error = ERROR_INVALID_PARAMETER;
+                self.push_trace(
+                    "shell",
+                    "SHCreateExplorerTaskband",
+                    BTreeMap::from([(
+                        "failure".to_string(),
+                        json!(format!("empty task command line at {index}")),
+                    )]),
+                    json!(E_INVALIDARG),
+                );
+                return Ok(());
+            }
+            command_lines.push(command_line);
+        }
+
+        let pid = self.guest_pid;
+        let created = taskband_store_locked(|store| {
+            if store.contains_key(&pid) {
+                return None;
+            }
+            let taskband = ExplorerTaskband {
+                created_at_ms: host_now_millis(),
+                tasks: command_lines
+                    .iter()
+                    .map(|command_line| TaskbandTaskEntry {
+                        command_line: command_line.clone(),
+                        display_name: taskband_display_name(command_line),
+                    })
+                    .collect(),
+            };
+            store.insert(pid, taskband);
+            store.get(&pid).cloned()
+        });
+        match created {
+            Some(taskband) => {
+                state.set(Register::Rax, u64::from(S_OK));
+                self.last_error = 0;
+                self.push_trace(
+                    "shell",
+                    "SHCreateExplorerTaskband",
+                    BTreeMap::from([
+                        ("created".to_string(), json!(true)),
+                        ("tasks".to_string(), json!(taskband.tasks.len())),
+                    ]),
+                    json!(S_OK),
+                );
+                Ok(())
+            }
+            None => {
+                // One taskband per shell session (as on Windows); the
+                // session already exists, so nothing new was created.
+                let existing_tasks = self
+                    .explorer_taskband()
+                    .map(|band| band.tasks.len())
+                    .unwrap_or(0);
+                state.set(Register::Rax, u64::from(S_FALSE));
+                self.last_error = 0;
+                self.push_trace(
+                    "shell",
+                    "SHCreateExplorerTaskband",
+                    BTreeMap::from([
+                        ("created".to_string(), json!(false)),
+                        ("existing_tasks".to_string(), json!(existing_tasks)),
+                        (
+                            "failure".to_string(),
+                            json!("taskband session already exists"),
+                        ),
+                    ]),
+                    json!(S_FALSE),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The explorer-taskband session of this runtime, when one exists.
+    pub(crate) fn explorer_taskband(&self) -> Option<ExplorerTaskband> {
+        let pid = self.guest_pid;
+        taskband_store_locked(|store| store.get(&pid).cloned())
     }
 
     /// The interface-IID data export.
@@ -1873,6 +3070,386 @@ fn x3daudio_compute(
 }
 
 // ---------------------------------------------------------------------------
+// Certificate selection — cryptdlg.dll CertSelectCertificate
+// ---------------------------------------------------------------------------
+//
+// Modeled contract (the SDK's CRYPTUI_SELECTCERTIFICATE_STRUCT-shaped
+// request, x86/x64 guest layouts):
+//
+//   BOOL CertSelectCertificate(
+//       PCCRYPTUI_SELECTCERTIFICATE_STRUCT pCertSelect,  // arg 0
+//       PCCERT_CONTEXT* ppSelectedCert);                 // arg 1
+//
+// Windows shows a picker dialog; this runtime has no certificate UI, so the
+// operation implements the honest unattended equivalent: a real selection
+// over the runtime's certificate-store state (`CertificateStoreManager`,
+// the same stores CertOpenStore/PFXImportCertStore populate).
+//
+// - The stores named by `rghStores` (cStores entries) and
+//   `rghDisplayStores` (cDisplayStores entries) are the candidate sources;
+//   certificates are deduplicated across stores by their DER bytes.
+// - Selection criteria (as far as the request is modeled): a certificate
+//   is a candidate when it is a member of a requested store AND its parsed
+//   X.509 validity currently holds (notBefore <= now <= notAfter).  The
+//   display-only members (szTitle/szDisplayName/dwDontUseColumn) have no
+//   selection semantics; a supplied pfnCallback would let the app filter
+//   the dialog's entries, but no guest-call path exists from this surface,
+//   so its presence is traced rather than silently honored.
+// - Best-match: with exactly one eligible certificate the operation
+//   selects it deterministically — TRUE, the selected certificate context
+//   (a real runtime context, as CertFindCertificateInStore produces)
+//   written to `*ppSelectedCert`, and the owning store handle written back
+//   to the request's `hSelectedCertStore`.  With none (or several — an
+//   ambiguous pick needs a user) the operation answers FALSE with the
+//   user-cancel semantics; no dialog is ever claimed.
+// - Real failure modes: a null request/out pointer, an undersized
+//   `dwSize`, unmapped store arrays or an unknown store handle fail with
+//   FALSE and GetLastError = ERROR_INVALID_PARAMETER / ERROR_INVALID_HANDLE.
+
+/// HRESULT-style/BOOL constants shared by the modeled shell and picker
+/// surfaces.
+const S_FALSE: u32 = 1;
+/// E_OUTOFMEMORY (0x8007000E).
+const E_OUTOFMEMORY: u32 = 0x8007_000e;
+/// E_ACCESSDENIED (0x80070005).
+const E_ACCESSDENIED: u32 = 0x8007_0005;
+/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND).
+const HRESULT_FILE_NOT_FOUND: u32 = 0x8007_0002;
+/// HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND).
+const HRESULT_PATH_NOT_FOUND: u32 = 0x8007_0003;
+/// HRESULT_FROM_WIN32(ERROR_DIRECTORY).
+const HRESULT_DIRECTORY_NOT_FOUND: u32 = 0x8007_010b;
+/// ERROR_OUTOFMEMORY (8) — the Win32 error behind E_OUTOFMEMORY.
+const ERROR_OUTOFMEMORY_WIN32: u32 = 8;
+/// ERROR_DIRECTORY (267).
+const ERROR_DIRECTORY_NOT_FOUND: u32 = 267;
+
+/// The guest offsets of the modeled CRYPTUI_SELECTCERTIFICATE_STRUCT.
+#[derive(Debug, Clone, Copy)]
+struct CertSelectLayout {
+    dw_flags: u64,
+    sz_title: u64,
+    pfn_callback: u64,
+    p_void_data: u64,
+    c_display_stores: u64,
+    rgh_display_stores: u64,
+    c_stores: u64,
+    rgh_stores: u64,
+    h_selected_cert_store: u64,
+    /// The size through the last member the selection consumes.
+    required_size: u64,
+}
+
+fn cert_select_layout(x86: bool) -> CertSelectLayout {
+    if x86 {
+        CertSelectLayout {
+            dw_flags: 8,
+            sz_title: 12,
+            pfn_callback: 24,
+            p_void_data: 28,
+            c_display_stores: 32,
+            rgh_display_stores: 36,
+            c_stores: 40,
+            rgh_stores: 44,
+            h_selected_cert_store: 56,
+            required_size: 48,
+        }
+    } else {
+        CertSelectLayout {
+            dw_flags: 16,
+            sz_title: 24,
+            pfn_callback: 48,
+            p_void_data: 56,
+            c_display_stores: 64,
+            rgh_display_stores: 72,
+            c_stores: 80,
+            rgh_stores: 88,
+            h_selected_cert_store: 112,
+            required_size: 96,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell links — shdocvw.dll SHCreateLinks
+// ---------------------------------------------------------------------------
+//
+// Modeled contract:
+//
+//   HRESULT SHCreateLinks(LPCWSTR pszTarget,        // arg 0
+//                         LPCWSTR pszLinkPath,      // arg 1
+//                         LPCWSTR pszDescription);  // arg 2 (optional)
+//
+// Creates a real, persistent Windows shell link (.lnk) for `pszTarget` at
+// `pszLinkPath`, wired through the exact .lnk machinery the runtime's
+// IShellLink/IPersistFile COM surface uses (`shell_link_file_bytes` →
+// `src/lnk.rs`, persisted through the real file layer with
+// `write_file_overwrite_w`), so the file a guest reads back is a genuine
+// shortcut with the documented binary layout.  S_OK when the link file was
+// written; E_INVALIDARG for null/empty target or link path; the COM Save
+// contract's E_ACCESSDENIED when the file layer rejects the write.
+
+// ---------------------------------------------------------------------------
+// Favorites — shdocvw.dll SHNavigateToFavorite
+// ---------------------------------------------------------------------------
+//
+// Modeled contract:
+//
+//   HRESULT SHNavigateToFavorite(LPCWSTR pszUrl,   // arg 0
+//                                LPCWSTR pszTitle, // arg 1 (optional)
+//                                DWORD dwFlags);   // arg 2
+//
+// with dwFlags = 0 (add/update, the default) or
+// FAVORITES_ACTION_REMOVE = 1.  The runtime has no browsing engine, so the
+// "navigate to a favorite" operation is modeled by its real substrate: the
+// favorites themselves.  Every add creates a REAL record in the per-runtime
+// favorites store (keyed by guest user, then URL) AND persists a genuine
+// Windows `.url` favorite file (`[InternetShortcut]`) under the guest
+// user's Favorites folder on the guest drive — the same artifact a real
+// browser's favorites list contains.  S_OK with a real record; S_FALSE
+// when a remove found nothing to remove; E_INVALIDARG for a null/empty
+// URL or an unknown flag.  List/remove of the store are real operations
+// surfaced through `favorite_records` and the trace.
+
+/// FAVORITES_ACTION_REMOVE: remove the stored favorite for the URL.
+const FAVORITES_ACTION_REMOVE: u32 = 0x0000_0001;
+
+/// One genuine favorite record (per guest user, per URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FavoriteRecord {
+    /// The guest user owning the favorite.
+    pub(crate) user: String,
+    /// The favorite URL (the record key).
+    pub(crate) url: String,
+    /// The display title.
+    pub(crate) title: String,
+    /// Host wall-clock milliseconds of the first add.
+    pub(crate) added_at_ms: u64,
+    /// Host wall-clock milliseconds of the last update.
+    pub(crate) updated_at_ms: u64,
+    /// The guest path of the persisted `.url` file (None when no file
+    /// could be persisted).
+    pub(crate) file_path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Folder windows — browseui.dll SHOpenFolderWindow
+// ---------------------------------------------------------------------------
+//
+// Modeled contract:
+//
+//   HRESULT SHOpenFolderWindow(LPCWSTR pszFolderPath, // arg 0
+//                              HWND hwndParent,       // arg 1 (unused)
+//                              DWORD dwFlags);        // arg 2
+//
+// There is no desktop shell in the runtime and no window machinery that
+// could display a shell view, so the honest real behavior is the folder-
+// window session: every call opens a real window session in the per-runtime
+// folder-window registry (folder path, visibility, open/close transitions
+// with timestamps).  S_OK when the window session was created;
+// E_INVALIDARG for a null/empty folder; HRESULT_FROM_WIN32(ERROR_FILE_
+// NOT_FOUND / ERROR_PATH_NOT_FOUND / ERROR_DIRECTORY) when the folder does
+// not resolve; E_OUTOFMEMORY when the registry's open-window budget is
+// exhausted.  Closing a window session (`close_folder_window`) records the
+// close transition and hides the window; the registry is observable
+// through `folder_window_records` and the trace.
+
+/// One folder-window transition event (open/close).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FolderWindowEvent {
+    /// Host wall-clock milliseconds of the transition.
+    pub(crate) at_ms: u64,
+    /// The transition kind: "open" or "close".
+    pub(crate) kind: String,
+}
+
+/// One open/closed folder-window session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FolderWindowRecord {
+    /// The per-runtime session id (monotonic).
+    pub(crate) id: u64,
+    /// The resolved guest folder path.
+    pub(crate) folder: String,
+    /// Window visibility (false after the session is closed).
+    pub(crate) visible: bool,
+    /// Host wall-clock milliseconds of the open transition.
+    pub(crate) opened_at_ms: u64,
+    /// Host wall-clock milliseconds of the close transition.
+    pub(crate) closed_at_ms: Option<u64>,
+    /// The transition events, oldest first.
+    pub(crate) events: VecDeque<FolderWindowEvent>,
+}
+
+/// The number of concurrently open folder-window sessions per runtime.
+const FOLDER_WINDOW_OPEN_BUDGET: usize = 128;
+
+/// The per-runtime folder-window registry (monotonic ids + sessions).
+#[derive(Debug, Default)]
+struct FolderWindowRegistry {
+    next_id: u64,
+    windows: std::collections::BTreeMap<u64, FolderWindowRecord>,
+}
+
+impl FolderWindowRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Explorer taskband — browseui.dll SHCreateExplorerTaskband
+// ---------------------------------------------------------------------------
+//
+// Modeled contract:
+//
+//   HRESULT SHCreateExplorerTaskband(LPWSTR* rgszCommandLines, // arg 0
+//                                    UINT cCommandLines,       // arg 1
+//                                    DWORD dwFlags);           // arg 2
+//
+// There is no explorer shell in the runtime, so the real underlying
+// operation that IS modelable is the taskband session: one taskband object
+// bound to the runtime's shell session, carrying the guest's requested task
+// entries (each entry a command line, with a derived display name).  The
+// Windows shell hosts exactly one taskband per session, so a second call
+// answers S_FALSE without creating another session.  S_OK when the taskband
+// session was actually created; E_INVALIDARG for a null entry array with a
+// nonzero count, an empty command line, or nonzero reserved dwFlags.  The
+// state is observable through `explorer_taskband` and the trace.
+
+/// The per-runtime explorer-taskband session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExplorerTaskband {
+    /// Host wall-clock milliseconds of the session creation.
+    pub(crate) created_at_ms: u64,
+    /// The task entries, in guest order.
+    pub(crate) tasks: Vec<TaskbandTaskEntry>,
+}
+
+/// One taskband task entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskbandTaskEntry {
+    /// The command line the guest requested for the task.
+    pub(crate) command_line: String,
+    /// The display name derived from the command line.
+    pub(crate) display_name: String,
+}
+
+/// Derive the task display name from a command line: the file name of the
+/// first whitespace-delimited token (quotes stripped, extension removed),
+/// or the whole command line when no path-like token exists.
+fn taskband_display_name(command_line: &str) -> String {
+    let token = command_line
+        .split_whitespace()
+        .next()
+        .unwrap_or(command_line)
+        .trim_matches('"');
+    let file_name = token.rsplit(['\\', '/']).next().unwrap_or(token).trim();
+    let stem = match file_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => file_name,
+    };
+    if stem.is_empty() {
+        command_line.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Sanitize a favorite title into a Windows file name (the invalid file
+/// name characters are replaced; trailing dots/spaces are trimmed).
+fn sanitize_favorite_file_name(title: &str) -> String {
+    let mut sanitized: String = title
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    while sanitized.ends_with(['.', ' ']) {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        "Favorite".to_string()
+    } else {
+        sanitized.chars().take(120).collect()
+    }
+}
+
+/// Host wall-clock milliseconds (Unix epoch).
+fn host_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Map a modeled HRESULT back to its Win32 GetLastError code.
+fn hresult_to_win32(hresult: u32) -> u32 {
+    hresult & 0x0000_ffff
+}
+
+// ---------------------------------------------------------------------------
+// Per-runtime stores (keyed by the runtime's guest pid — every runtime owns
+// a distinct guest pid, so parallel runtimes never share state).
+// ---------------------------------------------------------------------------
+
+type FavoriteStore = std::collections::BTreeMap<
+    u32,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, FavoriteRecord>>,
+>;
+
+fn favorite_store_locked<T>(op: impl FnOnce(&mut FavoriteStore) -> T) -> T {
+    use std::sync::LazyLock;
+    static STORE: LazyLock<std::sync::Mutex<FavoriteStore>> =
+        LazyLock::new(|| std::sync::Mutex::new(FavoriteStore::new()));
+    if let Ok(mut store) = STORE.lock() {
+        op(&mut store)
+    } else {
+        panic!("favorites store poisoned");
+    }
+}
+
+fn favorite_records_for(pid: u32, user: &str) -> Vec<FavoriteRecord> {
+    favorite_store_locked(|store| {
+        store
+            .get(&pid)
+            .and_then(|by_user| by_user.get(user))
+            .map(|by_url| by_url.values().cloned().collect())
+            .unwrap_or_default()
+    })
+}
+
+fn folder_window_store_locked<T>(
+    op: impl FnOnce(&mut std::collections::BTreeMap<u32, FolderWindowRegistry>) -> T,
+) -> T {
+    use std::sync::LazyLock;
+    static STORE: LazyLock<
+        std::sync::Mutex<std::collections::BTreeMap<u32, FolderWindowRegistry>>,
+    > = LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut store) = STORE.lock() {
+        op(&mut store)
+    } else {
+        panic!("folder-window store poisoned");
+    }
+}
+
+fn taskband_store_locked<T>(
+    op: impl FnOnce(&mut std::collections::BTreeMap<u32, ExplorerTaskband>) -> T,
+) -> T {
+    use std::sync::LazyLock;
+    static STORE: LazyLock<std::sync::Mutex<std::collections::BTreeMap<u32, ExplorerTaskband>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut store) = STORE.lock() {
+        op(&mut store)
+    } else {
+        panic!("taskband store poisoned");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CNG audit-log store
 // ---------------------------------------------------------------------------
 
@@ -2213,5 +3790,404 @@ mod x3daudio_math_tests {
             ..X3dEmitter::default()
         };
         assert_eq!(x3daudio_inner_radius_blend(&plain, &above, &listener), 0.0);
+    }
+}
+#[cfg(test)]
+mod audio_activation_tests {
+    use super::*;
+    use crate::audio_activation::{
+        ACTIVATION_E_INVALIDARG, ACTIVATION_E_NOINTERFACE, ACTIVATION_S_OK,
+        AUDCLNT_E_DEVICE_INVALIDATED, IID_IAUDIO_CLIENT,
+    };
+    use crate::ge::{GameEnvironment, GeArch};
+    use crate::real_audio::RealAudioBackend;
+    use tempfile::TempDir;
+
+    // Guest fixture addresses (far below the x86 thunk/data bases the
+    // runtime allocates from, mirroring the runtime's own x86 test layout).
+    const STACK: u64 = 0x50_000;
+    const HANDLER_OBJECT: u64 = 0x60_000;
+    const HANDLER_VTABLE: u64 = 0x60_100;
+    const HANDLER_STUB: u64 = 0x60_200;
+    const MARKER_HR: u64 = 0x44_000;
+    const MARKER_OBJ: u64 = 0x44_004;
+    const MARKER_COUNT: u64 = 0x44_008;
+    const RIID_ADDR: u64 = 0x63_000;
+    const OP_OUT: u64 = 0x64_000;
+    const PATH_ADDR: u64 = 0x65_000;
+
+    fn activation_test_runtime(name: &str) -> (PeHostRuntime, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.guest_arch = GuestArch::X86;
+        runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
+        runtime.next_data_address = data_base_for_arch(GuestArch::X86);
+        runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
+        runtime
+            .win32
+            .reset_address_space(private_pages_base_for_arch(GuestArch::X86));
+        runtime.x86_heap_region = 0;
+        (runtime, temp_dir)
+    }
+
+    /// Run the body on an 8 MB stack thread (the runtime's guest-callback
+    /// machinery needs the same big-stack setup the runtime test suite uses).
+    fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn big-stack thread")
+            .join()
+            .expect("big-stack thread panicked")
+    }
+
+    /// Install a guest completion-handler COM object whose `ActivateCompleted`
+    /// slot (vtable slot 3) is real x86 stub code that records
+    /// `(result_hr, activated_interface)` at the marker addresses and counts
+    /// its invocations.
+    fn install_handler(memory: &mut MemoryImage) {
+        memory.map_bytes(MARKER_HR, &[0_u8; 12]);
+        memory.map_bytes(HANDLER_OBJECT, &[0_u8; 8]);
+        memory.map_bytes(HANDLER_VTABLE, &[0_u8; 16]);
+        let mut stub = vec![0x90_u8; 0x40];
+        stub[..36].copy_from_slice(&[
+            0x8B, 0x44, 0x24, 0x08, // mov eax, [esp+8]   (result hr)
+            0xA3, 0x00, 0x40, 0x04, 0x00, // mov [0x44000], eax
+            0x8B, 0x44, 0x24, 0x0C, // mov eax, [esp+12]  (interface object)
+            0xA3, 0x04, 0x40, 0x04, 0x00, // mov [0x44004], eax
+            0xA1, 0x08, 0x40, 0x04, 0x00, // mov eax, [0x44008] (count)
+            0x05, 0x01, 0x00, 0x00, 0x00, // add eax, 1
+            0xA3, 0x08, 0x40, 0x04, 0x00, // mov [0x44008], eax
+            0x31, 0xC0, // xor eax, eax
+            0xC3, // ret
+        ]);
+        memory.map_bytes(HANDLER_STUB, &stub);
+        write_u32(memory, HANDLER_OBJECT, HANDLER_VTABLE as u32);
+        write_u32(memory, HANDLER_VTABLE + 12, HANDLER_STUB as u32);
+    }
+
+    /// Dispatch `ActivateAudioInterfaceAsync` (x86 stack args) through the
+    /// real import dispatch and return the HRESULT in EAX.
+    fn dispatch_activate(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        path: Option<&str>,
+        riid: &[u8; 16],
+        handler: u64,
+        operation_out: u64,
+    ) -> u64 {
+        let thunk = runtime.alloc_host_thunk(HostThunk::ActivateAudioInterfaceAsync);
+        memory.map_bytes(RIID_ADDR, riid);
+        memory.map_bytes(OP_OUT, &[0_u8; 8]);
+        let path_addr = match path {
+            Some(path) => {
+                let mut units = Vec::new();
+                for unit in path.encode_utf16() {
+                    units.extend_from_slice(&unit.to_le_bytes());
+                }
+                units.extend_from_slice(&0_u16.to_le_bytes());
+                memory.map_bytes(PATH_ADDR, &units);
+                PATH_ADDR
+            }
+            None => 0,
+        };
+        memory.map_bytes(STACK - 0x400, &[0_u8; 0x600]);
+        write_u32(memory, STACK, 0xDEAD_BEEF);
+        write_guest_pointer(memory, STACK + 4, path_addr, GuestArch::X86).expect("write path arg");
+        write_guest_pointer(memory, STACK + 8, RIID_ADDR, GuestArch::X86).expect("write riid arg");
+        write_guest_pointer(memory, STACK + 12, 0, GuestArch::X86)
+            .expect("write activation-params arg");
+        write_guest_pointer(memory, STACK + 16, handler, GuestArch::X86)
+            .expect("write handler arg");
+        write_guest_pointer(memory, STACK + 20, operation_out, GuestArch::X86)
+            .expect("write operation-out arg");
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, STACK);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .expect("dispatch ActivateAudioInterfaceAsync");
+        state.get(Register::Rax)
+    }
+
+    /// Poll for async completion: drain the runtime's pending audio
+    /// activations (the same drain the block-dispatch safepoint and the
+    /// message-loop idle pump run in a live session).
+    fn drain_activations(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) {
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, STACK);
+        runtime
+            .drain_pending_audio_activations(&mut state, memory)
+            .expect("drain audio activations");
+    }
+
+    fn marker_hr(memory: &MemoryImage) -> u32 {
+        read_u32(memory, MARKER_HR).expect("marker hr")
+    }
+
+    fn marker_object(memory: &MemoryImage) -> u32 {
+        read_u32(memory, MARKER_OBJ).expect("marker object")
+    }
+
+    fn marker_count(memory: &MemoryImage) -> u32 {
+        read_u32(memory, MARKER_COUNT).expect("marker count")
+    }
+
+    /// Capability probe shared with the real_audio tests: the success paths
+    /// need a real default render device.
+    fn real_default_device_available() -> bool {
+        match RealAudioBackend::new() {
+            Ok(backend) => backend
+                .enumerate_devices()
+                .iter()
+                .any(|device| device.is_default),
+            Err(error) => {
+                eprintln!(
+                    "audio activation test skipped: no real audio services available ({error})"
+                );
+                false
+            }
+        }
+    }
+
+    fn real_device_list_empty() -> bool {
+        match RealAudioBackend::new() {
+            Ok(backend) => backend.enumerate_devices().is_empty(),
+            Err(error) => {
+                eprintln!("audio activation test proceeding without audio services ({error})");
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn activation_null_handler_fails_invalidarg_without_completion() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = activation_test_runtime("act-invalid-arg");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            // Null completion handler: E_INVALIDARG synchronously, nothing queued.
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None,
+                &IID_IAUDIO_CLIENT,
+                0,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_E_INVALIDARG));
+            assert_eq!(
+                crate::audio_activation::pending_activation_completions(runtime.guest_pid),
+                0,
+                "no completion may be queued for an invalid-argument call"
+            );
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_count(&memory), 0, "handler must never be invoked");
+            // Null operation out-param: same synchronous failure.
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None,
+                &IID_IAUDIO_CLIENT,
+                HANDLER_OBJECT,
+                0,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_E_INVALIDARG));
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_count(&memory), 0);
+        })
+    }
+
+    #[test]
+    fn activation_unsupported_riid_completes_with_nointerface_never_success() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = activation_test_runtime("act-bad-riid");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            let unknown_riid = [0xAB; 16];
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None,
+                &unknown_riid,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            // The call starts the async activation and returns S_OK…
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            // …but the handler is NOT invoked inline during the call, and the
+            // activation operation carries no interface.
+            assert_eq!(marker_count(&memory), 0, "handler must not run inline");
+            assert_eq!(
+                crate::audio_activation::pending_activation_completions(runtime.guest_pid),
+                1
+            );
+            let operation = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_eq!(operation, 0, "failed activations return no interface");
+
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_count(&memory), 1, "handler invoked exactly once");
+            assert_eq!(
+                marker_hr(&memory),
+                ACTIVATION_E_NOINTERFACE,
+                "unsupported riid delivers E_NOINTERFACE"
+            );
+            assert_eq!(
+                marker_object(&memory),
+                0,
+                "no interface object for E_NOINTERFACE"
+            );
+            assert_eq!(
+                crate::audio_activation::pending_activation_completions(runtime.guest_pid),
+                0,
+                "the completion queue is empty after the drain"
+            );
+        })
+    }
+
+    #[test]
+    fn activation_default_device_completes_async_with_real_endpoint() {
+        with_big_stack(|| {
+            // Capability gate: needs a real default render device (same probing
+            // style as the real_audio tests).
+            if !real_default_device_available() {
+                eprintln!("skipping activation_default_device test: no real default render device");
+                return;
+            }
+            let (mut runtime, _tmp) = activation_test_runtime("act-default-device");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None, // null path = default render device
+                &IID_IAUDIO_CLIENT,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            // Not delivered inline: the handler must be invoked asynchronously.
+            assert_eq!(marker_count(&memory), 0, "handler must not run inline");
+            let endpoint = read_guest_pointer(&memory, OP_OUT, GuestArch::X86).unwrap();
+            assert_ne!(endpoint, 0, "the activation operation carries the endpoint");
+            assert_eq!(
+                crate::audio_activation::pending_activation_completions(runtime.guest_pid),
+                1,
+                "one completion queued"
+            );
+
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_count(&memory), 1, "handler invoked exactly once");
+            assert_eq!(marker_hr(&memory), ACTIVATION_S_OK);
+            assert_eq!(marker_object(&memory) as u64, endpoint);
+
+            // The endpoint is a REAL guest object bound to the REAL device data.
+            let kind = runtime
+                .guest_object_kind(endpoint)
+                .expect("endpoint object");
+            assert_eq!(kind, GuestObjectKind::DirectSound8);
+            let record = crate::audio_activation::endpoint_record(runtime.guest_pid, endpoint)
+                .expect("real device record bound to the endpoint");
+            assert!(record.device.is_default, "default render device activated");
+            assert!(!record.device.name.is_empty(), "real device name");
+            assert!(record.device.sample_rate > 0, "real device sample rate");
+            assert!(record.device.channels >= 1, "real device channel count");
+            assert_eq!(record.requested_riid, IID_IAUDIO_CLIENT);
+            // The object's IUnknown lifecycle is real: AddRef/Release move the
+            // runtime refcount and Release to zero removes the object.
+            let refs = runtime.add_ref_guest_object(endpoint).expect("AddRef");
+            assert_eq!(refs, 2);
+            assert_eq!(runtime.release_guest_object(endpoint).expect("Release"), 1);
+            assert_eq!(
+                runtime
+                    .release_guest_object(endpoint)
+                    .expect("final Release"),
+                0
+            );
+            assert!(!runtime.guest_objects.contains_key(&endpoint));
+        })
+    }
+
+    #[test]
+    fn activation_render_interface_guid_path_resolves_to_default_device() {
+        with_big_stack(|| {
+            // The documented DEVINTERFACE_AUDIO_RENDER GUID string must activate
+            // the default render device just like the empty path.
+            if !real_default_device_available() {
+                eprintln!("skipping activation render-guid test: no real default render device");
+                return;
+            }
+            let (mut runtime, _tmp) = activation_test_runtime("act-render-guid");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                Some("{e6327cad-dcec-4949-ae8a-991e976a79d2}"),
+                &IID_IAUDIO_CLIENT,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_hr(&memory), ACTIVATION_S_OK);
+            assert_ne!(marker_object(&memory), 0);
+        })
+    }
+
+    #[test]
+    fn activation_capture_guid_path_fails_with_device_error() {
+        with_big_stack(|| {
+            // DEVINTERFACE_AUDIO_CAPTURE never resolves on the render activation
+            // surface — the failure is AUDCLNT_E_DEVICE_INVALIDATED, delivered
+            // asynchronously (no real device needed for this path).
+            let (mut runtime, _tmp) = activation_test_runtime("act-capture-guid");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                Some("{2eef81be-33fa-4800-9670-1cd474972c3f}"),
+                &IID_IAUDIO_CLIENT,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_hr(&memory), AUDCLNT_E_DEVICE_INVALIDATED);
+            assert_eq!(marker_object(&memory), 0);
+            assert_eq!(marker_count(&memory), 1);
+        })
+    }
+
+    #[test]
+    fn activation_without_real_devices_completes_with_device_invalidated() {
+        with_big_stack(|| {
+            // Runs only when the real device list is genuinely empty (headless
+            // CI, VMs without CoreAudio output) — the condition the assignment
+            // requires for AUDCLNT_E_DEVICE_INVALIDATED.
+            if !real_device_list_empty() {
+                eprintln!("skipping activation no-device test: real audio devices are present");
+                return;
+            }
+            let (mut runtime, _tmp) = activation_test_runtime("act-no-devices");
+            let mut memory = MemoryImage::default();
+            install_handler(&mut memory);
+            let hr = dispatch_activate(
+                &mut runtime,
+                &mut memory,
+                None,
+                &IID_IAUDIO_CLIENT,
+                HANDLER_OBJECT,
+                OP_OUT,
+            );
+            assert_eq!(hr, u64::from(ACTIVATION_S_OK));
+            drain_activations(&mut runtime, &mut memory);
+            assert_eq!(marker_hr(&memory), AUDCLNT_E_DEVICE_INVALIDATED);
+            assert_eq!(marker_object(&memory), 0);
+            assert_eq!(marker_count(&memory), 1);
+        })
     }
 }

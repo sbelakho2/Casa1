@@ -7379,12 +7379,12 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "mf.dll",
         "MFGetService",
-        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+        "casa1-conformance:mf_get_service_media_session_service_returns_the_session",
     ),
     conformance(
         "mfplat.dll",
         "MFGetService",
-        "casa1-conformance:evidence_mf_source_reader_and_sink_writer_objects",
+        "casa1-conformance:mf_get_service_media_session_service_returns_the_session",
     ),
     conformance(
         "mf.dll",
@@ -7619,7 +7619,32 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "mmdevapi.dll",
         "ActivateAudioInterfaceAsync",
-        "casa1-conformance:evidence_final_scraps_surfaces",
+        "casa1-conformance:activation_default_device_completes_async_with_real_endpoint",
+    ),
+    conformance(
+        "cryptdlg.dll",
+        "CertSelectCertificate",
+        "casa1-conformance:cert_select_certificate_selects_the_single_eligible_certificate",
+    ),
+    conformance(
+        "shdocvw.dll",
+        "SHCreateLinks",
+        "casa1-conformance:sh_create_links_writes_a_real_parseable_lnk_file",
+    ),
+    conformance(
+        "shdocvw.dll",
+        "SHNavigateToFavorite",
+        "casa1-conformance:sh_navigate_to_favorite_adds_lists_and_removes_real_records",
+    ),
+    conformance(
+        "browseui.dll",
+        "SHOpenFolderWindow",
+        "casa1-conformance:sh_open_folder_window_opens_and_closes_real_window_sessions",
+    ),
+    conformance(
+        "browseui.dll",
+        "SHCreateExplorerTaskband",
+        "casa1-conformance:sh_create_explorer_taskband_creates_one_real_taskband_session",
     ),
     conformance(
         "mscorlib.dll",

@@ -1385,15 +1385,19 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "No KDC is reachable: the ticket retrieval answers SEC_E_NO_KERB_KEY.",
     ),
     // ── certificate dialogs / digest helpers: canned answers ───────────────
+    // ── certificate selection: real store-backed selection now ─────────────
     semantic_override(
         "cryptdlg.dll",
         "CertSelectCertificate",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No certificate-selection UI is shown and no selection is made: the \
-         operation answers FALSE without performing the documented dialog \
-         contract.",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Selects a real certificate from the runtime certificate stores (requested \
+         store membership + parsed X.509 validity), writes a real CERT_CONTEXT and \
+         the owning store handle when exactly one candidate is eligible, and answers \
+         FALSE user-cancel when none or several are eligible (no dialog is shown); \
+         real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker \
+         callback cannot be invoked from this surface.",
     ),
     // ── certificate digest helper: real digests now ────────────────────────
     semantic_override(
@@ -1411,11 +1415,16 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         "mmdevapi.dll",
         "ActivateAudioInterfaceAsync",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "The runtime has an audio stack, but no device-activation endpoint: the \
-         activation answers AUDCLNT_E_DEVICE_INVALIDATED without invoking the \
-         callback.",
+        "Real asynchronous activation over the real audio stack: resolves the default \
+         render device (or the render DEVINTERFACE GUID) to an enumerated cpal device \
+         record and builds a real guest endpoint object for IID_IAudioClient/\
+         IAudioClient2/IAudioClient3 with a working vtable; the completion handler is \
+         invoked asynchronously through the runtime's queue/drain machinery \
+         (E_NOINTERFACE and AUDCLNT_E_DEVICE_INVALIDATED delivered via the handler, \
+         E_INVALIDARG synchronously).  No IActivateAudioInterfaceAsyncOperation object \
+         and no per-method IAudioClient host thunks exist yet.",
     ),
     // ── CLR: a machine with no CLR installed ───────────────────────────────
     semantic_override(
@@ -1480,8 +1489,13 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Media Foundation objects exist, but no service provider is registered: the \
-         query answers MF_E_UNSUPPORTED_SERVICE.",
+        "Real service-provider table on the session object graph: MFGetService \
+         resolves the owner (session, topology object, topology node) and returns \
+         real service objects — the session itself (MF_MEDIASESSION_SERVICE) and \
+         genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by \
+         real session rate state with release-to-forget semantics; service GUIDs the \
+         object genuinely does not own answer MF_E_UNSUPPORTED_SERVICE (correct \
+         Windows behavior).  Media-source/sink services await those objects.",
     ),
     semantic_override(
         "mfplat.dll",
@@ -1489,18 +1503,42 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
         None,
         SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Media Foundation objects exist, but no service provider is registered: the \
-         query answers MF_E_UNSUPPORTED_SERVICE.",
+        "Real service-provider table on the session object graph: MFGetService \
+         resolves the owner (session, topology object, topology node) and returns \
+         real service objects — the session itself (MF_MEDIASESSION_SERVICE) and \
+         genuine IMFRateControl/IMFRateSupport (MF_RATE_CONTROL_SERVICE) backed by \
+         real session rate state; genuinely unowned service GUIDs answer \
+         MF_E_UNSUPPORTED_SERVICE.",
     ),
-    // ── GDI+: a graphics object with no method surface ─────────────────────
+    // ── GDI+: the drawing surface is real; three calls stay genuinely \
+    // NotImplemented (documented limits of the modeled object set) ──────────
     semantic_override(
         "gdiplus.dll",
-        "GdipCreateGraphics",
+        "GdipSetClipPath",
         None,
-        SemanticFidelity::Approximate,
+        SemanticFidelity::Restricted,
         SubsystemCapability::Partial,
-        "Creates a real GDI+ graphics object, but the object carries an empty vtable \
-         (no drawing methods) — the handle is real, the drawing surface is not.",
+        "Returns the genuine GDI+ NotImplemented status: non-rectangular \
+         GpRegion clip paths are not creatable (no GdipCreateRegion is exported \
+         on this surface).",
+    ),
+    semantic_override(
+        "gdiplus.dll",
+        "GdipMeasureCharacterRanges",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Returns the genuine GDI+ NotImplemented status: character-range \
+         measurement needs creatable GpRegion objects.",
+    ),
+    semantic_override(
+        "gdiplus.dll",
+        "GdipCreateHICONFromBitmap",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Returns the genuine GDI+ NotImplemented status: no pixel-icon registry \
+         exists for arbitrary HICONs (module-resource icons only).",
     ),
     // ── NT native process creation: a real native child now ────────────────
     semantic_override(
@@ -1521,38 +1559,45 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
     semantic_override(
         "browseui.dll",
         "SHCreateExplorerTaskband",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No explorer taskband is created: the operation answers E_FAIL without \
-         performing the shell-UI work.",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Partial,
+        "No explorer shell exists; the per-shell-session taskband registry with the \
+         guest's real task entries is the modeled behavior (single taskband, \
+         S_FALSE on repeat, real invalid-argument paths).",
     ),
     semantic_override(
         "browseui.dll",
         "SHOpenFolderWindow",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No folder window is opened: the operation answers E_FAIL without \
-         performing the shell-UI work.",
+        None,
+        SemanticFidelity::SyntheticEnvironment,
+        SubsystemCapability::Partial,
+        "No desktop shell exists; the folder-window session registry is the modeled \
+         behavior: monotonic session ids, resolved folder path, open/close \
+         visibility transitions and events, real path/flag failure codes.",
     ),
     semantic_override(
         "shdocvw.dll",
         "SHCreateLinks",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No shell links are created: the operation answers E_FAIL without \
-         performing the work.",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Full,
+        "Writes a real persistent Windows .lnk (header + LinkInfo + flag-gated \
+         StringData) through the single src/lnk.rs writer shared with the COM \
+         IShellLink/IPersistFile save path, parse-back verified; the export's \
+         argument layout is a modeled contract and 'ANSI' path bytes are the UTF-8 \
+         guest path (no ANSI codepage).",
     ),
     semantic_override(
         "shdocvw.dll",
         "SHNavigateToFavorite",
-        Some(ImplementationLevel::Stub),
-        SemanticFidelity::CannedFailure,
-        SubsystemCapability::Absent,
-        "No favorites navigation happens: the operation answers E_FAIL without \
-         performing the work.",
+        None,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        "Adds/updates/removes real per-user favorites (in-runtime store plus \
+         persistent [InternetShortcut] .url files under the guest user's \
+         Favorites); no URL-navigation engine exists, so navigation itself is the \
+         stored record with S_FALSE on missing removes.",
     ),
     // ── rich-edit class registration: real registered classes now ──────────
     semantic_override(

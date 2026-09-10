@@ -232,6 +232,7 @@ fn t33_07_brush_delete() {
 fn t33_08_pen_create_and_properties() {
     let mut state = fresh_state();
     let pen = GdiplusPen {
+        unit: 0,
         width: 2.5,
         color: 0xFF0000FF,
         brush_handle: None,
@@ -849,6 +850,10 @@ fn t33_23_bitmap_create_and_properties() {
         stride: 2560,
         pixels: vec![0; 640 * 480 * 4],
         locked: false,
+        scan0_guest: 0,
+        lock_x: 0,
+        lock_y: 0,
+        raw_kind: 0,
     };
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
 
@@ -878,6 +883,10 @@ fn t33_24_bitmap_get_width_height_format() {
         stride: 960,
         pixels: vec![0; 320 * 200 * 3],
         locked: false,
+        scan0_guest: 0,
+        lock_x: 0,
+        lock_y: 0,
+        raw_kind: 0,
     };
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
 
@@ -904,6 +913,10 @@ fn t33_25_bitmap_dispose_image() {
         stride: 4,
         pixels: vec![0; 4],
         locked: false,
+        scan0_guest: 0,
+        lock_x: 0,
+        lock_y: 0,
+        raw_kind: 0,
     };
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
     assert!(state.get(handle).is_some());
@@ -1514,6 +1527,10 @@ fn t33_41_bitmap_pixel_get_set() {
         stride: 16, // 4 * 4
         pixels: vec![0; 64],
         locked: false,
+        scan0_guest: 0,
+        lock_x: 0,
+        lock_y: 0,
+        raw_kind: 0,
     };
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bmp))));
 

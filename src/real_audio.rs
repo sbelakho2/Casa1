@@ -47,7 +47,7 @@ pub struct WasapiExclusiveState {
 }
 
 /// A real audio output device discovered via `cpal`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealAudioDevice {
     pub id: DeviceId,
     /// Stable identity key used to match a device across enumeration calls.
@@ -66,6 +66,76 @@ pub struct RealAudioDevice {
 // ---------------------------------------------------------------------------
 // Real audio backend
 // ---------------------------------------------------------------------------
+
+/// Why the device-interface path of an audio-interface activation could not
+/// be resolved to a real device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioActivationDeviceFailure {
+    /// The real output-device list is genuinely empty (or the backend has no
+    /// default render device). Maps to `AUDCLNT_E_DEVICE_INVALIDATED`.
+    NoDevices,
+    /// The supplied device-interface path names a device this runtime cannot
+    /// map onto the real (cpal) device list — e.g. a capture-endpoint
+    /// interface id (`DEVINTERFACE_AUDIO_CAPTURE`) or an endpoint instance
+    /// path for a non-default device. Also maps to the device error.
+    UnknownDevicePath,
+}
+
+/// `DEVINTERFACE_AUDIO_RENDER` (`{e6327cad-dcec-4949-ae8a-991e976a79d2}`) —
+/// the device-interface id that names the **default render** device.
+pub const DEVINTERFACE_AUDIO_RENDER: &str = "{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+/// `DEVINTERFACE_AUDIO_CAPTURE` (`{2eef81be-33fa-4800-9670-1cd474972c3f}`) —
+/// the device-interface id that names the default capture device. The real
+/// capture stack is not part of this activation surface, so the id never
+/// resolves here.
+pub const DEVINTERFACE_AUDIO_CAPTURE: &str = "{2eef81be-33fa-4800-9670-1cd474972c3f}";
+
+/// Resolve an `ActivateAudioInterfaceAsync` device-interface path against a
+/// real-device snapshot (pure, deterministic — tests exercise it with
+/// synthetic lists).
+///
+/// Windows semantics used here:
+/// - `None` / empty path → the default render device.
+/// - The `DEVINTERFACE_AUDIO_RENDER` interface id (the documented way to ask
+///   for the default render device by GUID string) → the default render
+///   device.
+/// - `DEVINTERFACE_AUDIO_CAPTURE` or any other endpoint instance path → the
+///   endpoint does not exist on this runtime's real device list.
+pub fn resolve_audio_activation_device(
+    devices: &[RealAudioDevice],
+    device_interface_path: Option<&str>,
+) -> Result<RealAudioDevice, AudioActivationDeviceFailure> {
+    let path = device_interface_path.map(str::trim).unwrap_or("");
+    let normalized = path
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(path);
+    let asks_default = path.is_empty()
+        || normalized.eq_ignore_ascii_case(
+            DEVINTERFACE_AUDIO_RENDER
+                .trim_start_matches('{')
+                .trim_end_matches('}'),
+        );
+    let asks_capture = normalized.eq_ignore_ascii_case(
+        DEVINTERFACE_AUDIO_CAPTURE
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+    );
+    let Some(default) = devices.iter().find(|device| device.is_default) else {
+        // No default render endpoint (the list may be empty, or every real
+        // device lacks the default flag).
+        return Err(AudioActivationDeviceFailure::NoDevices);
+    };
+    if asks_default {
+        return Ok(default.clone());
+    }
+    if asks_capture {
+        // The capture interface id never resolves on the render activation
+        // surface.
+        return Err(AudioActivationDeviceFailure::UnknownDevicePath);
+    }
+    Err(AudioActivationDeviceFailure::UnknownDevicePath)
+}
 
 /// Manages real audio output streams via `cpal`.
 ///
@@ -194,6 +264,24 @@ impl RealAudioBackend {
                 format!("unknown audio device {device_id}"),
             )
         })
+    }
+
+    /// Snapshot the enumerated real output devices (id, name, channels,
+    /// sample rate, default flag) for audio-interface activation.
+    pub fn activation_device_snapshot(&self) -> Vec<RealAudioDevice> {
+        self.devices.values().cloned().collect()
+    }
+
+    /// Resolve the `ActivateAudioInterfaceAsync` device-interface path
+    /// against the real device list of this backend.
+    ///
+    /// See [`resolve_audio_activation_device`] for the resolution rules.
+    pub fn resolve_activation_device(
+        &self,
+        device_interface_path: Option<&str>,
+    ) -> Result<RealAudioDevice, AudioActivationDeviceFailure> {
+        let devices = self.activation_device_snapshot();
+        resolve_audio_activation_device(&devices, device_interface_path)
     }
 
     // -----------------------------------------------------------------------
@@ -5267,5 +5355,131 @@ mod tests {
         unsafe {
             assert!((*xb.buffer.add(1) - 0.5).abs() < 0.001);
         }
+    }
+    // ── Audio-interface activation resolution tests ─────────────────────
+
+    fn sample_device(id: u64, name: &str, is_default: bool) -> RealAudioDevice {
+        RealAudioDevice {
+            id,
+            key: format!("{name}|2|48000"),
+            name: name.to_string(),
+            channels: 2,
+            sample_rate: 48_000,
+            is_default,
+        }
+    }
+
+    #[test]
+    fn activation_resolution_empty_list_is_no_devices() {
+        assert_eq!(
+            resolve_audio_activation_device(&[], None),
+            Err(AudioActivationDeviceFailure::NoDevices)
+        );
+        assert_eq!(
+            resolve_audio_activation_device(&[], Some("")),
+            Err(AudioActivationDeviceFailure::NoDevices)
+        );
+        assert_eq!(
+            resolve_audio_activation_device(&[], Some(DEVINTERFACE_AUDIO_RENDER)),
+            Err(AudioActivationDeviceFailure::NoDevices)
+        );
+    }
+
+    #[test]
+    fn activation_resolution_null_or_empty_path_selects_default() {
+        let devices = vec![
+            sample_device(1, "HDMI Output", false),
+            sample_device(2, "Built-in Speakers", true),
+        ];
+        let resolved = resolve_audio_activation_device(&devices, None).expect("null path");
+        assert_eq!(resolved.id, 2);
+        let resolved = resolve_audio_activation_device(&devices, Some("")).expect("empty path");
+        assert_eq!(resolved.id, 2);
+        let resolved = resolve_audio_activation_device(&devices, Some("   ")).expect("blank path");
+        assert_eq!(resolved.id, 2);
+        // The resolved device carries the real device data.
+        assert_eq!(resolved.name, "Built-in Speakers");
+        assert_eq!(resolved.channels, 2);
+        assert_eq!(resolved.sample_rate, 48_000);
+        assert!(resolved.is_default);
+    }
+
+    #[test]
+    fn activation_resolution_render_interface_guid_selects_default() {
+        let devices = vec![
+            sample_device(1, "HDMI Output", false),
+            sample_device(2, "Built-in Speakers", true),
+        ];
+        let with_braces =
+            resolve_audio_activation_device(&devices, Some(DEVINTERFACE_AUDIO_RENDER))
+                .expect("render interface id with braces");
+        assert_eq!(with_braces.id, 2);
+        let bare =
+            resolve_audio_activation_device(&devices, Some("e6327cad-dcec-4949-ae8a-991e976a79d2"))
+                .expect("render interface id without braces");
+        assert_eq!(bare.id, 2);
+        // Case-insensitive, like the Windows GUID string form.
+        let upper = resolve_audio_activation_device(
+            &devices,
+            Some("{E6327CAD-DCEC-4949-AE8A-991E976A79D2}"),
+        )
+        .expect("uppercase render interface id");
+        assert_eq!(upper.id, 2);
+    }
+
+    #[test]
+    fn activation_resolution_capture_guid_and_unknown_paths_are_unknown_devices() {
+        let devices = vec![sample_device(2, "Built-in Speakers", true)];
+        assert_eq!(
+            resolve_audio_activation_device(&devices, Some(DEVINTERFACE_AUDIO_CAPTURE)),
+            Err(AudioActivationDeviceFailure::UnknownDevicePath)
+        );
+        assert_eq!(
+            resolve_audio_activation_device(
+                &devices,
+                Some(
+                    r"\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{e6327cad-dcec-4949-ae8a-991e976a79d2}"
+                ),
+            ),
+            Err(AudioActivationDeviceFailure::UnknownDevicePath)
+        );
+    }
+
+    #[test]
+    fn activation_resolution_list_without_default_is_no_devices() {
+        // A device list with entries but no default render endpoint cannot
+        // serve a default-device activation.
+        let devices = vec![sample_device(1, "HDMI Output", false)];
+        assert_eq!(
+            resolve_audio_activation_device(&devices, None),
+            Err(AudioActivationDeviceFailure::NoDevices)
+        );
+    }
+
+    #[test]
+    fn backend_activation_resolution_matches_pure_resolver() {
+        // Capability gate: needs the real audio host to enumerate.
+        let backend = match RealAudioBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping backend_activation_resolution: no audio services ({error})");
+                return;
+            }
+        };
+        let snapshot = backend.activation_device_snapshot();
+        if snapshot.is_empty() {
+            assert_eq!(
+                backend.resolve_activation_device(None),
+                Err(AudioActivationDeviceFailure::NoDevices)
+            );
+            return;
+        }
+        let resolved = backend
+            .resolve_activation_device(None)
+            .expect("default device resolves when the list is non-empty");
+        assert!(resolved.is_default);
+        assert!(!resolved.name.is_empty());
+        // The snapshot used for resolution is the same real device list.
+        assert!(snapshot.iter().any(|device| device.id == resolved.id));
     }
 }

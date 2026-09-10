@@ -8195,6 +8195,7 @@ mod tests {
             color: 0x0000FF,
             brush_handle: None,
             width: 2.0,
+            unit: 0,
             dash_style: 0,
             line_join: 0,
             start_cap: 0,
@@ -8974,6 +8975,11 @@ pub enum GdiplusBrush {
 #[derive(Debug, Clone)]
 pub struct GdiplusPen {
     pub width: f32,
+    /// The `Unit` the pen was created with (`GdipCreatePen1`/`GdipCreatePen2`
+    /// `unit` argument; UnitWorld/UnitDisplay/UnitPixel map 1:1 to pixels at
+    /// 96 dpi, the other units convert at draw time).  Widths are stored in
+    /// the unit the caller supplied so `GdipGetPenWidth` round-trips.
+    pub unit: u32,
     pub color: u32,
     pub brush_handle: Option<u64>,
     pub dash_style: u32,
@@ -9099,6 +9105,20 @@ pub struct GdiplusBitmap {
     pub stride: i32,
     pub pixels: Vec<u8>,
     pub locked: bool,
+    /// Guest pointer handed out as `BitmapData.scan0` by `GdipBitmapLockBits`
+    /// (a guest-visible buffer the lock copies the pixels into).  Zero when
+    /// the bitmap is not locked.  `GdipBitmapUnlockBits` copies the buffer
+    /// back into `pixels` and frees it.
+    pub scan0_guest: u64,
+    /// Locked sub-rectangle origin (only meaningful while `scan0_guest` is
+    /// set), recorded by `GdipBitmapLockBits` so the unlock can copy the
+    /// guest buffer back to the right rows.
+    pub lock_x: u32,
+    pub lock_y: u32,
+    /// Source image family for `GdipGetImageRawFormat`: 0 = memory bitmap
+    /// (created from Scan0/Graphics/HBITMAP), 1 = BMP file/stream, 2 = PNG
+    /// file/stream, 3 = GDI DIB section.
+    pub raw_kind: u32,
 }
 
 /// A GDI+ image attributes object.

@@ -862,7 +862,7 @@ pub fn fill_polygon(
 
 /// Approximate an arc or pie by generating line segments.
 /// If `is_pie`, the segment list includes the centre point to form a pie shape.
-fn arc_to_line_segments(
+pub fn arc_to_line_segments(
     cx: f32,
     cy: f32,
     rx: f32,
@@ -1345,7 +1345,7 @@ pub fn fill_path(
 
 /// Approximate an ellipse with 32 line segments (the scanline filler closes
 /// the loop back to the first point).
-fn ellipse_points(x: f32, y: f32, w: f32, h: f32) -> Vec<GdiplusPointF> {
+pub fn ellipse_points(x: f32, y: f32, w: f32, h: f32) -> Vec<GdiplusPointF> {
     let cx = x + w / 2.0;
     let cy = y + h / 2.0;
     let rx = w / 2.0;
@@ -1539,6 +1539,356 @@ pub fn draw_string(
 pub fn get_compositing_mode(_brush_color: u32) -> u32 {
     // This is passed through from the dispatch handler; we don't look up state here.
     GDIPLUS_COMPOSITING_MODE_SOURCE_OVER
+}
+
+/// Flatten a path into closed-figure point lists for filling, exactly as
+/// [`fill_path`] consumes them: every `StartFigure` / `CloseFigure` boundary
+/// ends the current figure, self-contained closed elements (rectangle,
+/// ellipse, pie) form their own figures, and open chains become polygons.
+pub fn flatten_path_for_fill(path: &GdiplusPath) -> Vec<Vec<GdiplusPointF>> {
+    let mut figures: Vec<Vec<GdiplusPointF>> = Vec::new();
+    let mut current: Vec<GdiplusPointF> = Vec::new();
+    for elem in &path.elements {
+        match elem {
+            GdiplusPathElement::StartFigure | GdiplusPathElement::CloseFigure => {
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
+            }
+            GdiplusPathElement::Line { x1, y1, x2, y2 } => {
+                current.push(GdiplusPointF { x: *x1, y: *y1 });
+                current.push(GdiplusPointF { x: *x2, y: *y2 });
+            }
+            GdiplusPathElement::Rectangle { x, y, w, h } => {
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
+                figures.push(vec![
+                    GdiplusPointF { x: *x, y: *y },
+                    GdiplusPointF { x: *x + *w, y: *y },
+                    GdiplusPointF {
+                        x: *x + *w,
+                        y: *y + *h,
+                    },
+                    GdiplusPointF { x: *x, y: *y + *h },
+                ]);
+            }
+            GdiplusPathElement::Ellipse { x, y, w, h } => {
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
+                figures.push(ellipse_points(*x, *y, *w, *h));
+            }
+            GdiplusPathElement::Pie {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
+                let cx = x + w / 2.0;
+                let cy = y + h / 2.0;
+                let rx = w / 2.0;
+                let ry = h / 2.0;
+                figures.push(arc_to_line_segments(
+                    cx,
+                    cy,
+                    rx,
+                    ry,
+                    *start_angle,
+                    *sweep_angle,
+                    true,
+                ));
+            }
+            GdiplusPathElement::Polygon { points } | GdiplusPathElement::Lines { points } => {
+                current.extend(points.iter().cloned());
+            }
+            GdiplusPathElement::Bezier { points } => {
+                let segs = 32;
+                for s in 0..=segs {
+                    let t = s as f32 / segs as f32;
+                    current.push(eval_cubic_bezier(points, t));
+                }
+            }
+            GdiplusPathElement::Curve { points, tension: _ } => {
+                current.extend(points.iter().cloned());
+            }
+            GdiplusPathElement::ClosedCurve { points, tension: _ } => {
+                current.extend(points.iter().cloned());
+            }
+            GdiplusPathElement::Arc { .. } | GdiplusPathElement::String { .. } => {}
+        }
+    }
+    if !current.is_empty() {
+        figures.push(current);
+    }
+    figures
+}
+
+/// Flatten a path into polylines for stroking, matching the per-element
+/// outline semantics of [`draw_path`]: every strokable element becomes its
+/// own polyline.  The bool is `true` for elements whose outline is a closed
+/// loop (rectangle, ellipse, pie, closed curve), so callers join the last
+/// point back to the first.
+pub fn flatten_path_for_stroke(path: &GdiplusPath) -> Vec<(Vec<GdiplusPointF>, bool)> {
+    let mut out: Vec<(Vec<GdiplusPointF>, bool)> = Vec::new();
+    for elem in &path.elements {
+        match elem {
+            GdiplusPathElement::Line { x1, y1, x2, y2 } => {
+                out.push((
+                    vec![
+                        GdiplusPointF { x: *x1, y: *y1 },
+                        GdiplusPointF { x: *x2, y: *y2 },
+                    ],
+                    false,
+                ));
+            }
+            GdiplusPathElement::Rectangle { x, y, w, h } => {
+                out.push((
+                    vec![
+                        GdiplusPointF { x: *x, y: *y },
+                        GdiplusPointF { x: *x + *w, y: *y },
+                        GdiplusPointF {
+                            x: *x + *w,
+                            y: *y + *h,
+                        },
+                        GdiplusPointF { x: *x, y: *y + *h },
+                    ],
+                    true,
+                ));
+            }
+            GdiplusPathElement::Ellipse { x, y, w, h } => {
+                out.push((ellipse_points(*x, *y, *w, *h), true));
+            }
+            GdiplusPathElement::Pie {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
+                let cx = x + w / 2.0;
+                let cy = y + h / 2.0;
+                out.push((
+                    arc_to_line_segments(
+                        cx,
+                        cy,
+                        w / 2.0,
+                        h / 2.0,
+                        *start_angle,
+                        *sweep_angle,
+                        true,
+                    ),
+                    true,
+                ));
+            }
+            GdiplusPathElement::Arc {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
+                let cx = x + w / 2.0;
+                let cy = y + h / 2.0;
+                out.push((
+                    arc_to_line_segments(
+                        cx,
+                        cy,
+                        w / 2.0,
+                        h / 2.0,
+                        *start_angle,
+                        *sweep_angle,
+                        false,
+                    ),
+                    false,
+                ));
+            }
+            GdiplusPathElement::Bezier { points } => {
+                let segs = 32;
+                let mut poly = Vec::with_capacity(segs as usize + 1);
+                for s in 0..=segs {
+                    let t = s as f32 / segs as f32;
+                    poly.push(eval_cubic_bezier(points, t));
+                }
+                out.push((poly, false));
+            }
+            GdiplusPathElement::Polygon { points }
+            | GdiplusPathElement::Lines { points }
+            | GdiplusPathElement::Curve { points, tension: _ } => {
+                out.push((points.clone(), false));
+            }
+            GdiplusPathElement::ClosedCurve { points, tension: _ } => {
+                out.push((points.clone(), true));
+            }
+            GdiplusPathElement::StartFigure
+            | GdiplusPathElement::CloseFigure
+            | GdiplusPathElement::String { .. } => {}
+        }
+    }
+    out
+}
+
+/// General software blit used by the GdipDrawImage family: draws the source
+/// sub-rectangle `(src_x, src_y, src_w, src_h)` (source pixel units) scaled
+/// into `(dst_x, dst_y, dst_w, dst_h)` on the destination.  Applies an
+/// optional GDI+ colour-key range (source colours in `[lo, hi]`, inclusive,
+/// become transparent) and an optional 5×5 colour matrix before blending.
+///
+/// `bilinear` selects bilinear sampling when the blit scales (used for
+/// `InterpolationMode` Bilinear / HighQualityBilinear / HighQuality / Bicubic
+/// families, which the engine serves with bilinear filtering); the default
+/// path is nearest-neighbour like the plain [`draw_image_rect`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_image_ex(
+    dst_pixels: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    dst_stride: i32,
+    src_pixels: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: i32,
+    src_x: f32,
+    src_y: f32,
+    src_w: f32,
+    src_h: f32,
+    dst_x: f32,
+    dst_y: f32,
+    dst_w: f32,
+    dst_h: f32,
+    color_key: Option<(u32, u32)>,
+    color_matrix: Option<[[f32; 5]; 5]>,
+    bilinear: bool,
+    compositing_mode: u32,
+) {
+    if src_width == 0 || src_height == 0 || src_w <= 0.0 || src_h <= 0.0 {
+        return;
+    }
+    let ox = clamp_f32(dst_x);
+    let oy = clamp_f32(dst_y);
+    let ow = dst_w.max(1.0).round() as i32;
+    let oh = dst_h.max(1.0).round() as i32;
+    let src_read = |sx: f32, sy: f32| -> u32 {
+        let sx = sx.clamp(0.0, src_width.saturating_sub(1) as f32);
+        let sy = sy.clamp(0.0, src_height.saturating_sub(1) as f32);
+        let (x0, y0) = (sx.floor() as i64, sy.floor() as i64);
+        let src_row = |row: i64| -> i64 {
+            if src_stride < 0 {
+                (src_height as i64 - 1 - row) * src_stride as i64
+            } else {
+                row * src_stride as i64
+            }
+        };
+        let read = |x: i64, y: i64| -> u32 {
+            let off = src_row(y).saturating_add(x.saturating_mul(4));
+            if off < 0 || off.saturating_add(3) >= src_pixels.len() as i64 {
+                return 0x0000_0000;
+            }
+            let idx = off as usize;
+            u32::from_le_bytes([
+                src_pixels[idx],
+                src_pixels[idx + 1],
+                src_pixels[idx + 2],
+                src_pixels[idx + 3],
+            ])
+        };
+        if !bilinear {
+            return read(x0, y0);
+        }
+        let fx = sx - x0 as f32;
+        let fy = sy - y0 as f32;
+        let c00 = read(x0, y0);
+        let c10 = read((x0 + 1).min(src_width as i64 - 1), y0);
+        let c01 = read(x0, (y0 + 1).min(src_height as i64 - 1));
+        let c11 = read(
+            (x0 + 1).min(src_width as i64 - 1),
+            (y0 + 1).min(src_height as i64 - 1),
+        );
+        let lerp = |a: u32, b: u32, t: f32| -> u32 {
+            let a = a as f32;
+            let b = b as f32;
+            (a + (b - a) * t).round().clamp(0.0, 255.0) as u32
+        };
+        let mix = |c1: u32, c2: u32, c3: u32, c4: u32| -> u32 {
+            let top = |c1: u32, c2: u32, t: f32| -> [u32; 4] {
+                [
+                    lerp((c1 >> 24) & 0xff, (c2 >> 24) & 0xff, t),
+                    lerp((c1 >> 16) & 0xff, (c2 >> 16) & 0xff, t),
+                    lerp((c1 >> 8) & 0xff, (c2 >> 8) & 0xff, t),
+                    lerp(c1 & 0xff, c2 & 0xff, t),
+                ]
+            };
+            let a = top(c1, c2, fx);
+            let b = top(c3, c4, fx);
+            let out = [
+                a[0] + ((b[0] - a[0]) as f32 * fy).round() as u32,
+                a[1] + ((b[1] - a[1]) as f32 * fy).round() as u32,
+                a[2] + ((b[2] - a[2]) as f32 * fy).round() as u32,
+                a[3] + ((b[3] - a[3]) as f32 * fy).round() as u32,
+            ];
+            out[0] << 24 | out[1] << 16 | out[2] << 8 | out[3]
+        };
+        if c00 == c10 && c10 == c01 && c01 == c11 {
+            return c00;
+        }
+        mix(c00, c10, c01, c11)
+    };
+    let apply_matrix = |c: u32| -> u32 {
+        let Some(m) = color_matrix else {
+            return c;
+        };
+        let v = [
+            ((c >> 16) & 0xff) as f32,
+            ((c >> 8) & 0xff) as f32,
+            (c & 0xff) as f32,
+            ((c >> 24) & 0xff) as f32,
+            1.0,
+        ];
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            out[row] = m[row][0] * v[0]
+                + m[row][1] * v[1]
+                + m[row][2] * v[2]
+                + m[row][3] * v[3]
+                + m[row][4];
+        }
+        let clamp255 = |f: f32| f.round().clamp(0.0, 255.0) as u32;
+        (clamp255(out[3]) << 24)
+            | (clamp255(out[0]) << 16)
+            | (clamp255(out[1]) << 8)
+            | clamp255(out[2])
+    };
+    for py in 0..oh {
+        for px in 0..ow {
+            let sx = src_x + (px as f32 + 0.5) / ow as f32 * src_w;
+            let sy = src_y + (py as f32 + 0.5) / oh as f32 * src_h;
+            let original = src_read(sx, sy);
+            if let Some((lo, hi)) = color_key
+                && original >= lo
+                && original <= hi
+            {
+                continue;
+            }
+            let color = apply_matrix(original);
+            put_pixel(
+                dst_pixels,
+                dst_width,
+                dst_height,
+                dst_stride,
+                ox + px,
+                oy + py,
+                color,
+                compositing_mode,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

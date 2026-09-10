@@ -54,6 +54,53 @@ const MF_E_TOPO_COULD_NOT_OPEN: u32 = 0xC00D_5208;
 #[allow(dead_code)] // reserved for the MF error surface
 const MF_E_UNSUPPORTED_CHARACTERISTICS: u32 = 0xC00D_36B2;
 
+// ── Service registry GUIDs (the guest little-endian byte form) ────────────
+// The MFGetService service identifiers and the interface IIDs the service
+// providers answer.  All byte values below are the guest little-endian
+// representation of the documented Windows GUIDs.
+
+/// MF_RATE_CONTROL_SERVICE {866fa297-b802-4bf8-9dc9-5e3b6a9f53c9} (mfidl.h).
+const SERVICE_MF_RATE_CONTROL: [u8; 16] = [
+    0x97, 0xa2, 0x6f, 0x86, 0x02, 0xb8, 0xf8, 0x4b, 0x9d, 0xc9, 0x5e, 0x3b, 0x6a, 0x9f, 0x53, 0xc9,
+];
+/// MF_MEDIASESSION_SERVICE — the media-session service identifier the
+/// session owner answers with its IMFMediaSession interface.  The Windows
+/// SDK exports no constant under this name (no value is published in any
+/// SDK header), so the runtime keeps a stable Casa1-defined identifier:
+/// {b379a95c-76f1-49c1-af4c-23f7f628dfd1} in guest little-endian form.
+const SERVICE_MF_MEDIA_SESSION: [u8; 16] = [
+    0x5c, 0xa9, 0x79, 0xb3, 0xf1, 0x76, 0xc1, 0x49, 0xaf, 0x4c, 0x23, 0xf7, 0xf6, 0x28, 0xdf, 0xd1,
+];
+/// IID_IMFMediaSession {90377834-21d0-4dee-8214-ba2e3e6c1127}.
+const IID_IMF_MEDIA_SESSION: [u8; 16] = [
+    0x34, 0x78, 0x37, 0x90, 0xd0, 0x21, 0xee, 0x4d, 0x82, 0x14, 0xba, 0x2e, 0x3e, 0x6c, 0x11, 0x27,
+];
+/// IID_IMFRateControl {88ddcd21-03c3-4275-91ed-55ee3929328f}.
+const IID_IMF_RATE_CONTROL: [u8; 16] = [
+    0x21, 0xcd, 0xdd, 0x88, 0xc3, 0x03, 0x75, 0x42, 0x91, 0xed, 0x55, 0xee, 0x39, 0x29, 0x32, 0x8f,
+];
+/// IID_IMFRateSupport {0a9ccdbc-d797-4563-9667-94ec5d79292d}.
+const IID_IMF_RATE_SUPPORT: [u8; 16] = [
+    0xbc, 0xcd, 0x9c, 0x0a, 0x97, 0xd7, 0x63, 0x45, 0x96, 0x67, 0x94, 0xec, 0x5d, 0x79, 0x29, 0x2d,
+];
+/// IID_IUnknown {00000000-0000-0000-c000-000000000046}.
+const IID_IUNKNOWN: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+
+/// MFRATE_FORWARD (mfidl.h `_MFRATE_DIRECTION`).
+const MFRATE_FORWARD: u32 = 0;
+/// MFRATE_REVERSE (mfidl.h `_MFRATE_DIRECTION`).
+const MFRATE_REVERSE: u32 = 1;
+
+/// MF_E_UNSUPPORTED_RATE (mferror.h 0xC00D36D0).
+const MF_E_UNSUPPORTED_RATE: u32 = 0xC00D_36D0;
+
+/// The rate value the rate-support provider reports as the session's
+/// slowest forward rate: no pipeline component in the runtime graph can
+/// run slower than real time.
+const MF_SESSION_SLOWEST_FORWARD_RATE: f32 = 1.0;
+
 /// The standard MF interface vtable preamble: IUnknown + the first
 /// interface method slots that the runtime dispatches.  The remaining slots
 /// are filled with the interface's own methods.
@@ -98,18 +145,304 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `MFGetService(pUnk, guidService, riid, ppvObject)` — no service
-    /// providers in the MF runtime — `MF_E_UNSUPPORTED_SERVICE`.
+    /// `MFGetService(pUnk, guidService, riid, ppvObject)` — resolve the
+    /// object to the owner of the requested service in its object graph and
+    /// hand back a real provider object.
+    ///
+    /// Provider model: every guest object belongs to an object graph whose
+    /// root owns service tables.  Today the media session is the only owner
+    /// with providers (the session itself, plus its rate-control service);
+    /// the session's topology and topology-node objects resolve up to their
+    /// owning session.  Objects without a provider table, and service GUIDs
+    /// no owner provides, answer `MF_E_UNSUPPORTED_SERVICE` (the documented
+    /// Windows answer when the object does not own the service).
     pub(crate) fn dispatch_mf_get_service(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
+        let p_unk = guest_call_arg(state, memory, 0)?;
+        let service_ptr = guest_call_arg(state, memory, 1)?;
+        let iid_ptr = guest_call_arg(state, memory, 2)?;
         let out = guest_call_arg(state, memory, 3)?;
-        if out != 0 {
-            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        if service_ptr == 0 || iid_ptr == 0 || out == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+        let mut service = [0_u8; 16];
+        let service_bytes = memory.read_bytes(service_ptr, 16).unwrap_or_default();
+        service.copy_from_slice(&service_bytes[..service_bytes.len().min(16)]);
+        let mut iid = [0_u8; 16];
+        let iid_bytes = memory.read_bytes(iid_ptr, 16).unwrap_or_default();
+        iid.copy_from_slice(&iid_bytes[..iid_bytes.len().min(16)]);
+        let Some(owner) = self.mf_service_owner(p_unk) else {
+            // Not a runtime-registered object (or an object whose graph
+            // owns no service): the documented unsupported-service answer.
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        };
+        match self.guest_object_kind(owner) {
+            Ok(GuestObjectKind::ImfMediaSession) => {
+                self.dispatch_mf_session_get_service(state, memory, owner, &service, &iid)
+            }
+            _ => {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve a guest object to the owner of its services in the guest
+    /// object graph:
+    ///
+    /// - a media session owns its own session services;
+    /// - a session's topology objects and topology-node objects resolve to
+    ///   the session that holds them (`mf_session_topologies` and the
+    ///   topology's node table are the ownership edges).
+    ///
+    /// Everything else is its own (provider-less) root.
+    fn mf_service_owner(&self, object: u64) -> Option<u64> {
+        let kind = self.guest_object_kind(object).ok()?;
+        match kind {
+            GuestObjectKind::ImfMediaSession => {
+                self.mf_sessions.contains_key(&object).then_some(object)
+            }
+            GuestObjectKind::ImfTopology => self
+                .mf_session_topologies
+                .iter()
+                .find(|(_, topology)| **topology == object)
+                .map(|(session, _)| *session),
+            GuestObjectKind::ImfTopologyNode => self.mf_session_for_topology_node(object),
+            _ => None,
+        }
+    }
+
+    /// Find the session that owns a topology node: the node's media-model
+    /// id (its `TopologyNodeState.object`) must appear in the node table of
+    /// a session's full topology.
+    fn mf_session_for_topology_node(&self, node: u64) -> Option<u64> {
+        let node_id = self.mf_topology_nodes.get(&node)?.object;
+        if node_id == 0 {
+            return None;
+        }
+        self.mf_session_topologies
+            .iter()
+            .find_map(|(session, topology)| {
+                let topology = self.mf_topologies.get(topology)?;
+                topology
+                    .nodes
+                    .iter()
+                    .any(|entry| entry.id == node_id)
+                    .then_some(*session)
+            })
+    }
+
+    /// The media session's real provider table: the service GUIDs the
+    /// session owner provides and the object handed out for the requested
+    /// interface.  Returns `S_OK` after writing `ppvObject`, or
+    /// `MF_E_UNSUPPORTED_SERVICE` when the session does not own the service
+    /// (or does not answer the requested interface).
+    fn dispatch_mf_session_get_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        session: u64,
+        service: &[u8; 16],
+        iid: &[u8; 16],
+    ) -> AppResult<()> {
+        let out = guest_call_arg(state, memory, 3)?;
+        if service == &SERVICE_MF_MEDIA_SESSION {
+            // The session service: the session itself.
+            if iid == &IID_IMF_MEDIA_SESSION || iid == &IID_IUNKNOWN {
+                write_guest_pointer(memory, out, session, self.guest_arch).ok();
+                self.add_ref_guest_object(session)?;
+                state.set(Register::Rax, u64::from(S_OK));
+                return Ok(());
+            }
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+            return Ok(());
+        }
+        if service == &SERVICE_MF_RATE_CONTROL {
+            // The rate-control service: a real IMFRateControl /
+            // IMFRateSupport object whose methods drive the owning
+            // session's playback rate.  A fresh service object is handed
+            // out per query (the guest releases it like any GetService
+            // result); its owner-session registration lives in
+            // `mf_rate_services`.
+            let vtable = if iid == &IID_IMF_RATE_CONTROL || iid == &IID_IUNKNOWN {
+                self.alloc_guest_vtable(memory, mf_rate_control_methods())?
+            } else if iid == &IID_IMF_RATE_SUPPORT {
+                self.alloc_guest_vtable(memory, mf_rate_support_methods())?
+            } else {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                return Ok(());
+            };
+            let object =
+                self.alloc_guest_object(memory, GuestObjectKind::ImfRateControlService, vtable)?;
+            self.mf_rate_services.insert(object, session);
+            write_guest_pointer(memory, out, object, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
         }
         state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+        Ok(())
+    }
+
+    /// `IMFRateControl::SetRate(fThin, flRate)` — set the owning media
+    /// session's playback rate.  The session's clock/position machinery
+    /// runs forward at real time, so the genuinely backed rates are the
+    /// forward non-thinned rates from 1.0 up; anything else (thinned
+    /// playback, slow motion, reverse) answers `MF_E_UNSUPPORTED_RATE`.
+    pub(crate) fn dispatch_mf_rate_control_set_rate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let thin = guest_call_arg_u32(state, memory, 1)?;
+        let rate = f32::from_bits(guest_call_arg_u32(state, memory, 2)?);
+        let Some(&session) = self.mf_rate_services.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if thin != 0 || !rate.is_finite() || rate < MF_SESSION_SLOWEST_FORWARD_RATE {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_RATE));
+            return Ok(());
+        }
+        match self.mf_sessions.get_mut(&session) {
+            Some(session_state) => {
+                session_state.set_rate(rate);
+                state.set(Register::Rax, u64::from(S_OK));
+            }
+            None => state.set(Register::Rax, u64::from(E_NOINTERFACE)),
+        }
+        Ok(())
+    }
+
+    /// `IMFRateControl::GetRate(pfThin, pflRate)` — the session's current
+    /// playback rate (never thinned).
+    pub(crate) fn dispatch_mf_rate_control_get_rate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let thin_out = guest_call_arg(state, memory, 1)?;
+        let rate_out = guest_call_arg(state, memory, 2)?;
+        let Some(&session) = self.mf_rate_services.get(&this) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let Some(session_state) = self.mf_sessions.get(&session) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        let rate = session_state.get_rate();
+        if thin_out != 0 {
+            write_u32(memory, thin_out, 0);
+        }
+        if rate_out != 0 {
+            write_u32(memory, rate_out, rate.to_bits());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// The slowest/fastest forward rate of the session's rate-control
+    /// service (`IMFRateSupport`).  Reverse and thinned playback are not
+    /// backed by the session graph.
+    fn dispatch_mf_rate_support_bound(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        fastest: bool,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let direction = guest_call_arg_u32(state, memory, 1)?;
+        let thin = guest_call_arg_u32(state, memory, 2)?;
+        let out = guest_call_arg(state, memory, 3)?;
+        if !self.mf_rate_services.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        match direction {
+            MFRATE_FORWARD if thin == 0 => {}
+            MFRATE_FORWARD | MFRATE_REVERSE => {
+                // Thinned playback and reverse playback are not backed by
+                // the session graph.
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_RATE));
+                return Ok(());
+            }
+            _ => {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+        }
+        let bound = if fastest {
+            // The session clock/position math scales by any finite forward
+            // rate; no artificial ceiling is imposed on the fastest rate.
+            f32::MAX
+        } else {
+            MF_SESSION_SLOWEST_FORWARD_RATE
+        };
+        if out != 0 {
+            write_u32(memory, out, bound.to_bits());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMFRateSupport::GetSlowestRate(eDirection, fThin, pflRate)`.
+    pub(crate) fn dispatch_mf_rate_support_get_slowest_rate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mf_rate_support_bound(state, memory, false)
+    }
+
+    /// `IMFRateSupport::GetFastestRate(eDirection, fThin, pflRate)`.
+    pub(crate) fn dispatch_mf_rate_support_get_fastest_rate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        self.dispatch_mf_rate_support_bound(state, memory, true)
+    }
+
+    /// `IMFRateSupport::IsRateSupported(fThin, flRate,
+    /// pflNearestSupportedRate)` — the session backs forward non-thinned
+    /// rates from 1.0 up.
+    pub(crate) fn dispatch_mf_rate_support_is_rate_supported(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let thin = guest_call_arg_u32(state, memory, 1)?;
+        let rate = f32::from_bits(guest_call_arg_u32(state, memory, 2)?);
+        let nearest_out = guest_call_arg(state, memory, 3)?;
+        if !self.mf_rate_services.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let supported = thin == 0 && rate.is_finite() && rate >= MF_SESSION_SLOWEST_FORWARD_RATE;
+        if !supported && nearest_out != 0 {
+            write_u32(
+                memory,
+                nearest_out,
+                MF_SESSION_SLOWEST_FORWARD_RATE.to_bits(),
+            );
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if supported {
+                S_OK
+            } else {
+                MF_E_UNSUPPORTED_RATE
+            }),
+        );
         Ok(())
     }
 
@@ -3968,6 +4301,17 @@ impl PeHostRuntime {
             MfClockGetTime => self.dispatch_mf_clock_get_time(state, memory),
             MfClockStart => self.dispatch_mf_clock_start(state, memory),
             MfClockStop => self.dispatch_mf_clock_stop(state, memory),
+            MfRateControlSetRate => self.dispatch_mf_rate_control_set_rate(state, memory),
+            MfRateControlGetRate => self.dispatch_mf_rate_control_get_rate(state, memory),
+            MfRateSupportGetSlowestRate => {
+                self.dispatch_mf_rate_support_get_slowest_rate(state, memory)
+            }
+            MfRateSupportGetFastestRate => {
+                self.dispatch_mf_rate_support_get_fastest_rate(state, memory)
+            }
+            MfRateSupportIsRateSupported => {
+                self.dispatch_mf_rate_support_is_rate_supported(state, memory)
+            }
             MfSessionGetClock => self.dispatch_mf_session_get_clock(state, memory),
             MfSessionSetTopology => self.dispatch_mf_session_set_topology(state, memory),
             MfSessionGetSessionCapabilities => {
@@ -4179,6 +4523,25 @@ fn mf_clock_methods() -> Vec<HostThunk> {
     methods.push(HostThunk::MfClockGetTime);
     methods.push(HostThunk::MfClockStart);
     methods.push(HostThunk::MfClockStop);
+    methods
+}
+
+/// The IMFRateControl vtable (the session rate-control service object):
+/// the real method order SetRate, GetRate.
+fn mf_rate_control_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfRateControlSetRate);
+    methods.push(HostThunk::MfRateControlGetRate);
+    methods
+}
+
+/// The IMFRateSupport vtable (the session rate-support service object):
+/// the real method order GetSlowestRate, GetFastestRate, IsRateSupported.
+fn mf_rate_support_methods() -> Vec<HostThunk> {
+    let mut methods = unknown_preamble();
+    methods.push(HostThunk::MfRateSupportGetSlowestRate);
+    methods.push(HostThunk::MfRateSupportGetFastestRate);
+    methods.push(HostThunk::MfRateSupportIsRateSupported);
     methods
 }
 
@@ -4423,5 +4786,557 @@ fn mf_attribute_propvariant(mt: &ImfMediaType, key: Guid) -> Option<(u32, Vec<u8
         }
         Some(MediaTypeValue::Blob(blob)) => Some((0x1011, blob.clone())),
         None => None,
+    }
+}
+
+// ===========================================================================
+// MFGetService tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ge::{GameEnvironment, GeArch};
+    use tempfile::TempDir;
+
+    /// A runtime configured for x86 guest calls, mirroring the runtime-wide
+    /// test harness (deterministic per-arch thunk/data/heap bases).
+    fn mf_test_runtime(name: &str) -> (PeHostRuntime, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.guest_arch = GuestArch::X86;
+        runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
+        runtime.next_data_address = data_base_for_arch(GuestArch::X86);
+        runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
+        runtime
+            .win32
+            .reset_address_space(private_pages_base_for_arch(GuestArch::X86));
+        runtime.x86_heap_region = 0;
+        (runtime, temp_dir)
+    }
+
+    /// Dispatch an x86 thunk whose arguments are pushed on a scratch stack,
+    /// exactly like the runtime-wide `dispatch_x86_thunk` helper.
+    fn dispatch_x86_thunk(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        thunk: u64,
+        args: &[u32],
+    ) -> u64 {
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u32(memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in args.iter().enumerate() {
+            write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+        runtime
+            .dispatch_import(thunk, &mut state, memory)
+            .unwrap_or_else(|error| panic!("dispatch x86 thunk: {error}"));
+        state.get(Register::Rax)
+    }
+
+    /// Run a test body on an 8 MiB stack thread: guest dispatch recurses
+    /// (the same harness the runtime-wide evidence tests use).
+    fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn big-stack thread")
+            .join()
+            .expect("big-stack thread panicked")
+    }
+
+    fn write_guest_guid_bytes(memory: &mut MemoryImage, address: u64, bytes: &[u8; 16]) {
+        memory.map_bytes(address, bytes);
+    }
+
+    /// Create a media session guest object through the MFCreateMediaSession
+    /// thunk; returns the object address.
+    fn create_session(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) -> u64 {
+        let create_session: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaSession);
+        let session_out = 0x41_000;
+        let hr = dispatch_x86_thunk(runtime, memory, create_session, &[0, session_out as u32]);
+        assert_eq!(hr, 0, "MFCreateMediaSession");
+        let session = read_guest_pointer(memory, session_out, GuestArch::X86).unwrap();
+        assert_ne!(session, 0);
+        assert!(runtime.mf_sessions.contains_key(&session));
+        session
+    }
+
+    #[test]
+    fn mf_get_service_media_session_service_returns_the_session() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-session");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SESSION);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0, "the session owns the media-session service");
+            let service = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_eq!(service, session, "the service IS the session object");
+            assert_eq!(
+                runtime.guest_objects.get(&session).unwrap().refcount,
+                2,
+                "the handed-out interface carries its own reference"
+            );
+
+            // IUnknown is also an acceptable interface for the same service.
+            write_guest_guid_bytes(&mut memory, iid, &IID_IUNKNOWN);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                session
+            );
+        })
+    }
+
+    #[test]
+    fn mf_get_service_unsupported_service_and_interface() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-unsupported");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            // MF_TIMECODE_SERVICE {a0d502a7-0eb3-4885-b1b9-9feb0d083454}: a real
+            // Windows service GUID the session does not own (ASF sources own it).
+            let timecode_service: [u8; 16] = [
+                0xa7, 0x02, 0xd5, 0xa0, 0xb3, 0x0e, 0x85, 0x48, 0xb1, 0xb9, 0x9f, 0xeb, 0x0d, 0x08,
+                0x34, 0x54,
+            ];
+            write_guest_guid_bytes(&mut memory, guid, &timecode_service);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SESSION);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                0,
+                "the output pointer is nulled on failure"
+            );
+
+            // The media-session service answered with the wrong interface.
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_RATE_CONTROL);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+        })
+    }
+
+    #[test]
+    fn mf_get_service_rate_control_set_and_get_rate() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-rate");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let set_rate: u64 = runtime.alloc_host_thunk(HostThunk::MfRateControlSetRate);
+            let get_rate: u64 = runtime.alloc_host_thunk(HostThunk::MfRateControlGetRate);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_RATE_CONTROL);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_RATE_CONTROL);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0, "the session owns the rate-control service");
+            let rate_control = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_ne!(rate_control, 0);
+            assert_eq!(
+                runtime.mf_rate_services.get(&rate_control).copied(),
+                Some(session),
+                "the service object is registered to its owning session"
+            );
+            assert_eq!(
+                runtime.guest_object_kind(rate_control).unwrap(),
+                GuestObjectKind::ImfRateControlService
+            );
+
+            // The session starts at 1.0x.
+            let thin_out = 0x44_300;
+            let rate_out = 0x44_310;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rate,
+                &[rate_control as u32, thin_out as u32, rate_out as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(read_guest_u32(&memory, thin_out).unwrap(), 0);
+            assert_eq!(
+                read_guest_u32(&memory, rate_out).unwrap(),
+                1.0_f32.to_bits()
+            );
+
+            // SetRate(2.0) is stored on the session (real rate semantics).
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_rate,
+                &[rate_control as u32, 0, 2.0_f32.to_bits()],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(runtime.mf_sessions.get(&session).unwrap().get_rate(), 2.0);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rate,
+                &[rate_control as u32, thin_out as u32, rate_out as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_guest_u32(&memory, rate_out).unwrap(),
+                2.0_f32.to_bits()
+            );
+
+            // Unsupported rates: thinned playback, slow motion, reverse.
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_rate,
+                &[rate_control as u32, 1, 1.0_f32.to_bits()],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_rate,
+                &[rate_control as u32, 0, 0.5_f32.to_bits()],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_rate,
+                &[rate_control as u32, 0, (-2.0_f32).to_bits()],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+            assert_eq!(
+                runtime.mf_sessions.get(&session).unwrap().get_rate(),
+                2.0,
+                "a rejected rate never mutates the session"
+            );
+        })
+    }
+
+    #[test]
+    fn mf_get_service_rate_support_bounds() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-rate-support");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let slowest: u64 = runtime.alloc_host_thunk(HostThunk::MfRateSupportGetSlowestRate);
+            let fastest: u64 = runtime.alloc_host_thunk(HostThunk::MfRateSupportGetFastestRate);
+            let supported: u64 = runtime.alloc_host_thunk(HostThunk::MfRateSupportIsRateSupported);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_RATE_CONTROL);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_RATE_SUPPORT);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0);
+            let rate_support = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_ne!(rate_support, 0);
+            assert_eq!(
+                runtime.mf_rate_services.get(&rate_support).copied(),
+                Some(session)
+            );
+
+            // Forward non-thinned: slowest 1.0, fastest unbounded.
+            let rate_out = 0x44_300;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                slowest,
+                &[rate_support as u32, MFRATE_FORWARD, 0, rate_out as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_guest_u32(&memory, rate_out).unwrap(),
+                MF_SESSION_SLOWEST_FORWARD_RATE.to_bits()
+            );
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fastest,
+                &[rate_support as u32, MFRATE_FORWARD, 0, rate_out as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                read_guest_u32(&memory, rate_out).unwrap(),
+                f32::MAX.to_bits()
+            );
+
+            // Reverse direction and thinning are not backed.
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                slowest,
+                &[rate_support as u32, MFRATE_REVERSE, 0, rate_out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                fastest,
+                &[rate_support as u32, MFRATE_FORWARD, 1, rate_out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+
+            // IsRateSupported: >= 1.0x forward yes, slower rates carry the
+            // nearest supported rate out.
+            let nearest_out = 0x44_320;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                supported,
+                &[
+                    rate_support as u32,
+                    0,
+                    4.0_f32.to_bits(),
+                    nearest_out as u32,
+                ],
+            );
+            assert_eq!(hr, 0);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                supported,
+                &[
+                    rate_support as u32,
+                    0,
+                    0.5_f32.to_bits(),
+                    nearest_out as u32,
+                ],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_RATE as u64);
+            assert_eq!(
+                read_guest_u32(&memory, nearest_out).unwrap(),
+                MF_SESSION_SLOWEST_FORWARD_RATE.to_bits()
+            );
+        })
+    }
+
+    #[test]
+    fn mf_get_service_rate_service_release_forgets_the_owner() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-rate-release");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+            let release: u64 = runtime.alloc_host_thunk(HostThunk::GuestObjectRelease);
+            let get_rate: u64 = runtime.alloc_host_thunk(HostThunk::MfRateControlGetRate);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_RATE_CONTROL);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_RATE_CONTROL);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0);
+            let rate_control = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            let hr = dispatch_x86_thunk(&mut runtime, &mut memory, release, &[rate_control as u32]);
+            assert_eq!(hr, 0, "release of the fresh reference");
+            assert!(
+                !runtime.mf_rate_services.contains_key(&rate_control),
+                "releasing the service object drops its owner registration"
+            );
+            let rate_out = 0x44_300;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_rate,
+                &[rate_control as u32, 0, rate_out as u32],
+            );
+            assert_eq!(hr, E_NOINTERFACE as u64);
+        })
+    }
+
+    #[test]
+    fn mf_get_service_resolves_the_session_from_its_topology_graph() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-graph");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let create_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopology);
+            let create_node: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopologyNode);
+            let add_node: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyAddNode);
+            let set_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionSetTopology);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+
+            let topology_out = 0x41_100;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_topology,
+                &[topology_out as u32],
+            );
+            assert_eq!(hr, 0);
+            let topology = read_guest_pointer(&memory, topology_out, GuestArch::X86).unwrap();
+
+            let node_out = 0x41_200;
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                create_node,
+                &[0, node_out as u32],
+            );
+            assert_eq!(hr, 0);
+            let node = read_guest_pointer(&memory, node_out, GuestArch::X86).unwrap();
+
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                add_node,
+                &[topology as u32, node as u32],
+            );
+            assert_eq!(hr, 0);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_topology,
+                &[session as u32, 0, topology as u32],
+            );
+            assert_eq!(hr, 0);
+            assert_eq!(
+                runtime.mf_session_topologies.get(&session).copied(),
+                Some(topology)
+            );
+
+            // The topology object resolves to its owning session.
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SESSION);
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[topology as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, 0, "a session topology is owned by the session");
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                session
+            );
+
+            // And so does a topology node inside that topology.
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[node as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(
+                hr, 0,
+                "a node of the session topology is owned by the session"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                session
+            );
+        })
+    }
+
+    #[test]
+    fn mf_get_service_objects_without_services_answer_unsupported() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-service-unowned");
+            let mut memory = MemoryImage::default();
+            let session = create_session(&mut runtime, &mut memory);
+            let get_service: u64 = runtime.alloc_host_thunk(HostThunk::MfGetService);
+
+            let guid = 0x44_000;
+            let iid = 0x44_100;
+            let out = 0x44_200;
+            write_guest_guid_bytes(&mut memory, guid, &SERVICE_MF_MEDIA_SESSION);
+            write_guest_guid_bytes(&mut memory, iid, &IID_IMF_MEDIA_SESSION);
+
+            // An object with no provider table (a media event queue) does not
+            // own the session services.
+            let create_queue: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateEventQueue);
+            let queue_out = 0x41_300;
+            let hr =
+                dispatch_x86_thunk(&mut runtime, &mut memory, create_queue, &[queue_out as u32]);
+            assert_eq!(hr, 0);
+            let queue = read_guest_pointer(&memory, queue_out, GuestArch::X86).unwrap();
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[queue as u32, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+            assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+
+            // A pointer that is not a runtime-registered object at all.
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[0x00C0_FFEE, guid as u32, iid as u32, out as u32],
+            );
+            assert_eq!(hr, MF_E_UNSUPPORTED_SERVICE as u64);
+
+            // Null output pointer is an argument error.
+            let hr = dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                get_service,
+                &[session as u32, guid as u32, iid as u32, 0],
+            );
+            assert_eq!(hr, E_INVALIDARG as u64);
+        })
     }
 }

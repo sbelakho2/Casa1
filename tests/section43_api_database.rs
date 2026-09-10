@@ -322,57 +322,29 @@ fn semantic_axes_keep_callable_separate_from_exact() {
 }
 
 #[test]
-fn every_documented_stub_is_deliberate_and_ships_clean() {
-    // The re-audit's invariant: no Stub may exist without its deliberate
-    // registration (the guest-visible consequence), and no Implemented row
-    // may remain a no-op.  The seeded database's stubs are exactly the
-    // remaining audited canned no-ops (the certificate-selection dialog and
-    // the four shell-UI helpers), each carrying CannedFailure fidelity and a
-    // deliberate consequence, so the shipping gate is clean.
+fn no_stub_rows_remain_and_shipping_is_clean() {
+    // The real-implementation campaign finished every audited no-op: the
+    // certificate-selection dialog, the four shell-UI helpers, the rich-edit
+    // registration, the audit log, the digest helper, the native process
+    // creation and the X3DAudio math are all real now.  The seeded database
+    // must carry no Stub rows at all and the shipping gate must be clean.
     let database = ApiDatabase::from_thunk_metadata();
     let stubs: Vec<&ApiEntry> = database
         .entries()
         .iter()
         .filter(|entry| entry.implementation == ImplementationLevel::Stub)
         .collect();
-    assert_eq!(
-        stubs.len(),
-        5,
-        "the documented stub set is exactly the remaining canned no-ops"
+    assert!(
+        stubs.is_empty(),
+        "no canned stub rows may remain (found {:?})",
+        stubs
+            .iter()
+            .map(|entry| format!("{}!{}", entry.dll, entry.export))
+            .collect::<Vec<_>>()
     );
-    for entry in &stubs {
-        let consequence = database
-            .deliberately_unsupported_error(&entry.dll, &entry.export)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{}!{} must be deliberately unsupported with a consequence",
-                    entry.dll, entry.export
-                )
-            });
-        assert!(
-            !consequence.trim().is_empty(),
-            "{}!{} carries a non-empty consequence",
-            entry.dll,
-            entry.export
-        );
-        assert_eq!(
-            entry.semantic_fidelity,
-            SemanticFidelity::CannedFailure,
-            "{}!{} records canned fidelity",
-            entry.dll,
-            entry.export
-        );
-        assert!(
-            entry.subsystem_capability != SubsystemCapability::Full,
-            "{}!{} must not claim a fully available subsystem (got {:?})",
-            entry.dll,
-            entry.export,
-            entry.subsystem_capability
-        );
-    }
     assert!(
         database.shipping_gate().is_empty(),
-        "documented deliberate stubs ship clean"
+        "the stub-free registry ships clean"
     );
 }
 
@@ -1038,47 +1010,23 @@ fn report_generator_emits_expected_json_shape() {
             .len() as u64
     );
     // The completeness-gate violation count is the total-compatibility
-    // progress number.  The real-implementation wave completed six of the
-    // eleven documented no-ops (X3DAudioCalculate spatial math, CertDigestDigest
-    // digests, CngAuditLog audit records, MsftEditRegisterClass/RichEditANSIWndClass
-    // registration, NtCreateProcess native child creation); the five remaining
-    // canned no-ops — the certificate-selection dialog and the four shell-UI
-    // helpers — are still documented Stubs that pass shipping but honestly
-    // block completeness.
-    const DOCUMENTED_STUBS: &[(&str, &str)] = &[
-        ("cryptdlg.dll", "CertSelectCertificate"),
-        ("browseui.dll", "SHCreateExplorerTaskband"),
-        ("browseui.dll", "SHOpenFolderWindow"),
-        ("shdocvw.dll", "SHCreateLinks"),
-        ("shdocvw.dll", "SHNavigateToFavorite"),
-    ];
+    // progress number.  The real-implementation campaign completed every
+    // audited no-op: the canned six (X3DAudio math, digests, audit records,
+    // rich-edit registration, native child creation) plus the certificate
+    // selection and the four shell-UI helpers — nothing canned is left, no
+    // Stub row remains, and the honest complete-accounting report carries
+    // zero completeness violations.
     assert_eq!(
-        completeness_count,
-        DOCUMENTED_STUBS.len() as u64,
-        "the honest registry carries exactly the documented stub completeness violations"
+        completeness_count, 0,
+        "no stub, partial or uncovered-implemented row may remain"
     );
     let violations = gate["completeness_violations"]
         .as_array()
         .expect("completeness_violations");
-    assert_eq!(
-        violations.len(),
-        DOCUMENTED_STUBS.len(),
-        "violation array matches the documented count"
+    assert!(
+        violations.is_empty(),
+        "the completeness violation list must be empty, got {violations:?}"
     );
-    for (dll, export) in DOCUMENTED_STUBS {
-        assert!(
-            violations.iter().any(|violation| {
-                violation["dll"] == *dll
-                    && violation["export"] == *export
-                    && violation["kind"]
-                        == serde_json::json!(ApiGateViolationKind::StubNotDeliberatelyUnsupported)
-                    && violation["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains("documented Stub"))
-            }),
-            "completeness must report {dll}!{export} as a documented Stub with its consequence"
-        );
-    }
     for violation in violations {
         let entry = violation.as_object().expect("violation object");
         for key in ["dll", "export", "kind", "message"] {
@@ -1171,20 +1119,19 @@ fn api_report_gate_enforces_violations_via_the_binary() {
         "the cleaned registry carries no shipping violations"
     );
 
-    // The completeness gate fails on the seeded database exactly as the
-    // re-audited truth requires: the eleven documented Stubs (the canned
-    // no-ops — X3DAudioCalculate's "sound-cone math" included) pass shipping
-    // with their deliberate consequences but honestly block completeness, so
-    // the gate must exit non-zero until the real operations exist.
+    // The completeness gate passes on the seeded database: the
+    // real-implementation campaign completed every audited no-op (the
+    // X3DAudio math, digests, audit records, rich-edit registration, native
+    // child creation, certificate selection and the shell helpers), so no
+    // Stub, Partial or uncovered-Implemented row remains to block it.
     let status = std::process::Command::new(binary)
         .args(["api-report", "--gate", "completeness", "--out"])
         .arg(&out)
         .status()
         .expect("invoke casa1-oracle api-report");
     assert!(
-        !status.success(),
-        "api-report --gate completeness must exit non-zero while the documented \
-         stubs are unresolved"
+        status.success(),
+        "api-report --gate completeness must exit zero on the stub-free registry"
     );
 
     // --gate none never fails on violations.
